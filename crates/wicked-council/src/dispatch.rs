@@ -758,23 +758,27 @@ fn run_in_isolation(
     // 1 "Not logged in" and the seat was benched on every council (4-of-5 verdicts) — while the
     // ACP worker path, which sets the variable from the worker home, ran the same CLI fine; on a
     // laptop with no such variable the ballots ran on the OPERATOR's `~/.claude` login by
-    // accident. One resolver for both paths (`wicked_apps_core::spawn::seat_claude_config_dir`),
+    // accident. One resolver for every path (`wicked_apps_core::spawn::seat_config_for_carrier`),
     // CARRIER-AWARE, judged on the program this ballot is about to exec (the same file-stem test
     // the worker paths apply): a claude seat gets the VALIDATED worker dir (absolute by
     // construction, no-follow checked — a `<worker home>/claude -> ~/.claude` link would hand the
-    // ballot the OPERATOR's credentials, which the ACP spawn already refused); a codex / pi /
-    // copilot / opencode seat never reads the variable and gets it STRIPPED — no ambient claude
-    // configuration path in a foreign process (codex review, PR#413). `Inherit` is the operator's
-    // explicit hatch, the same one the worker paths honour. Fail CLOSED when a claude seat's dir
-    // cannot be resolved or validated: a ballot on the daemon's configuration is the defect, not
-    // a fallback.
-    let claude_config = match wicked_apps_core::spawn::claude_config_for_carrier(program) {
+    // ballot the OPERATOR's credentials, which the ACP spawn already refused); and — core#410 —
+    // a codex / pi / copilot / opencode seat gets its OWN root under the same worker home through
+    // the CLI's own configuration-home variable (`CODEX_HOME`, `PI_CODING_AGENT_DIR`,
+    // `COPILOT_HOME`, the XDG bases), so no ballot loads the operator's personal skills,
+    // extensions or credentials; every FOREIGN seat variable is STRIPPED (codex review, PR#413).
+    // `Inherit` is the operator's explicit hatch, the same one the worker paths honour. Fail
+    // CLOSED when a seat's root cannot be resolved or validated: a ballot on the daemon's
+    // configuration is the defect, not a fallback.
+    let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier(program)
+        .and_then(|c| c.ensure_dirs().map(|()| c))
+    {
         Ok(decision) => decision,
         Err(e) => {
             return Err(SeatFailure::new(
                 SeatFailureKind::SpawnFailed,
                 format!(
-                    "seat `{}`: worker config dir unresolvable ({e}); refusing to run the ballot \
+                    "seat `{}`: worker config root unresolvable ({e}); refusing to run the ballot \
                      under the daemon's own CLI configuration",
                     cli.key
                 ),
@@ -789,16 +793,8 @@ fn run_in_isolation(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear to a
-    // known slate, then set exactly what this path intends.
-    match &claude_config {
-        wicked_apps_core::spawn::CarrierClaudeConfig::Dir(dir) => {
-            command.env(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, dir);
-        }
-        wicked_apps_core::spawn::CarrierClaudeConfig::NotClaude => {
-            command.env_remove(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV);
-        }
-        wicked_apps_core::spawn::CarrierClaudeConfig::Inherit => {}
-    }
+    // known slate, then set exactly what this path intends (and strip the foreign seats').
+    seat_config.apply(&mut command);
 
     // Give the seat its own process group so the timeout path can signal the whole tree. Without
     // this, killing a CLI that shelled out leaves the grandchild alive and holding our pipes.
@@ -1518,6 +1514,89 @@ mod failure_diagnostics_tests {
              worker home's"
         );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A fake CLI named `name` in `bin` that records the value of `var` it received into `ledger`
+    /// (or `UNSET`) and then answers like a seat — the multi-variable sibling of
+    /// [`fake_recording_cli`] for the core#410 per-seat roots.
+    #[cfg(unix)]
+    fn fake_var_recording_cli(
+        bin: &std::path::Path,
+        name: &str,
+        ledger: &std::path::Path,
+        var: &str,
+    ) {
+        let script = bin.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{{var}:-UNSET}}\" > \"{}\"\n\
+                 echo 'RECOMMENDATION: 1 fine'\nexit 0\n",
+                ledger.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// core#410 (F-010 / F-068), end to end through the real dispatcher and the REAL registry
+    /// `pi` and `codex` seats: each ballot runs on ITS OWN root under the worker home — the CLI's
+    /// own configuration-home variable, never the daemon's decoy and never the operator's default
+    /// (`~/.pi/agent`, `~/.codex`, where the retired skill set lived). Deleting
+    /// `seat_config.apply(&mut command)` in `run_in_isolation` fails the "own root" assertion;
+    /// dropping a CLI from the resolver fails it for that seat.
+    #[test]
+    #[cfg(unix)]
+    fn a_pi_and_a_codex_ballot_each_run_on_their_own_seat_root_never_the_operators() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        for (key, var) in [
+            ("pi", wicked_apps_core::spawn::PI_AGENT_DIR_ENV),
+            ("codex", wicked_apps_core::spawn::CODEX_HOME_ENV),
+        ] {
+            let scratch = f030_scratch(&format!("root-{key}"));
+            let bin = scratch.join("bin");
+            let worker_home = scratch.join("worker");
+            let decoy = scratch.join("daemon-decoy");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&decoy).unwrap();
+            let ledger = scratch.join("seen-root.txt");
+            fake_var_recording_cli(&bin, key, &ledger, var);
+            let _path = path_with(&bin);
+            let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+            // The daemon carries the seat's OWN variable as a decoy too — it must be overridden.
+            let _decoy = EnvPin::set(var, &decoy);
+
+            let seat = registry_seat(key);
+            let outcome = quick_dispatcher().dispatch_prompt(&seat, &task(), "ballot");
+            assert!(
+                matches!(outcome, DispatchOutcome::Voted(_)),
+                "{key}: the fake seat answers, so the ballot must complete: {outcome:?}"
+            );
+            let seen = std::fs::read_to_string(&ledger)
+                .unwrap_or_else(|e| panic!("{key}: the fake ran and recorded {var}: {e}"))
+                .trim()
+                .to_string();
+            assert_ne!(seen, "UNSET", "{key}: the ballot must SET {var}");
+            assert_ne!(
+                std::path::PathBuf::from(&seen),
+                decoy,
+                "{key}: the ballot inherited the DAEMON's {var}"
+            );
+            assert_eq!(
+                std::path::PathBuf::from(&seen),
+                worker_home.join(key),
+                "{key}: the ballot runs on its own root under the worker home"
+            );
+            assert!(
+                worker_home.join(key).is_dir(),
+                "{key}: the root is created before the seat runs"
+            );
+            let _ = std::fs::remove_dir_all(&scratch);
+        }
     }
 
     /// codex, PR#413: a RELATIVE `WICKED_WORKER_HOME` is refused BEFORE any spawn — the seat is

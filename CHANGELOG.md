@@ -14,6 +14,58 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Fixed
+- **Per-seat configuration roots for EVERY CLI; a seat's startup banner never reaches the answer
+  (acceptance findings F-010 / F-068, core#410).** FINDING-061 / F-030 isolated the CLAUDE seat
+  (`CLAUDE_CONFIG_DIR` → the engine-owned worker home); every other seat kept running on the
+  OPERATOR's own configuration — `~/.codex`, `~/.pi/agent`, `~/.copilot`, `~/.config/opencode` +
+  `~/.local/share/opencode` — so a chat seat loaded the operator's personal skills and extensions
+  (a retired skill set) and pi streamed its 4.8 KB startup banner listing them as the answer's
+  opening, and a fresh `WICKED_WORKER_HOME` reported claude signed-out but the others signed-in off
+  the operator's logins. One resolver now decides every seat spawn — ACP worker AND chat, council
+  ballot, wrapped worker (`wicked_apps_core::spawn::seat_config_for` / `SeatCli`): claude keeps
+  `<worker home>/claude`; codex gets `CODEX_HOME=<worker home>/codex`; pi
+  `PI_CODING_AGENT_DIR=<worker home>/pi`; copilot `COPILOT_HOME=<worker home>/copilot`; opencode
+  `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME` under `<worker home>/opencode/{config,data,
+  state}` (its own `OPENCODE_CONFIG_DIR` only ADDS a directory — the global one is still read — so
+  the XDG bases move; documented side effect: git/gh inside an opencode seat resolve their XDG
+  config there too). Every FOREIGN seat variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+  `PI_CODING_AGENT_DIR`, `COPILOT_HOME`, `OPENCODE_CONFIG_DIR`) is STRIPPED; roots are created
+  private (0700) and no-follow checked; the `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` hatch inherits
+  everything, as before. opencode's extra config file (`OPENCODE_CONFIG`), inline document
+  (`OPENCODE_CONFIG_CONTENT`) and inline credentials (`OPENCODE_AUTH_CONTENT`) are stripped too
+  (the skills composition still bases itself on the daemon's ambient document for governed opencode
+  units with delivery — unchanged here); agy, which has no config-home variable, runs quiet
+  (`AGY_CLI_HIDE_LOGO=1`, `AGY_CLI_HIDE_ACCOUNT_INFO=1`). **Behaviour change:** codex / pi /
+  copilot / opencode seats now start signed OUT until the operator signs in the seat root once —
+  every seat's `login_invocation` names
+  it (`CODEX_HOME="<root>" codex login --device-auth`, …), so the studio's Sign-in terminal signs in
+  the directory the seats read; copilot's OAuth token stays in the per-user keychain (config
+  isolated, keychain not). agy has no known configuration-home variable and is isolated by stripping
+  alone. A stream-aware `BannerGate` on chat turns holds only a pi-banner-shaped head and releases
+  everything else at once, so the banner never enters `ChatDelta` (the assembled reply was already
+  stripped at its seam).
+- **Chats run in a recorded SCOPE, never the daemon's cwd (F-067, core#410 / crew#502).**
+  `chat_open` used to fall back to `std::env::current_dir()` — the DAEMON's working directory — and
+  advertised no estate MCP ("repo-less exploration"). It now takes a `ChatScope { cwd,
+  code_graph_db, read_roots }` recorded per chat: the seats run in the scope's cwd (omitted ⇒ a
+  private `<tmp>/wicked-core-chat-<id>` of the chat's own), their `session/new` advertises the
+  READ-ONLY estate MCP over the scope's graph (DES-GROUNDING-001 — the grounding governed workers
+  get) and the scoped repository roots as a claude seat's `additionalDirectories`; a seat re-warmed
+  after an eviction lands in the same scope; `chat_list` reports it. **Behaviour change:** a
+  SCOPED chat admits only seats that can be held to its read-only roots — an adapter admitted to
+  input governance (claude, opencode) or a seat whose `[cli.acp]` record arms `os_sandbox`;
+  pi / codex / copilot / agy (as registered: no permission requests, no floor) are refused for
+  scoped chats by name with the remedy, and admitted to unscoped chats. The read roots are read-only
+  IN FACT, for every seat: a claude seat's session fence denies `Edit`/`Write`/`NotebookEdit` under
+  them, and every seat's `session/request_permission` is judged against the chat's boundary (the
+  scratch root writable, the roots readable, nothing path-bearing beyond either) — a chat turn used
+  to answer every permission request `allow`. The scope is validated before it is recorded:
+  absolute roots outside the engine's own trees (`validate_extra_read_roots`), an existing graph
+  that is never a top-level file of the engine's own state home. core-ts: `chatOpen(chatId,
+  clisJson, cwd?, scopeJson?)` (`{"codeGraphDb"?, "readRoots"?}`), `chatSend`'s `cwd` accepted and
+  ignored, `chatList` rows gain `cwd` / `codeGraphDb` / `readRoots`.
+
 ### Added
 - **Dead letters carry when and who; the emit seam gets a read side and a drain (wicked-crew#495,
   acceptance finding F-022).** Every record the emit seam spools to the dead-letter outbox

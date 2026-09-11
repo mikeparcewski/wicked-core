@@ -171,6 +171,47 @@ pub(crate) fn permission_result(gate: &AcpGate<'_>, params: &Value) -> (Value, b
     }
 }
 
+/// The answer for a CHAT turn (core#410, review): a chat is not a run — no scope, no phase, no
+/// policy store, no decisions log — but it HAS a filesystem boundary: its scratch root is writable,
+/// the scoped repository roots are READ-ONLY, and nothing path-bearing outside either is reachable.
+/// Judged through the same pure check the governed carriers share
+/// (`gate_hook::boundary_denial_with`), so "outside the boundary" means one thing everywhere; a
+/// denied call is answered with the agent's own reject option. Fail-closed on an unreadable request
+/// or an agent that offers no way to say no, exactly like the governed answer — a read-only
+/// contract that only claude's `disallowedTools` honoured was a promise the other seats broke.
+pub(crate) fn chat_boundary_result(
+    boundary: &crate::gate_hook::BoundaryCtx,
+    params: &Value,
+) -> (Value, bool) {
+    let Some((tool, payload)) = pretool_payload(params) else {
+        return (cancelled("unparseable permission request"), false);
+    };
+    let (context, tool_name) =
+        crate::gate_hook::claude_pretool_context(&payload.to_string(), "chat", "chat");
+    let allowed = crate::gate_hook::boundary_denial_with(
+        &boundary.roots,
+        &boundary.cwd,
+        boundary.home.as_deref(),
+        boundary.claude_config_dir.as_deref(),
+        &context,
+        &tool_name,
+    )
+    .is_none();
+    match choose_option(params.get("options").unwrap_or(&Value::Null), allowed) {
+        Some(option_id) => (
+            json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+            allowed,
+        ),
+        None => (
+            cancelled(&format!(
+                "no {} option offered for `{tool}`",
+                if allowed { "allow" } else { "reject" }
+            )),
+            false,
+        ),
+    }
+}
+
 /// The answer for an UNGOVERNED turn: permitted.
 ///
 /// Ungoverned units have always been allowed to call tools on this path — there was no gate. What

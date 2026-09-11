@@ -824,22 +824,47 @@ impl Core {
         })
     }
 
-    /// Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13). Resolves to a
-    /// JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
-    /// also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
+    /// Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13) in a SCOPE
+    /// (wicked-core#410 / wicked-crew#502). `cwd` is the seats' working directory — the chat's
+    /// scratch root; omitted, a private `<tmp>/wicked-core-chat-<id>` of the chat's own, NEVER this
+    /// process's cwd. `scopeJson` is `{"codeGraphDb"?: string|null, "readRoots"?: string[]}`: the
+    /// estate graph the seats' READ-ONLY estate MCP is bound to (omitted/null ⇒ no estate MCP) and
+    /// the repository roots in scope (advertised to a claude seat as `additionalDirectories`,
+    /// recorded for every seat). Resolves to a JSON array of per-seat outcomes
+    /// `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed` also stream to
+    /// subscribers. Blocking handshakes run on the task pool, not the JS thread.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_open(
         &self,
         chat_id: String,
         clis_json: String,
         cwd: Option<String>,
+        scope_json: Option<String>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
             let clis: Vec<String> = serde_json::from_str(&clis_json).map_err(err)?;
-            let outcomes = core
-                .chat_open(&chat_id, &clis, cwd.map(std::path::PathBuf::from))
-                .map_err(err)?;
+            #[derive(serde::Deserialize, Default)]
+            #[serde(rename_all = "camelCase")]
+            struct ScopeJson {
+                #[serde(default)]
+                code_graph_db: Option<String>,
+                #[serde(default)]
+                read_roots: Vec<String>,
+            }
+            let parsed: ScopeJson = match scope_json.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => serde_json::from_str(s).map_err(err)?,
+                _ => ScopeJson::default(),
+            };
+            let scope = wicked_core::ChatScope {
+                cwd: cwd
+                    .filter(|c| !c.trim().is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| wicked_core::ChatScope::scratch_for(&chat_id)),
+                code_graph_db: parsed.code_graph_db.filter(|db| !db.trim().is_empty()),
+                read_roots: parsed.read_roots,
+            };
+            let outcomes = core.chat_open(&chat_id, &clis, scope).map_err(err)?;
             let arr: Vec<serde_json::Value> = outcomes
                 .into_iter()
                 .map(|(cli, r)| match r {
@@ -853,6 +878,8 @@ impl Core {
 
     /// Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
     /// resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
+    /// `cwd` is accepted for wire compatibility and IGNORED (wicked-core#410): every turn runs in
+    /// the scope recorded at `chatOpen` — a per-message working directory was the F-067 leak.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_send(
         &self,
@@ -862,14 +889,13 @@ impl Core {
         cwd: Option<String>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
+        let _ = cwd;
         task(move || {
             let targets: Option<Vec<String>> = match targets_json {
                 Some(t) => Some(serde_json::from_str(&t).map_err(err)?),
                 None => None,
             };
-            let seats = core
-                .chat_send(&chat_id, &text, targets, cwd.map(std::path::PathBuf::from))
-                .map_err(err)?;
+            let seats = core.chat_send(&chat_id, &text, targets).map_err(err)?;
             serde_json::to_string(&seats).map_err(err)
         })
     }
@@ -885,7 +911,11 @@ impl Core {
     }
 
     /// Every chat currently holding pool state — JSON array of
-    /// `[{chatId, seats, idleSecs}]`, sorted by id.
+    /// `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots}]`, sorted by id. `cwd` /
+    /// `codeGraphDb` / `readRoots` are the scope recorded at `chatOpen` (wicked-core#410): where the
+    /// seats run, the estate graph their read-only estate MCP is bound to (`null` ⇒ none), and the
+    /// repository roots in scope (`[]` when none); `cwd` is `null` only for a pool entry whose scope
+    /// is gone (a chat mid-close).
     ///
     /// Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
     /// chat ids freely, so without this an accumulation is invisible until the host runs out of
@@ -904,10 +934,16 @@ impl Core {
             let arr: Vec<serde_json::Value> = chats
                 .into_iter()
                 .map(|c| {
+                    // The recorded scope (wicked-core#410) rides the enumerate surface so an
+                    // operator can see WHERE a chat's seats run and what they are grounded on.
+                    let scope = c.scope.as_ref();
                     serde_json::json!({
                         "chatId": c.chat_id,
                         "seats": c.seats,
                         "idleSecs": (c.idle_secs != u64::MAX).then_some(c.idle_secs),
+                        "cwd": scope.map(|s| s.cwd.to_string_lossy().into_owned()),
+                        "codeGraphDb": scope.and_then(|s| s.code_graph_db.clone()),
+                        "readRoots": scope.map(|s| s.read_roots.clone()).unwrap_or_default(),
                     })
                 })
                 .collect();

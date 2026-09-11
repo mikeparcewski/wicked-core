@@ -1465,24 +1465,23 @@ impl WrappedCliStepRunner {
             // exceptions.
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
-            // The seat-aware CLAUDE_CONFIG_DIR decision on the WRAPPED carrier too (codex r2,
-            // PR#413): `hardened()` strips only the engine's own variables, so a wrapped worker
-            // inherited whatever the daemon carried — a non-claude seat an ambient claude config
-            // path it never reads, a claude seat the OPERATOR's login (worked by accident on a
-            // laptop, failed 100% wherever the daemon had a `CLAUDE_CONFIG_DIR`). Judged on the
-            // template's binary through the SAME resolver as the ACP spawn and the ballot: a
-            // claude carrier gets the validated worker home (the login the operator signed in
-            // once), a non-claude carrier gets the variable STRIPPED, the inherit hatch keeps the
-            // operator's own. Fail CLOSED on a resolver error — the launch is refused, never run
-            // under the daemon's configuration.
-            match wicked_apps_core::spawn::claude_config_for_carrier(&binary) {
-                Ok(wicked_apps_core::spawn::CarrierClaudeConfig::Dir(dir)) => {
-                    cmd.env(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, dir);
-                }
-                Ok(wicked_apps_core::spawn::CarrierClaudeConfig::NotClaude) => {
-                    cmd.env_remove(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV);
-                }
-                Ok(wicked_apps_core::spawn::CarrierClaudeConfig::Inherit) => {}
+            // The seat-aware configuration decision on the WRAPPED carrier too (codex r2,
+            // PR#413; core#410): `hardened()` strips only the engine's own variables, so a
+            // wrapped worker inherited whatever the daemon carried — a non-claude seat an ambient
+            // claude config path it never reads, a claude seat the OPERATOR's login (worked by
+            // accident on a laptop, failed 100% wherever the daemon had a `CLAUDE_CONFIG_DIR`),
+            // and every codex / pi / copilot / opencode seat the operator's OWN `~/.codex`,
+            // `~/.pi/agent`, `~/.copilot`, `~/.config/opencode` — skills, extensions and
+            // credentials included. Judged on the template's binary through the SAME resolver as
+            // the ACP spawn and the ballot: a claude carrier gets the validated worker home (the
+            // login the operator signed in once), every other known CLI its own root under that
+            // home through its own configuration-home variable, every foreign seat variable
+            // STRIPPED, the inherit hatch keeps the operator's own. Fail CLOSED on a resolver
+            // error — the launch is refused, never run under the daemon's configuration.
+            match wicked_apps_core::spawn::seat_config_for_carrier(&binary)
+                .and_then(|c| c.ensure_dirs().map(|()| c))
+            {
+                Ok(seat_config) => seat_config.apply(&mut cmd),
                 Err(e) => {
                     return StepOutput {
                         run_id: input.run_id.clone(),
@@ -4887,6 +4886,78 @@ mod tests {
             worker_home.join("claude"),
             "the wrapped claude worker runs on the worker home — the same dir the ACP spawn and the \
              ballot use"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#410 (F-010): a CODEX wrapped worker runs on ITS OWN root under the worker home
+    /// (`CODEX_HOME=<worker home>/codex`) — the same base the ACP spawn and the ballot use — and
+    /// carries NO claude configuration path, however the daemon was started (decoys for both). A
+    /// codex-stemmed fake echoes what it saw; the wrapped runner captures its stdout.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_wrapped_worker_runs_on_its_own_seat_root_with_no_foreign_seat_variable() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("wicked-codex-cfg-seat-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let worker_home = dir.join("worker");
+        let decoy = dir.join("daemon-decoy");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&decoy).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(
+            &codex,
+            "#!/bin/sh\necho \"SEEN_CODEX=[${CODEX_HOME:-UNSET}] SEEN_CLAUDE=[${CLAUDE_CONFIG_DIR:-UNSET}] \
+             SEEN_PI=[${PI_CODING_AGENT_DIR:-UNSET}]\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+        let _decoy_claude = VarGuard::set(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, &decoy);
+        let _decoy_codex = VarGuard::set(wicked_apps_core::spawn::CODEX_HOME_ENV, &decoy);
+        let _decoy_pi = VarGuard::set(wicked_apps_core::spawn::PI_AGENT_DIR_ENV, &decoy);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("probe".to_string());
+        u.assigned_invocation = Some(format!("{} {{PROMPT}}", codex.display()));
+        let input = StepInput {
+            run_id: "run-codex-seat-root".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        let expected = format!("SEEN_CODEX=[{}]", worker_home.join("codex").display());
+        assert!(
+            out.output.contains(&expected),
+            "the codex worker runs on its own seat root, not the daemon's decoy or ~/.codex; got: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("SEEN_CLAUDE=[UNSET]") && out.output.contains("SEEN_PI=[UNSET]"),
+            "no foreign seat variable reaches a codex worker; got: {}",
+            out.output
+        );
+        assert!(
+            worker_home.join("codex").is_dir(),
+            "the seat root is created before the worker runs"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

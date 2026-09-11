@@ -77,6 +77,7 @@ pub(crate) mod test_env {
 }
 
 pub use acp_runner::AcpStepRunner;
+pub use acp_runner::{ChatInfo, ChatOpenOutcomes, ChatScope};
 pub use actor::{RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
@@ -343,29 +344,33 @@ impl Core {
         })
     }
 
-    /// Eagerly warm one ACP session per seat for `chat_id`. Blocking (spawn + handshake per
-    /// seat) — call off any latency-sensitive thread. Per-seat outcomes returned; the same
-    /// outcomes stream to subscribers as `ChatSessionReady`/`ChatSessionFailed`.
+    /// Eagerly warm one ACP session per seat for `chat_id`, in `scope` (core#410 / crew#502):
+    /// the seats run in `scope.cwd` — the chat's own scratch root, never this process's working
+    /// directory (F-067) — grounded on `scope.code_graph_db` through the READ-ONLY estate MCP,
+    /// with `scope.read_roots` advertised. Blocking (spawn + handshake per seat) — call off any
+    /// latency-sensitive thread. Per-seat outcomes returned; the same outcomes stream to
+    /// subscribers as `ChatSessionReady`/`ChatSessionFailed`.
     pub fn chat_open(
         &self,
         chat_id: &str,
         clis: &[String],
-        cwd: Option<std::path::PathBuf>,
-    ) -> anyhow::Result<Vec<(String, Result<(), String>)>> {
+        scope: ChatScope,
+    ) -> anyhow::Result<ChatOpenOutcomes> {
         let runner = self.chat_runner()?;
-        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        Ok(runner.chat_open(chat_id, clis, &cwd))
+        runner
+            .chat_open(chat_id, clis, scope)
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Fan `text` out to the chat's warm seats (all, or the named subset) — one thread per
     /// seat so replies stream in parallel as `ChatDelta`/`ChatReply` events. Ack-fast:
-    /// returns the seats targeted, not their replies.
+    /// returns the seats targeted, not their replies. Every turn runs in the scope recorded at
+    /// [`Core::chat_open`]; there is no per-message working directory.
     pub fn chat_send(
         &self,
         chat_id: &str,
         text: &str,
         targets: Option<Vec<String>>,
-        cwd: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Vec<String>> {
         let runner = self.chat_runner()?;
         let seats = match targets {
@@ -375,18 +380,12 @@ impl Core {
         if seats.is_empty() {
             anyhow::bail!("chat '{chat_id}' has no warm seats — open it first");
         }
-        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         for cli in &seats {
             let runner = runner.clone();
             let tx = self.tx.clone();
-            let (chat_id, cli, text, cwd) = (
-                chat_id.to_string(),
-                cli.clone(),
-                text.to_string(),
-                cwd.clone(),
-            );
+            let (chat_id, cli, text) = (chat_id.to_string(), cli.clone(), text.to_string());
             std::thread::spawn(move || {
-                let outcome = runner.chat_turn(&chat_id, &cli, &text, &cwd);
+                let outcome = runner.chat_turn(&chat_id, &cli, &text);
                 let (ok, body) = match outcome {
                     Ok(reply) => (true, reply),
                     Err(e) => (false, e),

@@ -874,6 +874,11 @@ struct AcpProcess {
     /// (it could background a writer past the guard's final snapshot), and a no-code phase's
     /// process is killed, group and all, the moment its unit ends.
     no_code: bool,
+    /// A CHAT session's filesystem boundary (core#410, review): the scratch root writable, the
+    /// scoped repository roots read-only. Judged on every `session/request_permission` of a turn
+    /// that carries no governance gate (`acp_permission::chat_boundary_result`); `None` for unit
+    /// sessions, whose boundary rides their `AcpGate`.
+    chat_boundary: Option<crate::gate_hook::BoundaryCtx>,
 }
 
 impl Drop for AcpProcess {
@@ -1191,6 +1196,12 @@ pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = wicked_apps_core::spawn::CLAUDE_C
 /// branches are testable without mutating the test process's environment. The home is
 /// launch-independent (v3.1 §3): the settings a particular launch needs — its fence, its
 /// snapshot — ride that session's own configuration ([`SessionOptions`]), never this shared dir.
+///
+/// TEST-ONLY since core#410: the spawn resolves EVERY seat through
+/// `wicked_apps_core::spawn::seat_config_for` (whose claude arm is this same hatch + dir) and
+/// ensures the claude home right there; this stays as the claude-only view the agreement tests
+/// compare against the ballot's and the roster's spellings.
+#[cfg(test)]
 fn worker_claude_config_dir(
     inherit_operator: bool,
     operational_home: Option<&std::path::Path>,
@@ -1662,6 +1673,11 @@ fn resolved_binary_version_matches(binary: &str, expected: &str) -> bool {
     }
 }
 
+/// The shape the spawn tests drive (TEST-ONLY since core#410: the unit path and the chat path
+/// both call [`start_acp_process_with_write_roots`] directly — the unit with its governance
+/// facts, the chat with its recorded scope). `unix` like its only callers, the shell-script
+/// stub wrappers — on Windows it would be dead code under `-D warnings`.
+#[cfg(all(test, unix))]
 fn start_acp_process(
     config: &AcpConfig,
     cwd: &std::path::Path,
@@ -1669,17 +1685,19 @@ fn start_acp_process(
     // `Some` ⇒ point the worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at this dir
     // (core#264) so scratch lands inside the unit boundary instead of tripping (advisory)
     // denies in the system temp. UNIT sessions pass `<cwd>/tmp`; CHAT sessions pass `None` —
-    // dropping a `tmp/` dir into a user's own working directory would be intrusive.
+    // dropping a `tmp/` dir into a chat's scratch root is pointless (the root IS scratch).
     scratch_tmp: Option<&std::path::Path>,
-    // Whether the seat this bridge carries IS claude (`acp_seat_identity`): only a claude carrier
-    // gets the engine-owned claude config dir; every other bridge gets the variable STRIPPED.
-    seat_is_claude: bool,
+    // The CLI the seat this bridge carries runs (`seat_cli_of`, core#410): decides the per-seat
+    // configuration root — claude's engine-owned worker home, codex/pi/copilot/opencode's own roots
+    // under the same base — and which foreign seat variables are STRIPPED.
+    seat_cli: wicked_apps_core::spawn::SeatCli,
     // The engine's own operational state home (codex round 8), fenced on chat sessions too.
     operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
-    // No skills delivery and no per-session settings dir: CHAT sessions (and the tests that use
-    // this shape) are not run units — the skills handoff belongs to the unit path, which calls
-    // the chokepoint directly. The fence still rides the frame (`SessionOptions::deny`).
+    // No skills delivery and no per-session settings dir: the tests that use this shape are not
+    // run units — the skills handoff belongs to the unit path, which calls the chokepoint
+    // directly (as does the chat path, which adds its scope). The fence still rides the frame
+    // (`SessionOptions::deny`).
     start_acp_process_with_write_roots(
         config,
         cwd,
@@ -1687,8 +1705,9 @@ fn start_acp_process(
         scratch_tmp,
         &[],
         &[],
+        &[],
         &crate::skills_snapshot::SkillsDelivery::None,
-        seat_is_claude,
+        seat_cli,
         None,
         operational_home,
     )
@@ -1726,6 +1745,12 @@ pub(crate) struct SessionOptions<'a> {
     pub skills_plugin: Option<&'a std::path::Path>,
     pub deny: &'a [String],
     pub settings: Option<&'a std::path::Path>,
+    /// `additionalDirectories` — the SDK's "directories Claude may also access": a CHAT's scoped
+    /// repository roots (core#410 / crew#502), so a seat whose cwd is the chat's scratch root can
+    /// read the repos it was pointed at without a permission round-trip per file. Appended to an
+    /// existing list (never replacing one). Empty for unit sessions — a unit's read roots are the
+    /// in-process boundary's business (`assemble_read_roots`), not the SDK's.
+    pub additional_directories: &'a [String],
     /// `settingSources` — the ACP analog of the wrapped path's `--setting-sources project,local`
     /// (codex round 8): the engine OWNS the scope selection, so this is SET (not merged — a list
     /// that kept an existing `user` would defeat the isolation) when present; `None` under the
@@ -1742,6 +1767,7 @@ impl SessionOptions<'_> {
         skills_plugin: None,
         deny: &[],
         settings: None,
+        additional_directories: &[],
         setting_sources: None,
     };
 }
@@ -1791,6 +1817,26 @@ fn attach_session_options(params: &mut Value, options: &SessionOptions<'_>) {
     }
     if let Some(path) = options.settings {
         claude_code_options(params)["settings"] = json!(path.to_string_lossy().as_ref());
+    }
+    if !options.additional_directories.is_empty() {
+        let node = claude_code_options(params);
+        let ours = options
+            .additional_directories
+            .iter()
+            .map(|d| Value::String(d.clone()));
+        match node
+            .get_mut("additionalDirectories")
+            .and_then(Value::as_array_mut)
+        {
+            Some(list) => {
+                for dir in ours {
+                    if !list.contains(&dir) {
+                        list.push(dir);
+                    }
+                }
+            }
+            None => node["additionalDirectories"] = Value::Array(ours.collect()),
+        }
     }
     if let Some(sources) = options.setting_sources {
         claude_code_options(params)["settingSources"] = json!(sources);
@@ -1873,6 +1919,10 @@ fn start_acp_process_with_write_roots(
     code_graph_db: Option<&str>,
     scratch_tmp: Option<&std::path::Path>,
     extra_write_roots: &[String],
+    // core#410 / crew#502: a CHAT's scoped repository roots, advertised to a claude seat as the
+    // SDK's `additionalDirectories` (`SessionOptions`). Empty for unit sessions, whose read roots
+    // are the in-process boundary's (`assemble_read_roots`), never the SDK's.
+    additional_read_roots: &[String],
     // Ordered `(name, value)` provenance for the estate MCP the worker's `session/new` advertises
     // (`execute_wrapped::estate_provenance_env`) — stamped onto its `proposal.submit`s. Empty for a
     // repo-less session (no estate server is advertised at all) or an ungoverned/chat caller.
@@ -1884,13 +1934,14 @@ fn start_acp_process_with_write_roots(
     // `--add-dir …` appended to the bridge argv when the bridge IS pi / copilot; opencode's
     // `skills.paths` composed into `OPENCODE_CONFIG_CONTENT`; or nothing.
     delivery: &crate::skills_snapshot::SkillsDelivery,
-    // Whether the seat this bridge carries IS claude, as `acp_seat_identity` judges it (the merged
-    // registry record's `binary`). Decides the CLAUDE_CONFIG_DIR handling below: a claude carrier
-    // gets the engine-owned worker home (or inherits under the hatch); a codex/pi/copilot/opencode
-    // bridge never reads the variable and gets it STRIPPED — no ambient claude configuration path
-    // in a foreign process, and no ensuring (creating, re-sanitizing) claude's home on its account
-    // (codex review, PR#413).
-    seat_is_claude: bool,
+    // The CLI the seat this bridge carries runs, as `seat_cli_of` judges it (the merged registry
+    // record's `binary` — never the bridge). Decides the per-seat configuration below (core#410):
+    // a claude carrier gets the engine-owned worker home (created and re-sanitized here, or
+    // inherited under the hatch); codex / pi / copilot / opencode get their OWN roots under the
+    // same base through the CLI's own configuration-home variable; every foreign seat variable is
+    // STRIPPED — no ambient configuration path of another CLI, and no ensuring (creating,
+    // re-sanitizing) claude's home on a foreign seat's account (codex review, PR#413).
+    seat_cli: wicked_apps_core::spawn::SeatCli,
     // `Some((run_id, cli_key))` for a UNIT session: names its per-session settings directory
     // (v3.1 §3). `None` for chat sessions.
     session: Option<(&str, &str)>,
@@ -1903,23 +1954,43 @@ fn start_acp_process_with_write_roots(
     // that proceeded without the override would run under the operator's own configuration,
     // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
     // carries its own isolation.
-    let worker_config_dir = if !seat_is_claude {
-        // Carrier-aware: a non-claude bridge gets no claude config dir (stripped below).
-        None
-    } else {
-        match worker_claude_config_dir(
-            crate::execute_wrapped::inherits_operator_config(),
-            operational_home,
-        ) {
-            None => None,
-            Some(Ok(dir)) => Some(dir),
-            Some(Err(e)) => {
-                return Err(anyhow::anyhow!(
+    // core#410: EVERY seat's configuration decision from the ONE resolver
+    // (`wicked_apps_core::spawn::seat_config_for`) — claude keeps the FINDING-061 worker home
+    // (created, made private and RE-SANITIZED right here, as before); codex / pi / copilot /
+    // opencode get their own roots under the same base (created private); every foreign seat
+    // variable is stripped. Fail CLOSED on a resolver error, for every CLI.
+    let seat_config = wicked_apps_core::spawn::seat_config_for(seat_cli).map_err(|e| {
+        anyhow::anyhow!(
+            "ACP worker config isolation failed ({e}); refusing to start an ACP worker under the \
+             operator's own CLI configuration (FINDING-061 / core#410)"
+        )
+    })?;
+    let worker_config_dir: Option<std::path::PathBuf> = match (&seat_config, seat_cli) {
+        (
+            wicked_apps_core::spawn::SeatConfig::Isolated { .. },
+            wicked_apps_core::spawn::SeatCli::Claude,
+        ) => {
+            let dir = ensure_worker_config_home(operational_home).map_err(|e| {
+                anyhow::anyhow!(
                     "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
                      under the operator's own CLI configuration (FINDING-061)"
-                ))
-            }
+                )
+            })?;
+            // One resolver: the ensured dir IS the dir the decision sets.
+            debug_assert_eq!(Some(dir.as_path()), seat_config.claude_dir());
+            Some(dir)
         }
+        (wicked_apps_core::spawn::SeatConfig::Isolated { .. }, _) => {
+            seat_config.ensure_dirs().map_err(|e| {
+                anyhow::anyhow!(
+                    "ACP seat config root could not be prepared ({e}); refusing to start '{}' \
+                     under the operator's own CLI configuration (core#410)",
+                    config.binary
+                )
+            })?;
+            None
+        }
+        (wicked_apps_core::spawn::SeatConfig::Inherit, _) => None,
     };
     let skills_plugin: Option<&std::path::Path> = match delivery {
         SkillsDelivery::ClaudePlugin(root) => Some(root.as_path()),
@@ -1938,8 +2009,23 @@ fn start_acp_process_with_write_roots(
     let inherit = crate::execute_wrapped::inherits_operator_config();
     // (codex round 9) a fenced directory the rule syntax cannot spell refuses the spawn — the
     // frame is never sent with a hole in its fence.
-    let deny: Vec<String> = crate::execute_wrapped::deny_rules(skills_plugin, operational_home)
+    let mut deny: Vec<String> = crate::execute_wrapped::deny_rules(skills_plugin, operational_home)
         .map_err(anyhow::Error::msg)?;
+    // A CHAT's scoped repository roots are READ-ONLY (core#410, review): the claude seat's own
+    // fence says so — `Edit`/`Write`/`NotebookEdit` under each root are denied in the session's
+    // `disallowedTools` (the SDK honours them without a permission round-trip; the boundary on
+    // `session/request_permission` covers every other seat and every other tool). A root the rule
+    // syntax cannot spell refuses the spawn, like every other fenced directory.
+    for root in additional_read_roots {
+        let p = crate::execute_wrapped::rule_path(std::path::Path::new(root)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing to advertise read root {root}: it cannot be spelled as a permission rule"
+            )
+        })?;
+        for tool in ["Edit", "Write", "NotebookEdit"] {
+            deny.push(format!("{tool}({p}/**)"));
+        }
+    }
     let session_settings: Option<std::path::PathBuf> = match (session, &worker_config_dir) {
         (Some((run_id, cli_key)), Some(home)) => {
             Some(write_session_settings(home, run_id, cli_key, &deny)?)
@@ -1950,6 +2036,7 @@ fn start_acp_process_with_write_roots(
         skills_plugin,
         deny: &deny,
         settings: session_settings.as_deref(),
+        additional_directories: additional_read_roots,
         setting_sources: if inherit {
             None
         } else {
@@ -1982,8 +2069,15 @@ fn start_acp_process_with_write_roots(
         Some(expected) => resolved_binary_version_matches(&config.binary, expected),
     };
     // The graph's key dir is recognised against THIS daemon's repo-graph root — derived from the
-    // same state home the fence is built from (core#406).
-    let graph_write = crate::execute_wrapped::graph_write_dir(code_graph_db, operational_home);
+    // same state home the fence is built from (core#406) — and joins the WRITE roots for a UNIT
+    // session only (an indexing phase writes it); a CHAT (no unit session) is grounded on its graph
+    // READ-ONLY — the MCP runs `--readonly` and the boundary treats the graph as read-only — so its
+    // key dir never becomes a kernel-floor write root (Copilot, #426).
+    let graph_write = if session.is_some() {
+        crate::execute_wrapped::graph_write_dir(code_graph_db, operational_home)
+    } else {
+        None
+    };
     let worker_write_roots = crate::execute_wrapped::armed_write_root_paths(
         cwd,
         extra_write_roots,
@@ -2025,18 +2119,14 @@ fn start_acp_process_with_write_roots(
             cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, &worker_write_roots_env);
         }
         // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
-        // to a known slate, then set exactly what this path intends. This also overrides any
-        // CLAUDE_CONFIG_DIR the daemon itself inherited — the operator's live config dir is
-        // frequently exactly that variable.
-        if let Some(dir) = &worker_config_dir {
-            cmd.env(CLAUDE_CONFIG_DIR_ENV, dir);
-        } else if !seat_is_claude {
-            // No ambient claude configuration path for a non-claude carrier: the daemon's own
-            // CLAUDE_CONFIG_DIR would otherwise ride into a codex/pi/copilot/opencode bridge for
-            // nothing (PR#413). The claude-under-the-hatch case is the remaining `None`, which
-            // inherits on purpose.
-            cmd.env_remove(CLAUDE_CONFIG_DIR_ENV);
-        }
+        // to a known slate, then set exactly what this path intends. The seat's OWN
+        // configuration-home variable(s) point into its root under the worker home (this also
+        // overrides any CLAUDE_CONFIG_DIR / CODEX_HOME / … the daemon itself inherited — the
+        // operator's live config dir is frequently exactly that variable); every FOREIGN seat
+        // variable is stripped, so a codex/pi/copilot/opencode bridge never carries an ambient
+        // claude configuration path (PR#413) and a claude one never carries theirs (core#410).
+        // The inherit hatch sets and strips nothing, on purpose.
+        seat_config.apply(&mut cmd);
         // UNCONDITIONAL — never gated on whether THIS unit is governed (DES-INPUT-GOV-006 §3.3).
         // A session is spawned once and cached/reused across turns (`probe_cached_session`); a
         // process spawned before a later turn's governance decision would have no way to
@@ -2374,6 +2464,7 @@ fn start_acp_process_with_write_roots(
         // Bound by the unit runner right after the spawn (it holds the admitted snapshot; this
         // chokepoint only knows the delivery it put in the handshake).
         skills: None,
+        chat_boundary: None,
         session_dir: session_settings
             .as_deref()
             .and_then(std::path::Path::parent)
@@ -2875,6 +2966,99 @@ fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>
     Some((prop_name.clone(), prop_type.map(|s| s.to_string())))
 }
 
+/// A stream-aware banner gate over one turn's `agent_message_chunk` deltas (core#410, F-068):
+/// pi's RPC-mode startup banner arrives as the FIRST agent text of a seat's first turn — 4.8 KB
+/// listing every skill and extension the seat loaded — and used to stream straight into the
+/// chat transcript as the answer's opening (`ChatDelta`), where the UI turned its file names into
+/// artifact chips. `strip_pi_banner` cleans the ASSEMBLED output; this gate cleans the STREAM.
+///
+/// Loss-averse by construction: text is HELD only while it is still a plausible banner head
+/// (`pi v<digit>…` then `---`, up to the closing `---`), released the moment it diverges, and
+/// flushed at turn end either way; a complete banner is removed through `strip_pi_banner` (the
+/// one pattern), so the gate can never remove what the assembly seam would keep. Bounded: a
+/// banner-shaped head that never closes is released after [`BannerGate::HOLD_CAP`] bytes.
+#[derive(Debug, Default)]
+pub(crate) struct BannerGate {
+    held: String,
+    passthrough: bool,
+}
+
+impl BannerGate {
+    /// The most banner-shaped text held back before it is released as content.
+    const HOLD_CAP: usize = 64 * 1024;
+
+    /// Feed one delta; the text to deliver now, if any.
+    pub(crate) fn push(&mut self, delta: &str) -> Option<String> {
+        if self.passthrough {
+            return Some(delta.to_string());
+        }
+        // The bound is judged BEFORE retaining (Copilot, #426): one oversized banner-shaped chunk
+        // must not sit in `held` past the cap even for the length of this call. Past it, the head
+        // is content — release what is held plus this delta (a complete banner at the head is
+        // still stripped on the way out).
+        if self.held.len() + delta.len() > Self::HOLD_CAP {
+            self.passthrough = true;
+            let mut out = std::mem::take(&mut self.held);
+            out.push_str(delta);
+            return Some(strip_pi_banner(&out).to_string());
+        }
+        self.held.push_str(delta);
+        // Remove every COMPLETE banner at the head (observed twice in one capture, core#268).
+        let stripped = strip_pi_banner(&self.held);
+        if stripped.len() != self.held.len() {
+            self.held = stripped.to_string();
+        }
+        let head = self.held.trim_start_matches(['\n', '\r']);
+        if head.is_empty() {
+            // Nothing but stripped banners and line breaks so far — keep waiting for content.
+            return None;
+        }
+        if banner_head_could_follow(head) && self.held.len() <= Self::HOLD_CAP {
+            return None;
+        }
+        self.passthrough = true;
+        Some(std::mem::take(&mut self.held))
+    }
+
+    /// The turn ended: release whatever is held (a complete banner is stripped; an incomplete
+    /// banner-shaped head is content and is delivered — loss-averse).
+    pub(crate) fn finish(&mut self) -> Option<String> {
+        self.passthrough = true;
+        let rest = strip_pi_banner(&self.held).to_string();
+        self.held.clear();
+        (!rest.is_empty()).then_some(rest)
+    }
+}
+
+/// Could `head` (line-break-trimmed) still grow into a pi banner — `pi v<digit>…\n---\n…`? True
+/// for a strict prefix of that shape, false the moment a byte diverges from it.
+fn banner_head_could_follow(head: &str) -> bool {
+    const LEAD: &str = "pi v";
+    if head.len() < LEAD.len() {
+        return LEAD.starts_with(head);
+    }
+    let Some(after_lead) = head.strip_prefix(LEAD) else {
+        return false;
+    };
+    let Some(first) = after_lead.chars().next() else {
+        return true;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    // Past the version line, the next line must be a bare `---` (or a prefix of one so far).
+    match after_lead.find('\n') {
+        None => true,
+        Some(i) => {
+            let second = &after_lead[i + 1..];
+            match second.find('\n') {
+                None => "---".starts_with(second.trim_end_matches('\r')),
+                Some(_) => second.lines().next().unwrap_or("").trim_end() == "---",
+            }
+        }
+    }
+}
+
 /// Owned convenience over [`strip_pi_banner`]: returns the ORIGINAL `String` untouched when no
 /// banner was present (equal-length subslice ⇒ no copy), and clones only the stripped remainder
 /// otherwise. Exists so call sites stay ONE line — the exit-0 arm in `execute_wrapped` is under
@@ -3341,6 +3525,7 @@ prior output you are reviewing, testing, or revising."
                                                 &mut proc.stdin,
                                                 &write_lock,
                                                 gate,
+                                                proc.chat_boundary.as_ref(),
                                                 &v2,
                                                 &mut output,
                                                 MAX_OUT,
@@ -3462,6 +3647,7 @@ prior output you are reviewing, testing, or revising."
                                 &mut proc.stdin,
                                 &write_lock,
                                 gate,
+                                proc.chat_boundary.as_ref(),
                                 &v,
                                 &mut output,
                                 MAX_OUT,
@@ -3589,12 +3775,15 @@ prior output you are reviewing, testing, or revising."
 /// two cannot drift apart again.
 ///
 /// `gate` present ⇒ governed: the SAME policy and the SAME audit records as the wrapped path's
-/// PreToolUse hook. `gate` absent ⇒ permitted, as this path has always behaved — but said out loud
-/// rather than left to a capability we quietly withheld.
+/// PreToolUse hook. Otherwise a CHAT boundary, when the session carries one (core#410): the scratch
+/// root writable, the scoped roots read-only, nothing beyond — judged by the shared pure check.
+/// Neither ⇒ permitted, as this path has always behaved — but said out loud rather than left to a
+/// capability we quietly withheld.
 fn answer_permission_request<W: Write>(
     stdin: &mut W,
     write_lock: &Mutex<()>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
+    chat_boundary: Option<&crate::gate_hook::BoundaryCtx>,
     frame: &Value,
     output: &mut String,
     max_out: usize,
@@ -3606,9 +3795,10 @@ fn answer_permission_request<W: Write>(
         return; // a permission NOTIFICATION is not a thing; nothing to answer.
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
-    let result = match gate {
-        Some(g) => crate::acp_permission::permission_result(g, &params).0,
-        None => crate::acp_permission::allow_result(&params),
+    let result = match (gate, chat_boundary) {
+        (Some(g), _) => crate::acp_permission::permission_result(g, &params).0,
+        (None, Some(b)) => crate::acp_permission::chat_boundary_result(b, &params).0,
+        (None, None) => crate::acp_permission::allow_result(&params),
     };
     // NOT `let _ =`. A failed write leaves the agent blocked until the turn times out, and the
     // reason is the only thing that explains the stall — dropping it turns a broken pipe into
@@ -3965,6 +4155,13 @@ pub struct AcpStepRunner {
     /// the pool is keyed per seat and a chat with zero warm seats still needs a last-touch (it may
     /// be mid-`chat_open`, warming its first seat).
     chat_activity: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Each open chat's [`ChatScope`] (core#410 / crew#502) — the cwd, graph and read roots its
+    /// seats run against, recorded at `chat_open` so a seat re-warmed after an eviction lands in
+    /// the same scope — stamped with the OPEN GENERATION that recorded it, so an older open still
+    /// finishing cannot drop a newer open's record (Copilot, #426). Removed with the chat.
+    chat_scopes: Arc<Mutex<HashMap<String, RecordedScope>>>,
+    /// Monotonic open counter behind [`RecordedScope::gen`].
+    chat_open_seq: Arc<std::sync::atomic::AtomicU64>,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
     /// The engine's OWN operational state home — the canonical parent of the database it was
@@ -4003,6 +4200,9 @@ impl ChatCloseReason {
     }
 }
 
+/// `chat_open`'s per-seat outcomes: `(cli_key, Ok(()) | Err(reason))`, in the order asked.
+pub type ChatOpenOutcomes = Vec<(String, Result<(), String>)>;
+
 /// One live chat, for the enumerate surface. A leak nobody can list is a leak nobody can reclaim
 /// (FINDING-027 gap 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4012,6 +4212,191 @@ pub struct ChatInfo {
     pub seats: Vec<String>,
     /// Seconds since the last open/ensure/turn on this chat.
     pub idle_secs: u64,
+    /// What the seats run against (core#410 / crew#502); `None` for a pool entry whose scope was
+    /// never recorded (a chat mid-close).
+    pub scope: Option<ChatScope>,
+}
+
+/// What a chat's seats run against (core#410 / crew#502, F-067): the scratch directory they run
+/// IN, the code graph they are grounded ON, and the repository roots they may READ. Recorded at
+/// `chat_open` and reused by every later ensure — a seat evicted mid-chat re-warms into the SAME
+/// scope. Never the daemon's own working directory: a chat opened without one runs in a private
+/// scratch directory of its own ([`ChatScope::scratch_for`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChatScope {
+    /// The seats' working directory — the chat's scratch root. Created on the first ensure.
+    pub cwd: std::path::PathBuf,
+    /// The estate graph the seats' READ-ONLY estate MCP is bound to (DES-GROUNDING-001 — the same
+    /// grounding governed workers get): the project's co-located graph, or a repo's own. `None`
+    /// ⇒ no estate MCP is advertised.
+    pub code_graph_db: Option<String>,
+    /// The repository roots in scope, absolute. Advertised to a claude seat as the SDK's
+    /// `additionalDirectories`; recorded for every seat (the enumerate surface reports them).
+    pub read_roots: Vec<String>,
+}
+
+/// Create a chat's scratch root for its seats — ABSOLUTE, PRIVATE (0700 on unix, enforced on an
+/// existing directory too) and never through a planted link (Copilot, #426): the default root sits
+/// under the system temp directory, where another local user can pre-place a symlink under a
+/// predictable name, and `create_dir_all` alone would follow it and hand the seats that target as
+/// their cwd; a relative root would resolve against the daemon's cwd — the F-067 leak by another
+/// spelling. One shared helper with the seat config roots (`ensure_private_dir`).
+fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
+    wicked_apps_core::spawn::ensure_private_dir(cwd)
+        .map_err(|e| format!("refusing scratch root {} ({e})", cwd.display()))
+}
+
+/// The real path of `p` even when `p` does not exist yet: its longest EXISTING ancestor is
+/// canonicalized and the remaining segments re-appended. A lexical `resolve` would compare a path
+/// under a symlinked temp dir (macOS `/var/folders/…` → `/private/var/folders/…`) unequal to one
+/// that was resolved through the link.
+fn canonical_ish(p: &std::path::Path) -> std::path::PathBuf {
+    let mut cur = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&cur) {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Is `file` the SAME file (device + inode) as any top-level entry of `dir` — the operational store
+/// or one of its sidecars reached through a hard link or a symlink elsewhere? Unix only: on other
+/// platforms the canonical-path comparison covers symlinks and junctions, while a HARD link's
+/// identity needs `MetadataExt::file_index` (unstable) or a crate this workspace does not carry —
+/// a documented limitation (Copilot, #426): the chat opener is the daemon, and a hard link to the
+/// operational store would have to be planted by the operator's own account on that host.
+fn same_file_as_a_top_level_entry_of(file: &std::path::Path, dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(target) = std::fs::metadata(file) else {
+            return false;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            std::fs::metadata(e.path())
+                .map(|m| m.is_file() && m.dev() == target.dev() && m.ino() == target.ino())
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, dir);
+        false
+    }
+}
+
+/// A recorded chat scope and the open generation that recorded it (see `AcpStepRunner::chat_scopes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedScope {
+    gen: u64,
+    scope: ChatScope,
+}
+
+/// May `cli_key` join a chat in `scope` (Copilot, #426)? An UNSCOPED chat (no roots, no graph)
+/// promises nothing beyond its scratch root and admits every seat. A SCOPED chat promises that
+/// its roots are read-only and that the seats see nothing else — a promise this engine can keep
+/// only through a channel the seat actually passes through: the chat boundary on
+/// `session/request_permission` (an adapter admitted to input governance asks for every tool
+/// call — claude and opencode, as registered; copilot's `--acp` is NOT admitted) or the kernel
+/// write floor (`os_sandbox` armed on the seat's record). An adapter that asks no permissions and
+/// runs under no floor (pi-acp, codex-acp, copilot --acp, agy-acp as registered) would run
+/// unbounded behind a read-only statement, so it is refused BY NAME for
+/// scoped chats — the open still succeeds for the seats that can be held, and the per-seat
+/// outcome says why this one cannot. Read containment for such adapters needs a read jail this
+/// platform does not have; the residual is stated rather than hidden.
+fn scoped_seat_admission(
+    cli_key: &str,
+    scope: &ChatScope,
+    config: &AcpConfig,
+) -> Result<(), String> {
+    let scoped = scope.code_graph_db.is_some() || !scope.read_roots.is_empty();
+    if !scoped || config.acp_input_governance || config.os_sandbox {
+        return Ok(());
+    }
+    Err(format!(
+        "seat '{cli_key}' cannot join a SCOPED chat: its ACP adapter '{}' asks no permissions (the \
+         chat's read-only boundary never sees its tool calls) and its record arms no OS sandbox, so \
+         the scoped repositories could not be held read-only; open the chat unscoped for this seat, \
+         or set `os_sandbox = true` on its [cli.acp] record",
+        config.binary
+    ))
+}
+
+/// The boundary a chat's seats are judged against (core#410, review): the scratch root is the ONE
+/// write root (and the cwd), the scoped repository roots are read-only, `HOME` and — for a claude
+/// seat — its worker config dir get the same carve-outs the governed boundary applies. No phase
+/// scopes: a chat has no phases.
+fn chat_boundary(
+    scope: &ChatScope,
+    seat_cli: wicked_apps_core::spawn::SeatCli,
+) -> crate::gate_hook::BoundaryCtx {
+    crate::gate_hook::BoundaryCtx {
+        roots: crate::path_policy::AllowedRoots {
+            write: vec![scope.cwd.clone()],
+            read: scope
+                .read_roots
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        },
+        cwd: scope.cwd.clone(),
+        home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+        claude_config_dir: wicked_apps_core::spawn::seat_config_for(seat_cli)
+            .ok()
+            .and_then(|c| c.claude_dir().map(std::path::Path::to_path_buf)),
+        pre_build_scope: false,
+        no_code_scope: false,
+    }
+}
+
+impl ChatScope {
+    /// The private scratch root a chat runs in when its opener names none:
+    /// `<system temp>/wicked-core-chat-<safe prefix>-<fnv1a64 of the full id>`. NEVER the daemon's
+    /// cwd (F-067: a daemon started from `$HOME` gave every chat seat the operator's home directory
+    /// to explore). The readable prefix is the id reduced to `[A-Za-z0-9._-]` (so an arbitrary
+    /// client-minted id cannot spell a path); the hash of the FULL id keeps distinct ids apart —
+    /// `a/b` and `a_b`, `.` and `` — so two chats never share a root (Copilot, #426).
+    pub fn scratch_for(chat_id: &str) -> std::path::PathBuf {
+        let safe: String = chat_id
+            .chars()
+            .take(48)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        // FNV-1a 64: stable across builds and platforms (a `DefaultHasher` is neither), no
+        // dependency, and collision-resistant enough for ids one daemon mints.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in chat_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let prefix = if safe.is_empty() {
+            "chat"
+        } else {
+            safe.as_str()
+        };
+        std::env::temp_dir().join(format!("wicked-core-chat-{prefix}-{hash:016x}"))
+    }
 }
 
 impl AcpStepRunner {
@@ -4053,6 +4438,8 @@ impl AcpStepRunner {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
+            chat_scopes: Arc::new(Mutex::new(HashMap::new())),
+            chat_open_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             timeout: Duration::from_secs(secs),
             operational_home: None,
             elicitation_maps,
@@ -4156,6 +4543,13 @@ impl AcpStepRunner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        let scopes: HashMap<String, ChatScope> = self
+            .chat_scopes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, r)| (id.clone(), r.scope.clone()))
+            .collect();
         let mut out: Vec<ChatInfo> = by_chat
             .into_iter()
             .map(|(chat_id, mut seats)| {
@@ -4168,6 +4562,7 @@ impl AcpStepRunner {
                     .map(|t| now.saturating_duration_since(*t).as_secs())
                     .unwrap_or(u64::MAX);
                 ChatInfo {
+                    scope: scopes.get(&chat_id).cloned(),
                     chat_id,
                     seats,
                     idle_secs,
@@ -4245,12 +4640,7 @@ impl AcpStepRunner {
     /// Warm (or return the existing) ACP session for one chat seat. Unlike the run
     /// path, a failed start is NOT cached as poisoned — chats are interactive, so
     /// every ensure retries and the operator sees each failure.
-    fn chat_ensure(
-        &self,
-        chat_id: &str,
-        cli_key: &str,
-        cwd: &std::path::Path,
-    ) -> Result<Arc<Mutex<AcpProcess>>, String> {
+    fn chat_ensure(&self, chat_id: &str, cli_key: &str) -> Result<Arc<Mutex<AcpProcess>>, String> {
         // Touch FIRST, and unconditionally: a chat whose seat is warming is in use, and recording
         // that only on success would leave a chat mid-`chat_open` looking idle-since-forever to a
         // reaper running concurrently.
@@ -4264,26 +4654,63 @@ impl AcpStepRunner {
         }
         // ONE registry read for this launch: the transport config AND the seat identity come off
         // the same record (codex r2, PR#413).
-        let (config, seat_is_claude) =
+        let (config, seat_cli) =
             acp_launch_facts(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
         if config.transport == AcpTransport::Http {
             return Err(format!(
                 "ACP HTTP transport not supported for chat ('{cli_key}')"
             ));
         }
-        // Chat is repo-less exploration → no estate MCP server (FINDING-122).
-        let proc = start_acp_process(
+        // The scope recorded at open (core#410 / crew#502). A chat with none is a caller bug and
+        // is refused — never a fallback to the daemon's own cwd (F-067).
+        let scope = self
+            .chat_scopes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(chat_id)
+            .map(|r| r.scope.clone())
+            .ok_or_else(|| format!("chat '{chat_id}' has no scope recorded — open it first"))?;
+        // A SCOPED chat promises read-only roots: only a seat this engine can actually hold to
+        // that — its ACP adapter asks permissions (the chat boundary sees every tool call) or it
+        // runs under the kernel write floor — may join one (Copilot, #426).
+        scoped_seat_admission(cli_key, &scope, &config)?;
+        ensure_chat_scratch_root(&scope.cwd).map_err(|e| format!("chat '{chat_id}': {e}"))?;
+        // Grounded on the scope's graph — the READ-ONLY estate MCP, the same seam governed
+        // workers get (DES-GROUNDING-001; formerly "chat is repo-less exploration → no estate
+        // MCP", FINDING-122) — in its scratch cwd, with the scoped repository roots advertised.
+        // No skills delivery, no per-session settings dir, no unit provenance: a chat is not a
+        // run unit.
+        let mut proc = start_acp_process_with_write_roots(
             &config,
-            cwd,
+            &scope.cwd,
+            scope.code_graph_db.as_deref(),
             None,
+            &[],
+            &scope.read_roots,
+            &[],
+            &crate::skills_snapshot::SkillsDelivery::None,
+            seat_cli,
             None,
-            seat_is_claude,
             self.operational_home.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        // The chat's filesystem boundary, judged on every permission request of every turn on
+        // this session (core#410, review): write = the scratch root; read = the scoped roots.
+        proc.chat_boundary = Some(chat_boundary(&scope, seat_cli));
         let arc = Arc::new(Mutex::new(proc));
+        // Insert under BOTH locks, scopes then sessions (the order `chat_open` takes them): the
+        // scope this process was warmed in must still be the recorded one (Copilot, #426 — a
+        // re-open with a new scope while this seat was warming would otherwise land an old-scope
+        // process under a key the new scope now owns); a stale process is dropped, not inserted.
+        let scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
+        if scopes.get(chat_id).map(|r| &r.scope) != Some(&scope) {
+            drop(arc);
+            return Err(format!(
+                "chat '{chat_id}': its scope changed while seat '{cli_key}' was warming — retry"
+            ));
+        }
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        // A racing ensure may have inserted first — reuse theirs, drop ours.
+        // A racing ensure (same scope, by the check above) may have inserted first — reuse theirs.
         if let Some(Some(existing)) = guard.get(&key) {
             return Ok(existing.clone());
         }
@@ -4291,18 +4718,47 @@ impl AcpStepRunner {
         Ok(arc)
     }
 
-    /// Eagerly warm one session per seat; per-seat outcome, `ChatSessionReady`/
-    /// `ChatSessionFailed` emitted for each.
+    /// Eagerly warm one session per seat in `scope`; per-seat outcome, `ChatSessionReady`/
+    /// `ChatSessionFailed` emitted for each. The scope is RECORDED first (core#410 / crew#502) so
+    /// every later ensure — a re-warm after an eviction, a turn on a seat that was never warm —
+    /// lands in the same cwd, on the same graph, with the same read roots.
+    ///
+    /// Re-opening a chat that already holds a DIFFERENT scope EVICTS its warm seats first (the
+    /// pool entries are dropped, no `ChatClosed` — the chat is not closing), so they re-warm in
+    /// the new scope here rather than keep running in the old cwd while the record says
+    /// otherwise (Copilot, #426). A re-open with the SAME scope is a plain ensure. When no seat
+    /// is warm afterwards (every start failed, or `clis` was empty) the scope is DROPPED again:
+    /// the pool is what the reaper and the enumerate surface see, so a scope with no pool entry
+    /// would be held by nothing that can reclaim it — the caller opens again.
     pub fn chat_open(
         &self,
         chat_id: &str,
         clis: &[String],
-        cwd: &std::path::Path,
-    ) -> Vec<(String, Result<(), String>)> {
-        let opened: Vec<(String, Result<(), String>)> = clis
+        scope: ChatScope,
+    ) -> Result<ChatOpenOutcomes, String> {
+        self.validate_chat_scope(&scope)?;
+        let gen = self
+            .chat_open_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        {
+            let mut scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = scopes
+                .get(chat_id)
+                .is_some_and(|recorded| recorded.scope != scope);
+            if changed {
+                let prefix = Self::chat_pool_key(chat_id);
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|(rid, _), _| rid != &prefix);
+            }
+            scopes.insert(chat_id.to_string(), RecordedScope { gen, scope });
+        }
+        let opened: ChatOpenOutcomes = clis
             .iter()
             .map(|cli| {
-                let outcome = self.chat_ensure(chat_id, cli, cwd).map(|_| ());
+                let outcome = self.chat_ensure(chat_id, cli).map(|_| ());
                 match &outcome {
                     Ok(()) => self.emit_event(CoreEvent::ChatSessionReady {
                         chat: chat_id.to_string(),
@@ -4317,6 +4773,12 @@ impl AcpStepRunner {
                 (cli.clone(), outcome)
             })
             .collect();
+        if self.chat_seats(chat_id).is_empty() {
+            // Nothing warmed: hold no scope (and no activity stamp) for a chat the pool does not
+            // know — see the doc above. Only THIS open's record, though (Copilot, #426): a newer
+            // open may have recorded its own scope meanwhile, and that one is its to keep.
+            self.drop_scope_if_gen(chat_id, gen);
+        }
         // Enforce the cap only AFTER the new chat is warm and touched, so it is the freshest entry
         // and therefore the last possible victim. Doing it first would let a full pool evict a
         // chat, warm the new one, and leave the pool at the cap anyway — same memory, one more
@@ -4326,29 +4788,179 @@ impl AcpStepRunner {
         // is the surface an operator actually watches. A second, log-only channel would be the one
         // that goes stale.
         self.chat_enforce_cap(Self::chat_pool_cap());
-        opened
+        Ok(opened)
+    }
+
+    /// Drop `chat_id`'s recorded scope and activity stamp — only if the record is still the one
+    /// open generation `gen` made (Copilot, #426: an older open's cleanup must never remove a
+    /// newer open's record).
+    fn drop_scope_if_gen(&self, chat_id: &str, gen: u64) {
+        let mut scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
+        if scopes.get(chat_id).is_some_and(|r| r.gen == gen) {
+            scopes.remove(chat_id);
+            self.chat_activity
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(chat_id);
+        }
+    }
+
+    /// Refuse a scope this engine must not run a chat in (core#410, review) — judged BEFORE it is
+    /// recorded, so nothing downstream ever sees an invalid one. The N-API caller is the daemon,
+    /// but the run path validates what IT is handed and the chat path is held to the same bar:
+    ///  - every read root is absolute and passes `validate_extra_read_roots` (the same exclusions
+    ///    a run's launch-declared read roots get: never the engine's pin/config trees);
+    ///  - the scratch root is absolute (a relative one would resolve against the daemon's cwd);
+    ///  - the graph, when named, is an absolute path to an EXISTING file and never a top-level
+    ///    file of the engine's own state home — that is where the operational store and its
+    ///    sidecars live, and a chat's estate MCP over the operational store is FINDING-067.
+    fn validate_chat_scope(&self, scope: &ChatScope) -> Result<(), String> {
+        // The scratch root: absolute, and a STRICT descendant of the system temp directory
+        // (Copilot, #426 — an absolute-only rule let a caller name `/`, `$HOME` or the state home
+        // as the writable root, which the ensure would then have made 0700 and the boundary made
+        // writable). Judged on real paths through the longest existing ancestor, so a symlinked
+        // temp dir (macOS `/var` → `/private/var`) and a not-yet-created leaf compare correctly.
+        if !scope.cwd.is_absolute() {
+            return Err(format!(
+                "chat scope: cwd {} is not absolute",
+                scope.cwd.display()
+            ));
+        }
+        let cwd = canonical_ish(&scope.cwd);
+        // The temp bases: Rust's `temp_dir()` (unix: `TMPDIR`; Windows: `TMP` then `TEMP`), `/tmp`
+        // on unix, AND `TMP`/`TEMP` wherever set — Node's `os.tmpdir()`, which the daemon derives
+        // its base from, consults `TMPDIR`, `TMP`, `TEMP` in that order on unix and `TEMP` before
+        // `TMP` on Windows, so the two runtimes can disagree on which variable wins (independent
+        // review, C5); every spelling a caller could legitimately have used is accepted.
+        let temps: Vec<std::path::PathBuf> = {
+            let mut t = vec![canonical_ish(&std::env::temp_dir())];
+            if cfg!(unix) {
+                t.push(canonical_ish(std::path::Path::new("/tmp")));
+            }
+            for var in ["TMP", "TEMP"] {
+                if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                    let p = std::path::PathBuf::from(v);
+                    if p.is_absolute() {
+                        t.push(canonical_ish(&p));
+                    }
+                }
+            }
+            t
+        };
+        if !temps.iter().any(|t| cwd.starts_with(t) && cwd != *t) {
+            return Err(format!(
+                "chat scope: cwd {} must be a directory of its own under the system temp directory \
+                 ({}), never a repository, a home or the engine's state",
+                scope.cwd.display(),
+                std::env::temp_dir().display()
+            ));
+        }
+        let op_home = self.operational_home.as_deref().map(canonical_ish);
+        if let Some(op) = &op_home {
+            if cwd.starts_with(op) {
+                return Err(format!(
+                    "chat scope: cwd {} lies inside the engine's own state home",
+                    scope.cwd.display()
+                ));
+            }
+        }
+        // The read roots: absolute; the run path's exclusions; never the engine's state home or
+        // anything under it (Copilot, #426 — `validate_extra_read_roots` fences the config tree
+        // only); never equal to / containing / inside the scratch root (the claude deny rules over
+        // a root that contained the cwd would make the writable root unwritable — the two layers
+        // must agree).
+        for root in &scope.read_roots {
+            let p = std::path::Path::new(root);
+            if !p.is_absolute() {
+                return Err(format!("chat scope: read root {root:?} is not absolute"));
+            }
+            let r = canonical_ish(p);
+            if let Some(op) = &op_home {
+                if r.starts_with(op) {
+                    return Err(format!(
+                        "chat scope: read root {root} lies inside the engine's own state home \
+                         (FINDING-067)"
+                    ));
+                }
+            }
+            if r.starts_with(&cwd) || cwd.starts_with(&r) {
+                return Err(format!(
+                    "chat scope: read root {root} overlaps the scratch root {} — a root can neither \
+                     contain nor sit inside the chat's writable directory",
+                    scope.cwd.display()
+                ));
+            }
+        }
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from);
+        crate::path_policy::validate_extra_read_roots(&scope.read_roots, home.as_deref())
+            .map_err(|e| format!("chat scope: {e}"))?;
+        // The graph: absolute, an EXISTING file, and never the engine's own store — judged on the
+        // RESOLVED file (Copilot, #426: a symlink or hard link outside the state home that resolves
+        // to `core.db` or a sidecar passed a spelling-based check): its canonical parent must not
+        // be the state home, and on unix its (device, inode) must match no top-level entry there.
+        if let Some(db) = scope.code_graph_db.as_deref() {
+            let db_path = std::path::Path::new(db);
+            if !db_path.is_absolute() {
+                return Err(format!("chat scope: code graph {db:?} is not absolute"));
+            }
+            if !db_path.is_file() {
+                return Err(format!(
+                    "chat scope: no code graph at {db} (the estate MCP would answer for nothing)"
+                ));
+            }
+            if let Some(op) = self.operational_home.as_deref() {
+                let resolved =
+                    std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+                let op_real = canonical_ish(op);
+                if resolved
+                    .parent()
+                    .is_some_and(|parent| crate::state_home::same_dir(parent, &op_real))
+                    || same_file_as_a_top_level_entry_of(db_path, op)
+                {
+                    return Err(format!(
+                        "chat scope: {db} is (or resolves to) a top-level file of the engine's own \
+                         state home — the operational store is never a chat's graph (FINDING-067)"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One seat's turn on a chat message. Streams deltas via `ChatDelta`, returns the
     /// completed reply text. On failure the seat's session is EVICTED (next ensure
-    /// re-warms) and the error is returned — never floored, never faked.
-    pub fn chat_turn(
-        &self,
-        chat_id: &str,
-        cli_key: &str,
-        text: &str,
-        cwd: &std::path::Path,
-    ) -> Result<String, String> {
-        let arc = self.chat_ensure(chat_id, cli_key, cwd)?;
+    /// re-warms, into the chat's recorded scope) and the error is returned — never floored,
+    /// never faked.
+    pub fn chat_turn(&self, chat_id: &str, cli_key: &str, text: &str) -> Result<String, String> {
+        let arc = self.chat_ensure(chat_id, cli_key)?;
         let tx = self.tx.clone();
         let (chat_ev, cli_ev) = (chat_id.to_string(), cli_key.to_string());
-        let emit: Box<crate::workflow::DeltaSink> = Box::new(move |delta: &str| {
-            let _ = tx.send(Command::EmitEvent(CoreEvent::ChatDelta {
-                chat: chat_ev.clone(),
-                cli_key: cli_ev.clone(),
-                text: delta.to_string(),
-            }));
-        });
+        // F-068 (core#410): a seat's startup banner never reaches the transcript. The gate holds
+        // the stream only while it is still banner-shaped and releases everything else at once;
+        // the assembled reply below is banner-stripped at its own seam (`strip_pi_banner`).
+        let gate = Arc::new(Mutex::new(BannerGate::default()));
+        let deliver = {
+            let tx = tx.clone();
+            move |text: String| {
+                let _ = tx.send(Command::EmitEvent(CoreEvent::ChatDelta {
+                    chat: chat_ev.clone(),
+                    cli_key: cli_ev.clone(),
+                    text,
+                }));
+            }
+        };
+        let emit: Box<crate::workflow::DeltaSink> = {
+            let gate = Arc::clone(&gate);
+            let deliver = deliver.clone();
+            Box::new(move |delta: &str| {
+                let released = gate.lock().unwrap_or_else(|p| p.into_inner()).push(delta);
+                if let Some(text) = released {
+                    deliver(text);
+                }
+            })
+        };
         let result = {
             let mut proc = arc.lock().unwrap_or_else(|p| p.into_inner());
             // Chat turns never run in a governed epoch — epoch=0 disables elicitation.
@@ -4365,6 +4977,10 @@ impl AcpStepRunner {
                 None,
             )
         };
+        // Whatever the gate still holds at turn end is content (or a banner it strips) — deliver.
+        if let Some(text) = gate.lock().unwrap_or_else(|p| p.into_inner()).finish() {
+            deliver(text);
+        }
         // Touch again on the way out. `chat_ensure` touched on the way in, but a long turn would
         // then be counted as idle for its whole duration — a 40-minute agent turn would be reaped
         // out from under the operator the moment it finished.
@@ -4372,7 +4988,7 @@ impl AcpStepRunner {
         match result {
             Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.output),
             Ok(turn) => {
-                self.chat_evict(chat_id, cli_key);
+                self.chat_evict(chat_id, cli_key, &arc);
                 let msg = format!(
                     "seat '{cli_key}' turn ended {:?}: {}",
                     turn.status, turn.output
@@ -4389,7 +5005,7 @@ impl AcpStepRunner {
                 Err(msg)
             }
             Err(e) => {
-                self.chat_evict(chat_id, cli_key);
+                self.chat_evict(chat_id, cli_key, &arc);
                 let msg = format!("seat '{cli_key}' session error: {e}");
                 eprintln!("[wicked-core] chat '{chat_id}' evicting {msg}");
                 Err(msg)
@@ -4397,9 +5013,16 @@ impl AcpStepRunner {
         }
     }
 
-    fn chat_evict(&self, chat_id: &str, cli_key: &str) {
+    /// Drop the seat's pool entry — but only if it is still THIS process (Copilot, #426): a
+    /// re-open with a new scope may have evicted the old process and warmed a replacement under
+    /// the same key while a turn on the old one was still in flight; that turn's failure must not
+    /// remove the replacement.
+    fn chat_evict(&self, chat_id: &str, cli_key: &str, this: &Arc<Mutex<AcpProcess>>) {
+        let key = (Self::chat_pool_key(chat_id), cli_key.to_string());
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        guard.remove(&(Self::chat_pool_key(chat_id), cli_key.to_string()));
+        if matches!(guard.get(&key), Some(Some(existing)) if Arc::ptr_eq(existing, this)) {
+            guard.remove(&key);
+        }
     }
 
     /// The seats currently warm for a chat (fan-out default for `targets: None`).
@@ -4429,6 +5052,11 @@ impl AcpStepRunner {
         // Drop the activity entry too. It is small, but it is keyed by an unbounded stream of
         // client-minted chat ids — leaving it behind trades a 520 MB leak for a slower one.
         self.chat_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(chat_id);
+        // And the recorded scope (core#410): a closed chat holds no cwd/graph/roots either.
+        self.chat_scopes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(chat_id);
@@ -4648,8 +5276,9 @@ impl AcpStepRunner {
         let worker_cli = seat_identity_of(seat.as_ref(), &cli_key);
         // Judged off THIS record — the same one whose `[cli.acp]` decides the transport below
         // (`acp_cfg_probe`) — never a second registry read (codex r2, PR#413: a clis.toml edit
-        // between two reads would pair one record's bridge with another's identity).
-        let seat_is_claude = matches!(worker_cli, crate::skills_snapshot::WorkerCli::Claude);
+        // between two reads would pair one record's bridge with another's identity). The per-seat
+        // configuration decision (core#410) reads the same record's `binary`.
+        let seat_cli = seat_cli_of(seat.as_ref(), &cli_key);
         // core#396 / v3.1 §4 — admission, BEFORE the operator messages below are consumed
         // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST and ONE
         // policy for cached and fresh alike (`admit_turn`, codex round 4): a session this run
@@ -5023,9 +5652,10 @@ impl AcpStepRunner {
                     code_graph_db,
                     Some(&cwd.join("tmp")),
                     extra_write_roots,
+                    &[],
                     &estate_provenance,
                     &delivery,
-                    seat_is_claude,
+                    seat_cli,
                     Some((run_id.as_str(), cli_key.as_str())),
                     self.operational_home.as_deref(),
                 ) {
@@ -5564,14 +6194,22 @@ pub(crate) fn seat_identity_of(
 /// so its `[cli.acp]` table (or its absence) must decide the transport here exactly as it does
 /// everywhere else — and its `binary` decides the identity off that same record, never a second,
 /// independent read that a concurrent `clis.toml` edit could make disagree (codex r2, PR#413).
-fn acp_launch_facts(cli_key: &str) -> Option<(AcpConfig, bool)> {
+fn acp_launch_facts(cli_key: &str) -> Option<(AcpConfig, wicked_apps_core::spawn::SeatCli)> {
     let record = registry_record(cli_key);
     let config = record.as_ref().and_then(|c| c.acp.clone())?;
-    let seat_is_claude = matches!(
-        seat_identity_of(record.as_ref(), cli_key),
-        crate::skills_snapshot::WorkerCli::Claude
-    );
-    Some((config, seat_is_claude))
+    Some((config, seat_cli_of(record.as_ref(), cli_key)))
+}
+
+/// The CLI a seat RUNS, for the per-seat configuration decision (core#410) — judged off the SAME
+/// record as [`seat_identity_of`]: the record's `binary` (the CLI, never its `[cli.acp]` bridge —
+/// `pi-acp` carries pi, `codex-acp` carries codex), the key itself for an unregistered seat. Its
+/// claude arm is exactly `seat_identity_of`'s (`binary_is_claude` IS `SeatCli::from_binary ==
+/// Claude`), so the skills admission and the configuration root can never disagree on a seat.
+pub(crate) fn seat_cli_of(
+    seat: Option<&wicked_council::AgenticCli>,
+    cli_key: &str,
+) -> wicked_apps_core::spawn::SeatCli {
+    wicked_apps_core::spawn::SeatCli::from_binary(seat.map_or(cli_key, |c| c.binary.as_str()))
 }
 
 /// Make the wire-visible disclosure for a governed unit using an ACP adapter that has not passed
@@ -5641,15 +6279,30 @@ mod tests {
         scratch_tmp: Option<&std::path::Path>,
     ) -> anyhow::Result<AcpProcess> {
         // The stubs below stand in for the CLAUDE bridge unless a test says otherwise.
-        super::start_acp_process(config, cwd, code_graph_db, scratch_tmp, true, None)
+        super::start_acp_process(
+            config,
+            cwd,
+            code_graph_db,
+            scratch_tmp,
+            wicked_apps_core::spawn::SeatCli::Claude,
+            None,
+        )
     }
-    /// [`start_acp_process`] for a stub standing in for a NON-claude bridge (codex, pi, …).
+    /// [`start_acp_process`] for a stub standing in for a NON-claude bridge of an UNKNOWN CLI
+    /// (no configuration-home variable of its own — every seat variable stripped).
     #[cfg(unix)]
     fn start_non_claude_acp_process(
         config: &AcpConfig,
         cwd: &std::path::Path,
     ) -> anyhow::Result<AcpProcess> {
-        super::start_acp_process(config, cwd, None, None, false, None)
+        super::start_acp_process(
+            config,
+            cwd,
+            None,
+            None,
+            wicked_apps_core::spawn::SeatCli::Other,
+            None,
+        )
     }
     /// `#[cfg(unix)]`: its only callers drive shell-script stubs (Unix-only), so on Windows it
     /// would be dead code under `-D warnings`.
@@ -5671,9 +6324,10 @@ mod tests {
             code_graph_db,
             scratch_tmp,
             extra_write_roots,
+            &[],
             estate_provenance,
             delivery,
-            true,
+            wicked_apps_core::spawn::SeatCli::Claude,
             session,
             None,
         )
@@ -6061,19 +6715,21 @@ transport = "stdio"
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
-        let (cfg_a, claude_a) = a.expect("the override has an ACP table");
+        let (cfg_a, cli_a) = a.expect("the override has an ACP table");
         assert_eq!(
             cfg_a.binary, "/opt/overridden/bridge-a",
             "the bridge off THAT record"
         );
-        assert!(
-            !claude_a,
+        assert_ne!(
+            cli_a,
+            wicked_apps_core::spawn::SeatCli::Claude,
             "the key says claude but THAT record's binary does not — identity follows the record"
         );
-        let (cfg_b, claude_b) = b.expect("the override has an ACP table");
+        let (cfg_b, cli_b) = b.expect("the override has an ACP table");
         assert_eq!(cfg_b.binary, "/opt/overridden/bridge-b");
-        assert!(
-            claude_b,
+        assert_eq!(
+            cli_b,
+            wicked_apps_core::spawn::SeatCli::Claude,
             "a claude binary under another key IS a claude seat"
         );
         assert!(none.is_none(), "no record, no launch facts");
@@ -7563,6 +8219,333 @@ sleep 30
         let _ = std::fs::remove_dir_all(&seen_dir);
     }
 
+    /// core#410 (F-010 / F-068), through the REAL spawn: a bridge carrying a codex / pi /
+    /// copilot / opencode seat is handed THAT CLI's configuration-home variable pointing at its
+    /// own root under the worker home — created private — and NONE of the other seats' variables,
+    /// however many decoys the daemon carries. A fake bridge records the environment it was
+    /// spawned with. Deleting `seat_config.apply(&mut cmd)` in the spawn fails the "own variable"
+    /// assertion for every seat; deleting a `strip` entry fails the decoy assertion.
+    #[test]
+    #[cfg(unix)]
+    fn every_non_claude_bridge_gets_its_own_config_root_and_no_foreign_seat_variable() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        use wicked_apps_core::spawn::{
+            SeatCli, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, COPILOT_HOME_ENV,
+            OPENCODE_AUTH_CONTENT_ENV, OPENCODE_CONFIG_CONTENT_ENV, OPENCODE_CONFIG_DIR_ENV,
+            OPENCODE_CONFIG_FILE_ENV, PI_AGENT_DIR_ENV, XDG_CONFIG_HOME_ENV, XDG_DATA_HOME_ENV,
+            XDG_STATE_HOME_ENV,
+        };
+        // ONE spelling of opencode's inline-config variable across the two crates (the strip in
+        // apps-core, the composition here).
+        assert_eq!(
+            OPENCODE_CONFIG_CONTENT_ENV,
+            crate::skills_snapshot::OPENCODE_CONFIG_ENV
+        );
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("seat-roots");
+        let worker = dir.join("worker");
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        // The daemon carries a decoy for EVERY seat variable and for a generic XDG base.
+        let decoy = dir.join("daemon-decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        let _d1 = EnvPin::set(CLAUDE_CONFIG_DIR_ENV, &decoy);
+        let _d2 = EnvPin::set(CODEX_HOME_ENV, &decoy);
+        let _d3 = EnvPin::set(PI_AGENT_DIR_ENV, &decoy);
+        let _d4 = EnvPin::set(COPILOT_HOME_ENV, &decoy);
+        let _d5 = EnvPin::set(OPENCODE_CONFIG_DIR_ENV, &decoy);
+        let _d6 = EnvPin::set(XDG_CONFIG_HOME_ENV, &decoy);
+        let _d7 = EnvPin::set(XDG_DATA_HOME_ENV, &decoy);
+        let _d8 = EnvPin::set(XDG_STATE_HOME_ENV, &decoy);
+        // The operator's ambient INLINE opencode config (plugins, permission rules), extra config
+        // FILE and inline CREDENTIALS — none may reach an isolated seat, opencode's own included
+        // (Copilot, #426; independent review C2).
+        let _d9 = EnvPin::set(OPENCODE_CONFIG_CONTENT_ENV, &decoy);
+        let _d10 = EnvPin::set(OPENCODE_CONFIG_FILE_ENV, &decoy);
+        let _d11 = EnvPin::set(OPENCODE_AUTH_CONTENT_ENV, &decoy);
+        let vars = [
+            CLAUDE_CONFIG_DIR_ENV,
+            CODEX_HOME_ENV,
+            PI_AGENT_DIR_ENV,
+            COPILOT_HOME_ENV,
+            OPENCODE_CONFIG_DIR_ENV,
+            OPENCODE_CONFIG_CONTENT_ENV,
+            OPENCODE_CONFIG_FILE_ENV,
+            OPENCODE_AUTH_CONTENT_ENV,
+            XDG_CONFIG_HOME_ENV,
+            XDG_DATA_HOME_ENV,
+            XDG_STATE_HOME_ENV,
+        ];
+        let decoy_s = decoy.to_string_lossy().into_owned();
+        let cases: Vec<(SeatCli, Vec<(&str, std::path::PathBuf)>)> = vec![
+            (SeatCli::Codex, vec![(CODEX_HOME_ENV, worker.join("codex"))]),
+            (SeatCli::Pi, vec![(PI_AGENT_DIR_ENV, worker.join("pi"))]),
+            (
+                SeatCli::Copilot,
+                vec![(COPILOT_HOME_ENV, worker.join("copilot"))],
+            ),
+            (
+                SeatCli::Opencode,
+                vec![
+                    (XDG_CONFIG_HOME_ENV, worker.join("opencode").join("config")),
+                    (XDG_DATA_HOME_ENV, worker.join("opencode").join("data")),
+                    (XDG_STATE_HOME_ENV, worker.join("opencode").join("state")),
+                ],
+            ),
+        ];
+        for (seat_cli, own) in &cases {
+            let ledger = dir.join(format!("env-{seat_cli:?}.txt"));
+            let record: String = vars
+                .iter()
+                .map(|v| format!("printf '{v}=%s\\n' \"${{{v}:-UNSET}}\""))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let script = write_stub(
+                &dir,
+                &format!(
+                    r#"#!/bin/sh
+{{ {record}; }} > "{ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"roots"}}}}'
+sleep 30
+"#,
+                    ledger = ledger.display()
+                ),
+            );
+            let proc = super::start_acp_process(
+                &stub_config(&script, None),
+                &dir,
+                None,
+                None,
+                *seat_cli,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{seat_cli:?}: start: {e}"));
+            let seen: std::collections::HashMap<String, String> = std::fs::read_to_string(&ledger)
+                .unwrap()
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            for (var, root) in own {
+                assert_eq!(
+                    seen.get(*var).map(String::as_str),
+                    Some(root.to_string_lossy().as_ref()),
+                    "{seat_cli:?}: its own {var} points at its root under the worker home"
+                );
+                let meta = std::fs::metadata(root)
+                    .unwrap_or_else(|e| panic!("{seat_cli:?}: {} exists: {e}", root.display()));
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o700,
+                    "{seat_cli:?}: private"
+                );
+            }
+            let own_names: Vec<&str> = own.iter().map(|(v, _)| *v).collect();
+            for var in wicked_apps_core::spawn::SEAT_CONFIG_ENV {
+                if own_names.contains(var) {
+                    continue;
+                }
+                assert_eq!(
+                    seen.get(*var).map(String::as_str),
+                    Some("UNSET"),
+                    "{seat_cli:?}: the foreign seat variable {var} is STRIPPED, never the daemon's decoy"
+                );
+            }
+            if *seat_cli != SeatCli::Opencode {
+                for xdg in [XDG_CONFIG_HOME_ENV, XDG_DATA_HOME_ENV, XDG_STATE_HOME_ENV] {
+                    assert_eq!(
+                        seen.get(xdg).map(String::as_str),
+                        Some(decoy_s.as_str()),
+                        "{seat_cli:?}: a generic XDG base is inherited untouched"
+                    );
+                }
+            }
+            drop(proc);
+        }
+        restore_hermetic_worker_home();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#410 / crew#502, end to end through `chat_open` → `chat_turn` on a registry seat whose
+    /// bridge is a fake: the seat runs IN the scope's cwd (never this process's), its
+    /// `session/new` advertises the READ-ONLY estate MCP over the scope's graph and the scoped
+    /// repository roots as `additionalDirectories`, the seat's configuration is the worker home's
+    /// — and the pi-shaped startup banner the fake streams as its first chunk never reaches a
+    /// `ChatDelta`, while the answer does. `chat_list` reports the scope; `chat_close` drops it.
+    #[test]
+    #[cfg(unix)]
+    fn a_chat_seat_runs_in_its_scope_grounded_read_only_and_its_banner_never_reaches_the_stream() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("chat-scope");
+        let worker = dir.join("worker");
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        let frame_ledger = dir.join("session-new.json");
+        let env_ledger = dir.join("seen-config-dir.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{env_ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read new
+printf '%s\n' "$new" > "{frame_ledger}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"scoped"}}}}'
+read _prompt
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"pi v0.83.0\n---\n\n## Skills\n- /op/.pi/agent/skills/wicked-testing-x/SKILL.md\n\n## Extensions\n- /op/.pi/agent/extensions/wicked-testing.ts\n\n---\n"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Hello from the scoped seat"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+sleep 30
+"#,
+                env_ledger = env_ledger.display(),
+                frame_ledger = frame_ledger.display()
+            ),
+        );
+        // The seat: a CLAUDE seat (so `additionalDirectories` applies) whose bridge is the fake,
+        // registered through the operator's clis.toml under a pinned HOME.
+        let council = dir.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "stubchat"
+display_name = "Stub chat seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{}"
+transport = "stdio"
+acp_input_governance = true
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let prior_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &dir);
+
+        let chat_cwd = dir.join("chats").join("c1");
+        let (repo_a, repo_b) = (dir.join("repos").join("a"), dir.join("repos").join("b"));
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        let graph_db = dir.join("project-graphs").join("p1").join("estate.db");
+        std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
+        std::fs::write(&graph_db, b"").unwrap();
+        let scope = ChatScope {
+            cwd: chat_cwd.clone(),
+            code_graph_db: Some(graph_db.to_string_lossy().into_owned()),
+            read_roots: vec![
+                repo_a.to_string_lossy().into_owned(),
+                repo_b.to_string_lossy().into_owned(),
+            ],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let opened = r
+            .chat_open("c1", &["stubchat".to_string()], scope.clone())
+            .expect("a valid scope is accepted");
+        let turn = r.chat_turn("c1", "stubchat", "hello");
+        let listed = r.chat_list();
+        r.chat_close("c1", ChatCloseReason::Requested);
+        let after_close = r.chat_list();
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        restore_hermetic_worker_home();
+
+        assert_eq!(opened.len(), 1);
+        assert!(
+            opened[0].1.is_ok(),
+            "the fake bridge warms: {:?}",
+            opened[0]
+        );
+        // (1) The seat runs IN the scope's cwd — created for it — never the daemon's.
+        assert!(
+            chat_cwd.is_dir(),
+            "the scratch root is created on the first ensure"
+        );
+        let frame: Value =
+            serde_json::from_str(&std::fs::read_to_string(&frame_ledger).unwrap()).unwrap();
+        assert_eq!(
+            frame["params"]["cwd"],
+            json!(chat_cwd.to_string_lossy().as_ref()),
+            "the seat's cwd is the chat's scratch root: {frame}"
+        );
+        assert_ne!(
+            frame["params"]["cwd"],
+            json!(std::env::current_dir().unwrap().to_string_lossy().as_ref()),
+            "never the process's own working directory (F-067)"
+        );
+        // (2) Grounded: the READ-ONLY estate MCP over the scope's graph (DES-GROUNDING-001).
+        let servers = frame["params"]["mcpServers"]
+            .as_array()
+            .expect("mcpServers is an array");
+        assert_eq!(servers.len(), 1, "one estate server: {frame}");
+        assert_eq!(servers[0]["name"], "wicked-estate");
+        let args: Vec<&str> = servers[0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            args.contains(&graph_db.to_string_lossy().as_ref()),
+            "bound to the scope's graph: {args:?}"
+        );
+        assert!(args.contains(&"--readonly"), "read-only: {args:?}");
+        // (3) The scoped roots are advertised to the claude seat.
+        assert_eq!(
+            frame["params"]["_meta"]["claudeCode"]["options"]["additionalDirectories"],
+            json!(scope.read_roots),
+            "{frame}"
+        );
+        // (4) The seat's configuration is the worker home's (FINDING-061), not the operator's.
+        assert_eq!(
+            std::path::PathBuf::from(std::fs::read_to_string(&env_ledger).unwrap().trim()),
+            worker.join("claude")
+        );
+        // (5) The assembled reply is the answer; the banner never reached a ChatDelta.
+        assert_eq!(
+            turn.as_deref(),
+            Ok("Hello from the scoped seat"),
+            "{turn:?}"
+        );
+        let deltas: Vec<String> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(CoreEvent::ChatDelta { chat, text, .. }) if chat == "c1" => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        let streamed = deltas.concat();
+        assert!(
+            !streamed.contains("pi v0.83.0") && !streamed.contains("SKILL.md"),
+            "the startup banner must never enter the streamed transcript (F-068): {streamed:?}"
+        );
+        assert_eq!(streamed, "Hello from the scoped seat", "{deltas:?}");
+        // (6) The enumerate surface reports the scope; a closed chat holds none.
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].scope.as_ref(), Some(&scope));
+        assert!(after_close.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FINDING-122, ACP half: a run WITH a repo graph must advertise the estate MCP server on
     /// `session/new`, scoped to that repo's OWN store — the ACP-array twin of the wrapped path's
     /// settings.json injection — so the worker consumes the graph instead of re-deriving it. A
@@ -7808,6 +8791,7 @@ sleep 30
             skills_plugin: Some(root),
             deny: &[],
             settings: None,
+            additional_directories: &[],
             setting_sources: None,
         };
         let handed = session_new_params(cwd, servers.clone(), &with_plugin(gen7));
@@ -7848,6 +8832,7 @@ sleep 30
                 skills_plugin: None,
                 deny: &deny,
                 settings: Some(std::path::Path::new("/wh/sessions/r-claude/settings.json")),
+                additional_directories: &[],
                 setting_sources: Some(ENGINE_SETTING_SOURCES),
             },
         );
@@ -7873,6 +8858,7 @@ sleep 30
                 skills_plugin: None,
                 deny: &deny,
                 settings: None,
+                additional_directories: &[],
                 setting_sources: Some(ENGINE_SETTING_SOURCES),
             },
         );
@@ -7888,6 +8874,7 @@ sleep 30
                 skills_plugin: None,
                 deny: &deny,
                 settings: None,
+                additional_directories: &[],
                 setting_sources: None,
             },
         );
@@ -9636,27 +10623,36 @@ transport = "stdio"
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The call site must consult the SAME escape-hatch variable as the wrapped path, read from
-    /// the real environment — a hardcoded `false` would pass the behavioural test above while
-    /// silently deleting the operator's opt-out. Since core#396 that read is ONE shared function
-    /// (`execute_wrapped::inherits_operator_config`, also what the skills admission consults), so
-    /// the three cannot disagree; the audit pins the call to it. Needle built by concatenation and
-    /// matched on whitespace-stripped source so neither this test nor rustfmt can satisfy or break
-    /// it.
+    /// The call site must consult the SAME escape-hatch variable as the wrapped path and the
+    /// ballot, read from the real environment — a hardcoded decision would pass the behavioural
+    /// tests above while silently deleting the operator's opt-out. Since core#410 that read lives
+    /// INSIDE the one shared resolver every seat spawn calls
+    /// (`wicked_apps_core::spawn::seat_config_for`, which returns `Inherit` from
+    /// `inherits_operator_config()` — the same reader `execute_wrapped::inherits_operator_config`
+    /// and the skills admission delegate to), so the four cannot disagree; the audit pins the
+    /// spawn's call to that resolver, keyed on the seat it resolved. Needle built by concatenation
+    /// and matched on whitespace-stripped source so neither this test nor rustfmt can satisfy or
+    /// break it.
     #[test]
     fn the_acp_spawn_consults_the_same_inherit_escape_hatch_as_the_wrapped_path() {
         let src: String = include_str!("acp_runner.rs")
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let needle = format!(
-            "worker_claude_config_dir(crate::execute_wrapped::{}()",
-            "inherits_operator_config"
-        );
+        let needle = format!("wicked_apps_core::spawn::{}(seat_cli)", "seat_config_for");
         assert!(
             src.contains(&needle),
-            "start_acp_process no longer decides config isolation from the wrapped path's \
-             escape-hatch variable"
+            "start_acp_process no longer decides config isolation through the shared per-seat \
+             resolver (which is where the wrapped path's escape-hatch variable is read)"
+        );
+        // And the resolver's `Inherit` arm IS the hatch: the same predicate the wrapped path reads.
+        assert_eq!(
+            matches!(
+                wicked_apps_core::spawn::seat_config_for(wicked_apps_core::spawn::SeatCli::Codex)
+                    .expect("this host's worker home resolves"),
+                wicked_apps_core::spawn::SeatConfig::Inherit
+            ),
+            crate::execute_wrapped::inherits_operator_config()
         );
     }
 
@@ -9699,6 +10695,478 @@ transport = "stdio"
         );
         drop(dir);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Copilot, #426: a re-open with a DIFFERENT scope evicts the chat's pool entries (the seats
+    /// re-warm in the new scope), a re-open with the SAME scope leaves them alone — and a chat
+    /// that ends up with no warm seat holds no scope, so nothing un-reapable is left behind.
+    #[test]
+    fn reopening_with_a_new_scope_evicts_the_old_seats_and_a_seatless_chat_holds_no_scope() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let key = (AcpStepRunner::chat_pool_key("c1"), "claude".to_string());
+        let scope_a = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-scope-a"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let scope_b = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-scope-b"),
+            ..scope_a.clone()
+        };
+        // A recorded scope A with a pool entry (None slot: constructing a live child is not the
+        // point here). Re-open with the SAME scope and no seats to warm: the entry is untouched.
+        r.sessions.lock().unwrap().insert(key.clone(), None);
+        r.chat_scopes.lock().unwrap().insert(
+            "c1".to_string(),
+            RecordedScope {
+                gen: 0,
+                scope: scope_a.clone(),
+            },
+        );
+        let _ = r.chat_open("c1", &[], scope_a.clone());
+        assert!(
+            r.sessions.lock().unwrap().contains_key(&key),
+            "a same-scope re-open evicts nothing"
+        );
+        // Re-open with a DIFFERENT scope: the stale entry is evicted...
+        r.chat_scopes.lock().unwrap().insert(
+            "c1".to_string(),
+            RecordedScope {
+                gen: 0,
+                scope: scope_a.clone(),
+            },
+        );
+        let _ = r.chat_open("c1", &[], scope_b);
+        assert!(
+            !r.sessions.lock().unwrap().contains_key(&key),
+            "a re-open with a different scope evicts the seats warmed in the old one"
+        );
+        // ...and since nothing warmed (no clis), no scope is held for a chat the pool forgot.
+        assert!(r.chat_scopes.lock().unwrap().get("c1").is_none());
+        assert!(r.chat_activity.lock().unwrap().get("c1").is_none());
+        // Every seat failing to start (an unknown cli) ends the same way: outcome reported,
+        // nothing held.
+        let opened = r
+            .chat_open("c2", &["no-such-cli-xyz".to_string()], scope_a.clone())
+            .expect("a valid scope is accepted");
+        assert!(opened[0].1.is_err());
+        assert!(r.chat_scopes.lock().unwrap().get("c2").is_none());
+        assert!(r.chat_list().is_empty());
+        // Copilot, #426: the seatless cleanup drops only ITS OWN open's record — a newer open's
+        // record (a higher generation) survives an older open finishing with no seats.
+        r.chat_scopes.lock().unwrap().insert(
+            "c3".to_string(),
+            RecordedScope {
+                gen: 7,
+                scope: scope_a.clone(),
+            },
+        );
+        r.drop_scope_if_gen("c3", 6);
+        assert!(
+            r.chat_scopes.lock().unwrap().get("c3").is_some(),
+            "an older generation's cleanup leaves a newer record alone"
+        );
+        r.drop_scope_if_gen("c3", 7);
+        assert!(r.chat_scopes.lock().unwrap().get("c3").is_none());
+    }
+
+    /// Independent review, C5: the daemon derives its scratch base from Node's `os.tmpdir()`,
+    /// which may follow `TMP`/`TEMP` where Rust's `temp_dir()` does not — a scratch root under a
+    /// set `TMP` is accepted, one under an arbitrary directory still refused.
+    #[test]
+    #[cfg(unix)]
+    fn a_scratch_root_under_tmp_or_temp_is_accepted_as_a_temp_base() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // A root-level path that is under NO temp base (this checkout may itself live under /tmp,
+        // so nothing beneath it can serve). Validation never requires the cwd to exist, so nothing
+        // is created.
+        let alt =
+            std::path::PathBuf::from("/").join(format!("w2chat-not-a-temp-{}", std::process::id()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let scope = ChatScope {
+            cwd: alt.join("chats").join("c1"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let _unset_tmp = EnvPin::unset("TMP");
+        let _unset_temp = EnvPin::unset("TEMP");
+        let err = r
+            .validate_chat_scope(&scope)
+            .expect_err("outside every temp base");
+        assert!(err.contains("system temp"), "{err}");
+        let _tmp = EnvPin::set("TMP", &alt);
+        r.validate_chat_scope(&scope)
+            .expect("a root under $TMP is a temp root");
+        assert!(!alt.exists(), "validation creates nothing");
+    }
+
+    /// Copilot, #426: a seat whose adapter asks no permissions and runs under no kernel floor
+    /// cannot be held to a scoped chat's read-only roots — refused by name for SCOPED chats,
+    /// admitted to unscoped ones; an admitted or sandboxed adapter joins either.
+    #[test]
+    fn a_permission_less_unsandboxed_seat_is_refused_for_a_scoped_chat_only() {
+        let scoped = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-adm"),
+            code_graph_db: None,
+            read_roots: vec![std::env::temp_dir()
+                .join("repo")
+                .to_string_lossy()
+                .into_owned()],
+        };
+        let unscoped = ChatScope {
+            read_roots: vec![],
+            ..scoped.clone()
+        };
+        let mut cfg = AcpConfig {
+            binary: "pi-acp".into(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: false,
+            os_sandbox: false,
+            acp_governance_env: None,
+            verified_version: None,
+        };
+        let err = scoped_seat_admission("pi", &scoped, &cfg).expect_err("refused");
+        assert!(
+            err.contains("pi") && err.contains("SCOPED") && err.contains("pi-acp"),
+            "{err}"
+        );
+        assert!(
+            scoped_seat_admission("pi", &unscoped, &cfg).is_ok(),
+            "unscoped admits everyone"
+        );
+        cfg.os_sandbox = true;
+        assert!(
+            scoped_seat_admission("pi", &scoped, &cfg).is_ok(),
+            "the kernel floor holds it"
+        );
+        cfg.os_sandbox = false;
+        cfg.acp_input_governance = true;
+        assert!(
+            scoped_seat_admission("claude", &scoped, &cfg).is_ok(),
+            "the boundary holds it"
+        );
+    }
+
+    /// Copilot, #426: a scope is validated BEFORE it is recorded — relative roots, a missing graph
+    /// and the engine's own store are refused, and nothing is held for a refused chat.
+    #[test]
+    fn a_chat_scope_is_validated_before_it_is_recorded() {
+        let dir = scratch("chat-scope-validate");
+        let state = dir.join("state");
+        std::fs::create_dir_all(state.join("project-graphs").join("p1")).unwrap();
+        std::fs::write(state.join("core.db"), b"").unwrap();
+        let graph = state.join("project-graphs").join("p1").join("estate.db");
+        std::fs::write(&graph, b"").unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut r = AcpStepRunner::new(tx);
+        r.operational_home = Some(state.clone());
+        let base = ChatScope {
+            cwd: dir.join("chats").join("c1"),
+            code_graph_db: Some(graph.to_string_lossy().into_owned()),
+            read_roots: vec![repo.to_string_lossy().into_owned()],
+        };
+        // Valid: accepted (no seats to warm → nothing held, but no error).
+        assert!(r.chat_open("ok", &[], base.clone()).is_ok());
+        // A relative read root.
+        let err = r
+            .chat_open(
+                "rel",
+                &[],
+                ChatScope {
+                    read_roots: vec!["repos/x".into()],
+                    ..base.clone()
+                },
+            )
+            .expect_err("relative root");
+        assert!(err.contains("not absolute"), "{err}");
+        // A relative scratch root.
+        let err = r
+            .chat_open(
+                "relcwd",
+                &[],
+                ChatScope {
+                    cwd: std::path::PathBuf::from("chats/c1"),
+                    ..base.clone()
+                },
+            )
+            .expect_err("relative cwd");
+        assert!(err.contains("not absolute"), "{err}");
+        // A graph that does not exist.
+        let err = r
+            .chat_open(
+                "nograph",
+                &[],
+                ChatScope {
+                    code_graph_db: Some(dir.join("missing.db").to_string_lossy().into_owned()),
+                    ..base.clone()
+                },
+            )
+            .expect_err("missing graph");
+        assert!(err.contains("no code graph"), "{err}");
+        // The engine's OWN store (a top-level file of its state home) is never a chat's graph.
+        let err = r
+            .chat_open(
+                "opstore",
+                &[],
+                ChatScope {
+                    code_graph_db: Some(state.join("core.db").to_string_lossy().into_owned()),
+                    ..base.clone()
+                },
+            )
+            .expect_err("operational store");
+        assert!(err.contains("FINDING-067"), "{err}");
+        // …nor reached through a link elsewhere (Copilot, #426): judged on the resolved file.
+        #[cfg(unix)]
+        {
+            let link = dir.join("innocent-graph.db");
+            std::os::unix::fs::symlink(state.join("core.db"), &link).unwrap();
+            let err = r
+                .chat_open(
+                    "oplink",
+                    &[],
+                    ChatScope {
+                        code_graph_db: Some(link.to_string_lossy().into_owned()),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("symlink to the operational store");
+            assert!(err.contains("FINDING-067"), "{err}");
+            let hard = dir.join("hard-graph.db");
+            std::fs::hard_link(state.join("core.db"), &hard).unwrap();
+            let err = r
+                .chat_open(
+                    "ophard",
+                    &[],
+                    ChatScope {
+                        code_graph_db: Some(hard.to_string_lossy().into_owned()),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("hard link to the operational store");
+            assert!(err.contains("FINDING-067"), "{err}");
+        }
+        // The scratch root must be a directory of its own under the system temp dir — never the
+        // filesystem root (`/`, or `C:\` on Windows — spelled from the temp dir's own root so the
+        // case is absolute on every platform), the temp dir itself, the state home or a home
+        // directory (Copilot, #426).
+        let fs_root = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("a path has a root")
+            .to_path_buf();
+        for bad in [
+            fs_root,
+            std::env::temp_dir(),
+            state.clone(),
+            state.join("chats"),
+        ] {
+            let err = r
+                .chat_open(
+                    "badcwd",
+                    &[],
+                    ChatScope {
+                        cwd: bad.clone(),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("dangerous cwd");
+            assert!(
+                err.contains("system temp") || err.contains("state home"),
+                "{}: {err}",
+                bad.display()
+            );
+        }
+        // A read root inside the engine's state home, or overlapping the scratch root, is refused.
+        for (root, needle) in [
+            (state.join("project-graphs"), "state home"),
+            (base.cwd.clone(), "overlaps"),
+            (base.cwd.parent().unwrap().to_path_buf(), "overlaps"),
+        ] {
+            let err = r
+                .chat_open(
+                    "badroot",
+                    &[],
+                    ChatScope {
+                        read_roots: vec![root.to_string_lossy().into_owned()],
+                        ..base.clone()
+                    },
+                )
+                .expect_err("dangerous read root");
+            assert!(err.contains(needle), "{}: {err}", root.display());
+        }
+        // Nothing was recorded for any refused chat.
+        assert!(r.chat_scopes.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot, #426: a turn's eviction removes only the process IT ran on — a replacement warmed
+    /// under the same key by a re-open with a new scope survives the old turn's cleanup.
+    #[test]
+    #[cfg(unix)]
+    fn evicting_a_chat_seat_removes_only_the_process_the_turn_ran_on() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("chat-evict-identity");
+        let script = stub_idle_bridge(&dir);
+        let a = Arc::new(Mutex::new(
+            start_acp_process(&stub_config(&script, None), &dir, None, None).expect("a"),
+        ));
+        let b = Arc::new(Mutex::new(
+            start_acp_process(&stub_config(&script, None), &dir, None, None).expect("b"),
+        ));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let key = (AcpStepRunner::chat_pool_key("c1"), "claude".to_string());
+        r.sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(Arc::clone(&a)));
+        // The old turn (ran on `b`, since replaced) fails: the replacement `a` stays.
+        r.chat_evict("c1", "claude", &b);
+        assert!(r.sessions.lock().unwrap().contains_key(&key));
+        // A turn on `a` itself fails: its own entry goes.
+        r.chat_evict("c1", "claude", &a);
+        assert!(!r.sessions.lock().unwrap().contains_key(&key));
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot, #426: a chat's read roots are READ-ONLY for every seat — a permission request to
+    /// write under a scoped repository is answered with the agent's reject option, a read under it
+    /// and a write in the scratch root with allow, and anything outside both is refused.
+    #[test]
+    fn a_chat_boundary_denies_writes_under_the_read_roots_and_anything_outside() {
+        let dir = scratch("chat-boundary");
+        let cwd = dir.join("scratch");
+        let repo = dir.join("repo");
+        let outside = dir.join("elsewhere");
+        for d in [&cwd, &repo, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let scope = ChatScope {
+            cwd: cwd.clone(),
+            code_graph_db: None,
+            read_roots: vec![repo.to_string_lossy().into_owned()],
+        };
+        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Codex);
+        let request = |tool: &str, path: &std::path::Path| {
+            json!({
+                "sessionId": "s1",
+                "toolName": tool,
+                "toolCall": {"toolCallId": "t1", "rawInput": {
+                    "file_path": path.to_string_lossy(), "content": "x"}},
+                "options": [
+                    {"optionId": "allow", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"},
+                ],
+            })
+        };
+        let answer = |tool: &str, path: &std::path::Path| {
+            let (v, allowed) =
+                crate::acp_permission::chat_boundary_result(&boundary, &request(tool, path));
+            (
+                v["outcome"]["optionId"].as_str().unwrap().to_string(),
+                allowed,
+            )
+        };
+        assert_eq!(
+            answer("Write", &repo.join("src.rs")),
+            ("reject".to_string(), false),
+            "a write under a read root is refused"
+        );
+        assert_eq!(
+            answer("Edit", &repo.join("src.rs")),
+            ("reject".to_string(), false)
+        );
+        assert_eq!(
+            answer("Read", &repo.join("src.rs")),
+            ("allow".to_string(), true),
+            "a read under a read root is allowed"
+        );
+        assert_eq!(
+            answer("Write", &cwd.join("notes.md")),
+            ("allow".to_string(), true),
+            "the scratch root is writable"
+        );
+        assert_eq!(
+            answer("Write", &outside.join("x")),
+            ("reject".to_string(), false),
+            "nothing outside the boundary is writable"
+        );
+        assert_eq!(
+            answer("Read", &outside.join("x")),
+            ("reject".to_string(), false),
+            "nothing outside the boundary is readable either — the scope IS what the seats see"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot, #426: distinct chat ids never share a default scratch root — the readable prefix
+    /// is lossy, the hash of the full id is not.
+    #[test]
+    fn distinct_chat_ids_get_distinct_default_scratch_roots() {
+        let roots: Vec<std::path::PathBuf> = ["a/b", "a_b", "a b", ".", "", "..", "x", "X"]
+            .iter()
+            .map(|id| ChatScope::scratch_for(id))
+            .collect();
+        for (i, a) in roots.iter().enumerate() {
+            for b in &roots[i + 1..] {
+                assert_ne!(a, b, "two ids collapsed onto one root");
+            }
+            assert!(a.is_absolute());
+            let name = a.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("wicked-core-chat-"), "{name}");
+            assert!(
+                !name.contains('/') && !name.contains(' ') && !name.contains(".."),
+                "the root's own name never spells a path: {name}"
+            );
+        }
+        assert_eq!(
+            ChatScope::scratch_for("same"),
+            ChatScope::scratch_for("same"),
+            "deterministic"
+        );
+    }
+
+    /// Copilot, #426: the scratch root is never reached through a planted link — a symlink where
+    /// the chat's cwd should be refuses the ensure before any seat spawns.
+    #[test]
+    #[cfg(unix)]
+    fn a_planted_symlink_at_the_chat_scratch_root_refuses_the_seat() {
+        let dir = scratch("chat-scratch-link");
+        let operator_like = dir.join("operator-home");
+        std::fs::create_dir_all(&operator_like).unwrap();
+        let linked = dir.join("chat-cwd");
+        std::os::unix::fs::symlink(&operator_like, &linked).unwrap();
+        let err = ensure_chat_scratch_root(&linked).expect_err("a planted link is refused");
+        assert!(err.contains("symlink"), "{err}");
+        // A relative root would resolve against the daemon's cwd — refused (Copilot, #426).
+        let err = ensure_chat_scratch_root(std::path::Path::new("chats/c1")).expect_err("relative");
+        assert!(err.contains("relative"), "{err}");
+        // A real (or not-yet-existing) directory is created private; an existing too-open one is
+        // made private rather than left as found.
+        let fresh = dir.join("fresh").join("nested");
+        ensure_chat_scratch_root(&fresh).expect("creates");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_chat_scratch_root(&fresh).expect("idempotent");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "privacy is enforced, not merely granted at creation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9816,9 +11284,7 @@ transport = "stdio"
         let r = AcpStepRunner::new(tx);
         seed_chat(&r, "c1", MAX_BACKDATE);
 
-        assert!(r
-            .chat_ensure("c1", "no-such-cli-xyz", &std::env::temp_dir())
-            .is_err());
+        assert!(r.chat_ensure("c1", "no-such-cli-xyz").is_err());
 
         assert!(
             r.chat_reap_idle(TEST_TTL).is_empty(),
@@ -9942,6 +11408,74 @@ transport = "stdio"
         assert!(listed[0].seats.is_empty());
     }
 
+    /// core#410 (F-068) — the STREAM gate: a pi banner arriving as the first delta(s) is held and
+    /// removed; everything else is released the moment it is known not to be a banner; a
+    /// banner-shaped head that never closes is content and is delivered at the end (loss-averse).
+    #[test]
+    fn the_banner_gate_holds_only_a_banner_head_and_releases_everything_else() {
+        let banner =
+            "pi v0.83.0\n---\n\n## Skills\n- /x/SKILL.md\n\n## Extensions\n- /z.ts\n\n---\n";
+        // Banner in one delta, then the answer: the banner is swallowed, the answer released.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push(banner), None);
+        assert_eq!(g.push("Hello"), Some("Hello".to_string()));
+        assert_eq!(
+            g.push(" world"),
+            Some(" world".to_string()),
+            "passthrough after release"
+        );
+        assert_eq!(g.finish(), None);
+        // Banner split across deltas — held until the closing `---`, then only the answer.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("pi v0.8"), None);
+        assert_eq!(g.push("3.0\n---\n## Skills\n- a\n"), None);
+        assert_eq!(g.push("---\nAnswer"), Some("Answer".to_string()));
+        // A banner observed twice (core#268) is removed twice.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push(&format!("{banner}{banner}")), None);
+        assert_eq!(g.push("A"), Some("A".to_string()));
+        // Ordinary text is released on the FIRST delta — nothing buffered.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("Sure, here is"), Some("Sure, here is".to_string()));
+        // A head that starts like the banner but diverges is released whole.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("pi v"), None);
+        assert_eq!(
+            g.push("ersion drift is fine"),
+            Some("pi version drift is fine".to_string())
+        );
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("pi v1.0\n"), None);
+        assert_eq!(
+            g.push("not a rule"),
+            Some("pi v1.0\nnot a rule".to_string())
+        );
+        // Leading line breaks alone are held (not yet content), then delivered with the text.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("\n"), None);
+        assert_eq!(g.push("Hi"), Some("\nHi".to_string()));
+        // An unterminated banner-shaped head is content: delivered at the end, never dropped.
+        let mut g = BannerGate::default();
+        let open = "pi v1.0\n---\n## Skills\n";
+        assert_eq!(g.push(open), None);
+        assert_eq!(g.finish(), Some(open.to_string()));
+        // The hold is bounded: past the cap a banner-shaped head is released as content — judged
+        // BEFORE retaining, so `held` never exceeds the cap even for one oversized chunk (Copilot).
+        let mut g = BannerGate::default();
+        let huge = format!("pi v1.0\n---\n{}", "x".repeat(BannerGate::HOLD_CAP + 1));
+        assert_eq!(g.push(&huge), Some(huge.clone()));
+        assert!(g.held.is_empty());
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("pi v1.0\n"), None);
+        let big = "y".repeat(BannerGate::HOLD_CAP);
+        assert_eq!(g.push(&big), Some(format!("pi v1.0\n{big}")));
+        assert!(g.held.is_empty(), "nothing is retained past the cap");
+        // `finish` on a complete banner with nothing after it delivers nothing.
+        let mut g = BannerGate::default();
+        assert_eq!(g.push(banner), None);
+        assert_eq!(g.finish(), None);
+    }
+
     /// core#268 — the banner strip is pattern-gated and loss-averse: it removes exactly the
     /// observed rpc-startup shapes and NOTHING else. Falsified by loosening the head gate (the
     /// legit-content arm fails) or by stripping without a closing `---` (the unterminated arm).
@@ -9992,8 +11526,7 @@ transport = "stdio"
     fn chat_ensure_fails_loud_for_unknown_cli_and_does_not_poison() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let r = AcpStepRunner::new(tx);
-        let cwd = std::env::temp_dir();
-        let err = match r.chat_ensure("c1", "no-such-cli-xyz", &cwd) {
+        let err = match r.chat_ensure("c1", "no-such-cli-xyz") {
             Err(e) => e,
             Ok(_) => panic!("unknown cli must fail"),
         };
@@ -10949,7 +12482,7 @@ transport = "stdio"
             "jsonrpc":"2.0","id":null,"method":"session/request_permission",
             "params":{"options":[{"optionId":"allow","kind":"allow_once"}]}
         });
-        answer_permission_request(&mut sink, &lock, None, &frame, &mut output, 4096);
+        answer_permission_request(&mut sink, &lock, None, None, &frame, &mut output, 4096);
         let answered: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&sink).unwrap().trim_end())
                 .expect("an explicit null id must still be answered");
@@ -10960,7 +12493,15 @@ transport = "stdio"
         let note_frame = serde_json::json!({
             "jsonrpc":"2.0","method":"session/request_permission","params":{}
         });
-        answer_permission_request(&mut sink2, &lock, None, &note_frame, &mut output, 4096);
+        answer_permission_request(
+            &mut sink2,
+            &lock,
+            None,
+            None,
+            &note_frame,
+            &mut output,
+            4096,
+        );
         assert!(sink2.is_empty(), "a notification must draw no response");
 
         // 3. A failed write is surfaced in the output, not swallowed.
@@ -10976,7 +12517,15 @@ transport = "stdio"
                 Ok(())
             }
         }
-        answer_permission_request(&mut BrokenPipe, &lock, None, &frame, &mut output, 4096);
+        answer_permission_request(
+            &mut BrokenPipe,
+            &lock,
+            None,
+            None,
+            &frame,
+            &mut output,
+            4096,
+        );
         assert!(
             output.contains("could not answer a permission request") && output.contains("closed"),
             "a lost permission response must be named in the output: {output:?}"
