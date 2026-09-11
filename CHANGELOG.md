@@ -15,6 +15,17 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **core-ts build-from-source fixed; CI now syntax-checks the finalizer.** #444 left four unescaped
+  backticks (`role`, `posture`, `role`) inside the template literal that `scripts/finalize-dts.mjs`
+  emits the `CoreEventJson` doc block from, so the script no longer parsed (`SyntaxError: Unexpected
+  identifier 'role'`) and `npm run build` / `build:debug` in `crates/wicked-core-ts` failed from
+  source — wicked-crew's CI step "Build wicked-core-ts from source" went red on every PR. The
+  published `wicked-core-ts@0.7.21` is unaffected: the release path ships the COMMITTED `index.d.ts`
+  and never runs the finalizer. Nothing here caught it because nothing EXECUTED the script — the
+  crate's lockstep test compares it as text (`include_str!`, unescaping \` first, so an escaped
+  and an unescaped backtick read the same) and the tsc step `npm ci --ignore-scripts`. The core-ts
+  CI job now `node --check`s the script AND runs it against the committed `index.d.ts`, requiring a
+  byte-identical result. No shipped artifact changes; no version bump.
 - **Creators keep `Write`/`Edit` inside their granted write roots; the read-only fence is for
   evaluators (acceptance finding F-4R2-004, wave 5).** F-036's read-only posture was keyed on the
   worktree guard's marker alone (`worktree_guarded` = `!executes_code && !tool`), which is a
