@@ -156,6 +156,9 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
     git(&repo, &["config", "user.email", "t@example.invalid"]);
     git(&repo, &["config", "user.name", "t"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
+    // The Windows runner checks out with `core.autocrlf=true`; the engine's restore goes through
+    // git's checkout, so a byte-exact LF assertion on a restored file needs the conversion off.
+    git(&repo, &["config", "core.autocrlf", "false"]);
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     std::fs::write(repo.join("src/app.ts"), "buggy\n").unwrap();
     if let Some(passes) = cargo_test {

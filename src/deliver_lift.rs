@@ -63,7 +63,8 @@ pub(crate) fn is_deliver_unit(unit: &crate::domain::WorkUnit) -> bool {
 /// What the lift concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiftOutcome {
-    /// The base was already the remote tip — nothing to lift, the verified tree ships.
+    /// The remote tip is already an ancestor of `HEAD` — the run's base is current (HEAD may
+    /// carry the run's own commits on top; the deliver rebase is a no-op) — nothing to lift.
     Unchanged,
     /// The remote moved; the run's changes were re-applied onto its tip in the worktree.
     Lifted,
@@ -758,25 +759,39 @@ pub(crate) fn lift_and_reverify(
     // F-433-002: the checks are REPOSITORY-controlled code — a "passing" script can edit a
     // tracked file or move HEAD, and the Tool path has no final worktree guard. Prove the tree
     // the checks certified is the tree that ships, or fail closed.
-    let after = crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root).map_err(|e| {
-        format!(
-            "deliver: the repository's checks passed but the worktree could not be \
-             re-snapshotted afterwards ({e}); nothing was pushed — the deliver gate never pushes \
-             a tree it cannot prove."
-        )
-    })?;
-    if after.tree != now.tree || after.head != now.head {
+    // A failed proof is a refusal WITH the `passed: false` evidence (Copilot, fourth pass) — a
+    // consumer must be able to tell "the proof failed" from "the checks never ran".
+    let after = match crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root) {
+        Ok(a) => a,
+        Err(e) => {
+            return refuse(
+                &checks,
+                format!(
+                    "deliver: the repository's checks passed but the worktree could not be \
+                     re-snapshotted afterwards ({e}); nothing was pushed — the deliver gate never \
+                     pushes a tree it cannot prove."
+                ),
+            )
+        }
+    };
+    // Tree, commit AND the ref HEAD is attached to (Copilot, fourth pass): a check that detaches
+    // HEAD or switches branches at the same tip would otherwise pass both comparisons and the
+    // deliver script would push from the wrong ref.
+    if after.tree != now.tree || after.head != now.head || after.head_ref != now.head_ref {
         return refuse(
             &checks,
             format!(
-                "deliver: the repository's checks passed but CHANGED the tree while running (tree \
-                 {} → {}, HEAD {} → {}) — a check script that edits tracked files or moves HEAD \
-                 leaves a tree nobody verified. Nothing was pushed. Inspect the worktree, fix or \
-                 ignore the check's writes, and approve to retry.",
+                "deliver: the repository's checks passed but CHANGED the worktree while running \
+                 (tree {} → {}, HEAD {} → {}, HEAD ref {:?} → {:?}) — a check script that edits \
+                 tracked files, moves HEAD or switches the branch leaves a tree nobody verified. \
+                 Nothing was pushed. Inspect the worktree, fix or ignore the check's writes, and \
+                 approve to retry.",
                 short(&now.tree),
                 short(&after.tree),
                 short(&now.head),
                 short(&after.head),
+                now.head_ref,
+                after.head_ref,
             ),
         );
     }

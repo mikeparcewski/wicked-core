@@ -594,6 +594,26 @@ pub(crate) fn restore_creator_tree(
                     added.path
                 );
             }
+            // No-follow walk of every parent component (Copilot on #433, fourth pass): a
+            // symlinked directory between the worktree root and the leaf would make
+            // `remove_file` delete a same-named file OUTSIDE the worktree. Refuse — the restore
+            // fails closed — rather than follow. (The evaluator's process group is quiesced
+            // before the restore, so the swap needs a process the engine already killed; this is
+            // the belt to that brace.)
+            let mut ancestor = worktree.to_path_buf();
+            for comp in rel.parent().into_iter().flat_map(|d| d.components()) {
+                ancestor.push(comp);
+                if let Ok(meta) = std::fs::symlink_metadata(&ancestor) {
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "refusing to delete `{}`: its parent `{}` is a symlink (would follow \
+                             out of the worktree)",
+                            added.path,
+                            ancestor.display()
+                        );
+                    }
+                }
+            }
             let p = worktree.join(rel);
             match std::fs::symlink_metadata(&p) {
                 Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
