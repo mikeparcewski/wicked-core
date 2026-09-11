@@ -13824,8 +13824,24 @@ os_sandbox = true
             .join("wicked-studio-brochure-r2-m-dmsg-10");
         std::fs::create_dir_all(&root).unwrap();
         let sub = |s: &str| s.replace("<ROOT>", root.to_str().unwrap());
-        let frame: serde_json::Value =
-            serde_json::from_str(&sub(&fixture["request_permission_frame"].to_string())).unwrap();
+        // Substitute INSIDE the parsed value's strings — never in the serialized JSON text, where
+        // a Windows temp path's backslashes read as escapes (windows-latest, first CI pass of this
+        // PR: "invalid escape"). The spelling is then judged literally, exactly as the runner sees
+        // it in `rawInput.file_path`.
+        fn substitute_root(v: &mut serde_json::Value, sub: &dyn Fn(&str) -> String) {
+            match v {
+                serde_json::Value::String(s) => *s = sub(s),
+                serde_json::Value::Array(items) => {
+                    items.iter_mut().for_each(|i| substitute_root(i, sub))
+                }
+                serde_json::Value::Object(map) => {
+                    map.values_mut().for_each(|i| substitute_root(i, sub))
+                }
+                _ => {}
+            }
+        }
+        let mut frame = fixture["request_permission_frame"].clone();
+        substitute_root(&mut frame, &sub);
         let unit_json = &fixture["unit"];
         let mut unit: crate::domain::WorkUnit = serde_json::from_value(unit_json.clone())
             .expect("the persisted unit shape deserializes");

@@ -58,7 +58,7 @@ Only `id` is required on a phase — everything else defaults:
 | `kind` | `"build"` | Methodology badge: `recon` \| `build` \| `review` \| `test`. |
 | `gate_type` | `null` | Where the gate sits in the ladder: `value` \| `strategy` \| `execution` (`null` = ungated). |
 | `gate` | `"auto"` | Confirm policy — see below. |
-| `executes_code` | `false` | Phase runs code (provisions a git worktree, enables code tools). |
+| `executes_code` | `false` | Phase changes the tree under review (provisions a git worktree, enables code tools). `false` means the phase does NOT change that tree — it is worktree-guarded and, unless it plays `creator`, read-only at the tool boundary. A `creator` phase with `executes_code: false` (a document/proposal deliverable) still writes into the run's declared `extra_write_roots` (F-4R2-004); a phase that must leave a file IN the tree declares `true`. |
 | `verified_evidence` | `false` | Phase verdict must re-run the pinned verifier (re-verified evidence). |
 | `required_deliverables` | `[]` | Files that MUST exist for the structural gate (fail-closed if missing). |
 | `depends_on` | `[]` | Phase ids that must finish first (intra-workflow DAG; validated acyclic). |
