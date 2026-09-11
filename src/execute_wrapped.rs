@@ -340,9 +340,12 @@ const DENIED_BASH: &[&str] = &[
 /// deny rules would still apply — but no live probe has confirmed that here (a probe needs a
 /// logged-in worker home, which a read-only review cannot use), and the earlier "inert" claim was
 /// not re-measured on this version. Workers are pinned to `acceptEdits` below regardless, so
-/// nothing rests on the answer for them; the council's seat dispatch DOES pass the trust flag
-/// ([`wicked_council::dispatch`]) and reads the same shared settings file, so for seat votes the
-/// fence is exactly as live as that sentence turns out to be. The real boundary belongs in the
+/// nothing rests on the answer for them. The council's seat dispatch DOES pass the trust flag
+/// ([`wicked_council::dispatch`]) and creates no fence of its own: it reads the shared
+/// `settings.json` ONLY when an ACP worker spawn has already written it
+/// (`acp_runner::ensure_worker_config_home` is the sole writer), so a council-first ballot runs
+/// with no deny fence at all, and even with the file present the fence is only as live for seat
+/// votes as that sentence turns out to be. The real boundary belongs in the
 /// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
 /// closes the observed leaks in the meantime and does not pretend to close the class.
 ///
@@ -399,8 +402,9 @@ pub(crate) fn inject_isolation_flags(
         ),
         (
             "--permission-mode",
-            "workers always run under `--permission-mode acceptEdits` (`bypassPermissions`/`auto` \
-             make every deny rule inert)",
+            "workers always run under `--permission-mode acceptEdits` (`auto` was measured to bypass \
+             every deny rule; whether `bypassPermissions` keeps explicit deny rules is unmeasured \
+             on the current CLI — the mode is the engine's to state either way)",
         ),
     ] {
         if argv_states(&stated, &[flag]) {
@@ -423,11 +427,13 @@ pub(crate) fn inject_isolation_flags(
         // under `acceptEdits` got "Claude requested permissions to write to …" with the mode left
         // unset. So the mode has to be stated, not inherited.
         //
-        // `acceptEdits` and not `bypassPermissions`/`auto`: both of those make the deny rules
-        // below inert. Measured on the live CLI with an identical probe — under `acceptEdits` the
-        // read of the operator's config was refused by the rule, under `auto` it went straight
-        // through, and under `--dangerously-skip-permissions` likewise. `acceptEdits` is the only
-        // mode where a worker can do its job AND stay inside the boundary.
+        // `acceptEdits` and not `bypassPermissions`/`auto`. Measured on an EARLIER live CLI with an
+        // identical probe — under `acceptEdits` the read of the operator's config was refused by
+        // the rule, under `auto` it went straight through, and under
+        // `--dangerously-skip-permissions` likewise. On 2.1.268 the CLI's own SDK text says
+        // `bypassPermissions` keeps explicit deny rules; that is UNMEASURED here (see the LIMITS
+        // note on `inject_isolation_flags`) and nothing below depends on it: `acceptEdits` is the
+        // only mode where a worker can do its job AND is known to stay inside the boundary.
         flags.push("--permission-mode".into());
         flags.push("acceptEdits".into());
     }
@@ -7289,8 +7295,9 @@ mod tests {
         assert_eq!(
             flag_value(&argv, "--permission-mode"),
             Some("acceptEdits"),
-            "`auto` and `bypassPermissions` both make --disallowedTools inert (measured); \
-             acceptEdits is the only mode that lets a worker write AND stay inside the boundary"
+            "`auto` was measured to make --disallowedTools inert and `bypassPermissions` is \
+             unmeasured on the current CLI; acceptEdits is the only mode known to let a worker \
+             write AND stay inside the boundary"
         );
     }
 
