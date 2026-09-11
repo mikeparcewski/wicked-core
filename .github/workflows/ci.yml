@@ -77,6 +77,25 @@ jobs:
           cargo clippy --manifest-path crates/wicked-core-ts/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path crates/wicked-core-ts/Cargo.toml
 
+      # `scripts/finalize-dts.mjs` is the ONLY producer of `index.d.ts`'s hand-authored block, and
+      # `npm run build` / `build:debug` end by running it — yet until now no gate here EXECUTED it:
+      # the lockstep cargo test above reads the script as TEXT (`include_str!`, unescaping \` before
+      # it compares, so an escaped and an unescaped backtick read the same), and the tsc step below
+      # `npm ci --ignore-scripts` over the committed `index.d.ts`. #444 shipped four unescaped
+      # backticks inside the template literal — a SyntaxError that turned build-from-source red in
+      # every consumer (wicked-crew CI's "Build wicked-core-ts from source") while every gate here
+      # stayed green. So: parse the script, then run it against the committed `index.d.ts`
+      # (idempotent by contract: strip the old block, re-append) and require a byte-identical file.
+      # `shell: bash` so every line gates on every runner (pwsh does not stop on a native command's
+      # exit code mid-script); `.gitattributes` pins `*.d.ts` to LF, so the Windows diff is clean.
+      - name: core-ts finalize-dts.mjs parses and reproduces the committed index.d.ts
+        working-directory: wicked-core/crates/wicked-core-ts
+        shell: bash
+        run: |
+          node --check scripts/finalize-dts.mjs
+          node scripts/finalize-dts.mjs
+          git diff --exit-code -- index.d.ts
+
       # The binding's hand-authored TypeScript contract (`CoreEventJson`, `UnitDistributedEventJson`
       # — `scripts/finalize-dts.mjs`, shipped in `index.d.ts`) is asserted at COMPILE time over the
       # committed `index.d.ts` (`types-test/`, core#401): a loosened or drifted declaration fails

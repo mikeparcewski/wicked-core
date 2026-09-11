@@ -46,10 +46,10 @@ const HAND_AUTHORED = `${BEGIN}
  * baseRef, baseBefore, baseAfter, treeBefore, treeAfter, conflicts, note} (the deliver phase's
  * lift onto the remote tip, re-verified when it changed the tree); evaluatorToolCallDenied
  * {session, ord, attempt, cli, carrier, tool, kind, path, role, posture, reason} (a write-class
- * tool call a FENCED unit made was refused at the ACP permission boundary — `role` names the
- * unit's actual role, `posture` is 'read-only' for an executes_code:false evaluator/recon rung or
+ * tool call a FENCED unit made was refused at the ACP permission boundary — \`role\` names the
+ * unit's actual role, \`posture\` is 'read-only' for an executes_code:false evaluator/recon rung or
  * 'deliverable-roots' for a bound creator writing outside its granted write roots; the type
- * name is historical, read `role`); runBaseResolved
+ * name is historical, read \`role\`); runBaseResolved
  * {session, baseRef, baseCommit, localHead, behind, fetched, lifted, note} (which base a fresh
  * run worktree was minted from).
  */
