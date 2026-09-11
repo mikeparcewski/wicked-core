@@ -730,7 +730,7 @@ pub(crate) fn apply_and_finish_unit(
     attempt: u32,
     governed: bool,
     cli_keys: &[String],
-    agent_verdict: Option<&(bool, String)>,
+    agent_verdict: Option<&crate::validator::AgentVerdict>,
     evidence: &crate::workflow::UnitEvidence,
     emit: &mut dyn FnMut(CoreEvent),
     db_path: Option<&str>,
@@ -790,7 +790,25 @@ pub(crate) fn apply_and_finish_unit(
                     after_tree: m.after.tree.clone(),
                     head_moved: m.head_moved,
                     changed: m.changed.clone(),
+                    restored: m.restored,
+                    restore_error: m.restore_error.clone(),
                 });
+                // core#431 (F-3R2-010): the worker thread already put the creator's tree back
+                // (`cli_runner::run_unit_and_judge` → `worktree_guard::restore_creator_tree`);
+                // record WHAT was discarded so the ledger and the studio can show it.
+                if m.restored {
+                    emit(CoreEvent::WorktreeRestored {
+                        session: session_id.to_string(),
+                        ord: unit.ord,
+                        attempt,
+                        cli: unit.assigned_cli.clone().unwrap_or_default(),
+                        phase: unit.phase_id().unwrap_or_default().to_string(),
+                        tree: m.before.tree.clone(),
+                        head: (m.head_moved && !m.before.head.is_empty())
+                            .then(|| m.before.head.clone()),
+                        discarded: m.changed.clone(),
+                    });
+                }
                 m.denies()
                     .then(|| crate::worktree_guard::denial_reason(unit, m))
             }
@@ -999,12 +1017,17 @@ pub(crate) fn apply_and_finish_unit(
     // approved validator + a workdir); otherwise honestly `None`. `combined` is the full deny-dominance
     // result (all layers), identical to `GateDecided.allow`.
     let (agent_verdict_str, agent_reasoning) = match agent_verdict {
-        Some((pass, reasoning)) => (
-            Some(if *pass { "pass" } else { "reject" }.to_string()),
-            Some(reasoning.clone()),
+        Some(av) => (
+            Some(if av.pass { "pass" } else { "reject" }.to_string()),
+            Some(av.reasoning.clone()),
         ),
         None => (None, None),
     };
+    // (core#431, F-3R2-007) WHO judged: the seat the layer-2 judge ran under and whether it was
+    // identity-distinct from the work's author — `None` when no judge ran, so evaluator ≠ creator
+    // can be verified from the event stream instead of trusted.
+    let judge_cli = agent_verdict.and_then(|av| av.judge_cli.clone());
+    let judge_distinct = agent_verdict.and_then(|av| av.judge_distinct);
     // (M5) HONEST criterion: `Some` ONLY when a pinned validator gated this unit (its criterion); `None`
     // for an ungated phase — the unit description is never relabeled a "criterion". `has_deterministic_floor`
     // makes the ungated case explicit so `deterministic_pass` (vacuously true with no floor) isn't misread.
@@ -1057,6 +1080,8 @@ pub(crate) fn apply_and_finish_unit(
         denial_reason,
         denial,
         combined: outcome.approved,
+        judge_cli,
+        judge_distinct,
     });
     emit(CoreEvent::GateDecided {
         session: session_id.to_string(),
@@ -1205,16 +1230,12 @@ fn denial_for_outcome(
 /// structural phase) OR an agent PASS ⇒ `None` (no denial). PURE + actor-safe: the LLM already ran on
 /// the worker thread; this only interprets the `(pass, reasoning)` it produced. `combine_verdict`
 /// guarantees the agent can FAIL a gate but is never the sole approver.
-fn agent_verdict_denial(agent: Option<&(bool, String)>) -> Option<String> {
-    let (pass, reasoning) = agent?;
-    let verdict = crate::validator::AgentVerdict {
-        pass: *pass,
-        reasoning: reasoning.clone(),
-    };
-    match crate::validator::combine_verdict(true, Some(&verdict)) {
+fn agent_verdict_denial(agent: Option<&crate::validator::AgentVerdict>) -> Option<String> {
+    let verdict = agent?;
+    match crate::validator::combine_verdict(true, Some(verdict)) {
         crate::validator::GateVerdict::Approve => None,
         crate::validator::GateVerdict::Reject => {
-            Some(format!("agent validator rejected: {reasoning}"))
+            Some(format!("agent validator rejected: {}", verdict.reasoning))
         }
     }
 }
@@ -1537,14 +1558,24 @@ mod resolve_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A judge verdict with no seat attribution — the shape the fold tests need.
+    fn av(pass: bool, reasoning: &str) -> crate::validator::AgentVerdict {
+        crate::validator::AgentVerdict {
+            pass,
+            reasoning: reasoning.to_string(),
+            judge_cli: None,
+            judge_distinct: None,
+        }
+    }
+
     #[test]
     fn agent_verdict_denial_folds_the_rev04_combine_rule() {
         // No agent verdict (no pinned validator / structural phase) ⇒ no denial.
         assert!(agent_verdict_denial(None).is_none());
         // Agent PASS ⇒ no denial (deterministic side already passed to reach here).
-        assert!(agent_verdict_denial(Some(&(true, "looks good".into()))).is_none());
+        assert!(agent_verdict_denial(Some(&av(true, "looks good"))).is_none());
         // Agent REJECT ⇒ denial (deny-dominates); the reason is carried through for the UI.
-        let denial = agent_verdict_denial(Some(&(false, "diverged from criterion".into())));
+        let denial = agent_verdict_denial(Some(&av(false, "diverged from criterion")));
         assert!(
             denial
                 .as_deref()
@@ -1561,10 +1592,7 @@ mod resolve_tests {
         // off-thread agent verdict is REJECT; the fold must flip the unit to denied and record why.
         let mut approved = true;
         let mut denial_reason: Option<String> = None;
-        let agent = (
-            false,
-            "output does not satisfy the acceptance criterion".to_string(),
-        );
+        let agent = av(false, "output does not satisfy the acceptance criterion");
         if approved {
             if let Some(reason) = agent_verdict_denial(Some(&agent)) {
                 approved = false;
@@ -1580,7 +1608,7 @@ mod resolve_tests {
         // Mirror: an agent PASS leaves an approved unit approved (the agent never lone-approves, but it
         // also must not spuriously deny a passing unit).
         let mut approved2 = true;
-        if approved2 && agent_verdict_denial(Some(&(true, "ok".into()))).is_some() {
+        if approved2 && agent_verdict_denial(Some(&av(true, "ok"))).is_some() {
             approved2 = false;
         }
         assert!(approved2, "agent PASS must not flip an approved unit");

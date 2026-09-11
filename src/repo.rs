@@ -675,6 +675,161 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
 /// `master` of the operator's real clone. A cwd is not a boundary; the worktree is, so its existence
 /// has to be verified rather than inferred from a stat.
 pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf> {
+    create_worktree_based(repo_root, run_id).map(|(wt, _)| wt)
+}
+
+/// How a freshly minted run worktree's BASE commit was chosen (core#431, F-3R2-013).
+///
+/// The acceptance run branched from the registered clone's `HEAD`, five commits behind
+/// `origin/main` (the clone had not been pulled while the program ran); nothing fetched before
+/// the fix phase, so the worker fixed stale code and the deliver rebase later conflicted on a
+/// generated file. The engine now fetches `origin` and, when `HEAD` is strictly BEHIND the remote
+/// default branch (a fast-forward), bases the run on the remote tip. `HEAD` stays the base when it
+/// is the tip already, when it is ahead of/diverged from it (the operator's local unpushed work is
+/// theirs to keep — the deliver rebase handles that history as before), and when there is no
+/// remote or no resolvable default ref. Never fatal: a failed fetch is disclosed in `note` and the
+/// resolution falls back to whatever `origin/*` the clone already has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBase {
+    /// The remote default ref consulted (`origin/main`), when one was resolved.
+    pub base_ref: Option<String>,
+    /// The commit the worktree was created from.
+    pub commit: String,
+    /// The clone's `HEAD` at the time.
+    pub local_head: String,
+    /// Commits `local_head` was behind `base_ref` (0 when not lifted).
+    pub behind: u32,
+    /// Whether `git fetch origin` succeeded.
+    pub fetched: bool,
+    /// `true` when `commit` is the remote tip rather than `local_head`.
+    pub lifted: bool,
+    pub note: Option<String>,
+}
+
+impl RunBase {
+    fn from_head(head: &str, fetched: bool, note: impl Into<String>) -> Self {
+        RunBase {
+            base_ref: None,
+            commit: head.to_string(),
+            local_head: head.to_string(),
+            behind: 0,
+            fetched,
+            lifted: false,
+            note: Some(note.into()),
+        }
+    }
+
+    /// The wire record of this resolution (`runBaseResolved`).
+    pub(crate) fn to_event(&self, session: &str) -> crate::event::CoreEvent {
+        crate::event::CoreEvent::RunBaseResolved {
+            session: session.to_string(),
+            base_ref: self.base_ref.clone(),
+            base_commit: self.commit.clone(),
+            local_head: self.local_head.clone(),
+            behind: self.behind,
+            fetched: self.fetched,
+            lifted: self.lifted,
+            note: self.note.clone(),
+        }
+    }
+}
+
+/// Decide the base commit for a new run worktree of `repo_root` — see [`RunBase`].
+fn resolve_run_base(repo_root: &str) -> anyhow::Result<RunBase> {
+    let (ok, head, err) = git(repo_root, &["rev-parse", "HEAD"])?;
+    if !ok || head.is_empty() {
+        anyhow::bail!("{repo_root}: cannot resolve HEAD: {err}");
+    }
+    let (has_origin, _, _) = git(repo_root, &["remote", "get-url", "origin"])?;
+    if !has_origin {
+        return Ok(RunBase::from_head(
+            &head,
+            false,
+            "no `origin` remote — the run starts from the clone's HEAD",
+        ));
+    }
+    let root = Path::new(repo_root);
+    let (fetched, fetch_note) = match crate::deliver_lift::fetch_origin(root) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(format!("`git fetch origin` failed ({e})"))),
+    };
+    let Some(base_ref) = crate::deliver_lift::resolve_remote_default(root) else {
+        let mut note = "no remote default ref (origin/HEAD, origin/main) — the run starts from \
+                        the clone's HEAD"
+            .to_string();
+        if let Some(f) = fetch_note {
+            note.push_str(&format!("; {f}"));
+        }
+        return Ok(RunBase::from_head(&head, fetched, note));
+    };
+    let (ok, tip, err) = git(repo_root, &["rev-parse", &format!("{base_ref}^{{commit}}")])?;
+    if !ok || tip.is_empty() {
+        return Ok(RunBase::from_head(
+            &head,
+            fetched,
+            format!("{base_ref} does not resolve ({err}) — the run starts from the clone's HEAD"),
+        ));
+    }
+    let join_note = |base: &str, extra: Option<String>| -> Option<String> {
+        match extra {
+            Some(f) => Some(format!("{base}; {f}")),
+            None => (!base.is_empty()).then(|| base.to_string()),
+        }
+    };
+    if tip == head {
+        return Ok(RunBase {
+            base_ref: Some(base_ref),
+            commit: head.clone(),
+            local_head: head,
+            behind: 0,
+            fetched,
+            lifted: false,
+            note: join_note("", fetch_note),
+        });
+    }
+    // Strictly BEHIND (a fast-forward): base on the remote tip. Ahead of or diverged from it:
+    // keep HEAD — the operator's local commits are theirs, and folding them into the run's base
+    // would ship them under the run's name.
+    let (is_behind, _, _) = git(repo_root, &["merge-base", "--is-ancestor", &head, &tip])?;
+    if !is_behind {
+        return Ok(RunBase {
+            base_ref: Some(base_ref.clone()),
+            commit: head.clone(),
+            local_head: head,
+            behind: 0,
+            fetched,
+            lifted: false,
+            note: join_note(
+                &format!(
+                    "the clone's HEAD has commits {base_ref} lacks (local unpushed work or a \
+                     divergence) — kept as the run's base; the deliver rebase handles that history"
+                ),
+                fetch_note,
+            ),
+        });
+    }
+    let (_, count, _) = git(
+        repo_root,
+        &["rev-list", "--count", &format!("{head}..{tip}")],
+    )?;
+    let behind = count.trim().parse::<u32>().unwrap_or(0);
+    Ok(RunBase {
+        base_ref: Some(base_ref),
+        commit: tip,
+        local_head: head,
+        behind,
+        fetched,
+        lifted: true,
+        note: join_note("", fetch_note),
+    })
+}
+
+/// [`create_worktree`], also reporting HOW the base was chosen — `Some(RunBase)` for a freshly
+/// minted worktree, `None` when a live worktree was reused (a genuine resume keeps its history).
+pub fn create_worktree_based(
+    repo_root: &str,
+    run_id: &str,
+) -> anyhow::Result<(PathBuf, Option<RunBase>)> {
     let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
         if is_live_worktree(&wt) {
@@ -693,7 +848,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
                 // pre-provisioned for exactly this run (crew#390/#391) — adopt it.
                 None => stamp_worktree_owner(&wt, run_id),
             }
-            return Ok(wt); // genuine resume — reuse it
+            return Ok((wt, None)); // genuine resume — reuse it
         }
         // Not a worktree. Recoverable only while it holds nothing: an empty shell can be cleared and
         // re-added, and `worktree add` accepts an existing empty directory anyway. Anything else is
@@ -721,16 +876,44 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
     ensure_worktrees_excluded(repo_root);
     let branch = worktree_branch(run_id);
     let wt_str = wt.to_string_lossy().to_string();
-    let (ok, _, err) = git(repo_root, &["worktree", "add", &wt_str, "-b", &branch])?;
+    // core#431 (F-3R2-013): the base is the remote default branch's CURRENT tip when the clone
+    // is behind it — the worker starts from the code that is actually on `main`, so the deliver
+    // lift has nothing to move and cannot conflict on what landed while the run was queued.
+    let base = resolve_run_base(repo_root)?;
+    eprintln!(
+        "wicked-core: run {run_id} worktree based on {} ({}){}{}",
+        base.base_ref.as_deref().unwrap_or("HEAD"),
+        &base.commit[..base.commit.len().min(10)],
+        if base.lifted {
+            format!(
+                " — the clone's HEAD {} was {} commit(s) behind; lifted to the remote tip",
+                &base.local_head[..base.local_head.len().min(10)],
+                base.behind
+            )
+        } else {
+            String::new()
+        },
+        base.note
+            .as_deref()
+            .map(|n| format!(" [{n}]"))
+            .unwrap_or_default()
+    );
+    let (ok, _, err) = git(
+        repo_root,
+        &["worktree", "add", &wt_str, "-b", &branch, &base.commit],
+    )?;
     if !ok {
-        // A stale branch from a prior run can block re-add; retry without -b (reuse the branch).
+        // A stale branch from a prior run can block re-add; retry without -b (reuse the branch —
+        // and ITS history, so no base is reported for it).
         let (ok2, _, err2) = git(repo_root, &["worktree", "add", &wt_str, &branch])?;
         if !ok2 {
             anyhow::bail!("git worktree add failed: {err}{err2}");
         }
+        stamp_worktree_owner(&wt, run_id);
+        return Ok((wt, None));
     }
     stamp_worktree_owner(&wt, run_id);
-    Ok(wt)
+    Ok((wt, Some(base)))
 }
 
 /// Remove a run's worktree unconditionally (best-effort — a failure to clean up is logged, not
@@ -1862,6 +2045,171 @@ mod tests {
         );
         assert!(!is_live_worktree(&empty));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#431 (F-3R2-013), the stale-base scenario: the registered clone is behind `origin/main`
+    /// (commits landed while the run was queued; nobody pulled). A new run worktree must be based
+    /// on the REMOTE tip — fetched first — not on the clone's stale `HEAD`, and the resolution
+    /// must say so (`lifted`, `behind`). A clone that is AHEAD of the remote keeps its `HEAD`
+    /// (local unpushed work is the operator's), disclosed; a repo with no remote keeps `HEAD` too.
+    #[test]
+    fn a_new_run_worktree_is_based_on_the_remote_tip_when_the_clone_is_stale() {
+        fn sh(cwd: &Path, args: &[&str]) -> String {
+            // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        fn identity(repo: &Path) {
+            sh(repo, &["config", "user.email", "t@example.invalid"]);
+            sh(repo, &["config", "user.name", "t"]);
+            sh(repo, &["config", "commit.gpgsign", "false"]);
+        }
+        let base = std::env::temp_dir().join(format!(
+            "wicked-core-runbase-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        sh(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("a.txt"), "a\n").unwrap();
+        sh(&seed, &["add", "-A"]);
+        sh(&seed, &["commit", "-qm", "base"]);
+        let origin = base.join("origin.git");
+        sh(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        sh(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        // The operator's clone — the REGISTERED repo — left stale from here on.
+        let clone = base.join("clone");
+        sh(
+            &base,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        identity(&clone);
+        let stale_head = sh(&clone, &["rev-parse", "HEAD"]);
+        // Two commits land on origin from elsewhere.
+        let other = base.join("other");
+        sh(
+            &base,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        identity(&other);
+        for n in 1..=2 {
+            std::fs::write(other.join(format!("landed{n}.txt")), "x\n").unwrap();
+            sh(&other, &["add", "-A"]);
+            sh(&other, &["commit", "-qm", &format!("landed {n}")]);
+        }
+        sh(&other, &["push", "-q", "origin", "main"]);
+        let tip = sh(&other, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            sh(&clone, &["rev-parse", "HEAD"]),
+            stale_head,
+            "premise: the clone is stale"
+        );
+
+        let (wt, resolved) = create_worktree_based(clone.to_str().unwrap(), "r-stale").unwrap();
+        let resolved = resolved.expect("a freshly minted worktree reports its base");
+        assert!(resolved.fetched, "{resolved:?}");
+        assert_eq!(resolved.base_ref.as_deref(), Some("origin/main"));
+        assert!(resolved.lifted, "{resolved:?}");
+        assert_eq!(resolved.behind, 2);
+        assert_eq!(resolved.local_head, stale_head);
+        assert_eq!(resolved.commit, tip, "the base IS the remote tip");
+        assert_eq!(
+            sh(&wt, &["rev-parse", "HEAD"]),
+            tip,
+            "the worker starts from the current tip, not the clone's stale HEAD"
+        );
+        assert!(
+            wt.join("landed2.txt").exists(),
+            "the landed code is in the tree"
+        );
+        assert_eq!(
+            sh(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "wicked/r-stale"
+        );
+        // The clone's own checkout is untouched (only its origin/* refs moved).
+        assert_eq!(sh(&clone, &["rev-parse", "HEAD"]), stale_head);
+        // The wire record.
+        match resolved.to_event("r-stale") {
+            crate::event::CoreEvent::RunBaseResolved {
+                session,
+                base_ref,
+                base_commit,
+                behind,
+                lifted,
+                ..
+            } => {
+                assert_eq!(session, "r-stale");
+                assert_eq!(base_ref.as_deref(), Some("origin/main"));
+                assert_eq!(base_commit, tip);
+                assert_eq!((behind, lifted), (2, true));
+            }
+            other => panic!("expected runBaseResolved, got {other:?}"),
+        }
+
+        // A clone AHEAD of the remote (local unpushed work): HEAD stays the base, disclosed.
+        sh(&clone, &["fetch", "-q", "origin"]);
+        sh(&clone, &["reset", "-q", "--hard", "origin/main"]);
+        std::fs::write(clone.join("local.txt"), "mine\n").unwrap();
+        sh(&clone, &["add", "-A"]);
+        sh(&clone, &["commit", "-qm", "local unpushed"]);
+        let ahead = sh(&clone, &["rev-parse", "HEAD"]);
+        let (wt2, r2) = create_worktree_based(clone.to_str().unwrap(), "r-ahead").unwrap();
+        let r2 = r2.unwrap();
+        assert!(!r2.lifted && r2.behind == 0, "{r2:?}");
+        assert_eq!(r2.commit, ahead);
+        assert!(
+            r2.note
+                .as_deref()
+                .is_some_and(|n| n.contains("local unpushed work")),
+            "{:?}",
+            r2.note
+        );
+        assert_eq!(sh(&wt2, &["rev-parse", "HEAD"]), ahead);
+
+        // No remote at all: HEAD, disclosed.
+        let lone = base.join("lone");
+        std::fs::create_dir_all(&lone).unwrap();
+        sh(&lone, &["init", "-q", "-b", "main", "."]);
+        identity(&lone);
+        std::fs::write(lone.join("a.txt"), "a\n").unwrap();
+        sh(&lone, &["add", "-A"]);
+        sh(&lone, &["commit", "-qm", "base"]);
+        let (_, r3) = create_worktree_based(lone.to_str().unwrap(), "r-lone").unwrap();
+        let r3 = r3.unwrap();
+        assert!(r3.base_ref.is_none() && !r3.lifted && !r3.fetched, "{r3:?}");
+        assert!(r3
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("no `origin` remote")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

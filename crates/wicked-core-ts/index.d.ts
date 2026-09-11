@@ -653,8 +653,18 @@ export declare class Subscription {
  * PTY terminal sessions emit `terminalOpened` `{id, cwd}`, `terminalOutput` `{id, seq, bytesB64}`
  * (raw output base64-encoded in `bytesB64`), and `terminalExited` `{id, status}`.
  * Gate evidence (wicked-core F-036/F-039): evaluatorMutatedWorktree {session, ord, attempt, cli,
- * phase, beforeTree, afterTree, headMoved, changed} and repoChecksEvaluated {session,
- * ord, attempt, passed, criterion, checks, skipped}.
+ * phase, beforeTree, afterTree, headMoved, changed, restored, restoreError} and
+ * repoChecksEvaluated {session, ord, attempt, passed, criterion, checks, skipped}.
+ * core#431 additions: gateEvaluated carries `judgeCli: string | null` + `judgeDistinct: boolean |
+ * null` (who rendered agentVerdict); worktreeRestored {session, ord, attempt, cli, phase, tree,
+ * head, discarded} (the creator's tree was put back after an evaluator mutation);
+ * deliverLiftEvaluated {session, ord, attempt, outcome: 'unchanged'|'lifted'|'conflict'|'skipped',
+ * baseRef, baseBefore, baseAfter, treeBefore, treeAfter, conflicts, note} (the deliver phase's
+ * lift onto the remote tip, re-verified when it changed the tree); evaluatorToolCallDenied
+ * {session, ord, attempt, cli, carrier, tool, kind, path, reason} (a write-class tool call an
+ * executes_code:false phase made was refused at the ACP permission boundary); runBaseResolved
+ * {session, baseRef, baseCommit, localHead, behind, fetched, lifted, note} (which base a fresh
+ * run worktree was minted from).
  */
 export interface CoreEventJson {
   type: string

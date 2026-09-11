@@ -261,6 +261,17 @@ pub enum CoreEvent {
         /// denying layer was identified. Additive — consumers of the prose keep working.
         denial: Option<crate::domain::UnitDenial>,
         combined: bool,
+        /// (F-3R2-007, core#431) WHO rendered `agent_verdict`: the council seat key the layer-2
+        /// judge ran under, so "evaluator ≠ creator" for this gate is auditable from the event
+        /// stream alone (compare with the unit's `unitDistributed.cli`). `None` whenever no judge
+        /// ran (`agent_verdict == None`) — and on the bus-mediated path, where the evaluator
+        /// daemon's seat is not reported back.
+        judge_cli: Option<String>,
+        /// Whether that judge seat was IDENTITY-DISTINCT from the work's author (and the
+        /// deterministic validator's) — `Some(true)` for the rotation pick, `Some(false)` when the
+        /// judge fell back to the single default runner (prompt-only independence; see
+        /// `validator::AgentVerdict`). `None` when no judge ran or the seat is unknown.
+        judge_distinct: Option<bool>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
     /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;
@@ -629,6 +640,102 @@ pub enum CoreEvent {
         after_tree: String,
         head_moved: bool,
         changed: Vec<crate::worktree_guard::ChangedPath>,
+        /// (F-3R2-010, core#431) Whether the engine RESTORED the creator's tree (`before_tree`)
+        /// in the worktree right after detecting the mutation — so the retry a human approves
+        /// runs against the verified tree, never against the evaluator's edit. When `true`, a
+        /// `worktreeRestored` event follows with the discarded paths. `false` means the restore
+        /// failed or was not attempted (`restore_error` says why) and the operator-facing denial
+        /// keeps the manual `git read-tree` remedy.
+        restored: bool,
+        restore_error: Option<String>,
+    },
+    /// (F-3R2-010, core#431) The engine put the creator's tree back after an `executes_code:
+    /// false` phase changed it (`evaluatorMutatedWorktree` with `restored: true`): the run
+    /// branch's `HEAD` is back at the baseline commit when the phase had moved it, the index and
+    /// working tree match `tree` (the baseline the actor snapshotted at dispatch), and every path
+    /// the phase ADDED is deleted. `discarded` names exactly what the evaluator's edit was —
+    /// the same list the mutation event carried — so the ledger shows what was thrown away.
+    /// Emitted at the gate fold, before `gateEvaluated`; the gate's `denialReason` states the
+    /// restore, and the `awaitingHuman` prompt that follows says the retry runs against the
+    /// restored tree.
+    WorktreeRestored {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli: String,
+        phase: String,
+        /// The tree id the worktree was restored to (the creator's baseline).
+        tree: String,
+        /// The commit `HEAD` was reset to when the phase had moved it; `None` when it had not.
+        head: Option<String>,
+        discarded: Vec<crate::worktree_guard::ChangedPath>,
+    },
+    /// (F-3R2-013, core#431) Before the run's `deliver` tool phase pushed, the engine LIFTED the
+    /// run's work onto the remote default branch's CURRENT tip and said what that did. `outcome`
+    /// is one of: `unchanged` (the base was already the remote tip — the deliver rebase is a
+    /// no-op and the tree the checks verified is the tree that ships), `lifted` (the remote
+    /// moved; the run's changes were re-applied onto its tip in the worktree, `tree_before` →
+    /// `tree_after`, and the repository's own checks were RE-RUN on the lifted tree — see the
+    /// `repoChecksEvaluated` for this unit — before the push was allowed), `conflict` (the lift
+    /// would conflict in `conflicts`; the worktree was left exactly as verified and the deliver
+    /// unit FAILED with a `LIFT-CONFLICT` remedy — nothing was rebased or pushed), or `skipped`
+    /// (no remote / fetch failed / git too old — `note` says why; the deliver script's own rebase
+    /// then stands, as before). The deliver gate never pushes a tree that was not verified.
+    DeliverLiftEvaluated {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        outcome: String,
+        /// The remote default ref the lift targets (`origin/main`), when one was resolved.
+        base_ref: Option<String>,
+        /// The run branch's `HEAD` before the lift (the base the work was verified on).
+        base_before: Option<String>,
+        /// The remote tip the work now sits on (`lifted`) or would have (`conflict`).
+        base_after: Option<String>,
+        tree_before: Option<String>,
+        tree_after: Option<String>,
+        conflicts: Vec<String>,
+        note: Option<String>,
+    },
+    /// (F-3R2-009, core#431) An `executes_code: false` phase — an evaluator, a recon rung, a
+    /// review — asked to run a WRITE-CLASS tool (edit/write/delete/move, by ACP `kind` or by
+    /// tool name) and the engine REFUSED the call at the carrier's permission boundary. Fires on
+    /// the ACP carrier (`carrier: "acp"`) for EVERY seat, admitted to input governance or not:
+    /// the read-only posture no longer depends on the seat's governance adapter (the wrapped
+    /// carrier already applies `--sandbox read-only` / `--exclude-tools edit,write` at launch).
+    /// A refused call costs the seat one tool call, not the phase a retry; the worktree guard
+    /// remains the backstop for what a permission boundary cannot see (a `bash` heredoc).
+    EvaluatorToolCallDenied {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        /// The registry seat key (ACP-path convention, as `governanceUnenforced`).
+        cli: String,
+        carrier: String,
+        tool: String,
+        /// The ACP `toolCall.kind` when the agent sent one (`edit`, `delete`, `move`, …).
+        kind: Option<String>,
+        /// The path the call targeted, when its arguments carried one.
+        path: Option<String>,
+        reason: String,
+    },
+    /// (F-3R2-013, core#431) How the run's BASE commit was chosen when its worktree was minted:
+    /// the engine fetches `origin` and, when the registered clone's `HEAD` is behind the remote
+    /// default branch's tip (a fast-forward), bases the run on that tip — so the worker starts
+    /// from the current code and the deliver lift has nothing to move. `lifted: true` means the
+    /// base moved off the clone's `HEAD` by `behind` commits; `false` means `HEAD` was already
+    /// the tip, or was ahead of/diverged from it (local unpushed work — kept, and `note` says
+    /// so), or no remote default ref could be resolved (`base_ref: None`). Emitted once per
+    /// freshly minted worktree; a resumed run reuses its live worktree and emits nothing.
+    RunBaseResolved {
+        session: String,
+        base_ref: Option<String>,
+        base_commit: String,
+        local_head: String,
+        behind: u32,
+        fetched: bool,
+        lifted: bool,
+        note: Option<String>,
     },
     /// (F-039) The engine ran the repository's OWN checks in the run's worktree for the def's
     /// code-verifying unit (`verified_evidence` with an `executes_code` Creator upstream) and
@@ -1046,6 +1153,8 @@ impl CoreEvent {
                 denial_reason,
                 denial,
                 combined,
+                judge_cli,
+                judge_distinct,
             } => json!({
                 "type": "gateEvaluated",
                 "session": session,
@@ -1060,6 +1169,8 @@ impl CoreEvent {
                 "denialReason": denial_reason,
                 "denial": denial.as_ref().map(denial_json),
                 "combined": combined,
+                "judgeCli": judge_cli,
+                "judgeDistinct": judge_distinct,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`
             // marks a re-dispatch.
@@ -1509,6 +1620,8 @@ impl CoreEvent {
                 after_tree,
                 head_moved,
                 changed,
+                restored,
+                restore_error,
             } => json!({
                 "type": "evaluatorMutatedWorktree",
                 "session": session,
@@ -1520,6 +1633,96 @@ impl CoreEvent {
                 "afterTree": after_tree,
                 "headMoved": head_moved,
                 "changed": changed.iter().map(changed_path_json).collect::<Vec<_>>(),
+                "restored": restored,
+                "restoreError": restore_error,
+            }),
+            CoreEvent::WorktreeRestored {
+                session,
+                ord,
+                attempt,
+                cli,
+                phase,
+                tree,
+                head,
+                discarded,
+            } => json!({
+                "type": "worktreeRestored",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "phase": phase,
+                "tree": tree,
+                "head": head,
+                "discarded": discarded.iter().map(changed_path_json).collect::<Vec<_>>(),
+            }),
+            CoreEvent::DeliverLiftEvaluated {
+                session,
+                ord,
+                attempt,
+                outcome,
+                base_ref,
+                base_before,
+                base_after,
+                tree_before,
+                tree_after,
+                conflicts,
+                note,
+            } => json!({
+                "type": "deliverLiftEvaluated",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "outcome": outcome,
+                "baseRef": base_ref,
+                "baseBefore": base_before,
+                "baseAfter": base_after,
+                "treeBefore": tree_before,
+                "treeAfter": tree_after,
+                "conflicts": conflicts,
+                "note": note,
+            }),
+            CoreEvent::EvaluatorToolCallDenied {
+                session,
+                ord,
+                attempt,
+                cli,
+                carrier,
+                tool,
+                kind,
+                path,
+                reason,
+            } => json!({
+                "type": "evaluatorToolCallDenied",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "carrier": carrier,
+                "tool": tool,
+                "kind": kind,
+                "path": path,
+                "reason": reason,
+            }),
+            CoreEvent::RunBaseResolved {
+                session,
+                base_ref,
+                base_commit,
+                local_head,
+                behind,
+                fetched,
+                lifted,
+                note,
+            } => json!({
+                "type": "runBaseResolved",
+                "session": session,
+                "baseRef": base_ref,
+                "baseCommit": base_commit,
+                "localHead": local_head,
+                "behind": behind,
+                "fetched": fetched,
+                "lifted": lifted,
+                "note": note,
             }),
             CoreEvent::RepoChecksEvaluated {
                 session,
@@ -1739,6 +1942,145 @@ mod tests {
             "emitted unconditionally: {j}"
         );
         assert!(j["reason"].is_null(), "{j}");
+    }
+
+    /// core#431 (F-3R2-007): `gateEvaluated` names the judge — `judgeCli` + `judgeDistinct` ride
+    /// beside the verdict, emitted unconditionally (`null` when no judge ran), so evaluator ≠
+    /// creator is auditable from the event stream. Mutation: drop either key from the to_json arm
+    /// and the corresponding assertion fails; make either skip-if-none and the null case does.
+    #[test]
+    fn gate_evaluated_to_json_names_the_judge_additively() {
+        let ev = |judge: Option<(&str, bool)>| CoreEvent::GateEvaluated {
+            session: "run-1".into(),
+            ord: 4,
+            criterion: Some("c".into()),
+            has_deterministic_floor: true,
+            deterministic_pass: true,
+            agent_verdict: judge.map(|_| "pass".to_string()),
+            agent_reasoning: None,
+            evaluator_pass: None,
+            evaluator_policies: vec![],
+            denial_reason: None,
+            denial: None,
+            combined: true,
+            judge_cli: judge.map(|(k, _)| k.to_string()),
+            judge_distinct: judge.map(|(_, d)| d),
+        };
+        let j = ev(Some(("codex", true))).to_json();
+        assert_eq!(j["type"], "gateEvaluated");
+        assert_eq!(j["judgeCli"], "codex");
+        assert_eq!(j["judgeDistinct"], true);
+        let j = ev(None).to_json();
+        let obj = j.as_object().unwrap();
+        assert!(
+            obj.contains_key("judgeCli") && obj.contains_key("judgeDistinct"),
+            "{j}"
+        );
+        assert!(
+            j["judgeCli"].is_null() && j["judgeDistinct"].is_null(),
+            "{j}"
+        );
+    }
+
+    /// core#431 (F-3R2-010): the mutation event says whether the creator's tree was put back, and
+    /// `worktreeRestored` carries what was discarded. Mutation: drop `restored`/`restoreError`
+    /// from the arm and the first block fails; drop `discarded`/`head` and the second does.
+    #[test]
+    fn mutation_and_restore_events_carry_the_restore_outcome() {
+        let changed = vec![crate::worktree_guard::ChangedPath {
+            status: "M".into(),
+            path: "src/App.tsx".into(),
+        }];
+        let j = CoreEvent::EvaluatorMutatedWorktree {
+            session: "run-1".into(),
+            ord: 4,
+            attempt: 0,
+            cli: "pi".into(),
+            phase: "verify".into(),
+            before_tree: "598bbb99".into(),
+            after_tree: "4bffa800".into(),
+            head_moved: false,
+            changed: changed.clone(),
+            restored: true,
+            restore_error: None,
+        }
+        .to_json();
+        assert_eq!(j["type"], "evaluatorMutatedWorktree");
+        assert_eq!(j["restored"], true);
+        assert!(j.as_object().unwrap().contains_key("restoreError") && j["restoreError"].is_null());
+        let j = CoreEvent::WorktreeRestored {
+            session: "run-1".into(),
+            ord: 4,
+            attempt: 0,
+            cli: "pi".into(),
+            phase: "verify".into(),
+            tree: "598bbb99".into(),
+            head: None,
+            discarded: changed,
+        }
+        .to_json();
+        assert_eq!(j["type"], "worktreeRestored");
+        assert_eq!(j["tree"], "598bbb99");
+        assert!(j["head"].is_null());
+        assert_eq!(j["discarded"][0]["status"], "M");
+        assert_eq!(j["discarded"][0]["path"], "src/App.tsx");
+    }
+
+    /// core#431 (F-3R2-013 / F-3R2-009): the deliver-lift, run-base and evaluator-tool-denied
+    /// frames carry their outcome fields camelCase, nullable where the engine may not know.
+    #[test]
+    fn lift_base_and_tool_denied_events_to_json() {
+        let j = CoreEvent::DeliverLiftEvaluated {
+            session: "run-1".into(),
+            ord: 5,
+            attempt: 0,
+            outcome: "conflict".into(),
+            base_ref: Some("origin/main".into()),
+            base_before: Some("1432c96".into()),
+            base_after: Some("f57069d".into()),
+            tree_before: Some("598bbb99".into()),
+            tree_after: None,
+            conflicts: vec!["testid-inventory.json".into()],
+            note: None,
+        }
+        .to_json();
+        assert_eq!(j["type"], "deliverLiftEvaluated");
+        assert_eq!(j["outcome"], "conflict");
+        assert_eq!(j["baseRef"], "origin/main");
+        assert_eq!(j["conflicts"][0], "testid-inventory.json");
+        assert!(j["treeAfter"].is_null() && j["note"].is_null());
+        let j = CoreEvent::RunBaseResolved {
+            session: "run-1".into(),
+            base_ref: Some("origin/main".into()),
+            base_commit: "f57069d".into(),
+            local_head: "1432c96".into(),
+            behind: 5,
+            fetched: true,
+            lifted: true,
+            note: None,
+        }
+        .to_json();
+        assert_eq!(j["type"], "runBaseResolved");
+        assert_eq!(j["behind"], 5);
+        assert_eq!(j["lifted"], true);
+        assert_eq!(j["baseCommit"], "f57069d");
+        let j = CoreEvent::EvaluatorToolCallDenied {
+            session: "run-1".into(),
+            ord: 4,
+            attempt: 0,
+            cli: "pi".into(),
+            carrier: "acp".into(),
+            tool: "edit".into(),
+            kind: Some("edit".into()),
+            path: Some("src/App.tsx".into()),
+            reason: "r".into(),
+        }
+        .to_json();
+        assert_eq!(j["type"], "evaluatorToolCallDenied");
+        assert_eq!(j["carrier"], "acp");
+        assert_eq!(j["tool"], "edit");
+        assert_eq!(j["kind"], "edit");
+        assert_eq!(j["path"], "src/App.tsx");
     }
 
     /// FINDING-012: the `cliUsage` wire frame must expose the cache breakdown, so the studio Burn

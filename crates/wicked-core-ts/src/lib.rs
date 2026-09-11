@@ -2341,6 +2341,8 @@ mod tests {
                 denial_reason: None,
                 denial: None,
                 combined: true,
+                judge_cli: Some(s()),
+                judge_distinct: Some(true),
             },
             "gateEvaluated",
             &[
@@ -2357,6 +2359,8 @@ mod tests {
                 "denialReason",
                 "denial",
                 "combined",
+                "judgeCli",
+                "judgeDistinct",
             ],
         );
         check(
@@ -2806,6 +2810,8 @@ mod tests {
                 after_tree: s(),
                 head_moved: false,
                 changed: vec![],
+                restored: true,
+                restore_error: None,
             },
             "evaluatorMutatedWorktree",
             &[
@@ -2819,6 +2825,106 @@ mod tests {
                 "afterTree",
                 "headMoved",
                 "changed",
+                "restored",
+                "restoreError",
+            ],
+        );
+        // core#431 gate-evidence events: the restore, the deliver lift, the read-only refusal
+        // and the run-base resolution.
+        check(
+            CoreEvent::WorktreeRestored {
+                session: s(),
+                ord: 4,
+                attempt: 0,
+                cli: s(),
+                phase: s(),
+                tree: s(),
+                head: None,
+                discarded: vec![],
+            },
+            "worktreeRestored",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "cli",
+                "phase",
+                "tree",
+                "head",
+                "discarded",
+            ],
+        );
+        check(
+            CoreEvent::DeliverLiftEvaluated {
+                session: s(),
+                ord: 5,
+                attempt: 0,
+                outcome: "lifted".to_string(),
+                base_ref: Some(s()),
+                base_before: Some(s()),
+                base_after: Some(s()),
+                tree_before: Some(s()),
+                tree_after: Some(s()),
+                conflicts: vec![],
+                note: None,
+            },
+            "deliverLiftEvaluated",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "outcome",
+                "baseRef",
+                "baseBefore",
+                "baseAfter",
+                "treeBefore",
+                "treeAfter",
+                "conflicts",
+                "note",
+            ],
+        );
+        check(
+            CoreEvent::EvaluatorToolCallDenied {
+                session: s(),
+                ord: 4,
+                attempt: 0,
+                cli: s(),
+                carrier: "acp".to_string(),
+                tool: s(),
+                kind: Some(s()),
+                path: Some(s()),
+                reason: s(),
+            },
+            "evaluatorToolCallDenied",
+            &[
+                "type", "session", "ord", "attempt", "cli", "carrier", "tool", "kind", "path",
+                "reason",
+            ],
+        );
+        check(
+            CoreEvent::RunBaseResolved {
+                session: s(),
+                base_ref: Some(s()),
+                base_commit: s(),
+                local_head: s(),
+                behind: 5,
+                fetched: true,
+                lifted: true,
+                note: None,
+            },
+            "runBaseResolved",
+            &[
+                "type",
+                "session",
+                "baseRef",
+                "baseCommit",
+                "localHead",
+                "behind",
+                "fetched",
+                "lifted",
+                "note",
             ],
         );
         check(

@@ -1281,12 +1281,20 @@ pub(crate) fn run(
                         let tx = self_tx.clone();
                         let rid = run_id.clone();
                         std::thread::spawn(move || {
-                            let cmd = match crate::repo::create_worktree(&root, &rid) {
-                                Ok(wt) => Command::WorktreeReady {
-                                    spec,
-                                    repo_ref: Some(ref_id),
-                                    workdir: Some(wt.to_string_lossy().to_string()),
-                                },
+                            let cmd = match crate::repo::create_worktree_based(&root, &rid) {
+                                Ok((wt, base)) => {
+                                    // core#431 (F-3R2-013): say which base the run starts from
+                                    // — the remote tip after a fetch when the clone was stale.
+                                    // `None` = a live worktree was reused (a resume).
+                                    if let Some(b) = base {
+                                        let _ = tx.send(Command::EmitEvent(b.to_event(&rid)));
+                                    }
+                                    Command::WorktreeReady {
+                                        spec,
+                                        repo_ref: Some(ref_id),
+                                        workdir: Some(wt.to_string_lossy().to_string()),
+                                    }
+                                }
                                 Err(e) => Command::WorktreeFailed {
                                     run_id: rid,
                                     error: e.to_string(),
@@ -4023,7 +4031,7 @@ fn apply_step_result(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
-    agent_verdict: Option<(bool, String)>,
+    agent_verdict: Option<crate::validator::AgentVerdict>,
     evidence: crate::workflow::UnitEvidence,
     _db_path: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
@@ -4818,6 +4826,27 @@ fn apply_step_result(
                 },
             );
             let note = unsuppressed_gate_note(session.human_confirm);
+            // core#431 (F-3R2-010): when the denial is the worktree guard's AND the engine already
+            // restored the creator's tree, say so in the prompt — plain Approve used to read as
+            // "retry" while silently re-baselining on the evaluator's edit; now it means a retry
+            // against the restored, verified tree, and the operator is told that.
+            let guard_restored = unit
+                .denial
+                .as_ref()
+                .is_some_and(|d| d.source == "worktree_guard")
+                && unit.worktree_mutation.as_ref().is_some_and(|m| m.restored);
+            let prompt = if guard_restored {
+                format!(
+                    "Unit {ord} verdict is NOT PASS — the evaluator changed the tree under review; \
+                     its edit was discarded and the creator's verified tree restored. Approve to \
+                     retry the phase against the restored tree, or reject to cancel the run{note}"
+                )
+            } else {
+                format!(
+                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to \
+                     cancel the run{note}"
+                )
+            };
             pause_for_human(
                 store,
                 subscribers,
@@ -4828,7 +4857,7 @@ fn apply_step_result(
                 // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
                 // reviewed unit coincide here.
                 Some(ord),
-                format!("Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run{note}"),
+                prompt,
             )?;
             return Ok(StepApplied::Paused);
         }
@@ -5548,12 +5577,17 @@ fn dispatch_unit(
         let unit_ix2 = unit_ix;
         let attempt = session.attempt;
         let workdir = session.workdir.clone();
+        // core#431 (F-3R2-013): the deliver phase's LIFT context — the run's worktree and the
+        // registered repo it was linked from — resolved HERE (the actor holds the store), applied
+        // off-thread below before the push runs. `None` for every other tool unit.
+        let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
         std::thread::spawn(move || {
             // core#396 (codex round 6): the run-wide EXISTENCE admission runs before the FIRST
             // unit of ANY kind. A tool command spawns no worker, so neither runner would ever
             // judge this run's skill set — the command executed, and could mutate state, before
             // a later agent unit discovered the missing skill. Same ladder, same refusal shape
             // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
+            let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
                 Ok(admitted) => {
                     // The generation the RUN was judged against, reported like a handoff
@@ -5573,7 +5607,31 @@ fn dispatch_unit(
                             "tool",
                         )));
                     }
-                    run_tool_cmd(&cmd, workdir.as_deref())
+                    // core#431 (F-3R2-013): the deliver LIFT + RE-VERIFY runs BEFORE the push.
+                    // Unchanged/skipped ⇒ proceed; lifted ⇒ the repository's own checks re-ran
+                    // on the lifted tree and PASSED (the report rides as this unit's evidence);
+                    // conflict or failed re-verify ⇒ the unit FAILS here and the command never
+                    // runs — the deliver gate never pushes a tree that was not verified.
+                    let emit_ev = |ev: CoreEvent| {
+                        let _ = tx.send(crate::command::Command::EmitEvent(ev));
+                    };
+                    let lifted = lift_ctx.as_ref().map(|ctx| {
+                        crate::deliver_lift::lift_and_reverify(
+                            ctx,
+                            &input.run_id,
+                            ord,
+                            attempt,
+                            &emit_ev,
+                        )
+                    });
+                    match lifted {
+                        Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
+                        Some(Ok(report)) => {
+                            lift_checks = report;
+                            run_tool_cmd(&cmd, workdir.as_deref())
+                        }
+                        None => run_tool_cmd(&cmd, workdir.as_deref()),
+                    }
                 }
                 Err(e) => {
                     let refused = crate::execute_wrapped::skills_refusal(&input, &e);
@@ -5604,8 +5662,13 @@ fn dispatch_unit(
                     governed: false,
                 },
                 agent_verdict: None,
-                // A Tool unit is the engine's own command: no seat, no guard, no repo checks.
-                evidence: Default::default(),
+                // A Tool unit is the engine's own command: no seat, no guard — and no repo
+                // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
+                // here so the fold persists it on the unit and names the floor on the gate.
+                evidence: crate::workflow::UnitEvidence {
+                    worktree_guard: None,
+                    repo_checks: lift_checks,
+                },
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
                 ack: None,

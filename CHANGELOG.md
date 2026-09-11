@@ -769,6 +769,43 @@ Two release tracks share this file, newest entry first regardless of track:
   the remaining legacy graphs are `Deferred` — reported, untouched, copied at the next boot — so an
   upgrade with many stale or locked graphs cannot keep the daemon unavailable for N × 60 s. The
   STEERING guide's `rules fanout` example names `<state-home>/repo-graphs/<repo-key>/estate.db`.
+- **Deliver lifts onto the current base and re-verifies after a lift; the creator's tree is
+  restored on an evaluator mutation; the judge is named; ACP evaluators are read-only (#431;
+  F-3R2-013 / F-3R2-010 / F-3R2-007 / F-3R2-009).** Four gaps the Phase 3 acceptance re-run
+  found on one governed `bug` run. (1) The run branched from the registered clone's `HEAD`, five
+  commits behind `origin/main`; the deliver script's rebase then conflicted on a generated file
+  (`LIFT-CONFLICT`), the operator resolved it by hand, and the tree that was pushed was not the
+  tree the repo-checks floor had verified. Now `create_worktree` fetches `origin` and bases a new
+  run worktree on the remote default branch's tip when the clone is strictly behind it
+  (`runBaseResolved {baseRef, baseCommit, localHead, behind, fetched, lifted, note}`; a clone that
+  is ahead of/diverged from the remote keeps its `HEAD`, disclosed), and before the `deliver` tool
+  phase runs the engine LIFTS uncommitted work on a stale base onto the remote tip in memory
+  (`git merge-tree --write-tree`, git ≥ 2.38) — `deliverLiftEvaluated {outcome: unchanged |
+  lifted | conflict | skipped, baseRef, baseBefore, baseAfter, treeBefore, treeAfter, conflicts,
+  note}`. A conflict fails the deliver unit with a `LIFT-CONFLICT` remedy naming the files and
+  leaves the worktree exactly as verified; a lift RE-RUNS the repository's own checks on the
+  lifted tree (`repoChecksEvaluated` for the deliver unit) and the push runs only when they pass —
+  the deliver gate never pushes a tree that was not verified. A branch carrying its own commits
+  is skipped (the deliver rebase replays that history, as before). (2) On
+  `evaluatorMutatedWorktree` the only choices were Approve — which re-baselined on the CURRENT
+  tree, silently adopting the evaluator's edit — or cancel, and the engine's remedy was a shell
+  command. The worker thread now restores the creator's tree itself (`HEAD` reset when moved,
+  `read-tree --reset -u <beforeTree>`, added paths deleted, re-snapshot proven equal):
+  `evaluatorMutatedWorktree` carries `restored` + `restoreError`, a `worktreeRestored {tree,
+  head, discarded}` event follows, the gate's `denialReason` says the edit was discarded, and the
+  `awaitingHuman` prompt says Approve retries against the restored tree. (3) `gateEvaluated`
+  names the layer-2 judge: `judgeCli` (the seat key) and `judgeDistinct` (identity-distinct
+  rotation pick vs. the single-runner fallback; both `null` when no judge ran or on the bus path)
+  — evaluator ≠ creator is auditable from `/runs/:id/events`. `AgentVerdict` gained
+  `judge_cli`/`judge_distinct`. (4) On the ACP carrier the read-only posture applied only to the
+  wrapped argv path (`--exclude-tools edit,write`); a pi evaluator not admitted to input
+  governance was answered `allow_result` and rewrote the fix under review. Every
+  `executes_code: false` unit's ACP turn now refuses write-class `session/request_permission`
+  calls (edit/delete/move by ACP `kind`, or a write tool by name — pi's lower-case `edit`/`write`
+  included) with the agent's reject option, for admitted and unadmitted seats alike, disclosed
+  as `evaluatorToolCallDenied {cli, carrier: "acp", tool, kind, path, reason}`; `bash` stays
+  (posture, not guarantee — the worktree guard remains the backstop). core-ts `index.d.ts`
+  documents the new frames; the key sets are pinned by the binding's own tests.
 - **Repo graphs live under the daemon state home; an in-tree `.codegraph/` is never adopted
   (#406; F-016 / F-024).** `registerRepo`/onboarding minted every repo's code graph under the
   OPERATOR's `~/.wicked-estate/repo-graphs/<key>` whatever `--db` said — two daemons on one host

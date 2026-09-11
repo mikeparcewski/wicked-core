@@ -251,6 +251,35 @@ struct CompletedTask {
 struct AgentVerdictWire {
     pass: bool,
     reasoning: String,
+    /// (core#431) The judge seat + distinctness, carried across the bus so the actor's gate fold
+    /// can name the judge on `gateEvaluated`. `default` so a `task.completed` from an older
+    /// cli-runner (no judge fields) still deserializes — as an unknown judge, never a guessed one.
+    #[serde(default)]
+    judge_cli: Option<String>,
+    #[serde(default)]
+    judge_distinct: Option<bool>,
+}
+
+impl From<AgentVerdictWire> for crate::validator::AgentVerdict {
+    fn from(v: AgentVerdictWire) -> Self {
+        crate::validator::AgentVerdict {
+            pass: v.pass,
+            reasoning: v.reasoning,
+            judge_cli: v.judge_cli,
+            judge_distinct: v.judge_distinct,
+        }
+    }
+}
+
+impl From<crate::validator::AgentVerdict> for AgentVerdictWire {
+    fn from(v: crate::validator::AgentVerdict) -> Self {
+        AgentVerdictWire {
+            pass: v.pass,
+            reasoning: v.reasoning,
+            judge_cli: v.judge_cli,
+            judge_distinct: v.judge_distinct,
+        }
+    }
 }
 
 fn status_to_str(s: StepStatus) -> &'static str {
@@ -332,6 +361,8 @@ fn bus_request_agent_verdict(
     macro_rules! bus_deny {
         ($reason:expr) => {
             return crate::validator::AgentVerdict {
+                judge_cli: None,
+                judge_distinct: None,
                 pass: false,
                 reasoning: $reason,
             }
@@ -400,6 +431,8 @@ fn bus_request_agent_verdict(
                         resp.pass, resp.reasoning
                     );
                     return crate::validator::AgentVerdict {
+                        judge_cli: None,
+                        judge_distinct: None,
                         pass: resp.pass,
                         reasoning: resp.reasoning,
                     };
@@ -419,6 +452,8 @@ fn bus_request_agent_verdict(
          GOVERNANCE DENY (fail-closed; a timeout must never silently approve)"
     );
     crate::validator::AgentVerdict {
+        judge_cli: None,
+        judge_distinct: None,
         pass: false,
         reasoning: format!(
             "gate eval bus-path DENY: evaluator daemon did not respond within {GATE_EVAL_TIMEOUT:?}. \
@@ -647,7 +682,7 @@ pub(crate) fn run_unit_and_judge(
     emit_delta: &DeltaSink,
 ) -> (
     StepOutput,
-    Option<(bool, String)>,
+    Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
     run_unit_and_judge_with_roster(
@@ -670,7 +705,7 @@ fn run_unit_and_judge_with_roster(
     roster: &[crate::AgenticCli],
 ) -> (
     StepOutput,
-    Option<(bool, String)>,
+    Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
     let output = runner.run_unit_streaming(input, emit_delta);
@@ -722,7 +757,9 @@ fn run_unit_and_judge_with_roster(
                     // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
                     // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
                     let work_author = input.unit.assigned_cli.as_deref();
-                    let av = bus_request_agent_verdict(
+                    // The daemon does not report which seat judged: `judge_cli` stays `None` on
+                    // this path (core#431) — an honest unknown, never a guessed seat.
+                    return bus_request_agent_verdict(
                         &v.criterion,
                         work_for_agent,
                         &input.run_id,
@@ -731,7 +768,6 @@ fn run_unit_and_judge_with_roster(
                         &bus_path,
                         work_author,
                     );
-                    return (av.pass, av.reasoning);
                 }
                 // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
                 // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
@@ -753,8 +789,14 @@ fn run_unit_and_judge_with_roster(
                     roster,
                     &**runner,
                 ) {
-                    Ok(av) => (av.pass, av.reasoning),
-                    Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
+                    // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
+                    Ok(av) => av,
+                    Err(e) => crate::validator::AgentVerdict {
+                        pass: false,
+                        reasoning: format!("agent validator errored (fail-closed): {e}"),
+                        judge_cli: None,
+                        judge_distinct: None,
+                    },
                 }
             })
     } else {
@@ -801,11 +843,41 @@ fn run_unit_and_judge_with_roster(
     // now (the seat's process group is killed when it exits; each check's group likewise), so
     // this is the tree the gate is actually judging. The first look above only decided whether
     // the checks were worth running; the fold sees THIS.
-    let worktree_guard = if output.status == StepStatus::Ok {
+    let mut worktree_guard = if output.status == StepStatus::Ok {
         crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
     } else {
         None
     };
+    // core#431 (F-3R2-010): a DENYING mutation is undone HERE, on the worker thread, before the
+    // result reaches the gate — the engine runs the remedy its denial used to print for the
+    // operator (`git read-tree --reset -u <before.tree>`), so the retry a human approves runs
+    // against the creator's verified tree and never silently adopts the evaluator's edit. The
+    // outcome carries `restored`/`restore_error`; the fold emits `worktreeRestored` and words
+    // the denial accordingly. A failed restore is disclosed, never assumed.
+    if let (Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(m)), Some(wd)) =
+        (worktree_guard.as_mut(), input.workdir.as_deref())
+    {
+        if m.denies() {
+            match crate::worktree_guard::restore_creator_tree(wd, m) {
+                Ok(()) => eprintln!(
+                    "wicked-core: unit {} (phase `{}`, executes_code:false) changed the tree it \
+                     was reviewing — the evaluator's edit was discarded and the creator's tree {} \
+                     restored in {} (F-036 / core#431)",
+                    input.unit.ord,
+                    input.unit.phase_id().unwrap_or("?"),
+                    &m.before.tree[..m.before.tree.len().min(10)],
+                    wd.display()
+                ),
+                Err(e) => eprintln!(
+                    "wicked-core: unit {} changed the tree it was reviewing and the engine could \
+                     NOT restore the creator's tree in {}: {e} — the denial keeps the manual \
+                     remedy (core#431)",
+                    input.unit.ord,
+                    wd.display()
+                ),
+            }
+        }
+    }
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
@@ -1375,8 +1447,9 @@ fn run_cli_runner(
                                 governed: completed.governed,
                             };
                             let evidence = completed.evidence.clone();
-                            let agent_verdict =
-                                completed.agent_verdict.map(|v| (v.pass, v.reasoning));
+                            let agent_verdict = completed
+                                .agent_verdict
+                                .map(crate::validator::AgentVerdict::from);
                             let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(0);
                             if actor_tx
                                 .send(Command::ApplyStepResult {
@@ -1575,8 +1648,7 @@ fn run_cli_runner(
                     attempt: output.attempt,
                     output: output.output.clone(),
                     status: status_to_str(output.status).to_string(),
-                    agent_verdict: agent_verdict
-                        .map(|(pass, reasoning)| AgentVerdictWire { pass, reasoning }),
+                    agent_verdict: agent_verdict.map(AgentVerdictWire::from),
                     usage: output.usage.clone(),
                     files: output.files.clone(),
                     tools: output.tools.clone(),
@@ -1709,7 +1781,7 @@ fn run_task_completed_poller(
                     tools: task.tools,
                     governed: task.governed,
                 };
-                let agent_verdict = task.agent_verdict.map(|v| (v.pass, v.reasoning));
+                let agent_verdict = task.agent_verdict.map(crate::validator::AgentVerdict::from);
                 let evidence = task.evidence.clone();
                 // Reach the actor via the command channel (self_tx write-back). Gate cursor advance
                 // on the ack so a crash between dequeue and commit leaves the cursor behind for

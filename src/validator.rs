@@ -1108,6 +1108,25 @@ pub fn run_validator_reporting(
 pub struct AgentVerdict {
     pub pass: bool,
     pub reasoning: String,
+    /// (core#431, F-3R2-007) The council seat KEY the judge ran under — `Some` on the inline
+    /// path (rotation pick or single-runner fallback), `None` on the bus path (the evaluator
+    /// daemon does not report its seat) and for every verdict synthesised without a seat (a
+    /// parse failure, a bus deny). Rides to `gateEvaluated.judgeCli` so evaluator ≠ creator is
+    /// auditable from the event stream.
+    pub judge_cli: Option<String>,
+    /// `Some(true)` when `judge_cli` was an IDENTITY-DISTINCT seat (the rotation pick — genuine
+    /// independence), `Some(false)` when the judge fell back to the single default runner
+    /// (prompt-only independence, see the note above), `None` when unknown/not applicable.
+    pub judge_distinct: Option<bool>,
+}
+
+impl AgentVerdict {
+    /// Attribute this verdict to the seat that rendered it (core#431).
+    pub fn judged_by(mut self, seat_key: &str, distinct: bool) -> Self {
+        self.judge_cli = Some(seat_key.to_string());
+        self.judge_distinct = Some(distinct);
+        self
+    }
 }
 
 /// The council seat the DETERMINISTIC validator is authored/re-run under ([`author_deterministic_validator`]
@@ -1292,8 +1311,11 @@ fn agent_validate_in(
         match out.status {
             // The seat answered. Whatever it said is the verdict — including unreadable output,
             // which `parse_agent_verdict` fails closed to REJECT. Rotating past an answer would be
-            // shopping for a better one.
-            StepStatus::Ok => return Ok(parse_agent_verdict(&out.output)),
+            // shopping for a better one. Attributed to the seat that answered (core#431): an
+            // identity-distinct pick, so `judge_distinct = true`.
+            StepStatus::Ok => {
+                return Ok(parse_agent_verdict(&out.output).judged_by(&seat.key, true))
+            }
             // An operator stopped this run, or the seat burned its whole turn ceiling.
             // Rotating would defy the stop (and re-burn the ceiling on the next seat).
             // The message names WHICH of the two happened — a timed-out seat reported as
@@ -1353,7 +1375,9 @@ fn agent_validate_in(
     if out.status != StepStatus::Ok {
         anyhow::bail!("agent validation failed ({:?}): {}", out.status, out.output);
     }
-    Ok(parse_agent_verdict(&out.output))
+    // The single-runner FALLBACK: the deterministic validator's own seat judged — prompt-only
+    // independence, and the record says so (`judge_distinct = false`, core#431).
+    Ok(parse_agent_verdict(&out.output).judged_by(DETERMINISTIC_VALIDATOR_SEAT, false))
 }
 
 /// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
@@ -1609,6 +1633,8 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             "REJECT" if decisive && !mentions_pass => false,
             _ => {
                 return AgentVerdict {
+                    judge_cli: None,
+                    judge_distinct: None,
                     pass: false,
                     reasoning: format!(
                         "ambiguous or malformed verdict at the decision line (fail-closed): {line}"
@@ -1653,6 +1679,8 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             .unwrap_or_default();
         if closing.is_empty() {
             return AgentVerdict {
+                judge_cli: None,
+                judge_distinct: None,
                 pass: false,
                 reasoning: format!(
                     "{reasoning} [no closing verdict: the reply opened {first} and never closed \
@@ -1663,6 +1691,8 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
         }
         if closing != first {
             return AgentVerdict {
+                judge_cli: None,
+                judge_distinct: None,
                 pass: false,
                 reasoning: format!(
                     "{reasoning} [verdict drift: the reply opened {first} and closed {closing} — \
@@ -1688,6 +1718,8 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             });
         if contradicted_later {
             return AgentVerdict {
+                judge_cli: None,
+                judge_distinct: None,
                 pass: false,
                 reasoning: format!(
                     "{reasoning} [verdict drift: the decision line said {first}, a later line said \
@@ -1697,12 +1729,16 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
         }
 
         return AgentVerdict {
+            judge_cli: None,
+            judge_distinct: None,
             pass: leading,
             reasoning,
         };
     }
     // No contract line anywhere — never a lone-model approve on ambiguous/malformed output.
     AgentVerdict {
+        judge_cli: None,
+        judge_distinct: None,
         pass: false,
         reasoning: format!(
             "no unambiguous PASS/REJECT contract line (fail-closed): {}",
@@ -2185,10 +2221,14 @@ mod tests {
     #[test]
     fn combine_verdict_enforces_the_rev04_rule() {
         let pass = AgentVerdict {
+            judge_cli: None,
+            judge_distinct: None,
             pass: true,
             reasoning: "ok".into(),
         };
         let reject = AgentVerdict {
+            judge_cli: None,
+            judge_distinct: None,
             pass: false,
             reasoning: "no".into(),
         };

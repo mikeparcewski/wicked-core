@@ -130,6 +130,16 @@ pub struct WorktreeMutation {
     pub changed: Vec<ChangedPath>,
     /// `HEAD` moved between the snapshots — the unit committed, amended or reset the run branch.
     pub head_moved: bool,
+    /// (core#431, F-3R2-010) The engine put the creator's tree BACK after detecting this mutation
+    /// — `HEAD` reset to `before.head` when it had moved, index + working tree reset to
+    /// `before.tree`, every ADDED path deleted, and a fresh snapshot equal to `before.tree` to
+    /// prove it. `false` when the restore was not attempted or failed (`restore_error`); the
+    /// operator-facing denial then keeps the manual remedy. `#[serde(default)]`: a mutation
+    /// recorded by a pre-restore engine reads as not restored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
 }
 
 impl WorktreeMutation {
@@ -170,7 +180,7 @@ fn now_ms() -> u64 {
 }
 
 /// Run `git <args>` in `cwd`; `Ok(stdout)` on exit 0, `Err` naming the failure otherwise.
-fn git(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn git(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<Vec<u8>> {
     // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
     let mut cmd = Command::new("git");
     cmd.hardened().args(args).current_dir(cwd);
@@ -192,7 +202,11 @@ fn git(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<Vec<u
     Ok(out.stdout)
 }
 
-fn git_string(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<String> {
+pub(crate) fn git_string(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&git(cwd, args, env)?)
         .trim()
         .to_string())
@@ -307,7 +321,10 @@ fn plain_path(p: PathBuf) -> PathBuf {
 ///   rewrite used to snapshot as Clean).
 ///
 /// The full re-hash is the price, paid on purpose.
-fn snapshot_through(worktree: &Path, git_dir: &Path) -> anyhow::Result<WorktreeSnapshot> {
+pub(crate) fn snapshot_through(
+    worktree: &Path,
+    git_dir: &Path,
+) -> anyhow::Result<WorktreeSnapshot> {
     let pinned: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     let head = git_string(
         worktree,
@@ -435,8 +452,108 @@ fn compare_with_after(
             after,
             changed,
             head_moved,
+            restored: false,
+            restore_error: None,
         }),
     ))
+}
+
+/// Put the CREATOR's tree back after an `executes_code: false` phase changed it (core#431,
+/// F-3R2-010) — the engine's own execution of the remedy its denial used to print for the
+/// operator to run by hand (`git read-tree --reset -u <before.tree>`).
+///
+/// Through the SAME pinned git dir the baseline was taken through (`before.git_dir`), never the
+/// worktree's own `.git` file (adversarial review on #414). Steps, in order:
+///
+/// 1. `HEAD` moved (the phase committed/amended/reset the run branch) ⇒ `git reset --soft
+///    <before.head>` — the branch pointer goes back; the phase's commit is left dangling.
+/// 2. `git read-tree --reset -u <before.tree>` against the REAL index: index and working tree
+///    now match the baseline. The creator's previously-untracked files become staged (`A`) —
+///    the deliver script's `git add -u` + commit handles a staged tree exactly like a dirty one.
+/// 3. Every path the phase ADDED is deleted by name: `read-tree -u` removes only paths the
+///    index knew, and an evaluator-created file was never in it. Regular files and symlinks
+///    only (`symlink_metadata`, never followed); a path that escapes the worktree is refused.
+/// 4. A fresh snapshot must equal `before.tree` — otherwise the restore FAILED and the caller
+///    keeps the manual remedy. The proof is the same instrument that found the mutation.
+///
+/// Sets `restored` / `restore_error` on `m` and returns the same verdict as a `Result`. Never
+/// panics on git failure; a failed restore leaves whatever state git reached and says so.
+pub(crate) fn restore_creator_tree(
+    worktree: &Path,
+    m: &mut WorktreeMutation,
+) -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<()> {
+        let Some(git_dir) = m.before.git_dir.as_deref() else {
+            anyhow::bail!(
+                "the baseline carries no pinned git dir — cannot restore through a directory the \
+                 evaluator could have redirected"
+            );
+        };
+        let git_dir = Path::new(git_dir);
+        let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+        if m.head_moved && !m.before.head.is_empty() {
+            git(worktree, &["reset", "--soft", &m.before.head], &env)?;
+        }
+        git(
+            worktree,
+            &["read-tree", "--reset", "-u", &m.before.tree],
+            &env,
+        )?;
+        for added in m.changed.iter().filter(|c| c.status == "A") {
+            let rel = Path::new(&added.path);
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                anyhow::bail!(
+                    "refusing to delete `{}`: not a plain worktree-relative path",
+                    added.path
+                );
+            }
+            let p = worktree.join(rel);
+            match std::fs::symlink_metadata(&p) {
+                Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
+                    std::fs::remove_file(&p).map_err(|e| {
+                        anyhow::anyhow!("could not delete added path `{}`: {e}", added.path)
+                    })?;
+                }
+                Ok(_) => anyhow::bail!(
+                    "added path `{}` is not a regular file — left in place",
+                    added.path
+                ),
+                Err(_) => {} // already gone
+            }
+        }
+        let now = snapshot_through(worktree, git_dir)?;
+        if now.tree != m.before.tree {
+            anyhow::bail!(
+                "after the restore the tree is {} but the creator's baseline is {} — the worktree \
+                 is NOT the verified tree",
+                short(&now.tree),
+                short(&m.before.tree)
+            );
+        }
+        if m.head_moved && !m.before.head.is_empty() && now.head != m.before.head {
+            anyhow::bail!(
+                "after the restore HEAD is {} but the baseline HEAD is {}",
+                short(&now.head),
+                short(&m.before.head)
+            );
+        }
+        Ok(())
+    })();
+    match &result {
+        Ok(()) => {
+            m.restored = true;
+            m.restore_error = None;
+        }
+        Err(e) => {
+            m.restored = false;
+            m.restore_error = Some(e.to_string());
+        }
+    }
+    result
 }
 
 /// Run the guard for one finished unit: the worker-thread half. `None` when the unit is not
@@ -506,13 +623,33 @@ pub(crate) fn denial_reason(unit: &crate::domain::WorkUnit, m: &WorktreeMutation
     }
     s.push_str(&format!(
         " (tree {} → {}). The change under review is no longer the creator's, so this phase's \
-         verdict cannot certify it. Restore the creator's tree in the worktree with `git read-tree \
-         --reset -u {}`, or reject the run; a phase that must change code declares \
-         `executes_code: true` in the workflow def.",
+         verdict cannot certify it.",
         short(&m.before.tree),
         short(&m.after.tree),
-        m.before.tree
     ));
+    if m.restored {
+        // core#431 (F-3R2-010): the engine already ran the remedy — say so, and say what a
+        // human's Approve now means (a retry against the verified tree, NOT adoption of the
+        // evaluator's edit).
+        s.push_str(&format!(
+            " The evaluator's edit was DISCARDED: the engine restored the creator's tree ({}) in \
+             the worktree, so approving this gate retries the phase against the verified tree. \
+             A phase that must change code declares `executes_code: true` in the workflow def.",
+            short(&m.before.tree)
+        ));
+    } else {
+        s.push_str(&format!(
+            " Restore the creator's tree in the worktree with `git read-tree --reset -u {}`",
+            m.before.tree
+        ));
+        if let Some(why) = &m.restore_error {
+            s.push_str(&format!(" (the engine's own restore failed: {why})"));
+        }
+        s.push_str(
+            ", or reject the run; a phase that must change code declares `executes_code: true` \
+             in the workflow def.",
+        );
+    }
     s
 }
 
@@ -657,6 +794,99 @@ mod tests {
                 && reason.contains("executes_code: false")
                 && reason.contains(&format!("git read-tree --reset -u {}", before.tree)),
             "the denial names the paths, the rule and the restore: {reason}"
+        );
+    }
+
+    /// core#431 (F-3R2-010): the engine restores the creator's tree itself. After the F-036
+    /// mutation (modify + delete + add), `restore_creator_tree` must bring back exactly the
+    /// baseline — the modified file's creator content, the deleted creator file, and NO trace
+    /// of the evaluator's added file — proven by a fresh snapshot equal to the baseline tree; the
+    /// denial then says the edit was discarded instead of printing a command to run by hand.
+    #[test]
+    fn the_engine_restores_the_creators_tree_after_a_mutation() {
+        let wt = creator_worktree("restore");
+        let unit = guarded_unit();
+        let before = snapshot(&wt, &repo_of(&wt)).unwrap();
+        std::fs::write(
+            wt.join("src/a.ts"),
+            "export const a = 3; // evaluator's idea\n",
+        )
+        .unwrap();
+        std::fs::remove_file(wt.join("src/b.ts")).unwrap();
+        std::fs::write(wt.join("src/c.ts"), "export const c = 1;\n").unwrap();
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(!m.restored && m.restore_error.is_none());
+
+        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        assert!(m.restored, "{:?}", m.restore_error);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n",
+            "the creator's fix is back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/b.ts")).unwrap(),
+            "export const b = 1;\n",
+            "the creator's deleted file is back"
+        );
+        assert!(
+            !wt.join("src/c.ts").exists(),
+            "the evaluator's added file is gone"
+        );
+        let after = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert_eq!(after.tree, before.tree, "the tree IS the baseline again");
+        assert!(
+            compare(&wt, &before).unwrap().is_none(),
+            "the guard itself sees the restored tree as clean"
+        );
+        // The committed-but-ignored file the creator never touched is untouched too.
+        assert_eq!(
+            std::fs::read_to_string(wt.join("config/settings.local.json")).unwrap(),
+            "{\"port\":1}\n"
+        );
+        let reason = denial_reason(&unit, &m);
+        assert!(
+            reason.contains("DISCARDED") && reason.contains("restored the creator's tree"),
+            "the denial states the restore: {reason}"
+        );
+        assert!(
+            !reason.contains("git read-tree --reset -u"),
+            "no manual remedy once the engine ran it: {reason}"
+        );
+    }
+
+    /// The moved-`HEAD` shape (the evaluator committed its edit onto the run branch): the restore
+    /// resets the branch pointer to the baseline commit AND the tree, and the phase's commit is
+    /// left dangling — never on the run branch.
+    #[test]
+    fn a_restore_also_resets_a_head_the_evaluator_moved() {
+        let wt = creator_worktree("restore-head");
+        let before = snapshot(&wt, &repo_of(&wt)).unwrap();
+        run_git(&wt, &["config", "user.email", "t@example.invalid"]);
+        run_git(&wt, &["config", "user.name", "t"]);
+        run_git(&wt, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            wt.join("src/a.ts"),
+            "export const a = 9; // committed by the evaluator\n",
+        )
+        .unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-qm", "evaluator commit"]);
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(m.head_moved);
+        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        assert!(m.restored, "{:?}", m.restore_error);
+        let now = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert_eq!(now.head, before.head, "HEAD is back at the baseline commit");
+        assert_eq!(now.tree, before.tree, "the tree is the baseline");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n"
+        );
+        assert_eq!(
+            run_git(&wt, &["rev-parse", "HEAD"]),
+            before.head,
+            "the run branch itself points at the baseline"
         );
     }
 

@@ -3132,6 +3132,29 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
     }
 }
 
+/// (core#431, F-3R2-009) The READ-ONLY posture of an `executes_code: false` unit on the ACP
+/// carrier — an evaluator, a recon rung, a review. The wrapped carrier puts such a seat in
+/// read-only mode at launch (`--sandbox read-only`, `--exclude-tools edit,write`); the ACP
+/// carrier has no argv to do that with, so the posture is applied where the protocol gives the
+/// client a say: every `session/request_permission`. A write-class call (edit/delete/move by
+/// ACP `kind`, or a write tool by name — `acp_permission::write_class_call`) is answered with the
+/// agent's REJECT option and disclosed as `evaluatorToolCallDenied`, for EVERY seat, admitted to
+/// input governance or not — the pi evaluator that rewrote the fix under review was unadmitted
+/// and would have been answered `allow_result`, unchecked. `bash` stays (the phase must run the
+/// suite): this is a posture, not a guarantee; the worktree guard holds the rest.
+pub(crate) struct AcpReadOnly {
+    pub run_id: String,
+    pub ord: u32,
+    pub attempt: u32,
+    /// The registry seat key (the ACP-path convention for `cli`).
+    pub cli: String,
+    pub phase: String,
+    /// Where the denial event goes (`Command::EmitEvent`).
+    pub tx: std::sync::mpsc::Sender<Command>,
+}
+
+/// [`exec_turn_acp_posture`] with no read-only posture — every turn that is not an
+/// `executes_code: false` unit (chat turns, creator units, the tests' fixtures).
 #[allow(clippy::too_many_arguments)]
 fn exec_turn_acp(
     proc: &mut AcpProcess,
@@ -3144,6 +3167,35 @@ fn exec_turn_acp(
     epoch: u64,
     tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
+) -> anyhow::Result<TurnResult> {
+    exec_turn_acp_posture(
+        proc,
+        prompt,
+        prior_outputs,
+        emit,
+        timeout,
+        elicitation_maps,
+        run_id,
+        epoch,
+        tx,
+        gate,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_turn_acp_posture(
+    proc: &mut AcpProcess,
+    prompt: &str,
+    prior_outputs: &[PriorUnitOutput],
+    emit: &DeltaSink,
+    timeout: Duration,
+    elicitation_maps: Arc<Mutex<ElicitationMaps>>,
+    run_id: &str,
+    epoch: u64,
+    tx: &std::sync::mpsc::Sender<Command>,
+    gate: Option<&crate::acp_permission::AcpGate<'_>>,
+    read_only: Option<&AcpReadOnly>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
@@ -3526,6 +3578,7 @@ prior output you are reviewing, testing, or revising."
                                                 &write_lock,
                                                 gate,
                                                 proc.chat_boundary.as_ref(),
+                                                read_only,
                                                 &v2,
                                                 &mut output,
                                                 MAX_OUT,
@@ -3648,6 +3701,7 @@ prior output you are reviewing, testing, or revising."
                                 &write_lock,
                                 gate,
                                 proc.chat_boundary.as_ref(),
+                                read_only,
                                 &v,
                                 &mut output,
                                 MAX_OUT,
@@ -3779,11 +3833,17 @@ prior output you are reviewing, testing, or revising."
 /// root writable, the scoped roots read-only, nothing beyond — judged by the shared pure check.
 /// Neither ⇒ permitted, as this path has always behaved — but said out loud rather than left to a
 /// capability we quietly withheld.
+///
+/// `read_only` present (core#431, F-3R2-009) ⇒ the unit's phase declared `executes_code: false`:
+/// a WRITE-CLASS call is REFUSED before either branch above runs — deny-dominates, for admitted
+/// and unadmitted seats alike — and disclosed as `evaluatorToolCallDenied`.
+#[allow(clippy::too_many_arguments)]
 fn answer_permission_request<W: Write>(
     stdin: &mut W,
     write_lock: &Mutex<()>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
     chat_boundary: Option<&crate::gate_hook::BoundaryCtx>,
+    read_only: Option<&AcpReadOnly>,
     frame: &Value,
     output: &mut String,
     max_out: usize,
@@ -3795,6 +3855,60 @@ fn answer_permission_request<W: Write>(
         return; // a permission NOTIFICATION is not a thing; nothing to answer.
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    if let Some(ro) = read_only {
+        if let Some(call) = crate::acp_permission::write_class_call(&params) {
+            let reason = format!(
+                "phase `{}` declares executes_code:false — `{}`{}{} would change the tree under \
+                 review, so it is refused at the ACP permission boundary (F-036 read-only \
+                 posture). Report findings in this phase's output; a phase that must change \
+                 code declares executes_code:true in the workflow def.",
+                ro.phase,
+                call.tool,
+                call.kind
+                    .as_deref()
+                    .map(|k| format!(" (kind {k})"))
+                    .unwrap_or_default(),
+                call.path
+                    .as_deref()
+                    .map(|p| format!(" to `{p}`"))
+                    .unwrap_or_default(),
+            );
+            let _ = ro
+                .tx
+                .send(Command::EmitEvent(CoreEvent::EvaluatorToolCallDenied {
+                    session: ro.run_id.clone(),
+                    ord: ro.ord,
+                    attempt: ro.attempt,
+                    cli: ro.cli.clone(),
+                    carrier: "acp".to_string(),
+                    tool: call.tool.clone(),
+                    kind: call.kind.clone(),
+                    path: call.path.clone(),
+                    reason: reason.clone(),
+                }));
+            eprintln!(
+                "wicked-core: DENY (read-only evaluator, unit {}): {reason}",
+                ro.ord
+            );
+            let note = format!(
+                "\n[wicked-core] refused tool call `{}`: {reason}\n",
+                call.tool
+            );
+            if output.len() + note.len() <= max_out {
+                output.push_str(&note);
+            }
+            respond_or_note(
+                stdin,
+                write_lock,
+                &req_id,
+                crate::acp_permission::reject_result(&params),
+                "a permission request (read-only posture)",
+                output,
+                max_out,
+            );
+            return;
+        }
+    }
     let result = match (gate, chat_boundary) {
         (Some(g), _) => crate::acp_permission::permission_result(g, &params).0,
         (None, Some(b)) => crate::acp_permission::chat_boundary_result(b, &params).0,
@@ -5860,7 +5974,28 @@ impl AcpStepRunner {
                 }
             },
         );
-        let turn = exec_turn_acp(
+        // core#431 (F-3R2-009): an `executes_code: false` unit runs READ-ONLY on this carrier
+        // too — write-class permission requests are refused whatever the seat's governance
+        // admission (`AcpReadOnly`). Disclosed once per turn so the record says the posture held.
+        let read_only = crate::worktree_guard::applies_to(&input.unit).then(|| AcpReadOnly {
+            run_id: run_id.clone(),
+            ord: input.unit.ord,
+            attempt: input.attempt,
+            cli: cli_key.clone(),
+            phase: input.unit.phase_id().unwrap_or("").to_string(),
+            tx: self.tx.clone(),
+        });
+        if read_only.is_some() {
+            eprintln!(
+                "wicked-core: unit {} (phase `{}`, executes_code:false) runs on ACP seat \
+                 '{cli_key}' with the read-only posture: write-class tool calls (edit/write/\
+                 delete/move) are refused at the permission boundary; bash stays — the worktree \
+                 guard holds the rest (F-036 / core#431)",
+                input.unit.ord,
+                input.unit.phase_id().unwrap_or("?"),
+            );
+        }
+        let turn = exec_turn_acp_posture(
             &mut proc,
             &prompt,
             prior_outputs,
@@ -5871,6 +6006,7 @@ impl AcpStepRunner {
             input.elicitation_epoch,
             &self.tx,
             gate.as_ref(),
+            read_only.as_ref(),
         );
         let superseded = {
             let maps = self
@@ -12391,6 +12527,127 @@ transport = "stdio"
         // A RESPONSE is not agent-originated, so it is never a notification.
         let response = serde_json::json!({"jsonrpc":"2.0","id":7,"result":{}});
         assert!(!is_notification(&response));
+    }
+
+    /// core#431 (F-3R2-009): an `executes_code: false` unit on the ACP carrier is READ-ONLY even
+    /// with NO governance gate (the unadmitted-seat shape that let pi rewrite the fix under
+    /// review). A write-class request is answered with the agent's REJECT option and disclosed as
+    /// `evaluatorToolCallDenied`; a read request on the same posture is still allowed, and with no
+    /// posture the write is allowed as before (chat turns, creator units).
+    #[test]
+    fn a_read_only_unit_has_its_write_class_permission_requests_refused_and_disclosed() {
+        let frame = |name: &str, kind: &str, id: u64| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "t1", "name": name, "kind": kind,
+                                 "rawInput": {"path": "src/App.tsx"}},
+                    "options": [
+                        {"optionId": "allow", "kind": "allow_once"},
+                        {"optionId": "reject", "kind": "reject_once"},
+                    ],
+                },
+            })
+        };
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            let line = written
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response frame written");
+            serde_json::from_str(line).unwrap()
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let ro = super::AcpReadOnly {
+            run_id: "run-1".into(),
+            ord: 4,
+            attempt: 0,
+            cli: "pi".into(),
+            phase: "verify".into(),
+            tx,
+        };
+        let lock = std::sync::Mutex::new(());
+
+        // 1. pi's `edit` on the read-only posture, no gate: REFUSED + disclosed.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            Some(&ro),
+            &frame("edit", "edit", 7),
+            &mut output,
+            4096,
+        );
+        let v = answer_of(&sink);
+        assert_eq!(v["id"], 7);
+        assert_eq!(
+            v["result"]["outcome"]["optionId"], "reject",
+            "the write is refused with the agent's own reject option: {v}"
+        );
+        assert!(
+            output.contains("refused tool call `edit`") && output.contains("executes_code:false"),
+            "the turn output says why: {output}"
+        );
+        match rx.try_recv() {
+            Ok(crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::EvaluatorToolCallDenied {
+                    session,
+                    ord,
+                    cli,
+                    carrier,
+                    tool,
+                    kind,
+                    path,
+                    reason,
+                    ..
+                },
+            )) => {
+                assert_eq!((session.as_str(), ord, cli.as_str()), ("run-1", 4, "pi"));
+                assert_eq!(carrier, "acp");
+                assert_eq!(tool, "edit");
+                assert_eq!(kind.as_deref(), Some("edit"));
+                assert_eq!(path.as_deref(), Some("src/App.tsx"));
+                assert!(
+                    reason.contains("verify") && reason.contains("refused"),
+                    "{reason}"
+                );
+            }
+            Ok(_) => panic!("expected evaluatorToolCallDenied, got a different command"),
+            Err(e) => panic!("expected evaluatorToolCallDenied, got no event: {e}"),
+        }
+
+        // 2. A READ on the same posture: allowed, nothing disclosed.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            Some(&ro),
+            &frame("read", "read", 8),
+            &mut output,
+            4096,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
+        assert!(rx.try_recv().is_err(), "a read draws no denial event");
+        assert!(output.is_empty());
+
+        // 3. No posture (a creator unit / a chat turn): the write is allowed as before.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            &frame("edit", "edit", 9),
+            &mut output,
+            4096,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
     }
 
     /// End-to-end at the handshake dispatcher: a TRUE notification (id member absent) draws no

@@ -214,7 +214,8 @@ pub(crate) enum Command {
     /// all normal worker-initiated paths (no blocking needed).
     ApplyStepResult {
         output: StepOutput,
-        agent_verdict: Option<(bool, String)>,
+        /// The layer-2 judge's verdict, attributed to the seat that rendered it (core#431).
+        agent_verdict: Option<crate::validator::AgentVerdict>,
         /// Engine-derived evidence gathered on the worker thread after the seat's work (F-036
         /// worktree guard outcome, F-039 repo-checks report) — folded into the gate beside the
         /// output. `Default` (nothing gathered) for Tool units and pre-evidence payloads.
