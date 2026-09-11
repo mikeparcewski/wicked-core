@@ -669,6 +669,10 @@ pub enum CoreEvent {
         /// The commit `HEAD` was reset to when the phase had moved it; `None` when it had not.
         head: Option<String>,
         discarded: Vec<crate::worktree_guard::ChangedPath>,
+        /// (F-433-008) Where the discarded tree was pinned (`refs/wicked/suggestions/<run>/<ord>/
+        /// <attempt>`, a commit whose tree is the evaluator's `afterTree`) — `null` when the pin
+        /// failed. The #432 suggestion lane reads the edit back from here.
+        suggestion_ref: Option<String>,
     },
     /// (F-3R2-013, core#431) Before the run's `deliver` tool phase pushed, the engine LIFTED the
     /// run's work onto the remote default branch's CURRENT tip and said what that did. `outcome`
@@ -1652,6 +1656,7 @@ impl CoreEvent {
                 tree,
                 head,
                 discarded,
+                suggestion_ref,
             } => json!({
                 "type": "worktreeRestored",
                 "session": session,
@@ -1662,6 +1667,7 @@ impl CoreEvent {
                 "tree": tree,
                 "head": head,
                 "discarded": discarded.iter().map(changed_path_json).collect::<Vec<_>>(),
+                "suggestionRef": suggestion_ref,
             }),
             CoreEvent::DeliverLiftEvaluated {
                 session,
@@ -2024,9 +2030,11 @@ mod tests {
             tree: "598bbb99".into(),
             head: None,
             discarded: changed,
+            suggestion_ref: Some("refs/wicked/suggestions/run-1/4/0".into()),
         }
         .to_json();
         assert_eq!(j["type"], "worktreeRestored");
+        assert_eq!(j["suggestionRef"], "refs/wicked/suggestions/run-1/4/0");
         assert_eq!(j["tree"], "598bbb99");
         assert!(j["head"].is_null());
         assert_eq!(j["discarded"][0]["status"], "M");

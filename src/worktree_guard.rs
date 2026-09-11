@@ -146,6 +146,11 @@ pub struct WorktreeMutation {
     pub restored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
+    /// (F-433-008) The ref the DISCARDED tree was pinned under before the restore
+    /// (`refs/wicked/suggestions/<run>/<ord>/<attempt>`, a commit whose tree is `after.tree`),
+    /// so an evaluator's found fix is never gc-pruned and the #432 suggestion lane can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_ref: Option<String>,
 }
 
 impl WorktreeMutation {
@@ -469,6 +474,7 @@ fn compare_with_after(
             head_moved,
             restored: false,
             restore_error: None,
+            suggestion_ref: None,
         }),
     ))
 }
@@ -493,9 +499,16 @@ fn compare_with_after(
 ///
 /// Sets `restored` / `restore_error` on `m` and returns the same verdict as a `Result`. Never
 /// panics on git failure; a failed restore leaves whatever state git reached and says so.
+///
+/// `suggestion_ref` (F-433-008): when given, the DISCARDED tree is pinned first — a commit
+/// carrying `after.tree` (parent: the phase's HEAD) is written and the ref points at it — so
+/// the evaluator's edit survives `git gc` and the #432 suggestion lane can diff it against the
+/// creator's tree. A failed pin is logged and never blocks the restore: losing the suggestion is
+/// bad, shipping the evaluator's edit is the finding.
 pub(crate) fn restore_creator_tree(
     worktree: &Path,
     m: &mut WorktreeMutation,
+    suggestion_ref: Option<&str>,
 ) -> anyhow::Result<()> {
     let result = (|| -> anyhow::Result<()> {
         let Some(git_dir) = m.before.git_dir.as_deref() else {
@@ -506,6 +519,40 @@ pub(crate) fn restore_creator_tree(
         };
         let git_dir = Path::new(git_dir);
         let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+        if let Some(r) = suggestion_ref {
+            let identity = Path::new("wicked-core");
+            let pin_env: [(&str, &Path); 6] = [
+                ("GIT_DIR", git_dir),
+                ("GIT_WORK_TREE", worktree),
+                ("GIT_AUTHOR_NAME", identity),
+                ("GIT_AUTHOR_EMAIL", identity),
+                ("GIT_COMMITTER_NAME", identity),
+                ("GIT_COMMITTER_EMAIL", identity),
+            ];
+            let parent = if m.after.head.is_empty() {
+                m.before.head.clone()
+            } else {
+                m.after.head.clone()
+            };
+            let mut args = vec![
+                "commit-tree",
+                m.after.tree.as_str(),
+                "-m",
+                "wicked-core: evaluator suggestion (discarded by the worktree guard, F-036)",
+            ];
+            if !parent.is_empty() {
+                args.extend(["-p", parent.as_str()]);
+            }
+            match git_string(worktree, &args, &pin_env)
+                .and_then(|commit| git(worktree, &["update-ref", r, &commit], &env))
+            {
+                Ok(_) => m.suggestion_ref = Some(r.to_string()),
+                Err(e) => eprintln!(
+                    "wicked-core: could not pin the evaluator's discarded tree under {r}: {e} — \
+                     the restore proceeds; the suggestion may be gc-pruned (F-433-008)"
+                ),
+            }
+        }
         if m.head_moved {
             // An unborn baseline (`head` empty) cannot be "reset to" — there is no commit to
             // point at; say so instead of marking a still-moved HEAD restored (Copilot on #433).
@@ -864,9 +911,25 @@ mod tests {
         std::fs::write(wt.join("src/c.ts"), "export const c = 1;\n").unwrap();
         let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
         assert!(!m.restored && m.restore_error.is_none());
+        let evaluators_tree = m.after.tree.clone();
 
-        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        let pin = "refs/wicked/suggestions/restore/4/0";
+        restore_creator_tree(&wt, &mut m, Some(pin)).expect("restore succeeds");
         assert!(m.restored, "{:?}", m.restore_error);
+        // F-433-008: the discarded edit is pinned — reachable, so never gc-pruned — and is
+        // exactly the tree the evaluator left.
+        assert_eq!(m.suggestion_ref.as_deref(), Some(pin));
+        let pinned_commit = run_git(&wt, &["rev-parse", pin]);
+        assert_eq!(
+            run_git(&wt, &["rev-parse", &format!("{pinned_commit}^{{tree}}")]),
+            evaluators_tree,
+            "the pinned commit carries the evaluator's tree"
+        );
+        assert_eq!(
+            run_git(&wt, &["show", &format!("{pin}:src/a.ts")]).trim(),
+            "export const a = 3; // evaluator's idea",
+            "the suggestion's content is readable back from the ref"
+        );
         assert_eq!(
             std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
             "export const a = 2; // fixed\n",
@@ -922,7 +985,7 @@ mod tests {
         run_git(&wt, &["commit", "-qm", "evaluator commit"]);
         let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
         assert!(m.head_moved);
-        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        restore_creator_tree(&wt, &mut m, None).expect("restore succeeds");
         assert!(m.restored, "{:?}", m.restore_error);
         let now = snapshot(&wt, &repo_of(&wt)).unwrap();
         assert_eq!(now.head, before.head, "HEAD is back at the baseline commit");
@@ -959,7 +1022,7 @@ mod tests {
         .unwrap();
         let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
         assert!(m.head_moved, "a switched ref counts as a moved HEAD");
-        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        restore_creator_tree(&wt, &mut m, None).expect("restore succeeds");
         assert!(m.restored, "{:?}", m.restore_error);
         assert_eq!(
             run_git(&wt, &["symbolic-ref", "-q", "HEAD"]),
@@ -978,7 +1041,7 @@ mod tests {
         std::fs::write(wt.join("src/a.ts"), "export const a = 8; // detached\n").unwrap();
         let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
         assert!(m.head_moved, "a detached HEAD counts as moved");
-        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        restore_creator_tree(&wt, &mut m, None).expect("restore succeeds");
         assert_eq!(
             run_git(&wt, &["symbolic-ref", "-q", "HEAD"]),
             "refs/heads/wicked/restore-ref"

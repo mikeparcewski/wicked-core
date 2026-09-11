@@ -802,13 +802,27 @@ Two release tracks share this file, newest entry first regardless of track:
   the lifted tree (`repoChecksEvaluated` for the deliver unit) and the push runs only when they
   pass; an apply-phase failure (`failed`) fails the unit closed rather than letting the script run
   on a partial tree — the deliver gate never pushes a tree that was not verified. A branch
-  carrying its own commits is skipped (the deliver rebase replays that history, as before). (2) On
+  carrying its own commits is skipped (the deliver rebase replays that history, as before). THE
+  RULE that makes the sentence true on every path (independent review F-433-001): the session
+  records the VERIFIED TREE (`AgentSession::verified_tree` — the verify unit's guard after-tree
+  once its checks passed, or a deliver re-verify's post-check tree, via `UnitEvidence::
+  verified_tree`), and at deliver the worktree is snapshotted and the repository's checks run
+  whenever its tree ≠ that record — `unchanged` and `skipped` included — so a retry after a
+  failed re-verify, an operator's by-hand rebase, or a run with no verify phase is re-checked,
+  never waved through; a lift that moved a lockfile forces a frozen `--ignore-scripts` install
+  ahead of the checks and names the drift (F-433-003); the checks' own writes are caught by a
+  post-check snapshot (F-433-002). Both `git fetch origin` calls are non-interactive
+  (`core.askPass=`, `GIT_TERMINAL_PROMPT=0`, `ssh -oBatchMode=yes`) and killed at 120 s
+  (F-433-004); a failed fetch skips the deliver lift rather than trusting cached refs. (2) On
   `evaluatorMutatedWorktree` the only choices were Approve — which re-baselined on the CURRENT
   tree, silently adopting the evaluator's edit — or cancel, and the engine's remedy was a shell
   command. The worker thread now restores the creator's tree itself (`HEAD` reset when moved,
   `read-tree --reset -u <beforeTree>`, added paths deleted, re-snapshot proven equal):
   `evaluatorMutatedWorktree` carries `restored` + `restoreError`, a `worktreeRestored {tree,
-  head, discarded}` event follows, the gate's `denialReason` says the edit was discarded, and the
+  head, discarded, suggestionRef}` event follows — the discarded edit is PINNED first under
+  `refs/wicked/suggestions/<run>/<ord>/<attempt>` so it is never gc-pruned and the #432
+  suggestion lane can read it (F-433-008) — the gate's `denialReason` says the edit was
+  discarded, and the
   `awaitingHuman` prompt says Approve retries against the restored tree. (3) `gateEvaluated`
   names the layer-2 judge: `judgeCli` (the seat key) and `judgeDistinct` (identity-distinct
   rotation pick vs. the single-runner fallback; both `null` when no judge ran or on the bus path)
@@ -823,7 +837,9 @@ Two release tracks share this file, newest entry first regardless of track:
   reason}`; and because an UNADMITTED adapter never asks (pi-acp executes with zero permission
   round-trips, codex-acp auto-resolves edits), a guarded unit on such a seat is routed to the
   wrapped carrier — where the read-only lever is an argv fact — with `acpFallback
-  {fallbackKind: "read_only_requires_wrapped"}`. `bash` stays (posture, not guarantee — the
+  {fallbackKind: "read_only_requires_wrapped"}`; a lever-less seat there (agy, copilot) is
+  GUARD-ONLY: the read-only instruction rides its prompt and the daemon line says so
+  (F-433-009). `bash` stays (posture, not guarantee — the
   worktree guard remains the backstop, and its restore now runs for every exit status, re-attaches
   a switched/detached `HEAD` via the recorded `WorktreeSnapshot.head_ref`, and reports an unborn
   baseline honestly). The deliver command receives `WICKED_DELIVER_VERIFIED_BASE` (the verified

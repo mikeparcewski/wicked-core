@@ -1250,6 +1250,7 @@ pub(crate) fn run(
                         project_graph: spec.project_graph.clone(),
                         archived_at: None,
                         archive_note: None,
+                        verified_tree: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -4871,6 +4872,12 @@ fn apply_step_result(
         ));
     }
 
+    // (core#431, F-433-001) A checks floor that PASSED on this unit certified a tree: record it
+    // on the session so the deliver phase can tell whether the tree it is about to ship is
+    // still that one — and re-verify when it is not.
+    if let Some(t) = &evidence.verified_tree {
+        session.verified_tree = Some(t.clone());
+    }
     // Approved → advance the resume cursor past the unit we just applied.
     session.unit_ix = output.unit_ix + 1;
     session.attempt = 0;
@@ -5588,6 +5595,7 @@ fn dispatch_unit(
             // a later agent unit discovered the missing skill. Same ladder, same refusal shape
             // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
             let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
+            let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
                 Ok(admitted) => {
                     // The generation the RUN was judged against, reported like a handoff
@@ -5628,6 +5636,7 @@ fn dispatch_unit(
                         Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
                         Some(Ok(clearance)) => {
                             lift_checks = clearance.checks;
+                            lift_verified_tree = Some(clearance.verified_tree);
                             // The verified tip rides to the script (Copilot on #433): its own
                             // fetch + rebase + push can still race a remote that advances in
                             // the window; with this it can refuse or re-verify a moved base.
@@ -5677,6 +5686,7 @@ fn dispatch_unit(
                 evidence: Box::new(crate::workflow::UnitEvidence {
                     worktree_guard: None,
                     repo_checks: lift_checks,
+                    verified_tree: lift_verified_tree,
                 }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
@@ -6827,6 +6837,7 @@ mod gate_pause_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -6990,6 +7001,7 @@ mod terminal_gate_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -7122,6 +7134,7 @@ mod substance_gate_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -7404,6 +7417,7 @@ mod code_evidence_floor_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -7763,6 +7777,7 @@ mod deliverable_floor_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -8165,6 +8180,7 @@ mod seat_failover_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -8800,6 +8816,7 @@ mod def_gate_disclosure_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -8898,6 +8915,7 @@ mod def_gate_disclosure_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -9150,6 +9168,7 @@ mod terminal_worktree_reap_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -9580,6 +9599,7 @@ mod terminal_worktree_reap_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -9675,6 +9695,7 @@ mod worker_code_graph_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
 
@@ -9989,6 +10010,7 @@ mod project_graph_binding_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
 
@@ -10723,6 +10745,7 @@ mod phase_boundary_governance_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -11120,6 +11143,7 @@ mod turn_timeout_vs_cancel_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");

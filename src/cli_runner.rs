@@ -859,7 +859,15 @@ fn run_unit_and_judge_with_roster(
         (worktree_guard.as_mut(), input.workdir.as_deref())
     {
         if m.denies() {
-            match crate::worktree_guard::restore_creator_tree(wd, m) {
+            // F-433-008: the discarded edit is PINNED before the restore so it is never
+            // gc-pruned — the #432 suggestion lane can read it back.
+            let suggestion_ref = format!(
+                "refs/wicked/suggestions/{}/{}/{}",
+                crate::repo::sanitize_worktree_id(&input.run_id),
+                input.unit.ord,
+                input.attempt
+            );
+            match crate::worktree_guard::restore_creator_tree(wd, m, Some(&suggestion_ref)) {
                 Ok(()) => eprintln!(
                     "wicked-core: unit {} (phase `{}`, executes_code:false) changed the tree it \
                      was reviewing — the evaluator's edit was discarded and the creator's tree {} \
@@ -885,9 +893,21 @@ fn run_unit_and_judge_with_roster(
     if output.status != StepStatus::Ok {
         worktree_guard = None;
     }
+    // (core#431, F-433-001) The tree the checks CERTIFIED: only when they ran and passed AND
+    // the guard's final comparison says the tree is exactly what the seat left (Clean) — so the
+    // after-snapshot, taken after the checks, is the tree the checks ran on.
+    let verified_tree = match (&repo_checks, &worktree_guard) {
+        (Some(report), Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }))
+            if report.passed =>
+        {
+            Some(after.tree.clone())
+        }
+        _ => None,
+    };
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
+        verified_tree,
     };
     (output, agent_verdict, evidence)
 }

@@ -657,7 +657,8 @@ export declare class Subscription {
  * repoChecksEvaluated {session, ord, attempt, passed, criterion, checks, skipped}.
  * core#431 additions: gateEvaluated carries `judgeCli: string | null` + `judgeDistinct: boolean |
  * null` (who rendered agentVerdict); worktreeRestored {session, ord, attempt, cli, phase, tree,
- * head, discarded} (the creator's tree was put back after an evaluator mutation);
+ * head, discarded, suggestionRef} (the creator's tree was put back after an evaluator mutation;
+ * the discarded edit is pinned under suggestionRef);
  * deliverLiftEvaluated {session, ord, attempt, outcome: 'unchanged'|'lifted'|'conflict'|'skipped'|'failed',
  * baseRef, baseBefore, baseAfter, treeBefore, treeAfter, conflicts, note} (the deliver phase's
  * lift onto the remote tip, re-verified when it changed the tree); evaluatorToolCallDenied

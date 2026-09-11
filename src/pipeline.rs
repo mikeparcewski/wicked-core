@@ -487,6 +487,7 @@ pub(crate) fn pre_distribute(
         project_graph,
         archived_at: None,
         archive_note: None,
+        verified_tree: None,
     };
     if !session_already_started {
         put_node(store, session.to_node())?;
@@ -807,6 +808,7 @@ pub(crate) fn apply_and_finish_unit(
                         head: (m.head_moved && !m.before.head.is_empty())
                             .then(|| m.before.head.clone()),
                         discarded: m.changed.clone(),
+                        suggestion_ref: m.suggestion_ref.clone(),
                     });
                 }
                 m.denies()

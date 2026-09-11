@@ -42,6 +42,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use wicked_apps_core::spawn::HardenedCommand;
 
@@ -139,17 +140,29 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(10)]
 }
 
-/// `git fetch origin`, bounded so a stalled network cannot wedge the run: the HTTP transport
-/// aborts when it moves under 1 KiB/s for 30 s (git's `http.lowSpeed*`). Best-effort — the
-/// caller discloses a failure and works with whatever `origin/*` the clone already has.
+/// Hard wall-clock bound on `git fetch origin` (F-433-004): the fetch sits on the run's critical
+/// path (worktree mint) and on the deliver unit; a remote that hangs must degrade to a disclosed
+/// "fetch failed", never wedge the run.
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `git fetch origin`, NON-INTERACTIVE and BOUNDED (F-433-004): no credential prompt
+/// (`core.askPass=` + `GIT_TERMINAL_PROMPT=0`), no host-key/passphrase prompt
+/// (`ssh -oBatchMode=yes` unless the operator set their own `GIT_SSH_COMMAND`), the HTTP transport
+/// aborts under 1 KiB/s for 30 s, and the whole command is killed at [`FETCH_TIMEOUT`]. Best-effort
+/// — the caller discloses a failure; a daemon started from a terminal keeps its controlling tty, so
+/// without this a missing credential helper would block `resolve_run_base` and the run would never
+/// reach `WorktreeReady`.
 pub(crate) fn fetch_origin(cwd: &Path) -> Result<(), String> {
     fetch_origin_env(cwd, &[])
 }
 
 fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
-    git(
-        cwd,
-        &[
+    // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
+    let mut cmd = Command::new("git");
+    cmd.hardened()
+        .args([
+            "-c",
+            "core.askPass=",
             "-c",
             "http.lowSpeedLimit=1024",
             "-c",
@@ -157,11 +170,50 @@ fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
             "fetch",
             "--quiet",
             "origin",
-        ],
-        env,
-    )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+        ])
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not spawn `git fetch origin`: {e}"))?;
+    let stderr = child.stderr.take();
+    let deadline = Instant::now() + FETCH_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`git fetch origin` exceeded {}s and was killed",
+                    FETCH_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(format!("`git fetch origin` could not be waited on: {e}")),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut err = String::new();
+    if let Some(mut s) = stderr {
+        use std::io::Read;
+        let _ = s.read_to_string(&mut err);
+    }
+    Err(format!(
+        "`git fetch origin` failed ({status}): {}",
+        err.trim().lines().last().unwrap_or("").trim()
+    ))
 }
 
 /// The remote default ref the deliver script rebases onto, resolved the same way it does
@@ -291,13 +343,10 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
              stand, and no verified base is reported"
         ));
     }
-    let fetch_note: Option<String> = None;
     let Some(base_ref) = resolve_remote_default_env(worktree, &env) else {
-        let mut note = "no remote default ref (origin/HEAD, origin/main) to lift onto".to_string();
-        if let Some(f) = &fetch_note {
-            note.push_str(&format!("; {f}"));
-        }
-        return LiftReport::skipped(note);
+        return LiftReport::skipped(
+            "no remote default ref (origin/HEAD, origin/main) to lift onto",
+        );
     };
     let head = match git_string(worktree, &["rev-parse", "--verify", "HEAD"], &env) {
         Ok(h) if !h.is_empty() => h,
@@ -321,7 +370,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             tree_before: None,
             tree_after: None,
             conflicts: Vec::new(),
-            note: fetch_note,
+            note: None,
         };
     }
     if !is_ancestor(worktree, &env, &head, &tip) {
@@ -336,11 +385,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             note: Some(format!(
                 "the run branch has commits {base_ref} lacks (a phase committed, or the clone \
                  carried local unpushed work) — the engine lifts only uncommitted work on a stale \
-                 base; the deliver rebase replays this history{}",
-                fetch_note
-                    .as_deref()
-                    .map(|f| format!("; {f}"))
-                    .unwrap_or_default()
+                 base; the deliver rebase replays this history"
             )),
         };
     }
@@ -400,7 +445,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
                 tree_before: Some(before.tree),
                 tree_after: None,
                 conflicts,
-                note: fetch_note,
+                note: None,
             }
         }
     };
@@ -454,7 +499,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             tree_before: Some(before.tree),
             tree_after: Some(after.tree),
             conflicts: Vec::new(),
-            note: fetch_note,
+            note: None,
         },
         Ok(after) => failed(
             Some(after.tree.clone()),
@@ -479,6 +524,10 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
 pub(crate) struct LiftContext {
     pub worktree: PathBuf,
     pub repo_root: PathBuf,
+    /// The tree id the run last VERIFIED (the verify unit's guard after-tree once its checks
+    /// passed, or a previous deliver re-verify) — persisted on the session (F-433-001). `None`
+    /// when nothing was recorded: every deliver then re-verifies.
+    pub verified_tree: Option<String>,
 }
 
 /// Resolve the [`LiftContext`] for `unit` on the actor thread (store access).
@@ -496,6 +545,7 @@ pub(crate) fn lift_context(
     Some(LiftContext {
         worktree,
         repo_root: PathBuf::from(repo.root_path),
+        verified_tree: session.verified_tree.clone(),
     })
 }
 
@@ -510,19 +560,57 @@ pub(crate) const VERIFIED_BASE_ENV: &str = "WICKED_DELIVER_VERIFIED_BASE";
 
 /// What the deliver command may proceed with once the lift cleared it.
 pub(crate) struct LiftClearance {
-    /// The re-verify report when the tree was LIFTED and the checks passed — the unit's evidence.
+    /// The re-verify report when the repository's checks RAN on the current tree and passed —
+    /// the unit's evidence. `None` when the current tree IS the recorded verified tree.
     pub checks: Option<crate::repo_checks::RepoChecksReport>,
     /// The remote-tip commit the run's work now sits on and was verified against (`unchanged`
     /// or `lifted`); `None` when the lift was skipped.
     pub verified_base: Option<String>,
+    /// The tree id that is now VERIFIED — the one the command may ship. Persisted on the
+    /// session by the fold so the next deliver attempt can tell whether it changed (F-433-001).
+    pub verified_tree: String,
+}
+
+/// Lockfiles and manifests whose movement between the old base and the tip means the installed
+/// dependencies are stale (F-433-003): the checks must re-install (frozen, `--ignore-scripts`)
+/// before they can say anything about the lifted tree — the acceptance run's `tsc` failed on
+/// `api-types 0.25.0` installed vs `0.30.0` pinned, and the remedy blamed the tree.
+const LOCKFILE_PATHS: [&str; 6] = [
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+];
+
+/// The lockfiles/manifests that differ between `from` and `to` (a subset of [`LOCKFILE_PATHS`]).
+fn lockfile_drift(worktree: &Path, git_dir: &Path, from: &str, to: &str) -> Vec<String> {
+    let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+    let mut args: Vec<&str> = vec!["diff", "--name-only", from, to, "--"];
+    args.extend(LOCKFILE_PATHS);
+    match git_string(worktree, &args, &env) {
+        Ok(out) => out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Lift + re-verify for the deliver unit, off the actor thread, emitting the record through
-/// `emit`. `Ok(clearance)` ⇒ proceed to the command — `checks` is `Some` only when the tree was
-/// lifted and the repository's checks PASSED on it, `verified_base` names the tip the script
-/// should still see after its own fetch. `Err(text)` ⇒ do NOT run the command — the unit fails
-/// with `text` (a conflict, or a failed re-verify; `repoChecksEvaluated` was emitted for the
-/// latter).
+/// `emit`. THE RULE (F-433-001): whatever the lift concluded, the command may run only when the
+/// worktree's CURRENT tree is a tree the repository's own checks have certified — the tree the
+/// session recorded as verified, or one the checks pass on right here. `Ok(clearance)` ⇒
+/// proceed — `checks` is `Some` when the checks ran now, `verified_base` names the tip the script
+/// should still see after its own fetch, `verified_tree` is what the fold persists. `Err(text)`
+/// ⇒ do NOT run the command — the unit fails with `text` (a conflict, an apply failure, a failed
+/// re-verify, or checks that changed the tree; `repoChecksEvaluated {passed: false}` is emitted
+/// for the last two). A retry after a failed re-verify (the branch already on the tip ⇒
+/// `unchanged`), an operator's by-hand rebase, or a run resumed onto an edited worktree all land
+/// here with a tree ≠ the verified one — and are re-checked, not waved through.
 pub(crate) fn lift_and_reverify(
     ctx: &LiftContext,
     run_id: &str,
@@ -538,117 +626,165 @@ pub(crate) fn lift_and_reverify(
         .unwrap_or("the remote default branch");
     let tip = report.base_after.as_deref().map(short).unwrap_or("?");
     match report.outcome {
-        LiftOutcome::Unchanged => {
-            eprintln!(
-                "wicked-core: deliver lift for unit {ord}: unchanged — the run's base {} is \
-                 already at {base_ref} ({tip}); the verified tree ships",
-                report.base_before.as_deref().map(short).unwrap_or("?")
-            );
-            Ok(LiftClearance {
-                checks: None,
-                verified_base: report.base_after.clone(),
-            })
-        }
-        LiftOutcome::Skipped => {
-            eprintln!(
-                "wicked-core: deliver lift for unit {ord}: skipped — {}",
+        LiftOutcome::Failed => {
+            return Err(format!(
+                "deliver: the lift onto {base_ref} ({tip}) could not be applied cleanly — {}. \
+                 Nothing was pushed — the deliver gate never pushes a tree that was not verified. \
+                 Inspect the worktree (it may hold a partial checkout), restore or fix it, and \
+                 approve to retry the deliver phase.",
                 report.note.as_deref().unwrap_or("no reason recorded")
-            );
-            Ok(LiftClearance {
-                checks: None,
-                verified_base: None,
-            })
+            ))
         }
-        LiftOutcome::Failed => Err(format!(
-            "deliver: the lift onto {base_ref} ({tip}) could not be applied cleanly — {}. \
-             Nothing was pushed — the deliver gate never pushes a tree that was not verified. \
-             Inspect the worktree (it may hold a partial checkout), restore or fix it, and \
-             approve to retry the deliver phase.",
+        LiftOutcome::Conflict => {
+            return Err(format!(
+                "deliver: LIFT-CONFLICT — lifting the run's work onto {base_ref} ({tip}) would \
+                 conflict in: {}. The worktree was left exactly as verified (base {}); nothing was \
+                 rebased and nothing was pushed. Resolve on the branch (rebase onto {base_ref}, \
+                 regenerate any generated files, re-run the repository's checks) and approve to \
+                 retry the deliver phase.",
+                report.conflicts.join(", "),
+                report.base_before.as_deref().map(short).unwrap_or("?"),
+            ))
+        }
+        LiftOutcome::Unchanged => eprintln!(
+            "wicked-core: deliver lift for unit {ord}: unchanged — the run's base {} is already \
+             at {base_ref} ({tip})",
+            report.base_before.as_deref().map(short).unwrap_or("?")
+        ),
+        LiftOutcome::Skipped => eprintln!(
+            "wicked-core: deliver lift for unit {ord}: skipped — {}",
             report.note.as_deref().unwrap_or("no reason recorded")
-        )),
-        LiftOutcome::Conflict => Err(format!(
-            "deliver: LIFT-CONFLICT — lifting the run's work onto {base_ref} ({tip}) would \
-             conflict in: {}. The worktree was left exactly as verified (base {}); nothing was \
-             rebased and nothing was pushed. Resolve on the branch (rebase onto {base_ref}, \
-             regenerate any generated files, re-run the repository's checks) and approve to \
-             retry the deliver phase.",
-            report.conflicts.join(", "),
-            report.base_before.as_deref().map(short).unwrap_or("?"),
-        )),
-        LiftOutcome::Lifted => {
-            eprintln!(
-                "wicked-core: deliver lift for unit {ord}: lifted onto {base_ref} ({tip}), tree \
-                 {} → {} — re-running the repository's own checks on the lifted tree (F-039)",
-                report.tree_before.as_deref().map(short).unwrap_or("?"),
-                report.tree_after.as_deref().map(short).unwrap_or("?"),
-            );
-            let checks = crate::repo_checks::run(&ctx.worktree);
-            eprintln!(
-                "wicked-core: deliver lift re-verify for unit {ord}: {} — {}",
-                if checks.passed { "PASS" } else { "FAIL" },
-                checks.summary()
-            );
-            if checks.passed {
-                // The checks are REPOSITORY-controlled code: a "passing" script can edit a
-                // tracked file or move HEAD, and the Tool path has no final worktree guard
-                // (Copilot on #433, third pass). Prove the tree the checks certified is the tree
-                // that ships — the lifted tree, on the tip — or fail closed.
-                let after = crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root)
-                    .map_err(|e| {
-                        format!(
-                            "deliver: the repository's checks passed on the lifted tree but the \
-                             worktree could not be re-snapshotted afterwards ({e}); nothing was \
-                             pushed — the deliver gate never pushes a tree it cannot prove."
-                        )
-                    })?;
-                let lifted_tree = report.tree_after.as_deref().unwrap_or("");
-                let tip_commit = report.base_after.as_deref().unwrap_or("");
-                if after.tree != lifted_tree || after.head != tip_commit {
-                    emit(CoreEvent::RepoChecksEvaluated {
-                        session: run_id.to_string(),
-                        ord,
-                        attempt,
-                        passed: false,
-                        criterion: crate::repo_checks::CRITERION.to_string(),
-                        checks: checks.checks.clone(),
-                        skipped: checks.skipped.clone(),
-                    });
-                    return Err(format!(
-                        "deliver: the repository's checks passed on the lifted tree but CHANGED \
-                         it while running (tree {} → {}, HEAD {} → {}) — a check script that \
-                         edits tracked files or moves HEAD leaves a tree nobody verified. Nothing \
-                         was pushed. Inspect the worktree, fix or ignore the check's writes, and \
-                         approve to retry.",
-                        short(lifted_tree),
-                        short(&after.tree),
-                        short(tip_commit),
-                        short(&after.head),
-                    ));
-                }
-                Ok(LiftClearance {
-                    checks: Some(checks),
-                    verified_base: report.base_after.clone(),
-                })
-            } else {
-                emit(CoreEvent::RepoChecksEvaluated {
-                    session: run_id.to_string(),
-                    ord,
-                    attempt,
-                    passed: false,
-                    criterion: crate::repo_checks::CRITERION.to_string(),
-                    checks: checks.checks.clone(),
-                    skipped: checks.skipped.clone(),
-                });
-                Err(format!(
-                    "deliver: the run's work was lifted onto {base_ref} ({tip}) but the \
-                     repository's own checks FAILED on the lifted tree: {}. Nothing was pushed — \
-                     the deliver gate never pushes a tree that was not verified. The worktree now \
-                     holds the lifted tree; fix it there (or reject the run) and approve to retry.",
-                    checks.summary()
-                ))
+        ),
+        LiftOutcome::Lifted => eprintln!(
+            "wicked-core: deliver lift for unit {ord}: lifted onto {base_ref} ({tip}), tree {} → {}",
+            report.tree_before.as_deref().map(short).unwrap_or("?"),
+            report.tree_after.as_deref().map(short).unwrap_or("?"),
+        ),
+    }
+    // The tree that would ship, as it stands NOW — whatever the lift did or did not do.
+    let now = crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root).map_err(|e| {
+        format!(
+            "deliver: the worktree could not be snapshotted before delivery ({e}); nothing was \
+             pushed — the deliver gate never pushes a tree it cannot identify."
+        )
+    })?;
+    let verified_base = match report.outcome {
+        LiftOutcome::Unchanged | LiftOutcome::Lifted => report.base_after.clone(),
+        _ => None,
+    };
+    if ctx.verified_tree.as_deref() == Some(now.tree.as_str()) {
+        eprintln!(
+            "wicked-core: deliver for unit {ord}: the worktree tree {} is the tree the run \
+             verified — the checks need not run again",
+            short(&now.tree)
+        );
+        return Ok(LiftClearance {
+            checks: None,
+            verified_base,
+            verified_tree: now.tree,
+        });
+    }
+    // Not the verified tree ⇒ RE-VERIFY, whatever moved it (a lift, a failed earlier re-verify's
+    // leftover, an operator's by-hand rebase, an edit after verify, a run with no verify phase).
+    let why = match (&ctx.verified_tree, report.outcome) {
+        (_, LiftOutcome::Lifted) => "the lift changed the tree".to_string(),
+        (Some(v), _) => format!(
+            "the worktree's tree {} is not the tree the run verified ({})",
+            short(&now.tree),
+            short(v)
+        ),
+        (None, _) => "the run recorded no verified tree".to_string(),
+    };
+    // F-433-003: a lockfile that moved with the base means the installed dependencies are
+    // stale — force a frozen, scripts-off install ahead of the checks and NAME the drift.
+    let drift = match (&report.base_before, &report.base_after) {
+        (Some(from), Some(to)) if report.outcome == LiftOutcome::Lifted => {
+            match pinned_git_dir(&ctx.worktree, &ctx.repo_root) {
+                Ok(git_dir) => lockfile_drift(&ctx.worktree, &git_dir, from, to),
+                Err(_) => Vec::new(),
             }
         }
+        _ => Vec::new(),
+    };
+    let drift_note = if drift.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Lockfile drift between the old base and the tip ({}): dependencies were \
+             re-installed (frozen lockfile, --ignore-scripts) before the checks.",
+            drift.join(", ")
+        )
+    };
+    eprintln!(
+        "wicked-core: deliver re-verify for unit {ord}: {why}{} — running the repository's own \
+         checks on tree {} (F-039 / F-433-001)",
+        if drift.is_empty() {
+            String::new()
+        } else {
+            format!("; lockfile drift in {} ⇒ forced install", drift.join(", "))
+        },
+        short(&now.tree)
+    );
+    let checks = crate::repo_checks::run_forcing_install(&ctx.worktree, !drift.is_empty());
+    eprintln!(
+        "wicked-core: deliver re-verify for unit {ord}: {} — {}",
+        if checks.passed { "PASS" } else { "FAIL" },
+        checks.summary()
+    );
+    let refuse = |checks: &crate::repo_checks::RepoChecksReport, text: String| {
+        emit(CoreEvent::RepoChecksEvaluated {
+            session: run_id.to_string(),
+            ord,
+            attempt,
+            passed: false,
+            criterion: crate::repo_checks::CRITERION.to_string(),
+            checks: checks.checks.clone(),
+            skipped: checks.skipped.clone(),
+        });
+        Err(text)
+    };
+    if !checks.passed {
+        return refuse(
+            &checks,
+            format!(
+                "deliver: {why}, and the repository's own checks FAILED on it: {}.{drift_note} \
+                 Nothing was pushed — the deliver gate never pushes a tree that was not verified. \
+                 Fix the worktree (or reject the run) and approve to retry; the checks run again \
+                 until the tree passes.",
+                checks.summary()
+            ),
+        );
     }
+    // F-433-002: the checks are REPOSITORY-controlled code — a "passing" script can edit a
+    // tracked file or move HEAD, and the Tool path has no final worktree guard. Prove the tree
+    // the checks certified is the tree that ships, or fail closed.
+    let after = crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root).map_err(|e| {
+        format!(
+            "deliver: the repository's checks passed but the worktree could not be \
+             re-snapshotted afterwards ({e}); nothing was pushed — the deliver gate never pushes \
+             a tree it cannot prove."
+        )
+    })?;
+    if after.tree != now.tree || after.head != now.head {
+        return refuse(
+            &checks,
+            format!(
+                "deliver: the repository's checks passed but CHANGED the tree while running (tree \
+                 {} → {}, HEAD {} → {}) — a check script that edits tracked files or moves HEAD \
+                 leaves a tree nobody verified. Nothing was pushed. Inspect the worktree, fix or \
+                 ignore the check's writes, and approve to retry.",
+                short(&now.tree),
+                short(&after.tree),
+                short(&now.head),
+                short(&after.head),
+            ),
+        );
+    }
+    Ok(LiftClearance {
+        checks: Some(checks),
+        verified_base,
+        verified_tree: after.tree,
+    })
 }
 
 #[cfg(test)]
@@ -982,6 +1118,149 @@ mod tests {
             r.note
         );
         assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), head, "nothing moved");
+    }
+
+    /// A worktree with a `test` script that FAILS (`exit 1`), `node_modules/` present so the
+    /// floor installs nothing — the repository's own check, always red.
+    fn add_failing_npm_check(repo: &Path) {
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"lift-reverify","version":"0.0.0","scripts":{"test":"exit 1"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("node_modules")).unwrap();
+        std::fs::write(repo.join("node_modules/.keep"), "").unwrap();
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "-qm", "failing check"]);
+        run_git(repo, &["push", "-q", "origin", "main"]);
+    }
+
+    fn ctx_for(clone: &Path, wt: &Path, verified_tree: Option<String>) -> LiftContext {
+        LiftContext {
+            worktree: wt.to_path_buf(),
+            repo_root: clone.to_path_buf(),
+            verified_tree,
+        }
+    }
+
+    /// F-433-001, the load-bearing rule: a lift whose re-verify FAILS leaves the worktree on the
+    /// tip with the lifted content; the retry finds nothing to lift (`unchanged`) — and must
+    /// still re-run the checks, because the tree is not the one the run verified, and refuse
+    /// again. Before this rule the retry pushed the tree that had just failed the checks. Needs
+    /// `npm` on PATH; on a host with no OS sandbox the floor fails closed (also a refusal) — either
+    /// way the checks are consulted TWICE and the command never gets clearance.
+    #[test]
+    fn a_failed_reverify_is_re_run_on_retry_and_refuses() {
+        // spawn-audit: test-only — probes for `npm` on PATH to decide whether the fixture can run; reads no engine state.
+        if Command::new("npm").arg("--version").output().is_err() {
+            eprintln!("npm not on PATH — the re-verify test cannot run here");
+            return;
+        }
+        let (clone, wt) = stale_base_layout("reverify-retry");
+        // The seed repo had no check; the clone's checkout is the stale base. Land a failing
+        // check + a non-conflicting file on origin, so the lift changes the tree.
+        land_on_origin("reverify-retry", &clone, |o| {
+            std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+        });
+        let other = clone.parent().unwrap().join("other-reverify-retry");
+        add_failing_npm_check(&other);
+        // The run's verify unit certified the PRE-lift tree.
+        let verified = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
+        let ctx = ctx_for(&clone, &wt, Some(verified.clone()));
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+
+        // Attempt 0: lifted → checks run → refuse.
+        let first = lift_and_reverify(&ctx, "run-R", 5, 0, &emit);
+        let err = first.err().expect("a failing check refuses the deliver");
+        assert!(err.contains("Nothing was pushed"), "{err}");
+        let checks_evaluated = |evs: &[CoreEvent]| {
+            evs.iter()
+                .filter(|e| matches!(e, CoreEvent::RepoChecksEvaluated { passed: false, .. }))
+                .count()
+        };
+        assert_eq!(
+            checks_evaluated(&events.borrow()),
+            1,
+            "the checks were consulted"
+        );
+        let lifted = events.borrow().iter().any(
+            |e| matches!(e, CoreEvent::DeliverLiftEvaluated { outcome, .. } if outcome == "lifted"),
+        );
+        assert!(lifted, "{:?}", events.borrow().len());
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_eq!(
+            run_git(&wt, &["rev-parse", "HEAD"]),
+            tip,
+            "the worktree sits on the tip"
+        );
+
+        // Attempt 1 (the operator approved a retry): nothing to lift — and the tree is NOT the
+        // verified one, so the checks run again and refuse again.
+        let second = lift_and_reverify(&ctx, "run-R", 5, 1, &emit);
+        let err = second.err().expect("the retry must not be waved through");
+        assert!(
+            err.contains("is not the tree the run verified") || err.contains("FAILED"),
+            "{err}"
+        );
+        let unchanged = events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::DeliverLiftEvaluated { attempt: 1, outcome, .. } if outcome == "unchanged"));
+        assert!(unchanged, "the retry found nothing to lift");
+        assert_eq!(
+            checks_evaluated(&events.borrow()),
+            2,
+            "the checks were consulted AGAIN on the retry"
+        );
+    }
+
+    /// The fast path: the worktree's tree IS the tree the run verified — no checks, clearance.
+    #[test]
+    fn a_tree_that_matches_the_verified_tree_needs_no_checks() {
+        let (clone, wt) = stale_base_layout("verified-match");
+        let verified = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
+        let ctx = ctx_for(&clone, &wt, Some(verified.clone()));
+        let emit = |_: CoreEvent| {};
+        let c = lift_and_reverify(&ctx, "run-M", 5, 0, &emit).expect("cleared");
+        assert!(c.checks.is_none(), "no checks ran on the verified tree");
+        assert_eq!(c.verified_tree, verified);
+        assert_eq!(
+            c.verified_base.as_deref(),
+            Some(run_git(&wt, &["rev-parse", "origin/main"]).as_str())
+        );
+    }
+
+    /// `unchanged` is not a pass: an operator's edit after verify (or a by-hand rebase) leaves a
+    /// tree ≠ the verified one with nothing to lift — the checks run anyway. Here the repo has
+    /// no detectable check, so the floor reports `checks: []`… and on a host with no OS sandbox
+    /// it refuses instead — both are "the checks were consulted", never a silent proceed.
+    #[test]
+    fn an_unchanged_lift_over_a_tree_that_is_not_verified_still_consults_the_checks() {
+        let (clone, wt) = stale_base_layout("verified-mismatch");
+        let ctx = ctx_for(
+            &clone,
+            &wt,
+            Some("0000000000000000000000000000000000000000".into()),
+        );
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let result = lift_and_reverify(&ctx, "run-X", 5, 0, &emit);
+        match result {
+            Ok(c) => assert!(
+                c.checks.is_some(),
+                "unchanged + unverified tree ⇒ the checks ran (and passed vacuously)"
+            ),
+            Err(e) => assert!(
+                e.contains("is not the tree the run verified"),
+                "a refusal names why the checks ran: {e}"
+            ),
+        }
+        let unchanged = events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, CoreEvent::DeliverLiftEvaluated { outcome, .. } if outcome == "unchanged"));
+        assert!(unchanged);
     }
 
     #[test]

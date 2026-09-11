@@ -2841,6 +2841,7 @@ mod tests {
                 tree: s(),
                 head: None,
                 discarded: vec![],
+                suggestion_ref: Some(s()),
             },
             "worktreeRestored",
             &[
@@ -2853,6 +2854,7 @@ mod tests {
                 "tree",
                 "head",
                 "discarded",
+                "suggestionRef",
             ],
         );
         check(
