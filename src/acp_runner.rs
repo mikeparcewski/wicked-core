@@ -1973,8 +1973,11 @@ fn start_acp_process_with_write_roots(
     // PLUGIN for the Claude bridge (`session/new` `_meta.claudeCode.options.plugins`, the one
     // channel it honours for plugins: argv it does not parse is discarded, FINDING-060, and the
     // worker home's `plugins/` is re-sanitized on every spawn); `--no-skills --skill …` /
-    // `--add-dir …` appended to the bridge argv when the bridge IS pi / copilot; opencode's
-    // `skills.paths` composed into `OPENCODE_CONFIG_CONTENT`; or nothing.
+    // `--add-dir …` appended to the bridge argv when the bridge IS pi / copilot, pi's skill
+    // directories as `WICKED_PI_SKILL_DIRS` when the bridge is a separate program (`pi-acp`,
+    // F-079); opencode's `skills.paths` composed into `OPENCODE_CONFIG_CONTENT`; or nothing.
+    // Every delivered seat also gets `WICKED_GARDEN_ROOT` + a `PATH` prefix of the SAME root
+    // (`SkillsDelivery::launcher_env`).
     delivery: &crate::skills_snapshot::SkillsDelivery,
     // The CLI the seat this bridge carries runs, as `seat_cli_of` judges it (the merged registry
     // record's `binary` — never the bridge). Decides the per-seat configuration below (core#410):
@@ -2090,7 +2093,22 @@ fn start_acp_process_with_write_roots(
                 config.binary
             )
         })?;
-    let delivery_flags = delivery.argv_flags();
+    // F-079 (core#441): how the delivery rides THIS carrier — pi's / copilot's flags on the
+    // carrier's own argv when the carrier IS that CLI, pi's `WICKED_PI_SKILL_DIRS` in the
+    // environment when the carrier is a separate bridge program (`pi-acp`), which forwards it as
+    // `--no-skills --skill …` to the pi it spawns. A skill directory that cannot be spelled in a
+    // path-list fails the spawn (`exec_turn_inner` refuses the unit before reaching here).
+    let (delivery_flags, delivery_env) = delivery.acp_transport(&config.binary).map_err(|why| {
+        anyhow::anyhow!(
+            "refusing to start '{}': {why}; the skills delivery is never truncated",
+            config.binary
+        )
+    })?;
+    // The launcher environment every delivered seat gets with its skills (F-079): the pinned
+    // generation as `WICKED_GARDEN_ROOT` and its `scripts/` at the front of `PATH` — both from
+    // the SAME root the delivery was derived from, both read-only paths inside the fence's
+    // allowed slot. Empty when nothing is delivered.
+    let launcher_env = delivery.launcher_env(std::env::var_os("PATH").as_deref());
     // Computed ONCE per spawn — not re-probed per turn — because the session this spawn starts
     // is cached and reused across every turn of its lifetime (`probe_cached_session`); "the same
     // resolved ACP binary that is spawned" means the binary this exact process came from, so the
@@ -2178,6 +2196,15 @@ fn start_acp_process_with_write_roots(
         if let Some(content) = &opencode_config {
             cmd.env(crate::skills_snapshot::OPENCODE_CONFIG_ENV, content);
         }
+        // F-079: pi's skill directories for a separate bridge to forward (empty on every other
+        // carrier), then the launcher root + PATH prefix of the delivered generation. Set AFTER
+        // `hardened()` and `seat_config.apply` like everything else this path intends.
+        for (k, v) in &delivery_env {
+            cmd.env(k, v);
+        }
+        for (k, v) in &launcher_env {
+            cmd.env(k, v);
+        }
         // In-boundary scratch for unit sessions (core#264) — tools the bridge spawns inherit
         // this, so `mktemp`/`$TMPDIR` writes land inside the unit instead of the system temp.
         // Set ONLY when the dir really exists as a directory (same rule as the wrapped path):
@@ -2192,7 +2219,8 @@ fn start_acp_process_with_write_roots(
         }
         cmd.args(&config.start_args);
         // v3.2: pi's `--no-skills --skill <dir>…` / copilot's `--add-dir <view>` — only when the
-        // bridge IS that CLI (`WorkerCli::for_binaries` judged the carrier); empty otherwise.
+        // bridge IS that CLI (`SkillsDelivery::acp_transport` judged the carrier); empty
+        // otherwise (a separate pi bridge is handed `WICKED_PI_SKILL_DIRS` above instead).
         cmd.args(&delivery_flags);
         cmd.current_dir(cwd);
         cmd.stdin(Stdio::piped());
@@ -5849,6 +5877,19 @@ impl AcpStepRunner {
                 },
             );
         }
+        // F-079: the same posture for pi's path-list behind a separate bridge — a skill directory
+        // that cannot be spelled in `WICKED_PI_SKILL_DIRS` is a LAUNCH ERROR naming the variable,
+        // not a spawn failure that would fall back to the wrapped carrier.
+        if let Err(why) = delivery.acp_transport(&acp_config.binary) {
+            return crate::execute_wrapped::skills_refusal(
+                input,
+                &crate::skills_snapshot::SkillsError::LeverConfig {
+                    cli: cli_key.clone(),
+                    var: crate::skills_snapshot::PI_SKILL_DIRS_ENV,
+                    why,
+                },
+            );
+        }
 
         if acp_config.transport == AcpTransport::Http {
             let reason = format!(
@@ -6481,10 +6522,13 @@ fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
 /// handshake key off: the MERGED registry record read by key — the operator's `clis.toml`
 /// overriding a built-in wholesale — whose `binary` decides whether this is a claude seat
 /// (`binary_is_claude`, the same test the wrapped runner applies to its template) and whose
-/// `[cli.acp]` bridge is the CARRIER this path spawns (v3.2): a bridge that is a separate program
-/// (`pi-acp`, `codex-acp`) forwards no CLI flags and so has no skills lever even where the CLI
-/// itself does; a bridge that IS the CLI (`copilot --acp`, `opencode acp`) keeps it. An
-/// unregistered key is its own binary, exactly as `resolve_invocation` treats it.
+/// `[cli.acp]` bridge is the CARRIER this path spawns (v3.2, F-079): a lever that rides the
+/// environment is the SEAT's whatever carries it — pi behind `pi-acp` is judged as pi and handed
+/// `WICKED_PI_SKILL_DIRS` for the bridge to forward, opencode behind `opencode acp` as opencode;
+/// an argv-only lever (copilot's `--add-dir`) exists only where the bridge IS the CLI
+/// (`copilot --acp`), since a separate program forwards no CLI flags
+/// (`WorkerCli::for_binaries`). An unregistered key is its own binary, exactly as
+/// `resolve_invocation` treats it.
 ///
 /// ONE function for the runner (`exec_turn_inner`) and for seat selection
 /// (`distribute::seat_is_claude`, #402 review pass 2): routing eligibility is read off the same
@@ -9754,7 +9798,10 @@ cat >/dev/null
             ),
         );
         let skill_dir = dir.join("skills").join("domain");
-        let delivery = SkillsDelivery::OpencodeConfig(vec![skill_dir.clone()]);
+        let delivery = SkillsDelivery::OpencodeConfig {
+            root: dir.clone(),
+            dirs: vec![skill_dir.clone()],
+        };
         let mut config = stub_config(&script, None);
         config.acp_governance_env = Some((OPENCODE_CONFIG_ENV.to_string(), "not json".to_string()));
         let err = start_acp_process_with_write_roots(
@@ -15329,5 +15376,410 @@ transport = "stdio"
             "active_workers entry must be removed after EpochCleanup::drop (no leak)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F-079 (core#441): the ACP skills lever from the SEAT binary; the launcher environment ─
+
+    /// The ACP carrier judges pi's lever off the SEAT binary: the REAL built-in pi record carries
+    /// `[cli.acp] binary = "pi-acp"` (a separate bridge program), and its identity is now
+    /// `PiSkillFlags`, not `Absent` — while codex behind `codex-acp` and agy behind `agy-acp`
+    /// stay lever-less, copilot (`copilot --acp`) and opencode (`opencode acp`) keep theirs, and
+    /// an unregistered key is its own binary.
+    #[test]
+    fn the_acp_identity_of_a_pi_seat_behind_pi_acp_is_pi_with_its_skill_flags_lever() {
+        use crate::skills_snapshot::{SkillsLever, WorkerCli};
+        let builtin = wicked_council::registry::builtin();
+        let record = |key: &str| builtin.iter().find(|c| c.key == key).expect(key);
+        let pi = record("pi");
+        assert_eq!(
+            pi.acp.as_ref().map(|a| a.binary.as_str()),
+            Some("pi-acp"),
+            "the fixture is the real built-in: a separate bridge program carries pi"
+        );
+        assert_eq!(
+            super::seat_identity_of(Some(pi), "pi"),
+            WorkerCli::Other {
+                key: "pi".into(),
+                lever: SkillsLever::PiSkillFlags
+            }
+        );
+        assert_eq!(
+            super::seat_identity_of(Some(record("codex")), "codex").lever(),
+            SkillsLever::Absent
+        );
+        assert_eq!(
+            super::seat_identity_of(Some(record("agy")), "agy").lever(),
+            SkillsLever::Absent
+        );
+        assert_eq!(
+            super::seat_identity_of(Some(record("copilot")), "copilot").lever(),
+            SkillsLever::CopilotAddDir
+        );
+        assert_eq!(
+            super::seat_identity_of(Some(record("opencode")), "opencode").lever(),
+            SkillsLever::OpencodeConfig
+        );
+        assert!(matches!(
+            super::seat_identity_of(Some(record("claude")), "claude"),
+            WorkerCli::Claude
+        ));
+        assert_eq!(
+            super::seat_identity_of(None, "pi").lever(),
+            SkillsLever::PiSkillFlags
+        );
+        assert_eq!(
+            super::seat_identity_of(None, "codex").lever(),
+            SkillsLever::Absent
+        );
+    }
+
+    /// Parse the env-dumping stub's ledger: `ARG <token>` lines in order, `ENV <VAR>=<value>`.
+    #[cfg(unix)]
+    fn read_env_dump(
+        dump: &std::path::Path,
+    ) -> (Vec<String>, std::collections::BTreeMap<String, String>) {
+        let text = std::fs::read_to_string(dump).expect("the stub wrote its dump before ACP init");
+        let mut args = Vec::new();
+        let mut env = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            if let Some(a) = line.strip_prefix("ARG ") {
+                args.push(a.to_string());
+            } else if let Some(kv) = line.strip_prefix("ENV ") {
+                let (k, v) = kv.split_once('=').expect("ENV k=v");
+                env.insert(k.to_string(), v.to_string());
+            }
+        }
+        (args, env)
+    }
+
+    /// Through the REAL spawn chokepoint: a pi seat carried by a SEPARATE bridge program (the stub
+    /// is named `pi-acp`) is handed its deliverable skill directories as `WICKED_PI_SKILL_DIRS` —
+    /// one OS path-list in `--skill` order — with NO `--no-skills`/`--skill` on the bridge's own
+    /// argv (it would forward none), plus the launcher environment of the SAME generation:
+    /// `WICKED_GARDEN_ROOT=<root>` and `<root>/scripts` at the front of the daemon's `PATH`. A
+    /// carrier that IS pi (the stub renamed `pi`) gets the flags instead and no path-list, and the
+    /// launcher environment all the same. A delivery-less spawn gets none of the three.
+    #[test]
+    #[cfg(unix)]
+    fn a_separate_pi_bridge_is_handed_the_skill_dirs_and_launcher_env_not_flags() {
+        use crate::skills_snapshot::{
+            SkillsDelivery, GARDEN_ROOT_ENV, PATH_LIST_SEPARATOR, PI_SKILL_DIRS_ENV,
+        };
+        use std::ffi::OsString;
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("pi-acp-env");
+        let dump = dir.join("env.txt");
+        let body = format!(
+            "#!/bin/sh\n{{ for a in \"$@\"; do printf 'ARG %s\\n' \"$a\"; done; printf 'ENV \
+             {pi}=%s\\n' \"${{{pi}:-UNSET}}\"; printf 'ENV {root}=%s\\n' \"${{{root}:-UNSET}}\"; \
+             printf 'ENV PATH=%s\\n' \"${{PATH:-UNSET}}\"; }} > \"{dump}\"\nread _init\nprintf \
+             '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\nread _new\nprintf '%s\\n' \
+             '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"s\"}}}}'\ncat >/dev/null\n",
+            pi = PI_SKILL_DIRS_ENV,
+            root = GARDEN_ROOT_ENV,
+            dump = dump.display()
+        );
+        let write_named = |name: &str| -> std::path::PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, &body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let snapshot = dir.join("snap");
+        let a = snapshot.join("skills").join("a");
+        let b = snapshot.join("skills").join("q").join("b");
+        let delivery = SkillsDelivery::PiSkillFlags {
+            root: snapshot.clone(),
+            dirs: vec![a.clone(), b.clone()],
+        };
+        let start = |carrier: &std::path::Path, delivery: &SkillsDelivery| {
+            let _ = std::fs::remove_file(&dump);
+            let proc = super::start_acp_process_with_write_roots(
+                &stub_config(carrier, None),
+                &dir,
+                None,
+                None,
+                &[],
+                &[],
+                &[],
+                delivery,
+                wicked_apps_core::spawn::SeatCli::Pi,
+                Some(("r", "pi")),
+                None,
+            )
+            .expect("start");
+            let seen = read_env_dump(&dump);
+            drop(proc);
+            seen
+        };
+        let scripts_prefix = format!(
+            "{}{PATH_LIST_SEPARATOR}",
+            snapshot.join("scripts").display()
+        );
+        let daemon_path = std::env::var("PATH").unwrap_or_default();
+
+        // Behind a separate bridge program: the path-list, no flags, the launcher env.
+        let bridge = write_named("pi-acp");
+        let (args, env) = start(&bridge, &delivery);
+        assert!(
+            !args.iter().any(|x| x == "--no-skills" || x == "--skill"),
+            "a separate bridge forwards no CLI flags, so none ride its argv: {args:?}"
+        );
+        let mut list = OsString::from(&a);
+        list.push(PATH_LIST_SEPARATOR);
+        list.push(&b);
+        assert_eq!(env[PI_SKILL_DIRS_ENV], list.to_string_lossy());
+        assert_eq!(env[GARDEN_ROOT_ENV], snapshot.to_string_lossy());
+        assert!(
+            env["PATH"].starts_with(&scripts_prefix) && env["PATH"].ends_with(&daemon_path),
+            "PATH = <root>/scripts + the daemon's own: {}",
+            env["PATH"]
+        );
+
+        // The carrier that IS pi: the flags on its argv, no path-list; the launcher env stays.
+        let as_pi = write_named("pi");
+        let (args, env) = start(&as_pi, &delivery);
+        assert!(args.iter().any(|x| x == "--no-skills"), "{args:?}");
+        assert_eq!(
+            args.windows(2)
+                .filter(|w| w[0] == "--skill")
+                .map(|w| w[1].as_str())
+                .collect::<Vec<_>>(),
+            vec![a.to_string_lossy().as_ref(), b.to_string_lossy().as_ref()]
+        );
+        assert_eq!(env[PI_SKILL_DIRS_ENV], "UNSET");
+        assert_eq!(env[GARDEN_ROOT_ENV], snapshot.to_string_lossy());
+        assert!(env["PATH"].starts_with(&scripts_prefix), "{}", env["PATH"]);
+
+        // Nothing delivered ⇒ none of the three.
+        let (args, env) = start(&bridge, &SkillsDelivery::None);
+        assert!(!args.iter().any(|x| x == "--no-skills" || x == "--skill"));
+        assert_eq!(env[PI_SKILL_DIRS_ENV], "UNSET");
+        assert_eq!(env[GARDEN_ROOT_ENV], "UNSET");
+        assert!(!env["PATH"].starts_with(&scripts_prefix), "{}", env["PATH"]);
+        assert_eq!(env["PATH"], daemon_path, "the daemon's PATH, untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recording ACP bridge (python3, like [`write_recording_bridge`]) that ALSO records, on
+    /// `session/new`, the environment it was spawned with (the F-079 variables and `PATH`) and its
+    /// own argv after the ledger path — so a `run_unit` test can read back what the engine handed
+    /// the carrier without a real pi.
+    #[cfg(unix)]
+    fn write_env_recording_bridge(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("env-recording-bridge");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json, os
+ledger = sys.argv[1]
+
+def w(obj):
+    print(json.dumps(obj), flush=True)
+
+def record(entry):
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    method = req.get("method")
+    if method == "initialize":
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "serverInfo": {"name": "recording", "version": "0"}}})
+    elif method == "session/new":
+        keys = ("WICKED_PI_SKILL_DIRS", "WICKED_GARDEN_ROOT", "PATH")
+        record({"new": req.get("params"),
+                "env": {k: os.environ.get(k, "UNSET") for k in keys},
+                "argv": sys.argv[2:]})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "sessionId": "recording-session", "protocolVersion": "2025-03-26"}})
+    elif method == "session/prompt":
+        blocks = (req.get("params") or {}).get("prompt") or []
+        text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+        record({"prompt": text})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}}})
+    elif "id" in req:
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {}})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Through the real `AcpStepRunner` and the MERGED registry: a pi seat whose `[cli.acp]` names
+    /// a SEPARATE bridge program (a recording bridge at `…/bin/pi-acp`) is no longer `Absent`. Its
+    /// skill-bearing unit is admitted (was: refused `NoLever` by name); the bridge is spawned with
+    /// `WICKED_PI_SKILL_DIRS` naming exactly the PORTABLE skill directories (the `portable:
+    /// false` one withheld) in `--skill` order, `WICKED_GARDEN_ROOT=<snapshot>` and the `PATH`
+    /// prefix, and NO `--skill` on its argv; the prompt asks for the skill by its mirrored name —
+    /// not the `Unloaded` form; and exactly one `skillsSnapshotHanded {path: "acp", cli: <key>}`
+    /// names the published generation. On the rig (design §2.3) the pi unit emitted none.
+    #[test]
+    #[cfg(unix)]
+    fn a_pi_seat_over_pi_acp_is_handed_the_snapshot_and_reports_the_handoff() {
+        use crate::skills_snapshot::test_support::{
+            gen_dir, scratch as canonical_scratch, snapshot_root_with,
+        };
+        use crate::skills_snapshot::{GARDEN_ROOT_ENV, PATH_LIST_SEPARATOR, PI_SKILL_DIRS_ENV};
+        use crate::workflow::{StepInput, StepRunner};
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-pi-lever");
+        let _home = EnvPin::set("HOME", &home);
+        let snapshot = snapshot_root_with(
+            &gen_dir(&home.join(".wicked-crew"), "4"),
+            "4",
+            &[
+                ("domain", "wicked-garden-domain", true, &[]),
+                (
+                    "domain-extractor",
+                    "wicked-garden-domain-extractor",
+                    false,
+                    &[],
+                ),
+                ("qe/a11y", "wicked-garden-qe-a11y", true, &[]),
+            ],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let ledger = home.join("ledger.ndjson");
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bridge = bin.join("pi-acp");
+        std::fs::rename(write_env_recording_bridge(&home), &bridge).unwrap();
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "pi-seat"
+display_name = "pi seat"
+binary = "pi"
+headless_invocation = "pi -p {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let input = {
+            let mut u = crate::domain::WorkUnit::pending("run-pi:u1", "run-pi", 1, "extract");
+            u.assigned_cli = Some("pi-seat".to_string());
+            u.skill_ref = Some("wicked-garden-domain".to_string());
+            StepInput {
+                run_id: "run-pi".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-pi".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        let new = entries
+            .iter()
+            .find(|e| e.get("new").is_some())
+            .expect("session/new reached the bridge over ACP");
+        let domain = snapshot.join("skills").join("domain");
+        let a11y = snapshot.join("skills").join("qe").join("a11y");
+        assert_eq!(
+            new["env"][PI_SKILL_DIRS_ENV],
+            format!(
+                "{}{PATH_LIST_SEPARATOR}{}",
+                domain.display(),
+                a11y.display()
+            ),
+            "the PORTABLE dirs, in --skill order, never the extractor: {new}"
+        );
+        assert_eq!(
+            new["env"][GARDEN_ROOT_ENV],
+            snapshot.to_string_lossy().as_ref()
+        );
+        assert!(
+            new["env"]["PATH"].as_str().unwrap().starts_with(&format!(
+                "{}{PATH_LIST_SEPARATOR}",
+                snapshot.join("scripts").display()
+            )),
+            "{new}"
+        );
+        let argv: Vec<&str> = new["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !argv.iter().any(|a| *a == "--skill" || *a == "--no-skills"),
+            "nothing on the bridge's own argv: {argv:?}"
+        );
+        let prompt = entries
+            .iter()
+            .find_map(|e| e.get("prompt").and_then(Value::as_str))
+            .expect("one prompt reached the bridge");
+        assert!(
+            prompt.contains("Use your skill \"wicked-garden-domain\""),
+            "the mirrored-name directive, not the Unloaded form: {prompt}"
+        );
+        assert!(!prompt.contains("NOT loaded"), "{prompt}");
+        let handed: Vec<(String, String, String, Option<String>)> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(CoreEvent::SkillsSnapshotHanded {
+                    session,
+                    path,
+                    cli,
+                    gen,
+                    ..
+                }) => Some((session, path, cli, gen)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            handed,
+            vec![(
+                "run-pi".to_string(),
+                "acp".to_string(),
+                "pi-seat".to_string(),
+                Some("4".to_string())
+            )],
+            "exactly one handoff, on the ACP path, naming the seat key and the generation"
+        );
+        runner.drop_session("run-pi");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
