@@ -275,6 +275,11 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
         Err(e) => return LiftReport::skipped(format!("could not pin the worktree's git dir: {e}")),
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", &git_dir), ("GIT_WORK_TREE", worktree)];
+    // No `origin` at all ⇒ nothing to lift onto (the deliver script itself would fail its
+    // `git fetch origin`); say that, not "fetch failed".
+    if git(worktree, &["remote", "get-url", "origin"], &env).is_err() {
+        return LiftReport::skipped("no `origin` remote — nothing to lift onto");
+    }
     // A failed fetch means the cached `origin/*` refs are NOT proof of the current tip: an
     // `unchanged` verdict over them would let the script's own fetch + rebase ship a tree nobody
     // verified (Copilot on #433, third pass). Skip — disclosed — and hand the script no
@@ -949,10 +954,34 @@ mod tests {
         );
         let r = lift_onto_remote_default(&wt, &repo);
         assert_eq!(r.outcome, LiftOutcome::Skipped, "{r:?}");
-        assert!(r
-            .note
-            .as_deref()
-            .is_some_and(|n| n.contains("no remote default ref")));
+        assert!(
+            r.note
+                .as_deref()
+                .is_some_and(|n| n.contains("no `origin` remote")),
+            "{:?}",
+            r.note
+        );
+    }
+
+    /// Copilot on #433 (third pass): cached `origin/*` refs are not proof of the current tip. A
+    /// remote that cannot be fetched (here: the bare origin was deleted after the clone) makes
+    /// the lift SKIP before any ancestry test — the worktree untouched, no verified base.
+    #[test]
+    fn a_failed_fetch_skips_the_lift_instead_of_trusting_cached_refs() {
+        let (clone, wt) = stale_base_layout("fetch-fails");
+        std::fs::remove_dir_all(clone.parent().unwrap().join("origin.git")).unwrap();
+        let head = run_git(&wt, &["rev-parse", "HEAD"]);
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Skipped, "{r:?}");
+        assert!(
+            r.note
+                .as_deref()
+                .is_some_and(|n| n.contains("`git fetch origin` failed")
+                    && n.contains("no verified base is reported")),
+            "{:?}",
+            r.note
+        );
+        assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), head, "nothing moved");
     }
 
     #[test]
