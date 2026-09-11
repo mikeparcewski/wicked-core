@@ -1770,6 +1770,25 @@ impl WrappedCliStepRunner {
                 if let Some(spelling) = write_posture.env_value() {
                     cmd.env(crate::gate_hook::NO_CODE_SCOPE_ENV, spelling);
                 }
+                // F-02: a DELIVERABLE-ROOTS creator's roots ride their own env — EXACTLY the
+                // launch-validated extras (`deliverable_roots_of`), the same list the ACP fence
+                // holds in-process — never the write set (which also admits the repo-graph key
+                // dir). An unjoinable root arms an EMPTY list: the hook then refuses every
+                // creator write (fail closed) rather than judging a partial list.
+                if write_posture == crate::write_posture::WritePosture::DeliverableRoots {
+                    let roots = crate::write_posture::deliverable_roots_from(&g.extra_write_roots);
+                    let joined = crate::write_posture::deliverable_roots_env(&roots)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "wicked-core: unit {} deliverable roots cannot be joined for the \
+                                 hook env (a root contains the PATH separator) — arming NONE, so \
+                                 the creator fence refuses every write (fail closed)",
+                                input.unit.ord
+                            );
+                            std::ffi::OsString::new()
+                        });
+                    cmd.env(crate::gate_hook::DELIVERABLE_ROOTS_ENV, joined);
+                }
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
                 // worker reading, in turn, its own skill docs and then its graph. Both are

@@ -147,18 +147,38 @@ fn pre_build_scope_from_env() -> bool {
 }
 
 /// Set by the launcher to the governed unit's WRITE POSTURE when that posture fences writes
-/// ([`crate::write_posture::WritePosture::env_value`], F-036 / F-4R2-004): `read-only` for an
+/// ([`crate::write_posture::WritePosture::env_value`], F-036 / F-4R2-004): `1` for an
 /// `executes_code: false` phase that does not play creator (an evaluator, a recon rung, a review —
-/// the legacy `1`/`true` spelling still reads as this), `deliverable-roots` for a BOUND creator
-/// that declared `executes_code: false` (its deliverables live in the run's declared write roots,
-/// never in the tree under review). Same carrier, same strict parse and same UNSET-is-honest rule
-/// as [`PRE_BUILD_SCOPE_ENV`]: unset means no phase fence — a build phase must be free to write
-/// code, and an inherited junk value must never scope it away from that.
+/// the SAME spelling the hook parsed before postures existed, so a same-version pre-posture hook
+/// binary still reads an evaluator's fence as ON; `true` and the label `read-only` also parse),
+/// `deliverable-roots` for a BOUND creator that declared `executes_code: false` (its deliverables
+/// live in the run's declared write roots, never in the tree under review; a pre-posture hook
+/// reads this as no fence — guard-only — never as a refused deliverable). Same carrier, same
+/// strict parse and same UNSET-is-honest rule as [`PRE_BUILD_SCOPE_ENV`]: unset means no phase
+/// fence — a build phase must be free to write code, and an inherited junk value must never scope
+/// it away from that.
 pub const NO_CODE_SCOPE_ENV: &str = "WICKED_NO_CODE_SCOPE";
 
 /// Read [`NO_CODE_SCOPE_ENV`] off the hook subprocess's own environment.
 fn write_posture_from_env() -> crate::write_posture::WritePosture {
     crate::write_posture::WritePosture::parse_env(std::env::var_os(NO_CODE_SCOPE_ENV).as_deref())
+}
+
+/// Set by the launcher, alongside a `deliverable-roots` [`NO_CODE_SCOPE_ENV`], to the roots a
+/// fenced creator may write: EXACTLY the run's launch-validated `extra_write_roots`
+/// ([`crate::write_posture::deliverable_roots_of`]), PATH-separator-joined like [`WRITE_ROOTS_ENV`].
+/// Carried separately from the write roots on purpose (independent review of #444, F-02): the
+/// filesystem boundary's write set is cwd + extras + the repo-graph key dir, and a creator's
+/// deliverable belongs in the extras alone — judging "inside a declared root" off the write set
+/// would admit the graph dir here and refuse it on the ACP carrier. Unset or empty ⇒ no roots ⇒
+/// every creator write is refused (fail closed).
+pub const DELIVERABLE_ROOTS_ENV: &str = "WICKED_DELIVERABLE_ROOTS";
+
+/// Read [`DELIVERABLE_ROOTS_ENV`] off the hook subprocess's own environment.
+fn deliverable_roots_from_env() -> Vec<std::path::PathBuf> {
+    crate::write_posture::parse_deliverable_roots_env(
+        std::env::var_os(DELIVERABLE_ROOTS_ENV).as_deref(),
+    )
 }
 
 /// The unit's filesystem boundary, or `None` when the launcher armed no roots.
@@ -261,6 +281,10 @@ pub(crate) struct BoundaryCtx {
     /// ([`crate::write_posture::WritePosture::of`]). Rides here for the same reason
     /// `pre_build_scope` does; the subprocess carrier reads [`NO_CODE_SCOPE_ENV`].
     pub write_posture: crate::write_posture::WritePosture,
+    /// The roots a `DeliverableRoots` creator may write — EXACTLY the run's `extra_write_roots`
+    /// ([`crate::write_posture::deliverable_roots_of`]), the same list the ACP fence judges (F-02).
+    /// Empty for every other posture. The subprocess carrier reads [`DELIVERABLE_ROOTS_ENV`].
+    pub deliverable_roots: Vec<std::path::PathBuf>,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -451,7 +475,7 @@ pub(crate) fn phase_scope_denial(
     tool: &str,
     cwd: &std::path::Path,
     home: Option<&std::path::Path>,
-    write_roots: &[std::path::PathBuf],
+    deliverable_roots: &[std::path::PathBuf],
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
     if !(pre_build_scope || posture.fences_writes()) || !WRITE_TOOLS.contains(&tool) {
@@ -471,36 +495,24 @@ pub(crate) fn phase_scope_denial(
         return None;
     }
     // F-4R2-004: the DELIVERABLE-ROOTS posture — a BOUND creator whose phase declared
-    // `executes_code: false`. Its deliverables live in the run's declared write roots, so the only
-    // thing this fence refuses is a write INTO the tree under review (the unit cwd); anything else
-    // that reached here already passed the filesystem boundary, i.e. sits in a declared root.
-    // Judged with the boundary's own normalize → symlink-resolve → containment chain, so a
-    // relative spelling, a `..` hop or a `/tmp`→`/private/tmp` alias cannot dodge it.
+    // `executes_code: false`. Its deliverables live in EXACTLY the run's declared
+    // `extra_write_roots`; a write anywhere else — the tree under review (the unit cwd) first of
+    // all, but also an engine-owned directory the filesystem boundary admits (the repo-graph key
+    // dir) — is refused. ONE judgement with the ACP fence (`write_posture::
+    // deliverable_write_admitted`, F-02), on the boundary's own normalize → symlink-resolve →
+    // containment chain, so a relative spelling, a `..` hop or a `/tmp`→`/private/tmp` alias is
+    // judged on where it lands, identically on both carriers.
     if posture == WritePosture::DeliverableRoots && !pre_build_scope {
-        if !crate::path_policy::raw_resolves_within(path, cwd, home, cwd) {
+        if crate::write_posture::deliverable_write_admitted(path, cwd, home, deliverable_roots) {
             return None;
         }
-        // Name the roots OUTSIDE the tree (the deliverable's home), never the tree itself — judged
-        // through the same resolve chain on both sides, so a `/var`→`/private/var` alias between
-        // the armed spelling and the cwd cannot list the worktree as a deliverable root.
-        let roots: Vec<String> = write_roots
-            .iter()
-            .filter(|r| {
-                !crate::path_policy::raw_resolves_within(&r.to_string_lossy(), cwd, home, cwd)
-            })
-            .map(|r| r.display().to_string())
-            .collect();
-        let roots = if roots.is_empty() {
-            "(none declared — the run granted no write root outside the tree)".to_string()
-        } else {
-            roots.join(", ")
-        };
+        let roots = crate::write_posture::describe_deliverable_roots(deliverable_roots);
         return Some(format!(
             "phase scope: this phase plays creator and declares `executes_code: false` — its \
              deliverables belong in the run's declared write roots ({roots}), not in the tree \
-             under review; `{tool}` to `{path}` would change the worktree, so it is refused. Write \
-             the deliverable inside a declared root; a phase that must change the tree itself \
-             declares `executes_code: true`."
+             under review or anywhere else; `{tool}` to `{path}` is outside them, so it is \
+             refused. Write the deliverable inside a declared root; a phase that must change the \
+             tree itself declares `executes_code: true`."
         ));
     }
     // F-036: the READ-ONLY posture — a phase that declared it would not write code and does not
@@ -998,10 +1010,8 @@ pub(crate) fn evaluate_tool_call(
         None => std::env::var_os("HOME").map(std::path::PathBuf::from),
     };
     let scope_roots: Vec<std::path::PathBuf> = match boundary {
-        Some(b) => b.roots.write.clone(),
-        None => allowed_roots_from_env()
-            .map(|r| r.write)
-            .unwrap_or_default(),
+        Some(b) => b.deliverable_roots.clone(),
+        None => deliverable_roots_from_env(),
     };
     if let Some(reason) = phase_scope_denial(
         pre_build_scope,
@@ -2179,6 +2189,39 @@ mod tests {
         );
     }
 
+    /// F-01 (independent review of #444): the hook is the standalone `wicked-core` binary the
+    /// daemon finds on PATH, and the gate protocol handshake compares crate versions — a hook built
+    /// from pre-posture `main` at the SAME version parses [`NO_CODE_SCOPE_ENV`] with the strict
+    /// `1`/`true` rule ([`parse_pre_build_scope`], the very parser it used). The spelling the
+    /// launcher writes for the read-only posture must therefore still read as ON there, and the
+    /// new posture's spelling must read as OFF (no fence, guard-only) rather than anything else.
+    #[test]
+    fn a_pre_posture_hook_binary_still_reads_the_read_only_spelling_as_its_no_code_scope() {
+        use crate::write_posture::WritePosture as P;
+        let ro = std::ffi::OsString::from(P::ReadOnly.env_value().unwrap());
+        assert!(
+            parse_pre_build_scope(Some(&ro)),
+            "the read-only spelling the launcher arms is the one a pre-posture hook parsed as ON"
+        );
+        assert_eq!(
+            P::parse_env(Some(&ro)),
+            P::ReadOnly,
+            "and this hook reads it the same way"
+        );
+        let dr = std::ffi::OsString::from(P::DeliverableRoots.env_value().unwrap());
+        assert!(
+            !parse_pre_build_scope(Some(&dr)),
+            "an old hook reads the creator posture as no fence — guard-only, never a refused \
+             deliverable and never an evaluator fence lost"
+        );
+        assert_eq!(P::parse_env(Some(&dr)), P::DeliverableRoots);
+        assert_eq!(
+            P::Full.env_value(),
+            None,
+            "no fence is spelled by ABSENCE on both"
+        );
+    }
+
     /// F-4R2-004: the DELIVERABLE-ROOTS posture — a BOUND creator whose phase declares
     /// `executes_code: false`. Its `Write`/`Edit` INSIDE the run's declared write roots passes the
     /// phase scope (the filesystem boundary already judged containment); a write into the tree
@@ -2196,9 +2239,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let wt = base.join("wt");
         let inbox = base.join("inbox");
+        let graph = base.join("repo-graphs").join("key");
         std::fs::create_dir_all(wt.join("src")).unwrap();
         std::fs::create_dir_all(&inbox).unwrap();
-        let roots = vec![wt.clone(), inbox.clone()];
+        std::fs::create_dir_all(&graph).unwrap();
+        // The DELIVERABLE roots: exactly the run's extra_write_roots (F-02) — never the tree, never
+        // the repo-graph key dir the filesystem boundary also admits.
+        let roots = vec![inbox.clone()];
         let ctx = |p: &std::path::Path| serde_json::json!({ "path": p.to_string_lossy() });
         let deny = |path: &std::path::Path, tool: &str| {
             phase_scope_denial(
@@ -2257,6 +2304,13 @@ mod tests {
                  never the tree itself): {denied}"
             );
         }
+        // F-02: the repo-graph key dir is in the filesystem boundary's write set but is NOT a
+        // deliverable root — refused here exactly as the ACP fence refuses it.
+        let graph_write = deny(&graph.join("graph.db-wal"), "Write")
+            .expect("engine scratch the boundary admits is still not a deliverable root");
+        assert!(graph_write.contains("plays creator"), "{graph_write}");
+        // …and so is anything outside every root.
+        assert!(deny(&base.join("elsewhere.html"), "Write").is_some());
         // A RELATIVE spelling resolves against the tree — refused too.
         assert!(
             phase_scope_denial(
@@ -2285,16 +2339,16 @@ mod tests {
             ),
             None
         );
-        // With no root declared outside the tree the wording says so rather than listing nothing.
-        let only_tree = vec![wt.clone()];
+        // With no root declared the wording says so rather than listing nothing.
+        let none: Vec<std::path::PathBuf> = vec![];
         let denied = phase_scope_denial(
             false,
             P::DeliverableRoots,
-            &ctx(&wt.join("x.html")),
+            &ctx(&inbox.join("x.html")),
             "Write",
             &wt,
             None,
-            &only_tree,
+            &none,
         )
         .unwrap();
         assert!(denied.contains("none declared"), "{denied}");

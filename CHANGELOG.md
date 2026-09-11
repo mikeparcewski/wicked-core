@@ -37,8 +37,11 @@ Two release tracks share this file, newest entry first regardless of track:
   ordinary cwd + extras boundary; there is no tree to protect). `executes_code: false` keeps meaning
   "does not change the tree under review", never "writes nothing". Applied on the ACP permission
   bridge (`AcpWritePosture`, judged before any gate for admitted and unadmitted seats alike), the
-  gate hook's phase scope (`WICKED_NO_CODE_SCOPE` now carries `read-only` | `deliverable-roots`;
-  the legacy `1`/`true` still reads as read-only), the wrapped argv lever and the PTY session
+  gate hook's phase scope (`WICKED_NO_CODE_SCOPE` keeps the `1` spelling for read-only — so a
+  same-version pre-posture hook binary on PATH still reads an evaluator's fence as ON — and adds
+  `deliverable-roots`; the creator's roots ride `WICKED_DELIVERABLE_ROOTS`, exactly the extras, so
+  the hook and the ACP fence judge one identical root set — never the repo-graph key dir the
+  filesystem boundary also admits), the wrapped argv lever and the PTY session
   (only the read-only posture takes `--sandbox read-only` / `--exclude-tools`; a deliverable-roots
   creator on a lever-less seat is guard-only and told so in its prompt), and process/session
   isolation + quiesce (any fenced unit). The read-only-requires-wrapped reroute applies to the

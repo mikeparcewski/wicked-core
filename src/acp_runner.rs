@@ -3272,33 +3272,21 @@ impl AcpWritePosture {
                 target(call),
             )),
             WritePosture::DeliverableRoots => {
-                let roots = if self.deliverable_roots.is_empty() {
-                    "(none declared — the run granted no write root outside the tree)".to_string()
-                } else {
-                    self.deliverable_roots
-                        .iter()
-                        .map(|r| r.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
+                // ONE judgement with the gate hook's `phase_scope_denial` (F-02): exactly the
+                // declared roots, never the tree, never engine scratch the boundary admits.
                 let inside_roots = call.path.as_deref().is_some_and(|p| {
-                    !crate::path_policy::raw_resolves_within(
+                    crate::write_posture::deliverable_write_admitted(
                         p,
                         &self.cwd,
                         self.home.as_deref(),
-                        &self.cwd,
-                    ) && self.deliverable_roots.iter().any(|root| {
-                        crate::path_policy::raw_resolves_within(
-                            p,
-                            &self.cwd,
-                            self.home.as_deref(),
-                            root,
-                        )
-                    })
+                        &self.deliverable_roots,
+                    )
                 });
                 if inside_roots {
                     return Ok(());
                 }
+                let roots =
+                    crate::write_posture::describe_deliverable_roots(&self.deliverable_roots);
                 Err(format!(
                     "phase `{}` plays creator and declares executes_code:false — its deliverables \
                      belong in the run's declared write roots ({roots}), not in the tree under \
@@ -4690,6 +4678,7 @@ fn chat_boundary(
             .and_then(|c| c.claude_dir().map(std::path::Path::to_path_buf)),
         pre_build_scope: false,
         write_posture: crate::write_posture::WritePosture::Full,
+        deliverable_roots: Vec::new(),
     }
 }
 
@@ -5938,6 +5927,9 @@ impl AcpStepRunner {
                     // F-036 / F-4R2-004: the WRITE POSTURE, same route — the ACP carrier answers
                     // the seat's permission requests in-process, so the fact rides the boundary.
                     write_posture,
+                    // The creator fence's roots (F-02): exactly `g.extra_write_roots`, the list
+                    // the wrapped launcher arms on `WICKED_DELIVERABLE_ROOTS` for its hook.
+                    deliverable_roots: crate::write_posture::deliverable_roots_of(Some(g)),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -6345,6 +6337,7 @@ impl AcpStepRunner {
                         claude_config_dir: boundary.claude_config_dir.clone(),
                         pre_build_scope: boundary.pre_build_scope,
                         write_posture: boundary.write_posture,
+                        deliverable_roots: boundary.deliverable_roots.clone(),
                     }),
                 }
             },
@@ -6364,16 +6357,11 @@ impl AcpStepRunner {
             cli: cli_key.clone(),
             phase: input.unit.phase_id().unwrap_or("").to_string(),
             cwd: unit_cwd.clone(),
-            deliverable_roots: input
-                .governance
-                .as_ref()
-                .map(|g| {
-                    g.extra_write_roots
-                        .iter()
-                        .map(std::path::PathBuf::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            // EXACTLY the launch-validated extra_write_roots — the same list the gate hook
+            // judges (`write_posture::deliverable_roots_of`, F-02).
+            deliverable_roots: crate::write_posture::deliverable_roots_of(
+                input.governance.as_ref(),
+            ),
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             tx: self.tx.clone(),
         });
@@ -13794,6 +13782,86 @@ os_sandbox = true
             Ok(_) => panic!("expected the evaluator's denial, got a different command"),
             Err(e) => panic!("expected the evaluator's denial, got no event: {e}"),
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F-02 (independent review of #444): the ACP fence and the gate hook derive the SAME
+    /// deliverable roots for the same unit — exactly the governance context's `extra_write_roots`
+    /// — and render the SAME verdict for every write: inside a root → admitted on both; the tree
+    /// under review, the repo-graph key dir (which the filesystem boundary admits, so the hook used
+    /// to let it through), outside every root → refused on both.
+    #[test]
+    fn both_carriers_judge_a_deliverable_roots_write_identically() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-f02-parity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let inbox = base.join("inbox");
+        let graph = base.join("repo-graphs").join("key");
+        for d in [&wt, &inbox, &graph] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let g = crate::workflow::GovernanceContext {
+            db_path: base.join("core.db").to_string_lossy().into_owned(),
+            code_graph_db: Some(graph.join("graph.db").to_string_lossy().into_owned()),
+            extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
+            extra_read_roots: vec![],
+        };
+        // The ACP fence's roots (in-process) and the hook's roots (env round-trip) are one list.
+        let acp_roots = crate::write_posture::deliverable_roots_of(Some(&g));
+        let env = crate::write_posture::deliverable_roots_env(&acp_roots).unwrap();
+        let hook_roots = crate::write_posture::parse_deliverable_roots_env(Some(&env));
+        assert_eq!(acp_roots, vec![inbox.clone()]);
+        assert_eq!(hook_roots, acp_roots, "identical roots on both carriers");
+
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let fence = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::DeliverableRoots,
+            role: crate::workflow::PhaseRole::Creator,
+            run_id: "run-parity".into(),
+            ord: 2,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: "revise".into(),
+            cwd: wt.clone(),
+            deliverable_roots: acp_roots.clone(),
+            home: None,
+            tx,
+        };
+        let call = |p: &std::path::Path| crate::acp_permission::WriteClassCall {
+            tool: "Write".into(),
+            kind: Some("edit".into()),
+            path: Some(p.to_string_lossy().into_owned()),
+        };
+        let hook = |p: &std::path::Path| {
+            crate::gate_hook::phase_scope_denial(
+                false,
+                crate::write_posture::WritePosture::DeliverableRoots,
+                &serde_json::json!({ "path": p.to_string_lossy() }),
+                "Write",
+                &wt,
+                None,
+                &hook_roots,
+            )
+        };
+        let matrix: [(&str, std::path::PathBuf, bool); 5] = [
+            ("deliverable in the root", inbox.join("revised.html"), true),
+            ("nested in the root", inbox.join("sub").join("f.html"), true),
+            ("the tree under review", wt.join("index.html"), false),
+            ("the repo-graph key dir", graph.join("graph.db-wal"), false),
+            ("outside every root", base.join("elsewhere.html"), false),
+        ];
+        for (what, path, admitted) in matrix {
+            let acp = fence.judge(&call(&path)).is_ok();
+            let gate = hook(&path).is_none();
+            assert_eq!(acp, admitted, "ACP fence on {what}: {}", path.display());
+            assert_eq!(gate, admitted, "gate hook on {what}: {}", path.display());
+            assert_eq!(acp, gate, "the two carriers disagree on {what}");
+        }
+        drop(rx);
         let _ = std::fs::remove_dir_all(&base);
     }
 

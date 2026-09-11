@@ -44,6 +44,7 @@
 //! `pre_build_scope` and `worktree_guarded` are single plan-time markers.
 
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use crate::domain::WorkUnit;
 use crate::workflow::PhaseRole;
@@ -99,18 +100,29 @@ impl WritePosture {
     /// The value the wrapped launcher sets on [`crate::gate_hook::NO_CODE_SCOPE_ENV`] for the hook
     /// subprocess, or `None` for [`WritePosture::Full`] — UNSET is the honest "no phase fence"
     /// state, exactly as the pre-build scope env behaves.
+    ///
+    /// The read-only posture is written as `1` — the spelling the hook parsed BEFORE postures
+    /// existed (strict `1`/`true`), on purpose (independent review of #444, F-01): the hook is the
+    /// STANDALONE `wicked-core` binary the daemon finds on PATH, the gate protocol handshake
+    /// (`check_gate_protocol`) compares crate versions, and this change ships no bump — so a
+    /// same-version pre-posture hook must still read an evaluator's fence as ON. Only
+    /// `deliverable-roots` is a new spelling; an old hook reads it as "no fence", i.e. a bound
+    /// creator becomes guard-only there — strictly better than the pre-fix "refuse the
+    /// deliverable", and never a lost evaluator fence.
     pub(crate) fn env_value(self) -> Option<&'static str> {
         match self {
             WritePosture::Full => None,
-            WritePosture::DeliverableRoots | WritePosture::ReadOnly => Some(self.label()),
+            WritePosture::ReadOnly => Some("1"),
+            WritePosture::DeliverableRoots => Some("deliverable-roots"),
         }
     }
 
-    /// The pure half of the env read. Parsed STRICTLY: `read-only` (and the legacy `1`/`true`
-    /// spelling the launcher set before postures existed) ⇒ [`WritePosture::ReadOnly`];
-    /// `deliverable-roots` ⇒ [`WritePosture::DeliverableRoots`]; unset or anything else ⇒
-    /// [`WritePosture::Full`]. An inherited junk value must never scope a build phase away from
-    /// building — the inverse failure, and a louder one than the one the fence closes.
+    /// The pure half of the env read. Parsed STRICTLY: `1`/`true` (what the launcher writes, and
+    /// what it wrote before postures existed) or the label `read-only` ⇒
+    /// [`WritePosture::ReadOnly`]; `deliverable-roots` ⇒ [`WritePosture::DeliverableRoots`]; unset
+    /// or anything else ⇒ [`WritePosture::Full`]. An inherited junk value must never scope a build
+    /// phase away from building — the inverse failure, and a louder one than the one the fence
+    /// closes.
     pub(crate) fn parse_env(raw: Option<&OsStr>) -> Self {
         match raw.and_then(OsStr::to_str).map(str::trim) {
             Some(s)
@@ -125,6 +137,84 @@ impl WritePosture {
             }
             _ => WritePosture::Full,
         }
+    }
+}
+
+/// The DELIVERABLE ROOTS a fenced creator may write: EXACTLY the run's launch-validated
+/// `extra_write_roots` ([`crate::workflow::GovernanceContext::extra_write_roots`]) — nothing else.
+/// Not the unit cwd (the tree under review, which the fence excludes), not the repo-graph key
+/// directory the filesystem boundary also admits (engine scratch, written by the estate MCP —
+/// never a seat's deliverable), not the state home. ONE derivation for every carrier
+/// (independent review of #444, F-02): the ACP fence reads it in-process, the wrapped launcher
+/// arms it on [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`] for the hook subprocess, and the gate
+/// hook judges the same list — so the two carriers cannot disagree about where a creator's
+/// deliverable may land. No governance context ⇒ no roots ⇒ every creator write is refused
+/// (fail closed), the same rule the boundary applies to an unarmed run.
+pub(crate) fn deliverable_roots_of(
+    governance: Option<&crate::workflow::GovernanceContext>,
+) -> Vec<PathBuf> {
+    governance
+        .map(|g| deliverable_roots_from(&g.extra_write_roots))
+        .unwrap_or_default()
+}
+
+/// The slice-level core of [`deliverable_roots_of`]: the declared `extra_write_roots` as paths,
+/// in declaration order, nothing added and nothing dropped. The wrapped launcher calls this on its
+/// launch-resolved governance record (`execute_wrapped::GovLaunch`, which carries the same
+/// validated list) so every carrier derives from one function.
+pub(crate) fn deliverable_roots_from(extra_write_roots: &[String]) -> Vec<PathBuf> {
+    extra_write_roots.iter().map(PathBuf::from).collect()
+}
+
+/// The env spelling of [`deliverable_roots_of`] for the hook-subprocess carrier: the roots joined
+/// with the platform's PATH separator, exactly as `WICKED_WRITE_ROOTS` is. `None` when a root
+/// contains the separator and cannot be joined — the launcher then arms an EMPTY list rather than
+/// a partial one, and the hook refuses every creator write (fail closed); `Some("")` for no roots.
+pub(crate) fn deliverable_roots_env(roots: &[PathBuf]) -> Option<std::ffi::OsString> {
+    if roots.is_empty() {
+        return Some(std::ffi::OsString::new());
+    }
+    std::env::join_paths(roots.iter().map(|r| r.as_os_str())).ok()
+}
+
+/// The pure half of the [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`] read: the inverse of
+/// [`deliverable_roots_env`]. Unset or empty ⇒ no roots.
+pub(crate) fn parse_deliverable_roots_env(raw: Option<&OsStr>) -> Vec<PathBuf> {
+    match raw {
+        Some(v) if !v.is_empty() => std::env::split_paths(v).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// THE deliverable-roots judgement, shared by the ACP fence (`acp_runner::AcpWritePosture::judge`)
+/// and the gate hook (`gate_hook::phase_scope_denial`): a write-class call's RAW path (as the agent
+/// spelled it) is admitted iff it resolves inside one of `deliverable_roots` AND not inside `cwd`
+/// (the tree under review). Both containment tests run the boundary's own normalize →
+/// symlink-resolve → containment chain ([`crate::path_policy::raw_resolves_within`]), so a relative
+/// spelling, a `..` hop, a `/tmp`→`/private/tmp` alias or a Windows verbatim prefix is judged on
+/// where it LANDS, identically on both carriers.
+pub(crate) fn deliverable_write_admitted(
+    raw_path: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+    deliverable_roots: &[PathBuf],
+) -> bool {
+    !crate::path_policy::raw_resolves_within(raw_path, cwd, home, cwd)
+        && deliverable_roots
+            .iter()
+            .any(|root| crate::path_policy::raw_resolves_within(raw_path, cwd, home, root))
+}
+
+/// The operator-facing spelling of the roots a refusal names — the list, or the honest "none".
+pub(crate) fn describe_deliverable_roots(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        "(none declared — the run granted no write root outside the tree)".to_string()
+    } else {
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -218,7 +308,11 @@ mod tests {
             None,
             "UNSET is the honest no-fence state"
         );
-        assert_eq!(WritePosture::ReadOnly.env_value(), Some("read-only"));
+        assert_eq!(
+            WritePosture::ReadOnly.env_value(),
+            Some("1"),
+            "the read-only spelling is the one a pre-posture hook binary parses (F-01)"
+        );
         assert_eq!(
             WritePosture::DeliverableRoots.env_value(),
             Some("deliverable-roots")
@@ -228,8 +322,9 @@ mod tests {
         assert_eq!(role_wire(PhaseRole::Neutral), "neutral");
     }
 
-    /// The env carrier round-trips every posture, keeps the legacy `1`/`true` spelling as
-    /// read-only, and treats unset or junk as NO fence (strict parse, as the pre-build scope).
+    /// The env carrier round-trips every posture, reads `1`/`true` (what the launcher writes now
+    /// AND wrote before postures existed) and the `read-only` label as read-only, and treats
+    /// unset or junk as NO fence (strict parse, as the pre-build scope).
     #[test]
     fn env_spelling_round_trips_and_junk_is_no_fence() {
         let os = |s: &str| std::ffi::OsString::from(s);
@@ -254,5 +349,87 @@ mod tests {
                 "{junk:?} must not scope a build phase away from building"
             );
         }
+    }
+
+    /// F-02 (independent review of #444): the deliverable roots are EXACTLY the governance
+    /// context's `extra_write_roots` — derived once, and the env carrier the wrapped launcher arms
+    /// for the hook subprocess round-trips to the identical list the ACP fence holds in-process.
+    /// No governance context ⇒ no roots (fail closed).
+    #[test]
+    fn deliverable_roots_are_exactly_the_extra_write_roots_on_every_carrier() {
+        let inbox = std::env::temp_dir().join("wicked-f02-inbox");
+        let second = std::env::temp_dir().join("wicked-f02-second");
+        let g = crate::workflow::GovernanceContext {
+            db_path: "/state/core.db".into(),
+            code_graph_db: Some("/state/repo-graphs/key/graph.db".into()),
+            extra_write_roots: vec![
+                inbox.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+            ],
+            extra_read_roots: vec!["/somewhere/readonly".into()],
+        };
+        let in_process = deliverable_roots_of(Some(&g));
+        assert_eq!(
+            in_process,
+            vec![inbox.clone(), second.clone()],
+            "the roots are the extras and nothing else — not the graph db, not a read root"
+        );
+        let env = deliverable_roots_env(&in_process).expect("temp paths carry no separator");
+        let via_hook = parse_deliverable_roots_env(Some(&env));
+        assert_eq!(
+            via_hook, in_process,
+            "the env carrier round-trips to the same list"
+        );
+        assert!(deliverable_roots_of(None).is_empty());
+        assert!(parse_deliverable_roots_env(None).is_empty());
+        assert!(parse_deliverable_roots_env(Some(&deliverable_roots_env(&[]).unwrap())).is_empty());
+        assert!(describe_deliverable_roots(&[]).contains("none declared"));
+        assert!(describe_deliverable_roots(&in_process).contains(&inbox.display().to_string()));
+    }
+
+    /// THE shared judgement: inside a root and outside the tree ⇒ admitted; the tree, an
+    /// engine-owned dir the filesystem boundary admits (the repo-graph key dir), or anywhere else
+    /// ⇒ refused — on the resolved target, not the spelling.
+    #[test]
+    fn deliverable_write_admitted_is_roots_only_and_never_the_tree() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-f02-judge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let inbox = base.join("inbox");
+        let graph = base.join("repo-graphs").join("key");
+        for d in [&wt, &inbox, &graph] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = vec![inbox.clone()];
+        let ok = |p: &std::path::Path| {
+            deliverable_write_admitted(&p.to_string_lossy(), &wt, None, &roots)
+        };
+        assert!(ok(&inbox.join("revised.html")));
+        assert!(ok(&inbox.join("sub").join("fragment-1.html")));
+        assert!(
+            ok(&wt.join("..").join("inbox").join("revised.html")),
+            "a `..` hop that lands in the root is judged where it lands"
+        );
+        assert!(!ok(&wt.join("src").join("app.ts")), "the tree under review");
+        assert!(
+            !deliverable_write_admitted("src/app.ts", &wt, None, &roots),
+            "a relative spelling lands in the tree"
+        );
+        assert!(
+            !ok(&graph.join("graph.db-wal")),
+            "the repo-graph key dir is engine scratch, not a deliverable root (F-02)"
+        );
+        assert!(!ok(&base.join("elsewhere.html")));
+        assert!(!deliverable_write_admitted(
+            &inbox.join("x.html").to_string_lossy(),
+            &wt,
+            None,
+            &[]
+        ));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

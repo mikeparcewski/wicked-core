@@ -520,6 +520,7 @@ mod tests {
                 claude_config_dir: None,
                 pre_build_scope: false, // a build-phase unit: the FILESYSTEM boundary is what is on trial here
                 write_posture: crate::write_posture::WritePosture::Full,
+                deliverable_roots: vec![],
             })
         };
 
@@ -624,6 +625,7 @@ mod tests {
                 claude_config_dir: None,
                 pre_build_scope,
                 write_posture: crate::write_posture::WritePosture::Full,
+                deliverable_roots: vec![],
             })
         };
         // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.
