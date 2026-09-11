@@ -206,11 +206,15 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // never disagree about which phases are pre-build.
             unit.pre_build_scope = pre_build_scope;
             // F-036 — the WORKTREE GUARD marker. A def-driven, AGENT-executed phase that declared
-            // `executes_code: false` (an evaluator, a recon rung, a review) may not change the
-            // tree it works in: the actor snapshots the worktree at dispatch and the gate denies
-            // any non-exempt change when the work ends (`worktree_guard`). Read off the def, not
-            // guessed — a prose-planned unit carries no declaration and is never guarded; a Tool
-            // phase is the engine's own command (a `deliver` push MOVES HEAD on purpose).
+            // `executes_code: false` (an evaluator, a recon rung, a review — or a creator whose
+            // deliverable is a document outside the tree) may not change the tree it works in:
+            // the actor snapshots the worktree at dispatch and the gate denies any non-exempt
+            // change when the work ends (`worktree_guard`). Read off the def, not guessed — a
+            // prose-planned unit carries no declaration and is never guarded; a Tool phase is the
+            // engine's own command (a `deliver` push MOVES HEAD on purpose). What the unit may
+            // WRITE is NOT decided here: the carriers derive that from this marker together with
+            // `role` and the run's tree (`write_posture`, F-4R2-004), so a creator keeps its
+            // declared write roots.
             let is_tool = matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
             unit.worktree_guarded = !phase.executes_code && !is_tool;
             // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a

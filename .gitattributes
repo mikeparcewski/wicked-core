@@ -5,3 +5,7 @@
 crates/wicked-core-ts/*.d.ts text eol=lf
 crates/wicked-core-ts/scripts/*.mjs text eol=lf
 crates/wicked-core-ts/types-test/** text eol=lf
+
+# Regression fixtures are parsed byte-for-byte by tests that also pin recorded wording; a CRLF
+# checkout must not change what they contain (F-4R2-004 fixture, finding_045 corpus).
+tests/fixtures/** text eol=lf

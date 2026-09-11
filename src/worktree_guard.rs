@@ -30,6 +30,15 @@
 //! posture (where one exists — `execute_wrapped::no_code_posture`) PREVENTS most writes up front;
 //! this guard is what makes the rule hold when the posture is absent, bypassed or wrong.
 //!
+//! The guard's question is "did the TREE change" — nothing else. Which files a unit may WRITE is a
+//! different question, answered per carrier by `write_posture` from this marker TOGETHER WITH the
+//! unit's role and whether the run has a tree (F-4R2-004): an `executes_code: false` CREATOR
+//! (crew's interactive `draft`/`edit`/`revise`, steering `propose`, repo-learn `capture`) writes
+//! its deliverable into the run's declared `extra_write_roots` — outside the tree, so this guard
+//! never sees it — and is still guarded against changing the tree. Keying the write posture on
+//! `applies_to` alone made every such creator a "read-only evaluator" and refused its own
+//! deliverable.
+//!
 //! ## How the snapshot is taken without touching the worker's state
 //!
 //! `git write-tree` hashes an INDEX, so the content hash is computed over a TEMPORARY copy of the

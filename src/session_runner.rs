@@ -182,8 +182,11 @@ impl PersistentStepRunner {
             argv.retain(|a| a != "-p" && a != "--print");
             // Inject stream-json (skipped when the template already carries --output-format).
             inject_claude_stream_flags(&mut argv);
-        } else if crate::worktree_guard::applies_to(&input.unit) {
-            // F-036: a NO-CODE phase on a non-claude seat crosses the shared launch boundary —
+        } else if crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some())
+            == crate::write_posture::WritePosture::ReadOnly
+        {
+            // F-036: a READ-ONLY phase (an `executes_code: false` evaluator/recon rung — never a
+            // creator, F-4R2-004) on a non-claude seat crosses the shared launch boundary —
             // the template's tokens are rewritten to the seat's read-only lever (codex
             // `--sandbox read-only`, pi `--exclude-tools edit,write`), a write grant on a
             // lever-less seat refuses the launch. This carrier resolves no `trust_flags`, so the
@@ -302,7 +305,11 @@ impl PersistentStepRunner {
         // F-036 (codex review on #414): a session is reused ONLY when its posture matches this
         // phase's. A no-code phase reaching a creator-opened (write-posture) session closes it and
         // opens a fresh read-only one; a code phase reaching a read-only session likewise.
-        let wants_no_code = crate::worktree_guard::applies_to(&input.unit);
+        // F-4R2-004: derived from the unit's ROLE and the run's tree — a fenced unit (read-only or
+        // deliverable-roots) never shares a session with a write-posture one.
+        let wants_no_code =
+            crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some())
+                .fences_writes();
         let existing_id = {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard
@@ -316,8 +323,8 @@ impl PersistentStepRunner {
                     "wicked-core: run {run_id} unit {} needs a {} session but the open PTY session \
                      {tid} was opened {} — closing it and opening a fresh one (F-036)",
                     input.unit.ord,
-                    if wants_no_code { "read-only" } else { "write-posture" },
-                    if wants_no_code { "with write posture" } else { "read-only" }
+                    if wants_no_code { "fenced" } else { "write-posture" },
+                    if wants_no_code { "with write posture" } else { "fenced" }
                 );
                 self.drop_session(&run_id);
                 None

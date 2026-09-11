@@ -1339,13 +1339,21 @@ impl WrappedCliStepRunner {
                 },
             );
         }
+        // F-036 / F-4R2-004: the unit's WRITE POSTURE, derived from its role and the run's tree —
+        // read-only for an `executes_code: false` evaluator/recon rung, deliverable-roots for a
+        // BOUND creator that declared no code (it writes its deliverable into the run's declared
+        // write roots, never the tree), no fence for a code phase or an unbound creator.
+        let write_posture =
+            crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
         // F-433-009 (core#431): a NON-claude seat with NO read-only lever (agy, copilot) carrying
-        // an `executes_code: false` phase is GUARD-ONLY — nothing at the tool boundary stops a
-        // write, only the worktree guard after the fact (which now restores). The one lever such a
-        // seat has is its prompt: say the posture out loud. Decided from the same resolution the
-        // launch boundary applies (`no_code_posture` over the seat's declared flags).
+        // a READ-ONLY unit is GUARD-ONLY — nothing at the tool boundary stops a write, only the
+        // worktree guard after the fact (which now restores). The one lever such a seat has is its
+        // prompt: say the posture out loud. Decided from the same resolution the launch boundary
+        // applies (`no_code_posture` over the seat's declared flags). A DELIVERABLE-ROOTS creator
+        // on any non-claude seat is guard-only by construction (no argv lever expresses "these
+        // roots, not the tree"; claude gets the gate hook) and carries its own instruction.
         let guard_only = !is_claude
-            && crate::worktree_guard::applies_to(&input.unit)
+            && write_posture == crate::write_posture::WritePosture::ReadOnly
             && matches!(
                 no_code_posture(&binary, resolve_seat_posture(&cli_key)),
                 Ok(NoCodePosture {
@@ -1356,6 +1364,13 @@ impl WrappedCliStepRunner {
         let prompt = if guard_only {
             format!(
                 "{}\n\n{READ_ONLY_INSTRUCTION}",
+                unit_prompt(input, form, handed)
+            )
+        } else if !is_claude
+            && write_posture == crate::write_posture::WritePosture::DeliverableRoots
+        {
+            format!(
+                "{}\n\n{DELIVERABLE_ROOTS_INSTRUCTION}",
                 unit_prompt(input, form, handed)
             )
         } else {
@@ -1420,7 +1435,12 @@ impl WrappedCliStepRunner {
             // A seat with no lever whose template or posture grants writes is REFUSED; a seat with
             // no lever and no write grant runs, disclosed: the worktree guard catches its writes
             // after the fact (`worktree_guard`), and the record says so.
-            if crate::worktree_guard::applies_to(&input.unit) {
+            //
+            // F-4R2-004: ONLY the READ-ONLY posture takes the lever. A bound creator that declared
+            // no code (`DeliverableRoots`) must still write its deliverable into the run's
+            // declared roots, which a seat-wide read-only sandbox would refuse — it runs under the
+            // seat's ordinary posture, guard-only, and the record says so below.
+            if write_posture == crate::write_posture::WritePosture::ReadOnly {
                 match apply_no_code_posture(&mut argv, posture) {
                     Ok(ReadOnlyLever::None) => {
                         let note = format!(
@@ -1444,6 +1464,19 @@ impl WrappedCliStepRunner {
                     Err(why) => return posture_refusal(input, &why),
                 }
             } else {
+                if write_posture == crate::write_posture::WritePosture::DeliverableRoots {
+                    let note = format!(
+                        "phase `{}` plays creator and declares executes_code:false — its \
+                         deliverables belong in the run's declared write roots, not the tree; seat \
+                         '{cli_key}' exposes no per-root write lever, so the tree is GUARD-ONLY: \
+                         the deliverable-roots instruction rides the prompt and the worktree guard \
+                         denies (and restores) any change to the tree after the fact (F-036 / \
+                         F-4R2-004)",
+                        input.unit.phase_id().unwrap_or("?")
+                    );
+                    eprintln!("wicked-core: {note}");
+                    no_lever_note = Some(note);
+                }
                 apply_seat_posture(&mut argv, &posture);
             }
             // v3.2 §2: the seat's PER-LAUNCH skills delivery — pi's `--no-skills --skill <dir>…`,
@@ -1728,12 +1761,14 @@ impl WrappedCliStepRunner {
                 if input.unit.pre_build_scope {
                     cmd.env(crate::gate_hook::PRE_BUILD_SCOPE_ENV, "1");
                 }
-                // F-036: the NO-CODE scope — the same gate, for any `executes_code: false` phase
-                // (an evaluator reviewing a build, not only the pre-build ladder). The hook refuses
-                // the path-bearing write tools up front; the worktree guard is the post-hoc floor
-                // for what a hook cannot see (`Bash` heredocs). Set ONLY when the flag is on.
-                if crate::worktree_guard::applies_to(&input.unit) {
-                    cmd.env(crate::gate_hook::NO_CODE_SCOPE_ENV, "1");
+                // F-036 / F-4R2-004: the WRITE POSTURE — the same gate, for any fenced phase:
+                // `read-only` for an `executes_code: false` evaluator/recon rung (the hook refuses
+                // the path-bearing write tools everywhere), `deliverable-roots` for a bound
+                // creator that declared no code (the hook refuses them INTO the tree and lets the
+                // declared roots through). The worktree guard is the post-hoc floor for what a
+                // hook cannot see (`Bash` heredocs). Set ONLY when the posture fences.
+                if let Some(spelling) = write_posture.env_value() {
+                    cmd.env(crate::gate_hook::NO_CODE_SCOPE_ENV, spelling);
                 }
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
@@ -2963,6 +2998,17 @@ pub(crate) const READ_ONLY_INSTRUCTION: &str = "READ-ONLY PHASE (enforced after 
     phase declares executes_code: false. Do NOT edit, write, create, delete, move or format any \
     file in the worktree, and do not commit — report findings in your output only. Any change \
     you make is detected by the engine's worktree guard, discarded, and the phase is denied.";
+
+/// (F-4R2-004) The instruction a DELIVERABLE-ROOTS creator carries on a non-claude seat — a bound
+/// creator whose phase declared `executes_code: false`: no argv lever expresses "write these roots,
+/// not the tree", so the posture the boundary cannot apply per path is at least stated; the
+/// worktree guard holds the tree after the fact.
+pub(crate) const DELIVERABLE_ROOTS_INSTRUCTION: &str = "DELIVERABLE-ROOTS PHASE (the tree is \
+    enforced after the fact): this phase plays creator and declares executes_code: false. Write \
+    your deliverable ONLY inside the run's declared write roots (the output paths named in the \
+    task). Do NOT edit, write, create, delete, move or format any file in the worktree, and do \
+    not commit — any change to the worktree is detected by the engine's worktree guard, \
+    discarded, and the phase is denied.";
 
 /// Which read-only lever [`no_code_posture`] applied to a non-claude seat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

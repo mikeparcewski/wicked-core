@@ -2897,12 +2897,14 @@ mod tests {
                 tool: s(),
                 kind: Some(s()),
                 path: Some(s()),
+                role: s(),
+                posture: s(),
                 reason: s(),
             },
             "evaluatorToolCallDenied",
             &[
                 "type", "session", "ord", "attempt", "cli", "carrier", "tool", "kind", "path",
-                "reason",
+                "role", "posture", "reason",
             ],
         );
         check(

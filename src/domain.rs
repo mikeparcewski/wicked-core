@@ -384,10 +384,13 @@ pub struct WorkUnit {
     /// compares when the seat's work ends ([`crate::worktree_guard`]); the gate fold DENIES ANY
     /// change — there are no exemptions: documentation, declared deliverables and tool state all
     /// deny (source `worktree_guard`, `evaluatorMutatedWorktree`). The carriers also
-    /// read it as the NO-CODE phase scope (`WICKED_NO_CODE_SCOPE` / `BoundaryCtx::no_code_scope`)
-    /// so a governed seat is refused the path-bearing write tools up front. FALSE for every
-    /// `executes_code` phase, every Tool phase and every prose-planned unit — a guard that scoped
-    /// a creator away from creating would be the worse bug.
+    /// derive the unit's WRITE POSTURE from it TOGETHER WITH [`Self::role`] and the run's tree
+    /// ([`crate::write_posture::WritePosture::of`], F-4R2-004): an evaluator/recon rung is
+    /// refused the path-bearing write tools everywhere, a BOUND creator that declared no code is
+    /// refused them INTO the tree and keeps them inside the run's declared `extra_write_roots`,
+    /// an unbound creator carries no fence at all — this marker alone never decides who may
+    /// write. FALSE for every `executes_code` phase, every Tool phase and every prose-planned
+    /// unit — a guard that scoped a creator away from creating would be the worse bug.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree_guarded: bool,
     /// The worktree's content snapshot (tree hash + `HEAD`) taken at this unit's FIRST dispatch

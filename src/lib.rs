@@ -61,6 +61,7 @@ mod validator;
 mod validator_vault;
 mod workflow;
 mod worktree_guard;
+mod write_posture;
 
 /// The ONE lock every test in this binary takes before touching process-global environment.
 ///
