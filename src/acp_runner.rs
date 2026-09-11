@@ -4251,37 +4251,38 @@ fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
 /// under a symlinked temp dir (macOS `/var/folders/…` → `/private/var/folders/…`) unequal to one
 /// that was resolved through the link.
 fn canonical_ish(p: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let dots = || {
-        Err(format!(
-            "chat scope: {} has a `..` segment beyond its existing ancestors and cannot be resolved \
-             safely; spell the path plainly",
-            p.display()
-        ))
-    };
-    let mut cur = p;
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(cur) {
-            let mut out = real;
-            for seg in tail.iter().rev() {
-                out.push(seg);
+    // The tail below the longest EXISTING prefix, found by probing prefixes forward (the same walk
+    // `path_policy` and `spawn::refuse_symlinked_home` use) — platform-uniform, where "canonicalize
+    // the whole path and back off" is not: Windows normalizes `..` lexically before any lookup.
+    // A `..` in that tail, re-appended LEXICALLY, would be resolved by the kernel against the REAL
+    // directory at every consumer, re-aiming the result outside whatever the spelling appeared to
+    // sit under (core#410 hardening, reviewer R11): refuse rather than re-append. (A `.` is
+    // invisible to the kernel and to `Path` alike and re-aims nothing.)
+    let tail: Vec<std::ffi::OsString> = crate::path_policy::missing_tail(p)
+        .map(|c| {
+            if matches!(c, std::path::Component::ParentDir) {
+                Err(format!(
+                    "chat scope: {} has a `..` segment beyond its existing ancestors and cannot be \
+                     resolved safely; spell the path plainly",
+                    p.display()
+                ))
+            } else {
+                Ok(c.as_os_str().to_os_string())
             }
-            return Ok(out);
-        }
-        match (cur.file_name(), cur.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name);
-                cur = parent;
-            }
-            // `file_name()` is `None` for a path ending in `..`: the missing tail carries a parent
-            // step, which re-appended LEXICALLY would be resolved by the kernel against the REAL
-            // directory, re-aiming the result outside whatever the spelling appeared to sit under
-            // (core#410 hardening, reviewer R11). Refuse rather than re-append. (A `.` is invisible
-            // to both the kernel and `Path` alike and re-aims nothing.)
-            (None, Some(parent)) if parent != cur => return dots(),
-            _ => return Ok(p.to_path_buf()),
-        }
+        })
+        .collect::<Result<_, _>>()?;
+    let mut existing = p.to_path_buf();
+    for _ in &tail {
+        existing.pop();
     }
+    let mut out = match std::fs::canonicalize(&existing) {
+        Ok(real) => real,
+        Err(_) => return Ok(p.to_path_buf()),
+    };
+    for seg in &tail {
+        out.push(seg);
+    }
+    Ok(out)
 }
 
 /// Is `file` the SAME file (device + inode) as any top-level entry of `dir` — the operational store

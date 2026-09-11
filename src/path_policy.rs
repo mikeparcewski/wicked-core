@@ -143,23 +143,42 @@ fn resolve_symlinks(p: &Path) -> PathBuf {
 /// resolved to its grandparent). [`check`] and [`deliverable_exists`] normalize before resolving,
 /// so their tails never carry one; a declared root is spelled by the caller and is not. (A `.`
 /// segment is invisible to the kernel and to `Path` alike and re-aims nothing.)
+///
+/// The existing ancestor is found by walking the spelling's PREFIXES forward (as
+/// `spawn::refuse_symlinked_home` does), never by asking the filesystem about the whole path and
+/// backing off: Windows' path layer normalizes `..` lexically BEFORE any lookup, so
+/// `canonicalize("<repo>\missing\..\..")` succeeds on the grandparent there while failing on unix —
+/// the prefix walk stops at `<repo>\missing` on every platform and judges the same tail.
 fn resolve_symlinks_for_root(p: &Path) -> Result<PathBuf, String> {
-    let mut cur = p;
-    while std::fs::canonicalize(cur).is_err() {
-        match (cur.file_name(), cur.parent()) {
-            (Some(_), Some(parent)) => cur = parent,
-            // `file_name()` is `None` for a path ending in `..`: a parent step in the missing tail.
-            (None, Some(parent)) if parent != cur => {
-                return Err(format!(
-                    "{} has a `..` segment beyond its existing ancestors and cannot be resolved \
-                     safely; spell the root plainly",
-                    p.display()
-                ))
-            }
-            _ => break,
-        }
+    if missing_tail(p).any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "{} has a `..` segment beyond its existing ancestors and cannot be resolved safely; \
+             spell the root plainly",
+            p.display()
+        ));
     }
     Ok(resolve_symlinks(p))
+}
+
+/// The components of `p` BELOW its longest existing prefix — the tail nothing on disk answers for.
+/// Prefixes are probed one component at a time with `metadata` (following links, as every consumer
+/// will): a `..` INSIDE the existing part is the kernel's to resolve and is judged on the real
+/// target; a `..` in the returned tail has nothing real to resolve against.
+pub(crate) fn missing_tail(p: &Path) -> impl Iterator<Item = Component<'_>> {
+    let mut probe = PathBuf::new();
+    let mut exists = true;
+    p.components().filter(move |component| {
+        if !exists {
+            return true;
+        }
+        probe.push(component.as_os_str());
+        // A bare Windows drive prefix (`C:`) is not a filesystem entry — stat'ed with the root.
+        if matches!(component, Component::Prefix(_)) {
+            return false;
+        }
+        exists = std::fs::metadata(&probe).is_ok();
+        !exists
+    })
 }
 
 /// Is `path` inside the unit's boundary?
