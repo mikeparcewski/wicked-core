@@ -64,9 +64,11 @@
 //! IN PLACE (an operator deletes `~/.wicked-estate/repo-graphs` once the new daemon is verified;
 //! the engine never deletes anything it did not write) and a destination that already exists is
 //! never overwritten. The copy is CRASH-SAFE: the backup lands in a temp sibling
-//! (`<key>/estate.db.migrating-<pid>`) that is renamed onto `estate.db` only when the backup
-//! reports `Done`, so a boot killed mid-copy leaves nothing at the path the resolver serves; the
-//! next boot sweeps the stray temp and copies again. The backup is bounded (locked source, total
+//! (`<key>/estate.db.migrating-<pid>`) that is installed at `estate.db` only when the backup
+//! reports `Done` — a NO-REPLACE install (`hard_link` + `remove_file`; a `rename` would silently
+//! replace on Unix), so a graph that appeared meanwhile wins and the temp is discarded — and a boot
+//! killed mid-copy leaves nothing at the path the resolver serves; the next boot sweeps the stray
+//! temp and copies again. The backup is bounded (locked source, total
 //! steps, wall clock) and a copy that fails removes its temp so the repo simply re-indexes at its
 //! next onboarding instead of reading a torn database. Repos that were indexed IN-TREE (the F-024
 //! checkouts) are NOT migrated — an in-tree graph is never read — so they come through the
@@ -319,7 +321,25 @@ fn repo_graph_root_from(
 ) -> Option<PathBuf> {
     if let Some(r) = override_root {
         if !r.is_empty() {
-            return Some(PathBuf::from(r));
+            let root = PathBuf::from(&r);
+            if root.is_absolute() {
+                return Some(root);
+            }
+            // The module contract has always required an ABSOLUTE override (the sandbox grants
+            // fail closed on a relative one); before this the write resolver accepted it anyway,
+            // so `WICKED_ESTATE_REPO_GRAPH_ROOT=.` could mint `./<key>/estate.db` in whatever the
+            // current directory was — possibly the checkout — while the classifier granted
+            // nothing. Rejected here, ONCE aloud, and the precedence falls through to the state
+            // home exactly as if the variable were unset.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "wicked-core: {REPO_GRAPH_ROOT_ENV}={:?} is not an absolute path and is \
+                     ignored — the repo-graph root override must be absolute (the sandbox grants \
+                     fail closed on a relative one); resolving under the state home instead",
+                    r
+                );
+            });
         }
     }
     if let Some(sh) = state_home {
@@ -560,6 +580,14 @@ pub(crate) enum GraphMigration {
         to: PathBuf,
         error: String,
     },
+    /// Not attempted this boot: the overall boot migration budget was already spent on the repos
+    /// before it. Nothing was touched; the next boot re-takes the decision and copies it.
+    Deferred {
+        repo_id: String,
+        from: PathBuf,
+        to: PathBuf,
+        budget: std::time::Duration,
+    },
 }
 
 impl GraphMigration {
@@ -585,6 +613,19 @@ impl GraphMigration {
                 from.display(),
                 to.display()
             ),
+            GraphMigration::Deferred {
+                repo_id,
+                from,
+                to,
+                budget,
+            } => format!(
+                "wicked-core: deferred migrating repo `{repo_id}`'s code graph {} -> {}: this \
+                 boot's migration budget ({} s across all repos) is spent; nothing was touched and \
+                 the copy is retried at the next boot (or re-run onboarding to index it now)",
+                from.display(),
+                to.display(),
+                budget.as_secs()
+            ),
         }
     }
 }
@@ -597,22 +638,34 @@ pub(crate) fn migrate_legacy_repo_graphs<'a>(
     repos: impl IntoIterator<Item = (&'a str, &'a Path)>,
 ) -> Vec<GraphMigration> {
     match (repo_graph_root(), legacy_repo_graph_root()) {
-        (Some(root), Some(legacy)) => migrate_legacy_repo_graphs_at(repos, &root, &legacy),
+        (Some(root), Some(legacy)) => {
+            migrate_legacy_repo_graphs_at(repos, &root, &legacy, BOOT_MIGRATION_BUDGET)
+        }
         _ => Vec::new(),
     }
 }
 
-/// [`migrate_legacy_repo_graphs`] with both roots injected — pure apart from the copies.
+/// The OVERALL wall clock one boot may spend migrating, across every registered repo. The per-copy
+/// [`StepBudget::BOOT`] bounds one graph at 60 s; with many stale or locked legacy graphs those
+/// limits add up, and a daemon must not stay unavailable for N × 60 s. Once the budget is spent
+/// the remaining repos are DEFERRED — reported, untouched, and copied on the next boot (the
+/// decision is re-taken every boot, so nothing is lost, only delayed).
+const BOOT_MIGRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// [`migrate_legacy_repo_graphs`] with both roots and the overall budget injected — pure apart
+/// from the copies.
 fn migrate_legacy_repo_graphs_at<'a>(
     repos: impl IntoIterator<Item = (&'a str, &'a Path)>,
     root: &Path,
     legacy_root: &Path,
+    budget: std::time::Duration,
 ) -> Vec<GraphMigration> {
     // The override can name the legacy directory itself (an operator who pinned it); then there
     // is nothing to move and copying a graph onto itself would be the one way to corrupt it.
     if same_root(root, legacy_root) {
         return Vec::new();
     }
+    let started = std::time::Instant::now();
     let mut out = Vec::new();
     for (repo_id, repo) in repos {
         let from = repo_graph_db_at(legacy_root, repo);
@@ -625,8 +678,28 @@ fn migrate_legacy_repo_graphs_at<'a>(
         if to.exists() || !from.is_file() {
             continue;
         }
-        out.push(match copy_sqlite_db(&from, &to, &StepBudget::BOOT) {
-            Ok(()) => GraphMigration::Copied {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            out.push(GraphMigration::Deferred {
+                repo_id: repo_id.to_string(),
+                from,
+                to,
+                budget,
+            });
+            continue;
+        }
+        // The boot budget is a TRUE bound: a copy that starts with less than the per-copy 60 s
+        // left gets only what remains, so N copies can never add up past `budget` (+ one step).
+        let step_budget = StepBudget {
+            max_wall: StepBudget::BOOT.max_wall.min(remaining),
+            ..StepBudget::BOOT
+        };
+        out.push(match copy_sqlite_db(&from, &to, &step_budget) {
+            // The live graph appeared while the copy ran (the no-replace install refused to
+            // clobber it): nothing to report — it is exactly the "destination exists" skip above,
+            // decided a few seconds later.
+            Ok(Install::LiveGraphWon) => continue,
+            Ok(Install::Installed) => GraphMigration::Copied {
                 repo_id: repo_id.to_string(),
                 from,
                 to,
@@ -711,13 +784,41 @@ impl StepBudget {
     };
 }
 
+/// How a completed copy was installed at the served path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// The temp became `estate.db`.
+    Installed,
+    /// `estate.db` appeared while the copy ran; the live graph wins and the temp was discarded.
+    LiveGraphWon,
+}
+
+/// Install a completed temp at `to` WITHOUT ever replacing an existing file: `hard_link` fails
+/// with `AlreadyExists` on every platform when `to` is already there (a `rename` would silently
+/// replace it on Unix), so a graph that appeared between the `exists()` check and the install —
+/// an indexer racing the boot — is never clobbered; the live graph wins and the temp goes. The
+/// temp is removed on every path.
+fn install_completed_temp(tmp: &Path, to: &Path) -> Result<Install, String> {
+    let linked = std::fs::hard_link(tmp, to);
+    let _ = std::fs::remove_file(tmp);
+    match linked {
+        Ok(()) => Ok(Install::Installed),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Install::LiveGraphWon),
+        Err(e) => Err(format!(
+            "install {} -> {}: {e}",
+            tmp.display(),
+            to.display()
+        )),
+    }
+}
+
 /// Copy one SQLite database `from` → `to` with the online-backup API: a page-consistent snapshot
 /// even of a WAL-mode db another process still has open, which a byte copy of `estate.db` +
 /// `-wal` + `-shm` is not. CRASH-SAFE: the backup is written to a temp sibling
-/// (`<to>.migrating-<pid>`) and renamed onto `to` only after `StepResult::Done`, so no partially
-/// written database ever sits at the path the resolver serves. `to`'s directory is created; `to`
-/// must not exist. Every error path removes the temp; the budget bounds the copy.
-fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<(), String> {
+/// (`<to>.migrating-<pid>`) and installed at `to` only after `StepResult::Done`, with a
+/// NO-REPLACE install ([`install_completed_temp`]) so an existing `to` is never clobbered. `to`'s
+/// directory is created. Every error path removes the temp; the budget bounds the copy.
+fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<Install, String> {
     use rusqlite::{backup::Backup, backup::StepResult, Connection, OpenFlags};
     let dir = to
         .parent()
@@ -728,7 +829,7 @@ fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<(), Str
         std::process::id()
     ));
     let _ = std::fs::remove_file(&tmp);
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<Install, String> {
         let src = Connection::open_with_flags(
             from,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -774,12 +875,11 @@ fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<(), Str
                 }
             }
         }
-        // Both connections closed before the rename: a WAL-mode `tmp` with an open connection
-        // still has `-wal`/`-shm` siblings, and a rename under an open handle is not portable.
+        // Both connections closed before the install: a WAL-mode `tmp` with an open connection
+        // still has `-wal`/`-shm` siblings, and linking under an open handle is not portable.
         drop(dst);
         drop(src);
-        std::fs::rename(&tmp, to)
-            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), to.display()))
+        install_completed_temp(&tmp, to)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -988,12 +1088,17 @@ mod tests {
     /// home is NEVER an answer — it is the migration source only.
     #[test]
     fn the_root_is_the_override_then_the_state_home_then_the_default_state_home() {
-        let over = Some(std::ffi::OsString::from("/x/graphs"));
+        // Platform-native ABSOLUTE fixtures (off `current_dir()`): `/x/graphs` is relative on
+        // Windows, and a relative override is now rejected — so the override must be genuinely
+        // absolute on every CI leg for this test to say what it means.
+        let abs = std::env::current_dir().unwrap();
+        let over_path = abs.join("x").join("graphs");
+        let over = Some(over_path.clone().into_os_string());
         let home = Some(std::ffi::OsString::from("/home/u"));
-        let sh = PathBuf::from("/srv/crew-state");
+        let sh = abs.join("srv").join("crew-state");
         assert_eq!(
             repo_graph_root_from(over.clone(), Some(&sh), home.clone()),
-            Some(PathBuf::from("/x/graphs")),
+            Some(over_path),
             "the env override wins outright, even over a bound state home"
         );
         assert_eq!(
@@ -1339,7 +1444,7 @@ mod tests {
             ("gamma", gamma.as_path()),
         ];
 
-        let out = migrate_legacy_repo_graphs_at(repos, &root, &legacy_root);
+        let out = migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, BOOT_MIGRATION_BUDGET);
         assert_eq!(
             out,
             vec![GraphMigration::Copied {
@@ -1372,12 +1477,12 @@ mod tests {
 
         // Second boot: nothing left to do.
         assert_eq!(
-            migrate_legacy_repo_graphs_at(repos, &root, &legacy_root),
+            migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, BOOT_MIGRATION_BUDGET),
             vec![]
         );
         // The override pointed at the legacy directory itself: nothing to move, nothing touched.
         assert_eq!(
-            migrate_legacy_repo_graphs_at(repos, &legacy_root, &legacy_root),
+            migrate_legacy_repo_graphs_at(repos, &legacy_root, &legacy_root, BOOT_MIGRATION_BUDGET),
             vec![]
         );
         // A source that is not a database fails CLOSED: reported, the torn destination removed.
@@ -1386,7 +1491,12 @@ mod tests {
         let bad = repo_graph_db_at(&legacy_root, &delta);
         std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
         std::fs::write(&bad, b"not a sqlite database").unwrap();
-        let out = migrate_legacy_repo_graphs_at([("delta", delta.as_path())], &root, &legacy_root);
+        let out = migrate_legacy_repo_graphs_at(
+            [("delta", delta.as_path())],
+            &root,
+            &legacy_root,
+            BOOT_MIGRATION_BUDGET,
+        );
         assert!(
             matches!(&out[..], [GraphMigration::Failed { repo_id, .. }] if repo_id == "delta"),
             "{out:?}"
@@ -1449,7 +1559,12 @@ mod tests {
         assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
 
         // 3. Next boot: the stray is swept and the legacy source is copied in full.
-        let out = migrate_legacy_repo_graphs_at([("alpha", repo.as_path())], &root, &legacy_root);
+        let out = migrate_legacy_repo_graphs_at(
+            [("alpha", repo.as_path())],
+            &root,
+            &legacy_root,
+            BOOT_MIGRATION_BUDGET,
+        );
         assert!(
             matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
             "{out:?}"
@@ -1476,9 +1591,134 @@ mod tests {
         );
         // A third boot: nothing to do (and the completed copy is never re-copied).
         assert_eq!(
-            migrate_legacy_repo_graphs_at([("alpha", repo.as_path())], &root, &legacy_root),
+            migrate_legacy_repo_graphs_at(
+                [("alpha", repo.as_path())],
+                &root,
+                &legacy_root,
+                BOOT_MIGRATION_BUDGET
+            ),
             vec![]
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Hardening (review follow-up): the completed temp is installed WITHOUT replacing an existing
+    /// `estate.db`. A graph that appeared while the copy ran — an indexer racing the boot — wins;
+    /// the temp is discarded; the live file's bytes are untouched.
+    #[test]
+    fn the_install_never_replaces_a_live_graph_that_appeared_during_the_copy() {
+        let base = scratch("install-no-replace");
+        let key_dir = base.join("repo-graphs").join("alpha-0123456789ab");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let to = key_dir.join(CODE_GRAPH_DB_FILE);
+        let tmp = key_dir.join(format!("{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}1"));
+
+        // Nothing at `to`: the temp becomes the graph.
+        std::fs::write(&tmp, b"completed copy").unwrap();
+        assert_eq!(install_completed_temp(&tmp, &to), Ok(Install::Installed));
+        assert_eq!(std::fs::read(&to).unwrap(), b"completed copy");
+        assert!(!tmp.exists(), "the temp is gone after a successful install");
+
+        // A live graph at `to`: the install refuses, the live bytes survive, the temp is gone.
+        std::fs::write(&to, b"the live graph an indexer just wrote").unwrap();
+        std::fs::write(&tmp, b"a stale copy of the legacy graph").unwrap();
+        assert_eq!(install_completed_temp(&tmp, &to), Ok(Install::LiveGraphWon));
+        assert_eq!(
+            std::fs::read(&to).unwrap(),
+            b"the live graph an indexer just wrote",
+            "the live graph is never clobbered"
+        );
+        assert!(!tmp.exists(), "the losing temp is removed");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Hardening (review follow-up): a RELATIVE override is ignored (warned once), and the
+    /// precedence falls through to the state home exactly as if the variable were unset — the
+    /// write resolver must never mint `./<key>/estate.db` in whatever the cwd is.
+    #[test]
+    fn a_relative_override_is_ignored_and_the_state_home_wins() {
+        let abs = std::env::current_dir().unwrap();
+        let sh = abs.join("srv").join("crew-state");
+        let home = Some(std::ffi::OsString::from("/home/u"));
+        for rel in ["relative/graphs", ".", "../elsewhere"] {
+            assert_eq!(
+                repo_graph_root_from(Some(std::ffi::OsString::from(rel)), Some(&sh), home.clone()),
+                Some(sh.join("repo-graphs")),
+                "a relative override ({rel}) must not become the root"
+            );
+        }
+        assert_eq!(
+            repo_graph_root_from(
+                Some(std::ffi::OsString::from("relative/graphs")),
+                None,
+                home
+            ),
+            Some(
+                Path::new("/home/u")
+                    .join(".wicked-crew")
+                    .join("repo-graphs")
+            ),
+            "…and with no state home it falls through to the default state home"
+        );
+        // An absolute override (platform-native, off `current_dir()`) is still precedence 1.
+        let over_path = abs.join("x").join("graphs");
+        assert_eq!(
+            repo_graph_root_from(Some(over_path.clone().into_os_string()), Some(&sh), None),
+            Some(over_path)
+        );
+    }
+
+    /// Hardening (review follow-up): the boot-wide budget. With the budget already spent, every
+    /// remaining legacy graph is DEFERRED — reported, untouched — and the next boot (normal
+    /// budget) copies it. Repos with nothing to migrate are never reported either way.
+    #[test]
+    fn a_spent_boot_budget_defers_the_remaining_migrations_to_the_next_boot() {
+        let base = scratch("migrate-budget");
+        let legacy_root = base.join(".wicked-estate").join("repo-graphs");
+        let root = base.join("state-home").join("repo-graphs");
+        let alpha = base.join("alpha");
+        let clean = base.join("clean");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&clean).unwrap();
+        let _writer = sqlite_with_rows(&repo_graph_db_at(&legacy_root, &alpha), 3);
+        let repos = [("alpha", alpha.as_path()), ("clean", clean.as_path())];
+
+        let out =
+            migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, std::time::Duration::ZERO);
+        assert!(
+            matches!(&out[..], [GraphMigration::Deferred { repo_id, .. }] if repo_id == "alpha"),
+            "{out:?}"
+        );
+        assert!(
+            !repo_graph_db_at(&root, &alpha).exists(),
+            "a deferred repo is not touched"
+        );
+        assert!(out[0].notice().contains("deferred") && out[0].notice().contains("next boot"));
+
+        // A budget that is tiny but not spent still copies a small graph — the per-copy wall clock
+        // is capped to what remains, never widened to the full 60 s.
+        let out = migrate_legacy_repo_graphs_at(
+            repos,
+            &root,
+            &legacy_root,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
+            "{out:?}"
+        );
+        assert_eq!(row_count(&repo_graph_db_at(&root, &alpha)), 3);
+        std::fs::remove_dir_all(root.join(repo_graph_key(&alpha))).unwrap();
+
+        // Next boot, normal budget: copied.
+        let out = migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, BOOT_MIGRATION_BUDGET);
+        assert!(
+            matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
+            "{out:?}"
+        );
+        assert_eq!(row_count(&repo_graph_db_at(&root, &alpha)), 3);
 
         let _ = std::fs::remove_dir_all(&base);
     }

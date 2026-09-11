@@ -389,7 +389,7 @@ retirement is keyed on it):
 ```sh
 wicked-core rules fanout crates/wicked-governance/seed/corpus \
   --enforcement-crew-api http://127.0.0.1:7701 \
-  --discovery-db  <estate-home>/repo-graphs/<repo-key>/estate.db \   # repeat per live repo
+  --discovery-db  <state-home>/repo-graphs/<repo-key>/estate.db \   # repeat per live repo (state home = the daemon's --db parent)
   --knowledge-db  <estate knowledge store> \
   --scope workspace --knowledge-scope wiki:architecture \
   --manifest fanout-manifest.json
