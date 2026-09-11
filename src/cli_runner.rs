@@ -675,13 +675,16 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
-/// `benched` — the run's BENCHED seat keys (`AgentSession::benched_seats`, F-7R2-006): never a
-/// judge. The bus-mediated path passes none (the bench is not on the `DispatchedTask` wire).
+/// `run_roster` — the RUN's configured seat keys (`AgentSession::clis`): the judge is drawn from
+/// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
+/// from every registry record; empty = no intersection (the bus path, tests). `benched` — the
+/// run's BENCHED seat keys (`AgentSession::benched_seats`, F-7R2-006): never a judge.
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
+    run_roster: &[String],
     benched: &[String],
 ) -> (
     StepOutput,
@@ -694,6 +697,7 @@ pub(crate) fn run_unit_and_judge(
         agent_review_target,
         emit_delta,
         &crate::registry_roster(),
+        run_roster,
         benched,
     )
 }
@@ -707,6 +711,7 @@ fn run_unit_and_judge_with_roster(
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
     roster: &[crate::AgenticCli],
+    run_roster: &[String],
     benched: &[String],
 ) -> (
     StepOutput,
@@ -714,16 +719,48 @@ fn run_unit_and_judge_with_roster(
     crate::workflow::UnitEvidence,
 ) {
     let output = runner.run_unit_streaming(input, emit_delta);
-    // (F-7R2-006) The seats a JUDGE may run under: the roster minus the run's bench and minus
-    // every seat the launcher's health probe declared unusable — a signed-out seat cannot render
-    // a verdict, and in run b86c14c1 the judge itself ran on such a seat and errored.
-    let eligible: Vec<crate::AgenticCli> = roster
+    // (F-7R2-006 / review RT-1) The seats a JUDGE may run under: the registry seats the RUN
+    // configured (`run_roster`, when the caller knows it), minus the run's bench, minus every
+    // seat the launcher's health probe declared unusable — a signed-out seat cannot render a
+    // verdict, and in run b86c14c1 the judge itself ran on such a seat and errored; a registry
+    // seat the launcher never configured has no business judging the run.
+    // The pool is the run's configured seats when any of them is a registry seat; a run whose
+    // roster names NO registry seat (an ad-hoc launch roster, a test's fabricated keys) keeps
+    // the registry as its pool — there is nothing to intersect with, and a judge must exist.
+    let configured: Vec<&crate::AgenticCli> = roster
         .iter()
+        .filter(|c| run_roster.iter().any(|k| k == &c.key))
+        .collect();
+    let pool: Vec<&crate::AgenticCli> = if configured.is_empty() {
+        roster.iter().collect()
+    } else {
+        configured
+    };
+    let eligible: Vec<crate::AgenticCli> = pool
+        .into_iter()
         .filter(|c| !benched.iter().any(|b| b == &c.key))
         .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
         .cloned()
         .collect();
     let roster = eligible.as_slice();
+    // (review RT-1) Judge seats that refused with an AUTH failure while the rotation passed over
+    // them — benched by the fold (`source: "judge"`) so they are never re-tried by the next unit.
+    let judge_auth_refusals: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    let note_refusals = |refused: &[(String, String)]| {
+        for (seat, out) in refused {
+            if wicked_council::types::SeatFailureReason::classify(out, "").is_some() {
+                let mut v = judge_auth_refusals.borrow_mut();
+                if !v.contains(seat) {
+                    eprintln!(
+                        "wicked-core: judge seat '{seat}' refused with an authentication failure \
+                         on unit {}; benched for the run (F-7R2-006 / review RT-1)",
+                        input.unit.ord
+                    );
+                    v.push(seat.clone());
+                }
+            }
+        }
+    };
     // (F-7R2-005) DID THE UNIT CHANGE THE TREE? For a bound AGENT unit the guard does not cover
     // (a creator, a prose-planned unit), compare the worktree against the baseline the actor
     // snapshotted at dispatch. `Some(true)` arms the DEFAULT floor + judge below; an unknown
@@ -841,13 +878,15 @@ fn run_unit_and_judge_with_roster(
                     .as_deref()
                     .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
                 let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
-                match crate::validator::agent_validate(
+                let (verdict, refused) = crate::validator::agent_validate_with_refusals(
                     &v.criterion,
                     work_for_agent,
                     &excluded,
                     roster,
                     &**runner,
-                ) {
+                );
+                note_refusals(&refused);
+                match verdict {
                     // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
                     Ok(av) => av,
                     Err(e) => crate::validator::AgentVerdict {
@@ -880,23 +919,23 @@ fn run_unit_and_judge_with_roster(
                      (F-7R2-005)",
                     input.unit.ord
                 );
-                Some(
-                    match crate::validator::agent_validate(
-                        &criterion,
-                        work_for_agent,
-                        &excluded,
-                        roster,
-                        &**runner,
-                    ) {
-                        Ok(av) => av,
-                        Err(e) => crate::validator::AgentVerdict {
-                            pass: false,
-                            reasoning: format!("default judge errored (fail-closed): {e}"),
-                            judge_cli: None,
-                            judge_distinct: None,
-                        },
+                let (verdict, refused) = crate::validator::agent_validate_with_refusals(
+                    &criterion,
+                    work_for_agent,
+                    &excluded,
+                    roster,
+                    &**runner,
+                );
+                note_refusals(&refused);
+                Some(match verdict {
+                    Ok(av) => av,
+                    Err(e) => crate::validator::AgentVerdict {
+                        pass: false,
+                        reasoning: format!("default judge errored (fail-closed): {e}"),
+                        judge_cli: None,
+                        judge_distinct: None,
                     },
-                )
+                })
             } else {
                 let roster_keys: Vec<&str> = roster.iter().map(|c| c.key.as_str()).collect();
                 let why = format!(
@@ -1034,12 +1073,14 @@ fn run_unit_and_judge_with_roster(
         }
         _ => None,
     };
+    let judge_auth_refusals = judge_auth_refusals.into_inner();
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
         verified_tree,
         tree_changed,
         judge_skipped,
+        judge_auth_refusals,
     };
     (output, agent_verdict, evidence)
 }
@@ -1800,8 +1841,9 @@ fn run_cli_runner(
                     &input,
                     task.agent_review_target.as_deref(),
                     &emit_delta,
-                    // The run's bench is not on the `DispatchedTask` wire (F-7R2-006): the
-                    // bus-mediated judge picks from the whole registry roster.
+                    // Neither the run's roster nor its bench is on the `DispatchedTask` wire
+                    // (F-7R2-006): the bus-mediated judge picks from the whole registry roster.
+                    &[],
                     &[],
                 );
                 let completed = CompletedTask {
@@ -2416,7 +2458,7 @@ mod tests {
         let noop: &DeltaSink = &|_: &str| {};
         let runner: Arc<dyn StepRunner> = Arc::new(FailingRewriter);
         let (output, verdict, evidence) =
-            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[]);
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[], &[]);
         assert_eq!(output.status, StepStatus::Failed);
         assert!(verdict.is_none(), "no judge runs for a failed unit");
         assert!(
@@ -2507,7 +2549,7 @@ mod tests {
             seat("pi", "pi ask {PROMPT}"),
         ];
         let (_out, verdict, _evidence) =
-            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3, &[]);
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3, &[], &[]);
         assert!(
             verdict.is_some(),
             "an approved validator + workdir ⇒ a layer-2 verdict runs"
@@ -2533,7 +2575,7 @@ mod tests {
             seat("claude", "claude -p {PROMPT}"),
             seat("agy", "agy run {PROMPT}"),
         ];
-        let _ = run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2, &[]);
+        let _ = run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2, &[], &[]);
         let seen2 = rec2.seen.lock().unwrap();
         assert_eq!(
             seen2.last().cloned().flatten(),
@@ -3273,5 +3315,183 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path_b).parent().unwrap());
+    }
+
+    /// Review of #449, RT-1: the DEFAULT judge is drawn from the registry seats the RUN
+    /// configured (never a registry seat the launcher never seated), skips the bench, and a judge
+    /// seat that refuses with an authentication failure is reported for the bench — so the next
+    /// unit never re-tries it.
+    #[test]
+    fn the_default_judge_uses_the_run_roster_minus_the_bench_and_reports_auth_refusals() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::process::Command;
+        use std::sync::Mutex;
+
+        /// The unit writes a file (the tree changes); judge sessions record the seat they were
+        /// dispatched under — `dead` refuses as signed out, every other seat answers PASS.
+        struct Seats {
+            judged_on: Mutex<Vec<String>>,
+        }
+        impl StepRunner for Seats {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let mut out = StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "did".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                };
+                if input.unit.session_id == "validator" {
+                    let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                    self.judged_on.lock().unwrap().push(seat.clone());
+                    if seat == "dead" {
+                        out.status = StepStatus::Failed;
+                        out.output =
+                            "(cli `dead` exited 1) Not logged in · Please run /login".into();
+                    } else {
+                        out.output = "PASS\nfine\nPASS".into();
+                    }
+                } else if let Some(wd) = &input.workdir {
+                    std::fs::write(wd.join("note.txt"), "changed\n").unwrap();
+                }
+                out
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base =
+            std::env::temp_dir().join(format!("wicked-core-judge-roster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/judge-roster",
+            ],
+        );
+
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "Add a note");
+        unit.assigned_cli = Some("creator".into());
+        unit.default_floor = true;
+        unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let registry = [
+            seat("creator", "creator -p {PROMPT}"),
+            seat("dead", "dead -p {PROMPT}"),
+            seat("alive", "alive -p {PROMPT}"),
+            seat("stranger", "stranger -p {PROMPT}"), // in the registry, NOT on this run's roster
+        ];
+        let seats = Arc::new(Seats {
+            judged_on: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let noop: &DeltaSink = &|_| {};
+        let run_roster: Vec<String> = ["creator", "dead", "alive"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (out, verdict, evidence) = run_unit_and_judge_with_roster(
+            &runner,
+            &input,
+            None,
+            noop,
+            &registry,
+            &run_roster,
+            &[],
+        );
+        assert_eq!(out.status, StepStatus::Ok);
+        assert_eq!(
+            evidence.tree_changed,
+            Some(true),
+            "the unit changed its tree"
+        );
+        let verdict =
+            verdict.expect("a default judge ran: the tree changed and a distinct seat exists");
+        assert!(verdict.pass);
+        assert_eq!(
+            verdict.judge_cli.as_deref(),
+            Some("alive"),
+            "the judge rotated past the dead seat onto the run's other seat"
+        );
+        let judged_on = seats.judged_on.lock().unwrap().clone();
+        assert!(
+            !judged_on.iter().any(|s| s == "stranger"),
+            "a registry seat the run never configured is not a judge: {judged_on:?}"
+        );
+        assert!(
+            !judged_on.iter().any(|s| s == "creator"),
+            "evaluator ≠ creator: {judged_on:?}"
+        );
+        assert_eq!(
+            evidence.judge_auth_refusals,
+            vec!["dead".to_string()],
+            "the signed-out judge seat is reported for the bench"
+        );
+
+        // With `dead` benched, the next unit never dispatches to it.
+        seats.judged_on.lock().unwrap().clear();
+        let mut unit2 = input.unit.clone();
+        std::fs::remove_file(wt.join("note.txt")).unwrap();
+        unit2.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+        let input2 = StepInput {
+            unit: unit2,
+            ..input.clone()
+        };
+        let (_, verdict2, evidence2) = run_unit_and_judge_with_roster(
+            &runner,
+            &input2,
+            None,
+            noop,
+            &registry,
+            &run_roster,
+            &["dead".to_string()],
+        );
+        assert_eq!(verdict2.unwrap().judge_cli.as_deref(), Some("alive"));
+        assert!(
+            evidence2.judge_auth_refusals.is_empty()
+                && !seats.judged_on.lock().unwrap().iter().any(|s| s == "dead"),
+            "a benched judge seat is never tried again"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

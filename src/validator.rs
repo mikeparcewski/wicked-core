@@ -1296,10 +1296,56 @@ pub fn agent_validate(
     roster: &[AgenticCli],
     runner: &dyn StepRunner,
 ) -> anyhow::Result<AgentVerdict> {
+    agent_validate_with_refusals(criterion, work, excluded_seats, roster, runner).0
+}
+
+/// [`agent_validate`], also reporting every `(seat key, output tail)` the rotation passed over
+/// because the seat REFUSED to run (review of #449, RT-1) — the caller classifies an
+/// authentication refusal and benches the seat for the run, so the next unit's judge does not
+/// re-try it. The verdict half is byte-identical to `agent_validate`'s.
+pub(crate) fn agent_validate_with_refusals(
+    criterion: &str,
+    work: &str,
+    excluded_seats: &[&str],
+    roster: &[AgenticCli],
+    runner: &dyn StepRunner,
+) -> (anyhow::Result<AgentVerdict>, Vec<(String, String)>) {
+    let refused: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+    let verdict = agent_validate_inner(
+        criterion,
+        work,
+        excluded_seats,
+        roster,
+        runner,
+        &|seat, out| {
+            refused
+                .borrow_mut()
+                .push((seat.to_string(), out.to_string()));
+        },
+    );
+    (verdict, refused.into_inner())
+}
+
+fn agent_validate_inner(
+    criterion: &str,
+    work: &str,
+    excluded_seats: &[&str],
+    roster: &[AgenticCli],
+    runner: &dyn StepRunner,
+    on_refusal: &dyn Fn(&str, &str),
+) -> anyhow::Result<AgentVerdict> {
     // Teardown must happen on EVERY exit — verdict, rotation-exhausted bail, cancellation. Compute
     // first, release after, so no `?` or `bail!` can skip it and leak a CLI process.
     let run_id = validator_run_id();
-    let out = agent_validate_in(&run_id, criterion, work, excluded_seats, roster, runner);
+    let out = agent_validate_in(
+        &run_id,
+        criterion,
+        work,
+        excluded_seats,
+        roster,
+        runner,
+        on_refusal,
+    );
     runner.on_run_complete(&run_id);
     out
 }
@@ -1311,6 +1357,7 @@ fn agent_validate_in(
     excluded_seats: &[&str],
     roster: &[AgenticCli],
     runner: &dyn StepRunner,
+    on_refusal: &dyn Fn(&str, &str),
 ) -> anyhow::Result<AgentVerdict> {
     // The reply must commit TWICE — opening line and FINAL line, the same word both times. A model
     // that reasons its way to the other answer has to change both, and one that changes neither but
@@ -1379,6 +1426,7 @@ fn agent_validate_in(
             // so this arm covers both. That is the safe side: a seat that produced no parseable
             // output rendered no judgment, and the combine rule still means only a real PASS passes.
             StepStatus::Failed => {
+                on_refusal(&seat.key, out.output.trim());
                 refusals.push(format!("{} ({})", seat.key, out.output.trim()));
             }
             // Elicitation is not expected on a validator seat (no interactive human path exists);

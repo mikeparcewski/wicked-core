@@ -869,6 +869,30 @@ pub(crate) fn apply_and_finish_unit(
     let det_denial =
         pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new), db_path);
 
+    // (F-7R2-006 / review RT-1) A judge seat that refused with an authentication failure while
+    // this unit's judge rotated is BENCHED for the run — persisted on the session so the next
+    // unit's judge, the failover ladder and the triage judge all skip it.
+    if !evidence.judge_auth_refusals.is_empty() {
+        if let Ok(Some(mut session)) = crate::domain::get_session(&*store, session_id) {
+            let mut changed = false;
+            for seat in &evidence.judge_auth_refusals {
+                changed |= crate::domain::bench_seat(
+                    &mut session.benched_seats,
+                    crate::domain::BenchedSeat {
+                        cli: seat.clone(),
+                        reason: wicked_council::types::SeatFailureReason::NotLoggedIn
+                            .as_str()
+                            .to_string(),
+                        source: "judge".to_string(),
+                    },
+                );
+            }
+            if changed {
+                put_node(store, session.to_node())?;
+            }
+        }
+    }
+
     // ── (layer-1b) REPO CHECKS FLOOR (F-039) — for the def's code-verifying unit the worker
     // thread ran the repository's OWN checks in the worktree (`repo_checks`); their exit codes are
     // the deterministic evidence this gate rests on, not the seat's account of having run them.
@@ -902,6 +926,9 @@ pub(crate) fn apply_and_finish_unit(
                     criterion: crate::repo_checks::CRITERION.to_string(),
                     checks: report.checks.clone(),
                     skipped: report.skipped.clone(),
+                    sandbox_level: report.sandbox_level.clone(),
+                    sandbox_error: report.sandbox_error.clone(),
+                    detect_error: report.detect_error.clone(),
                 });
                 if default_floor_refused_unsandboxed {
                     eprintln!(
@@ -1162,6 +1189,44 @@ pub(crate) fn apply_and_finish_unit(
         && !has_deterministic_floor
         && agent_verdict.is_none()
         && evaluator_policies.is_empty();
+    // (review FL-1) WHY the deterministic layer is absent — on the wire whenever it is, judge or
+    // no judge, so a `repoChecksEvaluated {passed:false, checks:[]}` beside an approved gate is
+    // never left to daemon stderr to explain.
+    let floor_note: Option<String> =
+        (unit.tool_cmd.is_none() && !has_deterministic_floor).then(|| {
+            match (workdir.is_some(), evidence.tree_changed) {
+            (false, _) => "no pinned validator; repo checks do not apply to an unbound run (no \
+                           worktree)"
+                .to_string(),
+            (true, Some(false)) => {
+                "no pinned validator; repo checks did not apply (the unit left the worktree tree \
+                 unchanged)"
+                    .to_string()
+            }
+            (true, None) if crate::worktree_guard::applies_to(unit) => {
+                "no pinned validator; repo checks did not apply (a guarded executes_code:false \
+                 unit — the worktree guard held the tree)"
+                    .to_string()
+            }
+            (true, None) if !unit.default_floor => {
+                "no pinned validator; this def phase delegates verification to a later \
+                 verified_evidence phase"
+                    .to_string()
+            }
+            (true, Some(true)) if default_floor_refused_unsandboxed => format!(
+                "no pinned validator; the unit changed the worktree tree but the repo checks \
+                 could not run — {} (install an OS sandbox tool: sandbox-exec on macOS, \
+                 bubblewrap on Linux)",
+                evidence
+                    .repo_checks
+                    .as_ref()
+                    .and_then(|r| r.sandbox_error.clone())
+                    .unwrap_or_else(|| "no OS write boundary could be armed".to_string())
+            ),
+            (true, _) => "no pinned validator and the repo checks did not run".to_string(),
+        }
+        });
+    let judge_skipped_reason: Option<String> = evidence.judge_skipped.clone();
     let ungated_reason = ungated.then(|| {
         let mut parts: Vec<String> = Vec::new();
         parts.push(match (workdir.is_some(), evidence.tree_changed) {
@@ -1239,6 +1304,8 @@ pub(crate) fn apply_and_finish_unit(
         judge_distinct,
         ungated,
         ungated_reason,
+        floor_note,
+        judge_skipped_reason,
     });
     emit(CoreEvent::GateDecided {
         session: session_id.to_string(),

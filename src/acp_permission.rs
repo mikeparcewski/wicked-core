@@ -225,28 +225,84 @@ pub(crate) fn execute_command(params: &Value) -> Option<String> {
         return None;
     }
     let input = params.pointer("/toolCall/rawInput");
+    // A command is a STRING or an ARGV ARRAY (codex's `shell`/`exec_command` and codex-acp send
+    // `command: ["bash", "-lc", "git push"]` — review of #449, FN-3); either spelling under any
+    // of the keys the seats use.
+    // An argv element that holds whitespace or quotes (a `-c` SCRIPT: `["bash","-lc","git push"]`)
+    // is re-quoted so the fence's tokenizer sees the one token the shell would have been handed.
+    let shell_quote = |s: &str| -> String {
+        if s.is_empty()
+            || s.chars()
+                .any(|c| c.is_whitespace() || c == '\'' || c == '"')
+        {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        } else {
+            s.to_string()
+        }
+    };
+    let text_of = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            Value::Array(a) => {
+                let joined = a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(shell_quote)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!joined.trim().is_empty()).then_some(joined)
+            }
+            _ => None,
+        }
+    };
     let from_input = input.and_then(|i| {
-        ["command", "cmd", "commandLine", "command_line", "script"]
-            .into_iter()
-            .find_map(|k| i.get(k).and_then(Value::as_str))
-            .filter(|c| !c.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                i.get("args").and_then(Value::as_array).map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-            })
+        [
+            "command",
+            "cmd",
+            "commandLine",
+            "command_line",
+            "script",
+            "argv",
+            "args",
+        ]
+        .into_iter()
+        .find_map(|k| i.get(k).and_then(&text_of))
     });
     from_input
         .or_else(|| {
+            // The title is PROSE ("Run git push"): drop a leading run/execute-style verb so the
+            // command it describes is judged (review of #449, FN-6).
             params
                 .pointer("/toolCall/title")
                 .and_then(Value::as_str)
-                .filter(|t| !t.trim().is_empty())
-                .map(str::to_string)
+                .map(|t| {
+                    let trimmed = t.trim();
+                    let mut words = trimmed.splitn(2, char::is_whitespace);
+                    match (words.next(), words.next()) {
+                        (Some(first), Some(rest))
+                            if [
+                                "run",
+                                "running",
+                                "runs",
+                                "execute",
+                                "executing",
+                                "exec",
+                                "shell",
+                                "bash",
+                                "command",
+                                "cmd",
+                                "$",
+                            ]
+                            .contains(
+                                &first.trim_end_matches(':').to_ascii_lowercase().as_str(),
+                            ) =>
+                        {
+                            rest.trim().to_string()
+                        }
+                        _ => trimmed.to_string(),
+                    }
+                })
+                .filter(|t| !t.is_empty())
         })
         .filter(|c| !c.trim().is_empty())
 }
@@ -1084,6 +1140,48 @@ mod tests {
             execute_command(&an_edit),
             None,
             "an edit's `command` field is not a shell"
+        );
+    }
+
+    /// Review of #449, FN-3/FN-6: an ARRAY-valued command (codex `shell`) and a prose title are
+    /// both normalised to the command text the fence judges.
+    #[test]
+    fn execute_command_normalises_array_commands_and_prose_titles() {
+        let codex_shell = json!({
+            "toolCall": {"name": "shell", "kind": "execute", "rawInput": {"command": ["bash", "-lc", "git push origin main"]}},
+        });
+        assert_eq!(
+            execute_command(&codex_shell).as_deref(),
+            Some("bash -lc 'git push origin main'"),
+            "the -c script stays ONE token"
+        );
+        assert!(
+            crate::remote_write_fence::remote_write_command(
+                &execute_command(&codex_shell).unwrap()
+            )
+            .is_some(),
+            "the joined argv is judged as the command it is"
+        );
+        let argv_key = json!({
+            "toolCall": {"name": "exec_command", "rawInput": {"argv": ["gh", "pr", "create", "--fill"]}},
+        });
+        assert_eq!(
+            execute_command(&argv_key).as_deref(),
+            Some("gh pr create --fill")
+        );
+        let prose_title = json!({
+            "toolCall": {"kind": "execute", "title": "Run git push origin main"},
+        });
+        assert_eq!(
+            execute_command(&prose_title).as_deref(),
+            Some("git push origin main")
+        );
+        let colon_title = json!({
+            "toolCall": {"kind": "execute", "title": "Execute: gh pr merge 3"},
+        });
+        assert_eq!(
+            execute_command(&colon_title).as_deref(),
+            Some("gh pr merge 3")
         );
     }
 }

@@ -781,6 +781,9 @@ pub(crate) fn lift_and_reverify(
             criterion: crate::repo_checks::CRITERION.to_string(),
             checks: checks.checks.clone(),
             skipped: checks.skipped.clone(),
+            sandbox_level: checks.sandbox_level.clone(),
+            sandbox_error: checks.sandbox_error.clone(),
+            detect_error: checks.detect_error.clone(),
         });
         Err(text)
     };

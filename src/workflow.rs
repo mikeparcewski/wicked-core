@@ -276,6 +276,11 @@ pub struct UnitEvidence {
     /// `gateEvaluated.ungatedReason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge_skipped: Option<String>,
+    /// (wave 6, review RT-1) Judge seats that REFUSED with an authentication failure while the
+    /// agent judge rotated — the fold benches them for the run (`source: "judge"`) so the next
+    /// tree-changing unit does not re-try every dead seat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judge_auth_refusals: Vec<String>,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`

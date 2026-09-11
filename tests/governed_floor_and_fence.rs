@@ -204,6 +204,7 @@ struct Gate {
     combined: bool,
     ungated: bool,
     ungated_reason: Option<String>,
+    floor_note: Option<String>,
 }
 
 fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
@@ -218,6 +219,7 @@ fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
                 combined,
                 ungated,
                 ungated_reason,
+                floor_note,
                 ..
             } if *ord == want_ord => Some(Gate {
                 has_floor: *has_deterministic_floor,
@@ -226,6 +228,7 @@ fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
                 combined: *combined,
                 ungated: *ungated,
                 ungated_reason: ungated_reason.clone(),
+                floor_note: floor_note.clone(),
             }),
             _ => None,
         })
@@ -277,8 +280,9 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
             ord,
             passed,
             checks,
+            sandbox_error,
             ..
-        } if *ord == 1 => Some((*passed, checks.len())),
+        } if *ord == 1 => Some((*passed, checks.len(), sandbox_error.clone())),
         _ => None,
     });
     assert!(
@@ -312,13 +316,32 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
     // The floor COUNTS as deterministic when it ran; when the host could not arm a sandbox it is
     // disclosed, not counted — and never a denial for the default floor.
     match checks_for_1 {
-        Some((true, _)) => assert!(g1.has_floor, "checks ran ⇒ a deterministic floor"),
-        Some((false, 0)) => {
+        Some((true, _, _)) => {
+            assert!(g1.has_floor, "checks ran ⇒ a deterministic floor");
+            assert!(g1.floor_note.is_none(), "{:?}", g1.floor_note);
+        }
+        Some((false, 0, sandbox_error)) => {
             eprintln!(
                 "governed_floor_and_fence: no OS-sandbox tool on this host — the default floor \
                  is disclosed (not counted, not denied)"
             );
             assert!(!g1.has_floor);
+            // Review of #449, FL-1: the CAUSE is on the wire — on the checks frame and on the
+            // gate — even though a judge ran and the gate is not `ungated`.
+            let sandbox_error =
+                sandbox_error.expect("repoChecksEvaluated.sandboxError names the cause");
+            assert!(
+                sandbox_error.contains("no OS write boundary"),
+                "{sandbox_error}"
+            );
+            let note = g1
+                .floor_note
+                .as_deref()
+                .expect("gateEvaluated.floorNote names the absent floor's cause");
+            assert!(
+                note.contains("could not run") && note.contains("sandbox"),
+                "{note}"
+            );
         }
         other => panic!("unexpected repoChecksEvaluated shape for ord 1: {other:?}"),
     }
@@ -337,6 +360,13 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
         "the reason names the absent layers: {why}"
     );
     assert!(g2.judge_cli.is_none() && !g2.has_floor);
+    assert!(
+        g2.floor_note
+            .as_deref()
+            .is_some_and(|n| n.contains("unchanged")),
+        "floorNote rides every gate without a deterministic floor: {:?}",
+        g2.floor_note
+    );
     assert!(
         !evs.iter()
             .any(|ev| matches!(ev, CoreEvent::RepoChecksEvaluated { ord, .. } if *ord == last_ord)),

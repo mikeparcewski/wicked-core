@@ -943,6 +943,30 @@ pub fn remove_worktree(repo_root: &str, run_id: &str) {
     }
 }
 
+/// (F-7R2-013, review RN-1) `git clean -fdX` in a RETAINED worktree: removes IGNORED files only
+/// (`node_modules`, `target/`, build output) — never tracked files, never untracked files that
+/// are not ignored (a seat's leftover edit stays for the operator to see). Best-effort; the
+/// worktree must belong to `run_id`.
+pub(crate) fn clean_ignored_in_worktree(repo_root: &str, run_id: &str) {
+    let wt = worktree_path(repo_root, run_id);
+    if !wt.is_dir() || !may_touch_worktree(&wt, run_id) {
+        return;
+    }
+    let wt_str = wt.to_string_lossy().to_string();
+    match git(&wt_str, &["clean", "-fdX"]) {
+        Ok((true, _, _)) => {}
+        Ok((false, _, err)) => eprintln!(
+            "wicked-core: could not drop the ignored files of retained worktree {}: {}",
+            wt.display(),
+            err.trim()
+        ),
+        Err(e) => eprintln!(
+            "wicked-core: could not drop the ignored files of retained worktree {}: {e}",
+            wt.display()
+        ),
+    }
+}
+
 /// FINDING-003 — reap a TERMINAL run's worktree, but only when it is CLEAN. Returns whether the
 /// path is gone.
 ///

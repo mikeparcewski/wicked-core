@@ -2345,6 +2345,8 @@ mod tests {
                 judge_distinct: Some(true),
                 ungated: false,
                 ungated_reason: None,
+                floor_note: None,
+                judge_skipped_reason: None,
             },
             "gateEvaluated",
             &[
@@ -2365,6 +2367,8 @@ mod tests {
                 "judgeDistinct",
                 "ungated",
                 "ungatedReason",
+                "floorNote",
+                "judgeSkippedReason",
             ],
         );
         check(
@@ -2966,11 +2970,17 @@ mod tests {
                 criterion: s(),
                 checks: vec![],
                 skipped: vec![],
+                sandbox_level: s(),
+                sandbox_error: None,
+                detect_error: None,
             },
             "repoChecksEvaluated",
             &[
                 "type",
                 "session",
+                "sandboxLevel",
+                "sandboxError",
+                "detectError",
                 "ord",
                 "attempt",
                 "passed",

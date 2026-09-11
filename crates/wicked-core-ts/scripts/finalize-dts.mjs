@@ -53,7 +53,11 @@ const HAND_AUTHORED = `${BEGIN}
  * {session, baseRef, baseCommit, localHead, behind, fetched, lifted, note, runBranch} (which base a
  * fresh run worktree was minted from; runBranch is the \`wicked/<run>\` branch — wave 6).
  * Wave 6 additions (all additive): gateEvaluated carries \`ungated: boolean\` + \`ungatedReason:
- * string | null\` (true when NO machine layer gated the unit — render UNGATED, never "pass");
+ * string | null\` (true when NO machine layer gated the unit — render UNGATED, never "pass"),
+ * \`floorNote: string | null\` (why the deterministic layer is absent, whenever it is) and
+ * \`judgeSkippedReason: string | null\` (why no judge was convened for a unit that wanted one);
+ * repoChecksEvaluated carries \`sandboxLevel: string\`, \`sandboxError: string | null\`,
+ * \`detectError: string | null\` (an empty \`checks\` says WHY on the wire);
  * unitDistributed.degradedReason is set on EVERY routing method whenever eligible seats <
  * configured ("N of M seats benched: …"); workerToolCallDenied {session, ord, attempt, cli,
  * carrier, role, tool, command, reason, remedy} (a worker seat's \`git push\` / \`gh pr create\` /

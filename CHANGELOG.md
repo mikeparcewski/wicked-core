@@ -28,11 +28,26 @@ Two release tracks share this file, newest entry first regardless of track:
     POST …` while letting `gh pr view`, `gh api` GETs and local git through; a refusal is ADVISORY
     (one tool call, not the unit), answered with the remedy and disclosed as
     **`workerToolCallDenied` {session, ord, attempt, cli, carrier, role, tool, command, reason,
-    remedy}** plus a log line; (3) every seat spawn (wrapped, ACP, ballot — the inherit hatch
-    included) strips `GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` and
-    aims `GH_CONFIG_DIR` at an engine-owned credential-less directory
-    (`wicked_apps_core::spawn::fence_remote_credentials`), while the deliver tool phase
-    (`run_tool_cmd`, no seat config) keeps the daemon's login and still pushes.
+    remedy}** plus a log line — DENY-DOMINATES on git (independent review of #449, FN-1/FN-2): a
+    `git` verb not in the builtin allow-list is refused as a possible alias, `-c`/`--config-env`/
+    `GIT_CONFIG_*`/`git config` overrides of `alias.*`, `url.*`, `remote.*`, `credential.*`,
+    `core.sshCommand`… are refused before the verb is read, `gh alias` is refused whole, and the
+    parser reads `bash -e -c`, `gh pr -R o/r create`, `gh api -XPOST`, unquoted `cmd /c`,
+    `timeout -k`, array-valued ACP commands (codex `shell`) and prose titles; (3) every seat spawn
+    (wrapped, ACP, ballot — the inherit hatch included) strips the `GH_*`/`GITHUB_*` tokens AND
+    `SSH_AUTH_SOCK`/`GIT_SSH*`/`GIT_ASKPASS`/`GIT_CONFIG_*`/`GIT_EXEC_PATH`, aims `GH_CONFIG_DIR`
+    at an engine-owned credential-less directory, re-points `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+    at seat-owned files that include the operator's identity settings but RESET credential
+    helpers and askpass, and carries a transport-agnostic push kill with `-c` precedence
+    (`url.wicked-nopush://.pushInsteadOf` for https/http/ssh/git/`git@`/`file://`/absolute paths
+    — fetch and pull untouched), so `git -c alias.p=push p` over an ssh remote fails "unable to
+    find remote helper" (`wicked_apps_core::spawn::fence_remote_credentials`; fixture-tested
+    against ssh/scp/file/path remotes), while the deliver tool phase (`run_tool_cmd`, no seat
+    config) keeps the daemon's login and still pushes. Carrier coverage, stated: the per-call
+    command filter runs on the wrapped CLAUDE gate hook and the ACP bridge; wrapped non-claude
+    single-shot seats and ACP chat sessions are fenced by layers 1 (claude only) and 3. The Bash
+    rules ride the council ballot's own argv too (not only the shared worker file), and
+    `~/.config/gh`, `~/.config/git`, `~/.git-credentials` join the read fence.
   - **Health-aware routing with `degradedReason` (F-7R2-006).** `AgenticCli.health: Option<{usable,
     reason}>` (additive, serde-default) carries the launcher's sign-in/usability verdict; a seat
     with `usable: false`, or one that fails authentication IN the run (a `not_logged_in` council
@@ -43,7 +58,13 @@ Two release tracks share this file, newest entry first regardless of track:
     judge. `unitDistributed.degradedReason` is now set on EVERY routing arm whenever eligible <
     configured ("N of M seats benched: codex (signed out — launcher), pi (not_logged_in —
     ballot)") — the Council arm used to emit `null` unconditionally. An all-benched roster
-    refuses the plan by name instead of parking the run at a human gate per unit.
+    refuses the plan by name instead of parking the run at a human gate per unit. The default
+    and triage judges draw from the registry seats the RUN configured (`session.clis`) minus the
+    bench — never a registry seat the launcher did not seat — and a judge seat that refuses with
+    an authentication failure is benched (`source: "judge"`) so the next unit never re-tries it
+    (review RT-1). core#447's registry `credential`/free-tier declaration is NOT folded here (see
+    the PR body): `health` is the carrier either way and can be filled from the declaration when
+    it lands, with no wire change.
   - **Default repo-checks floor + judge, or an honest UNGATED (F-7R2-005).** Every PROSE-planned
     agent unit — and every agent unit of a def that declares no `verified_evidence` phase —
     carries `WorkUnit.default_floor` (plan-time; a def that verifies owns its floor, so the
@@ -56,8 +77,15 @@ Two release tracks share this file, newest entry first regardless of track:
     floor, no judge, empty policy selection — the vacuous default-allow run b86c14c1 passed seven
     times), with the cause per absent layer ("no judge: no eligible judge seat distinct from
     creator 'claude' …"). On a host with no OS sandbox the DEFAULT floor discloses instead of
-    denying (the declared `verified_evidence` floor stays fail-closed). A changed tree with no
-    check report denies fail-closed.
+    denying (the declared `verified_evidence` floor stays fail-closed) — and the cause is ON THE
+    WIRE whether or not a judge ran (review FL-1/FL-2): **`repoChecksEvaluated.sandboxLevel`,
+    `sandboxError`, `detectError`** and **`gateEvaluated.floorNote`** (why the deterministic
+    layer is absent, whenever it is) + **`judgeSkippedReason`** (why no judge was convened for a
+    unit that wanted one). A changed tree with no check report denies fail-closed. The marker is
+    "no `verified_evidence` phase AFTER this unit" (FL-3). Cost, stated (FL-4): the repository's
+    own checks run once per tree-changing prose unit (bounded by `CHECK_TIMEOUT`/`INSTALL_TIMEOUT`
+    per check); a repo with no detectable manifest yields `passed: true, checks: []` — consumers
+    render "0 checks detected", never "checks passed".
   - **Auth fallback kinds, no wrapped retry (F-7R2-019).** `acpFallback.fallbackKind` gains
     `auth_failed` (the handshake's `authenticate` failed) and `unauthenticated` (`session/new`
     refused after `authenticate`, or no method advertised) — pi's 401 used to be filed as
@@ -68,7 +96,10 @@ Two release tracks share this file, newest entry first regardless of track:
     `base_commit` and `finished_at` (additive) are durable; `runBaseResolved` gains `runBranch`.
     A COMPLETED run's worktree is kept until the run is archived (`ArchiveRun` reaps clean-only)
     or `WICKED_COMPLETED_WORKTREE_KEEP_DAYS` (default 14; `0` = reap at completion) elapses — the
-    boot reaper honours the window. Failed/cancelled runs are unchanged.
+    boot reaper honours the window AND every run completion sweeps expired retained trees (review
+    RN-1: no longer boot-only); a retained tree has its IGNORED files (`node_modules`, `target/`)
+    dropped at completion (`git clean -fdX`), never its tracked or untracked-not-ignored files.
+    Failed/cancelled runs are unchanged.
 
 ### Fixed
 - **core-ts build-from-source fixed; CI now syntax-checks the finalizer.** #444 left four unescaped

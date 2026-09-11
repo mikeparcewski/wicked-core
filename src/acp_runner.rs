@@ -17081,4 +17081,88 @@ transport = "stdio"
             out.output
         );
     }
+
+    /// Review of #449 (FN-1/FN-2/FN-3): every bypass spelling the review reproduced is refused by
+    /// the ACP permission bridge for a `Full`-posture creator — as a string command, and (the
+    /// codex `shell` shape) as an argv ARRAY — each answered with the reject option and disclosed.
+    #[test]
+    fn every_review_bypass_string_is_refused_by_the_acp_bridge() {
+        use serde_json::json;
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let full = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::Full,
+            role: crate::workflow::PhaseRole::Creator,
+            run_id: "run-1".into(),
+            ord: 7,
+            attempt: 0,
+            cli: "codex".into(),
+            phase: "build".into(),
+            cwd: std::path::PathBuf::from("/wt"),
+            deliverable_roots: vec![],
+            home: None,
+            tx,
+        };
+        let lock = std::sync::Mutex::new(());
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            let line = written
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response frame written");
+            serde_json::from_str(line).unwrap()
+        };
+        for (i, cmd) in crate::remote_write_fence::REVIEW_BYPASS_STRINGS
+            .iter()
+            .enumerate()
+        {
+            for shape in ["string", "argv"] {
+                let raw_input = if shape == "string" {
+                    json!({"command": cmd})
+                } else {
+                    // codex-acp's `shell`: the seat's shell receives the command as ONE `-lc`
+                    // script element.
+                    json!({"command": ["bash", "-lc", cmd]})
+                };
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": i,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "s",
+                        "toolCall": {"toolCallId": "tc", "name": "shell", "kind": "execute", "title": "Run command", "rawInput": raw_input},
+                        "options": [
+                            {"optionId": "allow", "kind": "allow_once"},
+                            {"optionId": "reject", "kind": "reject_once"},
+                        ],
+                    },
+                });
+                let mut sink: Vec<u8> = Vec::new();
+                let mut output = String::new();
+                super::answer_permission_request(
+                    &mut sink,
+                    &lock,
+                    None,
+                    None,
+                    Some(&full),
+                    &frame,
+                    &mut output,
+                    8192,
+                );
+                let v = answer_of(&sink);
+                assert_eq!(
+                    v["result"]["outcome"]["optionId"], "reject",
+                    "not refused on the ACP bridge ({shape}): {cmd} → {v}"
+                );
+                assert!(
+                    matches!(
+                        rx.try_recv(),
+                        Ok(crate::command::Command::EmitEvent(
+                            crate::event::CoreEvent::WorkerToolCallDenied { .. }
+                        ))
+                    ),
+                    "no workerToolCallDenied for ({shape}): {cmd}"
+                );
+            }
+        }
+    }
 }

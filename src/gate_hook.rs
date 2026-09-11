@@ -4421,4 +4421,36 @@ mod phase_scope_tests {
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&wt);
     }
+
+    /// Review of #449 (FN-1/FN-2): every bypass spelling the review reproduced is refused by the
+    /// WRAPPED carrier's Bash arm — advisory, with the remedy — and nothing in the corpus is
+    /// mistaken for a path question.
+    #[test]
+    fn every_review_bypass_string_is_refused_by_the_gate_hook() {
+        let wt =
+            std::env::temp_dir().join(format!("wicked-remote-write-corpus-{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        for cmd in crate::remote_write_fence::REVIEW_BYPASS_STRINGS {
+            let verdict = boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            );
+            let (reason, fatal) = verdict.unwrap_or_else(|| panic!("not refused: {cmd}"));
+            assert!(!fatal, "advisory, the seat continues: {cmd}");
+            assert!(
+                reason.starts_with(REMOTE_WRITE_REASON_PREFIX)
+                    && reason.contains(crate::remote_write_fence::REMEDY),
+                "{cmd}: {reason}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&wt);
+    }
 }

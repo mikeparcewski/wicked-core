@@ -283,6 +283,17 @@ pub enum CoreEvent {
         /// seat distinct from creator `claude` (roster: claude; benched: codex (signed out))").
         /// `None` (wire `null`) when gated.
         ungated_reason: Option<String>,
+        /// (wave 6, review FL-1) WHY the deterministic layer is absent on an AGENT unit, populated
+        /// whenever `has_deterministic_floor` is `false` — judge or no judge: "repo checks could
+        /// not run: no OS write boundary could be armed (…)", "the unit left the worktree tree
+        /// unchanged", "an unbound run", "a def phase that delegates verification to a later
+        /// verified_evidence phase". `None` when a floor ran or the unit is a Tool.
+        floor_note: Option<String>,
+        /// (wave 6, review FL-2) WHY no agent judge was convened for a unit that WANTED one (its
+        /// tree changed, no pinned validator): "no eligible judge seat distinct from creator 'x'
+        /// (…)". Populated whether or not the floor gated the unit; `None` when a judge ran or
+        /// none was wanted.
+        judge_skipped_reason: Option<String>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
     /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;
@@ -813,6 +824,16 @@ pub enum CoreEvent {
         criterion: String,
         checks: Vec<crate::repo_checks::CheckRun>,
         skipped: Vec<String>,
+        /// (wave 6, review FL-1) The OS write boundary the checks ran under (`sandboxed` |
+        /// `best_effort` | …, `RepoChecksReport::sandbox_level`) — so a `passed: false,
+        /// checks: []` frame says WHY on the wire.
+        sandbox_level: String,
+        /// `Some` when the floor REFUSED to run because no OS write boundary could be armed —
+        /// the cause the studio must show beside an empty `checks` (never "checks failed").
+        sandbox_error: Option<String>,
+        /// `Some` when check DETECTION itself failed (an unreadable manifest) — distinct from
+        /// "no checks detected".
+        detect_error: Option<String>,
     },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
@@ -1217,6 +1238,8 @@ impl CoreEvent {
                 judge_distinct,
                 ungated,
                 ungated_reason,
+                floor_note,
+                judge_skipped_reason,
             } => json!({
                 "type": "gateEvaluated",
                 "session": session,
@@ -1235,6 +1258,8 @@ impl CoreEvent {
                 "judgeDistinct": judge_distinct,
                 "ungated": ungated,
                 "ungatedReason": ungated_reason,
+                "floorNote": floor_note,
+                "judgeSkippedReason": judge_skipped_reason,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`
             // marks a re-dispatch.
@@ -1828,6 +1853,9 @@ impl CoreEvent {
                 criterion,
                 checks,
                 skipped,
+                sandbox_level,
+                sandbox_error,
+                detect_error,
             } => json!({
                 "type": "repoChecksEvaluated",
                 "session": session,
@@ -1837,6 +1865,9 @@ impl CoreEvent {
                 "criterion": criterion,
                 "checks": checks.iter().map(check_run_json).collect::<Vec<_>>(),
                 "skipped": skipped,
+                "sandboxLevel": sandbox_level,
+                "sandboxError": sandbox_error,
+                "detectError": detect_error,
             }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {
@@ -2063,6 +2094,8 @@ mod tests {
             judge_distinct: judge.map(|(_, d)| d),
             ungated: false,
             ungated_reason: None,
+            floor_note: None,
+            judge_skipped_reason: None,
         };
         let j = ev(Some(("codex", true))).to_json();
         assert_eq!(j["type"], "gateEvaluated");

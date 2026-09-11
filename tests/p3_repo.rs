@@ -150,7 +150,7 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
 ///
 /// Far above the ~2s an unloaded run needs, because the only thing a longer budget can change is
 /// whether a slow-but-correct run under concurrent test load is misreported as a broken one.
-const WAIT_BUDGET: Duration = Duration::from_secs(20);
+const WAIT_BUDGET: Duration = Duration::from_secs(180);
 
 /// Poll until `run_id` reaches `want`.
 ///

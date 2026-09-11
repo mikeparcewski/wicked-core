@@ -97,8 +97,6 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
 /// are `<session_id>:<phase_id>` (stable across resumes) — that id is the backing-phase linkage;
 /// `phase_ref` is left untouched (the execute path owns it).
 pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<WorkUnit> {
-    // F-7R2-005: does this def declare a verifying phase of its own? (See `default_floor`.)
-    let def_verifies = def.phases.iter().any(|p| p.verified_evidence);
     // Precondition: `def` is validated — phase ids are unique, so `<session>:<phase_id>` unit ids
     // are collision-free. The registry only ever hands out validated defs (`register` validates),
     // so the runtime path upholds this; the assert catches a raw unvalidated def in dev.
@@ -227,13 +225,15 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // declared write roots.
             let is_tool = matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
             unit.worktree_guarded = !phase.executes_code && !is_tool;
-            // F-7R2-005 — the DEFAULT floor marker for a def that VERIFIES NOTHING: no phase
-            // declares `verified_evidence`, so no `repo_checks_floor` will ever run; every agent
-            // unit that changes the tree then owes the repository's own checks and a distinct
-            // judge. A def with a verify phase keeps that phase as its one floor (the `bug`/
-            // `feature` `fix` gate is `auto` by design and must not hard-fail on checks the
-            // def routes to `verify`'s human gate).
-            unit.default_floor = !is_tool && !def_verifies;
+            // F-7R2-005 — the DEFAULT floor marker for an agent phase that NO LATER phase
+            // verifies: when no `verified_evidence` phase follows this one, no `repo_checks_floor`
+            // will ever re-derive its work, so a unit that changes the tree owes the repository's
+            // own checks and a distinct judge itself. A phase FOLLOWED by a verify phase leaves
+            // the floor to it (the `bug`/`feature` `fix` gate is `auto` by design and must not
+            // hard-fail on checks the def routes to `verify`'s human gate); a creator AFTER the
+            // def's verify phase is floored (review of #449, FL-3).
+            let later_verifies = def.phases[i + 1..].iter().any(|p| p.verified_evidence);
+            unit.default_floor = !is_tool && !later_verifies;
             // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a
             // `verified_evidence` agent phase with an `executes_code` Creator before it. The engine
             // runs the repository's own checks in the worktree after the seat's work and folds the

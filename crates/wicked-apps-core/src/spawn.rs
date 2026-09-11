@@ -441,7 +441,172 @@ pub const REMOTE_CREDENTIAL_ENV: &[&str] = &[
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
+    // (review of #449, FN-1) The ssh and git-credential paths: an agent-held key, an askpass
+    // helper, a seat-supplied ssh command, git's own environment-injected config, a re-pointed
+    // subcommand directory — every one a way to push around the gh-mediated https login.
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_EXEC_PATH",
+    "GIT_PROXY_COMMAND",
 ];
+
+/// Name PREFIXES of remote-write credential variables stripped by enumeration (their suffix is
+/// a counter): `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git's environment-injected config —
+/// the `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p …` bypass) and any `GIT_CREDENTIAL*`.
+pub const REMOTE_CREDENTIAL_ENV_PREFIXES: &[&str] =
+    &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_CREDENTIAL"];
+
+/// The scheme every seat push is rewritten to — one git has no remote helper for, so the push
+/// fails before any transport is contacted ("unable to find remote helper for 'wicked-nopush'").
+pub const NOPUSH_SCHEME: &str = "wicked-nopush://";
+
+/// URL prefixes rewritten for PUSH ONLY (`url.<NOPUSH_SCHEME>.pushInsteadOf`): every transport
+/// git speaks — https/http, ssh (URL and scp-like `git@host:` forms), the git protocol, `file://`
+/// and an absolute POSIX-path remote. `insteadOf` is NOT touched: fetch and pull keep working on
+/// every one of them. A seat fetches from its remotes; it never pushes to them. See
+/// [`nopush_url_prefixes`] for the full list — this base plus the Windows path spellings.
+pub const NOPUSH_URL_PREFIXES: &[&str] = &[
+    "https://",
+    "http://",
+    "ssh://",
+    "git+ssh://",
+    "ssh+git://",
+    "git://",
+    "git@",
+    "file://",
+    "/",
+];
+
+/// EVERY push-killed URL prefix: [`NOPUSH_URL_PREFIXES`] plus the Windows spellings of a local
+/// path remote — a drive letter (`C:`/`c:`, which git normalises to `C:/…` in remote URLs; the
+/// CI Windows runner's `%TEMP%` bare remote is exactly this) and a UNC share (`\\`). Listed on
+/// every platform: a remote URL beginning `X:` or `\\` means a Windows path nowhere else, so
+/// the entries are inert where they do not apply and the seat config is identical everywhere.
+pub fn nopush_url_prefixes() -> Vec<String> {
+    let mut all: Vec<String> = NOPUSH_URL_PREFIXES
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+    for letter in b'A'..=b'Z' {
+        all.push(format!("{}:", letter as char));
+        all.push(format!("{}:", (letter as char).to_ascii_lowercase()));
+    }
+    all.push("\\\\".to_string());
+    all
+}
+
+/// The `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries a seat spawn carries —
+/// git reads them with the precedence of `-c` (above every config FILE), so a repo-level
+/// `credential.helper` or `url.*.pushInsteadOf` cannot undo them: the push kill for every
+/// transport, credential helpers reset (an empty `credential.helper` clears the list), no askpass
+/// program. Returned as `(name, value)` pairs, `GIT_CONFIG_COUNT` last.
+pub fn nopush_git_config_env() -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = nopush_url_prefixes()
+        .iter()
+        .map(|p| {
+            (
+                format!("url.{NOPUSH_SCHEME}.pushInsteadOf"),
+                (*p).to_string(),
+            )
+        })
+        .collect();
+    entries.push(("credential.helper".to_string(), String::new()));
+    entries.push(("core.askPass".to_string(), String::new()));
+    let mut env: Vec<(String, String)> = Vec::with_capacity(entries.len() * 2 + 1);
+    for (i, (key, value)) in entries.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), key.clone()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), value.clone()));
+    }
+    env.push(("GIT_CONFIG_COUNT".to_string(), entries.len().to_string()));
+    env
+}
+
+/// The seat-owned git config files a seat spawn is pointed at (`GIT_CONFIG_GLOBAL`,
+/// `GIT_CONFIG_SYSTEM`), under [`seat_gh_config_dir`]: the GLOBAL file includes the operator's
+/// own global config (so `user.name`/`user.email`, `core.*`, `diff.*` keep working for the seat's
+/// commits) and then RESETS the credential helpers, askpass and the push transports; the SYSTEM
+/// file is empty (a system `credential.helper = manager`, as Git for Windows installs, never
+/// reaches a seat). Written idempotently on every spawn; `Err` when the worker home base cannot
+/// be resolved or the files cannot be written — callers then rely on the environment entries
+/// alone (which already outrank every file).
+pub fn seat_git_config_files() -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use anyhow::Context;
+    let dir = seat_gh_config_dir()?;
+    ensure_private_dir(&dir)?;
+    let global = dir.join("gitconfig");
+    let system = dir.join("gitconfig-system");
+    let mut content = String::from(
+        "# Written by wicked-core on every seat spawn (F-7R2-012, wave 6). A worker seat's git\n\
+         # reads THIS as its global config: the operator's own global config is included below\n\
+         # (identity, editor, diff settings keep working), then every credential helper and\n\
+         # askpass program is reset and every push transport is re-aimed at a scheme git has no\n\
+         # helper for. Fetch and pull are untouched. Delivery is the deliver phase's job.\n",
+    );
+    for path in operator_global_git_configs() {
+        // git's include syntax accepts forward slashes on every platform; a backslash would be
+        // read as an escape.
+        let spelled = path.to_string_lossy().replace('\\', "/");
+        content.push_str(&format!("[include]\n\tpath = {spelled}\n"));
+    }
+    content.push_str("[credential]\n\thelper =\n[core]\n\taskPass =\n");
+    content.push_str(&format!("[url \"{NOPUSH_SCHEME}\"]\n"));
+    for prefix in nopush_url_prefixes() {
+        // A value that begins with a backslash is quoted so git reads it literally.
+        if prefix.starts_with('\\') {
+            let escaped = prefix.replace('\\', "\\\\");
+            content.push_str(&format!("\tpushInsteadOf = \"{escaped}\"\n"));
+        } else {
+            content.push_str(&format!("\tpushInsteadOf = {prefix}\n"));
+        }
+    }
+    write_if_changed(&global, &content).context("seat global gitconfig")?;
+    write_if_changed(
+        &system,
+        "# Written by wicked-core (F-7R2-012): a worker seat's SYSTEM git config is empty.\n",
+    )
+    .context("seat system gitconfig")?;
+    Ok((global, system))
+}
+
+/// The operator's global git config file(s) that exist: `$GIT_CONFIG_GLOBAL` when set, else
+/// `$XDG_CONFIG_HOME/git/config` (or `~/.config/git/config`) and `~/.gitconfig` — the same two
+/// files git itself reads, in git's order.
+fn operator_global_git_configs() -> Vec<std::path::PathBuf> {
+    if let Some(explicit) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        let p = std::path::PathBuf::from(explicit);
+        return if p.is_file() { vec![p] } else { Vec::new() };
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")))
+        .map(|c| c.join("git").join("config"));
+    [xdg, home.map(|h| h.join(".gitconfig"))]
+        .into_iter()
+        .flatten()
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+fn write_if_changed(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if std::fs::read_to_string(path)
+        .map(|c| c == content)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    std::fs::write(path, content)
+}
 
 /// The `gh` CLI's configuration directory variable — where it reads `hosts.yml`, the stored
 /// login `gh auth login` wrote. A seat is pointed at an ENGINE-OWNED, credential-less directory
@@ -461,13 +626,39 @@ pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(worker_home_base()?.join(GH_UNAUTHENTICATED_DIR))
 }
 
-/// Strip the remote-write credentials from `cmd` and re-aim `gh` at the credential-less
-/// directory — the seat half of the F-7R2-012 fence, applied by [`SeatConfig::apply`] for every
-/// seat decision (the inherit hatch INCLUDED: the hatch is about whose CLI configuration a seat
-/// runs under, and `gh` is not a seat CLI — a seat never delivers, whatever it inherits).
+/// Strip the remote-write credentials from `cmd`, re-aim `gh` at the credential-less directory
+/// and kill every push transport — the seat half of the F-7R2-012 fence, applied by
+/// [`SeatConfig::apply`] for every seat decision (the inherit hatch INCLUDED: the hatch is about
+/// whose CLI configuration a seat runs under, and `gh`/`git` remotes are not a seat CLI — a seat
+/// never delivers, whatever it inherits).
+///
+/// Four things, in order: (1) every variable in [`REMOTE_CREDENTIAL_ENV`] and every one matching
+/// [`REMOTE_CREDENTIAL_ENV_PREFIXES`] in the daemon's environment is REMOVED — tokens, the ssh
+/// agent socket, askpass helpers, seat-supplied ssh commands, environment-injected git config;
+/// (2) `GH_CONFIG_DIR` → the credential-less directory, `GIT_TERMINAL_PROMPT=0` (a push that
+/// reaches an auth prompt fails instead of hanging the seat); (3) the transport kill rides the
+/// spawn as `GIT_CONFIG_COUNT`/`KEY`/`VALUE` entries ([`nopush_git_config_env`]) — `-c`
+/// precedence, above every file; (4) `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` → the seat-owned
+/// files ([`seat_git_config_files`]), so the operator's `~/.gitconfig` credential helpers and
+/// `~/.git-credentials` are never consulted while identity settings still are. Review of #449
+/// (FN-1): before this, `HOME`, `SSH_AUTH_SOCK` and the helpers rode into the seat, so
+/// `git -c alias.p=push p` pushed over ssh with nothing in the way.
 pub fn fence_remote_credentials(cmd: &mut Command) {
     for key in REMOTE_CREDENTIAL_ENV {
         cmd.env_remove(key);
+    }
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if REMOTE_CREDENTIAL_ENV_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            cmd.env_remove(name.as_ref());
+        }
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    for (name, value) in nopush_git_config_env() {
+        cmd.env(name, value);
     }
     match seat_gh_config_dir() {
         Ok(dir) => {
@@ -475,8 +666,19 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
         }
         Err(e) => eprintln!(
             "wicked-core: seat spawn cannot resolve the credential-less gh config dir ({e}); \
-             {GH_CONFIG_DIR_ENV} is left as inherited — the token variables are stripped and the \
-             remote-write command fence still applies"
+             {GH_CONFIG_DIR_ENV} is left as inherited — the token variables are stripped, the \
+             push transports are killed and the remote-write command fence still applies"
+        ),
+    }
+    match seat_git_config_files() {
+        Ok((global, system)) => {
+            cmd.env("GIT_CONFIG_GLOBAL", global);
+            cmd.env("GIT_CONFIG_SYSTEM", system);
+        }
+        Err(e) => eprintln!(
+            "wicked-core: seat spawn cannot write the seat-owned git config files ({e}); the \
+             operator's global/system git config stays readable — the push transports are still \
+             killed by the environment entries and the credential helpers reset"
         ),
     }
 }
@@ -1525,11 +1727,20 @@ mod tests {
             }
             decision.apply(&mut cmd);
             for var in REMOTE_CREDENTIAL_ENV {
-                assert_eq!(
+                // Every planted value is gone — REMOVED, or (for `GIT_CONFIG_COUNT`, which the
+                // transport kill re-sets to its own count) replaced by the engine's own value.
+                assert_ne!(
                     value(&cmd, var),
-                    Some(None),
-                    "{decision:?}: {var} is REMOVED, not left as a decoy"
+                    Some(Some("secret".to_string())),
+                    "{decision:?}: {var} must not survive as planted"
                 );
+                if *var != "GIT_CONFIG_COUNT" {
+                    assert_eq!(
+                        value(&cmd, var),
+                        Some(None),
+                        "{decision:?}: {var} is REMOVED, not left as a decoy"
+                    );
+                }
             }
             match value(&cmd, GH_CONFIG_DIR_ENV) {
                 Some(Some(dir)) => assert!(
@@ -1559,5 +1770,218 @@ mod tests {
                 .any(|v| REMOTE_CREDENTIAL_ENV.contains(v)),
             "the credential fence is applied per seat, not by hardened()"
         );
+    }
+
+    /// Review of #449, FN-1(b): the seat spawn strips the ssh/git credential paths too, kills
+    /// every push transport with `-c` precedence, and re-points git's global/system config at
+    /// seat-owned files — while `hardened()` alone (the deliver tool phase) keeps all of it.
+    #[test]
+    fn fence_strips_ssh_and_git_credential_paths_and_kills_every_push_transport() {
+        let value = |cmd: &Command, key: &str| -> Option<Option<String>> {
+            cmd.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let mut cmd = Command::new("true");
+        cmd.hardened();
+        for var in [
+            "SSH_AUTH_SOCK",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_EXEC_PATH",
+        ] {
+            cmd.env(var, "planted");
+        }
+        // Environment-injected config the daemon might carry (the review's bypass shape) — at
+        // an index the engine's own entries never reach.
+        std::env::set_var("GIT_CONFIG_KEY_97", "alias.p");
+        std::env::set_var("GIT_CONFIG_VALUE_97", "push");
+        fence_remote_credentials(&mut cmd);
+        std::env::remove_var("GIT_CONFIG_KEY_97");
+        std::env::remove_var("GIT_CONFIG_VALUE_97");
+        for var in [
+            "SSH_AUTH_SOCK",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_EXEC_PATH",
+            "GIT_CONFIG_KEY_97",
+            "GIT_CONFIG_VALUE_97",
+        ] {
+            assert_eq!(value(&cmd, var), Some(None), "{var} is REMOVED");
+        }
+        assert_eq!(value(&cmd, "GIT_TERMINAL_PROMPT"), Some(Some("0".into())));
+        let count: usize = value(&cmd, "GIT_CONFIG_COUNT")
+            .flatten()
+            .expect("the transport kill rides GIT_CONFIG_COUNT")
+            .parse()
+            .unwrap();
+        let mut push_kills = 0;
+        let mut helper_reset = false;
+        for i in 0..count {
+            let key = value(&cmd, &format!("GIT_CONFIG_KEY_{i}"))
+                .flatten()
+                .unwrap();
+            let val = value(&cmd, &format!("GIT_CONFIG_VALUE_{i}"))
+                .flatten()
+                .unwrap();
+            if key == format!("url.{NOPUSH_SCHEME}.pushInsteadOf") {
+                assert!(nopush_url_prefixes().contains(&val), "{val}");
+                push_kills += 1;
+            }
+            if key == "credential.helper" {
+                assert!(val.is_empty(), "an empty helper RESETS the list");
+                helper_reset = true;
+            }
+        }
+        assert_eq!(
+            push_kills,
+            nopush_url_prefixes().len(),
+            "every transport is killed — drive letters and UNC included"
+        );
+        assert!(
+            nopush_url_prefixes().iter().any(|p| p == "C:")
+                && nopush_url_prefixes().iter().any(|p| p == "c:"),
+            "Windows drive-letter path remotes are killed too"
+        );
+        assert!(helper_reset);
+        if worker_home_base().is_ok() {
+            let global = value(&cmd, "GIT_CONFIG_GLOBAL")
+                .flatten()
+                .expect("global git config re-pointed");
+            let system = value(&cmd, "GIT_CONFIG_SYSTEM")
+                .flatten()
+                .expect("system git config re-pointed");
+            assert!(
+                global.contains(GH_UNAUTHENTICATED_DIR) && system.contains(GH_UNAUTHENTICATED_DIR)
+            );
+            let text = std::fs::read_to_string(&global).unwrap();
+            assert!(
+                text.contains(&format!("[url \"{NOPUSH_SCHEME}\"]")),
+                "{text}"
+            );
+            assert!(
+                text.contains("pushInsteadOf = ssh://") && text.contains("pushInsteadOf = git@")
+            );
+            assert!(text.contains("helper =") && text.contains("askPass ="));
+        }
+        // The deliver tool phase: hardened() alone keeps every one of these.
+        let mut deliver = Command::new("true");
+        deliver.env("SSH_AUTH_SOCK", "/tmp/agent.sock");
+        deliver.env("GIT_SSH_COMMAND", "ssh -i key");
+        deliver.hardened();
+        assert_eq!(
+            value(&deliver, "SSH_AUTH_SOCK"),
+            Some(Some("/tmp/agent.sock".into()))
+        );
+        assert_eq!(
+            value(&deliver, "GIT_SSH_COMMAND"),
+            Some(Some("ssh -i key".into()))
+        );
+        assert_eq!(
+            value(&deliver, "GIT_CONFIG_COUNT"),
+            None,
+            "no transport kill on the deliver phase"
+        );
+    }
+
+    /// Review of #449, FN-1: the transport kill HOLDS — a seat-fenced `git push` fails before any
+    /// transport is contacted on an ssh remote (URL and scp-like), a `file://` remote and an
+    /// absolute-path remote, aliased (`git -c alias.p=push p`) or not; the same command WITHOUT
+    /// the fence pushes to the path remote (the fixture would otherwise have pushed), and
+    /// `git fetch` from it still works under the fence.
+    #[test]
+    fn a_fenced_seat_cannot_push_over_any_transport_while_the_deliver_phase_can() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-nopush-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let bare = base.join("bare.git");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        // spawn-audit: test-only fixture spawns; the fence under test is applied to the LAST one.
+        let git = |cwd: &std::path::Path, args: &[&str], fenced: bool| -> (bool, String) {
+            let mut c = Command::new("git");
+            c.hardened();
+            c.args(args).current_dir(cwd);
+            c.env("GIT_CONFIG_NOSYSTEM", "1");
+            if fenced {
+                fence_remote_credentials(&mut c);
+            }
+            let out = match c.output() {
+                Ok(o) => o,
+                Err(e) => return (false, format!("spawn: {e}")),
+            };
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        };
+        if !git(&bare, &["init", "-q", "--bare"], false).0 {
+            eprintln!("no usable git on this host — skipping the transport-kill fixture");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(git(&clone, &["init", "-q"], false).0);
+        for (k, v) in [
+            ("user.email", "t@example.invalid"),
+            ("user.name", "t"),
+            ("commit.gpgsign", "false"),
+            ("core.autocrlf", "false"),
+        ] {
+            assert!(git(&clone, &["config", k, v], false).0);
+        }
+        std::fs::write(clone.join("a.txt"), "a\n").unwrap();
+        assert!(git(&clone, &["add", "."], false).0);
+        assert!(git(&clone, &["commit", "-qm", "init"], false).0);
+        let bare_url = bare.to_string_lossy().replace('\\', "/");
+        let remotes = [
+            ("sshurl", "ssh://example.invalid/o/r.git".to_string()),
+            ("scp", "git@example.invalid:o/r.git".to_string()),
+            ("fileurl", format!("file://{bare_url}")),
+            ("path", bare_url.clone()),
+        ];
+        for (name, url) in &remotes {
+            assert!(
+                git(&clone, &["remote", "add", name, url], false).0,
+                "{name}"
+            );
+        }
+        // Under the fence: every push fails on the kill, before any transport is contacted.
+        for (name, _) in &remotes {
+            let (ok, out) = git(&clone, &["push", name, "HEAD:refs/heads/main"], true);
+            assert!(!ok, "a fenced push to remote {name} must fail: {out}");
+            assert!(
+                out.contains("wicked-nopush"),
+                "the failure is the transport kill, not a network error (remote {name}): {out}"
+            );
+        }
+        // The alias spelling the review reproduced: still killed by layer 3.
+        let (ok, out) = git(
+            &clone,
+            &["-c", "alias.p=push", "p", "path", "HEAD:refs/heads/main"],
+            true,
+        );
+        assert!(!ok && out.contains("wicked-nopush"), "{out}");
+        // Fetch keeps working under the fence (pushInsteadOf never touches fetch).
+        let (ok, out) = git(&clone, &["fetch", "path"], true);
+        assert!(ok, "a fenced fetch from the path remote works: {out}");
+        // Control — the same push WITHOUT the fence lands (the deliver phase's shape).
+        let (ok, out) = git(&clone, &["push", "path", "HEAD:refs/heads/main"], false);
+        assert!(
+            ok,
+            "the unfenced push to the bare path remote succeeds: {out}"
+        );
+        let (ok, refs) = git(&bare, &["show-ref", "refs/heads/main"], false);
+        assert!(ok && refs.contains("refs/heads/main"), "{refs}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

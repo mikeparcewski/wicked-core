@@ -4486,9 +4486,10 @@ fn apply_step_result(
                 // The FULL output rides beside the bounded excerpt so a `Fail` decision can
                 // persist the untruncated transcript record (usability review #1).
                 let full_output = output.output.clone();
-                // (F-7R2-006) The triage judge picks from the seats this run may still use —
-                // never a benched one (in run b86c14c1 the judge itself ran on signed-out pi and
-                // errored, escalating every failure to a human).
+                // (F-7R2-006 / review RT-1) The triage judge picks from the seats this run
+                // configured and may still use — never a benched one (in run b86c14c1 the judge
+                // itself ran on signed-out pi and errored, escalating every failure to a human).
+                let run_roster_keys: Vec<String> = session.clis.clone();
                 let benched_keys: Vec<String> = session
                     .benched_seats
                     .iter()
@@ -4502,7 +4503,7 @@ fn apply_step_result(
                             &desc,
                             &cli,
                             invocation.as_deref().unwrap_or("(unknown)"),
-                            &eligible_registry_roster(&benched_keys),
+                            &eligible_registry_roster(&run_roster_keys, &benched_keys),
                             &*runner2,
                             &ctx,
                         )
@@ -5088,14 +5089,68 @@ fn eligible_roster_keys(session: &crate::domain::AgentSession) -> Vec<String> {
         .collect()
 }
 
-/// (F-7R2-006) The registry roster minus `benched` keys and minus every seat whose registry
-/// record declares itself unusable — what the triage judge may run under.
-fn eligible_registry_roster(benched: &[String]) -> Vec<crate::AgenticCli> {
-    crate::registry_roster()
-        .into_iter()
+/// (F-7R2-006 / review RT-1) The registry seats the RUN configured (`run_roster`; empty = no
+/// intersection), minus `benched` keys and minus every seat whose registry record declares
+/// itself unusable — what the triage judge may run under.
+fn eligible_registry_roster(run_roster: &[String], benched: &[String]) -> Vec<crate::AgenticCli> {
+    let registry = crate::registry_roster();
+    // The run's configured registry seats when it has any; an ad-hoc roster (no registry key)
+    // keeps the whole registry as its pool — see `cli_runner::run_unit_and_judge_with_roster`.
+    let configured: Vec<crate::AgenticCli> = registry
+        .iter()
+        .filter(|c| run_roster.contains(&c.key))
+        .cloned()
+        .collect();
+    let pool = if configured.is_empty() {
+        registry
+    } else {
+        configured
+    };
+    pool.into_iter()
         .filter(|c| !benched.contains(&c.key))
         .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
         .collect()
+}
+
+/// (F-7R2-013, review RN-1) The COMPLETION-TIME sweep: every completed, unarchived run whose
+/// retention window has elapsed has its clean worktree reaped now — not only at the next daemon
+/// boot — so a long-lived daemon never accumulates expired checkouts. Clean-only, off-thread,
+/// the branch stays; a dirty tree is kept and named, as everywhere.
+fn sweep_expired_retained_worktrees(store: &dyn GraphStore) {
+    let now = crate::interaction::now_millis();
+    let Ok(sessions) = crate::domain::all_sessions(store) else {
+        return;
+    };
+    for s in sessions {
+        let expired = s.status == SessionStatus::Completed
+            && s.archived_at.is_none()
+            && s.finished_at.is_some()
+            && s.workdir.is_some()
+            && !worktree_retained(&s, now);
+        if expired {
+            eprintln!(
+                "wicked-core: run {}'s retained worktree has passed its retention window; \
+                 reaping it (clean-only, branch kept) (F-7R2-013)",
+                s.id
+            );
+            reap_terminal_worktree(store, &s);
+        }
+    }
+}
+
+/// (review RN-1) Drop the IGNORED files of a retained worktree — `node_modules`, `target/`, the
+/// build output a seat's own checks left behind — so a retained tree costs the diff-relevant
+/// files and nothing else; tracked and untracked-not-ignored files (the run's work, a leftover
+/// edit) are never touched. Off-thread; best-effort.
+fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
+    let Some(repo_id) = session.repo_ref.as_ref() else {
+        return;
+    };
+    let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) else {
+        return;
+    };
+    let rid = session.id.clone();
+    std::thread::spawn(move || crate::repo::clean_ignored_in_worktree(&repo.root_path, &rid));
 }
 
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
@@ -5859,6 +5914,7 @@ fn dispatch_unit(
                     verified_tree: lift_verified_tree,
                     tree_changed: None,
                     judge_skipped: None,
+                    judge_auth_refusals: Vec::new(),
                 }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
@@ -5882,8 +5938,9 @@ fn dispatch_unit(
         return Ok(true);
     }
 
-    // (F-7R2-006) The run's bench rides to the worker thread: the agent judge never runs on a
-    // benched seat.
+    // (F-7R2-006 / review RT-1) The run's roster and bench ride to the worker thread: the agent
+    // judge is drawn from the seats this run configured, never a benched one.
+    let run_roster_keys: Vec<String> = session.clis.clone();
     let benched_keys: Vec<String> = session
         .benched_seats
         .iter()
@@ -5925,6 +5982,7 @@ fn dispatch_unit(
             &input,
             agent_review_target.as_deref(),
             &emit,
+            &run_roster_keys,
             &benched_keys,
         );
         let _ = tx.send(Command::ApplyStepResult {
@@ -6364,17 +6422,22 @@ fn finalize_run(
         // the retention window elapses (`completed_worktree_retention`); `0` days restores the
         // reap-at-completion rule.
         match (completed_worktree_retention(), &session.workdir) {
-            (Some(window), Some(wd)) => eprintln!(
-                "wicked-core: run {run_id} completed — keeping its worktree at {wd} for up to \
-                 {} day(s) (until archived; branch {}) (F-7R2-013)",
-                window.as_secs() / (24 * 60 * 60),
-                session
-                    .run_branch
-                    .clone()
-                    .unwrap_or_else(|| crate::repo::worktree_branch(run_id))
-            ),
+            (Some(window), Some(wd)) => {
+                eprintln!(
+                    "wicked-core: run {run_id} completed — keeping its worktree at {wd} for up \
+                     to {} day(s) (until archived; branch {}) (F-7R2-013)",
+                    window.as_secs() / (24 * 60 * 60),
+                    session
+                        .run_branch
+                        .clone()
+                        .unwrap_or_else(|| crate::repo::worktree_branch(run_id))
+                );
+                clean_retained_worktree(&*store, &session);
+            }
             _ => reap_terminal_worktree(&*store, &session),
         }
+        // (review RN-1) …and every OTHER retained tree whose window has elapsed goes now.
+        sweep_expired_retained_worktrees(&*store);
     }
     emit(
         subscribers,
@@ -9916,6 +9979,74 @@ mod terminal_worktree_reap_tests {
             "the startup reap call's argument order changed — live must be the KEEP arg and terminal \
              the REAP arg; a swap compiles and reaps resumable checkouts (FINDING-003)"
         );
+    }
+
+    /// Review of #449, RN-1: the reaper is not boot-only — completing ANY run sweeps every other
+    /// completed, unarchived run whose retention window has elapsed (its clean worktree goes, the
+    /// branch stays), while a run still inside its window is kept.
+    #[test]
+    fn completing_a_run_sweeps_expired_retained_worktrees() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
+        std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // An EXPIRED retained run: completed long ago, never archived.
+        let (root_old, wt_old) = seeded_with_status(
+            &mut store,
+            "sweep-old",
+            "r-sweep-old",
+            SessionStatus::Completed,
+        );
+        let mut old = crate::domain::get_session(&store, "r-sweep-old")
+            .unwrap()
+            .unwrap();
+        old.finished_at = Some(
+            crate::interaction::now_millis()
+                - (DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS as i64 + 1) * 86_400_000,
+        );
+        put_node(&mut store, old.to_node()).unwrap();
+        // A FRESH retained run: completed a minute ago.
+        let (root_fresh, wt_fresh) = seeded_with_status(
+            &mut store,
+            "sweep-fresh",
+            "r-sweep-fresh",
+            SessionStatus::Completed,
+        );
+        let mut fresh = crate::domain::get_session(&store, "r-sweep-fresh")
+            .unwrap()
+            .unwrap();
+        fresh.finished_at = Some(crate::interaction::now_millis() - 60_000);
+        put_node(&mut store, fresh.to_node()).unwrap();
+        // The run that completes NOW.
+        let (root_now, wt_now) = seeded(&mut store, "sweep-now", "r-sweep-now");
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        finalize_run(&mut store, &mut subs, &runner, &tx, "r-sweep-now").unwrap();
+
+        wait_gone(&wt_old);
+        assert!(
+            branch_exists(&root_old, "wicked/r-sweep-old"),
+            "the expired run's branch is the record and survives the sweep"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            wt_fresh.exists() && crate::repo::is_live_worktree(&wt_fresh),
+            "a run inside its window is kept by the sweep"
+        );
+        assert!(
+            wt_now.exists() && crate::repo::is_live_worktree(&wt_now),
+            "the completing run itself is retained"
+        );
+        for root in [&root_old, &root_fresh, &root_now] {
+            let _ = std::fs::remove_dir_all(root);
+        }
+        match saved {
+            Some(v) => std::env::set_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV, v),
+            None => std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV),
+        }
     }
 }
 
