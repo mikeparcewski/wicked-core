@@ -138,6 +138,13 @@ pub struct AgentSession {
     /// Optional operator note recorded at archival ("superseded by fix X", "campaign backlog").
     #[serde(default)]
     pub archive_note: Option<String>,
+    /// (core#431, F-433-001) The worktree tree id the run last VERIFIED: the verify unit's
+    /// guard after-tree once the repository's own checks passed on it, or the tree a deliver
+    /// re-verify certified. The deliver phase compares the worktree's current tree against this
+    /// and re-runs the checks whenever they differ — whatever moved the tree. `None` until a
+    /// checks floor passes. `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_tree: Option<String>,
 }
 
 impl ToNode for AgentSession {
@@ -830,6 +837,7 @@ mod tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
 

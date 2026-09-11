@@ -1255,6 +1255,7 @@ pub(crate) fn run(
                         project_graph: spec.project_graph.clone(),
                         archived_at: None,
                         archive_note: None,
+                        verified_tree: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1286,12 +1287,20 @@ pub(crate) fn run(
                         let tx = self_tx.clone();
                         let rid = run_id.clone();
                         std::thread::spawn(move || {
-                            let cmd = match crate::repo::create_worktree(&root, &rid) {
-                                Ok(wt) => Command::WorktreeReady {
-                                    spec,
-                                    repo_ref: Some(ref_id),
-                                    workdir: Some(wt.to_string_lossy().to_string()),
-                                },
+                            let cmd = match crate::repo::create_worktree_based(&root, &rid) {
+                                Ok((wt, base)) => {
+                                    // core#431 (F-3R2-013): say which base the run starts from
+                                    // — the remote tip after a fetch when the clone was stale.
+                                    // `None` = a live worktree was reused (a resume).
+                                    if let Some(b) = base {
+                                        let _ = tx.send(Command::EmitEvent(b.to_event(&rid)));
+                                    }
+                                    Command::WorktreeReady {
+                                        spec,
+                                        repo_ref: Some(ref_id),
+                                        workdir: Some(wt.to_string_lossy().to_string()),
+                                    }
+                                }
                                 Err(e) => Command::WorktreeFailed {
                                     run_id: rid,
                                     error: e.to_string(),
@@ -1752,7 +1761,7 @@ pub(crate) fn run(
                     &self_tx,
                     output,
                     agent_verdict,
-                    evidence,
+                    *evidence,
                     &path,
                     &lifecycle_maps,
                     &actor_maps,
@@ -4039,7 +4048,7 @@ fn apply_step_result(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
-    agent_verdict: Option<(bool, String)>,
+    agent_verdict: Option<crate::validator::AgentVerdict>,
     evidence: crate::workflow::UnitEvidence,
     _db_path: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
@@ -4834,6 +4843,27 @@ fn apply_step_result(
                 },
             );
             let note = unsuppressed_gate_note(session.human_confirm);
+            // core#431 (F-3R2-010): when the denial is the worktree guard's AND the engine already
+            // restored the creator's tree, say so in the prompt — plain Approve used to read as
+            // "retry" while silently re-baselining on the evaluator's edit; now it means a retry
+            // against the restored, verified tree, and the operator is told that.
+            let guard_restored = unit
+                .denial
+                .as_ref()
+                .is_some_and(|d| d.source == "worktree_guard")
+                && unit.worktree_mutation.as_ref().is_some_and(|m| m.restored);
+            let prompt = if guard_restored {
+                format!(
+                    "Unit {ord} verdict is NOT PASS — the evaluator changed the tree under review; \
+                     its edit was discarded and the creator's verified tree restored. Approve to \
+                     retry the phase against the restored tree, or reject to cancel the run{note}"
+                )
+            } else {
+                format!(
+                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to \
+                     cancel the run{note}"
+                )
+            };
             pause_for_human(
                 store,
                 subscribers,
@@ -4844,7 +4874,7 @@ fn apply_step_result(
                 // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
                 // reviewed unit coincide here.
                 Some(ord),
-                format!("Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run{note}"),
+                prompt,
             )?;
             return Ok(StepApplied::Paused);
         }
@@ -4858,6 +4888,12 @@ fn apply_step_result(
         ));
     }
 
+    // (core#431, F-433-001) A checks floor that PASSED on this unit certified a tree: record it
+    // on the session so the deliver phase can tell whether the tree it is about to ship is
+    // still that one — and re-verify when it is not.
+    if let Some(t) = &evidence.verified_tree {
+        session.verified_tree = Some(t.clone());
+    }
     // Approved → advance the resume cursor past the unit we just applied.
     session.unit_ix = output.unit_ix + 1;
     session.attempt = 0;
@@ -5564,12 +5600,18 @@ fn dispatch_unit(
         let unit_ix2 = unit_ix;
         let attempt = session.attempt;
         let workdir = session.workdir.clone();
+        // core#431 (F-3R2-013): the deliver phase's LIFT context — the run's worktree and the
+        // registered repo it was linked from — resolved HERE (the actor holds the store), applied
+        // off-thread below before the push runs. `None` for every other tool unit.
+        let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
         std::thread::spawn(move || {
             // core#396 (codex round 6): the run-wide EXISTENCE admission runs before the FIRST
             // unit of ANY kind. A tool command spawns no worker, so neither runner would ever
             // judge this run's skill set — the command executed, and could mutate state, before
             // a later agent unit discovered the missing skill. Same ladder, same refusal shape
             // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
+            let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
+            let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
                 Ok(admitted) => {
                     // The generation the RUN was judged against, reported like a handoff
@@ -5589,7 +5631,41 @@ fn dispatch_unit(
                             "tool",
                         )));
                     }
-                    run_tool_cmd(&cmd, workdir.as_deref())
+                    // core#431 (F-3R2-013): the deliver LIFT + RE-VERIFY runs BEFORE the push.
+                    // Unchanged/skipped ⇒ proceed; lifted ⇒ the repository's own checks re-ran
+                    // on the lifted tree and PASSED (the report rides as this unit's evidence);
+                    // conflict or failed re-verify ⇒ the unit FAILS here and the command never
+                    // runs — the deliver gate never pushes a tree that was not verified.
+                    let emit_ev = |ev: CoreEvent| {
+                        let _ = tx.send(crate::command::Command::EmitEvent(ev));
+                    };
+                    let lifted = lift_ctx.as_ref().map(|ctx| {
+                        crate::deliver_lift::lift_and_reverify(
+                            ctx,
+                            &input.run_id,
+                            ord,
+                            attempt,
+                            &emit_ev,
+                        )
+                    });
+                    match lifted {
+                        Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
+                        Some(Ok(clearance)) => {
+                            lift_checks = clearance.checks;
+                            lift_verified_tree = Some(clearance.verified_tree);
+                            // The verified tip rides to the script (Copilot on #433): its own
+                            // fetch + rebase + push can still race a remote that advances in
+                            // the window; with this it can refuse or re-verify a moved base.
+                            let env: Vec<(String, String)> = clearance
+                                .verified_base
+                                .map(|b| {
+                                    vec![(crate::deliver_lift::VERIFIED_BASE_ENV.to_string(), b)]
+                                })
+                                .unwrap_or_default();
+                            run_tool_cmd(&cmd, workdir.as_deref(), &env)
+                        }
+                        None => run_tool_cmd(&cmd, workdir.as_deref(), &[]),
+                    }
                 }
                 Err(e) => {
                     let refused = crate::execute_wrapped::skills_refusal(&input, &e);
@@ -5620,8 +5696,14 @@ fn dispatch_unit(
                     governed: false,
                 },
                 agent_verdict: None,
-                // A Tool unit is the engine's own command: no seat, no guard, no repo checks.
-                evidence: Default::default(),
+                // A Tool unit is the engine's own command: no seat, no guard — and no repo
+                // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
+                // here so the fold persists it on the unit and names the floor on the gate.
+                evidence: Box::new(crate::workflow::UnitEvidence {
+                    worktree_guard: None,
+                    repo_checks: lift_checks,
+                    verified_tree: lift_verified_tree,
+                }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
                 ack: None,
@@ -5684,7 +5766,7 @@ fn dispatch_unit(
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,
-            evidence,
+            evidence: Box::new(evidence),
             process_gen: None, // local-path worker; bus consumer sets these in T7
             launch_seq: 0,
             ack: None,
@@ -5716,8 +5798,13 @@ fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
 
 /// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
 /// `(output, StepStatus)`. Exit 0 → `StepStatus::Ok`; anything else → `StepStatus::Failed`.
-/// Called off the actor thread (blocking subprocess).
-fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workflow::StepStatus) {
+/// Called off the actor thread (blocking subprocess). `extra_env` rides on top of the hardened
+/// environment — the deliver lift's `WICKED_DELIVER_VERIFIED_BASE` (core#431), nothing else today.
+fn run_tool_cmd(
+    cmd: &[String],
+    workdir: Option<&str>,
+    extra_env: &[(String, String)],
+) -> (String, crate::workflow::StepStatus) {
     use std::process::Command;
     let Some(bin) = cmd.first() else {
         return (
@@ -5744,6 +5831,9 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
     };
     let mut proc = Command::new(bin);
     proc.hardened().args(&cmd[1..]);
+    for (k, v) in extra_env {
+        proc.env(k, v);
+    }
     if let Some(wd) = workdir {
         proc.current_dir(wd);
     }
@@ -6763,6 +6853,7 @@ mod gate_pause_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -6926,6 +7017,7 @@ mod terminal_gate_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -7058,6 +7150,7 @@ mod substance_gate_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -7340,6 +7433,7 @@ mod code_evidence_floor_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -7699,6 +7793,7 @@ mod deliverable_floor_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -8101,6 +8196,7 @@ mod seat_failover_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -8736,6 +8832,7 @@ mod def_gate_disclosure_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -8834,6 +8931,7 @@ mod def_gate_disclosure_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -9086,6 +9184,7 @@ mod terminal_worktree_reap_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -9516,6 +9615,7 @@ mod terminal_worktree_reap_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -9611,6 +9711,7 @@ mod worker_code_graph_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
 
@@ -9925,6 +10026,7 @@ mod project_graph_binding_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         }
     }
 
@@ -10659,6 +10761,7 @@ mod phase_boundary_governance_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -11056,6 +11159,7 @@ mod turn_timeout_vs_cancel_tests {
             project_graph: None,
             archived_at: None,
             archive_note: None,
+            verified_tree: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");

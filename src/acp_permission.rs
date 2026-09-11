@@ -53,6 +53,147 @@ pub(crate) struct AcpGate<'a> {
 const ALLOW_KINDS: [&str; 2] = ["allow_once", "allow_always"];
 const REJECT_KINDS: [&str; 2] = ["reject_once", "reject_always"];
 
+/// The canonical tool name of a `session/request_permission` — see [`pretool_payload`] for the
+/// fallback chain and why `toolCall.title` is the last resort.
+fn tool_name(params: &Value) -> Option<String> {
+    params
+        .get("toolName")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            params
+                .pointer("/toolCall/name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            params
+                .pointer("/toolCall/title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+}
+
+/// A tool call that would WRITE — refused for an `executes_code: false` phase (core#431,
+/// F-3R2-009). `kind` is the ACP `toolCall.kind` when the agent sent one; `path` the target the
+/// call's arguments named, when any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteClassCall {
+    pub tool: String,
+    pub kind: Option<String>,
+    pub path: Option<String>,
+}
+
+/// ACP `ToolKind`s that change the tree. `execute` (bash) is deliberately NOT here: the phase
+/// must run tests — this is a posture, not a guarantee, exactly like the wrapped carrier's
+/// `--exclude-tools edit,write`; the worktree guard holds the rest.
+const WRITE_KINDS: [&str; 3] = ["edit", "delete", "move"];
+
+/// Tool NAMES that write, case-folded — the built-ins of the seats the engine convenes (claude's
+/// `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, pi's `edit`/`write`, codex's `apply_patch`, the
+/// `str_replace_*` family, opencode/copilot file tools) and the generic delete/move spellings.
+/// A name match denies even when the agent sent no `kind`.
+const WRITE_TOOL_NAMES: [&str; 22] = [
+    "write",
+    "edit",
+    "multiedit",
+    "notebookedit",
+    "write_file",
+    "edit_file",
+    "create_file",
+    "apply_patch",
+    "str_replace_editor",
+    "str_replace_based_edit_tool",
+    "delete",
+    "delete_file",
+    "remove_file",
+    "move",
+    "move_file",
+    "rename",
+    "rename_file",
+    "mkdir",
+    "create_directory",
+    "patch",
+    "writefile",
+    "editfile",
+];
+
+/// Tool-name PREFIXES that write (Copilot on #433): the `str_replace_*` family has more members
+/// than the two exact spellings above (`str_replace_file`, `str_replace_edit`, …), and bridges
+/// that surface file tools as `write_to_file` / `edit_notebook` / `delete_path` / `move_path` /
+/// `rename_symbol_file` follow the same verb-first convention. A prefix match denies even when
+/// the agent sent `kind: "other"`.
+const WRITE_TOOL_PREFIXES: [&str; 9] = [
+    "str_replace",
+    "write_",
+    "edit_",
+    "delete_",
+    "remove_",
+    "move_",
+    "rename_",
+    "create_file",
+    "apply_patch",
+];
+
+/// Is `tool` (case-folded) a write tool by name — an exact member of [`WRITE_TOOL_NAMES`] or a
+/// [`WRITE_TOOL_PREFIXES`] match?
+fn is_write_tool_name(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    WRITE_TOOL_NAMES.contains(&lower.as_str())
+        || WRITE_TOOL_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// Classify a permission request as a WRITE-class call, or `None` when it reads/searches/
+/// executes/thinks. Matches by ACP `kind` first (the protocol's vocabulary), then by tool name
+/// (a bridge that omits `kind`, or sends `other`, still names the tool).
+pub(crate) fn write_class_call(params: &Value) -> Option<WriteClassCall> {
+    let kind = params
+        .pointer("/toolCall/kind")
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+        .map(|k| k.to_ascii_lowercase());
+    let by_kind = kind.as_deref().is_some_and(|k| WRITE_KINDS.contains(&k));
+    // A request that carries a write-class `kind` and NO tool name is still a write (Copilot on
+    // #433): the kind is the protocol's own classification, and a nameless request must not
+    // fall through to the allow path on a read-only unit.
+    let tool = match tool_name(params) {
+        Some(t) => t,
+        None if by_kind => "(unnamed)".to_string(),
+        None => return None,
+    };
+    let by_name = is_write_tool_name(&tool);
+    if !(by_kind || by_name) {
+        return None;
+    }
+    let input = params.pointer("/toolCall/rawInput");
+    let path = input.and_then(|i| {
+        [
+            "path",
+            "file_path",
+            "filePath",
+            "filename",
+            "file",
+            "target_file",
+            "notebook_path",
+            "destination",
+        ]
+        .into_iter()
+        .find_map(|k| i.get(k).and_then(Value::as_str))
+        .filter(|p| !p.trim().is_empty())
+        .map(str::to_string)
+    });
+    Some(WriteClassCall { tool, kind, path })
+}
+
+/// The answer that REFUSES a call: the agent's reject option, else cancelled (never an allow).
+pub(crate) fn reject_result(params: &Value) -> Value {
+    match choose_option(params.get("options").unwrap_or(&Value::Null), false) {
+        Some(option_id) => json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+        None => cancelled("no reject option offered"),
+    }
+}
+
 /// Rewrite an ACP `session/request_permission` params object into the Claude `PreToolUse` shape.
 ///
 /// Deliberately a translation rather than a second parser: the resulting value goes through
@@ -76,23 +217,7 @@ pub(crate) fn pretool_payload(params: &Value) -> Option<(String, Value)> {
     // to answer `cancelled` (deny) with no governance record, silently blocking legitimate calls.
     // Empty strings at any step must not short-circuit the fallback — an explicit `"toolName": ""`
     // is semantically absent and must fall through to `toolCall.name` / `toolCall.title`.
-    let tool = params
-        .get("toolName")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            params
-                .pointer("/toolCall/name")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            params
-                .pointer("/toolCall/title")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        })?
-        .to_string();
+    let tool = tool_name(params)?;
     let input = params
         .pointer("/toolCall/rawInput")
         .cloned()
@@ -641,6 +766,102 @@ mod tests {
             crate::gate_hook::claude_pretool_context(&payload.to_string(), "unit", "build");
         assert_eq!(name, "Bash");
         assert_eq!(context["command"], "rm -rf /");
+    }
+
+    /// core#431 (F-3R2-009): the read-only posture on the ACP carrier. pi's built-in `edit` /
+    /// `write` (lower-case, never in the hook's `WRITE_TOOLS`) are write-class by NAME; an unknown
+    /// tool is write-class by ACP `kind`; reads, searches and `bash` are not — the phase must be
+    /// able to run the suite.
+    #[test]
+    fn write_class_calls_are_recognised_by_kind_and_by_name() {
+        let call = |name: &str, kind: Option<&str>, input: Value| {
+            let mut tc = json!({"toolCallId": "t1", "name": name, "rawInput": input});
+            if let Some(k) = kind {
+                tc["kind"] = json!(k);
+            }
+            json!({"sessionId": "s1", "toolCall": tc})
+        };
+        // pi: by name, no kind sent.
+        let w = write_class_call(&call("edit", None, json!({"path": "src/App.tsx"})))
+            .expect("pi's edit is a write");
+        assert_eq!(w.tool, "edit");
+        assert_eq!(w.kind, None);
+        assert_eq!(w.path.as_deref(), Some("src/App.tsx"));
+        assert!(write_class_call(&call("write", None, json!({}))).is_some());
+        // claude-sdk bridge spellings, case-folded.
+        assert!(
+            write_class_call(&call("Write", Some("edit"), json!({"file_path": "x"}))).is_some()
+        );
+        assert!(write_class_call(&call("NotebookEdit", None, json!({}))).is_some());
+        // An unknown tool the agent labels as an edit/delete/move: by kind.
+        let w = write_class_call(&call("frobnicate", Some("delete"), json!({"file": "a.ts"})))
+            .expect("kind delete is a write");
+        assert_eq!(w.kind.as_deref(), Some("delete"));
+        assert_eq!(w.path.as_deref(), Some("a.ts"));
+        assert!(write_class_call(&call("frobnicate", Some("MOVE"), json!({}))).is_some());
+        // Copilot on #433: the `str_replace_*` FAMILY and verb-first file tools, by prefix, even
+        // when the bridge labels the call `other`.
+        for name in [
+            "str_replace_file",
+            "Str_Replace_Edit",
+            "write_to_file",
+            "edit_notebook",
+            "delete_path",
+            "move_path",
+            "rename_symbol_file",
+            "create_file_v2",
+            "apply_patch_v4",
+        ] {
+            assert!(
+                write_class_call(&call(name, Some("other"), json!({}))).is_some(),
+                "{name} is a write tool by prefix"
+            );
+        }
+        // …but a read-ish tool that merely CONTAINS a verb is not (prefix, not substring).
+        assert!(
+            write_class_call(&call("read_write_lock_status", Some("other"), json!({}))).is_none()
+        );
+        assert!(write_class_call(&call("preview_edit_diff", Some("read"), json!({}))).is_none());
+        // Reads, searches, thinking and bash stay allowed (posture, not guarantee).
+        assert!(write_class_call(&call("read", Some("read"), json!({"path": "a"}))).is_none());
+        assert!(write_class_call(&call("Read", None, json!({}))).is_none());
+        assert!(write_class_call(&call("grep", Some("search"), json!({}))).is_none());
+        assert!(write_class_call(&call(
+            "bash",
+            Some("execute"),
+            json!({"command": "npm test"})
+        ))
+        .is_none());
+        assert!(write_class_call(&call("frobnicate", Some("other"), json!({}))).is_none());
+        // No tool name and no kind ⇒ not classifiable (the caller's fail-closed rules apply)…
+        assert!(write_class_call(&json!({"sessionId": "s1"})).is_none());
+        // …but a write-class KIND with no name is still a write (Copilot on #433).
+        let nameless = write_class_call(&json!({
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "t9", "kind": "edit", "rawInput": {"path": "src/x.ts"}},
+        }))
+        .expect("kind-only edit is a write");
+        assert_eq!(nameless.tool, "(unnamed)");
+        assert_eq!(nameless.kind.as_deref(), Some("edit"));
+        assert_eq!(nameless.path.as_deref(), Some("src/x.ts"));
+        assert!(write_class_call(&json!({
+            "sessionId": "s1", "toolCall": {"toolCallId": "t9", "kind": "read"},
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn reject_result_picks_the_reject_option_and_never_an_allow() {
+        let params = json!({"options": opts()});
+        let r = reject_result(&params);
+        assert_eq!(r["outcome"]["outcome"], "selected");
+        assert_eq!(r["outcome"]["optionId"], "reject");
+        // No reject option offered ⇒ cancelled, never the allow that happens to exist.
+        let only_allow = json!({"options": [{"optionId": "allow", "kind": "allow_once"}]});
+        assert_eq!(
+            reject_result(&only_allow)["outcome"]["outcome"],
+            "cancelled"
+        );
     }
 
     #[test]

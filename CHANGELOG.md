@@ -818,6 +818,67 @@ Two release tracks share this file, newest entry first regardless of track:
   (`enforceable_rule`); a bare `Write` (whole tool) is left as stated. Tests pin both generators,
   the argv carrier and the settings-file carrier free of `Write(<path>)`; the live-CLI check is
   documented on `enforceable_rule`.
+- **Deliver lifts onto the current base and re-verifies after a lift; the creator's tree is
+  restored on an evaluator mutation; the judge is named; ACP evaluators are read-only (#431;
+  F-3R2-013 / F-3R2-010 / F-3R2-007 / F-3R2-009).** Four gaps the Phase 3 acceptance re-run
+  found on one governed `bug` run. (1) The run branched from the registered clone's `HEAD`, five
+  commits behind `origin/main`; the deliver script's rebase then conflicted on a generated file
+  (`LIFT-CONFLICT`), the operator resolved it by hand, and the tree that was pushed was not the
+  tree the repo-checks floor had verified. Now `create_worktree` fetches `origin` and bases a new
+  run worktree on the remote default branch's tip when the clone is strictly behind it
+  (`runBaseResolved {baseRef, baseCommit, localHead, behind, fetched, lifted, note}`; a clone that
+  is ahead of/diverged from the remote keeps its `HEAD`, disclosed), and before the `deliver` tool
+  phase runs the engine LIFTS uncommitted work on a stale base onto the remote tip in memory
+  (`git merge-tree --write-tree`, git ≥ 2.38) — `deliverLiftEvaluated {outcome: unchanged |
+  lifted | conflict | skipped | failed, baseRef, baseBefore, baseAfter, treeBefore, treeAfter,
+  conflicts, note}`. A conflict fails the deliver unit with a `LIFT-CONFLICT` remedy naming the
+  files and leaves the worktree exactly as verified; a lift RE-RUNS the repository's own checks on
+  the lifted tree (`repoChecksEvaluated` for the deliver unit) and the push runs only when they
+  pass; an apply-phase failure (`failed`) fails the unit closed rather than letting the script run
+  on a partial tree — the deliver gate never pushes a tree that was not verified. A branch
+  carrying its own commits is skipped (the deliver rebase replays that history, as before). THE
+  RULE that makes the sentence true on every path (independent review F-433-001): the session
+  records the VERIFIED TREE (`AgentSession::verified_tree` — the verify unit's guard after-tree
+  once its checks passed, or a deliver re-verify's post-check tree, via `UnitEvidence::
+  verified_tree`), and at deliver the worktree is snapshotted and the repository's checks run
+  whenever its tree ≠ that record — `unchanged` and `skipped` included — so a retry after a
+  failed re-verify, an operator's by-hand rebase, or a run with no verify phase is re-checked,
+  never waved through; a lift that moved a lockfile forces a frozen `--ignore-scripts` install
+  ahead of the checks and names the drift (F-433-003); the checks' own writes are caught by a
+  post-check snapshot (F-433-002). Both `git fetch origin` calls are non-interactive
+  (`core.askPass=`, `GIT_TERMINAL_PROMPT=0`, `ssh -oBatchMode=yes`) and killed at 120 s
+  (F-433-004); a failed fetch skips the deliver lift rather than trusting cached refs. (2) On
+  `evaluatorMutatedWorktree` the only choices were Approve — which re-baselined on the CURRENT
+  tree, silently adopting the evaluator's edit — or cancel, and the engine's remedy was a shell
+  command. The worker thread now restores the creator's tree itself (`HEAD` reset when moved,
+  `read-tree --reset -u <beforeTree>`, added paths deleted, re-snapshot proven equal):
+  `evaluatorMutatedWorktree` carries `restored` + `restoreError`, a `worktreeRestored {tree,
+  head, discarded, suggestionRef}` event follows — the discarded edit is PINNED first under
+  `refs/wicked/suggestions/<run>/<ord>/<attempt>` so it is never gc-pruned and the #432
+  suggestion lane can read it (F-433-008) — the gate's `denialReason` says the edit was
+  discarded, and the
+  `awaitingHuman` prompt says Approve retries against the restored tree. (3) `gateEvaluated`
+  names the layer-2 judge: `judgeCli` (the seat key) and `judgeDistinct` (identity-distinct
+  rotation pick vs. the single-runner fallback; both `null` when no judge ran or on the bus path)
+  — evaluator ≠ creator is auditable from `/runs/:id/events`. `AgentVerdict` gained
+  `judge_cli`/`judge_distinct`. (4) On the ACP carrier the read-only posture applied only to the
+  wrapped argv path (`--exclude-tools edit,write`); a pi evaluator not admitted to input
+  governance was answered `allow_result` and rewrote the fix under review. Every
+  `executes_code: false` unit's ACP turn now refuses write-class `session/request_permission`
+  calls (edit/delete/move by ACP `kind`, or a write tool by name or verb-first prefix — pi's
+  lower-case `edit`/`write` and the `str_replace_*` family included) with the agent's reject
+  option, disclosed as `evaluatorToolCallDenied {cli, carrier: "acp", tool, kind, path,
+  reason}`; and because an UNADMITTED adapter never asks (pi-acp executes with zero permission
+  round-trips, codex-acp auto-resolves edits), a guarded unit on such a seat is routed to the
+  wrapped carrier — where the read-only lever is an argv fact — with `acpFallback
+  {fallbackKind: "read_only_requires_wrapped"}`; a lever-less seat there (agy, copilot) is
+  GUARD-ONLY: the read-only instruction rides its prompt and the daemon line says so
+  (F-433-009). `bash` stays (posture, not guarantee — the
+  worktree guard remains the backstop, and its restore now runs for every exit status, re-attaches
+  a switched/detached `HEAD` via the recorded `WorktreeSnapshot.head_ref`, and reports an unborn
+  baseline honestly). The deliver command receives `WICKED_DELIVER_VERIFIED_BASE` (the verified
+  remote-tip commit) so crew's script can refuse a base that moved after the re-verify. core-ts
+  `index.d.ts` documents the new frames; the key sets are pinned by the binding's own tests.
 - **Repo graphs live under the daemon state home; an in-tree `.codegraph/` is never adopted
   (#406; F-016 / F-024).** `registerRepo`/onboarding minted every repo's code graph under the
   OPERATOR's `~/.wicked-estate/repo-graphs/<key>` whatever `--db` said — two daemons on one host

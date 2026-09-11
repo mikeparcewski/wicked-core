@@ -256,6 +256,12 @@ pub struct UnitEvidence {
     pub worktree_guard: Option<crate::worktree_guard::WorktreeGuardOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_checks: Option<crate::repo_checks::RepoChecksReport>,
+    /// (core#431, F-433-001) The tree id the repository's own checks CERTIFIED for this unit —
+    /// the guard's after-snapshot when the checks passed on a clean evaluator, or the deliver
+    /// re-verify's post-check tree. The fold persists it as `AgentSession::verified_tree` when
+    /// the unit is approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_tree: Option<String>,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`

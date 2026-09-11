@@ -432,7 +432,16 @@ fn s(v: &[&str]) -> Vec<String> {
 
 /// Detect the repository's own checks in `worktree`. Pure over the filesystem — runs nothing.
 /// `Err` when a manifest exists but cannot be trusted (unreadable, malformed, a symlink).
-pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
+#[cfg(test)]
+pub(crate) fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
+    detect_opts(worktree, false)
+}
+
+/// [`detect`], optionally FORCING the dependency install step even when `node_modules/` is
+/// present (F-433-003): after a lift moved a lockfile, the installed modules are stale and the
+/// checks would fail for the wrong reason. Always frozen and `--ignore-scripts`, as the
+/// absent-`node_modules` install is.
+pub(crate) fn detect_opts(worktree: &Path, force_install: bool) -> Result<Vec<RepoCheck>, String> {
     let mut out = Vec::new();
     if let Some(probed) = probe(worktree, "package.json")? {
         let is_file = probed.is_file();
@@ -457,20 +466,25 @@ pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
             .collect();
         if !wanted.is_empty() {
             let node_modules = probe(worktree, "node_modules")?;
-            if node_modules.is_none() {
+            if node_modules.is_none() || force_install {
+                let why = if node_modules.is_none() {
+                    "node_modules absent"
+                } else {
+                    "forced: lockfile drift"
+                };
                 let has_lock = probe(worktree, "package-lock.json")?.is_some();
                 let (argv, source) = match pm {
                     "pnpm" => (
                         s(&["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]),
-                        "pnpm-lock.yaml (node_modules absent)",
+                        format!("pnpm-lock.yaml ({why})"),
                     ),
                     "yarn" => (
                         s(&["yarn", "install", "--frozen-lockfile", "--ignore-scripts"]),
-                        "yarn.lock (node_modules absent)",
+                        format!("yarn.lock ({why})"),
                     ),
                     _ if has_lock => (
                         s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
-                        "package-lock.json (node_modules absent)",
+                        format!("package-lock.json ({why})"),
                     ),
                     // No lockfile: `--no-package-lock`, or npm would write one into the reviewed
                     // tree and the worktree guard's final comparison would (correctly) deny it
@@ -484,13 +498,13 @@ pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
                             "--no-audit",
                             "--no-fund",
                         ]),
-                        "package.json (node_modules absent, no lockfile)",
+                        format!("package.json ({why}, no lockfile)"),
                     ),
                 };
                 out.push(RepoCheck {
                     name: "install".into(),
                     argv,
-                    source: source.into(),
+                    source,
                 });
             }
             for k in wanted {
@@ -696,13 +710,28 @@ impl CheckScratch {
 /// Detect and run the checks in `worktree`, stopping at the first failure. Fail-closed on a
 /// detection error and when no OS write boundary can be armed (see the module doc).
 pub fn run(worktree: &Path) -> RepoChecksReport {
+    run_forcing_install(worktree, false)
+}
+
+/// [`run`] with the install step FORCED (F-433-003) — the deliver re-verify after a lift that
+/// moved a lockfile.
+pub(crate) fn run_forcing_install(worktree: &Path, force_install: bool) -> RepoChecksReport {
     let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
-    run_with_sandbox(worktree, sandbox)
+    run_with_sandbox_opts(worktree, sandbox, force_install)
 }
 
 /// [`run`] against an explicit sandbox probe — the injectable seam, so the fail-closed branch is
 /// testable on a host that HAS a sandbox tool by handing it a best-effort probe.
+#[cfg(test)]
 pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoChecksReport {
+    run_with_sandbox_opts(worktree, sandbox, false)
+}
+
+fn run_with_sandbox_opts(
+    worktree: &Path,
+    sandbox: WorkerSandbox,
+    force_install: bool,
+) -> RepoChecksReport {
     let sandbox_level = sandbox.level.as_wire().to_string();
     let sandbox_note = sandbox.downgrade_reason.clone();
     if sandbox.level != crate::validator::SandboxLevel::Sandboxed || sandbox.wrapper.is_empty() {
@@ -710,7 +739,7 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
         // with the probe's own reason, and the gate turns that into a denial the operator can act
         // on. Detection is still reported so the record says what WOULD have run — and a
         // detection FAILURE is reported as such, never as "no checks" (Copilot on #414).
-        let (detected, detect_error) = match detect(worktree) {
+        let (detected, detect_error) = match detect_opts(worktree, force_install) {
             Ok(d) => (d, None),
             Err(e) => (Vec::new(), Some(e)),
         };
@@ -729,7 +758,7 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
             engine_writes_removed: Vec::new(),
         };
     }
-    let detected = match detect(worktree) {
+    let detected = match detect_opts(worktree, force_install) {
         Ok(d) => d,
         Err(e) => {
             return RepoChecksReport {
@@ -1021,8 +1050,22 @@ mod tests {
                 "--no-fund"
             ])
         );
-        // node_modules present ⇒ no install step.
+        // node_modules present ⇒ no install step — unless FORCED (F-433-003: a lift moved the
+        // lockfile, the installed modules are stale), which re-installs frozen + scripts-off.
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
+        let forced = detect_opts(&wt, true).unwrap();
+        assert_eq!(forced[0].name, "install", "{forced:?}");
+        assert_eq!(
+            forced[0].argv,
+            vec!["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+        );
+        assert!(
+            forced[0].source.contains("forced: lockfile drift"),
+            "{}",
+            forced[0].source
+        );
+        std::fs::remove_file(wt.join("package-lock.json")).unwrap();
         assert_eq!(
             detect(&wt)
                 .unwrap()

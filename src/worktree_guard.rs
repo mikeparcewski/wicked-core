@@ -101,6 +101,12 @@ use wicked_apps_core::spawn::HardenedCommand;
 pub struct WorktreeSnapshot {
     /// `HEAD`'s commit id; empty on an unborn branch.
     pub head: String,
+    /// The ref `HEAD` is attached to (`refs/heads/wicked/<run>`), or `None` when detached — or
+    /// when the snapshot predates this field (core#431; Copilot on #433). A guarded phase that
+    /// `git switch`es the worktree to another branch at the SAME commit moves nothing the commit
+    /// id can see; this is what catches it, and what the restore reattaches `HEAD` to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<String>,
     /// The tree object id over tracked + untracked-not-ignored content.
     pub tree: String,
     /// Wall-clock millis when taken (informational).
@@ -130,6 +136,21 @@ pub struct WorktreeMutation {
     pub changed: Vec<ChangedPath>,
     /// `HEAD` moved between the snapshots — the unit committed, amended or reset the run branch.
     pub head_moved: bool,
+    /// (core#431, F-3R2-010) The engine put the creator's tree BACK after detecting this mutation
+    /// — `HEAD` reset to `before.head` when it had moved, index + working tree reset to
+    /// `before.tree`, every ADDED path deleted, and a fresh snapshot equal to `before.tree` to
+    /// prove it. `false` when the restore was not attempted or failed (`restore_error`); the
+    /// operator-facing denial then keeps the manual remedy. `#[serde(default)]`: a mutation
+    /// recorded by a pre-restore engine reads as not restored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
+    /// (F-433-008) The ref the DISCARDED tree was pinned under before the restore
+    /// (`refs/wicked/suggestions/<run>/<ord>/<attempt>`, a commit whose tree is `after.tree`),
+    /// so an evaluator's found fix is never gc-pruned and the #432 suggestion lane can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion_ref: Option<String>,
 }
 
 impl WorktreeMutation {
@@ -170,7 +191,7 @@ fn now_ms() -> u64 {
 }
 
 /// Run `git <args>` in `cwd`; `Ok(stdout)` on exit 0, `Err` naming the failure otherwise.
-fn git(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn git(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<Vec<u8>> {
     // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
     let mut cmd = Command::new("git");
     cmd.hardened().args(args).current_dir(cwd);
@@ -192,7 +213,11 @@ fn git(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<Vec<u
     Ok(out.stdout)
 }
 
-fn git_string(cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> anyhow::Result<String> {
+pub(crate) fn git_string(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&git(cwd, args, env)?)
         .trim()
         .to_string())
@@ -307,7 +332,10 @@ fn plain_path(p: PathBuf) -> PathBuf {
 ///   rewrite used to snapshot as Clean).
 ///
 /// The full re-hash is the price, paid on purpose.
-fn snapshot_through(worktree: &Path, git_dir: &Path) -> anyhow::Result<WorktreeSnapshot> {
+pub(crate) fn snapshot_through(
+    worktree: &Path,
+    git_dir: &Path,
+) -> anyhow::Result<WorktreeSnapshot> {
     let pinned: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     let head = git_string(
         worktree,
@@ -315,6 +343,10 @@ fn snapshot_through(worktree: &Path, git_dir: &Path) -> anyhow::Result<WorktreeS
         &pinned,
     )
     .unwrap_or_default();
+    // The symbolic ref, when attached (`symbolic-ref -q` exits 1 on a detached HEAD).
+    let head_ref = git_string(worktree, &["symbolic-ref", "-q", "HEAD"], &pinned)
+        .ok()
+        .filter(|r| !r.is_empty());
     let tmp_index = scratch_index_path();
     // A stale scratch file from a crashed run would seed the index — refuse to start from one.
     let _ = std::fs::remove_file(&tmp_index);
@@ -351,6 +383,7 @@ fn snapshot_through(worktree: &Path, git_dir: &Path) -> anyhow::Result<WorktreeS
     let tree = result?;
     Ok(WorktreeSnapshot {
         head,
+        head_ref,
         tree,
         taken_at_ms: now_ms(),
         git_dir: Some(git_dir.to_string_lossy().into_owned()),
@@ -407,7 +440,11 @@ fn compare_with_after(
     };
     let git_dir = Path::new(git_dir);
     let after = snapshot_through(worktree, git_dir)?;
-    let head_moved = after.head != before.head;
+    // A moved commit id, OR a re-attached/detached `HEAD` at the same commit (`git switch -c
+    // other`, `git checkout --detach`): the run branch is no longer what the worktree is on.
+    // Only judged when the baseline recorded a ref (a pre-field baseline compares by commit).
+    let ref_moved = before.head_ref.is_some() && after.head_ref != before.head_ref;
+    let head_moved = after.head != before.head || ref_moved;
     if after.tree == before.tree && !head_moved {
         return Ok((after, None));
     }
@@ -435,8 +472,200 @@ fn compare_with_after(
             after,
             changed,
             head_moved,
+            restored: false,
+            restore_error: None,
+            suggestion_ref: None,
         }),
     ))
+}
+
+/// Put the CREATOR's tree back after an `executes_code: false` phase changed it (core#431,
+/// F-3R2-010) — the engine's own execution of the remedy its denial used to print for the
+/// operator to run by hand (`git read-tree --reset -u <before.tree>`).
+///
+/// Through the SAME pinned git dir the baseline was taken through (`before.git_dir`), never the
+/// worktree's own `.git` file (adversarial review on #414). Steps, in order:
+///
+/// 1. `HEAD` moved (the phase committed/amended/reset the run branch) ⇒ `git reset --soft
+///    <before.head>` — the branch pointer goes back; the phase's commit is left dangling.
+/// 2. `git read-tree --reset -u <before.tree>` against the REAL index: index and working tree
+///    now match the baseline. The creator's previously-untracked files become staged (`A`) —
+///    the deliver script's `git add -u` + commit handles a staged tree exactly like a dirty one.
+/// 3. Every path the phase ADDED is deleted by name: `read-tree -u` removes only paths the
+///    index knew, and an evaluator-created file was never in it. Regular files and symlinks
+///    only (`symlink_metadata`, never followed); a path that escapes the worktree is refused.
+/// 4. A fresh snapshot must equal `before.tree` — otherwise the restore FAILED and the caller
+///    keeps the manual remedy. The proof is the same instrument that found the mutation.
+///
+/// Sets `restored` / `restore_error` on `m` and returns the same verdict as a `Result`. Never
+/// panics on git failure; a failed restore leaves whatever state git reached and says so.
+///
+/// `suggestion_ref` (F-433-008): when given, the DISCARDED tree is pinned first — a commit
+/// carrying `after.tree` (parent: the phase's HEAD) is written and the ref points at it — so
+/// the evaluator's edit survives `git gc` and the #432 suggestion lane can diff it against the
+/// creator's tree. A failed pin is logged and never blocks the restore: losing the suggestion is
+/// bad, shipping the evaluator's edit is the finding.
+pub(crate) fn restore_creator_tree(
+    worktree: &Path,
+    m: &mut WorktreeMutation,
+    suggestion_ref: Option<&str>,
+) -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<()> {
+        let Some(git_dir) = m.before.git_dir.as_deref() else {
+            anyhow::bail!(
+                "the baseline carries no pinned git dir — cannot restore through a directory the \
+                 evaluator could have redirected"
+            );
+        };
+        let git_dir = Path::new(git_dir);
+        let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+        if let Some(r) = suggestion_ref {
+            let identity = Path::new("wicked-core");
+            let pin_env: [(&str, &Path); 6] = [
+                ("GIT_DIR", git_dir),
+                ("GIT_WORK_TREE", worktree),
+                ("GIT_AUTHOR_NAME", identity),
+                ("GIT_AUTHOR_EMAIL", identity),
+                ("GIT_COMMITTER_NAME", identity),
+                ("GIT_COMMITTER_EMAIL", identity),
+            ];
+            let parent = if m.after.head.is_empty() {
+                m.before.head.clone()
+            } else {
+                m.after.head.clone()
+            };
+            let mut args = vec![
+                "commit-tree",
+                m.after.tree.as_str(),
+                "-m",
+                "wicked-core: evaluator suggestion (discarded by the worktree guard, F-036)",
+            ];
+            if !parent.is_empty() {
+                args.extend(["-p", parent.as_str()]);
+            }
+            match git_string(worktree, &args, &pin_env)
+                .and_then(|commit| git(worktree, &["update-ref", r, &commit], &env))
+            {
+                Ok(_) => m.suggestion_ref = Some(r.to_string()),
+                Err(e) => eprintln!(
+                    "wicked-core: could not pin the evaluator's discarded tree under {r}: {e} — \
+                     the restore proceeds; the suggestion may be gc-pruned (F-433-008)"
+                ),
+            }
+        }
+        if m.head_moved {
+            // An unborn baseline (`head` empty) cannot be "reset to" — there is no commit to
+            // point at; say so instead of marking a still-moved HEAD restored (Copilot on #433).
+            // Run worktrees are always minted from a commit, so this is the generic guard.
+            if m.before.head.is_empty() {
+                anyhow::bail!(
+                    "HEAD moved off an unborn baseline branch — the engine cannot restore an \
+                     unborn HEAD; reset the run branch by hand"
+                );
+            }
+            // Re-attach HEAD to the run branch first when the phase switched or detached it
+            // (Copilot on #433): `reset --soft` moves whatever HEAD points at, and moving some
+            // OTHER branch would leave the worktree on the wrong ref with the right commit. A
+            // baseline from a pre-`head_ref` engine cannot say which ref that is — refuse
+            // rather than move whatever branch happens to be checked out (Copilot, second pass).
+            let Some(base_ref) = m.before.head_ref.as_deref() else {
+                anyhow::bail!(
+                    "HEAD moved and the baseline predates the run-branch record (no head_ref) — \
+                     the engine will not reset a branch it cannot name; restore by hand"
+                );
+            };
+            git(worktree, &["symbolic-ref", "HEAD", base_ref], &env)?;
+            git(worktree, &["reset", "--soft", &m.before.head], &env)?;
+        }
+        git(
+            worktree,
+            &["read-tree", "--reset", "-u", &m.before.tree],
+            &env,
+        )?;
+        for added in m.changed.iter().filter(|c| c.status == "A") {
+            let rel = Path::new(&added.path);
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                anyhow::bail!(
+                    "refusing to delete `{}`: not a plain worktree-relative path",
+                    added.path
+                );
+            }
+            // No-follow walk of every parent component (Copilot on #433, fourth pass): a
+            // symlinked directory between the worktree root and the leaf would make
+            // `remove_file` delete a same-named file OUTSIDE the worktree. Refuse — the restore
+            // fails closed — rather than follow. (The evaluator's process group is quiesced
+            // before the restore, so the swap needs a process the engine already killed; this is
+            // the belt to that brace.)
+            let mut ancestor = worktree.to_path_buf();
+            for comp in rel.parent().into_iter().flat_map(|d| d.components()) {
+                ancestor.push(comp);
+                if let Ok(meta) = std::fs::symlink_metadata(&ancestor) {
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "refusing to delete `{}`: its parent `{}` is a symlink (would follow \
+                             out of the worktree)",
+                            added.path,
+                            ancestor.display()
+                        );
+                    }
+                }
+            }
+            let p = worktree.join(rel);
+            match std::fs::symlink_metadata(&p) {
+                Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
+                    std::fs::remove_file(&p).map_err(|e| {
+                        anyhow::anyhow!("could not delete added path `{}`: {e}", added.path)
+                    })?;
+                }
+                Ok(_) => anyhow::bail!(
+                    "added path `{}` is not a regular file — left in place",
+                    added.path
+                ),
+                Err(_) => {} // already gone
+            }
+        }
+        let now = snapshot_through(worktree, git_dir)?;
+        if now.tree != m.before.tree {
+            anyhow::bail!(
+                "after the restore the tree is {} but the creator's baseline is {} — the worktree \
+                 is NOT the verified tree",
+                short(&now.tree),
+                short(&m.before.tree)
+            );
+        }
+        if m.head_moved {
+            if now.head != m.before.head {
+                anyhow::bail!(
+                    "after the restore HEAD is {} but the baseline HEAD is {}",
+                    short(&now.head),
+                    short(&m.before.head)
+                );
+            }
+            if m.before.head_ref.is_some() && now.head_ref != m.before.head_ref {
+                anyhow::bail!(
+                    "after the restore HEAD is attached to {:?} but the baseline was {:?}",
+                    now.head_ref,
+                    m.before.head_ref
+                );
+            }
+        }
+        Ok(())
+    })();
+    match &result {
+        Ok(()) => {
+            m.restored = true;
+            m.restore_error = None;
+        }
+        Err(e) => {
+            m.restored = false;
+            m.restore_error = Some(e.to_string());
+        }
+    }
+    result
 }
 
 /// Run the guard for one finished unit: the worker-thread half. `None` when the unit is not
@@ -506,13 +735,33 @@ pub(crate) fn denial_reason(unit: &crate::domain::WorkUnit, m: &WorktreeMutation
     }
     s.push_str(&format!(
         " (tree {} → {}). The change under review is no longer the creator's, so this phase's \
-         verdict cannot certify it. Restore the creator's tree in the worktree with `git read-tree \
-         --reset -u {}`, or reject the run; a phase that must change code declares \
-         `executes_code: true` in the workflow def.",
+         verdict cannot certify it.",
         short(&m.before.tree),
         short(&m.after.tree),
-        m.before.tree
     ));
+    if m.restored {
+        // core#431 (F-3R2-010): the engine already ran the remedy — say so, and say what a
+        // human's Approve now means (a retry against the verified tree, NOT adoption of the
+        // evaluator's edit).
+        s.push_str(&format!(
+            " The evaluator's edit was DISCARDED: the engine restored the creator's tree ({}) in \
+             the worktree, so approving this gate retries the phase against the verified tree. \
+             A phase that must change code declares `executes_code: true` in the workflow def.",
+            short(&m.before.tree)
+        ));
+    } else {
+        s.push_str(&format!(
+            " Restore the creator's tree in the worktree with `git read-tree --reset -u {}`",
+            m.before.tree
+        ));
+        if let Some(why) = &m.restore_error {
+            s.push_str(&format!(" (the engine's own restore failed: {why})"));
+        }
+        s.push_str(
+            ", or reject the run; a phase that must change code declares `executes_code: true` \
+             in the workflow def.",
+        );
+    }
     s
 }
 
@@ -554,6 +803,9 @@ mod tests {
         run_git(&repo, &["config", "user.email", "t@example.invalid"]);
         run_git(&repo, &["config", "user.name", "t"]);
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        // The Windows runner checks out with `core.autocrlf=true`; the restore goes through git's
+        // checkout, so a fixture that asserts byte-exact LF content must pin the conversion off.
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("src/a.ts"), "export const a = 1;\n").unwrap();
         std::fs::write(repo.join(".gitignore"), "node_modules/\n*.local.json\n").unwrap();
         // A COMMITTED file that an ignore rule matches (a `.vscode/settings.json`, a built
@@ -658,6 +910,163 @@ mod tests {
                 && reason.contains(&format!("git read-tree --reset -u {}", before.tree)),
             "the denial names the paths, the rule and the restore: {reason}"
         );
+    }
+
+    /// core#431 (F-3R2-010): the engine restores the creator's tree itself. After the F-036
+    /// mutation (modify + delete + add), `restore_creator_tree` must bring back exactly the
+    /// baseline — the modified file's creator content, the deleted creator file, and NO trace
+    /// of the evaluator's added file — proven by a fresh snapshot equal to the baseline tree; the
+    /// denial then says the edit was discarded instead of printing a command to run by hand.
+    #[test]
+    fn the_engine_restores_the_creators_tree_after_a_mutation() {
+        let wt = creator_worktree("restore");
+        let unit = guarded_unit();
+        let before = snapshot(&wt, &repo_of(&wt)).unwrap();
+        std::fs::write(
+            wt.join("src/a.ts"),
+            "export const a = 3; // evaluator's idea\n",
+        )
+        .unwrap();
+        std::fs::remove_file(wt.join("src/b.ts")).unwrap();
+        std::fs::write(wt.join("src/c.ts"), "export const c = 1;\n").unwrap();
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(!m.restored && m.restore_error.is_none());
+        let evaluators_tree = m.after.tree.clone();
+
+        let pin = "refs/wicked/suggestions/restore/4/0";
+        restore_creator_tree(&wt, &mut m, Some(pin)).expect("restore succeeds");
+        assert!(m.restored, "{:?}", m.restore_error);
+        // F-433-008: the discarded edit is pinned — reachable, so never gc-pruned — and is
+        // exactly the tree the evaluator left.
+        assert_eq!(m.suggestion_ref.as_deref(), Some(pin));
+        let pinned_commit = run_git(&wt, &["rev-parse", pin]);
+        assert_eq!(
+            run_git(&wt, &["rev-parse", &format!("{pinned_commit}^{{tree}}")]),
+            evaluators_tree,
+            "the pinned commit carries the evaluator's tree"
+        );
+        assert_eq!(
+            run_git(&wt, &["show", &format!("{pin}:src/a.ts")]).trim(),
+            "export const a = 3; // evaluator's idea",
+            "the suggestion's content is readable back from the ref"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n",
+            "the creator's fix is back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/b.ts")).unwrap(),
+            "export const b = 1;\n",
+            "the creator's deleted file is back"
+        );
+        assert!(
+            !wt.join("src/c.ts").exists(),
+            "the evaluator's added file is gone"
+        );
+        let after = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert_eq!(after.tree, before.tree, "the tree IS the baseline again");
+        assert!(
+            compare(&wt, &before).unwrap().is_none(),
+            "the guard itself sees the restored tree as clean"
+        );
+        // The committed-but-ignored file the creator never touched is untouched too.
+        assert_eq!(
+            std::fs::read_to_string(wt.join("config/settings.local.json")).unwrap(),
+            "{\"port\":1}\n"
+        );
+        let reason = denial_reason(&unit, &m);
+        assert!(
+            reason.contains("DISCARDED") && reason.contains("restored the creator's tree"),
+            "the denial states the restore: {reason}"
+        );
+        assert!(
+            !reason.contains("git read-tree --reset -u"),
+            "no manual remedy once the engine ran it: {reason}"
+        );
+    }
+
+    /// The moved-`HEAD` shape (the evaluator committed its edit onto the run branch): the restore
+    /// resets the branch pointer to the baseline commit AND the tree, and the phase's commit is
+    /// left dangling — never on the run branch.
+    #[test]
+    fn a_restore_also_resets_a_head_the_evaluator_moved() {
+        let wt = creator_worktree("restore-head");
+        let before = snapshot(&wt, &repo_of(&wt)).unwrap();
+        run_git(&wt, &["config", "user.email", "t@example.invalid"]);
+        run_git(&wt, &["config", "user.name", "t"]);
+        run_git(&wt, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            wt.join("src/a.ts"),
+            "export const a = 9; // committed by the evaluator\n",
+        )
+        .unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-qm", "evaluator commit"]);
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(m.head_moved);
+        restore_creator_tree(&wt, &mut m, None).expect("restore succeeds");
+        assert!(m.restored, "{:?}", m.restore_error);
+        let now = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert_eq!(now.head, before.head, "HEAD is back at the baseline commit");
+        assert_eq!(now.tree, before.tree, "the tree is the baseline");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n"
+        );
+        assert_eq!(
+            run_git(&wt, &["rev-parse", "HEAD"]),
+            before.head,
+            "the run branch itself points at the baseline"
+        );
+    }
+
+    /// Copilot on #433: the phase `git switch -c other` (same commit) and edits there. The commit
+    /// id alone would call HEAD unmoved; the recorded symbolic ref catches the switch, and the
+    /// restore re-attaches HEAD to the run branch before resetting — never leaving the worktree
+    /// on the wrong branch with the right commit.
+    #[test]
+    fn a_restore_reattaches_a_head_the_evaluator_switched_or_detached() {
+        let wt = creator_worktree("restore-ref");
+        let before = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert_eq!(
+            before.head_ref.as_deref(),
+            Some("refs/heads/wicked/restore-ref"),
+            "the baseline records the run branch"
+        );
+        run_git(&wt, &["switch", "-q", "-c", "evaluators-branch"]);
+        std::fs::write(
+            wt.join("src/a.ts"),
+            "export const a = 7; // on another branch\n",
+        )
+        .unwrap();
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(m.head_moved, "a switched ref counts as a moved HEAD");
+        restore_creator_tree(&wt, &mut m, None).expect("restore succeeds");
+        assert!(m.restored, "{:?}", m.restore_error);
+        assert_eq!(
+            run_git(&wt, &["symbolic-ref", "-q", "HEAD"]),
+            "refs/heads/wicked/restore-ref",
+            "HEAD is re-attached to the run branch"
+        );
+        assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), before.head);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n"
+        );
+        assert!(compare(&wt, &before).unwrap().is_none(), "clean again");
+
+        // Detached at the same commit + an edit: same outcome.
+        run_git(&wt, &["checkout", "-q", "--detach"]);
+        std::fs::write(wt.join("src/a.ts"), "export const a = 8; // detached\n").unwrap();
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(m.head_moved, "a detached HEAD counts as moved");
+        restore_creator_tree(&wt, &mut m, None).expect("restore succeeds");
+        assert_eq!(
+            run_git(&wt, &["symbolic-ref", "-q", "HEAD"]),
+            "refs/heads/wicked/restore-ref"
+        );
+        assert!(compare(&wt, &before).unwrap().is_none());
     }
 
     #[test]
@@ -944,6 +1353,7 @@ mod tests {
         let dir = scratch("nongit");
         let mut unit = guarded_unit();
         unit.worktree_baseline = Some(WorktreeSnapshot {
+            head_ref: None,
             head: String::new(),
             tree: "0".repeat(40),
             taken_at_ms: 0,

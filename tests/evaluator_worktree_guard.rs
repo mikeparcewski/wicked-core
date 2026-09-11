@@ -156,6 +156,9 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
     git(&repo, &["config", "user.email", "t@example.invalid"]);
     git(&repo, &["config", "user.name", "t"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
+    // The Windows runner checks out with `core.autocrlf=true`; the engine's restore goes through
+    // git's checkout, so a byte-exact LF assertion on a restored file needs the conversion off.
+    git(&repo, &["config", "core.autocrlf", "false"]);
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     std::fs::write(repo.join("src/app.ts"), "buggy\n").unwrap();
     if let Some(passes) = cargo_test {
@@ -389,9 +392,17 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
         reason.contains("M src/app.ts") && reason.contains("D src/fix.ts"),
         "the denial names every path the evaluator changed, with its status: {reason}"
     );
+    // core#431 (F-3R2-010): the engine RAN the restore — the denial says the edit was discarded
+    // instead of printing a `git read-tree` command for the operator to run by hand.
     assert!(
-        reason.contains("executes_code: false") && reason.contains("git read-tree --reset -u"),
-        "the denial names the rule and the restore: {reason}"
+        reason.contains("executes_code: false")
+            && reason.contains("DISCARDED")
+            && reason.contains("restored the creator's tree"),
+        "the denial names the rule and states the restore: {reason}"
+    );
+    assert!(
+        !reason.contains("git read-tree --reset -u"),
+        "no manual remedy once the engine restored the tree: {reason}"
     );
     // The pinned diff floor still PASSED (a diff exists) — which is exactly why it could not be
     // the instrument here; the record shows the guard overriding it.
@@ -406,8 +417,16 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
                 phase,
                 changed,
                 head_moved,
+                restored,
+                restore_error,
                 ..
-            } if *ord == 4 => Some((phase.clone(), changed.clone(), *head_moved)),
+            } if *ord == 4 => Some((
+                phase.clone(),
+                changed.clone(),
+                *head_moved,
+                *restored,
+                restore_error.clone(),
+            )),
             _ => None,
         })
         .expect("evaluatorMutatedWorktree emitted for the verify unit");
@@ -420,6 +439,60 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
     paths.sort();
     assert_eq!(paths, vec!["D src/fix.ts", "M src/app.ts"]);
     assert!(!mutation.2, "HEAD did not move");
+    // core#431 (F-3R2-010): the engine restored the creator's tree itself — the event says so,
+    // `worktreeRestored` names what was discarded, the worktree holds the creator's fix again,
+    // and the human prompt says Approve retries against the RESTORED tree (not the evaluator's).
+    assert!(mutation.3, "restored: {:?}", mutation.4);
+    let discarded = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::WorktreeRestored {
+                ord,
+                phase,
+                discarded,
+                head,
+                ..
+            } if *ord == 4 => Some((phase.clone(), discarded.clone(), head.clone())),
+            _ => None,
+        })
+        .expect("worktreeRestored emitted for the verify unit");
+    assert_eq!(discarded.0, "verify");
+    let mut discarded_paths: Vec<String> = discarded
+        .1
+        .iter()
+        .map(|c| format!("{} {}", c.status, c.path))
+        .collect();
+    discarded_paths.sort();
+    assert_eq!(
+        discarded_paths, paths,
+        "the restore discards exactly the mutation"
+    );
+    assert!(
+        discarded.2.is_none(),
+        "HEAD had not moved, so none was reset"
+    );
+    let wt = repo.join("wicked-worktrees").join("r-rewrite");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("src/app.ts")).unwrap(),
+        "fixed\n",
+        "the creator's fix is back in the worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("src/fix.ts")).unwrap(),
+        "the fix\n",
+        "the file the evaluator deleted is back"
+    );
+    let prompt = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::AwaitingHuman { ord, prompt, .. } if *ord == 4 => Some(prompt.clone()),
+            _ => None,
+        })
+        .expect("the verify gate escalated to a human");
+    assert!(
+        prompt.contains("edit was discarded") && prompt.contains("restored tree"),
+        "the gate prompt says what Approve now means: {prompt}"
+    );
 
     // The repo checks did NOT run over the rewritten tree — certifying the wrong code is worse
     // than running nothing, and the guard's denial is the honest record.

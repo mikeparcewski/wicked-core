@@ -1290,7 +1290,28 @@ impl WrappedCliStepRunner {
         let delivery = handed
             .map(|s| s.delivery(&worker_cli))
             .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
-        let prompt = unit_prompt(input, form, handed);
+        // F-433-009 (core#431): a NON-claude seat with NO read-only lever (agy, copilot) carrying
+        // an `executes_code: false` phase is GUARD-ONLY — nothing at the tool boundary stops a
+        // write, only the worktree guard after the fact (which now restores). The one lever such a
+        // seat has is its prompt: say the posture out loud. Decided from the same resolution the
+        // launch boundary applies (`no_code_posture` over the seat's declared flags).
+        let guard_only = !is_claude
+            && crate::worktree_guard::applies_to(&input.unit)
+            && matches!(
+                no_code_posture(&binary, resolve_seat_posture(&cli_key)),
+                Ok(NoCodePosture {
+                    lever: ReadOnlyLever::None,
+                    ..
+                })
+            );
+        let prompt = if guard_only {
+            format!(
+                "{}\n\n{READ_ONLY_INSTRUCTION}",
+                unit_prompt(input, form, handed)
+            )
+        } else {
+            unit_prompt(input, form, handed)
+        };
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
         // F-036: set below when a NO-CODE phase lands on a non-claude seat that exposes no
         // read-only lever — folded into the governance disclosure so the record says which
@@ -1355,8 +1376,10 @@ impl WrappedCliStepRunner {
                     Ok(ReadOnlyLever::None) => {
                         let note = format!(
                             "phase `{}` declares executes_code:false but seat '{cli_key}' exposes \
-                             no read-only posture lever, so writes are not prevented at the tool \
-                             boundary — the worktree guard denies them after the fact (F-036)",
+                             no read-only posture lever — GUARD-ONLY: writes are not prevented at \
+                             the tool boundary, the read-only instruction rides the prompt, and \
+                             the worktree guard denies (and restores) after the fact (F-036 / \
+                             F-433-009)",
                             input.unit.phase_id().unwrap_or("?")
                         );
                         eprintln!("wicked-core: {note}");
@@ -2909,6 +2932,14 @@ pub(crate) fn apply_seat_posture(argv: &mut Vec<String>, posture: &[String]) {
         None => argv.extend(posture.iter().cloned()),
     }
 }
+
+/// (F-433-009, core#431) The read-only instruction a GUARD-ONLY seat carries in its prompt — a
+/// non-claude seat with no argv lever (`ReadOnlyLever::None`) running an `executes_code: false`
+/// phase. The posture the wrapped carrier cannot apply at the tool boundary is at least stated.
+pub(crate) const READ_ONLY_INSTRUCTION: &str = "READ-ONLY PHASE (enforced after the fact): this \
+    phase declares executes_code: false. Do NOT edit, write, create, delete, move or format any \
+    file in the worktree, and do not commit — report findings in your output only. Any change \
+    you make is detected by the engine's worktree guard, discarded, and the phase is denied.";
 
 /// Which read-only lever [`no_code_posture`] applied to a non-claude seat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -23,6 +23,7 @@ mod cli_runner;
 mod clock;
 mod code_graph;
 mod command;
+mod deliver_lift;
 mod diagnostic;
 mod distribute;
 mod docs;
