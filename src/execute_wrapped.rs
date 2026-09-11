@@ -333,12 +333,18 @@ const DENIED_BASH: &[&str] = &[
 /// the file TOOLS (`Edit` covers every file-editing tool; a `Write(path)` rule is NOT matched by the
 /// CLI and is never emitted — [`enforceable_rule`]) — a `Bash(cat …)` of a denied path still gets
 /// through, and `DENIED_BASH` only names verbs
-/// that are unsalvageable rather than every command that could escape. The rules are also inert
-/// under `bypassPermissions` / `--dangerously-skip-permissions`, which is why the mode is pinned
-/// below; note the council's seat dispatch DOES pass that trust flag ([`wicked_council::dispatch`]),
-/// so seat votes are outside this boundary. The real boundary belongs in the PreToolUse gate-hook,
-/// which already sees every call and can reject on the resolved path; this closes the observed leaks
-/// in the meantime and does not pretend to close the class.
+/// that are unsalvageable rather than every command that could escape. Under `bypassPermissions` /
+/// `--dangerously-skip-permissions` the status of these rules is UNMEASURED on the installed CLI
+/// (2.1.268; wicked-crew#524 follow-up): its bundled SDK text says "permissionMode
+/// 'bypassPermissions' auto-approves every tool call (except explicit deny rules)", i.e. explicit
+/// deny rules would still apply — but no live probe has confirmed that here (a probe needs a
+/// logged-in worker home, which a read-only review cannot use), and the earlier "inert" claim was
+/// not re-measured on this version. Workers are pinned to `acceptEdits` below regardless, so
+/// nothing rests on the answer for them; the council's seat dispatch DOES pass the trust flag
+/// ([`wicked_council::dispatch`]) and reads the same shared settings file, so for seat votes the
+/// fence is exactly as live as that sentence turns out to be. The real boundary belongs in the
+/// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
+/// closes the observed leaks in the meantime and does not pretend to close the class.
 ///
 /// The engine's own governance is unaffected: the gate-hook rides a wicked-written `--settings`
 /// file ([`arm_input_governance`]), which is a separate source from the three scopes named here.
@@ -548,16 +554,32 @@ fn strip_plugin_dir(argv: &mut Vec<String>, prompt_ix: Option<usize>) -> Vec<Str
 /// to the `Edit(<path>)` form that enforces it instead of riding along inert. A BARE `Write` (the
 /// whole tool, no path) is a valid deny and is left alone.
 ///
+/// The CLI's validator (read from the installed 2.1.268 binary, wicked-crew#524 follow-up) names
+/// FOUR inert path forms, not one: `Write(<p>)`, `MultiEdit(<p>)` and `NotebookEdit(<p>)` are
+/// covered by `Edit(<p>)`; `Glob(<p>)` is covered by `Read(<p>)` ("Read rules cover all
+/// file-reading tools"). Every one of them is lifted to its enforced twin here; a bare tool name
+/// of any of them (no path) is a whole-tool deny and rides as stated.
+///
 /// Manual check against the live CLI (no automated test spawns claude): in a scratch config dir,
 /// `printf '{"permissions":{"deny":["Read(/tmp/fence/**)","Edit(/tmp/fence/**)"]}}' > s.json`,
 /// then `claude -p --settings s.json --setting-sources project,local --permission-mode acceptEdits
 /// 'use the Write tool to create /tmp/fence/probe.txt'` — expect NO `Permission deny rule` line on
 /// stderr, the write refused in the transcript, and no `/tmp/fence/probe.txt` afterwards.
 fn enforceable_rule(rule: String) -> String {
-    match rule.strip_prefix("Write(") {
-        Some(rest) if rest.ends_with(')') => format!("Edit({rest}"),
-        _ => rule,
+    const LIFTS: [(&str, &str); 4] = [
+        ("Write(", "Edit("),
+        ("MultiEdit(", "Edit("),
+        ("NotebookEdit(", "Edit("),
+        ("Glob(", "Read("),
+    ];
+    for (inert, enforced) in LIFTS {
+        if let Some(rest) = rule.strip_prefix(inert) {
+            if rest.ends_with(')') {
+                return format!("{enforced}{rest}");
+            }
+        }
     }
+    rule
 }
 
 /// Lift a template's OWN `--disallowedTools`/`--disallowed-tools` (either spelling, comma-joined
@@ -7416,8 +7438,18 @@ mod tests {
                 "one write-side rule per directory: {blanket:?}"
             );
         }
-        // The helper: only the `Write(<something>)` path form is rewritten; everything else rides.
+        // The helper: only the inert PATH forms are rewritten — to the twin the CLI enforces;
+        // everything else rides.
         assert_eq!(enforceable_rule("Write(/x/**)".into()), "Edit(/x/**)");
+        assert_eq!(enforceable_rule("MultiEdit(/x/**)".into()), "Edit(/x/**)");
+        assert_eq!(
+            enforceable_rule("NotebookEdit(/x/**)".into()),
+            "Edit(/x/**)"
+        );
+        assert_eq!(enforceable_rule("Glob(/x/**)".into()), "Read(/x/**)");
+        assert_eq!(enforceable_rule("MultiEdit".into()), "MultiEdit");
+        assert_eq!(enforceable_rule("NotebookEdit".into()), "NotebookEdit");
+        assert_eq!(enforceable_rule("Glob".into()), "Glob");
         assert_eq!(
             enforceable_rule("Write(C:/Users/me/.ssh/**)".into()),
             "Edit(C:/Users/me/.ssh/**)"
