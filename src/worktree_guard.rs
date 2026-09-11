@@ -736,6 +736,9 @@ mod tests {
         run_git(&repo, &["config", "user.email", "t@example.invalid"]);
         run_git(&repo, &["config", "user.name", "t"]);
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
+        // The Windows runner checks out with `core.autocrlf=true`; the restore goes through git's
+        // checkout, so a fixture that asserts byte-exact LF content must pin the conversion off.
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("src/a.ts"), "export const a = 1;\n").unwrap();
         std::fs::write(repo.join(".gitignore"), "node_modules/\n*.local.json\n").unwrap();
         // A COMMITTED file that an ignore rule matches (a `.vscode/settings.json`, a built

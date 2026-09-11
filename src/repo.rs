@@ -2068,6 +2068,7 @@ mod tests {
             sh(repo, &["config", "user.email", "t@example.invalid"]);
             sh(repo, &["config", "user.name", "t"]);
             sh(repo, &["config", "commit.gpgsign", "false"]);
+            sh(repo, &["config", "core.autocrlf", "false"]);
         }
         let base = std::env::temp_dir().join(format!(
             "wicked-core-runbase-{}-{:?}",

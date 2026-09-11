@@ -631,6 +631,9 @@ mod tests {
         run_git(repo, &["config", "user.email", "t@example.invalid"]);
         run_git(repo, &["config", "user.name", "t"]);
         run_git(repo, &["config", "commit.gpgsign", "false"]);
+        // The Windows runner checks out with `core.autocrlf=true`; the lift goes through git's
+        // checkout, so byte-exact LF assertions need the conversion pinned off.
+        run_git(repo, &["config", "core.autocrlf", "false"]);
     }
 
     /// The acceptance layout: a bare `origin`, the operator's clone (the REGISTERED repo, left
