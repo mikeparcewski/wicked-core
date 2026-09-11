@@ -78,6 +78,27 @@ Two release tracks share this file, newest entry first regardless of track:
   ignored, `chatList` rows gain `cwd` / `codeGraphDb` / `readRoots`.
 
 ### Added
+- **codex skills lever — the engine-minted `CODEX_HOME/skills` is populated from the pinned
+  snapshot (acceptance finding F-079, core#441; closes the core#400 residual).** codex has no
+  per-launch flag for skills, so until core#426 minted a per-seat `CODEX_HOME` it had no
+  wicked-owned lever (`Absent`): a skill-bearing codex unit was refused `NoLever` by name and a
+  skill-less one told its method was "NOT loaded". `SkillsLever::CodexSkillsDir` now populates
+  `<CODEX_HOME>/skills/<frontmatter name>/` — the deliverable portable skills FLAT by name (the
+  shape crew's `views/copilot` takes), COPIES (codex forbids symlinks; the read-only bit is cleared
+  so a later generation can remove them on Windows too), a skill's OWN files with any indexed
+  skill nested below it excluded (it lands under its own name), and a `.wicked-skills-gen` marker
+  (`pending` during the copy, `done` after) keyed by generation + content hash so an unchanged
+  generation is a no-op, a new one removes exactly the entries the previous one wrote, an
+  interrupted one is repaired, and nothing else under `CODEX_HOME` — never the operator's own
+  `~/.codex` — is touched (an entry no marker lists is never replaced; refused by path). Both
+  carriers populate BEFORE the seat spawns and before `skillsSnapshotHanded {path: "wrapped_cli"
+  | "acp", cli: codex}` is emitted, through the one seat-config resolver; a failure refuses the
+  launch (`SkillsError::SeatHome`), never a launch without the skills its directive names. The
+  lever is carrier-independent (codex behind `codex-acp` is judged as codex, like pi behind
+  `pi-acp`); under the inherit-operator-config hatch there is no minted home, so admission refuses
+  a skill-bearing codex unit `NoLever` naming the hatch. Admission's portability and
+  parent-nesting rules apply to codex exactly as to pi; `NONPORTABLE_SEAT` and the views are
+  unchanged.
 - **Seats are handed the garden launcher root, and the ACP skills lever is judged from the SEAT
   binary (acceptance finding F-079, core#441).** Every seat that receives a skills delivery — pi,
   copilot, opencode, claude, on both carriers — now also gets `WICKED_GARDEN_ROOT=<pinned snapshot

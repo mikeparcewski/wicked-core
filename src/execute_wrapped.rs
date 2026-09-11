@@ -1290,6 +1290,55 @@ impl WrappedCliStepRunner {
         let delivery = handed
             .map(|s| s.delivery(&worker_cli))
             .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
+        // The seat-aware configuration decision on the WRAPPED carrier too (codex r2, PR#413;
+        // core#410) — decided HERE, before anything is reported or built, and applied to the
+        // command below: `hardened()` strips only the engine's own variables, so a wrapped worker
+        // inherited whatever the daemon carried — a non-claude seat an ambient claude config path
+        // it never reads, a claude seat the OPERATOR's login (worked by accident on a laptop,
+        // failed 100% wherever the daemon had a `CLAUDE_CONFIG_DIR`), and every codex / pi /
+        // copilot / opencode seat the operator's OWN `~/.codex`, `~/.pi/agent`, `~/.copilot`,
+        // `~/.config/opencode` — skills, extensions and credentials included. Judged on the
+        // template's binary through the SAME resolver as the ACP spawn and the ballot: a claude
+        // carrier gets the validated worker home (the login the operator signed in once), every
+        // other known CLI its own root under that home through its own configuration-home
+        // variable, every foreign seat variable STRIPPED, the inherit hatch keeps the operator's
+        // own. Fail CLOSED on a resolver error — the launch is refused, never run under the
+        // daemon's configuration.
+        let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier(&binary)
+            .and_then(|c| c.ensure_dirs().map(|()| c))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: format!(
+                        "(worker config dir refused the launch of `{cli_key}`: {e}; refusing to \
+                         run the worker under the daemon's own CLI configuration)"
+                    ),
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                };
+            }
+        };
+        // F-079 (core#441), the codex lever: populate the seat's ENGINE-MINTED `CODEX_HOME/skills`
+        // from the pinned snapshot BEFORE the handoff is reported or the command is built — a
+        // population failure refuses the launch naming the seat; a relaunch on an unchanged
+        // generation is a no-op. A no-op for every other delivery.
+        if let Err(why) = crate::skills_snapshot::populate_seat_home(&delivery, seat_config.root())
+        {
+            return skills_refusal(
+                input,
+                &crate::skills_snapshot::SkillsError::SeatHome {
+                    cli: cli_key.clone(),
+                    why,
+                },
+            );
+        }
         // F-433-009 (core#431): a NON-claude seat with NO read-only lever (agy, copilot) carrying
         // an `executes_code: false` phase is GUARD-ONLY — nothing at the tool boundary stops a
         // write, only the worktree guard after the fact (which now restores). The one lever such a
@@ -1399,17 +1448,11 @@ impl WrappedCliStepRunner {
             }
             // v3.2 §2: the seat's PER-LAUNCH skills delivery — pi's `--no-skills --skill <dir>…`,
             // copilot's `--add-dir <view>` — rides the argv exactly like its posture (before any
-            // `--` guard). opencode's rides the env, set on the command below. Nothing is written
-            // into `~/.pi`, `~/.copilot`, `~/.config/opencode` or `~/.codex`; a seat without a
-            // lever gets no flags and no skills.
-            //
-            // Documented residual (codex round 9, ADJUDICATED; follow-up core#400): codex has no
-            // lever AND no engine-minted worker home — it runs under the operator's own `~/.codex`,
-            // which v3.2 forbids touching — so "no lever ⇒ no skills" means wicked DELIVERS nothing
-            // to codex and REFUSES a skill-bearing codex unit by name (`SkillsError::NoLever`,
-            // before launch). Whatever codex discovers ambiently under the operator's `~/.codex` is
-            // the operator's configuration, not a wicked delivery; isolating that discovery needs
-            // a `CODEX_HOME` worker home (auth relocation included), tracked in core#400.
+            // `--` guard). opencode's rides the env, set on the command below; codex's was
+            // populated into its ENGINE-MINTED `CODEX_HOME/skills` above (F-079, core#441 — the
+            // core#400 residual closed by core#426's per-seat homes). Nothing is written into
+            // `~/.pi`, `~/.copilot`, `~/.config/opencode` or the operator's `~/.codex`; a seat
+            // without a lever (agy) gets no flags and no skills.
             let flags = delivery.argv_flags();
             if !flags.is_empty() {
                 apply_seat_posture(&mut argv, &flags);
@@ -1577,40 +1620,10 @@ impl WrappedCliStepRunner {
             // exceptions.
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
-            // The seat-aware configuration decision on the WRAPPED carrier too (codex r2,
-            // PR#413; core#410): `hardened()` strips only the engine's own variables, so a
-            // wrapped worker inherited whatever the daemon carried — a non-claude seat an ambient
-            // claude config path it never reads, a claude seat the OPERATOR's login (worked by
-            // accident on a laptop, failed 100% wherever the daemon had a `CLAUDE_CONFIG_DIR`),
-            // and every codex / pi / copilot / opencode seat the operator's OWN `~/.codex`,
-            // `~/.pi/agent`, `~/.copilot`, `~/.config/opencode` — skills, extensions and
-            // credentials included. Judged on the template's binary through the SAME resolver as
-            // the ACP spawn and the ballot: a claude carrier gets the validated worker home (the
-            // login the operator signed in once), every other known CLI its own root under that
-            // home through its own configuration-home variable, every foreign seat variable
-            // STRIPPED, the inherit hatch keeps the operator's own. Fail CLOSED on a resolver
-            // error — the launch is refused, never run under the daemon's configuration.
-            match wicked_apps_core::spawn::seat_config_for_carrier(&binary)
-                .and_then(|c| c.ensure_dirs().map(|()| c))
-            {
-                Ok(seat_config) => seat_config.apply(&mut cmd),
-                Err(e) => {
-                    return StepOutput {
-                        run_id: input.run_id.clone(),
-                        unit_ix: input.unit_ix,
-                        attempt: input.attempt,
-                        output: format!(
-                            "(worker config dir refused the launch of `{cli_key}`: {e}; refusing \
-                             to run the worker under the daemon's own CLI configuration)"
-                        ),
-                        status: StepStatus::Failed,
-                        usage: None,
-                        files: Vec::new(),
-                        tools: Vec::new(),
-                        governed: false,
-                    };
-                }
-            }
+            // The seat-aware configuration decision (core#410), decided above alongside the
+            // delivery and applied here AFTER `hardened()`: this seat's own configuration-home
+            // variable set, every foreign one stripped, the inherit hatch touching nothing.
+            seat_config.apply(&mut cmd);
             // v3.2 §2, opencode's lever: `OPENCODE_CONFIG_CONTENT` composed WITH whatever the
             // daemon's environment already carries (the operator's own content, if any), gaining
             // `skills.paths` — one path per portable skill in the snapshot. Set AFTER `hardened()`
@@ -6517,12 +6530,14 @@ mod tests {
             SkillForm::for_invocation("/opt/bin/claude.exe -p {PROMPT}"),
             claude
         );
-        // v3.2: codex has no per-launch lever, so its form must not imply the skill is loaded;
-        // pi (and copilot, opencode) deliver, so they get the mirrored name.
+        // v3.2: a seat with no per-launch lever (agy) gets a form that must not imply the skill
+        // is loaded; pi, copilot, opencode — and, since F-079, codex through its engine-minted
+        // `CODEX_HOME/skills` — deliver, so they get the mirrored name.
         assert_eq!(
-            SkillForm::for_invocation("codex exec {PROMPT}"),
+            SkillForm::for_invocation("agy -p {PROMPT}"),
             SkillForm::Unloaded
         );
+        assert_eq!(SkillForm::for_invocation("codex exec {PROMPT}"), mirrored);
         assert_eq!(SkillForm::for_invocation("pi --skill x {PROMPT}"), mirrored);
         assert_eq!(SkillForm::for_invocation("copilot -p {PROMPT}"), mirrored);
         assert_eq!(SkillForm::for_invocation("opencode run {PROMPT}"), mirrored);
@@ -7821,8 +7836,9 @@ mod tests {
 
     /// A fake CLI named `name` — the stem selects the seat's lever (v3.2) — that records its argv
     /// one token per line into `argv_file`, then one `ENV <VAR>=<value|UNSET>` line each for
-    /// `OPENCODE_CONFIG_CONTENT`, `WICKED_GARDEN_ROOT`, `WICKED_PI_SKILL_DIRS` and `PATH`, so a
-    /// test can read back both carriers a launch used and the launcher environment (F-079).
+    /// `OPENCODE_CONFIG_CONTENT`, `WICKED_GARDEN_ROOT`, `WICKED_PI_SKILL_DIRS`, `CODEX_HOME` and
+    /// `PATH`, so a test can read back both carriers a launch used, the launcher environment and
+    /// the codex seat home (F-079).
     #[cfg(unix)]
     fn fake_recorder(
         bin_dir: &std::path::Path,
@@ -7838,6 +7854,7 @@ mod tests {
                  OPENCODE_CONFIG_CONTENT=%s\\n' \"${{OPENCODE_CONFIG_CONTENT:-UNSET}}\"; printf 'ENV \
                  WICKED_GARDEN_ROOT=%s\\n' \"${{WICKED_GARDEN_ROOT:-UNSET}}\"; printf 'ENV \
                  WICKED_PI_SKILL_DIRS=%s\\n' \"${{WICKED_PI_SKILL_DIRS:-UNSET}}\"; printf 'ENV \
+                 CODEX_HOME=%s\\n' \"${{CODEX_HOME:-UNSET}}\"; printf 'ENV \
                  PATH=%s\\n' \"${{PATH:-UNSET}}\"; }} > \"{}\"\n",
                 argv_file.display()
             ),
@@ -8607,24 +8624,26 @@ mod tests {
     /// `--no-skills` and one `--skill <dir>` per PORTABLE skill (the `portable: false` one is not
     /// delivered; a nested portable one is); copilot with `--add-dir <snapshot>/views/copilot`;
     /// opencode with `OPENCODE_CONFIG_CONTENT.skills.paths` naming the same portable dirs; claude
-    /// with its `--plugin-dir`. codex has no lever: a codex unit that invokes a skill is REFUSED
-    /// naming the skill and never launched, while a codex unit that names none runs with nothing
-    /// delivered. Throughout, fake `~/.codex`, `~/.pi`, `~/.copilot`, `~/.config/opencode` and
-    /// `~/.claude` trees are byte-identical before and after — no side channel, ever.
-    ///
-    /// What this PROVES for codex (codex round 9): the built argv carries NO delivery flag
-    /// (`--skill`/`--no-skills`/`--add-dir`/`--plugin-dir`), no delivery env, and a skill-naming
-    /// codex unit is refused by name before launch. What it CANNOT prove (documented residual,
-    /// core#400): that codex loads nothing ambient — the recorder here is not codex, and a real
-    /// codex runs under the operator's own `~/.codex`, which v3.2 forbids the engine to touch.
+    /// with its `--plugin-dir`; codex (F-079, core#441) with its ENGINE-MINTED `CODEX_HOME/skills`
+    /// POPULATED from the snapshot — flat by name, the portable skills only, a generation marker —
+    /// and no delivery flag at all. A seat with no lever (agy) runs with nothing delivered and no
+    /// launcher environment. Throughout, fake `~/.codex`, `~/.pi`, `~/.copilot`,
+    /// `~/.config/opencode` and `~/.claude` trees are byte-identical before and after — no side
+    /// channel, ever: codex's skills land under the WORKER home the engine minted, never under
+    /// the operator's `~/.codex`.
     #[cfg(unix)]
     #[test]
-    fn non_claude_seats_get_skills_only_through_their_lever_and_codex_gets_no_flag_and_is_refused_by_name(
+    fn non_claude_seats_get_skills_only_through_their_lever_and_codex_is_populated_from_the_snapshot(
     ) {
         use crate::skills_snapshot::test_support::{scratch, snapshot_root_with, tree_fingerprint};
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let home = scratch("levers-home");
         let _home = HomeGuard::pin(&home);
+        // This test's OWN worker home (restored to the armed hermetic one on drop): the codex
+        // population writes under `<worker home>/codex/skills`, which must not be shared with
+        // another test's generation.
+        let worker_home = home.join("worker");
+        let _worker = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
         let snapshot = snapshot_root_with(
             &crate::skills_snapshot::test_support::gen_dir(&home.join(".wicked-crew"), "3"),
             "3",
@@ -8804,21 +8823,13 @@ mod tests {
         );
         assert_launcher_env(&argv, "claude");
 
-        // codex: no lever. Invoking a skill ⇒ refused by name, never launched; no skill ⇒ runs
-        // with nothing delivered.
+        // codex (F-079): its lever is the engine-minted CODEX_HOME. A skill-invoking codex unit
+        // is ADMITTED and launched with no delivery flag; before the launch `<CODEX_HOME>/skills`
+        // was populated from the snapshot — the PORTABLE skills flat by name (never the
+        // extractor), a `done` generation marker — and the seat gets the launcher environment.
         let (out, argv) = launch("codex", Some("wicked-garden-domain"));
-        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
-        assert!(
-            out.output.contains("wicked-garden-domain")
-                && out.output.contains("no per-launch skills lever")
-                && out.output.contains("'codex'"),
-            "{}",
-            out.output
-        );
-        assert!(argv.is_none(), "a refused unit never launches the CLI");
-        let (out, argv) = launch("codex", None);
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
-        let argv = argv.expect("codex ran");
+        let argv = argv.expect("codex was launched");
         assert!(
             !argv.iter().any(|a| a == "--skill"
                 || a == "--no-skills"
@@ -8827,10 +8838,78 @@ mod tests {
             "{argv:?}"
         );
         assert_eq!(env_line(&argv), "UNSET");
-        // Handed nothing ⇒ no launcher environment either: no root, no path-list, and the PATH
-        // is the daemon's own, unprefixed.
+        assert_launcher_env(&argv, "codex");
+        let codex_home = std::path::PathBuf::from(env_of(&argv, "CODEX_HOME"));
+        assert_eq!(
+            codex_home.file_name().and_then(|n| n.to_str()),
+            Some("codex"),
+            "the engine-minted seat home, not the operator's ~/.codex: {}",
+            codex_home.display()
+        );
+        assert!(
+            codex_home.starts_with(&worker_home)
+                || std::fs::canonicalize(&codex_home)
+                    .map(|c| c.starts_with(std::fs::canonicalize(&worker_home).unwrap()))
+                    .unwrap_or(false),
+            "{} is not under this test's worker home {}",
+            codex_home.display(),
+            worker_home.display()
+        );
+        let codex_skills = codex_home.join("skills");
+        for name in ["wicked-garden-domain", "wicked-garden-qe-a11y"] {
+            let copy = codex_skills.join(name).join("SKILL.md");
+            let m = std::fs::symlink_metadata(&copy)
+                .unwrap_or_else(|e| panic!("{} populated: {e}", copy.display()));
+            assert!(
+                m.is_file() && !m.file_type().is_symlink(),
+                "a copy, never a link"
+            );
+        }
+        assert!(
+            std::fs::symlink_metadata(codex_skills.join("wicked-garden-domain-extractor")).is_err(),
+            "the portable:false skill is never delivered"
+        );
+        let marker =
+            std::fs::read_to_string(codex_skills.join(crate::codex_skills::GEN_MARKER)).unwrap();
+        assert!(
+            marker.starts_with("done 3 ")
+                && marker.contains("\nwicked-garden-domain\n")
+                && marker.contains("\nwicked-garden-qe-a11y\n"),
+            "{marker}"
+        );
+        // A relaunch on the same generation is a no-op: the populated tree is byte-identical.
+        let populated = tree_fingerprint(&codex_skills);
+        let (out, _) = launch("codex", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert_eq!(tree_fingerprint(&codex_skills), populated);
+
+        // agy: no lever. A skill-invoking unit is refused by name, never launched; one that names
+        // none runs with nothing delivered and no launcher environment: no root, no path-list,
+        // and the PATH is the daemon's own, unprefixed.
+        let (out, argv) = launch("agy", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("wicked-garden-domain")
+                && out.output.contains("no per-launch skills lever")
+                && out.output.contains("'agy'"),
+            "{}",
+            out.output
+        );
+        assert!(argv.is_none(), "a refused unit never launches the CLI");
+        let (out, argv) = launch("agy", None);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("agy ran");
+        assert!(
+            !argv.iter().any(|a| a == "--skill"
+                || a == "--no-skills"
+                || a == "--add-dir"
+                || a == "--plugin-dir"),
+            "{argv:?}"
+        );
+        assert_eq!(env_line(&argv), "UNSET");
         assert_eq!(env_of(&argv, "WICKED_GARDEN_ROOT"), "UNSET");
         assert_eq!(env_of(&argv, "WICKED_PI_SKILL_DIRS"), "UNSET");
+        assert_eq!(env_of(&argv, "CODEX_HOME"), "UNSET");
         assert!(
             !env_of(&argv, "PATH").starts_with(&scripts_prefix),
             "{}",
