@@ -1022,6 +1022,7 @@ mod tests {
             "interactive-chat-ledger.json",
             "project-graphs",
             "project-settings.json",
+            "repo-graphs",
             "skills",
         ] {
             assert!(r.classify(live).is_some(), "{live} must be classified");
@@ -1263,6 +1264,10 @@ mod tests {
         assert!(rules.contains(&format!("Read({}/**)", s(&home.join("evals")))));
         // Static: a registered entry that is ABSENT on disk is still denied (nothing enumerated).
         assert!(rules.contains(&format!("Read({}/**)", s(&home.join("project-graphs")))));
+        // core#406: the engine's own per-repo graphs live under the state home too, and the file
+        // tools are denied the whole subtree — a worker reaches its OWN graph through the estate
+        // MCP, never by reading a sibling repo's `estate.db` off disk.
+        assert!(rules.contains(&format!("Read({}/**)", s(&home.join("repo-graphs")))));
         // Nothing names the read slot or the generation.
         assert!(
             !rules.iter().any(|r| r.contains("snapshots/000007")

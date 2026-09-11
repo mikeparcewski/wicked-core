@@ -882,8 +882,9 @@ mod tests {
             // Through the engine's ONE resolver, never a hand-join — a second spelling here is
             // exactly the FINDING-069 drift this fixture exists to test against.
             code_graph_db: crate::code_graph::resolved_code_graph_db(std::path::Path::new(root))
-                .to_string_lossy()
-                .into_owned(),
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            findings: Vec::new(),
         }
     }
 

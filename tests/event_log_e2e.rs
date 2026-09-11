@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, SessionStatus, StepInput,
+    StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -124,6 +124,25 @@ fn wait_terminal(core: &Core, session: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("run `{session}` did not reach a terminal status in 20s");
+}
+
+/// Poll until `session` reports `want`, naming the last-seen status on timeout so a stalled run and a
+/// merely slow one are distinguishable.
+fn wait_status(core: &Core, session: &str, want: SessionStatus) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last: Option<SessionStatus> = None;
+    while Instant::now() < deadline {
+        if let Ok(views) = core.sessions_detail() {
+            if let Some(v) = views.iter().find(|v| v.session.id == session) {
+                if v.session.status == want {
+                    return;
+                }
+                last = Some(v.session.status);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    panic!("run `{session}` did not reach {want:?} in 20s (last observed {last:?})");
 }
 
 /// The finding, stated as a test: run with NOBODY listening, then read the history back afterwards.
@@ -388,6 +407,158 @@ fn to_json_is_part_of_the_public_surface() {
     .to_json();
     assert_eq!(j["type"], "sessionCompleted");
     assert_eq!(j["session"], "s");
+}
+
+// ── core#408: `seq` across a REAL daemon restart ─────────────────────────────────────────────
+
+/// The run the restart pair below drives — one constant so parent and child cannot drift.
+const RESTART_RUN: &str = "evlog-restart-seq";
+/// Set by the parent on the re-executed child: the store to open. Absent ⇒ the child test is a
+/// no-op (it is also collected as an ordinary test of this binary).
+const RESTART_CHILD_DB: &str = "WICKED_CORE_EVLOG_E2E_RESTART_DB";
+const RESTART_CHILD_TEST: &str = "seq_restart_child_approves_the_gate_in_a_fresh_process";
+
+/// core#408, end to end and across a REAL process boundary. The finding was found live: a run
+/// paused at a gate, the daemon restarted, the operator approved, and the resumed run's events came
+/// back with `seq` starting at 0 again — sorted ahead of the pre-restart history, so the tail of
+/// `GET /runs/:id/events` stayed the stale `awaitingHuman` while the run had moved on.
+///
+/// A second `Core` in THIS process cannot reproduce that: the counter is process-wide and never
+/// restarts inside one binary. So the second half runs in a second PROCESS — this test binary
+/// re-executed with a filter for `seq_restart_child_approves_the_gate_in_a_fresh_process` — whose
+/// counter genuinely starts at 0, exactly like the restarted daemon's. The child approves the gate
+/// and finishes the run; the parent then reads the whole history back through the public API and
+/// checks what consumers rely on: strictly increasing `seq`, the pre-restart prefix untouched, the
+/// tail the latest event, and the boundary marked once.
+#[test]
+fn seq_stays_monotonic_across_a_real_process_restart() {
+    let home = scratch("restart-seq");
+    let db = home.join("estate.db").to_str().unwrap().to_string();
+
+    // Process one: run up to the gate before unit 2, then go away with the run paused.
+    let before = {
+        let core = Core::spawn_with_engine(
+            db.clone(),
+            Arc::new(FirstOptionDispatcher),
+            Arc::new(OkRunner),
+        );
+        let mut s = spec(RESTART_RUN);
+        s.human_confirm = HumanConfirm::Before(2);
+        core.launch_run(s).expect("launch");
+        wait_status(&core, RESTART_RUN, SessionStatus::AwaitingHuman);
+        core.run_events(RESTART_RUN)
+    };
+    assert!(
+        before.iter().any(|e| e["type"] == "awaitingHuman"),
+        "the run paused at the gate: {before:#?}"
+    );
+    let seq = |e: &serde_json::Value| e["seq"].as_u64().expect("every record carries seq");
+    let max_before = before.iter().map(seq).max().unwrap();
+
+    // Process two: a fresh binary, counter at 0, over the same store — the restarted daemon.
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .arg("--exact")
+        .arg(RESTART_CHILD_TEST)
+        .env(RESTART_CHILD_DB, &db)
+        .output()
+        .expect("re-execute this test binary");
+    // Exit status only — libtest's human-readable summary is not a stable API (Copilot on #420).
+    // Whether the child actually did the work is asserted below on the history it left behind.
+    assert!(
+        out.status.success(),
+        "the restarted process must approve the gate and finish the run\n--- stdout\n{}\n\
+         --- stderr\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Read back through the public API — the path crew's `GET /runs/:id/events` takes.
+    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let after = core.run_events(RESTART_RUN);
+    assert!(
+        after.len() > before.len(),
+        "the resumed run recorded more history — if it did not, the child ran no test (did the \
+         `--exact` filter still name `{RESTART_CHILD_TEST}`?): {after:#?}"
+    );
+
+    // The pre-restart history is untouched and still comes first.
+    assert_eq!(
+        after[..before.len()].iter().map(seq).collect::<Vec<_>>(),
+        before.iter().map(seq).collect::<Vec<_>>(),
+        "the prefix is the pre-restart history, in place"
+    );
+    // One strictly increasing order across the boundary — nothing process two wrote sorts into the
+    // history process one wrote.
+    let seqs: Vec<u64> = after.iter().map(seq).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seq is strictly increasing across the restart: {seqs:?}"
+    );
+    assert!(
+        seqs[before.len()] > max_before,
+        "process two continued from the persisted max ({max_before}), not from 0: {seqs:?}"
+    );
+
+    // Pause → approval → completion, in that order, and the tail is no longer the stale prompt.
+    let types: Vec<&str> = after.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    let paused = types.iter().position(|t| *t == "awaitingHuman").unwrap();
+    let resumed = types
+        .iter()
+        .position(|t| *t == "resumed")
+        .expect("the approval was recorded");
+    let completed = types
+        .iter()
+        .position(|t| *t == "sessionCompleted")
+        .expect("the run finished");
+    assert!(
+        paused < resumed && resumed < completed,
+        "pause, then approval, then completion: {types:?}"
+    );
+    assert!(
+        resumed >= before.len(),
+        "the approval happened in process two"
+    );
+    assert_ne!(
+        types.last().copied(),
+        Some("awaitingHuman"),
+        "the tail is the latest event, not the pre-restart gate prompt: {types:?}"
+    );
+
+    // The boundary is marked exactly once, on the first record process two wrote.
+    let marked: Vec<usize> = after
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.get("daemonRestarted").is_some())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        marked,
+        vec![before.len()],
+        "`daemonRestarted: true` on the first post-restart record only: {after:#?}"
+    );
+    assert_eq!(
+        after[before.len()]["daemonRestarted"],
+        serde_json::json!(true)
+    );
+}
+
+/// The second process of `seq_stays_monotonic_across_a_real_process_restart`. As an ordinary test
+/// of this binary it does nothing; re-executed by the parent with the store path in
+/// `WICKED_CORE_EVLOG_E2E_RESTART_DB`, it plays the restarted daemon: open the same store with a
+/// counter at 0, approve the gate the run is paused at, and finish the run.
+#[test]
+fn seq_restart_child_approves_the_gate_in_a_fresh_process() {
+    let Ok(db) = std::env::var(RESTART_CHILD_DB) else {
+        return;
+    };
+    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let status = core
+        .confirm_gate(RESTART_RUN, HumanDecision::Approve { amend: None })
+        .expect("approve the gate after the restart");
+    assert_eq!(status, SessionStatus::Executing);
+    wait_terminal(&core, RESTART_RUN);
+    // Drain the writer before this process exits so the parent reads a complete log.
+    let _ = core.run_events(RESTART_RUN);
 }
 
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────

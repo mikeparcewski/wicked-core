@@ -714,6 +714,42 @@ impl Core {
         serde_json::to_string(&wicked_core::registry_roster()).map_err(err)
     }
 
+    /// EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
+    /// governance events to (`WICKED_ESTATE_DB`; wicked-crew#495) — as a JSON number string, over
+    /// a READ-ONLY connection (never the single-writer actor's handle; the store must already
+    /// exist). crew's `GET /diagnostics` reports it as `governance.records.total` and derives
+    /// `sinceBoot` from a boot baseline; an addon without this static answers `null` there.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn event_store_count(db_path: String) -> AsyncTask<CoreTask> {
+        task(move || {
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let n = wicked_apps_core::emit::count_events(&store).map_err(err)?;
+            Ok(n.to_string())
+        })
+    }
+
+    /// Replay a dead-letter outbox — the emit seam's NDJSON spool (`WICKED_APPS_EMIT_DEADLETTER`)
+    /// of governance events it could not store — into the estate store at `dbPath`, writing each
+    /// record as the EVENT node it should have been with its original `ts` restored
+    /// (`wicked_apps_core::emit::replay_outbox`). Opens the store read-write (creating it if
+    /// missing — the caller creates the parent directory). IDEMPOTENT: a replayed node's id is the
+    /// spool line's content hash plus its original stamp, so the same line replayed twice lands
+    /// once. Resolves to the JSON report `{ read, replayed, already_present, failed: [{ line,
+    /// reason }] }`; a failed entry carries its ORIGINAL line so the caller can keep it
+    /// dead-lettered. Behind `wicked-crew governance replay`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn replay_emit_outbox(outbox_path: String, db_path: String) -> AsyncTask<CoreTask> {
+        task(move || {
+            let mut store = wicked_apps_core::open_store(Some(db_path.as_str())).map_err(err)?;
+            let report = wicked_apps_core::emit::replay_outbox(
+                std::path::Path::new(&outbox_path),
+                &mut store,
+            )
+            .map_err(err)?;
+            serde_json::to_string(&report).map_err(err)
+        })
+    }
+
     /// Subscribe to the live [`CoreEvent`] stream. `callback` follows the Node error-first
     /// convention — `(err, eventJson)` — and is invoked once per event with the event serialized as
     /// a JSON string (`{ type, ...fields }`); parse it in JS. Events arrive in emission order. Call
@@ -1141,8 +1177,15 @@ impl Core {
     }
 
     /// A run's recorded event history, oldest first, as a JSON array. Each entry is the SAME tagged
-    /// object the `/ws` stream carries ([`CoreEvent::to_json`]) plus a capture-time `ts` (epoch millis)
-    /// and an ordering `seq`.
+    /// object the `/ws` stream carries ([`CoreEvent::to_json`]) plus the durable log's envelope — a
+    /// capture-time `ts` (epoch millis) and an ordering `seq`; `RecordedEventJson` is the shape.
+    ///
+    /// Ordering contract (wicked-core#408): `seq` is strictly increasing within a run for the run's
+    /// whole life, ACROSS daemon restarts — the engine continues a run's `seq` from its persisted
+    /// log rather than from 0 — so the array is in emission order and its last entry is the run's
+    /// latest event. The first entry a restarted engine records for a run carries
+    /// `daemonRestarted: true` (absent everywhere else). `ts` may repeat within a burst; never order
+    /// by it.
     ///
     /// The read half of FINDING-014: an evidence bundle assembled after a run must read what actually
     /// happened rather than re-derive pseudo-events from unit records, which cannot recover what it
@@ -1769,9 +1812,10 @@ impl Core {
     /// `core.db`), which holds run/governance nodes but none of a repo's domain/requirement nodes, so
     /// it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo. This
     /// resolves the repo from the registry, opens its `code_graph_db` (the engine-resolved path
-    /// every consumer shares — the legacy in-tree `<root>/.codegraph/estate.db` for a repo that
-    /// already has one, else the estate home's `<estate_root>/<key>/estate.db`; see wicked-core's
-    /// `code_graph.rs` ADR), and recomputes over it. An unknown `repo_ref` is an
+    /// every consumer shares — `<daemon state home>/repo-graphs/<key>/estate.db`, never inside the
+    /// checkout; see wicked-core's `code_graph.rs` ADR, core#406), and recomputes over it. The
+    /// daemon's own store path is handed along so the repo graph resolves under THIS daemon's
+    /// state home off the actor thread. An unknown `repo_ref` is an
     /// ERROR, never a silent vacuous report — the caller must name a real repo.
     /// Resolves to the coverage report as a JSON string (`ts_return_type` pins it — the crew adapter
     /// used to cast away an `unknown` here; #225 review).
@@ -1783,7 +1827,8 @@ impl Core {
             let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
             // The resolve-repo → open-its-store → recompute logic lives in wicked-core so it is
             // unit-testable there (this napi layer stays thin glue). An unknown repo errors.
-            let report = wicked_core::coverage_report_for_repo(&daemon, &repo_ref).map_err(err)?;
+            let report =
+                wicked_core::coverage_report_for_repo(&daemon, &db_path, &repo_ref).map_err(err)?;
             serde_json::to_string(&report).map_err(err)
         })
     }
@@ -1797,7 +1842,8 @@ impl Core {
         task(move || {
             use wicked_apps_core::open_store_ro;
             let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
-            let kinds = wicked_core::graph_kinds_for_repo(&daemon, &repo_ref).map_err(err)?;
+            let kinds =
+                wicked_core::graph_kinds_for_repo(&daemon, &db_path, &repo_ref).map_err(err)?;
             let shaped: Vec<_> = kinds
                 .into_iter()
                 .map(|(kind, count)| serde_json::json!({ "kind": kind, "count": count }))

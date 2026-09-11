@@ -2759,6 +2759,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
  "wicked-estate-core",
  "wicked-estate-store",
@@ -2793,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-core-ts"
-version = "0.7.17"
+version = "0.7.18"
 dependencies = [
  "anyhow",
  "napi",

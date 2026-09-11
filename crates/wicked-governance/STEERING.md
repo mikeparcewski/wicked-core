@@ -389,7 +389,7 @@ retirement is keyed on it):
 ```sh
 wicked-core rules fanout crates/wicked-governance/seed/corpus \
   --enforcement-crew-api http://127.0.0.1:7701 \
-  --discovery-db  <estate-home>/repo-graphs/<repo-key>/estate.db \   # repeat per live repo
+  --discovery-db  <state-home>/repo-graphs/<repo-key>/estate.db \   # repeat per live repo (state home = the daemon's --db parent)
   --knowledge-db  <estate knowledge store> \
   --scope workspace --knowledge-scope wiki:architecture \
   --manifest fanout-manifest.json
@@ -400,10 +400,11 @@ wicked-core rules fanout crates/wicked-governance/seed/corpus \
   payload for you to `POST /api/v1/governance/rules`, verified via
   `GET /api/v1/governance/rules/preview`; a daemon-held path passed as a `--*-db` flag is
   refused outright.
-- **Discovery copies** go to the per-repo estate graphs (default home
-  `~/.wicked-estate/repo-graphs/<key>/estate.db`, overridable via
-  `$WICKED_ESTATE_REPO_GRAPH_ROOT`); `--scope workspace` = every live repo graph gets a
-  replica.
+- **Discovery copies** go to the per-repo estate graphs under the daemon state home —
+  `<state home>/repo-graphs/<key>/estate.db`, where the state home is the parent of the engine's
+  `--db` (wicked-core#406; overridable via `$WICKED_ESTATE_REPO_GRAPH_ROOT`; the pre-#406
+  location `~/.wicked-estate/repo-graphs` is only the one-time migration source); `--scope
+  workspace` = every live repo graph gets a replica.
 - **Knowledge rationale** chunks land under the scope you pass, recallable via
   `knowledge.recall {scope_prefix: "wiki:"}`.
 - After any `wicked-estate index`, run `wicked-core rules relink` to re-derive the

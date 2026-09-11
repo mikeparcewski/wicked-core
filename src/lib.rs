@@ -93,7 +93,9 @@ pub use campaign::{
     CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
 };
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
-pub use code_graph::{index_repo, rank_symbols, recon_repo, RankedSymbol};
+pub use code_graph::{
+    index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, RankedSymbol,
+};
 pub use command::InjectTarget;
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
@@ -140,7 +142,10 @@ pub use project::{
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
     MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
-pub use repo::{coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoSpec};
+pub use repo::{
+    coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoFinding, RepoSpec,
+    FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
+};
 pub use repo_checks::{CheckRun, RepoCheck, RepoChecksReport};
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
@@ -1162,6 +1167,11 @@ impl Core {
     /// A run's recorded event history, oldest first — each entry the event's own tagged JSON
     /// ([`CoreEvent::to_json`], the same object `/ws` carries) plus a capture-time `ts` and an
     /// ordering `seq`.
+    ///
+    /// `seq` is strictly increasing within a run for the run's whole life, ACROSS daemon restarts
+    /// (core#408): a fresh engine continues a run's `seq` from its persisted log rather than from 0,
+    /// so the tail of this list is the run's latest event. The first entry a restarted engine
+    /// records for a run carries `daemonRestarted: true`; see [`crate::event_log`].
     ///
     /// This is the read half of FINDING-014. Consumers that need a run's event trail after the fact
     /// (evidence bundles, above all) read it HERE rather than re-deriving pseudo-events from unit

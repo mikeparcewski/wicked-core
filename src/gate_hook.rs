@@ -3578,7 +3578,7 @@ mod boundary_tests {
             launcher
                 .contains("armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref())"),
             "the ONLY widenings must be the launch-validated extra_write_roots riding the \
-             governance context and the ENGINE-resolved estate-home graph key dir \
+             governance context and the ENGINE-resolved repo-graph key dir \
              (`graph_write_dir`, never worker-controlled) — not env, not the unit, not the \
              workflow def"
         );
@@ -3607,15 +3607,17 @@ mod boundary_tests {
         // The wrapped carrier: extras enter WICKED_READ_ROOTS through `assemble_read_roots` —
         // never through `armed_write_roots`, whose exact argument list the test above pins.
         // Whitespace-collapsed so the audit pins the CALL, not rustfmt's line breaks — and only
-        // its STABLE prefix, through the third argument, so rustfmt's choice of a trailing comma
-        // before `)` cannot fail the audit either (Copilot, review pass 11). The third argument
+        // its STABLE prefix, through the fourth argument, so rustfmt's choice of a trailing comma
+        // before `)` cannot fail the audit either (Copilot, review pass 11). The second argument
+        // is the runner's operational state home (core#406): the graph-derived read root is
+        // recognised against THIS daemon's repo-graph root, never the default home's. The fourth
         // is the skills snapshot (core#396): the same one assembly read-widens to it.
         let launcher: String = include_str!("execute_wrapped.rs")
             .split_whitespace()
             .collect();
         assert!(
             launcher.contains(
-                "assemble_read_roots(g.code_graph_db.as_deref(),&g.extra_read_roots,g.skills_root.as_deref()"
+                "assemble_read_roots(g.code_graph_db.as_deref(),self.operational_home.as_deref(),&g.extra_read_roots,g.skills_root.as_deref()"
             ),
             "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
              skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"
