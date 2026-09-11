@@ -329,8 +329,10 @@ const DENIED_BASH: &[&str] = &[
 ///  2. **No filesystem boundary.** 41 of 331 path-bearing tool calls left the worktree.
 ///     `--disallowedTools` denies the file tools a path into the directories above.
 ///
-/// LIMITS, stated plainly: this is a deny-list, not a sandbox. `Read(...)` rules govern the file
-/// TOOLS — a `Bash(cat …)` of a denied path still gets through, and `DENIED_BASH` only names verbs
+/// LIMITS, stated plainly: this is a deny-list, not a sandbox. `Read(...)`/`Edit(...)` rules govern
+/// the file TOOLS (`Edit` covers every file-editing tool; a `Write(path)` rule is NOT matched by the
+/// CLI and is never emitted — [`enforceable_rule`]) — a `Bash(cat …)` of a denied path still gets
+/// through, and `DENIED_BASH` only names verbs
 /// that are unsalvageable rather than every command that could escape. The rules are also inert
 /// under `bypassPermissions` / `--dangerously-skip-permissions`, which is why the mode is pinned
 /// below; note the council's seat dispatch DOES pass that trust flag ([`wicked_council::dispatch`]),
@@ -429,7 +431,10 @@ pub(crate) fn inject_isolation_flags(
     // and admission (`fence_check`) already refused a snapshot the fence would cover. ALWAYS
     // injected — hatch or not — UNIONED with whatever the template itself denied.
     let mut rules = deny_rules(skills_plugin, operational_home)?;
-    for extra in lift_disallowed_tools(argv, prompt_ix) {
+    for extra in lift_disallowed_tools(argv, prompt_ix)
+        .into_iter()
+        .map(enforceable_rule)
+    {
         if !rules.contains(&extra) {
             rules.push(extra);
         }
@@ -526,6 +531,33 @@ fn strip_plugin_dir(argv: &mut Vec<String>, prompt_ix: Option<usize>) -> Vec<Str
     }
     *argv = out;
     stripped
+}
+
+/// A deny rule as the CLI actually enforces it (wicked-crew#524, acceptance finding F-3R2-004).
+///
+/// Claude Code's file-permission check matches path rules on `Read(<path>)` and `Edit(<path>)`
+/// ONLY — `Edit` rules cover every file-editing tool (Edit, Write, MultiEdit, NotebookEdit). A
+/// `Write(<path>)` rule is NOT consulted: the CLI (measured on 2.1.268) prints, once per such rule
+/// per launch, `Permission deny rule (…/settings.json): Write(<path>/**) is not matched by file
+/// permission checks — only Edit(path) rules are. Use Edit(<path>/**) instead (Edit rules cover
+/// all file-editing tools)`. The engine used to emit a `Write` twin beside every `Edit` rule: 12
+/// inert rules and 12 warnings on every claude ballot's stderr, and an operator reading the
+/// settings file saw `~/.ssh` "denied for Write" when only the `Edit` line did anything. So the
+/// engine's own rules are `Read` + `Edit` (see [`deny_rules`] / [`shared_deny_rules`]), and a
+/// template's OWN `Write(<path>)` deny — a template may add denies, never remove one — is rewritten
+/// to the `Edit(<path>)` form that enforces it instead of riding along inert. A BARE `Write` (the
+/// whole tool, no path) is a valid deny and is left alone.
+///
+/// Manual check against the live CLI (no automated test spawns claude): in a scratch config dir,
+/// `printf '{"permissions":{"deny":["Read(/tmp/fence/**)","Edit(/tmp/fence/**)"]}}' > s.json`,
+/// then `claude -p --settings s.json --setting-sources project,local --permission-mode acceptEdits
+/// 'use the Write tool to create /tmp/fence/probe.txt'` — expect NO `Permission deny rule` line on
+/// stderr, the write refused in the transcript, and no `/tmp/fence/probe.txt` afterwards.
+fn enforceable_rule(rule: String) -> String {
+    match rule.strip_prefix("Write(") {
+        Some(rest) if rest.ends_with(')') => format!("Edit({rest}"),
+        _ => rule,
+    }
 }
 
 /// Lift a template's OWN `--disallowedTools`/`--disallowed-tools` (either spelling, comma-joined
@@ -693,9 +725,9 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 /// state home. The default `~/.wicked-crew` keeps its blanket whenever it is not that launch's
 /// state home (v3.4 §2: the state home is derived from the snapshot path alone — the round-4
 /// companion variable `WICKED_CREW_STATE_HOME` is retired and not read; a custom state home is
-/// fenced only through a snapshot handed from it). `Edit`/`Write` keep the blanket
-/// `<dir>/**` everywhere: the snapshot is immutable by contract and a worker never writes under
-/// it. Both carriers use this (the `--disallowedTools` argv and the wrapped settings file; the
+/// fenced only through a snapshot handed from it). `Edit` keeps the blanket `<dir>/**`
+/// everywhere (the one write-side rule the CLI enforces — no `Write` twin, [`enforceable_rule`]):
+/// the snapshot is immutable by contract and a worker never writes under it. Both carriers use this (the `--disallowedTools` argv and the wrapped settings file; the
 /// ACP `session/new` options and per-session settings file), so the fence cannot differ by path.
 ///
 /// FAIL CLOSED, never widen: no runtime listing ever BUILDS a rule (pass 1 enumerated the state
@@ -782,9 +814,9 @@ pub(crate) fn deny_rules(
         } else {
             rules.push(format!("Read({p}/**)"));
         }
-        for tool in ["Edit", "Write"] {
-            rules.push(format!("{tool}({p}/**)"));
-        }
+        // `Edit(<path>)` is the ONE write-side rule the CLI enforces; see [`enforceable_rule`] for
+        // why no `Write(<path>)` twin is emitted (wicked-crew#524 / F-3R2-004).
+        rules.push(format!("Edit({p}/**)"));
     }
     rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
     Ok(rules)
@@ -812,7 +844,8 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
         }
         // Fail closed (codex round 9): the shared file is never written with a hole in it.
         let p = rule_path(&dir).ok_or_else(|| unspellable(&dir))?;
-        for tool in ["Read", "Edit", "Write"] {
+        // Read + Edit only: `Write(<path>)` is not a rule the CLI matches ([`enforceable_rule`]).
+        for tool in ["Read", "Edit"] {
             rules.push(format!("{tool}({p}/**)"));
         }
     }
@@ -4648,6 +4681,25 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        // wicked-crew#524 / F-3R2-004: the settings carrier holds NO `Write(<path>)` rule — the
+        // CLI does not match those ("only Edit(path) rules are") and warned once per rule per
+        // launch — while the `Read`/`Edit` fence and the Bash verbs are all there.
+        let deny: Vec<&str> = json["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !deny.iter().any(|r| r.starts_with("Write(")),
+            "an inert Write(<path>) rule reached the settings file: {deny:?}"
+        );
+        assert!(
+            deny.iter().any(|r| r.starts_with("Edit("))
+                && deny.iter().any(|r| r.starts_with("Read(")),
+            "the Read/Edit fence is in the settings file: {deny:?}"
+        );
+        assert!(deny.contains(&"Bash(sudo:*)"), "{deny:?}");
         assert_eq!(
             json["hooks"]["PreToolUse"][0]["matcher"], "*",
             "the hook governs EVERY tool"
@@ -7142,21 +7194,26 @@ mod tests {
         // FINDING-067: the daemon's OWN state home. `.wicked` was fenced and `.wicked-crew` was not,
         // which left `~/.wicked-crew/core.db` — every run, unit, policy and repo registration the
         // platform has — reachable by the file tools. Built through `rule_path` (not string-joined)
-        // so this asserts the rule as the matcher will actually see it, separators and all, and all
-        // three verbs are checked: a READ of that store is a cross-org leak on its own, before any
-        // write destroys anything.
+        // so this asserts the rule as the matcher will actually see it, separators and all, and both
+        // verbs the CLI enforces are checked: a READ of that store is a cross-org leak on its own,
+        // before any edit destroys anything. No `Write(<path>)` rule is emitted at all — the CLI
+        // does not match those (wicked-crew#524 / F-3R2-004, [`enforceable_rule`]).
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .expect("a home to derive rules from");
         let crew = rule_path(&home.join(".wicked-crew")).expect("the state home is expressible");
-        for tool in ["Read", "Edit", "Write"] {
+        for tool in ["Read", "Edit"] {
             let rule = format!("{tool}({crew}/**)");
             assert!(
                 denied.contains(&rule),
                 "the operational store's home must be denied: expected `{rule}` in {denied}"
             );
         }
+        assert!(
+            !denied.split(',').any(|r| r.starts_with("Write(")),
+            "no inert `Write(<path>)` rule may reach the CLI: {denied}"
+        );
         assert!(
             denied.contains("Bash(find /:*)") && denied.contains("Bash(pkill:*)"),
             "the two verbs no path rule can catch, both observed in campaign transcripts: {denied}"
@@ -7246,6 +7303,7 @@ mod tests {
             "--disallowedTools=Edit",
             "--disallowed-tools Edit,Write",
             "--disallowed-tools=Edit",
+            "--disallowedTools=Edit,Write(/srv/vault/**)",
         ] {
             let inv = format!("claude {stated} -p {{PROMPT}}");
             let mut argv = build_argv(&inv, "hi", &[]);
@@ -7264,9 +7322,20 @@ mod tests {
                 entries.contains(&"Edit"),
                 "the template's deny rides along: {argv:?}"
             );
-            if stated.contains("Write") {
+            if stated.contains("Edit,Write") && !stated.contains("Write(") {
+                // A BARE `Write` (the whole tool) is a valid deny and rides as stated…
                 assert!(entries.contains(&"Write"), "{argv:?}");
             }
+            if stated.contains("Write(/srv/vault/**)") {
+                // …but a `Write(<path>)` rule is inert on the CLI and is lifted as the `Edit(<path>)`
+                // form that enforces it (wicked-crew#524 / F-3R2-004).
+                assert!(entries.contains(&"Edit(/srv/vault/**)"), "{argv:?}");
+                assert!(!entries.contains(&"Write(/srv/vault/**)"), "{argv:?}");
+            }
+            assert!(
+                !entries.iter().any(|e| e.starts_with("Write(")),
+                "no `Write(<path>)` rule reaches the argv carrier: {argv:?}"
+            );
             for engine_rule in DENIED_BASH {
                 assert!(
                     entries.contains(engine_rule),
@@ -7302,6 +7371,62 @@ mod tests {
             &["--permission-modes".to_string()],
             &["--permission-mode"]
         ));
+    }
+
+    /// wicked-crew#524 / F-3R2-004 — every claude ballot's stderr carried 12 CLI warnings:
+    /// `Write(<path>/**) is not matched by file permission checks — only Edit(path) rules are`. The
+    /// engine emitted a `Write` twin beside each `Edit` rule; the twin was inert and the operator's
+    /// `~/.ssh`, `~/.claude` … fence read as stronger than it was. Neither generator emits a
+    /// `Write(<path>)` rule any more; the `Edit` rule (which the CLI applies to every file-editing
+    /// tool) and the `Read` rule stay; a template's own `Write(<path>)` is lifted as `Edit(<path>)`.
+    #[test]
+    fn no_write_path_rule_is_ever_emitted_only_the_enforced_edit_form() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        // `super::` — the tests module's own `deny_rules`/`shared_deny_rules` wrappers unwrap for
+        // the Unix fence fixtures; this test wants the real signatures on every platform.
+        let blanket = super::deny_rules(None, None).expect("blanket fence");
+        let shared = super::shared_deny_rules(None).expect("shared fence");
+        for rules in [&blanket, &shared] {
+            assert!(
+                !rules.iter().any(|r| r.starts_with("Write(")),
+                "an inert Write(<path>) rule: {rules:?}"
+            );
+            assert!(
+                rules.iter().any(|r| r.starts_with("Edit("))
+                    && rules.iter().any(|r| r.starts_with("Read(")),
+                "the Read/Edit fence is present: {rules:?}"
+            );
+            for verb in DENIED_BASH {
+                assert!(rules.contains(&verb.to_string()), "{rules:?}");
+            }
+        }
+        // Every fenced directory has exactly ONE write-side rule in the blanket fence, the Edit one.
+        for dir in denied_dirs(None) {
+            let p = rule_path(&dir).expect("expressible");
+            assert!(
+                blanket.contains(&format!("Edit({p}/**)")),
+                "Edit rule for {p}: {blanket:?}"
+            );
+            assert_eq!(
+                blanket
+                    .iter()
+                    .filter(|r| r.ends_with(&format!("({p}/**)")) && !r.starts_with("Read("))
+                    .count(),
+                1,
+                "one write-side rule per directory: {blanket:?}"
+            );
+        }
+        // The helper: only the `Write(<something>)` path form is rewritten; everything else rides.
+        assert_eq!(enforceable_rule("Write(/x/**)".into()), "Edit(/x/**)");
+        assert_eq!(
+            enforceable_rule("Write(C:/Users/me/.ssh/**)".into()),
+            "Edit(C:/Users/me/.ssh/**)"
+        );
+        assert_eq!(enforceable_rule("Write".into()), "Write");
+        assert_eq!(enforceable_rule("Edit(/x/**)".into()), "Edit(/x/**)");
+        assert_eq!(enforceable_rule("Read(/x/**)".into()), "Read(/x/**)");
+        assert_eq!(enforceable_rule("Bash(sudo:*)".into()), "Bash(sudo:*)");
+        assert_eq!(enforceable_rule("WriteFile(/x)".into()), "WriteFile(/x)");
     }
 
     /// The deny list is a `--disallowedTools` value AND a `permissions.deny` array in the settings
@@ -7803,6 +7928,12 @@ mod tests {
     /// `*` any run WITHOUT `/`, everything else is literal. The evaluator the fence tests judge the
     /// generated rule SET with — so a rule that covers the snapshot is caught as a set property,
     /// not by eyeballing strings.
+    ///
+    /// Tool semantics follow the CLI, not the string (wicked-crew#524 / F-3R2-004): an `Edit(…)`
+    /// rule governs EVERY file-editing tool (Edit, Write, MultiEdit, NotebookEdit — "Edit rules
+    /// cover all file-editing tools"), and a `Write(…)` PATH rule governs nothing ("is not matched
+    /// by file permission checks") — so a fence that only spelled `Write(…)` would fail these tests
+    /// exactly as it fails on the CLI.
     fn rule_denies(rule: &str, tool: &str, path: &str) -> bool {
         fn glob(p: &[u8], s: &[u8]) -> bool {
             match p {
@@ -7814,14 +7945,38 @@ mod tests {
                 [c, rest @ ..] => s.first() == Some(c) && glob(rest, &s[1..]),
             }
         }
-        rule.strip_prefix(tool)
-            .and_then(|r| r.strip_prefix('('))
-            .and_then(|r| r.strip_suffix(')'))
-            .is_some_and(|pattern| glob(pattern.as_bytes(), path.as_bytes()))
+        const FILE_EDITING_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+        let (rule_tool, rest) = match rule.split_once('(') {
+            Some((t, r)) => (t, r),
+            None => return false,
+        };
+        let governs = match rule_tool {
+            "Edit" => FILE_EDITING_TOOLS.contains(&tool),
+            "Write" => false, // inert on the CLI, whatever the pattern
+            other => other == tool,
+        };
+        governs
+            && rest
+                .strip_suffix(')')
+                .is_some_and(|pattern| glob(pattern.as_bytes(), path.as_bytes()))
     }
 
     #[test]
     fn the_rule_evaluator_reads_globs_the_way_permission_rules_are_written() {
+        // Tool semantics as the CLI applies them: `Edit(…)` covers every file-editing tool, a
+        // `Write(…)` path rule covers nothing (wicked-crew#524 / F-3R2-004).
+        for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            assert!(
+                rule_denies("Edit(/h/.ssh/**)", tool, "/h/.ssh/id_rsa"),
+                "{tool}"
+            );
+            assert!(
+                !rule_denies("Write(/h/.ssh/**)", tool, "/h/.ssh/id_rsa"),
+                "{tool}"
+            );
+        }
+        assert!(!rule_denies("Edit(/h/.ssh/**)", "Read", "/h/.ssh/id_rsa"));
+        assert!(!rule_denies("Edit(/h/.ssh/**)", "Bash", "/h/.ssh/id_rsa"));
         assert!(rule_denies(
             "Read(/h/.crew/**)",
             "Read",
@@ -7939,6 +8094,8 @@ mod tests {
                 p.display(),
                 denying(&fenced, "Read", &p)
             );
+            // Both through the ONE `Edit(…)` rule — the form the CLI applies to every
+            // file-editing tool (no `Write(…)` twin is emitted, wicked-crew#524).
             assert!(
                 !denying(&fenced, "Edit", &p).is_empty()
                     && !denying(&fenced, "Write", &p).is_empty(),
@@ -8008,9 +8165,11 @@ mod tests {
             !fenced.contains(&format!("Read({crew_rule}/**)")),
             "{fenced:?}"
         );
+        // The write side is the ONE `Edit(…)` blanket (the CLI applies it to every file-editing
+        // tool); no `Write(…)` twin is emitted (wicked-crew#524 / F-3R2-004).
         assert!(
             fenced.contains(&format!("Edit({crew_rule}/**)"))
-                && fenced.contains(&format!("Write({crew_rule}/**)")),
+                && !fenced.iter().any(|r| r.starts_with("Write(")),
             "{fenced:?}"
         );
         let claude_rule = rule_path(&home.join(".claude")).expect("expressible");
@@ -8119,7 +8278,7 @@ mod tests {
         assert!(
             !custom_fenced.contains(&format!("Read({custom_rule}/**)"))
                 && custom_fenced.contains(&format!("Edit({custom_rule}/**)"))
-                && custom_fenced.contains(&format!("Write({custom_rule}/**)")),
+                && !custom_fenced.iter().any(|r| r.starts_with("Write(")),
             "{custom_fenced:?}"
         );
         assert!(
