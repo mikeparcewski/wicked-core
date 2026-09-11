@@ -15,6 +15,17 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Chat scope validator hardening (core#410 follow-up; reviewer R11/b1–b3).** A `.`/`..` segment
+  anywhere in a chat scope's cwd, read roots or graph is refused by spelling before any containment
+  check (the worker-home rule, `spawn::refuse_dot_segments`), and a path whose MISSING tail still
+  carries `..` is refused rather than re-appended lexically — `/tmp/missing/../../<state home>`
+  could read as under the temp base while the kernel resolved it into the state home; the same rule
+  now guards `path_policy`'s launch-root resolution. Every read root must be an existing DIRECTORY
+  (a hard link to `core.db` placed elsewhere, a plain file or a missing path is refused). Scoped-chat
+  admission now also rests on the PROCESS the spawn produced: a seat relying on the kernel write
+  floor is refused when the floor did not arm (`sandbox_downgrade`), a governance-reliant seat when
+  the version pin did not prove the admitted adapter (`governance_verified == false`) — reported as
+  `ChatSessionFailed` with the reason.
 - **Per-seat configuration roots for EVERY CLI; a seat's startup banner never reaches the answer
   (acceptance findings F-010 / F-068, core#410).** FINDING-061 / F-030 isolated the CLAUDE seat
   (`CLAUDE_CONFIG_DIR` → the engine-owned worker home); every other seat kept running on the
