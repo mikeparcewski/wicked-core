@@ -586,6 +586,23 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.20** — npm release carrying the one engine change since 0.7.19, #433 (core#431 — the
+  Phase 3 acceptance re-run findings F-3R2-013 / -010 / -007 / -009): deliver lifts onto the current
+  base — a freshly minted worktree is based on the fetched remote default tip when the clone's
+  `HEAD` is strictly behind it (`runBaseResolved`), and the `deliver` unit lifts in memory (`git
+  merge-tree`) then re-verifies whenever the tree is not the verified tree (`deliverLiftEvaluated
+  {outcome: unchanged | lifted | conflict | skipped | failed}`; a manifest/lockfile move forces the
+  install step; both fetches are non-interactive); the engine restores the creator's tree on an
+  evaluator mutation and keeps the discarded edits reachable as a suggestion ref (`worktreeRestored
+  {discarded, suggestionRef}`); `gateEvaluated` names the judge (`judgeCli` / `judgeDistinct`);
+  read-only ACP evaluators — an admitted ACP seat's write-class tool call is refused under
+  `executes_code: false` (`evaluatorToolCallDenied`) and an unadmitted or unproven
+  (`governance_verified == false`) seat is rerouted to the wrapped carrier (`acpFallback
+  {fallbackKind: "read_only_requires_wrapped"}`); and the run-branch precondition — `HEAD` must be
+  attached to `refs/heads/wicked/<run>` before anything is lifted, reset or cleared. The four new
+  events are pinned in `index.d.ts` / `CoreEventJson`. **Coupling to note:** `wicked-crew-api-types`
+  0.33.0 and wicked-crew 0.7.30 consume the new events; crew 0.7.29 stays on `wicked-core-ts
+  ^0.7.19`.
 - **core-ts 0.7.19** — npm release carrying the engine changes since 0.7.18: event `seq` stays
   monotonic per run across daemon restarts — the first record an engine writes for a run raises the
   counter past the run's persisted max, and that record carries `daemonRestarted: true` (#420,
