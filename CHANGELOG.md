@@ -19,13 +19,13 @@ Two release tracks share this file, newest entry first regardless of track:
   anywhere in a chat scope's cwd, read roots or graph is refused by spelling before any containment
   check (the worker-home rule, `spawn::refuse_dot_segments`), and a path whose MISSING tail still
   carries `..` is refused rather than re-appended lexically — `/tmp/missing/../../<state home>`
-  could read as under the temp base while the kernel resolved it into the state home; the same rule
-  now guards `path_policy`'s launch-root resolution. Every read root must be an existing DIRECTORY
-  (a hard link to `core.db` placed elsewhere, a plain file or a missing path is refused). Scoped-chat
-  admission now also rests on the PROCESS the spawn produced: a seat relying on the kernel write
-  floor is refused when the floor did not arm (`sandbox_downgrade`), a governance-reliant seat when
-  the version pin did not prove the admitted adapter (`governance_verified == false`) — reported as
-  `ChatSessionFailed` with the reason.
+  could read as under the temp base while the kernel resolved it into the state home; launch extra
+  read/write roots now refuse any `.`/`..` segment in their spelling (was: only an unresolvable
+  tail). Every read root must be an existing DIRECTORY (a hard link to `core.db` placed elsewhere, a
+  plain file or a missing path is refused). Scoped-chat admission now also rests on the PROCESS the
+  spawn produced: a seat relying on the kernel write floor is refused when the floor did not arm
+  (`sandbox_downgrade`), a governance-reliant seat when the version pin did not prove the admitted
+  adapter (`governance_verified == false`) — reported as `ChatSessionFailed` with the reason.
 - **Per-seat configuration roots for EVERY CLI; a seat's startup banner never reaches the answer
   (acceptance findings F-010 / F-068, core#410).** FINDING-061 / F-030 isolated the CLAUDE seat
   (`CLAUDE_CONFIG_DIR` → the engine-owned worker home); every other seat kept running on the
@@ -586,6 +586,29 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.19** — npm release carrying the engine changes since 0.7.18: event `seq` stays
+  monotonic per run across daemon restarts — the first record an engine writes for a run raises the
+  counter past the run's persisted max, and that record carries `daemonRestarted: true` (#420,
+  core#408); dead-letter spool records carry `ts` / `pid` / `origin` (`WICKED_APPS_EMIT_ORIGIN`) and
+  the emit seam gains the `eventStoreCount` + `replayEmitOutbox` statics (#421, wicked-crew#495
+  companion), hardened by #429 (core#428 — greedy userinfo redaction, a legacy record's
+  `deadletter_reason` / `spooled_by` redacted before they become store metadata, the unstamped-line
+  conflation note); repo graphs live under the daemon state home and an in-tree `.codegraph` is
+  never adopted (#425, core#406), with the boot migration hardened — no-replace install, a relative
+  `WICKED_ESTATE_REPO_GRAPH_ROOT` rejected, a 300 s overall budget (#430); per-seat configuration
+  roots for EVERY CLI, a seat's startup banner never reaching the answer (#426, core#410), and the
+  chat-scope validator refusing dot segments and non-directory read roots with admission on an armed
+  floor (#435, #410 hardening); worker deny rules are the ones the CLI enforces — `Edit(path)`, no
+  inert `Write(path)` twin (#434, wicked-crew#524) with every inert path-rule form (`MultiEdit` /
+  `NotebookEdit` / `Glob`) lifted to its enforced twin and the `bypassPermissions` sentence
+  re-measured (#436); and the napi-release workflow now re-stamps main's lockfile itself after a
+  publish (#427 — #423 was the last manual re-stamp, for 0.7.18). **Not in this release:** #433
+  (deliver lifts onto the current base and re-verifies after a lift; the creator tree is restored on
+  evaluator mutation; the judge is named; read-only ACP evaluators) was still open when this train
+  left — it ships in core-ts 0.7.20 immediately after. **Coupling to note:** wicked-crew 0.7.29 pins
+  `wicked-core-ts ^0.7.19` (its `it.runIf(replayEmitOutboxSupported())` governance branch runs, not
+  skips, on this binding); `wicked-crew-api-types` 0.32.0 is already published, and 0.33.0 follows
+  with #433's wire.
 - **core-ts 0.7.18** — npm release carrying the two engine changes since 0.7.17: council ballots
   run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (#413, F-030 / F-031 / F-013
   — ONE carrier-aware, fail-closed resolver in `wicked_apps_core::spawn` shared by the ACP worker

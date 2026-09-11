@@ -1,6 +1,6 @@
 {
   "name": "wicked-core-ts",
-  "version": "0.7.18",
+  "version": "0.7.19",
   "description": "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-process orchestration engine from JS/TS.",
   "license": "MIT",
   "repository": {
@@ -43,11 +43,11 @@
     "typecheck": "tsc --noEmit -p types-test/tsconfig.json"
   },
   "optionalDependencies": {
-    "wicked-core-ts-darwin-x64": "0.7.18",
-    "wicked-core-ts-darwin-arm64": "0.7.18",
-    "wicked-core-ts-linux-x64-gnu": "0.7.18",
-    "wicked-core-ts-linux-arm64-gnu": "0.7.18",
-    "wicked-core-ts-win32-x64-msvc": "0.7.18"
+    "wicked-core-ts-darwin-x64": "0.7.19",
+    "wicked-core-ts-darwin-arm64": "0.7.19",
+    "wicked-core-ts-linux-x64-gnu": "0.7.19",
+    "wicked-core-ts-linux-arm64-gnu": "0.7.19",
+    "wicked-core-ts-win32-x64-msvc": "0.7.19"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
