@@ -10,6 +10,13 @@
 //! These tests go through the REAL engine (`Core::launch_run` → plan → distribute → dispatch),
 //! not the routing function alone: the seeded `onboarding` def, a registered repo, an empty seat
 //! pool, and a stub `wicked-estate` on `PATH` that records what it was handed.
+//!
+//! POSIX only (`#![cfg(unix)]` — the suite's idiom for script-driven tests: `p4a_wrapped`,
+//! `terminal`, `domain_extraction_e2e`): the stub is a shell script, which Windows can neither
+//! resolve on `PATH` without a `PATHEXT` extension nor exec by bare name (`CreateProcess` appends
+//! only `.exe`). The routing-level proofs in `src/distribute.rs` run on every platform.
+
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Command;
