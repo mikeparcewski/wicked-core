@@ -155,6 +155,26 @@ fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// The distribution of a Tool-executor unit: the engine's own command, handed to no seat — its
+/// `assigned_cli` is the tool's program token (the operator reads `wicked-estate`, not a seat
+/// key), no invocation, no council, routing `tool`. The caller sets `benched` when a bench rides.
+fn tool_distribution(unit: &WorkUnit) -> Distribution {
+    Distribution {
+        assigned_cli: unit
+            .tool_cmd
+            .as_ref()
+            .and_then(|c| c.first())
+            .cloned()
+            .unwrap_or_else(|| "__tool__".to_string()),
+        assigned_invocation: None,
+        council_task_ref: None,
+        routing: RoutingInfo::Tool,
+        seat_constraint: None,
+        degraded_reason: None,
+        benched: Vec::new(),
+    }
+}
+
 const DISTRIBUTE_CRITERIA: &[&str] = &["general"];
 
 /// Convene the council (in-process) for every unit, persisting its task/verdict on the SHARED store
@@ -331,6 +351,11 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
 
 /// The routing core, honouring a bench set (F-7R2-006). Rules, in order:
 ///
+/// 0. SEAT REQUIREMENT is per UNIT (F-E2E-011) — a Tool-executor unit (`tool_cmd`) is the engine's
+///    own command: it convenes no council and is handed to no seat. A plan whose EVERY unit is a
+///    tool therefore needs no seat at all and is routed `tool` before any eligibility verdict —
+///    crew launches such a run (`onboarding`: index + annotate) with `clis: []` by design
+///    (wicked-crew#533). Rules 1–3 apply once at least one planned unit needs a seat.
 /// 1. ELIGIBILITY — the seats the launcher declared unusable (`health.usable == false`) and every
 ///    seat in `prior_benched` are set aside; the council convenes over the rest (so
 ///    `councilConvened.clis` names only eligible seats). An empty eligible set REFUSES the plan by
@@ -356,6 +381,21 @@ pub(crate) fn distribute_units_against_benched(
     let mut benched: Vec<BenchedSeat> = prior_benched.to_vec();
     for seat in launcher_benched(configured) {
         crate::domain::bench_seat(&mut benched, seat);
+    }
+    // (F-E2E-011, rule 0) No planned unit needs a seat ⇒ nothing to elect and nothing to refuse:
+    // every unit is routed `tool` here, before the eligibility verdict below can read an empty
+    // roster as "every configured seat is benched" (a 1-second `sessionFailed` on every
+    // onboarding run, with a "sign a seat in" remedy for a run that seats nobody). The bench still
+    // rides every distribution, so a launcher-declared unusable seat is persisted exactly as it
+    // would be for a seated plan.
+    if units.iter().all(|u| u.tool_cmd.is_some()) {
+        return Ok(units
+            .iter()
+            .map(|u| Distribution {
+                benched: benched.clone(),
+                ..tool_distribution(u)
+            })
+            .collect());
     }
     let eligible: Vec<AgenticCli> = eligible_seats(configured, &benched)
         .into_iter()
@@ -426,23 +466,7 @@ pub(crate) fn distribute_units_against_benched(
             .map(|(unit, candidates)| {
                 s.spawn(move || {
                     if unit.tool_cmd.is_some() {
-                        Ok((
-                            Distribution {
-                                assigned_cli: unit
-                                    .tool_cmd
-                                    .as_ref()
-                                    .and_then(|c| c.first())
-                                    .cloned()
-                                    .unwrap_or_else(|| "__tool__".to_string()),
-                                assigned_invocation: None,
-                                council_task_ref: None,
-                                routing: RoutingInfo::Tool,
-                                seat_constraint: None,
-                                degraded_reason: None,
-                                benched: Vec::new(),
-                            },
-                            Vec::new(),
-                        ))
+                        Ok((tool_distribution(unit), Vec::new()))
                     } else {
                         // The council votes among the CANDIDATES — the whole roster, or the seats
                         // the unit's skills admit. A single candidate takes the single-seat path
@@ -2153,6 +2177,146 @@ mod tests {
         assert!(
             msg.contains("codex (signed out — launcher)")
                 && msg.contains("pi (dispatch budget — launcher)"),
+            "{msg}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");
+    }
+
+    // ── F-E2E-011: the seat requirement is per UNIT — a tool-only plan needs no seat ──────────
+
+    /// A Tool-executor unit in the seeded onboarding shape (`wicked-estate <verb> …`).
+    fn tool_unit(ord: u32, verb: &str) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("u{ord}"), "s1", ord, format!("{verb} the repo"));
+        u.tool_cmd = Some(vec!["wicked-estate".into(), verb.into()]);
+        u
+    }
+
+    /// crew hands a tool-only workflow (`onboarding`) `clis: []` (wicked-crew#533): every unit
+    /// routes `tool` to the tool's own program, no ballot is dispatched and nothing is refused —
+    /// core-ts 0.7.22 bailed "every configured seat is benched" here, 1 s into every onboarding.
+    #[test]
+    fn a_tool_only_plan_needs_no_seat_and_routes_tool_on_an_empty_roster() {
+        let (dispatcher, calls) = spy();
+        let dists = distribute_units_against_benched(
+            &[tool_unit(1, "index"), tool_unit(2, "clusters")],
+            &[],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("a plan that seats nobody is not refused for having no seat");
+        assert_eq!(dists.len(), 2);
+        for d in &dists {
+            assert_eq!(d.assigned_cli, "wicked-estate");
+            assert!(matches!(d.routing, RoutingInfo::Tool), "{:?}", d.routing);
+            assert_eq!(d.assigned_invocation, None);
+            assert_eq!(d.council_task_ref, None);
+            assert_eq!(d.degraded_reason, None);
+            assert!(d.benched.is_empty());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");
+    }
+
+    /// A tool-only plan on a roster whose EVERY seat is benched proceeds too — the seats are
+    /// irrelevant to it — and the whole bench (prior + launcher) rides each distribution for the
+    /// actor to persist, exactly as it would for a seated plan.
+    #[test]
+    fn a_tool_only_plan_on_an_all_benched_roster_routes_tool_and_carries_the_bench() {
+        let (dispatcher, calls) = spy();
+        let mut codex = seat("codex");
+        codex.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
+        let prior = BenchedSeat {
+            cli: "pi".into(),
+            reason: "not_logged_in".into(),
+            source: "ballot".into(),
+        };
+        let dists = distribute_units_against_benched(
+            &[tool_unit(1, "index")],
+            &[codex, seat("pi")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[prior],
+        )
+        .expect("the tool unit routes; the bench is not a refusal");
+        assert_eq!(dists[0].assigned_cli, "wicked-estate");
+        assert!(matches!(dists[0].routing, RoutingInfo::Tool));
+        assert_eq!(
+            dists[0].degraded_reason, None,
+            "a tool unit is never degraded by the bench"
+        );
+        let mut benched: Vec<(&str, &str)> = dists[0]
+            .benched
+            .iter()
+            .map(|b| (b.cli.as_str(), b.source.as_str()))
+            .collect();
+        benched.sort();
+        assert_eq!(benched, vec![("codex", "launcher"), ("pi", "ballot")]);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");
+    }
+
+    /// The refusal is unchanged the moment a unit NEEDS a seat: a tool unit beside an agent unit
+    /// on an empty roster is refused by the existing message, before any ballot.
+    #[test]
+    fn a_mixed_plan_with_an_agent_unit_and_no_seat_is_still_refused() {
+        let (dispatcher, calls) = spy();
+        let err = distribute_units_against_benched(
+            &[
+                tool_unit(1, "index"),
+                WorkUnit::pending("u2", "s1", 2, "Build the thing"),
+            ],
+            &[],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect_err("the agent unit needs a seat and none is configured");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no eligible seat for s1")
+                && msg.contains("every configured seat is benched"),
+            "{msg}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");
+    }
+
+    /// (F-7R2-006 unchanged) …and on a roster whose every seat is benched, the refusal still
+    /// names the benched seats — the tool unit does not lend the agent unit a seat.
+    #[test]
+    fn a_mixed_plan_on_an_all_benched_roster_is_still_refused_by_name() {
+        let (dispatcher, calls) = spy();
+        let mut codex = seat("codex");
+        codex.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
+        let err = distribute_units_against_benched(
+            &[
+                tool_unit(1, "index"),
+                WorkUnit::pending("u2", "s1", 2, "Build the thing"),
+            ],
+            &[codex],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect_err("no eligible seat for the agent unit");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("every configured seat is benched")
+                && msg.contains("codex (signed out — launcher)"),
             "{msg}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");

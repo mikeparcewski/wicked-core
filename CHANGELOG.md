@@ -139,6 +139,22 @@ Two release tracks share this file, newest entry first regardless of track:
   and an unescaped backtick read the same) and the tsc step `npm ci --ignore-scripts`. The core-ts
   CI job now `node --check`s the script AND runs it against the committed `index.d.ts`, requiring a
   byte-identical result. No shipped artifact changes; no version bump.
+- **A plan whose every unit is a Tool executor needs no CLI seat (F-E2E-011).** On crew 0.7.31 +
+  core-ts 0.7.22 every `onboarding` run failed about one second after launch: crew hands the
+  tool-only workflow an empty seat pool by design (wicked-crew#533 — its two `wicked-estate`
+  phases convene no council), and the wave-6 routing core (#449) refused the plan for an empty
+  eligible seat set BEFORE it looked at executor types — `sessionStarted {cliCount: 0}` → "no
+  eligible seat … every configured seat is benched — (sign a seat in, or add one …)" →
+  `sessionFailed`, a remedy for a run that seats nobody. No registered repo got a graph. The seat
+  requirement is now per UNIT: a plan whose every unit carries a `tool_cmd` is routed `tool`
+  before any eligibility verdict (the bench still rides each distribution and is persisted as
+  before), and the refusal fires only when at least one planned unit needs a seat — a tool unit
+  beside an agent unit on an empty or all-benched roster is refused exactly as before, by the same
+  message. Proven through the engine, not the routing function alone: the SEEDED `onboarding` def
+  launched with `clis: []` against a registered repo distributes both units to `wicked-estate`,
+  spawns them with the repo bound in, and completes; a tool + agent plan with `clis: []` still
+  fails with the existing message; the #449 bench tests are unchanged. Wire: additive
+  (`unitDistributed` reads exactly as before). No version bump.
 - **Creators keep `Write`/`Edit` inside their granted write roots; the read-only fence is for
   evaluators (acceptance finding F-4R2-004, wave 5).** F-036's read-only posture was keyed on the
   worktree guard's marker alone (`worktree_guarded` = `!executes_code && !tool`), which is a
