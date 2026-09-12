@@ -71,6 +71,7 @@ fn spec(session_id: &str, problem: &str) -> LaunchSpec {
         entity_mode: wicked_core::EntityMode::Shared,
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),

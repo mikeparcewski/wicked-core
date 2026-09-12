@@ -342,6 +342,7 @@ mod tests {
             entity_mode: EntityMode::Shared,
             session_id: "run-reassign".to_string(),
             human_confirm: HumanConfirm::default(),
+            auto_deliver: false,
             repo_ref: None,
             workflow: None,
             extra_write_roots: Vec::new(),

@@ -127,6 +127,7 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
             entity_mode: EntityMode::Shared,
             session_id: "r".into(),
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             repo_ref: None,
             workflow: Some("unresolvable-pin".into()),
             extra_write_roots: Vec::new(),

@@ -1085,6 +1085,7 @@ pub(crate) fn run(
                     entity_mode,
                     session_id,
                     human_confirm: _, // legacy straight-through path ignores gates
+                    auto_deliver: _,  // …and composes no deliver unit to gate
                     repo_ref: _,      // legacy path has no worktree
                     workflow,
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
@@ -1246,6 +1247,7 @@ pub(crate) fn run(
                         clis: cli_keys,
                         status: SessionStatus::Planning,
                         human_confirm: spec.human_confirm,
+                        auto_deliver: spec.auto_deliver,
                         unit_ix: 0,
                         attempt: 0,
                         workdir: None, // resolved off-thread; updated in WorktreeReady
@@ -1343,6 +1345,7 @@ pub(crate) fn run(
                     spec.entity_mode,
                     &run_id,
                     spec.human_confirm,
+                    spec.auto_deliver,
                     repo_ref,
                     workdir,
                     spec.extra_write_roots.clone(),
@@ -1516,6 +1519,7 @@ pub(crate) fn run(
                     spec.entity_mode,
                     &run_id,
                     spec.human_confirm,
+                    spec.auto_deliver,
                     repo_ref.clone(),
                     workdir.clone(),
                     spec.extra_write_roots.clone(),
@@ -3007,6 +3011,7 @@ pub(crate) fn run(
                                     // The failed unit's own output is the artifact: the operator
                                     // is judging what unit `ord` produced, not the next phase.
                                     Some(ord),
+                                    "failure",
                                     prompt,
                                 ) {
                                     emit_run_error(&mut subscribers, &run_id, e);
@@ -3051,6 +3056,7 @@ pub(crate) fn run(
                             &mut session,
                             ord,
                             Some(ord),
+                            "triage",
                             prompt,
                         ) {
                             emit_run_error(&mut subscribers, &run_id, e);
@@ -3328,6 +3334,7 @@ pub(crate) fn launch_run_inner(
         spec.entity_mode,
         &run_id,
         spec.human_confirm,
+        spec.auto_deliver,
         repo_ref,
         workdir,
         spec.extra_write_roots.clone(),
@@ -4488,6 +4495,7 @@ fn apply_step_result(
                         &mut session,
                         ord,
                         Some(ord),
+                        "failure",
                         prompt,
                     )?;
                     return Ok(StepApplied::Paused);
@@ -4996,6 +5004,7 @@ fn apply_step_result(
                 // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
                 // reviewed unit coincide here.
                 Some(ord),
+                "escalation",
                 prompt,
             )?;
             return Ok(StepApplied::Paused);
@@ -5110,7 +5119,13 @@ pub(crate) const DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS: u64 = 14;
 /// Whether a session's worktree is RETAINED right now: Completed, not archived, finished within
 /// the retention window. A completed run with no `finished_at` (pre-wave-6) is not retained.
 pub(crate) fn worktree_retained(session: &crate::domain::AgentSession, now_ms: i64) -> bool {
-    if session.status != SessionStatus::Completed || session.archived_at.is_some() {
+    // A CANCELLED run's kept-dirty tree (F-E2E-028) rides the same window as a completed one
+    // (review of #456, F6): retained until the window elapses, then reaped clean-only again.
+    if !matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled
+    ) || session.archived_at.is_some()
+    {
         return false;
     }
     let (Some(finished), Some(window)) = (session.finished_at, completed_worktree_retention())
@@ -5323,6 +5338,7 @@ fn partition_sessions_for_reap(
 /// campaign node's slot (deferred, non-re-entrant). Shared by the pre-unit gate ([`advance_or_pause`]),
 /// the CONDITIONAL verdict gate (seam finding #3), and the TERMINAL gate (seam finding #4) so all three
 /// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
+#[allow(clippy::too_many_arguments)]
 fn pause_for_human(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -5330,6 +5346,10 @@ fn pause_for_human(
     session: &mut crate::domain::AgentSession,
     ord: u32,
     reviewing_ord: Option<u32>,
+    // WHY the run pauses (review of #456, F7) — `run_level` | `def` | `deliver` | `terminal` |
+    // `escalation` | `failure` | `triage`; rides `AwaitingHuman.gate_kind` and the durable
+    // interaction request so a consumer never keys on the prompt's wording.
+    gate_kind: &str,
     prompt: String,
 ) -> anyhow::Result<()> {
     session.status = SessionStatus::AwaitingHuman;
@@ -5341,6 +5361,7 @@ fn pause_for_human(
         ord,
         reviewing_ord,
         &prompt,
+        gate_kind,
         crate::interaction::now_millis(),
     );
     crate::domain::put_nodes(store, &[session.to_node(), request.to_node()])?;
@@ -5351,6 +5372,7 @@ fn pause_for_human(
             ord,
             reviewing_ord,
             prompt: prompt.clone(),
+            gate_kind: gate_kind.to_string(),
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
@@ -5402,6 +5424,7 @@ fn advance_or_pause(
                     // The terminal gate is always DEF-declared — `term`'s own `GateSpec` is what
                     // this branch matched on — so it is attributable, and to itself.
                     Some(term.ord),
+                    "terminal",
                     format!(
                         "Approve completion after the final phase (unit {}): {}{}",
                         term.ord, term.description, note
@@ -5418,6 +5441,11 @@ fn advance_or_pause(
         // fires AFTER the preceding phase's work, so the artifact under review is that phase's
         // output — naming the upcoming phase instead (FINDING-032) pointed the operator at work
         // that had not run and, in the common case, at a phase that had declared no gate at all.
+        let gate_kind = match reason {
+            PauseReason::DefGate { .. } => "def",
+            PauseReason::RunLevel => "run_level",
+            PauseReason::DeliverGate { .. } => "deliver",
+        };
         let (reviewing_ord, prompt) = match reason {
             PauseReason::DefGate { reviewing_ord } => {
                 let done = units.iter().find(|u| u.ord == reviewing_ord).map_or_else(
@@ -5443,6 +5471,32 @@ fn advance_or_pause(
                     unit.ord, unit.description
                 ),
             ),
+            PauseReason::DeliverGate { reviewing_ord } => {
+                // Name what leaves the machine, and under whose account: the operator's
+                // playbook step "pin `gh auth switch` immediately before approving the deliver
+                // gate" is only executable when there IS a gate that says so.
+                let branch = session
+                    .run_branch
+                    .clone()
+                    .unwrap_or_else(|| crate::repo::worktree_branch(run_id));
+                let repo = session
+                    .repo_ref
+                    .as_deref()
+                    .map_or_else(|| "the run's repository".to_string(), |r| format!("`{r}`"));
+                (
+                    reviewing_ord,
+                    format!(
+                        "Approve delivery before unit {} runs: {}. This step leaves the machine \
+                         — it commits the run's verified work, pushes branch `{branch}` to the \
+                         remote and opens a pull request on {repo} under the gh account active \
+                         in the daemon's environment (pin it now if it must differ). Merge stays \
+                         yours. Reject cancels the run and keeps the worktree and its \
+                         uncommitted work on disk. [deliver gate: engine-enforced unless the \
+                         launch set autoDeliver: true]",
+                        unit.ord, unit.description
+                    ),
+                )
+            }
         };
         let ord = unit.ord;
         pause_for_human(
@@ -5452,6 +5506,7 @@ fn advance_or_pause(
             &mut session,
             ord,
             reviewing_ord,
+            gate_kind,
             prompt,
         )?;
         return Ok(Progress::Paused);
@@ -5544,6 +5599,11 @@ enum PauseReason {
     /// The PRECEDING phase declared the gate; its ord is carried so the prompt and the event can
     /// name the phase whose output is actually being approved.
     DefGate { reviewing_ord: u32 },
+    /// The upcoming unit is the run's DELIVER phase (F-E2E-030): it pushes the run branch and
+    /// opens a pull request — the one step that leaves the machine — and the launch did not opt
+    /// out (`auto_deliver: false`). `reviewing_ord` is the preceding unit whose verified output is
+    /// what the human is releasing, when there is one.
+    DeliverGate { reviewing_ord: Option<u32> },
 }
 
 /// Why to pause for a human before dispatching `units[unit_ix]`, or `None` to dispatch. Two sources:
@@ -5574,6 +5634,23 @@ fn should_pause(
     unit_ix: usize,
 ) -> Option<PauseReason> {
     let ord = units[unit_ix].ord;
+    // DELIVER GATE (F-E2E-030): the deliver unit pushes the run branch to the remote and opens the
+    // PR under whatever `gh` account the daemon holds — a step a customer must be able to review
+    // (and pin their account for) BEFORE it leaves the machine. Run 0ab5ccb8 launched under the
+    // composer's default `before:1` posture and the only human gate was the intake; verify passed,
+    // and the push followed unattended. So the deliver unit is gated by the ENGINE, not by the
+    // posture: it pauses unless the launch said `auto_deliver: true` — an explicit, non-default
+    // signal (an absent wire field is `false`), never `human_confirm: none`, which is also the
+    // default and the typo fallback (FINDING-019/023). Judged first: a def gate on the preceding
+    // phase would pause here anyway, and this prompt is the one that names the push.
+    if !session.auto_deliver && crate::deliver_lift::is_deliver_unit(&units[unit_ix]) {
+        return Some(PauseReason::DeliverGate {
+            reviewing_ord: unit_ix
+                .checked_sub(1)
+                .and_then(|i| units.get(i))
+                .map(|prev| prev.ord),
+        });
+    }
     let run_level = match session.human_confirm {
         crate::domain::HumanConfirm::None => false,
         crate::domain::HumanConfirm::All => true,
@@ -6811,12 +6888,35 @@ pub(crate) fn cancel_run(
              (the prompt may keep rendering as open): {e}"
         );
     }
-    // FORCE-discard the worktree — Cancel is the operator explicitly abandoning the work, the one
-    // terminal status where uncommitted bytes are discarded on purpose. Completed/Failed runs reap
-    // through `reap_terminal_worktree` instead (FINDING-003): a clean tree goes, unlanded work stays.
+    // Reap the worktree by the SAME rule every other terminal status uses (FINDING-003): a clean
+    // tree goes, a dirty one stays and is named. Cancel used to FORCE-discard it — and run
+    // 01234444 (F-E2E-028) showed what that costs: the operator rejected an escalation gate to
+    // stop a verify loop, and the creator's uncommitted fix (3 files, $1.37 of work) survived only
+    // as an unreferenced tree object while the evaluator's DISCARDED edit was kept under
+    // `refs/wicked/suggestions`. A reject at the deliver gate (F-E2E-030) is the same cancel, one
+    // phase later, over verified-but-unpushed work. Uncommitted bytes are never a run's to discard
+    // on the operator's behalf; the boot reaper applies this rule to cancelled runs too.
     if let Some(repo_id) = &session.repo_ref {
         if let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) {
-            crate::repo::remove_worktree(&repo.root_path, run_id);
+            let reaped = crate::repo::reap_worktree_if_clean(&repo.root_path, run_id);
+            if !reaped {
+                // Review of #456, F6: say it on the wire, not only on stderr — the operator's
+                // work survived and this is where. The retention window then applies to the
+                // cancelled tree exactly as to a completed one (`worktree_retained`).
+                emit(
+                    subscribers,
+                    CoreEvent::WorktreeRetained {
+                        session: run_id.to_string(),
+                        path: session.workdir.clone().unwrap_or_default(),
+                        reason: format!(
+                            "cancelled with uncommitted work the `{}` branch does not carry — \
+                             the worktree is kept (clean-only reap; retained for \
+                             WICKED_COMPLETED_WORKTREE_KEEP_DAYS, then reaped clean-only again)",
+                            crate::repo::worktree_branch(run_id)
+                        ),
+                    },
+                );
+            }
         }
     }
     emit(
@@ -7132,6 +7232,7 @@ mod gate_pause_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: hc,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,
@@ -7190,6 +7291,86 @@ mod gate_pause_tests {
             None,
             "no preceding phase ⇒ no def pause"
         );
+    }
+
+    /// The run's deliver unit as crew composes it: a Tool executor whose phase id is `deliver`.
+    fn deliver_unit(ord: u32, status: UnitStatus) -> WorkUnit {
+        let mut u = WorkUnit::pending("s:deliver".to_string(), "s", ord, "deliver — push + PR");
+        u.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "echo deliver".into()]);
+        u.status = status;
+        u
+    }
+
+    #[test]
+    fn the_deliver_unit_pauses_by_default_whatever_the_run_level_policy_says() {
+        // F-E2E-030: run 0ab5ccb8 launched under `before:1` — the intake gate was the only human
+        // gate, verify passed, and the push + PR followed unattended. The deliver unit is gated by
+        // the ENGINE: `human_confirm` None / Before(1) / All all pause before it.
+        let units = vec![
+            unit(1, GateSpec::Auto, UnitStatus::Done),
+            unit(
+                2,
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                UnitStatus::Done,
+            ),
+            deliver_unit(3, UnitStatus::Pending),
+        ];
+        for hc in [
+            HumanConfirm::None,
+            HumanConfirm::Before(1),
+            HumanConfirm::All,
+        ] {
+            assert_eq!(
+                should_pause(&sess(hc), &units, 2),
+                Some(PauseReason::DeliverGate {
+                    reviewing_ord: Some(2)
+                }),
+                "{hc:?}: the deliver unit is human-confirmed, attributing the verified output \
+                 of the preceding unit"
+            );
+        }
+        // The units BEFORE it are untouched by the deliver gate: `before:1` still gates unit 1
+        // only, and unit 2 dispatches straight after a passed unit 1.
+        let s = sess(HumanConfirm::Before(1));
+        assert_eq!(should_pause(&s, &units, 0), Some(PauseReason::RunLevel));
+        assert_eq!(should_pause(&s, &units, 1), None);
+        // A deliver unit that is the run's FIRST unit still pauses, reviewing nothing.
+        let only = vec![deliver_unit(1, UnitStatus::Pending)];
+        assert_eq!(
+            should_pause(&sess(HumanConfirm::None), &only, 0),
+            Some(PauseReason::DeliverGate {
+                reviewing_ord: None
+            })
+        );
+    }
+
+    #[test]
+    fn auto_deliver_is_the_explicit_opt_out_and_other_tool_units_are_never_deliver_gated() {
+        let units = vec![
+            unit(1, GateSpec::Auto, UnitStatus::Done),
+            deliver_unit(2, UnitStatus::Pending),
+        ];
+        let mut s = sess(HumanConfirm::None);
+        s.auto_deliver = true;
+        assert_eq!(
+            should_pause(&s, &units, 1),
+            None,
+            "autoDeliver: true — the explicit, non-default signal — lets the deliver unit run"
+        );
+        // …while the run-level policy still applies on its own terms.
+        let mut all = sess(HumanConfirm::All);
+        all.auto_deliver = true;
+        assert_eq!(should_pause(&all, &units, 1), Some(PauseReason::RunLevel));
+        // A Tool unit that is NOT the deliver phase (a `domain-graph` persist step) is not gated.
+        let mut other_tool = unit(2, GateSpec::Auto, UnitStatus::Pending);
+        other_tool.tool_cmd = Some(vec!["wicked-core".into(), "domain-graph".into()]);
+        let units = vec![unit(1, GateSpec::Auto, UnitStatus::Done), other_tool];
+        assert_eq!(should_pause(&sess(HumanConfirm::None), &units, 1), None);
+        // An AGENT unit whose phase happens to be named `deliver` is not the deliver unit either.
+        let mut agent = WorkUnit::pending("s:deliver".to_string(), "s", 2, "d");
+        agent.status = UnitStatus::Pending;
+        let units = vec![unit(1, GateSpec::Auto, UnitStatus::Done), agent];
+        assert_eq!(should_pause(&sess(HumanConfirm::None), &units, 1), None);
     }
 
     #[test]
@@ -7300,6 +7481,7 @@ mod terminal_gate_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 1, // cursor is PAST the single (terminal) unit — the run is out of units
             attempt: 0,
             workdir: None,
@@ -7437,6 +7619,7 @@ mod substance_gate_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,
@@ -7724,6 +7907,7 @@ mod code_evidence_floor_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir,
@@ -8088,6 +8272,7 @@ mod deliverable_floor_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir,
@@ -8495,6 +8680,7 @@ mod seat_failover_tests {
             clis: clis.iter().map(|c| c.to_string()).collect(),
             status,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix,
             attempt: 0,
             workdir: None,
@@ -9135,6 +9321,7 @@ mod def_gate_disclosure_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: hc,
+            auto_deliver: false,
             unit_ix: 1,
             attempt: 0,
             workdir: None,
@@ -9238,6 +9425,7 @@ mod def_gate_disclosure_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 1, // past the single terminal unit
             attempt: 0,
             workdir: None,
@@ -9495,6 +9683,7 @@ mod terminal_worktree_reap_tests {
             clis: vec![],
             status,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: Some(wt.to_string_lossy().to_string()),
@@ -9965,6 +10154,7 @@ mod terminal_worktree_reap_tests {
             clis: vec![],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,
@@ -10133,6 +10323,7 @@ mod worker_code_graph_tests {
             clis: vec![],
             status,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,
@@ -10452,6 +10643,7 @@ mod project_graph_binding_tests {
             clis: Vec::new(),
             status: SessionStatus::Executing,
             human_confirm: crate::domain::HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,
@@ -11191,6 +11383,7 @@ mod phase_boundary_governance_tests {
             clis: vec!["claude".into()],
             status: SessionStatus::AwaitingHuman,
             human_confirm: HumanConfirm::All,
+            auto_deliver: false,
             unit_ix: 0, // cursor at unit 0
             attempt: 0,
             workdir: None,
@@ -11593,6 +11786,7 @@ mod turn_timeout_vs_cancel_tests {
             clis: vec!["claude".into(), "codex".into()],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt,
             workdir: None,
@@ -11769,6 +11963,7 @@ mod turn_timeout_vs_cancel_tests {
             clis: vec![],
             status: SessionStatus::Completed,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: Some("/tmp/wt".into()),
@@ -11843,6 +12038,7 @@ mod turn_timeout_vs_cancel_tests {
             clis: vec!["a".into(), "b".into(), "c".into()],
             status: SessionStatus::Executing,
             human_confirm: HumanConfirm::None,
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,

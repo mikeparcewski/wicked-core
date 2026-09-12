@@ -15,6 +15,85 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Deliver gate (acceptance finding F-E2E-030).** Run `0ab5ccb8` launched under the studio
+  composer's default posture (`humanConfirm: before:1`): the intake gate was the only human gate,
+  verify passed, and the crew-composed `deliver` Tool unit pushed `wicked/<run>` and opened the PR
+  unattended, under whatever `gh` account the daemon held. The ENGINE now gates the deliver unit:
+  `should_pause` pauses before a Tool unit whose phase id is `deliver` (`deliver_lift::is_deliver_unit`,
+  the same recognition the lift uses) whatever the run-level `human_confirm` says, with a prompt
+  that names the push (branch, repository, "under the gh account active in the daemon's
+  environment — pin it now if it must differ"). The one opt-out is EXPLICIT and non-default:
+  `LaunchSpec.auto_deliver: bool` / core-ts `LaunchOptions.autoDeliver?: boolean` (absent ⇒ `false`
+  ⇒ gated), persisted as `AgentSession.auto_deliver` (serde-default, additive on the run DTO) so a
+  resume re-arms the same posture. `human_confirm: none` is NOT an opt-out (FINDING-019/023: it is
+  also the enum default and the typo fallback). A def gate on the preceding phase still fires as
+  before; the deliver gate is judged first so its prompt is the one shown. Behaviour change for
+  the non-daemon launchers — the `wicked-core` CLI, the bus bridge and campaign nodes — whose runs
+  compose a deliver phase: they now park `awaiting_human` before it, and expose no `auto_deliver`
+  opt-out in v1.
+- **Floor provisioning by declared dependencies (F-E2E-029 a).** `repo_checks::detect` installed
+  only when `node_modules/` was ABSENT. Run `0ab5ccb8`'s nested worktree carried a `node_modules/`
+  holding only vitest's cache (written when the creator ran the suite; Node had resolved the
+  runner upward into the customer's clone), so the floor skipped the install, `npm run test`
+  started and three path-relative suites died on ENOENT under `node_modules/wicked-crew-api-types/`
+  — a deterministic denial cleared only by steering the evaluator to `npm ci`. The floor now
+  installs when `node_modules/` is absent OR any DECLARED top-level dependency (`dependencies` +
+  `devDependencies`; a symlinked package counts, optional/peer are not required) lacks
+  `node_modules/<name>/package.json`; the `install` check's `source` names the first missing
+  dependency. A failed install is reported as **dependency provisioning failed … an environment
+  finding, not a verdict on the change** (with the lockfile, the reason, and the install's own
+  output), never a bare ENOENT denial — the gate stays closed (deny-dominates); the reason is now
+  legible. Deferred: bun / pip / pyproject provisioning (npm, pnpm, yarn handled; Cargo
+  self-provisions).
+- **Package-manager install fence — BEST-EFFORT (F-E2E-029 b, `src/install_fence.rs`, new).**
+  During run `01234444` the creator seat put 194 MB of `node_modules` into the CUSTOMER'S CLONE
+  ROOT (the worktree's parent). The claude ACP seat's record arms no OS write boundary
+  (`acp.os_sandbox: false`), the bridge judged `fs/write_text_file` paths and remote-write
+  commands, and nothing judged WHERE a shell command's install would land. **The exact command was
+  never captured** (ACP tool calls are not logged as run events; no unit-3 transcript exists), so
+  the fence closes the spellings the review could reproduce, not a proven one. On the two carriers
+  that see the command text per call (the wrapped carrier's `PreToolUse` hook and the ACP
+  permission bridge, beside the remote-write fence) a mutating `npm`/`pnpm`/`yarn`/`bun`
+  invocation whose effective directory is OUTSIDE the unit's worktree is refused — following
+  `cd`/`pushd`/`popd` (subshell `( … )` scoped), `--prefix`/`-C`/`--dir`/`--cwd`, `env -C`/`--chdir`,
+  `npm_config_prefix=`, `~`, canonical spellings, and global installs (`npm i -g`, `yarn global
+  add`, `pnpm add -g`, `bun add -g` — the global prefix is outside by definition). **The shell cwd is
+  tracked across tool calls per `(run, unit, attempt)`** — the natural two-step `cd <clone>` then
+  `npm ci` in the next call is refused on both carriers (ACP: on the per-unit fence state; hook: a
+  sidecar of the attempt's decisions log, `install-fence-cwd-<phase>`), updated only by ALLOWED
+  calls, reset on a new attempt. Advisory (one tool call, not the unit), answered with the remedy,
+  disclosed as `workerToolCallDenied` (`reason` prefix `install fence:`). Reads (`npm ls`), scripts
+  (`npm run`, `npm test`) and installs inside the worktree pass. **Known evasions it does not
+  close** (independent review, 55 probes): a path carried in a shell variable (`ROOT=../..; cd
+  $ROOT`, `--prefix "$ROOT"`, `$(git rev-parse …)`); a script fed by pipe, `sh -c "$(… | base64
+  -d)"`, or a file (`sh /tmp/x.sh`); a symlink CREATED in the same command; program indirection
+  (`npx npm`, `corepack npm`, `$(which npm)`, `node -e "execSync(…)"`, `npm exec -- npm ci`);
+  shell control-flow keywords (`if cd ../..; then npm ci; fi`, `for … do`). A text scan is never
+  hermetic: **F-E2E-029(b) stays OPEN until OS containment (`os_sandbox: true`) is armed for the
+  seat**; until then the engine discloses the posture per seat (below).
+- **`sandboxPosture` (additive event; review of #456 F4).** At distribution every agent unit's
+  assigned seat discloses its write containment: `os` (the record arms the kernel write boundary,
+  `acp.os_sandbox: true` — read by both carriers) or `advisory` (no OS boundary — worktree guard +
+  command-text fences only, a shell can evade a text scan; the rig's claude ACP seat). Wire:
+  `{session, ord, cli, posture, reason}`. The studio fold (run header beside `run-degraded`) is a
+  follow-up.
+- **`awaitingHuman.gateKind` (additive; review of #456 F7)** — `run_level` | `def` | `deliver` |
+  `terminal` | `escalation` | `failure` | `triage`, also on the durable interaction request
+  (`gate_kind`), so a consumer keys on WHY the run paused, never on the prompt's wording.
+- **`worktreeRetained` (additive event; review of #456 F6)** — `{session, path, reason}` when a
+  cancelled run's worktree is kept because it holds uncommitted work; the
+  `WICKED_COMPLETED_WORKTREE_KEEP_DAYS` window now covers cancelled runs too (then reaped
+  clean-only, as before).
+
+### Changed
+- **Cancel keeps a dirty worktree (F-E2E-028).** `cancel_run` FORCE-discarded the worktree; run
+  `01234444`'s creator fix (3 files) survived only as an unreferenced tree object after the
+  operator rejected an escalation gate, while the evaluator's discarded edit was kept under
+  `refs/wicked/suggestions`. Cancel now reaps by the rule every other terminal status uses
+  (FINDING-003, `reap_worktree_if_clean`): a clean tree goes, one holding uncommitted work stays and
+  is named on stderr. A reject at the new deliver gate is the same cancel over verified, unpushed
+  work — its prompt says the worktree is kept.
+
 - **Wave 6 — the governed testing journey (acceptance findings F-7R2-005/006/012/013/019).**
   - **Worker remote-write fence (F-7R2-012).** A worker seat opened wicked-studio PR #258 from
     its own shell (`git push`, `gh pr create`) on the daemon's ambient `gh` login; the ledger

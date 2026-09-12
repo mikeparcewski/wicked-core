@@ -92,6 +92,17 @@ pub struct AgentSession {
     /// The human-confirm gate policy. `#[serde(default)]` so older sessions still deserialize.
     #[serde(default)]
     pub human_confirm: HumanConfirm,
+    /// Whether the run's DELIVER phase (the crew-composed `deliver` Tool unit that pushes the run
+    /// branch and opens the pull request) may run WITHOUT a human confirming it first
+    /// (F-E2E-030). `false` — the default, and what an absent wire field lands on — means the
+    /// engine pauses before the deliver unit whatever the run-level [`Self::human_confirm`] says:
+    /// a push to a remote is the one step that leaves the machine, under whatever `gh` account
+    /// is active at push time, so it is human-confirmed unless the launch EXPLICITLY opted out.
+    /// `true` is that explicit, non-default opt-out (`autoDeliver: true` on the launch). Persisted
+    /// so a resume/redrive re-arms the same posture the launch declared. `#[serde(default)]` for
+    /// back-compat: older sessions deserialize gated.
+    #[serde(default)]
+    pub auto_deliver: bool,
     /// Resume cursor: the index of the NEXT unit to execute (0-based into the ordered units). The
     /// interactive engine advances this as each unit's outcome is applied; `ResumeRun` re-enters
     /// here. `#[serde(default)]` so older sessions deserialize at 0.
@@ -980,6 +991,7 @@ mod tests {
             clis: vec!["claude".to_string(), "agy".to_string()],
             status: SessionStatus::Planning,
             human_confirm: HumanConfirm::Before(2),
+            auto_deliver: false,
             unit_ix: 0,
             attempt: 0,
             workdir: None,

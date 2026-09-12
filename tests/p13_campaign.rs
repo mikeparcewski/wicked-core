@@ -615,6 +615,7 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         clis: vec![],
         status,
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         unit_ix: 0,
         attempt: 0,
         workdir: None,

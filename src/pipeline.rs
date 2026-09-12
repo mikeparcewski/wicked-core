@@ -66,7 +66,8 @@ pub fn run_session(
         entity_mode,
         session_id,
         crate::domain::HumanConfirm::None, // sync path runs straight through (no interactive gates)
-        None,                              // sync path has no registered repo
+        false, // …but a deliver unit would still be gated (the sync path composes none)
+        None,  // sync path has no registered repo
         None,
         Vec::new(), // sync path declares no extra write roots (core#259)
         Vec::new(), // …no extra read roots either (core#294)
@@ -357,6 +358,9 @@ pub(crate) fn pre_distribute(
     entity_mode: EntityMode,
     session_id: &str,
     human_confirm: crate::domain::HumanConfirm,
+    // The launch's EXPLICIT deliver-gate opt-out (F-E2E-030), persisted on the session so a
+    // resume re-arms the same posture; `false` = the deliver unit is human-confirmed.
+    auto_deliver: bool,
     repo_ref: Option<String>,
     workdir: Option<String>,
     // Launcher-declared extra write roots (core#259), already validated at launch; persisted on
@@ -482,6 +486,7 @@ pub(crate) fn pre_distribute(
         clis: cli_keys.clone(),
         status: SessionStatus::Planning,
         human_confirm,
+        auto_deliver,
         unit_ix: 0,
         attempt: 0,
         workdir,
@@ -666,6 +671,39 @@ pub(crate) fn apply_distributions(
             degraded_reason,
             seat_constraint: dist.seat_constraint.clone(),
         });
+        // (F-E2E-029 review F4) Say what write containment the assigned seat actually runs under.
+        // `os_sandbox` on the seat's record arms the kernel write boundary on BOTH carriers
+        // (`acp_runner` for ACP, `execute_wrapped::worker_os_sandbox_enabled` for wrapped); a
+        // record without it — the rig's claude ACP seat — runs under the worktree guard and the
+        // command-text fences only, which a shell can evade. A Tool unit has no seat to disclose.
+        if !matches!(dist.routing, RoutingInfo::Tool) {
+            if let Some(seat) = pre.clis.iter().find(|c| c.key == dist.assigned_cli) {
+                let (posture, reason) = if seat.acp.as_ref().is_some_and(|a| a.os_sandbox) {
+                    (
+                        "os",
+                        "the seat record arms the kernel write boundary (acp.os_sandbox: true): \
+                         writes outside the worktree are refused by the OS"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "advisory",
+                        "the seat record arms no OS write boundary (acp.os_sandbox: false): \
+                         write containment is the worktree guard plus the command-text fences \
+                         (remote-write, install) — best-effort, a shell can evade a text scan; \
+                         set `os_sandbox = true` on the seat's [cli.acp] record for a kernel fence"
+                            .to_string(),
+                    )
+                };
+                emit(CoreEvent::SandboxPosture {
+                    session: pre.session_id.clone(),
+                    ord: u.ord,
+                    cli: dist.assigned_cli.clone(),
+                    posture: posture.to_string(),
+                    reason,
+                });
+            }
+        }
     }
     // (F-7R2-006) The bench the distribution ran under is the RUN's: persisted so every dispatch
     // (failover, triage judge, agent judge) and any re-plan honours it. Union, first reason wins.
@@ -696,6 +734,7 @@ pub(crate) fn plan_and_distribute(
     entity_mode: EntityMode,
     session_id: &str,
     human_confirm: crate::domain::HumanConfirm,
+    auto_deliver: bool,
     repo_ref: Option<String>,
     workdir: Option<String>,
     extra_write_roots: Vec<String>,
@@ -723,6 +762,7 @@ pub(crate) fn plan_and_distribute(
         entity_mode,
         session_id,
         human_confirm,
+        auto_deliver,
         repo_ref,
         workdir,
         extra_write_roots,
@@ -1105,13 +1145,19 @@ pub(crate) fn apply_and_finish_unit(
             // the hook is a subprocess with no emit seam, so the fold discloses the refusal here
             // from its durable record — the ACP carrier emits the same event live.
             if let Some((reason, command)) = rec.remote_write_refusal() {
+                // The install fence (F-E2E-029) records under the same claim shape; its remedy
+                // differs, and the reason's prefix says which fence spoke.
+                let remedy = if reason.starts_with(crate::install_fence::REASON_PREFIX) {
+                    crate::install_fence::REMEDY
+                } else {
+                    crate::remote_write_fence::REMEDY
+                };
                 eprintln!(
-                    "wicked-core: unit {} ({}) on '{}' asked to run a remote-writing command and \
-                     was refused by the gate hook: `{command}` — {} (F-7R2-012)",
+                    "wicked-core: unit {} ({}) on '{}' asked to run a fenced command and was \
+                     refused by the gate hook: `{command}` — {remedy} (F-7R2-012 / F-E2E-029)",
                     unit.ord,
                     crate::write_posture::role_wire(unit.role),
                     unit.assigned_cli.as_deref().unwrap_or("claude"),
-                    crate::remote_write_fence::REMEDY
                 );
                 emit(CoreEvent::WorkerToolCallDenied {
                     session: session_id.to_string(),
@@ -1126,7 +1172,7 @@ pub(crate) fn apply_and_finish_unit(
                     tool: rec.tool_name.clone(),
                     command,
                     reason,
-                    remedy: crate::remote_write_fence::REMEDY.to_string(),
+                    remedy: remedy.to_string(),
                 });
             }
             emit(CoreEvent::GovernanceHookFired {
@@ -1964,6 +2010,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             "s-unseeded",
             crate::domain::HumanConfirm::None,
+            false,
             None,
             None,
             Vec::new(),
@@ -2087,6 +2134,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             "s-dropin-unseeded",
             crate::domain::HumanConfirm::None,
+            false,
             Some(repo.id.clone()),
             None,
             Vec::new(),
@@ -2385,6 +2433,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             &sid,
             crate::domain::HumanConfirm::None,
+            false,
             None,
             None,
             Vec::new(),
@@ -2422,6 +2471,27 @@ mod resolve_tests {
                 Some("1 of 3 seats benched: codex (signed out — launcher)"),
                 "degradedReason on the `{method}` arm"
             );
+        }
+        // (F-E2E-029 review F4) Every agent unit's seat discloses its write containment; these
+        // seats carry no ACP record ⇒ no OS write boundary ⇒ `advisory`, never claimed hermetic.
+        let postures: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CoreEvent::SandboxPosture {
+                    posture, reason, ..
+                } => Some((posture.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            postures.len(),
+            distributed.len(),
+            "one sandboxPosture per distributed agent unit"
+        );
+        for (posture, reason) in &postures {
+            assert_eq!(posture, "advisory");
+            assert!(reason.contains("no OS write boundary"), "{reason}");
+            assert!(reason.contains("best-effort"), "{reason}");
         }
         let session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
         assert_eq!(session.benched_seats.len(), 1);

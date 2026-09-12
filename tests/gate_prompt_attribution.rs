@@ -115,6 +115,7 @@ fn wait_for_gate(
                 ord,
                 reviewing_ord,
                 prompt,
+                ..
             }) if s == session => return Ok((ord, reviewing_ord, prompt)),
             Ok(CoreEvent::SessionCompleted { session: s })
             | Ok(CoreEvent::SessionFailed { session: s, .. })
@@ -162,6 +163,7 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
         session_id: "attr-def".into(),
         // No run-level policy: the DEF's own gate is the sole reason this run pauses.
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: None,
         workflow: Some("attr-test".into()),
         extra_write_roots: Vec::new(),
@@ -226,6 +228,7 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
         session_id: "attr-run".into(),
         // Every gate in the def is `auto`, so the run-level policy is the only source of a pause.
         human_confirm: HumanConfirm::All,
+        auto_deliver: false,
         repo_ref: None,
         workflow: Some("attr-runlevel".into()),
         extra_write_roots: Vec::new(),

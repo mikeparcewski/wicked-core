@@ -836,6 +836,10 @@ fn launch_from_event(
         entity_mode,
         session_id: session_id.clone(),
         human_confirm,
+        // Bus launches carry no auto-deliver opt-out in v1 (F-E2E-030): a deliver unit composed
+        // into such a run is human-confirmed. Wire it through `req.args` only as an explicit,
+        // validated token, never implicitly.
+        auto_deliver: false,
         repo_ref: req.args.repo_ref.clone(),
         workflow: req.workflow.clone(),
         // Bus-requested runs are unfiled in v1 — filing arrives via the daemon API's `projectId`.

@@ -147,6 +147,7 @@ fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
         entity_mode: EntityMode::Shared,
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: None,
         workflow: Some(workflow.into()),
         extra_write_roots: Vec::new(),

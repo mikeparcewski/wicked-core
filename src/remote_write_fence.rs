@@ -535,7 +535,7 @@ pub(crate) fn remote_write_command(command: &str) -> Option<RemoteWriteHit> {
 
 /// Split on [`SEGMENT_SEPARATORS`] outside single/double quotes (a backslash escapes the next
 /// character outside single quotes). Empty segments are dropped.
-fn split_segments(command: &str) -> Vec<String> {
+pub(crate) fn split_segments(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -581,7 +581,7 @@ fn split_segments(command: &str) -> Vec<String> {
 
 /// Whitespace tokenizer that keeps a quoted string as ONE token (quotes stripped, `\x` → `x`
 /// outside single quotes). A `$` stays a token character (a variable is not a verb).
-fn tokenize(segment: &str) -> Vec<String> {
+pub(crate) fn tokenize(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_token = false;
@@ -628,7 +628,7 @@ fn tokenize(segment: &str) -> Vec<String> {
 }
 
 /// The program's file stem, case-folded: `/usr/local/bin/GIT.exe` → `git`.
-fn program_stem(tok: &str) -> String {
+pub(crate) fn program_stem(tok: &str) -> String {
     let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
     let lower = base.to_ascii_lowercase();
     let stem = lower
@@ -666,7 +666,7 @@ fn fenced_config_key(key: &str) -> bool {
 /// is the program being run. Returns the index of that token and every environment assignment
 /// seen on the way (leading ones and `env`'s), or `None` when the segment has no program left
 /// (e.g. `FOO=1` alone).
-fn program_index(tokens: &[String]) -> Option<(usize, Vec<String>)> {
+pub(crate) fn program_index(tokens: &[String]) -> Option<(usize, Vec<String>)> {
     let mut assigned: Vec<String> = Vec::new();
     let mut i = 0;
     loop {
@@ -737,7 +737,7 @@ fn wrapper_value_flags(stem: &str) -> &'static [&'static str] {
 /// its value (review of #449, FN-2 + r2 R2-4); a bare `-e` (errexit) is NOT a script flag; `--`
 /// ends the options. `None` when the shell is invoked on a FILE or interactively — the stated
 /// limit.
-fn sh_script(args: &[String]) -> Option<&str> {
+pub(crate) fn sh_script(args: &[String]) -> Option<&str> {
     let mut saw_c = false;
     let mut i = 0;
     while i < args.len() {

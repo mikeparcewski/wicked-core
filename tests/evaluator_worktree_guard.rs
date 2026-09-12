@@ -217,6 +217,7 @@ fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
         entity_mode: wicked_core::EntityMode::Shared,
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: Some(repo_ref.to_string()),
         workflow: Some("bug".into()),
         extra_write_roots: Vec::new(),

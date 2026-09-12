@@ -70,6 +70,10 @@ pub struct InteractionRequest {
     pub reviewing_ord: Option<u32>,
     /// The full prompt text shown to the human.
     pub prompt: String,
+    /// WHY the run paused (mirrors `AwaitingHuman.gate_kind`; review of #456, F7). `None` on rows
+    /// written before the field existed.
+    #[serde(default)]
+    pub gate_kind: Option<String>,
     pub status: InteractionStatus,
     /// The decision payload (JSON text, e.g. `{"approve":true,"amend":null}`) once resolved.
     #[serde(default)]
@@ -131,6 +135,7 @@ pub fn open_gate(
     ord: u32,
     reviewing_ord: Option<u32>,
     prompt: &str,
+    gate_kind: &str,
     now_ms: i64,
 ) -> InteractionRequest {
     let id = format!(
@@ -144,6 +149,7 @@ pub fn open_gate(
         ord: Some(ord),
         reviewing_ord,
         prompt: prompt.to_string(),
+        gate_kind: Some(gate_kind.to_string()),
         status: InteractionStatus::Open,
         answer: None,
         created_at: now_ms,
@@ -204,7 +210,7 @@ mod tests {
 
     #[test]
     fn request_round_trips_through_node() {
-        let r = open_gate("run-1", 2, Some(1), "Approve unit 2?", 99);
+        let r = open_gate("run-1", 2, Some(1), "Approve unit 2?", "def", 99);
         assert_eq!(InteractionRequest::from_node(&r.to_node()).unwrap(), r);
         assert_eq!(r.status, InteractionStatus::Open);
     }
@@ -212,10 +218,10 @@ mod tests {
     #[test]
     fn same_gate_reopens_same_row_and_resolve_closes_it() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        let r = open_gate("run-1", 1, None, "Approve unit 1?", 10);
+        let r = open_gate("run-1", 1, None, "Approve unit 1?", "run_level", 10);
         put_node(&mut store, r.to_node()).unwrap();
         // Re-pause on the same (session, kind, ord) — same id, still ONE row.
-        let again = open_gate("run-1", 1, None, "Approve unit 1 (retry)?", 20);
+        let again = open_gate("run-1", 1, None, "Approve unit 1 (retry)?", "run_level", 20);
         assert_eq!(again.id, r.id);
         put_node(&mut store, again.to_node()).unwrap();
         assert_eq!(
@@ -253,8 +259,16 @@ mod tests {
     #[test]
     fn filters_by_session_and_status() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        put_node(&mut store, open_gate("run-a", 1, None, "a?", 1).to_node()).unwrap();
-        put_node(&mut store, open_gate("run-b", 1, None, "b?", 2).to_node()).unwrap();
+        put_node(
+            &mut store,
+            open_gate("run-a", 1, None, "a?", "run_level", 1).to_node(),
+        )
+        .unwrap();
+        put_node(
+            &mut store,
+            open_gate("run-b", 1, None, "b?", "run_level", 2).to_node(),
+        )
+        .unwrap();
         assert_eq!(list_interactions(&store, None, None).unwrap().len(), 2);
         assert_eq!(
             list_interactions(&store, Some("run-a"), None)

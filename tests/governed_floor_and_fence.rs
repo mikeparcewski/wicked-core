@@ -256,6 +256,7 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
         entity_mode: wicked_core::EntityMode::Shared,
         session_id: run_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: Some(entry.id.clone()),
         workflow: None,
         extra_write_roots: Vec::new(),
