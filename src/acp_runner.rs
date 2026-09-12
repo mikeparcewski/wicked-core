@@ -4023,8 +4023,28 @@ fn answer_permission_request<W: Write>(
         // disclosed as `workerToolCallDenied` with the remedy, logged. One tool call, not the
         // unit: the seat reads the remedy and continues.
         if let Some(command) = crate::acp_permission::execute_command(&params) {
-            if let Some(hit) = crate::remote_write_fence::remote_write_command(&command) {
-                let reason = hit.reason();
+            // INSTALL FENCE (F-E2E-029): judged beside it, on the same call — a package-manager
+            // install whose effective directory (after `cd`, `--prefix`, `-C`, `--cwd`) is
+            // outside the unit's worktree is refused the same advisory way. Run 01234444's
+            // creator put 194 MB of `node_modules` into the customer's clone root on a seat with
+            // no OS write boundary; the command text is the one place that names the target.
+            let denial = crate::remote_write_fence::remote_write_command(&command)
+                .map(|hit| {
+                    (
+                        "remote-write fence",
+                        hit.reason(),
+                        crate::remote_write_fence::REMEDY,
+                    )
+                })
+                .or_else(|| {
+                    crate::install_fence::foreign_install(
+                        &command,
+                        &fence.cwd,
+                        fence.home.as_deref(),
+                    )
+                    .map(|hit| ("install fence", hit.reason(), crate::install_fence::REMEDY))
+                });
+            if let Some((label, reason, remedy)) = denial {
                 let tool = crate::acp_permission::pretool_payload(&params)
                     .map(|(t, _)| t)
                     .unwrap_or_else(|| "(execute)".to_string());
@@ -4040,14 +4060,13 @@ fn answer_permission_request<W: Write>(
                         tool: tool.clone(),
                         command: command.clone(),
                         reason: reason.clone(),
-                        remedy: crate::remote_write_fence::REMEDY.to_string(),
+                        remedy: remedy.to_string(),
                     }));
                 eprintln!(
-                    "wicked-core: DENY (remote-write fence, {} unit {} on '{}'): `{command}` — {}",
+                    "wicked-core: DENY ({label}, {} unit {} on '{}'): `{command}` — {remedy}",
                     crate::write_posture::role_wire(fence.role),
                     fence.ord,
                     fence.cli,
-                    crate::remote_write_fence::REMEDY
                 );
                 let note =
                     format!("\n[wicked-core] refused tool call `{tool}` (`{command}`): {reason}\n");
@@ -4059,7 +4078,7 @@ fn answer_permission_request<W: Write>(
                     write_lock,
                     &req_id,
                     crate::acp_permission::reject_result(&params),
-                    "a permission request (remote-write fence)",
+                    "a permission request (command fence)",
                     output,
                     max_out,
                 );

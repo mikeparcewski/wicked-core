@@ -9971,6 +9971,7 @@ mod project_graph_end_to_end_tests {
             entity_mode: crate::EntityMode::Shared,
             session_id: id.into(),
             human_confirm: crate::HumanConfirm::None,
+            auto_deliver: false,
             repo_ref: Some(repo.id.clone()),
             workflow: None,
             extra_write_roots: Vec::new(),

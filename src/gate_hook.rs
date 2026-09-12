@@ -380,6 +380,13 @@ pub(crate) fn boundary_denial_with(
             if let Some(hit) = crate::remote_write_fence::remote_write_command(command) {
                 return Some((hit.reason(), false));
             }
+            // INSTALL FENCE (F-E2E-029): a package-manager install whose effective directory —
+            // after `cd`/`pushd` and the manager's own `--prefix`/`-C`/`--cwd` — leaves the unit's
+            // worktree (`cwd`) is refused the same advisory way, and recorded so the fold discloses
+            // it as `workerToolCallDenied` with its remedy.
+            if let Some(hit) = crate::install_fence::foreign_install(command, cwd, home) {
+                return Some((hit.reason(), false));
+            }
             for target in bash_write_targets(command) {
                 if let Err(d) = crate::path_policy::check(&target, roots, true, cwd, home) {
                     // A shell write into the SYSTEM temp is the same benign-scratch class as
@@ -992,7 +999,9 @@ pub(crate) fn evaluate_tool_call(
         // A REMOTE-WRITE refusal (F-7R2-012) is recorded under its own claim id, with the command
         // segment beside the reason, so the gate fold can disclose it as `workerToolCallDenied`
         // (`collect_hook_decisions` surfaces both) — advisory like a blocked read.
-        if reason.starts_with(REMOTE_WRITE_REASON_PREFIX) {
+        if reason.starts_with(REMOTE_WRITE_REASON_PREFIX)
+            || reason.starts_with(crate::install_fence::REASON_PREFIX)
+        {
             let command = context
                 .get("command")
                 .and_then(serde_json::Value::as_str)

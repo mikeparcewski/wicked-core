@@ -66,7 +66,8 @@ pub fn run_session(
         entity_mode,
         session_id,
         crate::domain::HumanConfirm::None, // sync path runs straight through (no interactive gates)
-        None,                              // sync path has no registered repo
+        false, // …but a deliver unit would still be gated (the sync path composes none)
+        None,  // sync path has no registered repo
         None,
         Vec::new(), // sync path declares no extra write roots (core#259)
         Vec::new(), // …no extra read roots either (core#294)
@@ -357,6 +358,9 @@ pub(crate) fn pre_distribute(
     entity_mode: EntityMode,
     session_id: &str,
     human_confirm: crate::domain::HumanConfirm,
+    // The launch's EXPLICIT deliver-gate opt-out (F-E2E-030), persisted on the session so a
+    // resume re-arms the same posture; `false` = the deliver unit is human-confirmed.
+    auto_deliver: bool,
     repo_ref: Option<String>,
     workdir: Option<String>,
     // Launcher-declared extra write roots (core#259), already validated at launch; persisted on
@@ -482,6 +486,7 @@ pub(crate) fn pre_distribute(
         clis: cli_keys.clone(),
         status: SessionStatus::Planning,
         human_confirm,
+        auto_deliver,
         unit_ix: 0,
         attempt: 0,
         workdir,
@@ -696,6 +701,7 @@ pub(crate) fn plan_and_distribute(
     entity_mode: EntityMode,
     session_id: &str,
     human_confirm: crate::domain::HumanConfirm,
+    auto_deliver: bool,
     repo_ref: Option<String>,
     workdir: Option<String>,
     extra_write_roots: Vec<String>,
@@ -723,6 +729,7 @@ pub(crate) fn plan_and_distribute(
         entity_mode,
         session_id,
         human_confirm,
+        auto_deliver,
         repo_ref,
         workdir,
         extra_write_roots,
@@ -1105,13 +1112,19 @@ pub(crate) fn apply_and_finish_unit(
             // the hook is a subprocess with no emit seam, so the fold discloses the refusal here
             // from its durable record — the ACP carrier emits the same event live.
             if let Some((reason, command)) = rec.remote_write_refusal() {
+                // The install fence (F-E2E-029) records under the same claim shape; its remedy
+                // differs, and the reason's prefix says which fence spoke.
+                let remedy = if reason.starts_with(crate::install_fence::REASON_PREFIX) {
+                    crate::install_fence::REMEDY
+                } else {
+                    crate::remote_write_fence::REMEDY
+                };
                 eprintln!(
-                    "wicked-core: unit {} ({}) on '{}' asked to run a remote-writing command and \
-                     was refused by the gate hook: `{command}` — {} (F-7R2-012)",
+                    "wicked-core: unit {} ({}) on '{}' asked to run a fenced command and was \
+                     refused by the gate hook: `{command}` — {remedy} (F-7R2-012 / F-E2E-029)",
                     unit.ord,
                     crate::write_posture::role_wire(unit.role),
                     unit.assigned_cli.as_deref().unwrap_or("claude"),
-                    crate::remote_write_fence::REMEDY
                 );
                 emit(CoreEvent::WorkerToolCallDenied {
                     session: session_id.to_string(),
@@ -1126,7 +1139,7 @@ pub(crate) fn apply_and_finish_unit(
                     tool: rec.tool_name.clone(),
                     command,
                     reason,
-                    remedy: crate::remote_write_fence::REMEDY.to_string(),
+                    remedy: remedy.to_string(),
                 });
             }
             emit(CoreEvent::GovernanceHookFired {
@@ -1964,6 +1977,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             "s-unseeded",
             crate::domain::HumanConfirm::None,
+            false,
             None,
             None,
             Vec::new(),
@@ -2087,6 +2101,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             "s-dropin-unseeded",
             crate::domain::HumanConfirm::None,
+            false,
             Some(repo.id.clone()),
             None,
             Vec::new(),
@@ -2385,6 +2400,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             &sid,
             crate::domain::HumanConfirm::None,
+            false,
             None,
             None,
             Vec::new(),

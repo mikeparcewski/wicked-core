@@ -38,6 +38,13 @@ export interface LaunchOptions {
   entityMode?: string
   /** Human-confirm gate policy: `none` (default) | `all` | `before:<ord>`. */
   humanConfirm?: string
+  /**
+   * EXPLICIT opt-out of the engine's deliver gate (F-E2E-030). The run's `deliver` Tool unit
+   * (the crew-composed phase that pushes the run branch and opens the PR) pauses for a human
+   * before it runs — whatever `humanConfirm` says — unless this is `true`. Omit (or `false`)
+   * for the gate; `true` only when the caller has named the launch "auto-deliver" to its user.
+   */
+  autoDeliver?: boolean
   /** The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run. */
   repoRef?: string
   /**

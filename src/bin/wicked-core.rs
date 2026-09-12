@@ -521,6 +521,7 @@ fn main() {
                 entity_mode: EntityMode::Shared,
                 session_id: String::new(),
                 human_confirm: HumanConfirm::None,
+                auto_deliver: false,
                 repo_ref: None,
                 workflow: flag(&args, "--workflow"),
                 project_id: flag(&args, "--project"),
@@ -827,6 +828,9 @@ fn run_interactive(core: &Core, args: &[String]) {
         entity_mode: EntityMode::Shared,
         session_id,
         human_confirm,
+        // The CLI has no auto-deliver flag: a deliver unit composed into a run launched here is
+        // human-confirmed (F-E2E-030) — the safe default, and the one every launcher inherits.
+        auto_deliver: false,
         repo_ref,
         workflow: flag(args, "--workflow"),
         project_id: flag(args, "--project"),

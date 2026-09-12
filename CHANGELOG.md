@@ -15,6 +15,54 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Deliver gate (acceptance finding F-E2E-030).** Run `0ab5ccb8` launched under the studio
+  composer's default posture (`humanConfirm: before:1`): the intake gate was the only human gate,
+  verify passed, and the crew-composed `deliver` Tool unit pushed `wicked/<run>` and opened the PR
+  unattended, under whatever `gh` account the daemon held. The ENGINE now gates the deliver unit:
+  `should_pause` pauses before a Tool unit whose phase id is `deliver` (`deliver_lift::is_deliver_unit`,
+  the same recognition the lift uses) whatever the run-level `human_confirm` says, with a prompt
+  that names the push (branch, repository, "under the gh account active in the daemon's
+  environment — pin it now if it must differ"). The one opt-out is EXPLICIT and non-default:
+  `LaunchSpec.auto_deliver: bool` / core-ts `LaunchOptions.autoDeliver?: boolean` (absent ⇒ `false`
+  ⇒ gated), persisted as `AgentSession.auto_deliver` (serde-default, additive on the run DTO) so a
+  resume re-arms the same posture. `human_confirm: none` is NOT an opt-out (FINDING-019/023: it is
+  also the enum default and the typo fallback). A def gate on the preceding phase still fires as
+  before; the deliver gate is judged first so its prompt is the one shown.
+- **Floor provisioning by declared dependencies (F-E2E-029 a).** `repo_checks::detect` installed
+  only when `node_modules/` was ABSENT. Run `0ab5ccb8`'s nested worktree carried a `node_modules/`
+  holding only vitest's cache (written when the creator ran the suite; Node had resolved the
+  runner upward into the customer's clone), so the floor skipped the install, `npm run test`
+  started and three path-relative suites died on ENOENT under `node_modules/wicked-crew-api-types/`
+  — a deterministic denial cleared only by steering the evaluator to `npm ci`. The floor now
+  installs when `node_modules/` is absent OR any DECLARED top-level dependency (`dependencies` +
+  `devDependencies`; a symlinked package counts, optional/peer are not required) lacks
+  `node_modules/<name>/package.json`; the `install` check's `source` names the first missing
+  dependency. A failed install is reported as **dependency provisioning failed … an environment
+  finding, not a verdict on the change** (with the lockfile, the reason, and the install's own
+  output), never a bare ENOENT denial.
+- **Package-manager install fence (F-E2E-029 b, `src/install_fence.rs`, new).** During run
+  `01234444` the creator seat put 194 MB of `node_modules` into the CUSTOMER'S CLONE ROOT (the
+  worktree's parent) — the claude ACP seat arms no OS write boundary (`os_sandbox: false`), the
+  bridge judged `fs/write_text_file` paths and remote-write commands, and nothing judged WHERE a
+  shell command's install would land. On the two carriers that see the command text per call (the
+  wrapped carrier's `PreToolUse` hook and the ACP permission bridge, beside the remote-write
+  fence) a mutating `npm`/`pnpm`/`yarn`/`bun` invocation whose effective directory — following
+  `cd`/`pushd` across segments (subshell `( … )` scoped), `--prefix`/`-C`/`--dir`/`--cwd`, `~`, and
+  canonical spellings — is OUTSIDE the unit's worktree is refused. Advisory (one tool call, not the
+  unit), answered with the remedy ("install in the run's worktree … the engine provisions the
+  worktree's dependencies itself"), disclosed as `workerToolCallDenied` (live from the bridge; at
+  the gate fold from the hook's record, with the install fence's own remedy). Reads (`npm ls`),
+  scripts (`npm run`, `npm test`) and installs inside the worktree pass.
+
+### Changed
+- **Cancel keeps a dirty worktree (F-E2E-028).** `cancel_run` FORCE-discarded the worktree; run
+  `01234444`'s creator fix (3 files) survived only as an unreferenced tree object after the
+  operator rejected an escalation gate, while the evaluator's discarded edit was kept under
+  `refs/wicked/suggestions`. Cancel now reaps by the rule every other terminal status uses
+  (FINDING-003, `reap_worktree_if_clean`): a clean tree goes, one holding uncommitted work stays and
+  is named on stderr. A reject at the new deliver gate is the same cancel over verified, unpushed
+  work — its prompt says the worktree is kept.
+
 - **Wave 6 — the governed testing journey (acceptance findings F-7R2-005/006/012/013/019).**
   - **Worker remote-write fence (F-7R2-012).** A worker seat opened wicked-studio PR #258 from
     its own shell (`git push`, `gh pr create`) on the daemon's ambient `gh` login; the ledger

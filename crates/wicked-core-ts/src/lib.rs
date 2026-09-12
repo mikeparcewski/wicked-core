@@ -607,6 +607,11 @@ pub struct LaunchOptions {
     pub entity_mode: Option<String>,
     /// Human-confirm gate policy: `none` (default) | `all` | `before:<ord>`.
     pub human_confirm: Option<String>,
+    /// EXPLICIT opt-out of the engine's deliver gate (F-E2E-030). The run's `deliver` Tool unit
+    /// (the crew-composed phase that pushes the run branch and opens the PR) pauses for a human
+    /// before it runs — whatever `humanConfirm` says — unless this is `true`. Omit (or `false`)
+    /// for the gate; `true` only when the caller has named the launch "auto-deliver" to its user.
+    pub auto_deliver: Option<bool>,
     /// The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run.
     pub repo_ref: Option<String>,
     /// A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
@@ -658,6 +663,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         // silent downgrade to None, so a JS caller that mistypes humanConfirm gets a thrown error,
         // not an unattended run.
         human_confirm: HumanConfirm::parse(o.human_confirm.as_deref()).map_err(err)?,
+        auto_deliver: o.auto_deliver.unwrap_or(false),
         repo_ref: o.repo_ref,
         workflow: o.workflow,
         project_id: o.project_id,

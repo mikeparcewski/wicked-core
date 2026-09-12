@@ -36,6 +36,7 @@ mod execute;
 mod execute_wrapped;
 mod gate_hook;
 mod graph_browser;
+mod install_fence;
 mod interaction;
 mod knowledge;
 #[cfg(test)]
@@ -184,6 +185,11 @@ pub struct LaunchSpec {
     /// The human-confirm gate policy: pause before none / every / a specific unit. Defaults to
     /// `None` (run straight through) when built without it.
     pub human_confirm: HumanConfirm,
+    /// EXPLICIT opt-out of the deliver gate (F-E2E-030): `true` lets the run's `deliver` Tool
+    /// unit push and open its PR unattended; `false` (the default — an absent wire field lands
+    /// here) pauses for a human before it regardless of `human_confirm`. Delivery leaves the
+    /// machine under the daemon's active `gh` account, so the default is the gate, never the push.
+    pub auto_deliver: bool,
     /// The id of a registered repo to run within (P3). When set, COE creates an isolated git
     /// worktree for the run and executes there; `None` runs without a repo (no worktree).
     pub repo_ref: Option<String>,

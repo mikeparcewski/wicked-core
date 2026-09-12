@@ -236,13 +236,29 @@ impl RepoChecksReport {
                 // "error: test failed" line on stderr, and an operator needs to see either.
                 let out = last_lines(&c.stdout_tail);
                 let err = last_lines(&c.stderr_tail);
-                match (out.is_empty(), err.is_empty()) {
+                let line = match (out.is_empty(), err.is_empty()) {
                     (true, true) => c.summary(),
                     (false, true) => format!("{} — stdout tail: {out}", c.summary()),
                     (true, false) => format!("{} — stderr tail: {err}", c.summary()),
                     (false, false) => {
                         format!("{} — stdout tail: {out} — stderr tail: {err}", c.summary())
                     }
+                };
+                // A failed INSTALL is an environmental finding about provisioning the worktree,
+                // not a verdict on the work (F-E2E-029): say so, and say what was being provisioned
+                // (`source` = the lockfile and why the install ran), so the operator reads
+                // "dependencies could not be installed", never a bare ENOENT.
+                if c.name == "install" {
+                    format!(
+                        "dependency provisioning failed — the worktree's dependencies could not \
+                         be installed from {} ({line}); the repository's checks were not run \
+                         against an installed tree. This is an environment finding, not a \
+                         verdict on the change: fix the install (registry access, lockfile) and \
+                         retry the phase",
+                        c.source
+                    )
+                } else {
+                    line
                 }
             })
             .collect();
@@ -465,13 +481,15 @@ pub(crate) fn detect_opts(worktree: &Path, force_install: bool) -> Result<Vec<Re
             .filter(|k| scripts.is_some_and(|m| m.get(*k).and_then(|v| v.as_str()).is_some()))
             .collect();
         if !wanted.is_empty() {
-            let node_modules = probe(worktree, "node_modules")?;
-            if node_modules.is_none() || force_install {
-                let why = if node_modules.is_none() {
-                    "node_modules absent"
-                } else {
-                    "forced: lockfile drift"
-                };
+            // PROVISIONING (F-E2E-029): presence of `node_modules/` is not an install — see
+            // `node_modules_gap`. The gap names the first declared dependency that is missing, so
+            // the `install` check's `source` says WHY it ran.
+            let gap = match probe(worktree, "node_modules")? {
+                None => Some("node_modules absent".to_string()),
+                Some(_) => node_modules_gap(worktree, &json)?,
+            };
+            if gap.is_some() || force_install {
+                let why = gap.unwrap_or_else(|| "forced: lockfile drift".to_string());
                 let has_lock = probe(worktree, "package-lock.json")?.is_some();
                 let (argv, source) = match pm {
                     "pnpm" => (
@@ -540,6 +558,64 @@ pub(crate) fn detect_opts(worktree: &Path, force_install: bool) -> Result<Vec<Re
         });
     }
     Ok(out)
+}
+
+/// Why the worktree's `node_modules/` does NOT provision the checks, or `None` when it does.
+///
+/// Presence alone is not provisioning (F-E2E-029). Run `0ab5ccb8`'s worktree — nested under the
+/// customer's clone at `<repo>/wicked-worktrees/<run>` — carried a `node_modules/` holding only a
+/// test runner's cache (`node_modules/.vite/…`, written when the creator ran the suite; Node had
+/// resolved the runner UPWARD into the clone root's own install), so the floor skipped the install
+/// step, `npm run test` started (the runner resolved from the parent again) and three
+/// path-relative suites died on ENOENT under `<worktree>/node_modules/wicked-crew-api-types/` — a
+/// deterministic denial the operator could only clear by steering the read-only evaluator to run
+/// `npm ci` itself. The floor now requires every DECLARED top-level dependency (`dependencies` +
+/// `devDependencies`) to be present as `node_modules/<name>/package.json`; a symlinked package (a
+/// workspace member, `npm link`) counts — its presence is all that is checked, nothing under it is
+/// read or followed. Optional and peer dependencies are not required (they may legitimately be
+/// absent). The first missing dependency names the reason; a manifest declaring none is
+/// provisioned by definition.
+fn node_modules_gap(
+    worktree: &Path,
+    package_json: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let mut declared: Vec<&str> = Vec::new();
+    for key in ["dependencies", "devDependencies"] {
+        match package_json.get(key) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Object(m)) => declared.extend(m.keys().map(String::as_str)),
+            Some(_) => return Err(format!("`package.json` `{key}` is not an object")),
+        }
+    }
+    for name in declared {
+        // `@scope/name` is two path segments; anything that would leave `node_modules/` is not a
+        // dependency name and is reported rather than probed.
+        if name.is_empty()
+            || name
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(format!(
+                "`package.json` declares a dependency with an invalid name `{name}`"
+            ));
+        }
+        let entry = worktree.join("node_modules").join(name);
+        let present = match std::fs::symlink_metadata(&entry) {
+            Ok(m) if m.file_type().is_symlink() => true,
+            Ok(m) if m.is_dir() => entry.join("package.json").is_file(),
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("`node_modules/{name}` could not be inspected: {e}")),
+        };
+        if !present {
+            return Ok(Some(format!(
+                "node_modules present but `{name}` is not installed — a hollow or partial tree \
+                 (e.g. only a tool's cache dir), so the checks would resolve modules outside \
+                 the worktree or fail on ENOENT"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Files the engine's own checks may CREATE beside a manifest that ships none — removed after the
@@ -1073,6 +1149,120 @@ mod tests {
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["typecheck", "test"]
+        );
+    }
+
+    #[test]
+    fn a_hollow_node_modules_does_not_count_as_provisioned_and_the_install_names_the_gap() {
+        // F-E2E-029: the nested worktree's `node_modules/` held only vitest's cache dir; the floor
+        // must install, and say which declared dependency was missing.
+        let wt = scratch("hollow-node-modules");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"dependencies":{"wicked-crew-api-types":"1.0.0"},"devDependencies":{"vitest":"3.0.0","@types/node":"22.0.0"},"optionalDependencies":{"fsevents":"2.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/.vite/vitest")).unwrap();
+        let detected = detect(&wt).unwrap();
+        assert_eq!(detected[0].name, "install", "{detected:?}");
+        assert_eq!(
+            detected[0].argv,
+            s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+        );
+        assert!(
+            detected[0]
+                .source
+                .contains("`wicked-crew-api-types` is not installed"),
+            "the install's source names the first missing declared dependency: {}",
+            detected[0].source
+        );
+        // A partial install — some dependencies present — is still a gap, named by the missing one
+        // (declared names are visited in sorted order: `@types/node` before `vitest`).
+        for dep in ["wicked-crew-api-types", "@types/node"] {
+            std::fs::create_dir_all(wt.join("node_modules").join(dep)).unwrap();
+            std::fs::write(wt.join("node_modules").join(dep).join("package.json"), "{}").unwrap();
+        }
+        let detected = detect(&wt).unwrap();
+        assert_eq!(detected[0].name, "install");
+        assert!(
+            detected[0].source.contains("`vitest` is not installed"),
+            "{}",
+            detected[0].source
+        );
+        // Every declared dependency present (a scoped one included; the OPTIONAL one absent)
+        // ⇒ provisioned ⇒ no install step.
+        std::fs::create_dir_all(wt.join("node_modules/vitest")).unwrap();
+        std::fs::write(wt.join("node_modules/vitest/package.json"), "{}").unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["test".to_string()], "provisioned ⇒ no install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_dependency_counts_as_installed() {
+        // A workspace member or `npm link` target is a symlink in `node_modules/`; its presence is
+        // the install, and nothing under it is followed or read.
+        let wt = scratch("symlinked-dep");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"devDependencies":{"linked":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/elsewhere", wt.join("node_modules/linked"))
+            .unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["test".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_install_is_reported_as_a_provisioning_finding_not_a_verdict() {
+        let report = RepoChecksReport {
+            detected: vec![RepoCheck {
+                name: "install".into(),
+                argv: s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
+                source: "package-lock.json (node_modules absent)".into(),
+            }],
+            checks: vec![CheckRun {
+                name: "install".into(),
+                argv: s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
+                source: "package-lock.json (node_modules absent)".into(),
+                exit_code: Some(1),
+                timed_out: false,
+                spawn_error: None,
+                duration_ms: 1200,
+                stdout_tail: String::new(),
+                stderr_tail: "npm ERR! code ENOTFOUND\nnpm ERR! network request failed".into(),
+            }],
+            skipped: vec!["typecheck".into(), "test".into()],
+            passed: false,
+            detect_error: None,
+            sandbox_level: "sandboxed".into(),
+            sandbox_note: None,
+            sandbox_error: None,
+            engine_writes_removed: Vec::new(),
+        };
+        let reason = report.denial_reason();
+        assert!(
+            reason.contains("dependency provisioning failed"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("package-lock.json (node_modules absent)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("environment finding, not a verdict"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("ENOTFOUND"),
+            "the install's own stderr rides along: {reason}"
+        );
+        assert!(
+            reason.contains("not run after the failure: typecheck, test"),
+            "{reason}"
         );
     }
 
