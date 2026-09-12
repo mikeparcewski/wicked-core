@@ -859,6 +859,37 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.23** — npm release carrying the two engine fixes since 0.7.22, all on main tip
+  f37e325 (plus #451, the 0.7.22 platform-lockfile re-stamp): **#452** (acceptance finding
+  F-7R3-001) — routing benches a seat that is DEAD for the run, not only one that is signed out.
+  A seat whose council ballots all fail with a quota / rate-limit / billing-class refusal, a seat
+  whose binary is not installed, or one that times out for the dispatcher's whole
+  consecutive-failure streak (`WICKED_COUNCIL_SEAT_BENCH_THRESHOLD`, default 2) with no vote in
+  between is benched for the run, and `unitDistributed.degradedReason` names the seat and the
+  kind (`1 of 5 seats benched: copilot (quota_exhausted (3/3 ballots) — ballot)`). The quota
+  verdict is a refusal-frame classifier over the seat's own words — a self-framed provider
+  sentence or API code anywhere in the judged output, or a whole-word quota term beside refusal
+  phrasing on one of the last six lines and only under a non-zero exit; never an identifier such
+  as `rate_limiter`, never a bare `429`/`402` — and not-installed is judged from the spawn error
+  kind, never from text. Deny-dominates both ways: one successful ballot keeps the seat, an
+  unclassified failure proves nothing. The worker and judge transcripts classify with the same
+  frame and bench by the same rule (`quota_exhausted` only while the seat has no successful unit
+  in the run). **`BenchedSeat.reason` is free text and heterogeneous by design** — the bare
+  `not_logged_in` token, `quota_exhausted (k/n ballots)`, `not_installed (k/n ballots)`,
+  `timed_out (k/n ballots, no vote returned)`, or the launcher's own words — consumers render it,
+  never parse it. **`UnitEvidence.judge_refusals`** `[{seat, reason}]` (additive,
+  `#[serde(default)]`) carries the judge's refusals with their cause beside the unchanged
+  `judge_auth_refusals`. **#453** (acceptance finding F-E2E-011) — a plan whose every unit is a
+  Tool executor needs no CLI seat: crew hands its tool-only `onboarding` workflow `clis: []` by
+  design, and 0.7.22 refused it ("no eligible seat … every configured seat is benched") about one
+  second after launch, so no registered repo got a graph. The seat requirement is now per UNIT —
+  a tool-only plan is routed `tool` before any eligibility verdict, and the empty-eligible refusal
+  fires only when at least one planned unit actually needs a seat (a tool unit beside an agent
+  unit on an empty or all-benched roster is refused exactly as before). Wire shape, additive
+  only: new `councilSeatFailed.reason` tokens `quota_exhausted` / `not_installed`, new free text
+  on `degradedReason`, one defaulted field on `UnitEvidence`; `unitDistributed` for tool units
+  reads exactly as before. **Coupling to note:** wicked-crew 0.7.32 pins `wicked-core-ts
+  ^0.7.23`.
 - **core-ts 0.7.22** — npm release carrying the two engine changes since 0.7.21, all on main tip
   18f1dab (plus #446, the 0.7.21 platform-lockfile re-stamp): **#448** — `scripts/finalize-dts.mjs`
   parses again (the four unescaped backticks #444 left in its doc template broke `npm run build`
