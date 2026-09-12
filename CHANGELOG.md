@@ -938,6 +938,38 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.24** — npm release carrying the one engine change since 0.7.23, on main tip
+  11d3b66 (plus #455, the 0.7.23 platform-lockfile re-stamp): **#456** (acceptance findings
+  F-E2E-030 / F-E2E-029 / F-E2E-028). **The deliver phase is always human-gated.** The engine
+  pauses before the `deliver` Tool unit — the one step that leaves the machine — whatever the
+  run's `human_confirm` policy says, and the prompt names the branch, the repo and the gh account
+  that will push. The only opt-out is the launch setting `autoDeliver` (core-ts
+  `LaunchOptions.autoDeliver?: boolean`, absent ⇒ gated; `LaunchSpec.auto_deliver` on the engine;
+  `human_confirm: none` is NOT an opt-out) (F-E2E-030). **The repo-checks floor provisions the
+  declared dependencies INTO the run worktree** with a frozen lockfile (`--ignore-scripts`,
+  isolated cache) before running checks — a hollow or partial `node_modules/` (any declared
+  dependency without `node_modules/<name>/package.json`) triggers the install and the check names
+  the first missing dependency; a failed install is reported as an environment finding
+  ("dependency provisioning failed — … not a verdict on the change") with the install's own
+  output, never a bare ENOENT denial (F-E2E-029a). **Best-effort install fence:** a mutating
+  `npm`/`pnpm`/`yarn`/`bun` invocation whose effective directory escapes the unit's worktree is
+  refused — following `cd`/`pushd`/`popd`, `--prefix`/`-C`/`--dir`/`--cwd`, `env -C`,
+  `npm_config_prefix=` and global installs — stateful across tool calls per `(run, unit,
+  attempt)` on both carriers (the ACP permission bridge and the hook), advisory per tool call,
+  disclosed as `workerToolCallDenied` with the `install fence:` reason prefix. It is never
+  claimed hermetic: each distributed agent unit now also emits an additive `sandboxPosture
+  {session, ord, cli, posture: 'os' | 'advisory', reason}` naming the seat's write containment,
+  and F-E2E-029b stays OPEN until OS containment (`os_sandbox: true`) is armed for the seat.
+  **Cancel keeps a worktree that holds uncommitted work** (a clean one is still reaped) and emits
+  `worktreeRetained {session, path, reason}`; kept worktrees ride the
+  `WICKED_COMPLETED_WORKTREE_KEEP_DAYS` window (F-E2E-028). **`awaitingHuman.gateKind`**
+  (`run_level` | `def` | `deliver` | `terminal` | `escalation` | `failure` | `triage`; `gate_kind`
+  on the durable interaction request) — consumers key on it, never on the prompt text. Wire shape,
+  additive only: `autoDeliver` optional on `LaunchOptions`; `auto_deliver` on the run DTO
+  (`#[serde(default)]`, always present on a new engine — a consumer promises a gate only when it
+  is present); new `gateKind`, `sandboxPosture`, `worktreeRetained`. **Coupling to note:**
+  wicked-crew 0.7.33 pins `wicked-core-ts ^0.7.24` and reports `/health.capabilities.deliverGate`
+  true on it.
 - **core-ts 0.7.23** — npm release carrying the two engine fixes since 0.7.22, all on main tip
   f37e325 (plus #451, the 0.7.22 platform-lockfile re-stamp): **#452** (acceptance finding
   F-7R3-001) — routing benches a seat that is DEAD for the run, not only one that is signed out.
