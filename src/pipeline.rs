@@ -869,20 +869,56 @@ pub(crate) fn apply_and_finish_unit(
     let det_denial =
         pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new), db_path);
 
-    // (F-7R2-006 / review RT-1) A judge seat that refused with an authentication failure while
-    // this unit's judge rotated is BENCHED for the run — persisted on the session so the next
-    // unit's judge, the failover ladder and the triage judge all skip it.
-    if !evidence.judge_auth_refusals.is_empty() {
+    // (F-7R2-006 / review RT-1 / F-7R3-001) A judge seat that REFUSED while this unit's judge
+    // rotated — an authentication failure, a quota refusal, a binary that could not start — is
+    // BENCHED for the run under its own reason, persisted on the session so the next unit's
+    // judge, the failover ladder and the triage judge all skip it. `judge_refusals` carries every
+    // refusal with its cause; `judge_auth_refusals` (authentication only) is read too, for a
+    // payload from a serializer without the newer field.
+    let mut judge_benches: Vec<(String, String)> = evidence
+        .judge_refusals
+        .iter()
+        .map(|r| (r.seat.clone(), r.reason.clone()))
+        .collect();
+    for seat in &evidence.judge_auth_refusals {
+        if !judge_benches.iter().any(|(s, _)| s == seat) {
+            judge_benches.push((
+                seat.clone(),
+                wicked_council::types::SeatFailureReason::NotLoggedIn
+                    .as_str()
+                    .to_string(),
+            ));
+        }
+    }
+    if !judge_benches.is_empty() {
         if let Ok(Some(mut session)) = crate::domain::get_session(&*store, session_id) {
+            // (review F3 on #452) The ballot ledger's rule, applied to a transcript: a
+            // quota-class refusal benches only a seat with NO successful unit in this run;
+            // sign-in / missing binary on first occurrence. A token this build does not know (a
+            // newer serializer) benches as written — deny wins.
+            let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
             let mut changed = false;
-            for seat in &evidence.judge_auth_refusals {
+            for (seat, token) in judge_benches {
+                let why = match wicked_council::types::SeatFailureReason::from_token(&token) {
+                    Some(reason) => crate::domain::transcript_bench_reason(
+                        reason,
+                        crate::domain::seat_succeeded_in_run(&units, &seat),
+                    ),
+                    None => Some(token),
+                };
+                let Some(why) = why else {
+                    eprintln!(
+                        "wicked-core: judge seat '{seat}' refused on unit {} but has a successful \
+                         unit in this run — not benched (F-7R3-001)",
+                        unit.ord
+                    );
+                    continue;
+                };
                 changed |= crate::domain::bench_seat(
                     &mut session.benched_seats,
                     crate::domain::BenchedSeat {
-                        cli: seat.clone(),
-                        reason: wicked_council::types::SeatFailureReason::NotLoggedIn
-                            .as_str()
-                            .to_string(),
+                        cli: seat,
+                        reason: why,
                         source: "judge".to_string(),
                     },
                 );

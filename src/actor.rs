@@ -4115,6 +4115,13 @@ fn apply_step_result(
     }
     let mut output = output;
     let mut units = crate::domain::session_units(store, &run_id)?;
+    // (F-7R3-001, review F3) The seats with a SUCCESSFUL unit in this run so far — read before
+    // `unit` borrows the list; a quota-class refusal below benches only a seat without one.
+    let seats_with_a_done_unit: Vec<String> = units
+        .iter()
+        .filter(|u| matches!(u.status, crate::domain::UnitStatus::Done))
+        .filter_map(|u| u.assigned_cli.clone())
+        .collect();
     let unit = units
         .get_mut(output.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("unit ix {} out of range for {run_id}", output.unit_ix))?;
@@ -4329,30 +4336,66 @@ fn apply_step_result(
         // recovery path runs: the failover ladder, the triage judge and the agent judge all read
         // the bench, so the dead seat is never re-dispatched (run b86c14c1 parked at five human
         // gates re-dispatching codex/pi). Persisted — a resume honours it too.
-        let auth_refusal = if unit.tool_cmd.is_none() {
-            wicked_council::types::SeatFailureReason::classify(&output.output, "")
+        // (F-7R3-001) …and so does a QUOTA refusal (`exceeded your monthly quota`, `rate limit`,
+        // `usage limit`, `insufficient credits`, …) or a binary that could not be spawned at all
+        // (the wrapped runner's `(could not run …: No such file or directory)` line): a seat that
+        // answers this way has no work left in it for this run. The transcript is judged by
+        // `classify_refusal` — authentication over the whole text, quota over its tail only — so
+        // a worker whose SUBJECT was rate limiting is not mistaken for one that was rate limited.
+        let seat_refusal = if unit.tool_cmd.is_none() {
+            // (r2-N2) The generic quota rule needs exit evidence — the wrapped runner's own
+            // `(cli … exited N)` marker with N ≠ 0; a provider sentence needs none.
+            let exited_nonzero =
+                crate::execute_wrapped::wrapped_exit_code(&output.output).is_some_and(|c| c != 0);
+            wicked_council::types::SeatFailureReason::classify_refusal(
+                &output.output,
+                exited_nonzero,
+            )
+            .or_else(|| {
+                crate::execute_wrapped::spawn_failure_detail(&output.output)
+                    .and_then(wicked_council::types::SeatFailureReason::classify_spawn_detail)
+            })
         } else {
             None
         };
-        if let Some(reason) = auth_refusal {
+        if let Some(reason) = seat_refusal {
             let cli = unit
                 .assigned_cli
                 .clone()
                 .unwrap_or_else(|| "claude".to_string());
-            if crate::domain::bench_seat(
-                &mut session.benched_seats,
-                crate::domain::BenchedSeat {
-                    cli: cli.clone(),
-                    reason: reason.as_str().to_string(),
-                    source: "worker".to_string(),
-                },
+            // (review F3 on #452) The ballot ledger's rule, applied to a transcript: a
+            // quota-class refusal benches only a seat with NO successful unit in this run — one
+            // refusal beside a success is a flaky provider (or a misread transcript), not a dead
+            // seat; a sign-in or missing-binary refusal benches on first occurrence as before.
+            // Either way the unit itself fails over below.
+            match crate::domain::transcript_bench_reason(
+                reason,
+                seats_with_a_done_unit.contains(&cli),
             ) {
-                put_node(store, session.to_node())?;
-                eprintln!(
-                    "wicked-core: seat '{cli}' failed authentication on unit {ord} of {run_id} \
-                     ({}); benched for the run — never re-dispatched, never a judge (F-7R2-006)",
+                Some(why) => {
+                    if crate::domain::bench_seat(
+                        &mut session.benched_seats,
+                        crate::domain::BenchedSeat {
+                            cli: cli.clone(),
+                            reason: why.clone(),
+                            source: "worker".to_string(),
+                        },
+                    ) {
+                        put_node(store, session.to_node())?;
+                        eprintln!(
+                            "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({why}); \
+                             benched for the run — never re-dispatched, never a judge (F-7R2-006 \
+                             / F-7R3-001)",
+                            reason.verb()
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({}) but has a \
+                     successful unit in this run — not benched; the unit fails over (F-7R3-001)",
+                    reason.verb(),
                     reason.as_str()
-                );
+                ),
             }
         }
         // Escalation requires a human in the loop. Autonomous sessions
@@ -4578,7 +4621,7 @@ fn apply_step_result(
         // moves to a seat that can take it instead of parking at a human gate per unit.
         if unit.tool_cmd.is_none()
             && (crate::acp_runner::is_worker_originated_failure(&output.output)
-                || auth_refusal.is_some())
+                || seat_refusal.is_some())
         {
             let failed_cli = unit
                 .assigned_cli
@@ -5915,6 +5958,7 @@ fn dispatch_unit(
                     tree_changed: None,
                     judge_skipped: None,
                     judge_auth_refusals: Vec::new(),
+                    judge_refusals: Vec::new(),
                 }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,

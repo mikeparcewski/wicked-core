@@ -167,7 +167,10 @@ pub struct AgentSession {
     /// target, never a triage judge. Two sources: the launcher's health probe on the roster it
     /// handed (`AgenticCli::health.usable == false`) and an authentication failure observed IN
     /// the run (a `not_logged_in` council ballot, a worker exit with an auth refusal, an ACP
-    /// `unauthenticated`/`auth_failed` handshake). Persisted so a resume never re-seats a dead
+    /// `unauthenticated`/`auth_failed` handshake) — and, F-7R3-001, a seat that is DEAD for the
+    /// run without being signed out: every ballot refused on quota (`quota_exhausted`), the binary
+    /// could not spawn (`not_installed`), or it timed out on a streak of ballots and voted on none
+    /// (`timed_out`); a worker or judge refusing on the same causes. Persisted so a resume never re-seats a dead
     /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<BenchedSeat>,
@@ -178,8 +181,9 @@ pub struct AgentSession {
 pub struct BenchedSeat {
     /// The roster key.
     pub cli: String,
-    /// Why — the launcher's words (`signed out`) or the engine's classification
-    /// (`not_logged_in`, `unauthenticated`).
+    /// Why — the launcher's words (`signed out`) or the engine's classification: the cause token
+    /// (`not_logged_in`, `quota_exhausted`, `not_installed`, `timed_out`), for a ballot-ledger
+    /// bench with the count that proved it (`quota_exhausted (3/3 ballots)`) (F-7R3-001).
     pub reason: String,
     /// Who benched it: `launcher` (the roster's health probe), `ballot` (a council seat failure),
     /// `worker` (a unit's worker failed with an auth refusal).
@@ -216,6 +220,33 @@ pub fn benched_summary(benched: &[BenchedSeat], configured: usize) -> Option<Str
         configured.max(benched.len()),
         list.join(", ")
     ))
+}
+
+/// (F-7R3-001, review F3) Whether `seat` has produced a SUCCESSFUL unit in this run so far — a
+/// `Done` unit it was assigned. The transcript benches (a worker's or a judge's refusal) read it
+/// the way the ballot ledger reads a vote: one success keeps the seat against a quota-class
+/// refusal — a flaky provider, or a misread transcript, is not a dead seat.
+pub fn seat_succeeded_in_run(units: &[WorkUnit], seat: &str) -> bool {
+    units
+        .iter()
+        .any(|u| matches!(u.status, UnitStatus::Done) && u.assigned_cli.as_deref() == Some(seat))
+}
+
+/// (F-7R3-001, review F3) The bench reason a worker's / judge's classified refusal earns, or
+/// `None` when it does not bench: `not_logged_in` and `not_installed` bench on first occurrence
+/// (a sign-in or a binary does not appear mid-run); `quota_exhausted` only while the seat has NO
+/// success in the run — the ballot ledger's deny-dominates rule applied to a transcript — and the
+/// reason says so, because a single refusal sufficed.
+pub fn transcript_bench_reason(
+    reason: wicked_council::types::SeatFailureReason,
+    seat_succeeded: bool,
+) -> Option<String> {
+    use wicked_council::types::SeatFailureReason as R;
+    match reason {
+        R::NotLoggedIn | R::NotInstalled => Some(reason.as_str().to_string()),
+        R::QuotaExhausted if seat_succeeded => None,
+        R::QuotaExhausted => Some(format!("{} (no success in the run)", reason.as_str())),
+    }
 }
 
 impl ToNode for AgentSession {
@@ -866,6 +897,43 @@ pub struct SessionView {
 
 #[cfg(test)]
 mod tests {
+    /// (F-7R3-001, review F3) A transcript's quota refusal benches only a seat with no `Done`
+    /// unit in the run; sign-in and missing-binary refusals bench regardless.
+    #[test]
+    fn a_transcript_refusal_benches_quota_only_while_the_seat_has_no_success() {
+        use super::*;
+        use wicked_council::types::SeatFailureReason as R;
+        let mut done = WorkUnit::pending("u1", "s", 1, "built the thing");
+        done.assigned_cli = Some("copilot".into());
+        done.status = UnitStatus::Done;
+        let mut live = WorkUnit::pending("u2", "s", 2, "failing now");
+        live.assigned_cli = Some("copilot".into());
+        live.status = UnitStatus::Distributed;
+        let mut rejected = WorkUnit::pending("u3", "s", 3, "rejected");
+        rejected.assigned_cli = Some("codex".into());
+        rejected.status = UnitStatus::Rejected;
+        let units = [done, live, rejected];
+        assert!(seat_succeeded_in_run(&units, "copilot"));
+        assert!(
+            !seat_succeeded_in_run(&units, "codex"),
+            "a rejected unit is not a success"
+        );
+        assert!(!seat_succeeded_in_run(&units, "pi"));
+        assert_eq!(transcript_bench_reason(R::QuotaExhausted, true), None);
+        assert_eq!(
+            transcript_bench_reason(R::QuotaExhausted, false).as_deref(),
+            Some("quota_exhausted (no success in the run)")
+        );
+        assert_eq!(
+            transcript_bench_reason(R::NotLoggedIn, true).as_deref(),
+            Some("not_logged_in")
+        );
+        assert_eq!(
+            transcript_bench_reason(R::NotInstalled, true).as_deref(),
+            Some("not_installed")
+        );
+    }
+
     use super::*;
 
     /// FINDING-019: the ONE human-confirm parser accepts the three real tokens (absent = unattended

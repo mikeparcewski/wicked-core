@@ -1979,7 +1979,7 @@ impl WrappedCliStepRunner {
                 }
                 Err(e) => (
                     StepStatus::Failed,
-                    format!("(could not run `{}`: {e})", argv[0]),
+                    format!("{COULD_NOT_RUN_PREFIX}{}`: {e})", argv[0]),
                     None,
                     Vec::new(),
                     Vec::new(),
@@ -3389,6 +3389,32 @@ type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>)
 /// CANCELLED, …)` — two sentinels, because the ceiling is the engine's own act while the token
 /// flips on a run-terminal (operator) cancel. Uses a scoped thread so the stdout drain can borrow
 /// `emit` (which lives on the worker stack); the adapter is MOVED into that thread.
+/// The wrapped runner's own marker for a unit whose CLI could not be SPAWNED (as opposed to one
+/// that ran and exited non-zero): `(could not run <program>: <os error>)`. The actor's and the
+/// judge's bench read it structurally ([`spawn_failure_detail`]) — a `NotFound` spawn is
+/// `not_installed` for the run (F-7R3-001).
+pub(crate) const COULD_NOT_RUN_PREFIX: &str = "(could not run `";
+
+/// (F-7R3-001) The OS error text of a wrapped spawn failure, when `output` IS one — `None` for
+/// every output that is not the runner's own spawn-failure line, so a worker that RAN is never
+/// mistaken for one that could not start, whatever its transcript says.
+pub(crate) fn spawn_failure_detail(output: &str) -> Option<&str> {
+    let rest = output.strip_prefix(COULD_NOT_RUN_PREFIX)?;
+    let (_program, detail) = rest.split_once("`: ")?;
+    Some(detail.trim_end().strip_suffix(')').unwrap_or(detail))
+}
+
+/// (F-7R3-001, r2-N2) The exit code the wrapped runner's own marker carries — `(cli `<key>`
+/// exited <code>) …` → `Some(code)`; `None` for any output that is not that line (a spawn
+/// failure, a timeout, a cancellation, an ACP transcript). The generic quota rule reads it as its
+/// exit evidence: a quota word beside a refusal verb classifies only under a non-zero exit.
+pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
+    let rest = output.strip_prefix("(cli `")?;
+    let (_key, rest) = rest.split_once("` exited ")?;
+    let (code, _) = rest.split_once(')')?;
+    code.trim().parse().ok()
+}
+
 fn run_bounded(
     mut cmd: Command,
     timeout: Duration,
@@ -3927,6 +3953,52 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 
 #[cfg(test)]
 mod tests {
+    /// (r2-N2 on #452) The runner's exit marker is read structurally: the code it carries, and
+    /// `None` for every other shape of output.
+    #[test]
+    fn wrapped_exit_code_reads_only_the_runners_own_exit_marker() {
+        assert_eq!(
+            wrapped_exit_code("(cli `codex` exited 1) error[E0308]: mismatched types"),
+            Some(1)
+        );
+        assert_eq!(wrapped_exit_code("(cli `codex` exited 0) done"), Some(0));
+        assert_eq!(wrapped_exit_code("(cli `codex` exited 137) "), Some(137));
+        assert_eq!(
+            wrapped_exit_code("(cli `codex` exceeded the timeout and was killed)"),
+            None
+        );
+        assert_eq!(
+            wrapped_exit_code("(could not run `codex`: No such file or directory (os error 2))"),
+            None
+        );
+        assert_eq!(wrapped_exit_code("rate limit exceeded"), None);
+    }
+
+    /// (F-7R3-001) The runner's own spawn-failure line is recognised STRUCTURALLY — its prefix
+    /// and the program token — and yields the OS error text; a unit that RAN and merely printed
+    /// the same words is never mistaken for one that could not start.
+    #[test]
+    fn spawn_failure_detail_reads_only_the_runners_own_could_not_run_line() {
+        let line =
+            format!("{COULD_NOT_RUN_PREFIX}copilot`: No such file or directory (os error 2))");
+        assert_eq!(
+            spawn_failure_detail(&line),
+            Some("No such file or directory (os error 2)")
+        );
+        assert_eq!(
+            spawn_failure_detail(&line)
+                .and_then(wicked_council::types::SeatFailureReason::classify_spawn_detail),
+            Some(wicked_council::types::SeatFailureReason::NotInstalled)
+        );
+        assert_eq!(
+            spawn_failure_detail("(cli `copilot` exited 1) cat: x: No such file or directory"),
+            None
+        );
+        assert_eq!(
+            spawn_failure_detail("No such file or directory (os error 2)"),
+            None
+        );
+    }
     use super::*;
 
     /// The fence and injector entry points with NO operational state home (the tests here fence

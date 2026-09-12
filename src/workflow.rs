@@ -281,6 +281,23 @@ pub struct UnitEvidence {
     /// tree-changing unit does not re-try every dead seat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judge_auth_refusals: Vec<String>,
+    /// (F-7R3-001) EVERY judge seat that refused while the agent judge rotated, with the
+    /// classified cause (`not_logged_in`, `quota_exhausted`, `not_installed`) — the superset of
+    /// `judge_auth_refusals`, which keeps its pre-F-7R3-001 meaning (authentication only) so a
+    /// reader without this field still benches those. The fold benches each seat here for the
+    /// run (`source: "judge"`) under its own reason. Additive: absent on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judge_refusals: Vec<JudgeRefusal>,
+}
+
+/// (F-7R3-001) One judge seat's refusal during the agent judge's rotation
+/// ([`UnitEvidence::judge_refusals`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeRefusal {
+    /// The roster key.
+    pub seat: String,
+    /// The classified cause — `wicked_council::types::SeatFailureReason::as_str`.
+    pub reason: String,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`

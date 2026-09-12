@@ -160,7 +160,8 @@ pub enum CoreEvent {
         /// The OS/IO error text, where the branch has one.
         detail: String,
         /// The classified cause when the seat's own words matched a known signature
-        /// (`not_logged_in`), `None` (wire `null`) otherwise — emitted unconditionally, the same
+        /// (`not_logged_in`; F-7R3-001: `quota_exhausted`, and `not_installed` for a `NotFound`
+        /// spawn), `None` (wire `null`) otherwise — emitted unconditionally, the same
         /// "unknown" rule as every other `Option` on this stream.
         reason: Option<String>,
         /// How long the seat ran before failing. A spawn error costs ~0 ms; a timeout costs the
