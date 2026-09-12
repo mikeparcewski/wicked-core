@@ -737,8 +737,11 @@ impl SeatFailureReason {
     /// empty), other CLIs on stderr. Deliberately narrow: an unrecognised failure stays
     /// unclassified rather than mislabelled. Scans each stream in place — no combined or
     /// lowercased copy — because it runs over the UNTRUNCATED output of `wait_with_output`, which
-    /// a pathological seat can make large (Copilot, PR#413).
-    pub fn classify(stdout: &str, stderr: &str) -> Option<Self> {
+    /// a pathological seat can make large (Copilot, PR#413). `nonzero_exit` is the exit evidence
+    /// the GENERIC quota rule needs (r2-N2 on #452): the process ran to completion and exited
+    /// non-zero — [`SeatFailure::exited_nonzero`] for a ballot record; a provider sentence and an
+    /// authentication refusal need none.
+    pub fn classify(stdout: &str, stderr: &str, nonzero_exit: bool) -> Option<Self> {
         // AUTHENTICATION first: it is the more specific fix (sign THAT directory in), and a
         // sign-in refusal that also mentions a plan is still a sign-in refusal.
         if [stdout, stderr]
@@ -747,7 +750,10 @@ impl SeatFailureReason {
         {
             return Some(SeatFailureReason::NotLoggedIn);
         }
-        if [stdout, stderr].iter().any(|s| quota_refusal_frame(s)) {
+        if [stdout, stderr]
+            .iter()
+            .any(|s| quota_refusal_frame(s, nonzero_exit))
+        {
             return Some(SeatFailureReason::QuotaExhausted);
         }
         None
@@ -760,11 +766,14 @@ impl SeatFailureReason {
     /// body of a long transcript is the unit's subject matter, not the seat's condition. A
     /// refusal straddling the tail cut is missed by design: a real refusal is terminal, so it
     /// never does (review F4). A ballot's output goes through [`Self::classify`] whole.
-    pub fn classify_refusal(output: &str) -> Option<Self> {
+    /// `nonzero_exit` — the runner's own failure marker (`(cli … exited N)`, N ≠ 0) — is the
+    /// exit evidence the generic quota rule needs (r2-N2); a carrier that hands the engine no
+    /// exit status classifies provider sentences only.
+    pub fn classify_refusal(output: &str, nonzero_exit: bool) -> Option<Self> {
         if matches_any(output, NOT_LOGGED_IN) {
             return Some(SeatFailureReason::NotLoggedIn);
         }
-        if quota_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES)) {
+        if quota_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES), nonzero_exit) {
             return Some(SeatFailureReason::QuotaExhausted);
         }
         None
@@ -825,10 +834,19 @@ const NOT_LOGGED_IN: &[&str] = &[
     "not signed in",
 ];
 
-/// (F-7R3-001, review F1) Quota-class refusals that are complete in themselves — an API error
-/// code, or a sentence no code identifier and no prose about limiting produces. Matched as WHOLE
-/// tokens (no letter, digit or `_` on either side) on a terminal line of the output.
+/// (F-7R3-001, review F1 / r2-N1) Quota-class refusals that are complete in themselves — a
+/// provider's own sentence, an API error code, or a phrase no code identifier and no prose about
+/// limiting produces. Matched as WHOLE tokens (no letter, digit or `_` on either side) ANYWHERE in
+/// the judged output — a refusal followed by a stack trace is still a refusal — and with no exit
+/// evidence required.
 const QUOTA_SELF_FRAMED: &[&str] = &[
+    // The providers' own sentences: copilot, OpenAI, codex, claude, Anthropic, Gemini.
+    "exceeded your monthly quota",
+    "exceeded your current quota",
+    "hit your usage limit",
+    "usage limit reached",
+    "exceed your account's rate limit",
+    "resource has been exhausted",
     // API / RPC error codes (Anthropic, OpenAI, gRPC).
     "insufficient_quota",
     "quota_exceeded",
@@ -851,11 +869,12 @@ const QUOTA_SELF_FRAMED: &[&str] = &[
     "payment required",
 ];
 
-/// (F-7R3-001, review F1) The GENERIC quota words — which classify only inside a REFUSAL FRAME:
-/// as whole words (a plural `s` allowed; never `rate limiting`, `RateLimiter`, `rate_limiter`,
-/// `ratelimit_bucket`) on a terminal line that also carries one of [`REFUSAL_VERBS`]. `the rate
-/// limit middleware has no tests` is subject matter; `You have exceeded your monthly quota` is
-/// the seat's condition.
+/// (F-7R3-001, review F1 / r2-N2) The GENERIC quota words — which classify only inside a REFUSAL
+/// FRAME: as whole words (a plural `s` allowed; never `rate limiting`, `RateLimiter`,
+/// `rate_limiter`, `ratelimit_bucket`) on a terminal line that also carries one of
+/// [`REFUSAL_VERBS`], and only under a NON-ZERO exit. `the rate limit middleware has no tests` is
+/// subject matter; `✗ rate limit > returns 429 when exceeded` on an exit-0 / parse-only failure
+/// is test output; `You have exceeded your monthly quota` is the seat's condition.
 const QUOTA_GENERIC: &[&str] = &["quota", "rate limit", "usage limit"];
 
 /// (F-7R3-001, review F1) The refusal phrasing the seats' real messages carry beside a generic
@@ -882,37 +901,46 @@ const REFUSAL_VERBS: &[&str] = &[
     "402",
 ];
 
-/// How many terminal non-empty lines the quota refusal frame is judged over — a refusal and the
-/// hint lines a CLI prints under it, never the body of the work.
+/// How many terminal non-empty lines the GENERIC quota rule is judged over — a refusal and the
+/// hint lines a CLI prints under it, never the body of the work. (A self-framed provider
+/// sentence is judged over the whole tail: a stack trace under it does not hide it — r2-N1.)
 pub const REFUSAL_FRAME_LINES: usize = 6;
 
 /// How much of a worker's / judge's transcript tail [`SeatFailureReason::classify_refusal`]
 /// judges the quota refusal frame over.
 pub const REFUSAL_TAIL_BYTES: usize = 2048;
 
-/// (F-7R3-001, review F1) Does `text` END in a quota refusal? Judged over its last
-/// [`REFUSAL_FRAME_LINES`] non-empty lines only — a CLI prints its refusal last, and the same
-/// words earlier are the work's subject — and a line counts when it carries a self-framed phrase
-/// ([`QUOTA_SELF_FRAMED`]) or a generic quota word ([`QUOTA_GENERIC`]) beside refusal phrasing
-/// ([`REFUSAL_VERBS`]). ASCII-case-insensitive; the whole-word rule keeps code identifiers and
-/// adjacent words (`rate_limiter`, `RateLimiter`, `rate limiting`) out.
-pub fn quota_refusal_frame(text: &str) -> bool {
-    text.lines()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(REFUSAL_FRAME_LINES)
-        .any(|line| {
-            QUOTA_SELF_FRAMED
-                .iter()
-                .any(|p| has_whole_phrase(line, p, false))
-                || (QUOTA_GENERIC
+/// (F-7R3-001, review F1 / r2-N1 / r2-N2) Is `text` a quota refusal? Two rules. A SELF-FRAMED
+/// phrase ([`QUOTA_SELF_FRAMED`] — a provider's own sentence or an API code) counts anywhere in
+/// `text` and needs no exit evidence: copilot's refusal followed by a Node stack trace is still
+/// a refusal. A GENERIC quota word ([`QUOTA_GENERIC`]) counts only beside refusal phrasing
+/// ([`REFUSAL_VERBS`]) on the same line, only on the last [`REFUSAL_FRAME_LINES`] non-empty lines
+/// — a CLI prints its refusal last, the same words earlier are the work's subject — and only
+/// when `nonzero_exit` says the process failed: on an exit-0 / parse-only failure the line is
+/// test output, not the seat's condition. ASCII-case-insensitive; the whole-word rule keeps code
+/// identifiers and adjacent words (`rate_limiter`, `RateLimiter`, `rate limiting`) out.
+pub fn quota_refusal_frame(text: &str, nonzero_exit: bool) -> bool {
+    if QUOTA_SELF_FRAMED
+        .iter()
+        .any(|p| has_whole_phrase(text, p, false))
+    {
+        return true;
+    }
+    nonzero_exit
+        && text
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .take(REFUSAL_FRAME_LINES)
+            .any(|line| {
+                QUOTA_GENERIC
                     .iter()
                     .any(|w| has_whole_phrase(line, w, true))
                     && REFUSAL_VERBS.iter().any(|v| match *v {
                         "exceed" | "exhaust" => has_word_prefix(line, v),
                         _ => has_whole_phrase(line, v, false),
-                    }))
-        })
+                    })
+            })
 }
 
 /// A byte that continues an identifier or a word: a letter, a digit or `_`. Any other byte —
@@ -1090,7 +1118,7 @@ impl SeatFailure {
     /// FIRST (codex, PR#413: classifying after the cut missed a signature past 4096 bytes), then
     /// stored within the cap — stderr as head+tail, stdout as tail.
     pub fn with_output(mut self, stdout: &str, stderr: &str) -> Self {
-        self.reason = SeatFailureReason::classify(stdout, stderr);
+        self.reason = SeatFailureReason::classify(stdout, stderr, self.exited_nonzero());
         self.stdout = tail_within_cap(stdout);
         self.stderr = head_and_tail_within_cap(stderr);
         self
@@ -1100,7 +1128,8 @@ impl SeatFailure {
     /// attached; an earlier positive classification is kept), then stored as head+tail within
     /// [`STDERR_CAPTURE_LIMIT`], cut on char boundaries so the result stays valid UTF-8.
     pub fn with_stderr(mut self, stderr: &str) -> Self {
-        self.reason = SeatFailureReason::classify(&self.stdout, stderr).or(self.reason);
+        self.reason = SeatFailureReason::classify(&self.stdout, stderr, self.exited_nonzero())
+            .or(self.reason);
         self.stderr = head_and_tail_within_cap(stderr);
         self
     }
@@ -1109,9 +1138,17 @@ impl SeatFailure {
     /// attached; an earlier positive classification is kept), then stored as its TAIL within
     /// [`STDERR_CAPTURE_LIMIT`] — a CLI states its final error last.
     pub fn with_stdout(mut self, stdout: &str) -> Self {
-        self.reason = SeatFailureReason::classify(stdout, &self.stderr).or(self.reason);
+        self.reason = SeatFailureReason::classify(stdout, &self.stderr, self.exited_nonzero())
+            .or(self.reason);
         self.stdout = tail_within_cap(stdout);
         self
+    }
+
+    /// (r2-N2 on #452) The exit evidence the generic quota rule needs: this record's process ran
+    /// to completion and exited non-zero — the [`SeatFailureKind::NonZeroExit`] branch, or a
+    /// recorded non-zero code. A timeout, a spawn failure or a panic has no exit to speak of.
+    pub fn exited_nonzero(&self) -> bool {
+        self.kind == SeatFailureKind::NonZeroExit || self.exit_code.is_some_and(|c| c != 0)
     }
 
     /// One-line summary suitable for a degrade string: the branch, the exit code, the classified
@@ -1562,7 +1599,7 @@ mod failure_reason_tests {
             .with_stderr("error: Authentication required — run `codex login`");
         assert_eq!(f.reason, Some(SeatFailureReason::NotLoggedIn));
         assert_eq!(
-            SeatFailureReason::classify("NOT LOGGED IN", ""),
+            SeatFailureReason::classify("NOT LOGGED IN", "", false),
             Some(SeatFailureReason::NotLoggedIn),
             "case-insensitive"
         );
@@ -1576,7 +1613,7 @@ mod failure_reason_tests {
             .with_stdout("usage: agy [options]");
         assert_eq!(f.reason, None);
         assert!(!f.summary().contains('['), "{}", f.summary());
-        assert_eq!(SeatFailureReason::classify("", ""), None);
+        assert_eq!(SeatFailureReason::classify("", "", true), None);
     }
 
     /// (F-7R3-001) The seats' REAL quota refusals classify `quota_exhausted` — the copilot string
@@ -1611,13 +1648,13 @@ mod failure_reason_tests {
             );
             assert_eq!(f.reason.unwrap().as_str(), "quota_exhausted");
             assert_eq!(
-                SeatFailureReason::classify("", words),
+                SeatFailureReason::classify("", words, true),
                 Some(SeatFailureReason::QuotaExhausted),
                 "either stream: {words:?}"
             );
         }
         assert_eq!(
-            SeatFailureReason::classify("EXCEEDED YOUR MONTHLY QUOTA", ""),
+            SeatFailureReason::classify("EXCEEDED YOUR MONTHLY QUOTA", "", false),
             Some(SeatFailureReason::QuotaExhausted),
             "case-insensitive"
         );
@@ -1631,7 +1668,8 @@ mod failure_reason_tests {
         assert_eq!(
             SeatFailureReason::classify(
                 "Not logged in · Please run /login (your plan's rate limit also applies)",
-                ""
+                "",
+                true
             ),
             Some(SeatFailureReason::NotLoggedIn)
         );
@@ -1640,22 +1678,22 @@ mod failure_reason_tests {
             "Not logged in · Please run /login\nYou've hit your usage limit.",
         ] {
             assert_eq!(
-                SeatFailureReason::classify(s, ""),
+                SeatFailureReason::classify(s, "", true),
                 Some(SeatFailureReason::NotLoggedIn),
                 "ballot: {s:?}"
             );
             assert_eq!(
-                SeatFailureReason::classify_refusal(s),
+                SeatFailureReason::classify_refusal(s, true),
                 Some(SeatFailureReason::NotLoggedIn),
                 "transcript: {s:?}"
             );
         }
         assert_eq!(
-            SeatFailureReason::classify("rate limit reached", "authentication required"),
+            SeatFailureReason::classify("rate limit reached", "authentication required", true),
             Some(SeatFailureReason::NotLoggedIn)
         );
         assert_eq!(
-            SeatFailureReason::classify("error: compile failed: expected `;`", "exit 101"),
+            SeatFailureReason::classify("error: compile failed: expected `;`", "exit 101", true),
             None
         );
         assert_eq!(
@@ -1709,9 +1747,9 @@ mod failure_reason_tests {
         ];
         let mut hits = Vec::new();
         for s in cases {
-            if SeatFailureReason::classify(s, "").is_some()
-                || SeatFailureReason::classify("", s).is_some()
-                || SeatFailureReason::classify_refusal(s).is_some()
+            if SeatFailureReason::classify(s, "", true).is_some()
+                || SeatFailureReason::classify("", s, true).is_some()
+                || SeatFailureReason::classify_refusal(s, true).is_some()
             {
                 hits.push(s);
             }
@@ -1720,32 +1758,109 @@ mod failure_reason_tests {
         // A quota word beside a refusal verb on the same line IS the frame; the same verb on
         // another line is not.
         assert!(quota_refusal_frame(
-            "Error: quota exceeded for this project"
+            "Error: quota exceeded for this project",
+            true
         ));
         assert!(!quota_refusal_frame(
-            "the quota module\nlimits were exceeded by the test"
+            "the quota module\nlimits were exceeded by the test",
+            true
         ));
     }
 
-    /// (F-7R3-001, review F1) The frame is TERMINAL: a refusal on the last lines classifies, the
-    /// same line buried under more than `REFUSAL_FRAME_LINES` lines of later output does not.
+    /// (review F1 / r2-N1 / r2-N2 on #452) The GENERIC rule is terminal and exit-gated: a quota
+    /// word beside a refusal verb classifies on one of the last lines of a NON-ZERO exit — not
+    /// buried under later output, not on an exit-0 / parse-only failure. A SELF-FRAMED provider
+    /// sentence classifies anywhere in the judged text — copilot's refusal followed by a Node
+    /// stack trace is still a refusal — and needs no exit evidence.
     #[test]
-    fn the_quota_refusal_frame_reads_only_the_terminal_lines() {
-        let refusal = "Error: You have exceeded your monthly quota for premium requests.";
-        let hints = "Please upgrade your plan.\nLearn more: https://example.invalid/quota\n";
-        assert!(quota_refusal_frame(&format!("{refusal}\n{hints}")));
-        let buried = format!(
-            "{refusal}\n{}",
-            (0..REFUSAL_FRAME_LINES + 1)
-                .map(|i| format!("  at frame {i}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+    fn the_generic_rule_is_terminal_and_exit_gated_while_provider_sentences_are_not() {
+        let stack = (0..8)
+            .map(|i| {
+                format!("    at Object.<anonymous> (/usr/lib/node_modules/copilot/index.js:{i}:1)")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // r2-N1: the copilot refusal followed by eight stack lines — on both paths, either
+        // stream, with or without exit evidence.
+        let copilot =
+            format!("Error: You have exceeded your monthly quota for premium requests.\n{stack}");
+        assert!(quota_refusal_frame(&copilot, false));
+        assert_eq!(
+            SeatFailureReason::classify(&copilot, "", true),
+            Some(SeatFailureReason::QuotaExhausted)
         );
-        assert!(!quota_refusal_frame(&buried), "{buried}");
-        assert_eq!(SeatFailureReason::classify_refusal(&buried), None);
-        assert_eq!(SeatFailureReason::classify(&buried, ""), None);
-        // Blank lines do not count against the window.
-        assert!(quota_refusal_frame(&format!("{refusal}\n\n\n\n\n\n\n\n")));
+        assert_eq!(
+            SeatFailureReason::classify("", &copilot, false),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(
+                &format!("(cli `copilot` exited 1) {copilot}"),
+                true
+            ),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        // The generic rule: the terminal lines only (blank lines do not count against the window)…
+        let generic = "Error: rate limit reached, retrying in 60s";
+        assert!(quota_refusal_frame(generic, true));
+        assert!(quota_refusal_frame(
+            &format!("{generic}\nPlease wait.\n\n\n\n\n"),
+            true
+        ));
+        let buried = format!("{generic}\n{stack}");
+        assert!(!quota_refusal_frame(&buried, true), "{buried}");
+        assert_eq!(SeatFailureReason::classify(&buried, "", true), None);
+        assert_eq!(SeatFailureReason::classify_refusal(&buried, true), None);
+        // …and only under a non-zero exit (r2-N2): the reviewer's test-output lines. An exit-0
+        // ballot is never a `SeatFailure` (a tolerant parse yields a hollow vote), so the flag
+        // models the wrapped runner's `(cli … exited 0)` and any carrier without exit evidence.
+        let prose = [
+            "✗ rate limit > returns 429 when exceeded",
+            "FAIL rate limit exceeded test (expected 429, got 200)",
+            "the rate limit is out of scope for this PR",
+            "we reached the quota module refactor",
+            "quota.rs exceeded 80 columns (rustfmt)",
+        ];
+        for line in prose {
+            assert_eq!(
+                SeatFailureReason::classify(line, "", false),
+                None,
+                "exit 0 / parse-only failure: {line:?}"
+            );
+            assert_eq!(
+                SeatFailureReason::classify_refusal(line, false),
+                None,
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            SeatFailureReason::classify(prose[0], "", true),
+            Some(SeatFailureReason::QuotaExhausted),
+            "exit != 0: the frame's precondition holds"
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(prose[0], true),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        // At the record level the exit evidence is the dispatch branch: a `NonZeroExit` record
+        // classifies the generic line, a timed-out record (no exit) does not — while a provider
+        // sentence classifies on either.
+        assert_eq!(
+            SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1")
+                .with_output(prose[0], "")
+                .reason,
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        let timed_out =
+            || SeatFailure::new(SeatFailureKind::TimedOut, "exceeded 60s dispatch budget");
+        assert!(!timed_out().exited_nonzero());
+        assert_eq!(timed_out().with_stderr(generic).reason, None);
+        assert_eq!(
+            timed_out()
+                .with_stderr("You've hit your usage limit.")
+                .reason,
+            Some(SeatFailureReason::QuotaExhausted)
+        );
     }
 
     /// (F-7R3-001) A worker's / judge's transcript is judged for quota over its TAIL only: the
@@ -1755,15 +1870,18 @@ mod failure_reason_tests {
     fn a_transcript_refusal_is_judged_over_its_tail_for_quota_but_whole_for_auth() {
         let filler = "x".repeat(REFUSAL_TAIL_BYTES * 2);
         let body_mentions_it = format!("implementing the rate limit middleware\n{filler}\nexit 1");
-        assert_eq!(SeatFailureReason::classify_refusal(&body_mentions_it), None);
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&body_mentions_it, true),
+            None
+        );
         let refused_last = format!("{filler}\nError: You have exceeded your monthly quota.");
         assert_eq!(
-            SeatFailureReason::classify_refusal(&refused_last),
+            SeatFailureReason::classify_refusal(&refused_last, true),
             Some(SeatFailureReason::QuotaExhausted)
         );
         let auth_first = format!("Not logged in · Please run /login\n{filler}");
         assert_eq!(
-            SeatFailureReason::classify_refusal(&auth_first),
+            SeatFailureReason::classify_refusal(&auth_first, false),
             Some(SeatFailureReason::NotLoggedIn)
         );
         // The tail cut lands on a char boundary — 2-, 3- and 4-byte text does not panic, and
@@ -1776,12 +1894,12 @@ mod failure_reason_tests {
             ] {
                 let wide = ch.repeat(n) + "\nError: exceeded your monthly quota";
                 assert_eq!(
-                    SeatFailureReason::classify_refusal(&wide),
+                    SeatFailureReason::classify_refusal(&wide, true),
                     Some(SeatFailureReason::QuotaExhausted),
                     "{ch} x {n}"
                 );
                 assert_eq!(
-                    SeatFailureReason::classify_refusal(&ch.repeat(n)),
+                    SeatFailureReason::classify_refusal(&ch.repeat(n), true),
                     None,
                     "{ch} x {n} plain"
                 );

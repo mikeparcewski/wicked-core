@@ -3404,6 +3404,17 @@ pub(crate) fn spawn_failure_detail(output: &str) -> Option<&str> {
     Some(detail.trim_end().strip_suffix(')').unwrap_or(detail))
 }
 
+/// (F-7R3-001, r2-N2) The exit code the wrapped runner's own marker carries — `(cli `<key>`
+/// exited <code>) …` → `Some(code)`; `None` for any output that is not that line (a spawn
+/// failure, a timeout, a cancellation, an ACP transcript). The generic quota rule reads it as its
+/// exit evidence: a quota word beside a refusal verb classifies only under a non-zero exit.
+pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
+    let rest = output.strip_prefix("(cli `")?;
+    let (_key, rest) = rest.split_once("` exited ")?;
+    let (code, _) = rest.split_once(')')?;
+    code.trim().parse().ok()
+}
+
 fn run_bounded(
     mut cmd: Command,
     timeout: Duration,
@@ -3942,6 +3953,26 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 
 #[cfg(test)]
 mod tests {
+    /// (r2-N2 on #452) The runner's exit marker is read structurally: the code it carries, and
+    /// `None` for every other shape of output.
+    #[test]
+    fn wrapped_exit_code_reads_only_the_runners_own_exit_marker() {
+        assert_eq!(
+            wrapped_exit_code("(cli `codex` exited 1) error[E0308]: mismatched types"),
+            Some(1)
+        );
+        assert_eq!(wrapped_exit_code("(cli `codex` exited 0) done"), Some(0));
+        assert_eq!(wrapped_exit_code("(cli `codex` exited 137) "), Some(137));
+        assert_eq!(
+            wrapped_exit_code("(cli `codex` exceeded the timeout and was killed)"),
+            None
+        );
+        assert_eq!(
+            wrapped_exit_code("(could not run `codex`: No such file or directory (os error 2))"),
+            None
+        );
+        assert_eq!(wrapped_exit_code("rate limit exceeded"), None);
+    }
 
     /// (F-7R3-001) The runner's own spawn-failure line is recognised STRUCTURALLY — its prefix
     /// and the program token — and yields the OS error text; a unit that RAN and merely printed

@@ -134,11 +134,12 @@ Two release tracks share this file, newest entry first regardless of track:
   on `not_logged_in` and the launcher's `health.usable: false` only, so a quota-exhausted seat
   stayed routable and the run headed for a failure-escalation gate. The council now classifies
   two more causes on `councilSeatFailed.reason` — **`quota_exhausted`**, judged as a REFUSAL
-  FRAME on a terminal line of the output (the seats' own messages: a self-framed phrase such as
+  FRAME (the seats' own messages: a self-framed provider sentence or API code anywhere in the
+  judged output — `exceeded your monthly quota`, `hit your usage limit`, `usage limit reached`,
   `too many requests`, `insufficient credits`, `credit balance is too low`, `billing details`,
   `payment required`, `rate_limit_error`, `insufficient_quota`, or a generic quota word — `quota`,
   `rate limit`, `usage limit`, as whole words — beside refusal phrasing — `exceeded`, `exhausted`,
-  `reached`, `hit your`, `insufficient`, `out of`, …; never `rate_limiter`, `RateLimiter`, `rate
+  `reached`, `hit your`, `insufficient`, `out of`, … — on one of the last six lines and only under a non-zero exit; never `rate_limiter`, `RateLimiter`, `rate
   limiting`, `the usage limits section` or `the rate limit middleware has no tests` on their own,
   and never a bare `429`/`402`) and **`not_installed`** (a `Command::spawn` `NotFound`, judged
   from the error kind, never from text) — and the distribution keeps a per-seat ledger over every

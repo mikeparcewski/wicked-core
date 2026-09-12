@@ -755,7 +755,10 @@ fn run_unit_and_judge_with_roster(
     let note_refusals = |refused: &[(String, String)]| {
         use wicked_council::types::SeatFailureReason;
         for (seat, out) in refused {
-            let reason = SeatFailureReason::classify_refusal(out).or_else(|| {
+            // (r2-N2) Exit evidence for the generic quota rule: the runner's own marker.
+            let exited_nonzero =
+                crate::execute_wrapped::wrapped_exit_code(out).is_some_and(|c| c != 0);
+            let reason = SeatFailureReason::classify_refusal(out, exited_nonzero).or_else(|| {
                 crate::execute_wrapped::spawn_failure_detail(out)
                     .and_then(SeatFailureReason::classify_spawn_detail)
             });

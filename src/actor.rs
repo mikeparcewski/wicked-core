@@ -4343,12 +4343,18 @@ fn apply_step_result(
         // `classify_refusal` — authentication over the whole text, quota over its tail only — so
         // a worker whose SUBJECT was rate limiting is not mistaken for one that was rate limited.
         let seat_refusal = if unit.tool_cmd.is_none() {
-            wicked_council::types::SeatFailureReason::classify_refusal(&output.output).or_else(
-                || {
-                    crate::execute_wrapped::spawn_failure_detail(&output.output)
-                        .and_then(wicked_council::types::SeatFailureReason::classify_spawn_detail)
-                },
+            // (r2-N2) The generic quota rule needs exit evidence — the wrapped runner's own
+            // `(cli … exited N)` marker with N ≠ 0; a provider sentence needs none.
+            let exited_nonzero =
+                crate::execute_wrapped::wrapped_exit_code(&output.output).is_some_and(|c| c != 0);
+            wicked_council::types::SeatFailureReason::classify_refusal(
+                &output.output,
+                exited_nonzero,
             )
+            .or_else(|| {
+                crate::execute_wrapped::spawn_failure_detail(&output.output)
+                    .and_then(wicked_council::types::SeatFailureReason::classify_spawn_detail)
+            })
         } else {
             None
         };

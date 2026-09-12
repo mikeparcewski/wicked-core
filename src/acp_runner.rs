@@ -17075,7 +17075,7 @@ transport = "stdio"
             out.output
         );
         assert_eq!(
-            wicked_council::types::SeatFailureReason::classify(&out.output, ""),
+            wicked_council::types::SeatFailureReason::classify(&out.output, "", false),
             Some(wicked_council::types::SeatFailureReason::NotLoggedIn),
             "the actor benches the seat from these words: {}",
             out.output
