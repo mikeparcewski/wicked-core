@@ -212,28 +212,42 @@ fn allowed_roots_from_env() -> Option<crate::path_policy::AllowedRoots> {
 /// the wider root set and let it through.
 const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 
-/// Refuse a path-bearing tool call that reaches outside the unit's boundary (FINDING-045/098).
-///
-/// The motivating case is not a generic escape. A governed worker in the campaign located
-/// `~/.config/wicked-core/workflows/domain-extraction.json` — the pin binding its OWN gate — and
-/// began authoring a replacement, including vaulting and approving it. Nothing objected; an
-/// unrelated network failure stopped it. `evaluator != creator` is this platform's headline
-/// structural claim, and it was enforced by a file the creator could rewrite.
-///
-/// Returns `(reason, fatal)`, or `None` when the call is inside the boundary, carries nothing
-/// path-shaped, or no boundary was configured. `fatal` drives whether the deny ABORTS the unit (a
-/// write/escape) or is ADVISORY (blocked but the worker continues) — see [`append_boundary_deny`] /
-/// core#219. A blocked READ is always advisory; a blocked WRITE is fatal EXCEPT into the worker's
-/// own Claude Code state tree (`~/.claude/**`) — see the carve-out below (core#235).
-fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, bool)> {
+/// The hook-subprocess boundary check WITHOUT a shell-cwd sidecar — the spelling the boundary
+/// tests exercise (judged from the process cwd, as before the install fence became stateful).
+#[cfg(test)]
+fn boundary_denial_untracked(context: &serde_json::Value, tool: &str) -> Option<(String, bool)> {
     let roots = allowed_roots_from_env()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    // The hook subprocess runs inside the WORKER's environment, so this is the worker's own
-    // effective config home — minted or inherited alike (contrast the in-process arm, which
-    // must gate on the inherit hatch because it reads the DAEMON's env).
     let cfg = std::env::var_os("CLAUDE_CONFIG_DIR").and_then(|v| valid_config_home(&v));
     boundary_denial_with(&roots, &cwd, home.as_deref(), cfg.as_deref(), context, tool)
+}
+
+/// Refuse a path-bearing tool call that reaches outside the unit's boundary (FINDING-045/098) —
+/// the hook-subprocess arm: env-carried roots, the process cwd, `$HOME`, the worker's own
+/// `CLAUDE_CONFIG_DIR` — with the install fence's per-attempt shell-cwd sidecar (review of #456,
+/// F1). Returns `(reason, fatal)`; see [`boundary_denial_with`] for the pure check and the
+/// advisory/fatal rule. The process cwd is the seat's LAUNCH cwd (the worktree) on every
+/// call — Claude Code's Bash tool keeps its own shell cwd between calls — so the sidecar, not the
+/// process, says where the seat's shell stands.
+fn boundary_denial(
+    context: &serde_json::Value,
+    tool: &str,
+    install_state: &Path,
+) -> Option<(String, bool)> {
+    let roots = allowed_roots_from_env()?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let cfg = std::env::var_os("CLAUDE_CONFIG_DIR").and_then(|v| valid_config_home(&v));
+    boundary_denial_tracked(
+        &roots,
+        &cwd,
+        home.as_deref(),
+        cfg.as_deref(),
+        context,
+        tool,
+        Some(install_state),
+    )
 }
 
 /// Validate a raw `CLAUDE_CONFIG_DIR` value before it may steer the agent-state carve-out
@@ -324,6 +338,68 @@ pub(crate) fn boundary_denial_with(
     context: &serde_json::Value,
     tool: &str,
 ) -> Option<(String, bool)> {
+    boundary_denial_tracked(roots, cwd, home, claude_config_dir, context, tool, None)
+}
+
+/// The sidecar of the attempt's decisions log that carries the seat's shell cwd as the install
+/// fence tracks it across tool calls (review of #456, F1): `<attempt dir>/install-fence-cwd-<phase>`.
+/// Attempt-scoped by its directory, so a retry starts back at the worktree; phase-scoped so two
+/// units of one attempt never share a shell.
+pub(crate) fn install_fence_cwd_path(decisions_path: &str, phase: &str) -> std::path::PathBuf {
+    let safe: String = phase
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Path::new(decisions_path).with_file_name(format!("install-fence-cwd-{safe}"))
+}
+
+/// The tracked shell cwd, or `None` when no allowed call has moved it yet (⇒ the worktree).
+fn read_install_fence_cwd(state: Option<&Path>) -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(state?).ok()?;
+    let t = raw.trim();
+    (!t.is_empty()).then(|| std::path::PathBuf::from(t))
+}
+
+/// Persist where the seat's shell stands after an ALLOWED Bash call (its trailing `cd`/`pushd`
+/// applied to the tracked cwd), so the next call is judged from there. Called by
+/// [`evaluate_tool_call`] on its allow exit only — a refused call never ran.
+pub(crate) fn track_install_fence_cwd(
+    command: &str,
+    worktree: &Path,
+    home: Option<&Path>,
+    state: &Path,
+) {
+    let here = read_install_fence_cwd(Some(state)).unwrap_or_else(|| worktree.to_path_buf());
+    let after = crate::install_fence::judge_from(command, worktree, &here, home).here_after;
+    if after == worktree {
+        // Back at (or never left) the worktree — the absence of the file says the same.
+        let _ = std::fs::remove_file(state);
+        return;
+    }
+    if let Some(parent) = state.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(state, after.to_string_lossy().as_bytes());
+}
+
+/// [`boundary_denial_with`] judging the install fence from the cwd persisted at `install_state`
+/// (the wrapped carrier's per-attempt sidecar), or from `cwd` when there is none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn boundary_denial_tracked(
+    roots: &crate::path_policy::AllowedRoots,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    claude_config_dir: Option<&std::path::Path>,
+    context: &serde_json::Value,
+    tool: &str,
+    install_state: Option<&std::path::Path>,
+) -> Option<(String, bool)> {
     // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
     if let Some(path) = context
         .get("path")
@@ -378,6 +454,14 @@ pub(crate) fn boundary_denial_with(
             // reason's prefix and records it under its own claim id so the fold can disclose
             // `workerToolCallDenied` with the command and the remedy.
             if let Some(hit) = crate::remote_write_fence::remote_write_command(command) {
+                return Some((hit.reason(), false));
+            }
+            // INSTALL FENCE (F-E2E-029): a package-manager install whose effective directory —
+            // after `cd`/`pushd` and the manager's own `--prefix`/`-C`/`--cwd` — leaves the unit's
+            // worktree (`cwd`) is refused the same advisory way, and recorded so the fold discloses
+            // it as `workerToolCallDenied` with its remedy.
+            let here = read_install_fence_cwd(install_state).unwrap_or_else(|| cwd.to_path_buf());
+            if let Some(hit) = crate::install_fence::judge_from(command, cwd, &here, home).hit {
                 return Some((hit.reason(), false));
             }
             for target in bash_write_targets(command) {
@@ -970,6 +1054,9 @@ pub(crate) fn evaluate_tool_call(
     // store-open below, because a boundary escape needs NO policy store to judge — an unreachable
     // store used to mask a boundary escape as `infra-deny`, losing the claim the fold and the
     // operator diagnose by (caught by CI on the #260 proof test, which runs storeless).
+    // The wrapped carrier's per-attempt shell-cwd sidecar (review of #456, F1): the install fence
+    // judges this call from where the seat's shell stood after its last ALLOWED call.
+    let install_state = install_fence_cwd_path(decisions_path, phase);
     let boundary_verdict = match boundary {
         Some(b) => boundary_denial_with(
             &b.roots,
@@ -979,7 +1066,7 @@ pub(crate) fn evaluate_tool_call(
             context,
             tool,
         ),
-        None => boundary_denial(context, tool),
+        None => boundary_denial(context, tool, &install_state),
     };
     if let Some((reason, fatal)) = boundary_verdict {
         // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
@@ -992,7 +1079,9 @@ pub(crate) fn evaluate_tool_call(
         // A REMOTE-WRITE refusal (F-7R2-012) is recorded under its own claim id, with the command
         // segment beside the reason, so the gate fold can disclose it as `workerToolCallDenied`
         // (`collect_hook_decisions` surfaces both) — advisory like a blocked read.
-        if reason.starts_with(REMOTE_WRITE_REASON_PREFIX) {
+        if reason.starts_with(REMOTE_WRITE_REASON_PREFIX)
+            || reason.starts_with(crate::install_fence::REASON_PREFIX)
+        {
             let command = context
                 .get("command")
                 .and_then(serde_json::Value::as_str)
@@ -1131,7 +1220,20 @@ pub(crate) fn evaluate_tool_call(
             eprintln!("wicked-governance: DENY `{t}` (claim {})", claim.claim_id);
             2
         }
-        _ => 0,
+        _ => {
+            // ALLOWED: the seat's shell runs this call, so its trailing `cd` is where the install
+            // fence judges the next one from (review of #456, F1). Only here — every deny above
+            // returned 2 before this point, and a refused call never moved the shell.
+            if tool == "Bash" && boundary.is_none() {
+                if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    track_install_fence_cwd(command, &cwd, home.as_deref(), &install_state);
+                }
+            }
+            0
+        }
     }
 }
 
@@ -3500,6 +3602,67 @@ mod boundary_tests {
     }
 
     /// core#294, the ADVERSARIAL topology: the declared read root CONTAINS the write root. This is
+    #[test]
+    fn the_install_fence_tracks_the_shell_cwd_across_hook_calls_and_a_cd_back_re_allows() {
+        // Review of #456, F1 — the wrapped carrier: `cd <clone>` (call 1, allowed) then `npm ci`
+        // (call 2) must be refused from the persisted cwd, not from the process cwd.
+        let repo =
+            std::env::temp_dir().join(format!("wicked-hook-install-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("wicked-worktrees/run-1/sub")).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let wt = repo.join("wicked-worktrees").join("run-1");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let state =
+            install_fence_cwd_path(&decisions_path_for("run-1", 0).to_string_lossy(), "unit-3");
+        let _ = std::fs::remove_file(&state);
+        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
+        let judge = |cmd: &str| {
+            boundary_denial_tracked(&roots, &wt, None, None, &ctx(cmd), "Bash", Some(&state))
+        };
+        // Fresh attempt: judged from the worktree.
+        assert_eq!(judge("npm ci"), None);
+        // Call 1 allowed: `cd <clone>` — nothing to refuse, the shell moved; persist it as the
+        // allow exit does.
+        let cd_clone = format!("cd {}", repo.display());
+        assert_eq!(judge(&cd_clone), None);
+        track_install_fence_cwd(&cd_clone, &wt, None, &state);
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap().trim(),
+            repo.to_string_lossy()
+        );
+        // A benign intermediate call keeps the tracking.
+        assert_eq!(judge("git status"), None);
+        track_install_fence_cwd("git status", &wt, None, &state);
+        // Call 2: refused, advisory, naming the clone root and the install-fence remedy.
+        let (reason, fatal) = judge("npm ci").expect("the two-call split is refused");
+        assert!(!fatal, "advisory: the call is blocked, the unit continues");
+        assert!(
+            reason.starts_with(crate::install_fence::REASON_PREFIX),
+            "{reason}"
+        );
+        assert!(reason.contains(&*repo.to_string_lossy()), "{reason}");
+        // A refusal never moves the shell: the sidecar still says the clone root.
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap().trim(),
+            repo.to_string_lossy()
+        );
+        // A `cd` back into the worktree re-allows — and the sidecar is dropped (= the worktree).
+        let cd_back = format!("cd {}", wt.display());
+        assert_eq!(judge(&cd_back), None);
+        track_install_fence_cwd(&cd_back, &wt, None, &state);
+        assert!(!state.exists(), "back at the worktree ⇒ no sidecar");
+        assert_eq!(judge("npm ci"), None);
+        // A new attempt has its own sidecar path (attempt-scoped directory).
+        assert_ne!(
+            install_fence_cwd_path(&decisions_path_for("run-1", 1).to_string_lossy(), "unit-3"),
+            state
+        );
+    }
+
     /// not exotic — it is the PRIMARY use: worktrees live at `<repo>/wicked-worktrees/<run>`
     /// (see [`crate::repo`]), so `extraReadRoots: [repoRoot]` on a run bound to that same repo
     /// puts the unit's own worktree INSIDE the read grant. If the read list leaked into the write
@@ -3703,7 +3866,7 @@ mod boundary_tests {
             // HOME-pinning test (the skills fixtures pin HOME to a temp scratch) would otherwise
             // hand this test a pin under the system temp, where the core#264 carve-out applies.
             let pin = dirs_config_workflow();
-            let (denial, is_write) = boundary_denial(&ctx(&pin), "Write")
+            let (denial, is_write) = boundary_denial_untracked(&ctx(&pin), "Write")
                 .expect("writing the gate's own pin must be refused");
             assert!(is_write, "writing the pin is a WRITE escape (unit-fatal)");
             assert!(
@@ -3733,7 +3896,7 @@ mod boundary_tests {
             "{home}/.claude/projects/-tmp-wicked-boundary-wt-mem/memory/project_x_domain.md"
         );
         with_roots(Some(wt.to_str().unwrap()), || {
-            let (_, fatal) = boundary_denial(&ctx(&mem), "Write")
+            let (_, fatal) = boundary_denial_untracked(&ctx(&mem), "Write")
                 .expect("a write outside the worktree is STILL blocked");
             assert!(
                 !fatal,
@@ -3741,7 +3904,7 @@ mod boundary_tests {
             );
             // Control: an escape to a DIFFERENT out-of-boundary path (the gate pin) stays FATAL —
             // the carve-out is scoped to ~/.claude, it does not relax the pin.
-            let (_, pin_fatal) = boundary_denial(&ctx(&dirs_config_workflow()), "Write")
+            let (_, pin_fatal) = boundary_denial_untracked(&ctx(&dirs_config_workflow()), "Write")
                 .expect("writing the gate pin is still refused");
             assert!(
                 pin_fatal,
@@ -3756,7 +3919,7 @@ mod boundary_tests {
         std::fs::create_dir_all(&wt).unwrap();
         let inside = wt.join("src").join("main.rs");
         with_roots(Some(wt.to_str().unwrap()), || {
-            assert!(boundary_denial(&ctx(inside.to_str().unwrap()), "Write").is_none());
+            assert!(boundary_denial_untracked(&ctx(inside.to_str().unwrap()), "Write").is_none());
         });
     }
 
@@ -3768,7 +3931,7 @@ mod boundary_tests {
         std::fs::create_dir_all(&wt).unwrap();
         let escape = wt.join("..").join("elsewhere.json");
         with_roots(Some(wt.to_str().unwrap()), || {
-            assert!(boundary_denial(&ctx(escape.to_str().unwrap()), "Write").is_some());
+            assert!(boundary_denial_untracked(&ctx(escape.to_str().unwrap()), "Write").is_some());
         });
     }
 
@@ -3779,7 +3942,7 @@ mod boundary_tests {
         let wt = std::env::temp_dir().join("wicked-boundary-wt4");
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
-            assert!(boundary_denial(&ctx("/etc/passwd"), "Read").is_some());
+            assert!(boundary_denial_untracked(&ctx("/etc/passwd"), "Read").is_some());
         });
     }
 
@@ -3789,7 +3952,7 @@ mod boundary_tests {
     #[test]
     fn an_unarmed_boundary_is_absent_not_permissive_and_not_denying() {
         with_roots(None, || {
-            assert!(boundary_denial(&ctx("/etc/passwd"), "Write").is_none());
+            assert!(boundary_denial_untracked(&ctx("/etc/passwd"), "Write").is_none());
         });
     }
 
@@ -3799,7 +3962,7 @@ mod boundary_tests {
         let wt = std::env::temp_dir().join("wicked-boundary-wt5");
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
-            assert!(boundary_denial(&json!({"command": "ls /"}), "Bash").is_none());
+            assert!(boundary_denial_untracked(&json!({"command": "ls /"}), "Bash").is_none());
         });
     }
 
@@ -3815,26 +3978,38 @@ mod boundary_tests {
         let inside = inside.to_str().unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
             // Redirect to an absolute path outside the boundary → DENY, is_write=true (fatal).
-            let d = boundary_denial(&json!({"command": "echo pwned > /etc/evil-marker"}), "Bash");
+            let d = boundary_denial_untracked(
+                &json!({"command": "echo pwned > /etc/evil-marker"}),
+                "Bash",
+            );
             assert!(
                 d.as_ref().is_some_and(|(_, is_write)| *is_write),
                 "a Bash redirect out of the worktree must be a FATAL boundary deny: {d:?}"
             );
             // cp and tee destinations outside → also denied.
             assert!(
-                boundary_denial(&json!({"command": "cp ./a.txt /etc/evil-marker"}), "Bash")
-                    .is_some(),
+                boundary_denial_untracked(
+                    &json!({"command": "cp ./a.txt /etc/evil-marker"}),
+                    "Bash"
+                )
+                .is_some(),
                 "cp to an outside destination must be denied"
             );
             assert!(
-                boundary_denial(&json!({"command": "echo x | tee /etc/evil-marker"}), "Bash")
-                    .is_some(),
+                boundary_denial_untracked(
+                    &json!({"command": "echo x | tee /etc/evil-marker"}),
+                    "Bash"
+                )
+                .is_some(),
                 "tee to an outside file must be denied"
             );
             // A write INSIDE the worktree is fine — the boundary is a fence, not a Bash ban.
             assert!(
-                boundary_denial(&json!({ "command": format!("echo ok > {inside}") }), "Bash")
-                    .is_none(),
+                boundary_denial_untracked(
+                    &json!({ "command": format!("echo ok > {inside}") }),
+                    "Bash"
+                )
+                .is_none(),
                 "a Bash write inside the worktree must be allowed"
             );
             // Standard write SINKS are not escapes — the governed PageIndex pass failed on an
@@ -3856,14 +4031,14 @@ mod boundary_tests {
                 "(echo x > /dev/null)",
             ] {
                 assert!(
-                    boundary_denial(&json!({ "command": sink }), "Bash").is_none(),
+                    boundary_denial_untracked(&json!({ "command": sink }), "Bash").is_none(),
                     "a Bash write to a standard sink must be allowed: {sink}"
                 );
             }
             // NON-MASKING: splitting the glued `;` must not hide a second redirect that DOES escape.
             // `>/dev/null;>/etc/evil` is a safe sink followed by a glued escape — the escape must win.
             assert!(
-                boundary_denial(
+                boundary_denial_untracked(
                     &json!({"command": "echo x >/dev/null;>/etc/evil-marker"}),
                     "Bash"
                 )
@@ -3880,7 +4055,7 @@ mod boundary_tests {
             // escape handling in `shell_tokens` → the split truncates to `<wt>/sub\` and this fails.
             let escaped = format!(r"echo x > {}/sub\;/../../../../../etc/evil", wt.display());
             assert!(
-                boundary_denial(&json!({ "command": escaped }), "Bash").is_some(),
+                boundary_denial_untracked(&json!({ "command": escaped }), "Bash").is_some(),
                 "an escaped ; must keep the whole target so its ../.. escape is still denied: {escaped}"
             );
             // A QUOTED separator is likewise literal — the `;` must not split. (These deny via the
@@ -3892,7 +4067,7 @@ mod boundary_tests {
                     wt.display()
                 );
                 assert!(
-                    boundary_denial(&json!({ "command": quoted }), "Bash").is_some(),
+                    boundary_denial_untracked(&json!({ "command": quoted }), "Bash").is_some(),
                     "a quoted ; must not split the target and hide a ../.. escape: {quoted}"
                 );
             }

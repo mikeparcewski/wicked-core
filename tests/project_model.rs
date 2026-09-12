@@ -84,6 +84,7 @@ fn spec(session_id: &str, hc: HumanConfirm, project_id: Option<String>) -> Launc
         entity_mode: wicked_core::EntityMode::Shared,
         session_id: session_id.into(),
         human_confirm: hc,
+        auto_deliver: false,
         repo_ref: None,
         workflow: None,
         project_id,

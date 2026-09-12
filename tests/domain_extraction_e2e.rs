@@ -410,6 +410,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         entity_mode: EntityMode::Shared,
         session_id: run_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: Some(repo_ref.into()),
         workflow: Some("domain-extraction".into()),
         extra_write_roots: Vec::new(),

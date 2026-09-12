@@ -138,6 +138,7 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
         entity_mode: wicked_core::EntityMode::Shared,
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref,
         workflow: None,
         extra_write_roots: Vec::new(),
@@ -265,7 +266,11 @@ fn launch_in_repo_creates_worktree_and_passes_workdir() {
 }
 
 #[test]
-fn cancel_discards_the_worktree() {
+fn cancel_reaps_a_clean_worktree_but_keeps_one_holding_uncommitted_work() {
+    // F-E2E-028: cancel used to FORCE-discard the worktree — run 01234444's creator fix (3 files)
+    // survived only as an unreferenced tree object after the operator rejected an escalation
+    // gate. Cancel now reaps by the same rule as every other terminal status (FINDING-003): a
+    // clean tree goes, a dirty one stays.
     let repo = make_git_repo("cancel");
     let (core, _) = core_for("cancel");
     let entry = core
@@ -286,10 +291,24 @@ fn cancel_discards_the_worktree() {
     assert!(wt.is_dir(), "worktree exists while the run is parked");
 
     assert_eq!(core.cancel_run("run2").unwrap(), SessionStatus::Cancelled);
-    // Give the (synchronous) cancel cleanup a beat, then assert the worktree is gone.
+    // The (synchronous) cancel cleanup reaps a CLEAN worktree.
     assert!(
         !wt.is_dir(),
-        "cancelling a run discards its worktree (work abandoned)"
+        "cancelling a run with a clean worktree reaps it (nothing to lose)"
+    );
+
+    // The same cancel over a worktree carrying UNCOMMITTED work keeps it.
+    let mut s = spec("run3", Some(entry.id.clone()));
+    s.human_confirm = HumanConfirm::Before(1);
+    core.launch_run(s).expect("launch");
+    assert!(wait_status(&core, "run3", SessionStatus::AwaitingHuman));
+    let wt = repo.join("wicked-worktrees").join("run3");
+    assert!(wt.is_dir());
+    std::fs::write(wt.join("fix.txt"), "the creator's uncommitted fix\n").unwrap();
+    assert_eq!(core.cancel_run("run3").unwrap(), SessionStatus::Cancelled);
+    assert!(
+        wt.join("fix.txt").is_file(),
+        "cancelling a run whose worktree holds uncommitted work keeps the worktree and the work"
     );
 }
 

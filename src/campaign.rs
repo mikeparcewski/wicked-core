@@ -71,6 +71,7 @@ impl RunSpec {
             entity_mode: self.entity_mode,
             session_id: run_id,
             human_confirm: self.human_confirm,
+            auto_deliver: false,
             repo_ref: self.repo_ref.clone(),
             workflow: self.workflow_id.clone(),
             // Campaign nodes are unfiled in v1 — a campaign-level projectId is an open question

@@ -161,6 +161,7 @@ fn spec(session_id: &str, workflow: &str, repo_ref: Option<String>) -> LaunchSpe
         entity_mode: EntityMode::Shared,
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref,
         workflow: Some(workflow.into()),
         extra_write_roots: Vec::new(),

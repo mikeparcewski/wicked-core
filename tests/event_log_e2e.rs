@@ -100,6 +100,7 @@ fn spec(session: &str) -> LaunchSpec {
         session_id: session.into(),
         clis: vec![cli("a")],
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: None,
         entity_mode: EntityMode::Shared,
         workflow: None,

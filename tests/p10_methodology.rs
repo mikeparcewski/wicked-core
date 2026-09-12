@@ -121,6 +121,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         entity_mode: EntityMode::Shared,
         session_id: "r".into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),

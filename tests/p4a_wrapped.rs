@@ -121,6 +121,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         entity_mode: wicked_core::EntityMode::Shared,
         session_id: "run".into(),
         human_confirm: HumanConfirm::None,
+        auto_deliver: false,
         repo_ref: Some(entry.id.clone()),
         workflow: None,
         extra_write_roots: Vec::new(),
