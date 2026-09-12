@@ -696,6 +696,20 @@ pub enum SeatFailureReason {
     /// `login_invocation` names it. F-030/F-031: this was every claude ballot on a fresh install,
     /// recorded as a bare `non_zero_exit` with an empty stderr.
     NotLoggedIn,
+    /// (F-7R3-001) The seat's account has no capacity left, so the CLI refused the work
+    /// (`exceeded your monthly quota` — copilot; `rate limit` / `rate_limit_error`; `usage
+    /// limit`; `insufficient credits` / `credit balance is too low`; `check your plan and
+    /// billing details`; `payment required`). Nothing the run can do re-fills it: a seat that
+    /// answered every ballot this way is benched for the run rather than seated as the reviewer
+    /// (run c7e42297 routed the review unit to copilot via `evaluator_distinct` after copilot had
+    /// failed every ballot with exactly this refusal).
+    QuotaExhausted,
+    /// (F-7R3-001) The seat's binary could not be spawned at all — `ENOENT` / `NotFound` on
+    /// `Command::spawn` (not installed, not on the daemon's PATH). Judged STRUCTURALLY from the
+    /// spawn error ([`SeatFailure::spawn_failed`], [`Self::classify_spawn_detail`]), never from
+    /// a transcript: `No such file or directory` in a worker's output is more often the worker's
+    /// own `cat` than the seat's absence.
+    NotInstalled,
 }
 
 impl SeatFailureReason {
@@ -703,6 +717,18 @@ impl SeatFailureReason {
     pub fn as_str(self) -> &'static str {
         match self {
             SeatFailureReason::NotLoggedIn => "not_logged_in",
+            SeatFailureReason::QuotaExhausted => "quota_exhausted",
+            SeatFailureReason::NotInstalled => "not_installed",
+        }
+    }
+
+    /// The seat's refusal, in the words a bench reason / degrade string uses: `failed
+    /// authentication`, `exhausted its quota`, `is not installed`.
+    pub fn verb(self) -> &'static str {
+        match self {
+            SeatFailureReason::NotLoggedIn => "failed authentication",
+            SeatFailureReason::QuotaExhausted => "exhausted its quota",
+            SeatFailureReason::NotInstalled => "is not installed",
         }
     }
 
@@ -713,28 +739,138 @@ impl SeatFailureReason {
     /// lowercased copy — because it runs over the UNTRUNCATED output of `wait_with_output`, which
     /// a pathological seat can make large (Copilot, PR#413).
     pub fn classify(stdout: &str, stderr: &str) -> Option<Self> {
-        const NOT_LOGGED_IN: &[&str] = &[
-            "not logged in",
-            "run /login",
-            "authentication required",
-            "authentication_error",
-            "not authenticated",
-            "unauthenticated",
-            "please log in",
-            "please login",
-            "please sign in",
-            "login required",
-            "not signed in",
-        ];
-        [stdout, stderr]
+        // AUTHENTICATION first: it is the more specific fix (sign THAT directory in), and a
+        // sign-in refusal that also mentions a plan is still a sign-in refusal.
+        if [stdout, stderr]
             .iter()
-            .any(|stream| {
-                NOT_LOGGED_IN
-                    .iter()
-                    .any(|sig| contains_ignore_ascii_case(stream, sig))
-            })
-            .then_some(SeatFailureReason::NotLoggedIn)
+            .any(|s| matches_any(s, NOT_LOGGED_IN))
+        {
+            return Some(SeatFailureReason::NotLoggedIn);
+        }
+        if [stdout, stderr]
+            .iter()
+            .any(|s| matches_any(s, QUOTA_EXHAUSTED))
+        {
+            return Some(SeatFailureReason::QuotaExhausted);
+        }
+        None
     }
+
+    /// (F-7R3-001) Classify a WORKER's or JUDGE's failed transcript — the engine's single output
+    /// string, not a ballot's two streams. Authentication signatures are judged over the WHOLE
+    /// text as before (they are rare in prose); quota signatures only over its last
+    /// [`REFUSAL_TAIL_BYTES`] — a CLI states its final refusal last, while `rate limit` or
+    /// `billing details` in the body of a long transcript is more often the unit's subject
+    /// matter (a worker implementing a rate limiter, then failing on a compile error) than the
+    /// seat's condition. A ballot's output goes through [`Self::classify`] whole: a vote is short.
+    pub fn classify_refusal(output: &str) -> Option<Self> {
+        if matches_any(output, NOT_LOGGED_IN) {
+            return Some(SeatFailureReason::NotLoggedIn);
+        }
+        if matches_any(tail_bytes(output, REFUSAL_TAIL_BYTES), QUOTA_EXHAUSTED) {
+            return Some(SeatFailureReason::QuotaExhausted);
+        }
+        None
+    }
+
+    /// (F-7R3-001) Classify the OS error a `Command::spawn` returned: `NotFound` (ENOENT — the
+    /// binary is not installed or not on PATH) is [`Self::NotInstalled`]; any other spawn error
+    /// (permissions, a broken interpreter line, resource limits) stays unclassified, because
+    /// nothing says it will fail the same way next time.
+    pub fn classify_spawn_error(err: &std::io::Error) -> Option<Self> {
+        (err.kind() == std::io::ErrorKind::NotFound).then_some(SeatFailureReason::NotInstalled)
+    }
+
+    /// (F-7R3-001) [`Self::classify_spawn_error`] over the error's TEXT — for a carrier that
+    /// hands the engine the spawn failure as a string (the wrapped runner's
+    /// `(could not run <program>: No such file or directory (os error 2))`). The caller must already
+    /// know the text IS a spawn error; this only decides whether it is the missing-binary one.
+    /// Spellings: the Unix and Windows `os error 2` renderings, and the shells' own words.
+    pub fn classify_spawn_detail(detail: &str) -> Option<Self> {
+        const NOT_INSTALLED: &[&str] = &[
+            "os error 2)",
+            "no such file or directory",
+            "cannot find the file specified",
+            "program not found",
+            "command not found",
+            "executable file not found",
+            "not found on path",
+            "enoent",
+        ];
+        matches_any(detail, NOT_INSTALLED).then_some(SeatFailureReason::NotInstalled)
+    }
+}
+
+/// The sign-in refusals the seats print — ASCII-case-insensitive substrings.
+const NOT_LOGGED_IN: &[&str] = &[
+    "not logged in",
+    "run /login",
+    "authentication required",
+    "authentication_error",
+    "not authenticated",
+    "unauthenticated",
+    "please log in",
+    "please login",
+    "please sign in",
+    "login required",
+    "not signed in",
+];
+
+/// (F-7R3-001) The capacity refusals the seats print — ASCII-case-insensitive substrings, each
+/// the CLI's or its provider's own words. Bare status numbers (`429`, `402`) are deliberately
+/// absent: in a transcript they are as likely a line number as a status.
+const QUOTA_EXHAUSTED: &[&str] = &[
+    // GitHub Copilot: "You have exceeded your monthly quota …".
+    "exceeded your monthly quota",
+    "monthly quota",
+    // OpenAI `insufficient_quota`: "You exceeded your current quota, please check your plan and
+    // billing details".
+    "exceeded your current quota",
+    "insufficient_quota",
+    "quota exceeded",
+    "quota_exceeded",
+    "quota exhausted",
+    "out of quota",
+    // Rate limiting — `rate_limit_error`, "rate limit reached", "rate limited", 429's phrase.
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "too many requests",
+    // claude / codex: "You've hit your usage limit".
+    "usage limit",
+    // Credits / billing — Anthropic "Your credit balance is too low", OpenAI billing pointers,
+    // 402's phrase.
+    "insufficient credits",
+    "insufficient_credits",
+    "out of credits",
+    "credit balance is too low",
+    "billing details",
+    "plans & billing",
+    "billing hard limit",
+    "payment required",
+];
+
+/// How much of a worker's / judge's transcript tail [`SeatFailureReason::classify_refusal`]
+/// judges quota signatures over.
+pub const REFUSAL_TAIL_BYTES: usize = 2048;
+
+/// Any of `needles` in `haystack`, ASCII-case-insensitively.
+fn matches_any(haystack: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|sig| contains_ignore_ascii_case(haystack, sig))
+}
+
+/// The last `n` bytes of `s`, cut forward to a char boundary (whole characters only).
+fn tail_bytes(s: &str, n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    let mut start = s.len() - n;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 /// `haystack.to_lowercase().contains(needle)` for an ASCII-lowercase `needle`, without the copy:
@@ -837,6 +973,17 @@ impl SeatFailure {
             stdout: String::new(),
             detail: detail.into(),
             reason: None,
+        }
+    }
+
+    /// (F-7R3-001) The `Command::spawn` branch: [`SeatFailureKind::SpawnFailed`] naming the
+    /// program and the OS error, classified [`SeatFailureReason::NotInstalled`] when the error
+    /// is `NotFound` — judged from the error KIND, never from text, so a seat whose binary is
+    /// absent is benched for the run while a permissions or resource failure stays unclassified.
+    pub fn spawn_failed(program: &str, err: &std::io::Error) -> Self {
+        SeatFailure {
+            reason: SeatFailureReason::classify_spawn_error(err),
+            ..SeatFailure::new(SeatFailureKind::SpawnFailed, format!("{program}: {err}"))
         }
     }
 
@@ -1331,6 +1478,123 @@ mod failure_reason_tests {
         assert_eq!(f.reason, None);
         assert!(!f.summary().contains('['), "{}", f.summary());
         assert_eq!(SeatFailureReason::classify("", ""), None);
+    }
+
+    /// (F-7R3-001) The quota-class refusals classify `quota_exhausted` — the copilot string
+    /// from run c7e42297 first, then the other seats' spellings — and the wire token is stable.
+    #[test]
+    fn quota_refusals_are_classified_as_quota_exhausted() {
+        for words in [
+            "Error: You have exceeded your monthly quota for premium requests.",
+            "rate_limit_error: This request would exceed your account's rate limit",
+            "You've hit your usage limit. Try again at 3pm.",
+            "Your credit balance is too low to access the API. Please go to Plans & Billing.",
+            "You exceeded your current quota, please check your plan and billing details.",
+            "HTTP 429 Too Many Requests",
+            "insufficient credits",
+        ] {
+            let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1").with_output(words, "");
+            assert_eq!(
+                f.reason,
+                Some(SeatFailureReason::QuotaExhausted),
+                "{words:?} must classify as quota_exhausted"
+            );
+            assert_eq!(f.reason.unwrap().as_str(), "quota_exhausted");
+            assert_eq!(
+                SeatFailureReason::classify("", words),
+                Some(SeatFailureReason::QuotaExhausted),
+                "either stream: {words:?}"
+            );
+        }
+        assert_eq!(
+            SeatFailureReason::classify("EXCEEDED YOUR MONTHLY QUOTA", ""),
+            Some(SeatFailureReason::QuotaExhausted),
+            "case-insensitive"
+        );
+    }
+
+    /// (F-7R3-001) Authentication wins over quota when a refusal says both (the sign-in is the
+    /// more specific fix), and an unrelated failure that merely exits non-zero stays unclassified.
+    #[test]
+    fn authentication_outranks_quota_and_unrelated_output_stays_unclassified() {
+        assert_eq!(
+            SeatFailureReason::classify(
+                "Not logged in · Please run /login (your plan's rate limit also applies)",
+                ""
+            ),
+            Some(SeatFailureReason::NotLoggedIn)
+        );
+        assert_eq!(
+            SeatFailureReason::classify("error: compile failed: expected `;`", "exit 101"),
+            None
+        );
+        assert_eq!(
+            SeatFailureReason::QuotaExhausted.verb(),
+            "exhausted its quota"
+        );
+        assert_eq!(SeatFailureReason::NotInstalled.as_str(), "not_installed");
+    }
+
+    /// (F-7R3-001) A worker's / judge's transcript is judged for quota over its TAIL only: the
+    /// same words deep in a long body (the unit's subject matter) do not bench the seat, while
+    /// the refusal a CLI prints last does — and an auth refusal anywhere still classifies.
+    #[test]
+    fn a_transcript_refusal_is_judged_over_its_tail_for_quota_but_whole_for_auth() {
+        let filler = "x".repeat(REFUSAL_TAIL_BYTES * 2);
+        let body_mentions_it = format!("implementing the rate limit middleware\n{filler}\nexit 1");
+        assert_eq!(SeatFailureReason::classify_refusal(&body_mentions_it), None);
+        let refused_last = format!("{filler}\nError: You have exceeded your monthly quota.");
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&refused_last),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+        let auth_first = format!("Not logged in · Please run /login\n{filler}");
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&auth_first),
+            Some(SeatFailureReason::NotLoggedIn)
+        );
+        // The tail cut lands on a char boundary — multi-byte text does not panic.
+        let wide = "é".repeat(REFUSAL_TAIL_BYTES) + "rate limit";
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&wide),
+            Some(SeatFailureReason::QuotaExhausted)
+        );
+    }
+
+    /// (F-7R3-001) A spawn that fails `NotFound` is `spawn_failed [not_installed]`, naming the
+    /// program; any other spawn error stays unclassified. The text form recognises both the Unix
+    /// and the Windows rendering of `os error 2`.
+    #[test]
+    fn a_not_found_spawn_is_classified_not_installed_and_other_spawn_errors_are_not() {
+        let missing =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let f = SeatFailure::spawn_failed("copilot", &missing);
+        assert_eq!(f.kind, SeatFailureKind::SpawnFailed);
+        assert_eq!(f.reason, Some(SeatFailureReason::NotInstalled));
+        assert!(f.detail.starts_with("copilot: "), "{f:?}");
+        assert!(
+            f.summary().contains("spawn_failed [not_installed]"),
+            "{}",
+            f.summary()
+        );
+
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(SeatFailure::spawn_failed("copilot", &denied).reason, None);
+
+        assert_eq!(
+            SeatFailureReason::classify_spawn_detail("No such file or directory (os error 2)"),
+            Some(SeatFailureReason::NotInstalled)
+        );
+        assert_eq!(
+            SeatFailureReason::classify_spawn_detail(
+                "The system cannot find the file specified. (os error 2)"
+            ),
+            Some(SeatFailureReason::NotInstalled)
+        );
+        assert_eq!(
+            SeatFailureReason::classify_spawn_detail("Permission denied (os error 13)"),
+            None
+        );
     }
 
     /// stdout keeps the TAIL (a CLI states its final error last), cut on a char boundary.

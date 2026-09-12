@@ -743,20 +743,34 @@ fn run_unit_and_judge_with_roster(
         .cloned()
         .collect();
     let roster = eligible.as_slice();
-    // (review RT-1) Judge seats that refused with an AUTH failure while the rotation passed over
-    // them — benched by the fold (`source: "judge"`) so they are never re-tried by the next unit.
-    let judge_auth_refusals: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    // (review RT-1 / F-7R3-001) Judge seats that REFUSED while the rotation passed over them —
+    // an authentication failure, a quota refusal, a binary that could not start — benched by the
+    // fold (`source: "judge"`) so they are never re-tried by the next unit. The transcript is
+    // judged by `classify_refusal` (authentication over the whole text, quota over its tail) and
+    // a wrapped `(could not run …)` line by the spawn error it carries.
+    let judge_refusals: std::cell::RefCell<Vec<crate::workflow::JudgeRefusal>> =
+        std::cell::RefCell::new(Vec::new());
     let note_refusals = |refused: &[(String, String)]| {
+        use wicked_council::types::SeatFailureReason;
         for (seat, out) in refused {
-            if wicked_council::types::SeatFailureReason::classify(out, "").is_some() {
-                let mut v = judge_auth_refusals.borrow_mut();
-                if !v.contains(seat) {
+            let reason = SeatFailureReason::classify_refusal(out).or_else(|| {
+                crate::execute_wrapped::spawn_failure_detail(out)
+                    .and_then(SeatFailureReason::classify_spawn_detail)
+            });
+            if let Some(reason) = reason {
+                let mut v = judge_refusals.borrow_mut();
+                if !v.iter().any(|r| &r.seat == seat) {
                     eprintln!(
-                        "wicked-core: judge seat '{seat}' refused with an authentication failure \
-                         on unit {}; benched for the run (F-7R2-006 / review RT-1)",
-                        input.unit.ord
+                        "wicked-core: judge seat '{seat}' {} on unit {} ({}); benched for the run \
+                         (F-7R2-006 / review RT-1 / F-7R3-001)",
+                        reason.verb(),
+                        input.unit.ord,
+                        reason.as_str()
                     );
-                    v.push(seat.clone());
+                    v.push(crate::workflow::JudgeRefusal {
+                        seat: seat.clone(),
+                        reason: reason.as_str().to_string(),
+                    });
                 }
             }
         }
@@ -1073,7 +1087,13 @@ fn run_unit_and_judge_with_roster(
         }
         _ => None,
     };
-    let judge_auth_refusals = judge_auth_refusals.into_inner();
+    let judge_refusals = judge_refusals.into_inner();
+    // The pre-F-7R3-001 carrier keeps its meaning — authentication refusals only.
+    let judge_auth_refusals: Vec<String> = judge_refusals
+        .iter()
+        .filter(|r| r.reason == wicked_council::types::SeatFailureReason::NotLoggedIn.as_str())
+        .map(|r| r.seat.clone())
+        .collect();
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
@@ -1081,6 +1101,7 @@ fn run_unit_and_judge_with_roster(
         tree_changed,
         judge_skipped,
         judge_auth_refusals,
+        judge_refusals,
     };
     (output, agent_verdict, evidence)
 }
@@ -3466,6 +3487,14 @@ mod tests {
             evidence.judge_auth_refusals,
             vec!["dead".to_string()],
             "the signed-out judge seat is reported for the bench"
+        );
+        // (F-7R3-001) …and, with its cause, on the carrier the fold benches from.
+        assert_eq!(
+            evidence.judge_refusals,
+            vec![crate::workflow::JudgeRefusal {
+                seat: "dead".to_string(),
+                reason: "not_logged_in".to_string(),
+            }]
         );
 
         // With `dead` benched, the next unit never dispatches to it.

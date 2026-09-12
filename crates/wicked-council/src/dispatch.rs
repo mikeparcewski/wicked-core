@@ -288,6 +288,15 @@ impl BenchConfig {
     }
 }
 
+/// (F-7R3-001) The consecutive-failure streak that benches a seat here — the resolved policy
+/// knob ([`ENV_SEAT_BENCH_THRESHOLD`], default [`DEFAULT_SEAT_BENCH_THRESHOLD`]) — exposed so the
+/// engine's RUN-level bench applies the same streak to a seat that timed out on every ballot of
+/// a distribution and voted on none: one slow answer is a slow answer; a streak with no vote in
+/// between is a seat charging its whole budget to every ballot.
+pub fn seat_bench_threshold() -> u32 {
+    BenchConfig::from_env().threshold
+}
+
 /// Parse a positive count from a raw env value, falling back when it says nothing usable.
 ///
 /// Zero is rejected for the same reason `secs_or` rejects it: a threshold of zero benches every
@@ -812,12 +821,9 @@ fn run_in_isolation(
 
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            return Err(SeatFailure::new(
-                SeatFailureKind::SpawnFailed,
-                format!("{program}: {e}"),
-            ))
-        }
+        // (F-7R3-001) `NotFound` classifies `not_installed` from the error KIND — the run
+        // benches a seat whose binary is absent instead of re-asking it on every ballot.
+        Err(e) => return Err(SeatFailure::spawn_failed(program, &e)),
     };
 
     if let Some(payload) = stdin_payload {
@@ -1305,6 +1311,12 @@ mod failure_diagnostics_tests {
         );
         let f = failure_of(&cli, Duration::from_secs(5));
         assert_eq!(f.kind, SeatFailureKind::SpawnFailed);
+        // (F-7R3-001) …and the missing binary is CLASSIFIED, so the run benches the seat.
+        assert_eq!(
+            f.reason,
+            Some(crate::types::SeatFailureReason::NotInstalled),
+            "{f:?}"
+        );
         // Naming the binary is the difference between "council did not reach a vote" and a
         // one-line fix.
         assert!(

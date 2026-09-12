@@ -167,7 +167,10 @@ pub struct AgentSession {
     /// target, never a triage judge. Two sources: the launcher's health probe on the roster it
     /// handed (`AgenticCli::health.usable == false`) and an authentication failure observed IN
     /// the run (a `not_logged_in` council ballot, a worker exit with an auth refusal, an ACP
-    /// `unauthenticated`/`auth_failed` handshake). Persisted so a resume never re-seats a dead
+    /// `unauthenticated`/`auth_failed` handshake) — and, F-7R3-001, a seat that is DEAD for the
+    /// run without being signed out: every ballot refused on quota (`quota_exhausted`), the binary
+    /// could not spawn (`not_installed`), or it timed out on a streak of ballots and voted on none
+    /// (`timed_out`); a worker or judge refusing on the same causes. Persisted so a resume never re-seats a dead
     /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<BenchedSeat>,
@@ -178,8 +181,9 @@ pub struct AgentSession {
 pub struct BenchedSeat {
     /// The roster key.
     pub cli: String,
-    /// Why — the launcher's words (`signed out`) or the engine's classification
-    /// (`not_logged_in`, `unauthenticated`).
+    /// Why — the launcher's words (`signed out`) or the engine's classification: the cause token
+    /// (`not_logged_in`, `quota_exhausted`, `not_installed`, `timed_out`), for a ballot-ledger
+    /// bench with the count that proved it (`quota_exhausted (3/3 ballots)`) (F-7R3-001).
     pub reason: String,
     /// Who benched it: `launcher` (the roster's health probe), `ballot` (a council seat failure),
     /// `worker` (a unit's worker failed with an auth refusal).

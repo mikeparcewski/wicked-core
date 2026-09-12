@@ -4329,12 +4329,23 @@ fn apply_step_result(
         // recovery path runs: the failover ladder, the triage judge and the agent judge all read
         // the bench, so the dead seat is never re-dispatched (run b86c14c1 parked at five human
         // gates re-dispatching codex/pi). Persisted — a resume honours it too.
-        let auth_refusal = if unit.tool_cmd.is_none() {
-            wicked_council::types::SeatFailureReason::classify(&output.output, "")
+        // (F-7R3-001) …and so does a QUOTA refusal (`exceeded your monthly quota`, `rate limit`,
+        // `usage limit`, `insufficient credits`, …) or a binary that could not be spawned at all
+        // (the wrapped runner's `(could not run …: No such file or directory)` line): a seat that
+        // answers this way has no work left in it for this run. The transcript is judged by
+        // `classify_refusal` — authentication over the whole text, quota over its tail only — so
+        // a worker whose SUBJECT was rate limiting is not mistaken for one that was rate limited.
+        let seat_refusal = if unit.tool_cmd.is_none() {
+            wicked_council::types::SeatFailureReason::classify_refusal(&output.output).or_else(
+                || {
+                    crate::execute_wrapped::spawn_failure_detail(&output.output)
+                        .and_then(wicked_council::types::SeatFailureReason::classify_spawn_detail)
+                },
+            )
         } else {
             None
         };
-        if let Some(reason) = auth_refusal {
+        if let Some(reason) = seat_refusal {
             let cli = unit
                 .assigned_cli
                 .clone()
@@ -4349,8 +4360,9 @@ fn apply_step_result(
             ) {
                 put_node(store, session.to_node())?;
                 eprintln!(
-                    "wicked-core: seat '{cli}' failed authentication on unit {ord} of {run_id} \
-                     ({}); benched for the run — never re-dispatched, never a judge (F-7R2-006)",
+                    "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({}); benched for the \
+                     run — never re-dispatched, never a judge (F-7R2-006 / F-7R3-001)",
+                    reason.verb(),
                     reason.as_str()
                 );
             }
@@ -4578,7 +4590,7 @@ fn apply_step_result(
         // moves to a seat that can take it instead of parking at a human gate per unit.
         if unit.tool_cmd.is_none()
             && (crate::acp_runner::is_worker_originated_failure(&output.output)
-                || auth_refusal.is_some())
+                || seat_refusal.is_some())
         {
             let failed_cli = unit
                 .assigned_cli
@@ -5915,6 +5927,7 @@ fn dispatch_unit(
                     tree_changed: None,
                     judge_skipped: None,
                     judge_auth_refusals: Vec::new(),
+                    judge_refusals: Vec::new(),
                 }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
