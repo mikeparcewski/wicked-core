@@ -16910,6 +16910,19 @@ transport = "stdio"
                 .expect("one response");
             serde_json::from_str(line).unwrap()
         };
+        // Real directories (the fence canonicalises what exists), spelled as a seat would type
+        // them — forward slashes, no `\\?\` verbatim prefix — so the probe holds on Windows too.
+        let root =
+            std::env::temp_dir().join(format!("wicked-acp-install-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("studio/wicked-worktrees/run-1")).unwrap();
+        let clone = std::fs::canonicalize(root.join("studio")).unwrap();
+        let wt = std::fs::canonicalize(root.join("studio/wicked-worktrees/run-1")).unwrap();
+        let sh = |p: &std::path::Path| -> String {
+            let text = p.display().to_string();
+            let text = text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string();
+            text.replace('\\', "/")
+        };
         let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
         let full = super::AcpWritePosture {
             posture: crate::write_posture::WritePosture::Full,
@@ -16919,7 +16932,7 @@ transport = "stdio"
             attempt: 0,
             cli: "claude".into(),
             phase: "fix".into(),
-            cwd: std::path::PathBuf::from("/repos/studio/wicked-worktrees/run-1"),
+            cwd: wt.clone(),
             deliverable_roots: vec![],
             home: None,
             tx,
@@ -16942,11 +16955,11 @@ transport = "stdio"
             (answer_of(&sink), output)
         };
         // Call 1: `cd` to the clone root — allowed (no install), and the shell moved.
-        let (v1, _) = ask("cd /repos/studio", 1);
+        let (v1, _) = ask(&format!("cd {}", sh(&clone)), 1);
         assert_eq!(v1["result"]["outcome"]["optionId"], "allow", "{v1}");
         assert_eq!(
             full.fence_cwd.lock().unwrap().as_deref(),
-            Some(std::path::Path::new("/repos/studio"))
+            Some(clone.as_path())
         );
         // A benign intermediate call keeps the tracking.
         let (v2, _) = ask("ls node_modules | head", 2);
@@ -16955,13 +16968,13 @@ transport = "stdio"
         let (v3, out3) = ask("npm ci", 3);
         assert_eq!(v3["result"]["outcome"]["optionId"], "reject", "{v3}");
         assert!(
-            out3.contains("install fence") && out3.contains("/repos/studio"),
+            out3.contains("install fence") && out3.contains(&*clone.to_string_lossy()),
             "{out3}"
         );
         // The refusal did not move the tracked shell (the call never ran)…
         assert_eq!(
             full.fence_cwd.lock().unwrap().as_deref(),
-            Some(std::path::Path::new("/repos/studio"))
+            Some(clone.as_path())
         );
         // …and the disclosure names the install fence's remedy.
         let mut denied = 0;
@@ -16979,7 +16992,7 @@ transport = "stdio"
         }
         assert_eq!(denied, 1);
         // A `cd` back into the worktree re-allows the same command.
-        let (v4, _) = ask("cd /repos/studio/wicked-worktrees/run-1", 4);
+        let (v4, _) = ask(&format!("cd {}", sh(&wt)), 4);
         assert_eq!(v4["result"]["outcome"]["optionId"], "allow", "{v4}");
         let (v5, _) = ask("npm ci", 5);
         assert_eq!(v5["result"]["outcome"]["optionId"], "allow", "{v5}");
