@@ -71,6 +71,18 @@ pub(crate) fn foreign_install(
     cwd: &Path,
     home: Option<&Path>,
 ) -> Option<InstallHit> {
+    // The shared tokenizer reads a backslash as a POSIX escape. On Windows a seat's shell spells
+    // paths with backslashes (`cd C:\Users\me\repo && npm ci`) and neither cmd nor PowerShell
+    // escapes with one, so normalise them to forward slashes — which every Windows API accepts —
+    // before the text is tokenized, or the path would lose its separators and the fence would judge
+    // a directory nobody named. POSIX text is untouched.
+    let normalised;
+    let command = if cfg!(windows) {
+        normalised = command.replace('\\', "/");
+        normalised.as_str()
+    } else {
+        command
+    };
     let mut here = cwd.to_path_buf();
     judge_script(command, cwd, &mut here, home)
 }
@@ -440,11 +452,19 @@ mod tests {
         foreign_install(cmd, wt, Some(Path::new("/home/seat")))
     }
 
+    /// `p` as a seat would type it in a command: forward slashes on every platform, and without
+    /// the `\\?\` verbatim prefix a canonicalised Windows path carries (no shell spells that).
+    fn sh(p: &Path) -> String {
+        let text = p.display().to_string();
+        let text = text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string();
+        text.replace('\\', "/")
+    }
+
     #[test]
     fn a_cd_to_the_clone_root_followed_by_an_install_is_refused_and_names_the_target() {
         let wt = wt("clone-root");
         let clone = wt.parent().unwrap().parent().unwrap().to_path_buf();
-        let hit = judge(&format!("cd {} && npm ci", clone.display()), &wt).expect("refused");
+        let hit = judge(&format!("cd {} && npm ci", sh(&clone)), &wt).expect("refused");
         assert_eq!(hit.program, "npm");
         assert_eq!(hit.verb, "ci");
         assert_eq!(hit.target, clone);
@@ -459,7 +479,7 @@ mod tests {
         assert!(judge("npm ci --prefix ../..", &wt).is_some());
         assert!(judge("npm --prefix=../../ install", &wt).is_some());
         assert!(judge("pnpm -C ../.. add left-pad", &wt).is_some());
-        assert!(judge(&format!("pnpm --dir {} install", clone.display()), &wt).is_some());
+        assert!(judge(&format!("pnpm --dir {} install", sh(&clone)), &wt).is_some());
         assert!(
             judge("yarn --cwd ../..", &wt).is_some(),
             "bare yarn is an install"
@@ -474,6 +494,15 @@ mod tests {
             judge("cd ~ && npm install", &wt).is_some(),
             "home is outside"
         );
+        // A Windows spelling of an outside directory is judged as that directory, not as a
+        // backslash-escaped fragment (the seat's shell does not escape with backslashes there).
+        #[cfg(windows)]
+        assert_eq!(
+            judge(&format!("cd {} && npm ci", clone.display()), &wt)
+                .expect("refused")
+                .target,
+            clone
+        );
     }
 
     #[test]
@@ -483,7 +512,7 @@ mod tests {
         assert_eq!(judge("npm ci --ignore-scripts && npm test", &wt), None);
         assert_eq!(judge("cd sub && npm install", &wt), None);
         assert_eq!(judge("cd sub/.. && npm install", &wt), None);
-        assert_eq!(judge(&format!("cd {} && npm ci", wt.display()), &wt), None);
+        assert_eq!(judge(&format!("cd {} && npm ci", sh(&wt)), &wt), None);
         assert_eq!(judge("npm install --prefix ./sub", &wt), None);
         assert_eq!(judge("pnpm -C sub install", &wt), None);
         // Reads, scripts and non-install verbs anywhere.
@@ -517,7 +546,7 @@ mod tests {
         {
             std::os::unix::fs::symlink(&wt, &link).unwrap();
             assert_eq!(
-                judge(&format!("cd {} && npm ci", link.display()), &wt),
+                judge(&format!("cd {} && npm ci", sh(&link)), &wt),
                 None,
                 "a symlink INTO the worktree resolves inside"
             );
