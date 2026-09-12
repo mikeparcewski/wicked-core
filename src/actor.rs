@@ -3011,6 +3011,7 @@ pub(crate) fn run(
                                     // The failed unit's own output is the artifact: the operator
                                     // is judging what unit `ord` produced, not the next phase.
                                     Some(ord),
+                                    "failure",
                                     prompt,
                                 ) {
                                     emit_run_error(&mut subscribers, &run_id, e);
@@ -3055,6 +3056,7 @@ pub(crate) fn run(
                             &mut session,
                             ord,
                             Some(ord),
+                            "triage",
                             prompt,
                         ) {
                             emit_run_error(&mut subscribers, &run_id, e);
@@ -4493,6 +4495,7 @@ fn apply_step_result(
                         &mut session,
                         ord,
                         Some(ord),
+                        "failure",
                         prompt,
                     )?;
                     return Ok(StepApplied::Paused);
@@ -5001,6 +5004,7 @@ fn apply_step_result(
                 // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
                 // reviewed unit coincide here.
                 Some(ord),
+                "escalation",
                 prompt,
             )?;
             return Ok(StepApplied::Paused);
@@ -5115,7 +5119,13 @@ pub(crate) const DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS: u64 = 14;
 /// Whether a session's worktree is RETAINED right now: Completed, not archived, finished within
 /// the retention window. A completed run with no `finished_at` (pre-wave-6) is not retained.
 pub(crate) fn worktree_retained(session: &crate::domain::AgentSession, now_ms: i64) -> bool {
-    if session.status != SessionStatus::Completed || session.archived_at.is_some() {
+    // A CANCELLED run's kept-dirty tree (F-E2E-028) rides the same window as a completed one
+    // (review of #456, F6): retained until the window elapses, then reaped clean-only again.
+    if !matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled
+    ) || session.archived_at.is_some()
+    {
         return false;
     }
     let (Some(finished), Some(window)) = (session.finished_at, completed_worktree_retention())
@@ -5328,6 +5338,7 @@ fn partition_sessions_for_reap(
 /// campaign node's slot (deferred, non-re-entrant). Shared by the pre-unit gate ([`advance_or_pause`]),
 /// the CONDITIONAL verdict gate (seam finding #3), and the TERMINAL gate (seam finding #4) so all three
 /// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
+#[allow(clippy::too_many_arguments)]
 fn pause_for_human(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -5335,6 +5346,10 @@ fn pause_for_human(
     session: &mut crate::domain::AgentSession,
     ord: u32,
     reviewing_ord: Option<u32>,
+    // WHY the run pauses (review of #456, F7) — `run_level` | `def` | `deliver` | `terminal` |
+    // `escalation` | `failure` | `triage`; rides `AwaitingHuman.gate_kind` and the durable
+    // interaction request so a consumer never keys on the prompt's wording.
+    gate_kind: &str,
     prompt: String,
 ) -> anyhow::Result<()> {
     session.status = SessionStatus::AwaitingHuman;
@@ -5346,6 +5361,7 @@ fn pause_for_human(
         ord,
         reviewing_ord,
         &prompt,
+        gate_kind,
         crate::interaction::now_millis(),
     );
     crate::domain::put_nodes(store, &[session.to_node(), request.to_node()])?;
@@ -5356,6 +5372,7 @@ fn pause_for_human(
             ord,
             reviewing_ord,
             prompt: prompt.clone(),
+            gate_kind: gate_kind.to_string(),
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
@@ -5407,6 +5424,7 @@ fn advance_or_pause(
                     // The terminal gate is always DEF-declared — `term`'s own `GateSpec` is what
                     // this branch matched on — so it is attributable, and to itself.
                     Some(term.ord),
+                    "terminal",
                     format!(
                         "Approve completion after the final phase (unit {}): {}{}",
                         term.ord, term.description, note
@@ -5423,6 +5441,11 @@ fn advance_or_pause(
         // fires AFTER the preceding phase's work, so the artifact under review is that phase's
         // output — naming the upcoming phase instead (FINDING-032) pointed the operator at work
         // that had not run and, in the common case, at a phase that had declared no gate at all.
+        let gate_kind = match reason {
+            PauseReason::DefGate { .. } => "def",
+            PauseReason::RunLevel => "run_level",
+            PauseReason::DeliverGate { .. } => "deliver",
+        };
         let (reviewing_ord, prompt) = match reason {
             PauseReason::DefGate { reviewing_ord } => {
                 let done = units.iter().find(|u| u.ord == reviewing_ord).map_or_else(
@@ -5483,6 +5506,7 @@ fn advance_or_pause(
             &mut session,
             ord,
             reviewing_ord,
+            gate_kind,
             prompt,
         )?;
         return Ok(Progress::Paused);
@@ -6874,7 +6898,25 @@ pub(crate) fn cancel_run(
     // on the operator's behalf; the boot reaper applies this rule to cancelled runs too.
     if let Some(repo_id) = &session.repo_ref {
         if let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) {
-            let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, run_id);
+            let reaped = crate::repo::reap_worktree_if_clean(&repo.root_path, run_id);
+            if !reaped {
+                // Review of #456, F6: say it on the wire, not only on stderr — the operator's
+                // work survived and this is where. The retention window then applies to the
+                // cancelled tree exactly as to a completed one (`worktree_retained`).
+                emit(
+                    subscribers,
+                    CoreEvent::WorktreeRetained {
+                        session: run_id.to_string(),
+                        path: session.workdir.clone().unwrap_or_default(),
+                        reason: format!(
+                            "cancelled with uncommitted work the `{}` branch does not carry — \
+                             the worktree is kept (clean-only reap; retained for \
+                             WICKED_COMPLETED_WORKTREE_KEEP_DAYS, then reaped clean-only again)",
+                            crate::repo::worktree_branch(run_id)
+                        ),
+                    },
+                );
+            }
         }
     }
     emit(

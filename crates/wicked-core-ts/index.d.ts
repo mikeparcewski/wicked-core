@@ -687,6 +687,15 @@ export declare class Subscription {
  * carrier, role, tool, command, reason, remedy} (a worker seat's `git push` / `gh pr create` /
  * `gh api` mutation refused — delivery is the deliver phase's job); acpFallback.fallbackKind gains
  * 'auth_failed' | 'unauthenticated' (no single-shot fallback follows an auth kind).
+ * F-E2E-030/029/028 additions (all additive): awaitingHuman carries `gateKind: 'run_level' | 'def' |
+ * 'deliver' | 'terminal' | 'escalation' | 'failure' | 'triage'` (WHY the run paused — key on it,
+ * never on the prompt's wording; the engine's deliver gate is 'deliver'); workerToolCallDenied.reason
+ * may start with 'install fence:' (a package-manager install outside the unit's worktree, judged
+ * from the seat's shell cwd tracked across its tool calls — best-effort, never hermetic);
+ * sandboxPosture {session, ord, cli, posture: 'os' | 'advisory', reason} (the write containment
+ * the assigned seat runs under — 'advisory' = no OS write boundary on the seat record, command-text
+ * fences + worktree guard only); worktreeRetained {session, path, reason} (a terminal run's worktree
+ * kept because it holds uncommitted work — cancel included).
  */
 export interface CoreEventJson {
   type: string

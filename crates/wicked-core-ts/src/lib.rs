@@ -2452,9 +2452,17 @@ mod tests {
                 ord: 1,
                 reviewing_ord: Some(1),
                 prompt: s(),
+                gate_kind: s(),
             },
             "awaitingHuman",
-            &["type", "session", "ord", "reviewingOrd", "prompt"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "reviewingOrd",
+                "prompt",
+                "gateKind",
+            ],
         );
         check(
             CoreEvent::Resumed {
@@ -2966,6 +2974,27 @@ mod tests {
                 "type", "session", "ord", "attempt", "cli", "carrier", "role", "tool", "command",
                 "reason", "remedy",
             ],
+        );
+        // Review of #456 (F4/F6): the seat's write containment at distribution; a kept worktree.
+        check(
+            CoreEvent::SandboxPosture {
+                session: s(),
+                ord: 3,
+                cli: s(),
+                posture: "advisory".to_string(),
+                reason: s(),
+            },
+            "sandboxPosture",
+            &["type", "session", "ord", "cli", "posture", "reason"],
+        );
+        check(
+            CoreEvent::WorktreeRetained {
+                session: s(),
+                path: s(),
+                reason: s(),
+            },
+            "worktreeRetained",
+            &["type", "session", "path", "reason"],
         );
         check(
             CoreEvent::RepoChecksEvaluated {

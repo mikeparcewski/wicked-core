@@ -19,9 +19,26 @@
 //! `yarn` or `bun` whose effective directory is outside the worktree. Reads (`npm ls`, `npm view`),
 //! scripts (`npm run`, `npm test`) and installs INTO the worktree (any depth) pass. A refusal is
 //! ADVISORY (one tool call, not the unit): the seat gets the remedy and continues, and the call is
-//! disclosed as `workerToolCallDenied`. Same honest limit as every command filter here: a
-//! Turing-complete shell can evade a scan of the literal text; OS containment is the hermetic
-//! guarantee, and the seats that have it armed never reach this rule with an escape.
+//! disclosed as `workerToolCallDenied`.
+//!
+//! **Stateful across tool calls** (review of #456, F1): a seat's shell keeps its cwd between
+//! calls (Claude Code's Bash tool does), so `cd <clone>` in one call and `npm ci` in the next is
+//! the natural spelling of the escape. Both carriers therefore judge from a PERSISTED effective
+//! cwd per `(run, unit, attempt)` — the ACP bridge on its per-unit `AcpWritePosture`, the hook in a
+//! sidecar of the attempt's decisions log — and update it with the trailing `cd`/`pushd` of every
+//! call that was ALLOWED (a refused call never ran, so it never moved the shell). A new attempt
+//! starts back at the worktree.
+//!
+//! **BEST-EFFORT, never hermetic.** This is a scan of the literal command text. Known evasions
+//! the independent review reproduced and this module does NOT close: a path carried in a shell
+//! variable (`ROOT=../..; cd $ROOT`, `--prefix "$ROOT"`, `$(git rev-parse …)`), a script fed by
+//! pipe / `sh -c "$(… | base64 -d)"` / a file (`sh /tmp/x.sh`), a symlink CREATED in the same
+//! command (`ln -s ../.. out2 && cd out2 && npm ci` — the lexical fallback cannot see it yet),
+//! program indirection (`npx npm`, `corepack npm`, `$(which npm)`, `node -e "execSync(…)"`,
+//! `npm exec -- npm ci`), and shell control flow whose keywords read as programs (`if cd ../..;
+//! then npm ci; fi`, `for … do`). OS containment (`os_sandbox: true` on the seat record) is the
+//! only hermetic write boundary; a seat without it runs under this fence and the worktree guard
+//! alone, and the engine says so at dispatch (`sandboxPosture`).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -63,14 +80,28 @@ impl InstallHit {
     }
 }
 
-/// Judge `command`, run by a seat whose working directory is `cwd` (the run worktree): `Some(hit)`
-/// when a mutating package-manager invocation would install OUTSIDE `cwd`, following `cd`/`pushd`
-/// across segments and the managers' own directory flags; `None` otherwise. `home` expands `~`.
-pub(crate) fn foreign_install(
+/// The outcome of judging one command from a tracked shell cwd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Judgement {
+    /// The foreign install found, if any — the call must be refused.
+    pub hit: Option<InstallHit>,
+    /// Where the seat's shell stands AFTER this command, had it run (its trailing `cd`/`pushd`
+    /// applied to `here`). Persist it ONLY when the call is allowed: a refused call never ran.
+    pub here_after: PathBuf,
+}
+
+/// Judge `command` for a seat whose worktree is `worktree` and whose shell currently stands at
+/// `here` (the cwd tracked across the unit's earlier tool calls; the worktree at the first call).
+/// `Some(hit)` when a mutating package-manager invocation would install OUTSIDE the worktree,
+/// following `cd`/`pushd` within the command and the managers' own directory flags, `env -C`, and
+/// `npm_config_prefix=`; `here_after` is the shell's cwd once the command has run. `home` expands
+/// `~`.
+pub(crate) fn judge_from(
     command: &str,
-    cwd: &Path,
+    worktree: &Path,
+    here: &Path,
     home: Option<&Path>,
-) -> Option<InstallHit> {
+) -> Judgement {
     // The shared tokenizer reads a backslash as a POSIX escape. On Windows a seat's shell spells
     // paths with backslashes (`cd C:\Users\me\repo && npm ci`) and neither cmd nor PowerShell
     // escapes with one, so normalise them to forward slashes — which every Windows API accepts —
@@ -83,8 +114,23 @@ pub(crate) fn foreign_install(
     } else {
         command
     };
-    let mut here = cwd.to_path_buf();
-    judge_script(command, cwd, &mut here, home)
+    let mut cur = here.to_path_buf();
+    let hit = judge_script(command, worktree, &mut cur, home);
+    Judgement {
+        hit,
+        here_after: cur,
+    }
+}
+
+/// [`judge_from`] for a shell standing at the worktree — the first call of a unit, and the
+/// stateless spelling the tests use.
+#[cfg(test)]
+pub(crate) fn foreign_install(
+    command: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Option<InstallHit> {
+    judge_from(command, cwd, cwd, home).hit
 }
 
 /// A top-level piece of a script: plain text (segments to judge in order), or a parenthesised
@@ -185,12 +231,62 @@ fn judge_script(
     None
 }
 
+/// The directory a leading `env -C <dir>` / `env --chdir[=]<dir>` wrapper runs its program in
+/// (review of #456, F2), read off the tokens BEFORE the program word; `None` when no such wrapper.
+fn env_chdir(prefix: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < prefix.len() {
+        if program_stem(&prefix[i]) == "env" {
+            let mut j = i + 1;
+            while j < prefix.len() {
+                let t = prefix[j].as_str();
+                if let Some(v) = t.strip_prefix("--chdir=") {
+                    return Some(v.to_string());
+                }
+                if t == "-C" || t == "--chdir" {
+                    return prefix.get(j + 1).cloned();
+                }
+                if !t.starts_with('-') && env_assignment_of(t).is_none() {
+                    break; // the next program word (a nested wrapper) — `env`'s options are over
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `NAME=value` → `(NAME, value)` for a shell env-assignment token, else `None`.
+fn env_assignment_of(tok: &str) -> Option<(&str, &str)> {
+    let (name, value) = tok.split_once('=')?;
+    (!name.is_empty()
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some((name, value))
+}
+
+/// The npm prefix an env assignment in the command's own prefix sets (review of #456, F3):
+/// `npm_config_prefix=<dir> npm ci` / `NPM_CONFIG_PREFIX=<dir> npm ci` — legible text npm honours
+/// as `--prefix`. A value carried in a variable (`$X`) stays a stated limit.
+fn env_npm_prefix(prefix: &[String]) -> Option<String> {
+    prefix.iter().find_map(|t| {
+        env_assignment_of(t)
+            .filter(|(n, _)| n.eq_ignore_ascii_case("npm_config_prefix"))
+            .map(|(_, v)| v.to_string())
+    })
+}
+
 fn judge_segments(
     script: &str,
     worktree: &Path,
     here: &mut PathBuf,
     home: Option<&Path>,
 ) -> Option<InstallHit> {
+    // `pushd`/`popd` within ONE command; across calls only `here` survives (a `popd` whose stack
+    // is in an earlier call is unknown — `here` is left as is, which errs towards where the shell
+    // last provably stood).
+    let mut stack: Vec<PathBuf> = Vec::new();
     for segment in split_segments(script) {
         let tokens = tokenize(&segment);
         let Some((start, _assigned)) = program_index(&tokens) else {
@@ -198,6 +294,7 @@ fn judge_segments(
         };
         let program = program_stem(&tokens[start]);
         let args = &tokens[start + 1..];
+        let prefix = &tokens[..start];
         match program.as_str() {
             "cd" | "pushd" => {
                 // `cd` alone / `cd ~` → home; `cd -` → unknown (leave `here` as is: the fence
@@ -206,6 +303,9 @@ fn judge_segments(
                 let dest = args
                     .iter()
                     .find(|a| !a.starts_with('-') || a.as_str() == "-");
+                if program == "pushd" {
+                    stack.push(here.clone());
+                }
                 match dest.map(String::as_str) {
                     None | Some("~") => {
                         if let Some(h) = home {
@@ -216,16 +316,36 @@ fn judge_segments(
                     Some(d) => *here = resolve(here, d, home),
                 }
             }
+            "popd" => {
+                if let Some(prev) = stack.pop() {
+                    *here = prev;
+                }
+            }
             "npm" | "pnpm" | "yarn" | "bun" => {
-                if let Some((verb, dir)) = mutating_install(&program, args) {
-                    let target = match dir {
+                if let Some(install) = mutating_install(&program, args) {
+                    // `env -C <dir>` runs THIS program elsewhere without moving the shell.
+                    let seg_here = match env_chdir(prefix) {
                         Some(d) => resolve(here, &d, home),
                         None => here.clone(),
                     };
-                    if !inside(&target, worktree) {
+                    let dir = install
+                        .dir
+                        .clone()
+                        .or_else(|| (program == "npm").then(|| env_npm_prefix(prefix)).flatten());
+                    let target = if install.global {
+                        // A global install writes to the manager's global prefix — outside the
+                        // worktree by definition, wherever it is (review of #456, F5).
+                        PathBuf::from("(global prefix — outside the worktree)")
+                    } else {
+                        match dir {
+                            Some(d) => resolve(&seg_here, &d, home),
+                            None => seg_here,
+                        }
+                    };
+                    if install.global || !inside(&target, worktree) {
                         return Some(InstallHit {
                             program: program.clone(),
-                            verb,
+                            verb: install.verb,
                             target,
                             segment: segment.trim().to_string(),
                         });
@@ -262,9 +382,19 @@ fn judge_segments(
     None
 }
 
-/// The mutating verb and the explicit target directory (if any) of a package-manager invocation,
-/// or `None` for a read, a script run, or a non-mutating verb.
-fn mutating_install(program: &str, args: &[String]) -> Option<(String, Option<String>)> {
+/// A mutating package-manager invocation: the verb, the explicit target directory (if any) and
+/// whether it targets the manager's GLOBAL prefix (`npm i -g`, `yarn global add`, `pnpm add -g`,
+/// `bun add -g`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MutatingInstall {
+    verb: String,
+    dir: Option<String>,
+    global: bool,
+}
+
+/// The mutating invocation of a package manager, or `None` for a read, a script run, or a
+/// non-mutating verb.
+fn mutating_install(program: &str, args: &[String]) -> Option<MutatingInstall> {
     let (dir_flags, verbs, bare_is_install): (&[&str], &[&str], bool) = match program {
         "npm" => (
             &["--prefix", "-C"],
@@ -363,12 +493,15 @@ fn mutating_install(program: &str, args: &[String]) -> Option<(String, Option<St
     };
     let mut dir: Option<String> = None;
     let mut verb: Option<String> = None;
+    let mut global = false;
     let mut i = 0;
     while i < args.len() {
         let tok = args[i].as_str();
         if let Some((flag, value)) = tok.split_once('=') {
             if dir_flags.contains(&flag) {
                 dir = Some(value.to_string());
+            } else if flag == "--location" && value == "global" {
+                global = true;
             }
             i += 1;
             continue;
@@ -380,10 +513,28 @@ fn mutating_install(program: &str, args: &[String]) -> Option<(String, Option<St
             i += 2;
             continue;
         }
+        if tok == "--location" {
+            if args.get(i + 1).is_some_and(|v| v == "global") {
+                global = true;
+            }
+            i += 2;
+            continue;
+        }
         if tok == "--" {
             break;
         }
+        if tok == "-g" || tok == "--global" {
+            global = true;
+            i += 1;
+            continue;
+        }
         if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if program == "yarn" && tok == "global" && verb.is_none() {
+            // `yarn global add|remove|upgrade …` — the verb follows the `global` word.
+            global = true;
             i += 1;
             continue;
         }
@@ -393,8 +544,16 @@ fn mutating_install(program: &str, args: &[String]) -> Option<(String, Option<St
         i += 1;
     }
     match verb {
-        Some(v) if verbs.contains(&v.as_str()) => Some((v, dir)),
-        None if bare_is_install => Some(("install".to_string(), dir)),
+        Some(v) if verbs.contains(&v.as_str()) => Some(MutatingInstall {
+            verb: v,
+            dir,
+            global,
+        }),
+        None if bare_is_install || global => Some(MutatingInstall {
+            verb: "install".to_string(),
+            dir,
+            global,
+        }),
         _ => None,
     }
 }
@@ -551,5 +710,77 @@ mod tests {
                 "a symlink INTO the worktree resolves inside"
             );
         }
+    }
+
+    #[test]
+    fn env_chdir_npm_config_prefix_and_global_installs_are_judged() {
+        let wt = wt("f2-f3-f5");
+        // F2 — `env -C` / `--chdir` run the manager elsewhere without moving the shell.
+        let hit = judge("env -C ../.. npm ci", &wt).expect("refused");
+        assert_eq!(hit.target, wt.parent().unwrap().parent().unwrap());
+        assert!(judge("env --chdir=../.. npm ci", &wt).is_some());
+        assert!(judge("env --chdir ../.. CI=1 npm ci", &wt).is_some());
+        assert_eq!(judge("env -C sub npm ci", &wt), None, "inside stays inside");
+        // …and `env -C` does not move the tracked shell.
+        let j = judge_from("env -C ../.. npm ls", &wt, &wt, None);
+        assert_eq!(j.hit, None);
+        assert_eq!(j.here_after, wt);
+        // F3 — the npm prefix as an env assignment in the command's own prefix.
+        assert!(judge("npm_config_prefix=../.. npm ci", &wt).is_some());
+        assert!(judge("NPM_CONFIG_PREFIX=../.. npm ci", &wt).is_some());
+        assert_eq!(judge("npm_config_prefix=./sub npm ci", &wt), None);
+        assert_eq!(
+            judge("npm_config_prefix=../.. npm ls", &wt),
+            None,
+            "a read is a read"
+        );
+        // F5 — global installs write outside the worktree by definition.
+        for cmd in [
+            "npm i -g left-pad",
+            "npm install --global left-pad",
+            "npm install --location=global left-pad",
+            "npm install --location global left-pad",
+            "yarn global add left-pad",
+            "pnpm add -g left-pad",
+            "bun add -g left-pad",
+        ] {
+            let hit = judge(cmd, &wt).unwrap_or_else(|| panic!("{cmd} must be refused"));
+            assert!(
+                hit.target.to_string_lossy().contains("global prefix"),
+                "{cmd}: {hit:?}"
+            );
+        }
+        assert_eq!(judge("npm ls -g", &wt), None, "a global READ passes");
+    }
+
+    #[test]
+    fn the_shell_cwd_is_tracked_across_calls_and_a_cd_back_inside_re_allows() {
+        // Review F1: `cd <clone>` in call 1, `npm ci` in call 2 is the natural spelling of the
+        // escape — the fence must carry the shell's cwd from one call to the next.
+        let wt = wt("stateful");
+        let clone = wt.parent().unwrap().parent().unwrap().to_path_buf();
+        let home = Some(Path::new("/home/seat"));
+        // Call 1: an allowed `cd` moves the tracked shell.
+        let c1 = judge_from(&format!("cd {}", sh(&clone)), &wt, &wt, home);
+        assert_eq!(c1.hit, None);
+        assert_eq!(c1.here_after, clone);
+        // A benign intermediate call keeps the tracking.
+        let c2 = judge_from("ls -la && git status", &wt, &c1.here_after, home);
+        assert_eq!(c2.hit, None);
+        assert_eq!(c2.here_after, clone);
+        // Call 3: the install is judged where the shell stands — refused, naming the clone root.
+        let c3 = judge_from("npm ci", &wt, &c2.here_after, home);
+        let hit = c3.hit.expect("the two-call split is refused");
+        assert_eq!(hit.target, clone);
+        // A `cd` back inside re-allows the same command.
+        let c4 = judge_from(&format!("cd {}", sh(&wt)), &wt, &c2.here_after, home);
+        assert_eq!(c4.hit, None);
+        assert_eq!(c4.here_after, wt);
+        assert_eq!(judge_from("npm ci", &wt, &c4.here_after, home).hit, None);
+        // `pushd`/`popd` within one call; a refused call's `here_after` is never persisted by
+        // the callers, so a refusal carries no cwd side effect.
+        let c5 = judge_from("pushd ../.. && npm ls && popd && npm ci", &wt, &wt, home);
+        assert_eq!(c5.hit, None);
+        assert_eq!(c5.here_after, wt);
     }
 }

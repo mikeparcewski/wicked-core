@@ -3240,6 +3240,11 @@ pub(crate) struct AcpWritePosture {
     pub home: Option<std::path::PathBuf>,
     /// Where the denial event goes (`Command::EmitEvent`).
     pub tx: std::sync::mpsc::Sender<Command>,
+    /// The seat's shell cwd as the install fence tracks it across this unit attempt's tool calls
+    /// (review of #456, F1): `None` = the worktree (`cwd`). Updated only by an ALLOWED `execute`
+    /// call's trailing `cd`/`pushd` — a refused call never ran. The struct is minted per unit
+    /// dispatch, so a new attempt starts back at the worktree.
+    pub fence_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl AcpWritePosture {
@@ -4028,6 +4033,20 @@ fn answer_permission_request<W: Write>(
             // outside the unit's worktree is refused the same advisory way. Run 01234444's
             // creator put 194 MB of `node_modules` into the customer's clone root on a seat with
             // no OS write boundary; the command text is the one place that names the target.
+            // Judged from the shell cwd tracked across this unit attempt's calls, not the
+            // worktree the seat was launched in (review of #456, F1).
+            let here = fence
+                .fence_cwd
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| fence.cwd.clone());
+            let install_judgement = crate::install_fence::judge_from(
+                &command,
+                &fence.cwd,
+                &here,
+                fence.home.as_deref(),
+            );
             let denial = crate::remote_write_fence::remote_write_command(&command)
                 .map(|hit| {
                     (
@@ -4037,13 +4056,18 @@ fn answer_permission_request<W: Write>(
                     )
                 })
                 .or_else(|| {
-                    crate::install_fence::foreign_install(
-                        &command,
-                        &fence.cwd,
-                        fence.home.as_deref(),
-                    )
-                    .map(|hit| ("install fence", hit.reason(), crate::install_fence::REMEDY))
+                    install_judgement
+                        .hit
+                        .clone()
+                        .map(|hit| ("install fence", hit.reason(), crate::install_fence::REMEDY))
                 });
+            if denial.is_none() {
+                // The call is allowed: the seat's shell will run it, so its trailing `cd`
+                // becomes where the NEXT call is judged from (F1 — the two-call split).
+                if let Ok(mut here) = fence.fence_cwd.lock() {
+                    *here = Some(install_judgement.here_after.clone());
+                }
+            }
             if let Some((label, reason, remedy)) = denial {
                 let tool = crate::acp_permission::pretool_payload(&params)
                     .map(|(t, _)| t)
@@ -6559,6 +6583,7 @@ impl AcpStepRunner {
             ),
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             tx: self.tx.clone(),
+            fence_cwd: std::sync::Mutex::new(None),
         });
         if let Some(f) = fence.as_ref() {
             match f.posture {
@@ -13719,6 +13744,7 @@ os_sandbox = true
             deliverable_roots: vec![],
             home: None,
             tx,
+            fence_cwd: std::sync::Mutex::new(None),
         };
         let lock = std::sync::Mutex::new(());
 
@@ -13869,6 +13895,7 @@ os_sandbox = true
                 deliverable_roots: vec![inbox.clone()],
                 home: None,
                 tx: tx.clone(),
+                fence_cwd: std::sync::Mutex::new(None),
             }
         };
         let creator = fence(
@@ -14043,6 +14070,7 @@ os_sandbox = true
             deliverable_roots: acp_roots.clone(),
             home: None,
             tx,
+            fence_cwd: std::sync::Mutex::new(None),
         };
         let call = |p: &std::path::Path| crate::acp_permission::WriteClassCall {
             tool: "Write".into(),
@@ -14197,6 +14225,7 @@ os_sandbox = true
             deliverable_roots: extra_write_roots.clone(),
             home: None,
             tx,
+            fence_cwd: std::sync::Mutex::new(None),
         };
         let mut sink: Vec<u8> = Vec::new();
         let mut output = String::new();
@@ -16853,6 +16882,110 @@ transport = "stdio"
     /// and disclosing `workerToolCallDenied` with the command and the remedy; a read passes, and
     /// a `Full` posture still lets write-class calls through to the ordinary answer.
     #[test]
+    fn the_install_fence_tracks_the_seats_shell_cwd_across_calls_on_the_bridge() {
+        // Review of #456, F1: `cd <clone>` in call 1 then `npm ci` in call 2 — the natural two-step
+        // — must be refused on the ACP carrier, from the cwd the earlier ALLOWED call left behind.
+        use serde_json::json;
+        let frame = |command: &str, id: u64| -> serde_json::Value {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "acp-1",
+                    "toolCall": {"toolCallId": format!("c{id}"), "title": "Bash", "kind": "execute",
+                                 "rawInput": {"command": command}},
+                    "options": [
+                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            })
+        };
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            let line = written
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response");
+            serde_json::from_str(line).unwrap()
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let full = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::Full,
+            role: crate::workflow::PhaseRole::Creator,
+            run_id: "run-1".into(),
+            ord: 3,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: "fix".into(),
+            cwd: std::path::PathBuf::from("/repos/studio/wicked-worktrees/run-1"),
+            deliverable_roots: vec![],
+            home: None,
+            tx,
+            fence_cwd: std::sync::Mutex::new(None),
+        };
+        let lock = std::sync::Mutex::new(());
+        let ask = |cmd: &str, id: u64| -> (serde_json::Value, String) {
+            let mut sink: Vec<u8> = Vec::new();
+            let mut output = String::new();
+            super::answer_permission_request(
+                &mut sink,
+                &lock,
+                None,
+                None,
+                Some(&full),
+                &frame(cmd, id),
+                &mut output,
+                4096,
+            );
+            (answer_of(&sink), output)
+        };
+        // Call 1: `cd` to the clone root — allowed (no install), and the shell moved.
+        let (v1, _) = ask("cd /repos/studio", 1);
+        assert_eq!(v1["result"]["outcome"]["optionId"], "allow", "{v1}");
+        assert_eq!(
+            full.fence_cwd.lock().unwrap().as_deref(),
+            Some(std::path::Path::new("/repos/studio"))
+        );
+        // A benign intermediate call keeps the tracking.
+        let (v2, _) = ask("ls node_modules | head", 2);
+        assert_eq!(v2["result"]["outcome"]["optionId"], "allow", "{v2}");
+        // Call 3: the install is judged where the shell stands — REFUSED, naming the clone root.
+        let (v3, out3) = ask("npm ci", 3);
+        assert_eq!(v3["result"]["outcome"]["optionId"], "reject", "{v3}");
+        assert!(
+            out3.contains("install fence") && out3.contains("/repos/studio"),
+            "{out3}"
+        );
+        // The refusal did not move the tracked shell (the call never ran)…
+        assert_eq!(
+            full.fence_cwd.lock().unwrap().as_deref(),
+            Some(std::path::Path::new("/repos/studio"))
+        );
+        // …and the disclosure names the install fence's remedy.
+        let mut denied = 0;
+        while let Ok(cmd) = rx.try_recv() {
+            if let crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::WorkerToolCallDenied {
+                    command, remedy, ..
+                },
+            ) = cmd
+            {
+                assert_eq!(command, "npm ci");
+                assert_eq!(remedy, crate::install_fence::REMEDY);
+                denied += 1;
+            }
+        }
+        assert_eq!(denied, 1);
+        // A `cd` back into the worktree re-allows the same command.
+        let (v4, _) = ask("cd /repos/studio/wicked-worktrees/run-1", 4);
+        assert_eq!(v4["result"]["outcome"]["optionId"], "allow", "{v4}");
+        let (v5, _) = ask("npm ci", 5);
+        assert_eq!(v5["result"]["outcome"]["optionId"], "allow", "{v5}");
+    }
+
+    #[test]
     fn the_permission_bridge_refuses_a_remote_write_command_for_every_posture() {
         use serde_json::json;
         let frame = |tool: &str, kind: &str, input: serde_json::Value, id: u64| {
@@ -16892,6 +17025,7 @@ transport = "stdio"
             deliverable_roots: vec![],
             home: None,
             tx,
+            fence_cwd: std::sync::Mutex::new(None),
         };
         let lock = std::sync::Mutex::new(());
 
@@ -17120,6 +17254,7 @@ transport = "stdio"
             deliverable_roots: vec![],
             home: None,
             tx,
+            fence_cwd: std::sync::Mutex::new(None),
         };
         let lock = std::sync::Mutex::new(());
         let answer_of = |sink: &[u8]| -> serde_json::Value {

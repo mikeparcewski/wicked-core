@@ -27,7 +27,10 @@ Two release tracks share this file, newest entry first regardless of track:
   ⇒ gated), persisted as `AgentSession.auto_deliver` (serde-default, additive on the run DTO) so a
   resume re-arms the same posture. `human_confirm: none` is NOT an opt-out (FINDING-019/023: it is
   also the enum default and the typo fallback). A def gate on the preceding phase still fires as
-  before; the deliver gate is judged first so its prompt is the one shown.
+  before; the deliver gate is judged first so its prompt is the one shown. Behaviour change for
+  the non-daemon launchers — the `wicked-core` CLI, the bus bridge and campaign nodes — whose runs
+  compose a deliver phase: they now park `awaiting_human` before it, and expose no `auto_deliver`
+  opt-out in v1.
 - **Floor provisioning by declared dependencies (F-E2E-029 a).** `repo_checks::detect` installed
   only when `node_modules/` was ABSENT. Run `0ab5ccb8`'s nested worktree carried a `node_modules/`
   holding only vitest's cache (written when the creator ran the suite; Node had resolved the
@@ -39,20 +42,48 @@ Two release tracks share this file, newest entry first regardless of track:
   `node_modules/<name>/package.json`; the `install` check's `source` names the first missing
   dependency. A failed install is reported as **dependency provisioning failed … an environment
   finding, not a verdict on the change** (with the lockfile, the reason, and the install's own
-  output), never a bare ENOENT denial.
-- **Package-manager install fence (F-E2E-029 b, `src/install_fence.rs`, new).** During run
-  `01234444` the creator seat put 194 MB of `node_modules` into the CUSTOMER'S CLONE ROOT (the
-  worktree's parent) — the claude ACP seat arms no OS write boundary (`os_sandbox: false`), the
-  bridge judged `fs/write_text_file` paths and remote-write commands, and nothing judged WHERE a
-  shell command's install would land. On the two carriers that see the command text per call (the
-  wrapped carrier's `PreToolUse` hook and the ACP permission bridge, beside the remote-write
-  fence) a mutating `npm`/`pnpm`/`yarn`/`bun` invocation whose effective directory — following
-  `cd`/`pushd` across segments (subshell `( … )` scoped), `--prefix`/`-C`/`--dir`/`--cwd`, `~`, and
-  canonical spellings — is OUTSIDE the unit's worktree is refused. Advisory (one tool call, not the
-  unit), answered with the remedy ("install in the run's worktree … the engine provisions the
-  worktree's dependencies itself"), disclosed as `workerToolCallDenied` (live from the bridge; at
-  the gate fold from the hook's record, with the install fence's own remedy). Reads (`npm ls`),
-  scripts (`npm run`, `npm test`) and installs inside the worktree pass.
+  output), never a bare ENOENT denial — the gate stays closed (deny-dominates); the reason is now
+  legible. Deferred: bun / pip / pyproject provisioning (npm, pnpm, yarn handled; Cargo
+  self-provisions).
+- **Package-manager install fence — BEST-EFFORT (F-E2E-029 b, `src/install_fence.rs`, new).**
+  During run `01234444` the creator seat put 194 MB of `node_modules` into the CUSTOMER'S CLONE
+  ROOT (the worktree's parent). The claude ACP seat's record arms no OS write boundary
+  (`acp.os_sandbox: false`), the bridge judged `fs/write_text_file` paths and remote-write
+  commands, and nothing judged WHERE a shell command's install would land. **The exact command was
+  never captured** (ACP tool calls are not logged as run events; no unit-3 transcript exists), so
+  the fence closes the spellings the review could reproduce, not a proven one. On the two carriers
+  that see the command text per call (the wrapped carrier's `PreToolUse` hook and the ACP
+  permission bridge, beside the remote-write fence) a mutating `npm`/`pnpm`/`yarn`/`bun`
+  invocation whose effective directory is OUTSIDE the unit's worktree is refused — following
+  `cd`/`pushd`/`popd` (subshell `( … )` scoped), `--prefix`/`-C`/`--dir`/`--cwd`, `env -C`/`--chdir`,
+  `npm_config_prefix=`, `~`, canonical spellings, and global installs (`npm i -g`, `yarn global
+  add`, `pnpm add -g`, `bun add -g` — the global prefix is outside by definition). **The shell cwd is
+  tracked across tool calls per `(run, unit, attempt)`** — the natural two-step `cd <clone>` then
+  `npm ci` in the next call is refused on both carriers (ACP: on the per-unit fence state; hook: a
+  sidecar of the attempt's decisions log, `install-fence-cwd-<phase>`), updated only by ALLOWED
+  calls, reset on a new attempt. Advisory (one tool call, not the unit), answered with the remedy,
+  disclosed as `workerToolCallDenied` (`reason` prefix `install fence:`). Reads (`npm ls`), scripts
+  (`npm run`, `npm test`) and installs inside the worktree pass. **Known evasions it does not
+  close** (independent review, 55 probes): a path carried in a shell variable (`ROOT=../..; cd
+  $ROOT`, `--prefix "$ROOT"`, `$(git rev-parse …)`); a script fed by pipe, `sh -c "$(… | base64
+  -d)"`, or a file (`sh /tmp/x.sh`); a symlink CREATED in the same command; program indirection
+  (`npx npm`, `corepack npm`, `$(which npm)`, `node -e "execSync(…)"`, `npm exec -- npm ci`);
+  shell control-flow keywords (`if cd ../..; then npm ci; fi`, `for … do`). A text scan is never
+  hermetic: **F-E2E-029(b) stays OPEN until OS containment (`os_sandbox: true`) is armed for the
+  seat**; until then the engine discloses the posture per seat (below).
+- **`sandboxPosture` (additive event; review of #456 F4).** At distribution every agent unit's
+  assigned seat discloses its write containment: `os` (the record arms the kernel write boundary,
+  `acp.os_sandbox: true` — read by both carriers) or `advisory` (no OS boundary — worktree guard +
+  command-text fences only, a shell can evade a text scan; the rig's claude ACP seat). Wire:
+  `{session, ord, cli, posture, reason}`. The studio fold (run header beside `run-degraded`) is a
+  follow-up.
+- **`awaitingHuman.gateKind` (additive; review of #456 F7)** — `run_level` | `def` | `deliver` |
+  `terminal` | `escalation` | `failure` | `triage`, also on the durable interaction request
+  (`gate_kind`), so a consumer keys on WHY the run paused, never on the prompt's wording.
+- **`worktreeRetained` (additive event; review of #456 F6)** — `{session, path, reason}` when a
+  cancelled run's worktree is kept because it holds uncommitted work; the
+  `WICKED_COMPLETED_WORKTREE_KEEP_DAYS` window now covers cancelled runs too (then reaped
+  clean-only, as before).
 
 ### Changed
 - **Cancel keeps a dirty worktree (F-E2E-028).** `cancel_run` FORCE-discarded the worktree; run

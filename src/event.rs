@@ -427,6 +427,13 @@ pub enum CoreEvent {
         ord: u32,
         reviewing_ord: Option<u32>,
         prompt: String,
+        /// WHY the run paused (review of #456, F7; additive): `run_level` (the launch's
+        /// `human_confirm` policy), `def` (the preceding phase's workflow-declared gate),
+        /// `deliver` (the engine's deliver gate, F-E2E-030), `terminal` (an unconditional gate on
+        /// the last phase), `escalation` (a not-pass verdict under `human_confirm_if`), `failure`
+        /// (a worker failure the operator may retry) or `triage` (a failure triage escalated). A
+        /// consumer keys on this, never on the prompt's wording.
+        gate_kind: String,
     },
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
@@ -786,6 +793,32 @@ pub enum CoreEvent {
         command: String,
         reason: String,
         remedy: String,
+    },
+    /// (F-E2E-029 review F4; additive) The WRITE CONTAINMENT the seat assigned to an agent unit
+    /// actually runs under, disclosed at distribution so an operator is never left believing a
+    /// fence is hermetic: `os` — the seat's record arms the kernel write boundary
+    /// (`acp.os_sandbox: true`; the wrapped carrier reads the same flag); `advisory` — the record
+    /// arms none, so containment is the worktree guard plus the command-text fences (remote-write,
+    /// install), which a shell can evade. Run `01234444`'s creator ran `advisory` and put 194 MB
+    /// of `node_modules` into the customer's clone root; nothing had said so.
+    SandboxPosture {
+        session: String,
+        ord: u32,
+        /// The registry seat key.
+        cli: String,
+        /// `os` | `advisory`.
+        posture: String,
+        reason: String,
+    },
+    /// (F-E2E-028 review F6; additive) A terminal run's worktree was KEPT because it holds
+    /// uncommitted work the run branch does not carry — named on the wire, not only on stderr,
+    /// so a skin can point the operator at the path. Cancel and the terminal reap apply the same
+    /// rule; the retention window (`WICKED_COMPLETED_WORKTREE_KEEP_DAYS`) then reaps it clean-only.
+    WorktreeRetained {
+        session: String,
+        /// The kept worktree's absolute path.
+        path: String,
+        reason: String,
     },
     /// (F-3R2-013, core#431) How the run's BASE commit was chosen when its worktree was minted:
     /// the engine fetches `origin` and, when the registered clone's `HEAD` is behind the remote
@@ -1319,8 +1352,9 @@ impl CoreEvent {
                 ord,
                 reviewing_ord,
                 prompt,
+                gate_kind,
             } => {
-                json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt })
+                json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind })
             }
             CoreEvent::Resumed { session, ord } => {
                 json!({ "type": "resumed", "session": session, "ord": ord })
@@ -1823,6 +1857,30 @@ impl CoreEvent {
                 "command": command,
                 "reason": reason,
                 "remedy": remedy,
+            }),
+            CoreEvent::SandboxPosture {
+                session,
+                ord,
+                cli,
+                posture,
+                reason,
+            } => json!({
+                "type": "sandboxPosture",
+                "session": session,
+                "ord": ord,
+                "cli": cli,
+                "posture": posture,
+                "reason": reason,
+            }),
+            CoreEvent::WorktreeRetained {
+                session,
+                path,
+                reason,
+            } => json!({
+                "type": "worktreeRetained",
+                "session": session,
+                "path": path,
+                "reason": reason,
             }),
             CoreEvent::RunBaseResolved {
                 session,

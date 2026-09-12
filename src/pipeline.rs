@@ -671,6 +671,39 @@ pub(crate) fn apply_distributions(
             degraded_reason,
             seat_constraint: dist.seat_constraint.clone(),
         });
+        // (F-E2E-029 review F4) Say what write containment the assigned seat actually runs under.
+        // `os_sandbox` on the seat's record arms the kernel write boundary on BOTH carriers
+        // (`acp_runner` for ACP, `execute_wrapped::worker_os_sandbox_enabled` for wrapped); a
+        // record without it — the rig's claude ACP seat — runs under the worktree guard and the
+        // command-text fences only, which a shell can evade. A Tool unit has no seat to disclose.
+        if !matches!(dist.routing, RoutingInfo::Tool) {
+            if let Some(seat) = pre.clis.iter().find(|c| c.key == dist.assigned_cli) {
+                let (posture, reason) = if seat.acp.as_ref().is_some_and(|a| a.os_sandbox) {
+                    (
+                        "os",
+                        "the seat record arms the kernel write boundary (acp.os_sandbox: true): \
+                         writes outside the worktree are refused by the OS"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "advisory",
+                        "the seat record arms no OS write boundary (acp.os_sandbox: false): \
+                         write containment is the worktree guard plus the command-text fences \
+                         (remote-write, install) — best-effort, a shell can evade a text scan; \
+                         set `os_sandbox = true` on the seat's [cli.acp] record for a kernel fence"
+                            .to_string(),
+                    )
+                };
+                emit(CoreEvent::SandboxPosture {
+                    session: pre.session_id.clone(),
+                    ord: u.ord,
+                    cli: dist.assigned_cli.clone(),
+                    posture: posture.to_string(),
+                    reason,
+                });
+            }
+        }
     }
     // (F-7R2-006) The bench the distribution ran under is the RUN's: persisted so every dispatch
     // (failover, triage judge, agent judge) and any re-plan honours it. Union, first reason wins.
@@ -2438,6 +2471,27 @@ mod resolve_tests {
                 Some("1 of 3 seats benched: codex (signed out — launcher)"),
                 "degradedReason on the `{method}` arm"
             );
+        }
+        // (F-E2E-029 review F4) Every agent unit's seat discloses its write containment; these
+        // seats carry no ACP record ⇒ no OS write boundary ⇒ `advisory`, never claimed hermetic.
+        let postures: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CoreEvent::SandboxPosture {
+                    posture, reason, ..
+                } => Some((posture.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            postures.len(),
+            distributed.len(),
+            "one sandboxPosture per distributed agent unit"
+        );
+        for (posture, reason) in &postures {
+            assert_eq!(posture, "advisory");
+            assert!(reason.contains("no OS write boundary"), "{reason}");
+            assert!(reason.contains("best-effort"), "{reason}");
         }
         let session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
         assert_eq!(session.benched_seats.len(), 1);

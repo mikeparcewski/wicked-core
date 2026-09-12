@@ -115,6 +115,7 @@ fn wait_for_gate(
                 ord,
                 reviewing_ord,
                 prompt,
+                ..
             }) if s == session => return Ok((ord, reviewing_ord, prompt)),
             Ok(CoreEvent::SessionCompleted { session: s })
             | Ok(CoreEvent::SessionFailed { session: s, .. })
