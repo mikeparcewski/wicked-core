@@ -744,10 +744,12 @@ fn run_unit_and_judge_with_roster(
         .collect();
     let roster = eligible.as_slice();
     // (review RT-1 / F-7R3-001) Judge seats that REFUSED while the rotation passed over them —
-    // an authentication failure, a quota refusal, a binary that could not start — benched by the
-    // fold (`source: "judge"`) so they are never re-tried by the next unit. The transcript is
-    // judged by `classify_refusal` (authentication over the whole text, quota over its tail) and
-    // a wrapped `(could not run …)` line by the spawn error it carries.
+    // an authentication failure, a quota refusal, a binary that could not start — reported for
+    // the fold to bench (`source: "judge"`; a quota refusal benches only a seat with no
+    // successful unit in the run — review F3) so they are never re-tried by the next unit. The
+    // transcript is judged by `classify_refusal` (authentication over the whole text, the quota
+    // refusal frame over its tail) and a wrapped `(could not run …)` line by the spawn error it
+    // carries.
     let judge_refusals: std::cell::RefCell<Vec<crate::workflow::JudgeRefusal>> =
         std::cell::RefCell::new(Vec::new());
     let note_refusals = |refused: &[(String, String)]| {
@@ -761,8 +763,8 @@ fn run_unit_and_judge_with_roster(
                 let mut v = judge_refusals.borrow_mut();
                 if !v.iter().any(|r| &r.seat == seat) {
                     eprintln!(
-                        "wicked-core: judge seat '{seat}' {} on unit {} ({}); benched for the run \
-                         (F-7R2-006 / review RT-1 / F-7R3-001)",
+                        "wicked-core: judge seat '{seat}' {} on unit {} ({}); reported for the \
+                         run's bench (F-7R2-006 / review RT-1 / F-7R3-001)",
                         reason.verb(),
                         input.unit.ord,
                         reason.as_str()

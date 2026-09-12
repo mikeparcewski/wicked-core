@@ -133,11 +133,16 @@ Two release tracks share this file, newest entry first regardless of track:
   failed EVERY council ballot with "exceeded your monthly quota" — the wave-6 bench (#449) fired
   on `not_logged_in` and the launcher's `health.usable: false` only, so a quota-exhausted seat
   stayed routable and the run headed for a failure-escalation gate. The council now classifies
-  two more causes on `councilSeatFailed.reason` — **`quota_exhausted`** (the seats' own words:
-  `exceeded your monthly quota`, `rate limit`, `too many requests`, `usage limit`, `insufficient
-  credits`, `credit balance is too low`, `billing details`, `payment required`, …) and
-  **`not_installed`** (a `Command::spawn` `NotFound`, judged from the error kind, never from
-  text) — and the distribution keeps a per-seat ledger over every council it convened. A seat
+  two more causes on `councilSeatFailed.reason` — **`quota_exhausted`**, judged as a REFUSAL
+  FRAME on a terminal line of the output (the seats' own messages: a self-framed phrase such as
+  `too many requests`, `insufficient credits`, `credit balance is too low`, `billing details`,
+  `payment required`, `rate_limit_error`, `insufficient_quota`, or a generic quota word — `quota`,
+  `rate limit`, `usage limit`, as whole words — beside refusal phrasing — `exceeded`, `exhausted`,
+  `reached`, `hit your`, `insufficient`, `out of`, …; never `rate_limiter`, `RateLimiter`, `rate
+  limiting`, `the usage limits section` or `the rate limit middleware has no tests` on their own,
+  and never a bare `429`/`402`) and **`not_installed`** (a `Command::spawn` `NotFound`, judged
+  from the error kind, never from text) — and the distribution keeps a per-seat ledger over every
+  council it convened. A seat
   is benched for the run when a ballot fails authentication or cannot spawn (on first
   occurrence, as the auth rule always did), or when it returned NO vote on any ballot and every
   failure was quota-class, or it timed out on at least the dispatcher's own consecutive-failure
@@ -148,16 +153,24 @@ Two release tracks share this file, newest entry first regardless of track:
   naming the kind and the count: `1 of 5 seats benched: copilot (quota_exhausted (3/3 ballots)
   — ballot)`; a unit the council had handed to such a seat is reassigned with the cause
   ("council picked 'copilot', which exhausted its quota on its ballot (…); reassigned to
-  'codex'"). The worker and judge paths bench on the same causes (`classify_refusal`:
-  authentication over the whole transcript, quota over its last 2 KiB so a unit ABOUT rate
-  limiting is not mistaken for one that was rate limited; the wrapped runner's `(could not run
-  …)` line is `not_installed`); **`UnitEvidence.judge_refusals`** (additive, `#[serde(default)]`)
-  carries the judge's refusals with their cause beside the unchanged `judge_auth_refusals`. When
-  the bench leaves no seat distinct from the builders, a review/test unit stays on its creator
-  seat and `degradedReason` says so ("evaluator≠creator not enforceable for unit N: it stays on
-  creator seat 'x' …") — never a routing error, never a silent stall; the gate still reports
-  UNGATED unless the repo-checks floor gates it. Wire: additive (new `reason` tokens, new free
-  text on `degradedReason`, one defaulted field); crew 0.7.31 keeps working.
+  'codex'"). The worker and judge paths classify with the same frame (`classify_refusal`:
+  authentication over the whole transcript, the quota frame over its last 2 KiB) and bench by the
+  same deny-dominates rule — `quota_exhausted` only while the seat has NO successful unit in the
+  run (reason `quota_exhausted (no success in the run)`; one refusal beside a success is a flaky
+  provider, not a dead seat), `not_logged_in` / `not_installed` on first occurrence; the wrapped
+  runner's `(could not run …)` line is `not_installed`. **`UnitEvidence.judge_refusals`**
+  (additive, `#[serde(default)]`) carries the judge's refusals with their cause beside the
+  unchanged `judge_auth_refusals`. When the bench leaves no seat distinct from the builders, a
+  review/test unit stays on its creator seat and `degradedReason` says so ("evaluator≠creator not
+  enforceable for unit N: it stays on creator seat 'x' …") — never a routing error, never a silent
+  stall; the gate still reports UNGATED unless the repo-checks floor gates it. A bench-free roster
+  is unchanged on stderr and on the wire (a single seat stays silent, as before). Wire: additive
+  (new `reason` tokens, new free text on `degradedReason`, one defaulted field); crew 0.7.31 keeps
+  working. `BenchedSeat.reason` is free text and heterogeneous by design — the bare `not_logged_in`
+  token, `quota_exhausted (k/n ballots)`, `not_installed (k/n ballots)`, `timed_out (k/n ballots,
+  no vote returned)`, `quota_exhausted (no success in the run)`, or the launcher's own words —
+  consumers render it, never parse it (api-types already declares `reason: string`; its doc line
+  naming only `not_logged_in`/`unauthenticated` is crew's to refresh in 0.7.32).
 - **core-ts build-from-source fixed; CI now syntax-checks the finalizer.** #444 left four unescaped
   backticks (`role`, `posture`, `role`) inside the template literal that `scripts/finalize-dts.mjs`
   emits the `CoreEventJson` doc block from, so the script no longer parsed (`SyntaxError: Unexpected

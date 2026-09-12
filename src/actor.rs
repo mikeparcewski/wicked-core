@@ -4115,6 +4115,13 @@ fn apply_step_result(
     }
     let mut output = output;
     let mut units = crate::domain::session_units(store, &run_id)?;
+    // (F-7R3-001, review F3) The seats with a SUCCESSFUL unit in this run so far — read before
+    // `unit` borrows the list; a quota-class refusal below benches only a seat without one.
+    let seats_with_a_done_unit: Vec<String> = units
+        .iter()
+        .filter(|u| matches!(u.status, crate::domain::UnitStatus::Done))
+        .filter_map(|u| u.assigned_cli.clone())
+        .collect();
     let unit = units
         .get_mut(output.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("unit ix {} out of range for {run_id}", output.unit_ix))?;
@@ -4350,21 +4357,39 @@ fn apply_step_result(
                 .assigned_cli
                 .clone()
                 .unwrap_or_else(|| "claude".to_string());
-            if crate::domain::bench_seat(
-                &mut session.benched_seats,
-                crate::domain::BenchedSeat {
-                    cli: cli.clone(),
-                    reason: reason.as_str().to_string(),
-                    source: "worker".to_string(),
-                },
+            // (review F3 on #452) The ballot ledger's rule, applied to a transcript: a
+            // quota-class refusal benches only a seat with NO successful unit in this run — one
+            // refusal beside a success is a flaky provider (or a misread transcript), not a dead
+            // seat; a sign-in or missing-binary refusal benches on first occurrence as before.
+            // Either way the unit itself fails over below.
+            match crate::domain::transcript_bench_reason(
+                reason,
+                seats_with_a_done_unit.contains(&cli),
             ) {
-                put_node(store, session.to_node())?;
-                eprintln!(
-                    "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({}); benched for the \
-                     run — never re-dispatched, never a judge (F-7R2-006 / F-7R3-001)",
+                Some(why) => {
+                    if crate::domain::bench_seat(
+                        &mut session.benched_seats,
+                        crate::domain::BenchedSeat {
+                            cli: cli.clone(),
+                            reason: why.clone(),
+                            source: "worker".to_string(),
+                        },
+                    ) {
+                        put_node(store, session.to_node())?;
+                        eprintln!(
+                            "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({why}); \
+                             benched for the run — never re-dispatched, never a judge (F-7R2-006 \
+                             / F-7R3-001)",
+                            reason.verb()
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({}) but has a \
+                     successful unit in this run — not benched; the unit fails over (F-7R3-001)",
                     reason.verb(),
                     reason.as_str()
-                );
+                ),
             }
         }
         // Escalation requires a human in the loop. Autonomous sessions

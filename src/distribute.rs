@@ -727,8 +727,9 @@ fn enforce_evaluator_distinct(
     // Warn when every roster seat is a builder CLI so operators can detect degraded separation.
     // `find` below will return `None` for every Review/Test unit in this configuration, leaving
     // them on their original (builder) CLI with no routing change — silently, unless we speak up.
-    let has_evaluator_seat = roster_keys.iter().any(|k| !builder_clis.contains(k));
-    if !has_evaluator_seat {
+    // A SINGLE-seat roster never warns: it has nothing to separate and never did (review F2 on
+    // #452 — main's `len() < 2` guard, kept as `warns_about_missing_evaluator_seat`).
+    if warns_about_missing_evaluator_seat(roster_keys, &builder_clis) {
         let review_test_affected = units.iter().zip(dists.iter()).any(|(u, d)| {
             u.tool_cmd.is_none()
                 && matches!(u.stage, StageKind::Review | StageKind::Test)
@@ -770,6 +771,16 @@ fn enforce_evaluator_distinct(
         }
     }
     same_seat
+}
+
+/// Whether [`enforce_evaluator_distinct`] warns that evaluator≠creator cannot be enforced: a
+/// roster of TWO or more seats, every one of which built. One seat has nothing to separate and
+/// stays silent — main's `len() < 2` guard, kept (review F2 on #452).
+fn warns_about_missing_evaluator_seat(
+    roster_keys: &[String],
+    builder_clis: &std::collections::HashSet<String>,
+) -> bool {
+    roster_keys.len() >= 2 && roster_keys.iter().all(|k| builder_clis.contains(k))
 }
 
 /// (F-7R3-001) One convened seat's outcome on one unit's council, as the run-level bench reads it.
@@ -2847,6 +2858,92 @@ mod tests {
         .expect("routes");
         assert!(dists[0].benched.is_empty(), "{:?}", dists[0].benched);
         assert_eq!(dists[0].degraded_reason, None);
+    }
+
+    /// (review F1 on #452) A seat whose ballot exits non-zero after printing a vote ABOUT a rate
+    /// limiter — subject words, no refusal — is NOT benched: the council leaves the failure
+    /// unclassified and the seat stays routable, exactly as on main.
+    #[test]
+    fn a_failed_ballot_whose_words_are_about_rate_limiting_does_not_bench_the_seat() {
+        fn subject_words() -> wicked_council::types::SeatFailure {
+            wicked_council::types::SeatFailure::new(
+                wicked_council::types::SeatFailureKind::NonZeroExit,
+                "exit 1",
+            )
+            .with_output(
+                "Option 1 — fit. Top risk: the rate limit middleware has no tests.",
+                "",
+            )
+        }
+        let dispatcher = dead_seat("copilot", subject_words, false);
+        let roster = [seat("claude"), seat("copilot"), seat("codex")];
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("routes");
+        assert!(
+            dists.iter().all(|d| d.benched.is_empty()),
+            "subject words in a FAILED ballot benched the seat: {:?}",
+            dists[0].benched
+        );
+        assert!(dists.iter().all(|d| d.degraded_reason.is_none()));
+        assert_eq!(
+            dists[1].assigned_cli, "copilot",
+            "still the first non-builder seat: {:?}",
+            dists[1].routing
+        );
+    }
+
+    /// (review F2 on #452) A bench-free SINGLE-seat roster is unchanged: no bench, `degradedReason`
+    /// `null`, the review stays on the only seat — and the evaluator≠creator stderr warning is for
+    /// a roster that COULD have separated, never for one seat.
+    #[test]
+    fn a_single_seat_roster_is_unchanged_and_never_warned_about() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(RecordingDispatcher { seen });
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &[seat("claude")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("routes");
+        assert!(dists
+            .iter()
+            .all(|d| d.degraded_reason.is_none() && d.benched.is_empty()));
+        assert_eq!(dists[1].assigned_cli, "claude");
+
+        let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let builders = |ks: &[&str]| {
+            ks.iter()
+                .map(|k| k.to_string())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert!(
+            !warns_about_missing_evaluator_seat(&keys(&["claude"]), &builders(&["claude"])),
+            "one seat has nothing to separate"
+        );
+        assert!(warns_about_missing_evaluator_seat(
+            &keys(&["claude", "codex"]),
+            &builders(&["claude", "codex"])
+        ));
+        assert!(!warns_about_missing_evaluator_seat(
+            &keys(&["claude", "codex"]),
+            &builders(&["claude"])
+        ));
     }
 
     /// A unit the council handed to a seat the ledger then benched is reassigned with the CAUSE

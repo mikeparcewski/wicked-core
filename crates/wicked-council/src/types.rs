@@ -747,10 +747,7 @@ impl SeatFailureReason {
         {
             return Some(SeatFailureReason::NotLoggedIn);
         }
-        if [stdout, stderr]
-            .iter()
-            .any(|s| matches_any(s, QUOTA_EXHAUSTED))
-        {
+        if [stdout, stderr].iter().any(|s| quota_refusal_frame(s)) {
             return Some(SeatFailureReason::QuotaExhausted);
         }
         None
@@ -758,19 +755,31 @@ impl SeatFailureReason {
 
     /// (F-7R3-001) Classify a WORKER's or JUDGE's failed transcript — the engine's single output
     /// string, not a ballot's two streams. Authentication signatures are judged over the WHOLE
-    /// text as before (they are rare in prose); quota signatures only over its last
-    /// [`REFUSAL_TAIL_BYTES`] — a CLI states its final refusal last, while `rate limit` or
-    /// `billing details` in the body of a long transcript is more often the unit's subject
-    /// matter (a worker implementing a rate limiter, then failing on a compile error) than the
-    /// seat's condition. A ballot's output goes through [`Self::classify`] whole: a vote is short.
+    /// text as before (they are rare in prose); the quota REFUSAL FRAME ([`quota_refusal_frame`])
+    /// only over its last [`REFUSAL_TAIL_BYTES`] — a CLI states its final refusal last, and the
+    /// body of a long transcript is the unit's subject matter, not the seat's condition. A
+    /// refusal straddling the tail cut is missed by design: a real refusal is terminal, so it
+    /// never does (review F4). A ballot's output goes through [`Self::classify`] whole.
     pub fn classify_refusal(output: &str) -> Option<Self> {
         if matches_any(output, NOT_LOGGED_IN) {
             return Some(SeatFailureReason::NotLoggedIn);
         }
-        if matches_any(tail_bytes(output, REFUSAL_TAIL_BYTES), QUOTA_EXHAUSTED) {
+        if quota_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES)) {
             return Some(SeatFailureReason::QuotaExhausted);
         }
         None
+    }
+
+    /// The reason for a stable wire token ([`Self::as_str`]), `None` for anything else — the
+    /// fold reads a judge refusal back off `UnitEvidence.judge_refusals` by its token.
+    pub fn from_token(token: &str) -> Option<Self> {
+        [
+            SeatFailureReason::NotLoggedIn,
+            SeatFailureReason::QuotaExhausted,
+            SeatFailureReason::NotInstalled,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == token)
     }
 
     /// (F-7R3-001) Classify the OS error a `Command::spawn` returned: `NotFound` (ENOENT — the
@@ -816,43 +825,133 @@ const NOT_LOGGED_IN: &[&str] = &[
     "not signed in",
 ];
 
-/// (F-7R3-001) The capacity refusals the seats print — ASCII-case-insensitive substrings, each
-/// the CLI's or its provider's own words. Bare status numbers (`429`, `402`) are deliberately
-/// absent: in a transcript they are as likely a line number as a status.
-const QUOTA_EXHAUSTED: &[&str] = &[
-    // GitHub Copilot: "You have exceeded your monthly quota …".
-    "exceeded your monthly quota",
-    "monthly quota",
-    // OpenAI `insufficient_quota`: "You exceeded your current quota, please check your plan and
-    // billing details".
-    "exceeded your current quota",
+/// (F-7R3-001, review F1) Quota-class refusals that are complete in themselves — an API error
+/// code, or a sentence no code identifier and no prose about limiting produces. Matched as WHOLE
+/// tokens (no letter, digit or `_` on either side) on a terminal line of the output.
+const QUOTA_SELF_FRAMED: &[&str] = &[
+    // API / RPC error codes (Anthropic, OpenAI, gRPC).
     "insufficient_quota",
-    "quota exceeded",
     "quota_exceeded",
-    "quota exhausted",
-    "out of quota",
-    // Rate limiting — `rate_limit_error`, "rate limit reached", "rate limited", 429's phrase.
-    "rate limit",
-    "rate_limit",
-    "ratelimit",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+    // HTTP 429's own phrase.
     "too many requests",
-    // claude / codex: "You've hit your usage limit".
-    "usage limit",
-    // Credits / billing — Anthropic "Your credit balance is too low", OpenAI billing pointers,
-    // 402's phrase.
+    // Credits / billing — Anthropic "Your credit balance is too low … Plans & Billing", OpenAI
+    // "check your plan and billing details", 402's phrase.
     "insufficient credits",
     "insufficient_credits",
     "out of credits",
+    "no credits remaining",
     "credit balance is too low",
-    "billing details",
+    "plan and billing",
     "plans & billing",
+    "billing details",
     "billing hard limit",
     "payment required",
 ];
 
+/// (F-7R3-001, review F1) The GENERIC quota words — which classify only inside a REFUSAL FRAME:
+/// as whole words (a plural `s` allowed; never `rate limiting`, `RateLimiter`, `rate_limiter`,
+/// `ratelimit_bucket`) on a terminal line that also carries one of [`REFUSAL_VERBS`]. `the rate
+/// limit middleware has no tests` is subject matter; `You have exceeded your monthly quota` is
+/// the seat's condition.
+const QUOTA_GENERIC: &[&str] = &["quota", "rate limit", "usage limit"];
+
+/// (F-7R3-001, review F1) The refusal phrasing the seats' real messages carry beside a generic
+/// quota word — copilot `You have exceeded your monthly quota`, claude `usage limit reached`,
+/// codex `You've hit your usage limit`, OpenAI `You exceeded your current quota`, Anthropic
+/// `would exceed your account's rate limit`, Gemini `Resource has been exhausted (e.g. check
+/// quota)`. `exceed` / `exhaust` match as word PREFIXES (exceeded, exceeds, exhausted); the rest
+/// as whole tokens or phrases. `429` / `402` count as a frame only here, next to a quota word,
+/// never on their own — `too_many_requests_returns_429` is a test name, not a status.
+const REFUSAL_VERBS: &[&str] = &[
+    "exceed",
+    "exhaust",
+    "reached",
+    "hit your",
+    "hit the",
+    "insufficient",
+    "out of",
+    "too low",
+    "used up",
+    "run out",
+    "ran out",
+    "no remaining",
+    "429",
+    "402",
+];
+
+/// How many terminal non-empty lines the quota refusal frame is judged over — a refusal and the
+/// hint lines a CLI prints under it, never the body of the work.
+pub const REFUSAL_FRAME_LINES: usize = 6;
+
 /// How much of a worker's / judge's transcript tail [`SeatFailureReason::classify_refusal`]
-/// judges quota signatures over.
+/// judges the quota refusal frame over.
 pub const REFUSAL_TAIL_BYTES: usize = 2048;
+
+/// (F-7R3-001, review F1) Does `text` END in a quota refusal? Judged over its last
+/// [`REFUSAL_FRAME_LINES`] non-empty lines only — a CLI prints its refusal last, and the same
+/// words earlier are the work's subject — and a line counts when it carries a self-framed phrase
+/// ([`QUOTA_SELF_FRAMED`]) or a generic quota word ([`QUOTA_GENERIC`]) beside refusal phrasing
+/// ([`REFUSAL_VERBS`]). ASCII-case-insensitive; the whole-word rule keeps code identifiers and
+/// adjacent words (`rate_limiter`, `RateLimiter`, `rate limiting`) out.
+pub fn quota_refusal_frame(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(REFUSAL_FRAME_LINES)
+        .any(|line| {
+            QUOTA_SELF_FRAMED
+                .iter()
+                .any(|p| has_whole_phrase(line, p, false))
+                || (QUOTA_GENERIC
+                    .iter()
+                    .any(|w| has_whole_phrase(line, w, true))
+                    && REFUSAL_VERBS.iter().any(|v| match *v {
+                        "exceed" | "exhaust" => has_word_prefix(line, v),
+                        _ => has_whole_phrase(line, v, false),
+                    }))
+        })
+}
+
+/// A byte that continues an identifier or a word: a letter, a digit or `_`. Any other byte —
+/// space, punctuation, a quote, a UTF-8 continuation byte — is a boundary.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `needle` in `line` as a whole phrase, ASCII-case-insensitively: no word byte immediately
+/// before it and none immediately after it (one plural `s` allowed after when `plural_ok`).
+/// `rate limit` in `the rate limit middleware`, but not in `rate limiting`, `rate_limiter` or
+/// `RateLimiter`.
+fn has_whole_phrase(line: &str, needle: &str, plural_ok: bool) -> bool {
+    let (h, n) = (line.as_bytes(), needle.as_bytes());
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    (0..=h.len() - n.len()).any(|i| {
+        if !h[i..i + n.len()].eq_ignore_ascii_case(n) || (i > 0 && is_word_byte(h[i - 1])) {
+            return false;
+        }
+        let mut j = i + n.len();
+        if plural_ok && j < h.len() && h[j].eq_ignore_ascii_case(&b's') {
+            j += 1;
+        }
+        j >= h.len() || !is_word_byte(h[j])
+    })
+}
+
+/// `prefix` starts a word in `line`, ASCII-case-insensitively — `exceed` in `exceeded` and
+/// `exceeds`, never in `unexceeded`.
+fn has_word_prefix(line: &str, prefix: &str) -> bool {
+    let (h, n) = (line.as_bytes(), prefix.as_bytes());
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    (0..=h.len() - n.len())
+        .any(|i| h[i..i + n.len()].eq_ignore_ascii_case(n) && (i == 0 || !is_word_byte(h[i - 1])))
+}
 
 /// Any of `needles` in `haystack`, ASCII-case-insensitively.
 fn matches_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1480,8 +1579,9 @@ mod failure_reason_tests {
         assert_eq!(SeatFailureReason::classify("", ""), None);
     }
 
-    /// (F-7R3-001) The quota-class refusals classify `quota_exhausted` — the copilot string
-    /// from run c7e42297 first, then the other seats' spellings — and the wire token is stable.
+    /// (F-7R3-001) The seats' REAL quota refusals classify `quota_exhausted` — the copilot string
+    /// from run c7e42297 first, then the other seats' and providers' spellings — and the wire
+    /// token is stable.
     #[test]
     fn quota_refusals_are_classified_as_quota_exhausted() {
         for words in [
@@ -1492,6 +1592,16 @@ mod failure_reason_tests {
             "You exceeded your current quota, please check your plan and billing details.",
             "HTTP 429 Too Many Requests",
             "insufficient credits",
+            // claude CLI's own line, codex's, Gemini's, Anthropic's 429 JSON blob, gRPC's status.
+            "Claude AI usage limit reached|1757600000",
+            "You have used up your monthly quota. Upgrade to continue.",
+            "Error: Resource has been exhausted (e.g. check quota).",
+            "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit.\"}}",
+            "status: RESOURCE_EXHAUSTED",
+            "rate limit exceeded",
+            "rate limit reached, retrying in 60s",
+            "Error: rate limit: 429",
+            "You have exceeded your usage limits for this billing period.",
         ] {
             let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1").with_output(words, "");
             assert_eq!(
@@ -1514,7 +1624,8 @@ mod failure_reason_tests {
     }
 
     /// (F-7R3-001) Authentication wins over quota when a refusal says both (the sign-in is the
-    /// more specific fix), and an unrelated failure that merely exits non-zero stays unclassified.
+    /// more specific fix) — in either order, on either path, across the two streams — and an
+    /// unrelated failure that merely exits non-zero stays unclassified.
     #[test]
     fn authentication_outranks_quota_and_unrelated_output_stays_unclassified() {
         assert_eq!(
@@ -1522,6 +1633,25 @@ mod failure_reason_tests {
                 "Not logged in · Please run /login (your plan's rate limit also applies)",
                 ""
             ),
+            Some(SeatFailureReason::NotLoggedIn)
+        );
+        for s in [
+            "You've hit your usage limit.\nNot logged in · Please run /login",
+            "Not logged in · Please run /login\nYou've hit your usage limit.",
+        ] {
+            assert_eq!(
+                SeatFailureReason::classify(s, ""),
+                Some(SeatFailureReason::NotLoggedIn),
+                "ballot: {s:?}"
+            );
+            assert_eq!(
+                SeatFailureReason::classify_refusal(s),
+                Some(SeatFailureReason::NotLoggedIn),
+                "transcript: {s:?}"
+            );
+        }
+        assert_eq!(
+            SeatFailureReason::classify("rate limit reached", "authentication required"),
             Some(SeatFailureReason::NotLoggedIn)
         );
         assert_eq!(
@@ -1533,6 +1663,89 @@ mod failure_reason_tests {
             "exhausted its quota"
         );
         assert_eq!(SeatFailureReason::NotInstalled.as_str(), "not_installed");
+        for r in [
+            SeatFailureReason::NotLoggedIn,
+            SeatFailureReason::QuotaExhausted,
+            SeatFailureReason::NotInstalled,
+        ] {
+            assert_eq!(SeatFailureReason::from_token(r.as_str()), Some(r));
+        }
+        assert_eq!(SeatFailureReason::from_token("signed out"), None);
+    }
+
+    /// (F-7R3-001, review F1) SUBJECT MATTER is never the seat's condition: a short failed
+    /// transcript about a rate limiter, a failed ballot whose vote names the rate limit
+    /// middleware, code identifiers and adjacent words that contain a quota word, a bare quota
+    /// word with no refusal phrasing, and bare status numbers all stay UNCLASSIFIED — on both
+    /// paths. These are the reviewer's probes on #452.
+    #[test]
+    fn subject_matter_identifiers_and_bare_words_are_not_quota_refusals() {
+        let short_transcript = "(cli `codex` exited 1) error[E0308]: mismatched types in \
+                                src/rate_limit.rs:42 while wiring the rate limit middleware; test \
+                                too_many_requests_returns_429 failed";
+        assert!(short_transcript.len() < REFUSAL_TAIL_BYTES);
+        let cases = [
+            short_transcript,
+            "Option 1 — fit. Top risk: the rate limit middleware has no tests.",
+            "fn rate_limiter()",
+            "the RateLimiter type",
+            "ratelimit_bucket.rs",
+            "rate limiting is out of scope",
+            "see the usage limits section",
+            "rate limit",
+            "usage limit",
+            "monthly quota",
+            "rate_limit",
+            "ratelimit",
+            "the quota module owns quota.rs",
+            "429",
+            "402",
+            "HTTP 429",
+            "status 402",
+            "server returned 429 after 3 retries",
+            "error 402",
+            "sh: copilot: command not found",
+            "cat: x: No such file or directory",
+        ];
+        let mut hits = Vec::new();
+        for s in cases {
+            if SeatFailureReason::classify(s, "").is_some()
+                || SeatFailureReason::classify("", s).is_some()
+                || SeatFailureReason::classify_refusal(s).is_some()
+            {
+                hits.push(s);
+            }
+        }
+        assert!(hits.is_empty(), "classified as a quota refusal: {hits:?}");
+        // A quota word beside a refusal verb on the same line IS the frame; the same verb on
+        // another line is not.
+        assert!(quota_refusal_frame(
+            "Error: quota exceeded for this project"
+        ));
+        assert!(!quota_refusal_frame(
+            "the quota module\nlimits were exceeded by the test"
+        ));
+    }
+
+    /// (F-7R3-001, review F1) The frame is TERMINAL: a refusal on the last lines classifies, the
+    /// same line buried under more than `REFUSAL_FRAME_LINES` lines of later output does not.
+    #[test]
+    fn the_quota_refusal_frame_reads_only_the_terminal_lines() {
+        let refusal = "Error: You have exceeded your monthly quota for premium requests.";
+        let hints = "Please upgrade your plan.\nLearn more: https://example.invalid/quota\n";
+        assert!(quota_refusal_frame(&format!("{refusal}\n{hints}")));
+        let buried = format!(
+            "{refusal}\n{}",
+            (0..REFUSAL_FRAME_LINES + 1)
+                .map(|i| format!("  at frame {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(!quota_refusal_frame(&buried), "{buried}");
+        assert_eq!(SeatFailureReason::classify_refusal(&buried), None);
+        assert_eq!(SeatFailureReason::classify(&buried, ""), None);
+        // Blank lines do not count against the window.
+        assert!(quota_refusal_frame(&format!("{refusal}\n\n\n\n\n\n\n\n")));
     }
 
     /// (F-7R3-001) A worker's / judge's transcript is judged for quota over its TAIL only: the
@@ -1553,12 +1766,27 @@ mod failure_reason_tests {
             SeatFailureReason::classify_refusal(&auth_first),
             Some(SeatFailureReason::NotLoggedIn)
         );
-        // The tail cut lands on a char boundary — multi-byte text does not panic.
-        let wide = "é".repeat(REFUSAL_TAIL_BYTES) + "rate limit";
-        assert_eq!(
-            SeatFailureReason::classify_refusal(&wide),
-            Some(SeatFailureReason::QuotaExhausted)
-        );
+        // The tail cut lands on a char boundary — 2-, 3- and 4-byte text does not panic, and
+        // the refusal at the very end still classifies.
+        for ch in ["é", "€", "😀"] {
+            for n in [
+                REFUSAL_TAIL_BYTES / 4,
+                REFUSAL_TAIL_BYTES,
+                REFUSAL_TAIL_BYTES * 3 + 1,
+            ] {
+                let wide = ch.repeat(n) + "\nError: exceeded your monthly quota";
+                assert_eq!(
+                    SeatFailureReason::classify_refusal(&wide),
+                    Some(SeatFailureReason::QuotaExhausted),
+                    "{ch} x {n}"
+                );
+                assert_eq!(
+                    SeatFailureReason::classify_refusal(&ch.repeat(n)),
+                    None,
+                    "{ch} x {n} plain"
+                );
+            }
+        }
     }
 
     /// (F-7R3-001) A spawn that fails `NotFound` is `spawn_failed [not_installed]`, naming the

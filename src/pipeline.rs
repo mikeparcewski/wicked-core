@@ -892,13 +892,33 @@ pub(crate) fn apply_and_finish_unit(
     }
     if !judge_benches.is_empty() {
         if let Ok(Some(mut session)) = crate::domain::get_session(&*store, session_id) {
+            // (review F3 on #452) The ballot ledger's rule, applied to a transcript: a
+            // quota-class refusal benches only a seat with NO successful unit in this run;
+            // sign-in / missing binary on first occurrence. A token this build does not know (a
+            // newer serializer) benches as written — deny wins.
+            let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
             let mut changed = false;
-            for (seat, reason) in judge_benches {
+            for (seat, token) in judge_benches {
+                let why = match wicked_council::types::SeatFailureReason::from_token(&token) {
+                    Some(reason) => crate::domain::transcript_bench_reason(
+                        reason,
+                        crate::domain::seat_succeeded_in_run(&units, &seat),
+                    ),
+                    None => Some(token),
+                };
+                let Some(why) = why else {
+                    eprintln!(
+                        "wicked-core: judge seat '{seat}' refused on unit {} but has a successful \
+                         unit in this run — not benched (F-7R3-001)",
+                        unit.ord
+                    );
+                    continue;
+                };
                 changed |= crate::domain::bench_seat(
                     &mut session.benched_seats,
                     crate::domain::BenchedSeat {
                         cli: seat,
-                        reason,
+                        reason: why,
                         source: "judge".to_string(),
                     },
                 );
