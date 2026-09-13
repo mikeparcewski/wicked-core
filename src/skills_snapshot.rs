@@ -4815,6 +4815,13 @@ mod tests {
     /// Both refusals are structured and name the skills.
     #[test]
     fn admission_refuses_nested_skills_for_claude_and_nonportable_skills_for_other_clis() {
+        // The codex arm below asserts the `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` hatch is OFF;
+        // `execute_wrapped` tests set it under the env lock's write side, so read-hold the lock
+        // like this module's other env-reading tests — otherwise a parallel hatch test makes the
+        // codex admission read `NoLever` (seen on the macOS leg of core PR #477).
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let base = scratch("cli");
         let root = snapshot_root_with(
             &gen_dir(&base, "12"),
