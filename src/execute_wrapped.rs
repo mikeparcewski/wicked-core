@@ -2826,8 +2826,12 @@ fn arm_input_governance(
     // Write the ARMED marker BEFORE the CLI runs: its presence lets the actor-side fold distinguish a
     // governed unit that legitimately made no tool-calls (marker only) from one whose evidence was erased
     // or whose hook never fired (marker absent → fail closed). Closes the council evidence-integrity blocker.
-    crate::gate_hook::write_armed_marker(&decisions_path, &phase)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    crate::gate_hook::write_armed_marker_for(
+        &decisions_path,
+        &phase,
+        Some(crate::gate_hook::CARRIER_WRAPPED_CLI),
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
     // Insert `--mcp-config <path>` FIRST so it parses as a flag (never demoted past the prompt / a `--`
     // guard). It is variadic and takes a FILE PATH — not comma-joinable — so it cannot ride the
     // append-or-before-`--` path of `inject_isolation_flags` (a bare positional prompt could be swallowed

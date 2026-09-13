@@ -14,6 +14,36 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Fixed
+- **Estate grounding allowlist — read-only estate reads are allowed in governed units, writes stay
+  denied, every estate deny names the tool and the command (DES-GROUNDING-001 §7, issue #463 items
+  1 + 2, F-RC1-046 / F-RC1-047).** The governance gate denied every `wicked-estate` /
+  `wicked-estate-mcp` invocation from Bash as unit-FATAL whatever the subcommand — a finished
+  `recon` unit that ran `wicked-estate stats` died as `sessionFailed` with no route back — while
+  the estate stdio shim garden's skills actually run (`sh …/_python.sh …/scripts/mem/estate_memory.py`)
+  was invisible to the binary-name scan. `bash_denied_estate_indexer` is replaced by
+  `classify_estate_command`, a per-command allowlist: the read-only CLI subcommands (`query`,
+  `blast-radius`, `rank`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`, `clusters`
+  without `--annotate`) are **allowed**; the write subcommands (`index`, `scip`, `tfstate`,
+  `import-telemetry`, `compact`, `watch`, `clusters --annotate`) and any unrecognised verb are
+  **denied** fail-closed. `wicked-estate-mcp` and garden's shim / `mem` backends — recognised by
+  the script in executing position, through `python*` / `py` / `sh` / `_python.sh` / `python -m`
+  — are allowed only with **both** `--readonly` **and** a pinned store (`--db <path>`, a leading
+  `WICKED_ESTATE_DB=` / `WICKED_HOME=` / `WICKED_MEMORY_DB=` assignment, or those variables in the
+  worker environment — a parameter of the judgement on both carriers:
+  `BoundaryCtx.estate_store_pinned` on ACP, the hook's own environment on the wrapped path). A
+  denied estate command is a real decision record on both arms: the tool annotation rides with
+  the claim (no `(unknown)`), the command at `obligations[1]`, the reason naming the segment and
+  why (write verb / unknown verb / no `--readonly` / no pin) plus the remedy. On a unit whose
+  posture fences writes (recon / pre-build) the deny is **advisory** (`estate-deny:`): the seat
+  continues with the remedy and the fold emits `workerToolCallDenied` — its `carrier` now read
+  back off the armed marker (`write_armed_marker_for`, written by both carriers) instead of an
+  assumed `wrapped_cli`. On a code-executing unit it stays **fatal** (`boundary-deny:`; the unit
+  is denied as before, now with the tool named). `proposal.submit` through the `--readonly` shim
+  stays allowed. The shim rule is inert until wicked-garden #1130 spells `--readonly` on the
+  backend argv; item 3 (a denied recon command opens a gate, never `sessionFailed`) is tracked
+  with core#464.
+
 ### Added
 - **State-home fence: unregistered entries are a configuration error, refused at intake (core#411,
   wicked-crew#497; acceptance findings F-RC1-011, F-RC2-020, F-032/F-033).** The worker Read fence

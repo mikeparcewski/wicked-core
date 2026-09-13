@@ -4853,6 +4853,9 @@ fn chat_boundary(
         pre_build_scope: false,
         write_posture: crate::write_posture::WritePosture::Full,
         deliverable_roots: Vec::new(),
+        // A chat is judged by `chat_boundary_result` → `boundary_denial_with`, the STRICT
+        // spelling: an estate shim call there must pin its store on argv (issue #463).
+        estate_store_pinned: false,
     }
 }
 
@@ -6032,9 +6035,10 @@ impl AcpStepRunner {
                 // it: the fold uses its presence to tell a governed unit that legitimately made no
                 // tool calls from one whose hook never fired. Without it, a clean governed ACP run
                 // would be denied for looking bypassed.
-                if let Err(e) = crate::gate_hook::write_armed_marker(
+                if let Err(e) = crate::gate_hook::write_armed_marker_for(
                     std::path::Path::new(&decisions_path),
                     &phase,
+                    Some(crate::gate_hook::CARRIER_ACP),
                 ) {
                     // Fail CLOSED: unable to arm means unable to prove the gate ran.
                     let reason = crate::diagnostic::with_cause(
@@ -6109,6 +6113,13 @@ impl AcpStepRunner {
                     // The creator fence's roots (F-02): exactly `g.extra_write_roots`, the list
                     // the wrapped launcher arms on `WICKED_DELIVERABLE_ROOTS` for its hook.
                     deliverable_roots: crate::write_posture::deliverable_roots_of(Some(g)),
+                    // (issue #463) Whether the AGENT child's environment pins the estate store
+                    // its shim / MCP reads resolve — the pins that survive `hardened()`; this
+                    // carrier never sets `WICKED_ESTATE_DB` on the child (its graph rides
+                    // `session/new` `mcpServers`), so only the inherited `WICKED_HOME` /
+                    // `WICKED_MEMORY_DB` count. Judged HERE, where the daemon env is the child's
+                    // parent — the wrapped carrier's hook reads its own environment instead.
+                    estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child(),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -6567,6 +6578,7 @@ impl AcpStepRunner {
                         pre_build_scope: boundary.pre_build_scope,
                         write_posture: boundary.write_posture,
                         deliverable_roots: boundary.deliverable_roots.clone(),
+                        estate_store_pinned: boundary.estate_store_pinned,
                     }),
                 }
             },
@@ -16967,6 +16979,7 @@ transport = "stdio"
             deliverable_roots: vec![],
             pre_build_scope: false,
             write_posture: crate::write_posture::WritePosture::Full,
+            estate_store_pinned: false,
         };
         let lock = std::sync::Mutex::new(());
         let ask = |cmd: &str, id: u64| -> serde_json::Value {

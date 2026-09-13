@@ -80,3 +80,43 @@ Memory/knowledge/rules recall from a worker resolve to `$WICKED_HOME` defaults, 
 - **Other interactive seams (demo/video, chat, edit).** §3.3 rewrites only the DRAFT grounding clause (`draftProblem`). The demo (`demoProblem`), chat (`chatProblem`), and edit (`editProblem`) seams author governed runs too, so they inherit the keystone (their workers now get the read-only estate tools via gap #1) but their prompts do NOT direct the worker to ground via the index. Note: chat/edit are *deliberately* ungrounded today (the CREW-UX-8 split, `chat-events.ts:273`) on the premise that grounding = an expensive repo snapshot; with cheap index-tool grounding that premise is weaker. Whether revisions and demos should now ground via the index is a per-seam DESIGN decision, not an automatic copy of the draft clause — assess each before applying.
 - Passing the `projectGraph` binding on generic `POST /runs` launches (§3.2), and wiring the memory/knowledge env for workers (§3.4).
 - Index staleness: the project graph is a few commits behind; refresh cadence for grounding freshness.
+- **(§7) Shim rule inert until wicked-garden #1130 lands** — it spells `--readonly` on the backend argv and forwards it to the spawned `wicked-estate-mcp`; until then every shim call is denied for the missing flag (safe, disclosed). Whether `nodes` / `hotspots` — pure reads the CLI also offers — join the read allowlist; they are denied fail-closed today.
+
+## 7. Transport — Bash-path grounding allowlist (issue #463, 2026-09-13)
+
+**Decision (2026-09-13).** Governed workers ground through **skills + a deterministic script/CLI seam**, not through a Claude-Code-registered MCP server. The organization-managed `allowedMcpServers` allowlist silently drops a handed `wicked-estate` server (core#462 detects and discloses that), but a Bash call that spawns a process is not subject to it, behaves identically on every seat CLI (MCP support is uneven outside Claude Code), and every call is visible to wicked-governance. This supersedes §3.1's premise *for grounding* — the `--mcp-config` hand-off stays as the first rung where the org policy admits it — and moves the write boundary from the MCP process flag (§3.0 `--readonly`) into a governance **allowlist rule** the gate hook enforces on the command text. It answers §6's "wiring the memory/knowledge env for workers" only in part: the rule *requires* a pinned store, §3.4 still owns *setting* one.
+
+### 7.1 Allowlist (`classify_estate_command`, `src/gate_hook.rs`)
+
+| Shape (judged on every pipeline / `;` / `&&` segment) | Condition | Verdict |
+|---|---|---|
+| `wicked-estate {query, blast-radius, rank, stats, source, semantic, cross-graph, subscribe}` | — | **ALLOW** |
+| `wicked-estate clusters` | without `--annotate` | **ALLOW** |
+| `wicked-estate clusters --annotate` | — | **DENY** (write) |
+| `wicked-estate {index, scip, tfstate, import-telemetry, compact, watch}` | — | **DENY** (write) |
+| `wicked-estate <anything else>` | — | **DENY** (unknown verb, fail-closed) |
+| `wicked-estate-mcp …` | `--readonly` **and** a pinned store | **ALLOW** |
+| the estate shim / a `mem` backend (§7.3) | `--readonly` **and** a pinned store | **ALLOW** |
+| `wicked-estate-mcp` / shim / backend | missing `--readonly` | **DENY** |
+| `wicked-estate-mcp` / shim / backend | `--readonly` but no pinned store | **DENY** |
+
+A **pinned store** is any of: `--db <path>` / `--db=<path>` on the segment's argv; a leading `WICKED_ESTATE_DB=…` / `WICKED_HOME=…` / `WICKED_MEMORY_DB=…` assignment (bare or through `env`); or the same variables in the **worker's environment** (`ESTATE_STORE_PIN_ENV`). The worker-env fact is a *parameter* of the pure judgement, like the roots and the posture (core#260): the wrapped carrier's hook reads its own environment (the launcher re-sets `WICKED_ESTATE_DB` to the repo graph after `hardened()` — `arm_worker_estate_channel`), the ACP bridge derives it on the runner as the pins that survive `hardened()` (`WICKED_HOME` / `WICKED_MEMORY_DB`; the ACP child never receives `WICKED_ESTATE_DB` — its graph rides `session/new` `mcpServers`). `--readonly` alone is not enough: an unpinned shim resolves whatever store the cwd or the operator's defaults happen to name.
+
+`proposal.submit` through the `--readonly` shim stays ALLOWED — it is the safe write §3.0 carved out (lands `pending`, provenance server-stamped from `WICKED_RUN_*`), and the rule never inspects the JSON-RPC payload.
+
+### 7.2 Advisory / fatal split, and what a denied unit gets (F-RC1-046 / F-RC1-047)
+
+Every estate deny is a **real decision record**: the tool-call annotation rides in the same buffer as the claim (so `GovernanceHookFired.toolName` and `UnitDenial.denied_tool` name the tool — never `(unknown)`), `obligations[1]` carries the offending command, and the reason names the segment and *why* (write verb / unknown verb / no `--readonly` / no pin) plus the remedy. The unit's **posture** decides the arm:
+
+- **Advisory** — the unit's write posture fences writes or it is a pre-build rung (`WICKED_NO_CODE_SCOPE` / `WICKED_PRE_BUILD_SCOPE` on the wrapped carrier, `BoundaryCtx` on ACP): claim `estate-deny:<phase>`, advisory by the allowlist. The call is blocked, the seat is handed the remedy and continues, the unit is **not** denied, and the fold discloses `workerToolCallDenied {tool, command, reason, remedy, carrier}` — the carrier read back off the armed marker (`_wicked_gov_carrier`, written by both carriers), not assumed. This is the `remote-write-deny` precedent, **not a human pause**: with read-only grounding allowed, the F-RC1-046 shape (`wicked-estate stats` on a recon unit) no longer denies at all, and a write attempt on a recon unit is disclosed without killing the unit.
+- **Fatal** — a code-executing unit: claim `boundary-deny:<phase>`, the class the fence always emitted for a write escape; the fold denies the unit (`UnitDenied`, `denied_tool` = the tool, the command in the claim) exactly as before. A write escape on the shared graph from a unit that may run code is not recoverable by "continue".
+
+Issue #463 item 3 — a denied command on a captured unit opening a **gate** naming the command and a remedy instead of a retroactive `sessionFailed` — is the actor-seam change tracked with core#464 (the same `apply_step_result` fold); the records above are the payload that gate reads, on both arms.
+
+### 7.3 Argv contract — the shim / backend pattern (cross-repo, wicked-garden #1130)
+
+The fence sees only the **outer** Bash argv. wicked-garden grounds through `scripts/_estate_client.py` (the stdio shim that spawns `wicked-estate-mcp`) and the backends that import it — every `scripts/mem/*.py` (`estate_memory.py`, `auto_memorize.py`, `session_fact_extractor.py`) and `scripts/_context_backend.py` — always through a launcher: `sh "$ROOT/scripts/_python.sh" "$ROOT/scripts/mem/estate_memory.py" recall '{…}'`. The classifier therefore recognises the **script in executing position** — the program word itself, the first non-flag argument of `python*` / `py` / `sh` / `bash` / `zsh` / `dash` (looking through garden's `_python.sh` / `_run.py` resolvers), or the module of `python -m <mod>` — matched by basename (`_estate_client.py`, `_context_backend.py`) or by the `scripts/mem/` path segment. A mention is not an invocation (`grep readonly scripts/_estate_client.py` passes). A new backend that spawns the shim from another directory must be added to `ESTATE_SHIM_SCRIPTS` or live under `scripts/mem/` — until then it is invisible to the scan, exactly as before.
+
+The contract garden #1130 implements: in governed mode the skill text spells **`--readonly` on the backend's own argv**, the backend forwards `--readonly` (and `--db`, when given) to the `wicked-estate-mcp` it spawns, and the store pin normally rides the worker environment (§7.1). Until #1130 lands, every shim call is denied for the missing `--readonly` — safe (it closes the hole the old binary-name scan never saw: the shim's program word is `python`) and disclosed with the exact remedy. End-to-end acceptance (a `capture-learnings` run lands proposals via the shim on the rig with an org MCP allowlist that lacks `wicked-estate`) needs both halves.
+
+Limits, unchanged from the fences beside it: a literal scan does not see through `sh -c '…'`, `python -c '…'`, a renamed binary, raw SQLite, or a backend spawned from an unlisted path; the OS sandbox is the hermetic layer (§5).
