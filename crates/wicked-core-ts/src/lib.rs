@@ -734,6 +734,32 @@ impl Core {
         })
     }
 
+    /// The state-home PREFLIGHT crew runs at `serve` (wicked-core#411 / wicked-crew#497): survey
+    /// the state home the worker Read fence classifies and report every entry its registry cannot
+    /// classify — the condition that would otherwise refuse EVERY worker launch, discovered today
+    /// at the run's first worker after a planning council and the intake gate. `snapshotPath` is
+    /// the published generation crew hands the engine (`WICKED_SKILLS_SNAPSHOT`; the state home is
+    /// derived from its shape), or absent when none is handed — the store's parent (`dbPath`) is
+    /// then surveyed for information. Resolves to the JSON `{ stateHome, derivedFrom:
+    /// 'snapshot' | 'db' | null, unregistered: [{ name, path, level }], refusesLaunches, error,
+    /// remedy }` — `refusesLaunches` is true exactly when a handed snapshot derives a state home
+    /// with unregistered entries, which is also what `launchRun` now rejects synchronously with a
+    /// typed configuration error (no session persisted). Read-only; never touches the process
+    /// environment. An addon without this static answers `null` in crew's `GET /diagnostics.stateHome`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn preflight_state_home(
+        snapshot_path: Option<String>,
+        db_path: String,
+    ) -> AsyncTask<CoreTask> {
+        task(move || {
+            let report = wicked_core::preflight_state_home(
+                snapshot_path.as_deref().map(std::path::Path::new),
+                &db_path,
+            );
+            serde_json::to_string(&report).map_err(err)
+        })
+    }
+
     /// Replay a dead-letter outbox — the emit seam's NDJSON spool (`WICKED_APPS_EMIT_DEADLETTER`)
     /// of governance events it could not store — into the estate store at `dbPath`, writing each
     /// record as the EVENT node it should have been with its original `ts` restored
