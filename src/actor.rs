@@ -1172,6 +1172,16 @@ pub(crate) fn run(
                         home.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
+                    // core#411 / wicked-crew#497: the state-home INTAKE fence. An entry under the
+                    // handed snapshot's state home that the registry cannot classify would refuse
+                    // EVERY worker launch of this run — surfaced, until now, at the first worker
+                    // (after a planning council and the intake gate) as a failed unit the triage
+                    // judge could not fix. A configuration error is judged HERE, in the sync fast
+                    // path like every other launch-time refusal: a typed `StateHomeConfigError`
+                    // (downcastable, naming every entry and the remedy), NO session persisted,
+                    // nothing planned, no judge. Everything else about the snapshot (unset,
+                    // unresolvable, shapeless, kind mismatches) keeps its launch-time admission.
+                    crate::state_home::intake_fence().map_err(anyhow::Error::new)?;
                     // Read the repo from the store (fast, no git subprocess) so the worker thread
                     // can create the worktree with its root_path without holding a store handle.
                     // `create_worktree` (git worktree add) is moved off the actor thread below.

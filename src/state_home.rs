@@ -75,6 +75,28 @@
 //! (crew is the only writer of that directory, and the listing refuses it then); a generation
 //! published while a session runs is readable by that session until its next launch —
 //! generations are immutable and hold only the enabled skills of a newer publish.
+//!
+//! # An unregistered entry is a CONFIGURATION error, said at boot and at intake (core#411)
+//!
+//! Fail-closed-by-name is right, but WHERE it fired was wrong: at the run's first worker launch —
+//! after a planning council and the intake gate — as a `SkillsError::Config` the runner turned into
+//! a failed unit, which the failure-triage judge then labelled "triage judge errored" and escalated
+//! with an "Approve to retry" that could only fail again (wicked-crew#497, F-032/F-033). The daemon
+//! booted green throughout. Twice in one day that shape cost every governed run on a host: the
+//! acceptance rig's `WICKED_WORKFLOWS_DIR=<state home>/workflows` (F-RC1-011) and a
+//! `skills.fixture-debris-…` directory left in the operator's live state home (F-RC2-020). So the
+//! same classification now has two EARLIER, TYPED surfaces beside the launch-time refusal, which
+//! stays as the last line: [`survey`] lists EVERY unregistered entry at once (the fence stops at the
+//! first, and removing `interactive` only moved the rig's refusal to `workflows`);
+//! [`intake_fence`] runs it in `Core::launch_run`'s synchronous fast path and refuses with
+//! [`StateHomeConfigError`] — no session persisted, nothing planned, no judge; and
+//! [`preflight_state_home`] is the engine call crew makes at `serve` so the daemon reports the
+//! blocker before anyone launches. Every message is in operator terms — the entry, the state
+//! home, the variable, what to do — and none cites a repository fixture path. Entries an OPERATOR
+//! variable can place under the state home (`workflows`, `steering-inbox`, `interactive`) are
+//! registered so a pre-existing placement is fenced rather than refusing every launch; crew
+//! refuses to boot with such a variable pointed inside the state home. Debris is deliberately NOT
+//! patterned: a quarantine-by-rename inside the state home is what the fence must refuse.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -718,10 +740,10 @@ fn check_entry_kind(state_home: &Path, name: &str, entry: &Entry) -> Result<(), 
     let ft = meta.file_type();
     let refuse = |actual: &str| {
         format!(
-            "`{name}` under {} is {actual} where the state-home registry declares a `{}` \
-             (tests/fixtures/state-home-subtrees.json); the worker Read fence would emit a rule \
-             for the declared kind and leave the actual entry uncovered, so the launch is refused \
-             rather than fenced wrongly — remove the entry, or fix what wrote it",
+            "`{name}` under {} is {actual} where the state-home registry declares a `{}`; the \
+             worker Read fence would emit a rule for the declared kind and leave the actual entry \
+             uncovered, so the launch is refused rather than fenced wrongly — move the entry out of \
+             the state home, or fix what wrote it, and restart the daemon",
             state_home.display(),
             entry.kind
         )
@@ -777,16 +799,16 @@ fn check_child_kind(
         return Ok(());
     }
     Err(format!(
-        "`{name}` under {} is {} where the state-home registry declares `{}` a {} \
-         (tests/fixtures/state-home-subtrees.json{}); the worker Read fence would fence the \
-         declared kind and leave the actual entry uncovered, so the launch is refused rather than \
-         fenced wrongly — remove it, or fix what wrote it",
+        "`{name}` under {} is {} where the state-home registry declares `{}` a {}{}; the worker \
+         Read fence would fence the declared kind and leave the actual entry uncovered, so the \
+         launch is refused rather than fenced wrongly — move it out of the state home, or fix what \
+         wrote it, and restart the daemon",
         dir.display(),
         actual_kind(meta),
         pattern.spelled(),
         pattern.spec.kind.spelled(),
         if pattern.spec.transient {
-            ", a transient name of a parked crew mutation"
+            " (a transient name of a parked crew mutation)"
         } else {
             ""
         }
@@ -916,12 +938,260 @@ fn list_names(dir: &Path) -> Result<Vec<String>, String> {
 
 fn unclassified(dir: &Path, name: &str) -> String {
     format!(
-        "`{name}` under {} is not in the state-home registry (tests/fixtures/state-home-subtrees.json), \
-         so the worker Read fence cannot classify it; the launch is refused rather than leaving \
-         it unfenced — remove the entry, or register it in core AND crew (a new crew store must \
-         be registered in both before it may appear there)",
+        "`{name}` under {} is not in the state-home registry, so the worker Read fence cannot \
+         classify it; the launch is refused rather than leaving it unfenced — {REMEDY}",
         dir.display()
     )
+}
+
+// ── core#411 / wicked-crew#497: unregistered entries are a CONFIGURATION error ───────────────
+//
+// The fence above stops at the FIRST entry it cannot classify — right for a launch (fail closed,
+// cheap) and wrong for an operator: on the acceptance rig, removing `interactive` only moved the
+// refusal to `workflows` (F-RC1-011), and the refusal surfaced at the run's first worker, after a
+// planning council and the intake gate, labelled "triage judge errored" with an "Approve to retry"
+// offer for a retry that could only fail (F-032/F-033, F-RC2-020 on the live daemon: three runs,
+// two seats, zero governed runs possible while the daemon booted GREEN). The helpers below give
+// the same classification two earlier, typed surfaces: a boot-time SURVEY crew reports before the
+// first launch, and an INTAKE refusal `Core::launch_run` returns synchronously — no session
+// persisted, nothing planned, no judge — naming every entry and the remedy in operator terms.
+
+/// The remedy every unregistered-entry message ends with — operator terms, no repository paths.
+pub(crate) const REMEDY: &str = "move each entry out of the state home (or point the WICKED_* \
+     variable that created it at a directory OUTSIDE the state home) and restart the daemon; a \
+     store crew or the engine is meant to keep there must first be added to the state-home \
+     registry that wicked-core and wicked-crew ship, in a release of both";
+
+/// One entry the registry cannot classify, as [`survey`] reports it (core#411).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnregisteredEntry {
+    /// The entry's name as listed.
+    pub name: String,
+    /// Its absolute path.
+    pub path: String,
+    /// Where it sits: `state-home` (a top-level entry) or `skills-root` (a child of the skills root
+    /// that is neither the read slot nor a registered denied child).
+    pub level: &'static str,
+}
+
+/// EVERY entry of `state_home` the launch-time fence would refuse BY NAME — the top level and the
+/// skills root's children — sorted as listed, all at once (core#411). Kind mismatches and read-slot
+/// entries stay launch-time refusals (a different, rarer class than the two incidents this exists
+/// for). `Err` when the state home or its skills root cannot be listed.
+pub(crate) fn survey(state_home: &Path) -> Result<Vec<UnregisteredEntry>, String> {
+    let registry = registry().map_err(|e| format!("the state-home registry is unusable ({e})"))?;
+    let mut out = Vec::new();
+    for name in list_names(state_home)? {
+        if registry.classify(&name).is_none() {
+            out.push(UnregisteredEntry {
+                path: state_home.join(&name).display().to_string(),
+                name,
+                level: "state-home",
+            });
+        }
+    }
+    if let Some(skills) = registry.skills_entry() {
+        if let Claim::Name(skills_name) = &skills.claim {
+            let skills_dir = state_home.join(skills_name);
+            // A skills root that is not a real directory (absent, or a symlink) has no children
+            // to classify here — the launch refuses a linked one as a kind mismatch.
+            if std::fs::symlink_metadata(&skills_dir).is_ok_and(|m| m.is_dir()) {
+                let slot = skills.read_slot.as_deref();
+                let patterns = root_patterns(skills);
+                for name in list_names(&skills_dir)? {
+                    if Some(name.as_str()) == slot || patterns.iter().any(|p| p.matches(&name)) {
+                        continue;
+                    }
+                    out.push(UnregisteredEntry {
+                        path: skills_dir.join(&name).display().to_string(),
+                        name,
+                        level: "skills-root",
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The daemon's state home holds entries the worker Read fence cannot classify (core#411 /
+/// wicked-crew#497). A CONFIGURATION error: [`crate::Core::launch_run`] returns it SYNCHRONOUSLY
+/// from intake — no session is persisted, nothing is planned, no council convenes, no triage judge
+/// is asked — and crew reports the same survey at boot ([`preflight_state_home`]). Typed (not a
+/// bare string) so crew can answer `POST /runs` 409 with the entries and the remedy as fields, and
+/// so the message is spelled ONCE, in operator terms: which entries, under which state home, and
+/// what to do — never a repository test-fixture path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateHomeConfigError {
+    /// The variable whose snapshot derived the state home (`WICKED_SKILLS_SNAPSHOT`).
+    pub var: &'static str,
+    /// The snapshot that variable names (canonical spelling).
+    pub snapshot: String,
+    /// The state home derived from it — the directory the fence classifies.
+    pub state_home: String,
+    /// Every entry the registry cannot classify, top level first, then the skills root's children.
+    pub unregistered: Vec<UnregisteredEntry>,
+    /// What to do about it, in operator terms.
+    pub remedy: String,
+}
+
+impl std::fmt::Display for StateHomeConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let named: Vec<String> = self
+            .unregistered
+            .iter()
+            .map(|u| {
+                if u.level == "skills-root" {
+                    format!("`{}` (under the skills root)", u.name)
+                } else {
+                    format!("`{}`", u.name)
+                }
+            })
+            .collect();
+        write!(
+            f,
+            "configuration error: the daemon's state home {} (derived from {}={}) holds {} {} the \
+             worker Read fence cannot classify — {} — so every worker launch from this daemon would \
+             be refused; the run was not started. Remedy: {}",
+            self.state_home,
+            self.var,
+            self.snapshot,
+            self.unregistered.len(),
+            if self.unregistered.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            named.join(", "),
+            self.remedy
+        )
+    }
+}
+
+impl std::error::Error for StateHomeConfigError {}
+
+/// The INTAKE fence (core#411): before a run is persisted, classify the state home the handed
+/// snapshot derives and refuse — typed, synchronously — when it holds an unregistered entry, so
+/// the refusal never waits for the first worker. Reads the ONE skills input the engine has
+/// (`WICKED_SKILLS_SNAPSHOT`, v3.4 §2). Everything that is NOT this class is left to the
+/// launch-time admission it already has, unchanged: an unset or empty variable, a path that does
+/// not resolve, a snapshot without the `<state home>/skills/snapshots/<gen>` shape, an unlistable
+/// state home, a kind mismatch.
+pub(crate) fn intake_fence() -> Result<(), StateHomeConfigError> {
+    let explicit = std::env::var_os(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    intake_fence_for(explicit.as_deref())
+}
+
+/// [`intake_fence`] with its input explicit, so the refusal is testable without the process
+/// environment.
+pub(crate) fn intake_fence_for(snapshot: Option<&Path>) -> Result<(), StateHomeConfigError> {
+    let Some(named) = snapshot else {
+        return Ok(());
+    };
+    let Some(root) = canonical_spelling(named) else {
+        return Ok(());
+    };
+    let Some(state_home) = of_snapshot(&root) else {
+        return Ok(());
+    };
+    let Ok(unregistered) = survey(&state_home) else {
+        return Ok(());
+    };
+    if unregistered.is_empty() {
+        return Ok(());
+    }
+    Err(StateHomeConfigError {
+        var: crate::skills_snapshot::SKILLS_SNAPSHOT_ENV,
+        snapshot: root.display().to_string(),
+        state_home: state_home.display().to_string(),
+        unregistered,
+        remedy: REMEDY.to_string(),
+    })
+}
+
+/// The boot-time answer crew asks for before the first launch (core#411; core-ts
+/// `Core.preflightStateHome`): which state home the fence would open around, and what it cannot
+/// classify there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateHomePreflight {
+    /// The state home surveyed, or `None` when neither input yields one.
+    pub state_home: Option<String>,
+    /// `snapshot` — derived from the handed snapshot's shape (the directory the fence classifies);
+    /// `db` — the engine's own store parent, surveyed when no snapshot is handed (informational:
+    /// with no snapshot the fence is a blanket and refuses nothing by name).
+    pub derived_from: Option<&'static str>,
+    /// Every entry the registry cannot classify.
+    pub unregistered: Vec<UnregisteredEntry>,
+    /// `true` exactly when a HANDED snapshot derives a state home with unregistered entries — the
+    /// condition [`intake_fence`] refuses every launch on.
+    pub refuses_launches: bool,
+    /// Why the survey could not run (an unresolvable snapshot, a shapeless path, an unlistable
+    /// directory), or `None`.
+    pub error: Option<String>,
+    /// The remedy, spelled once.
+    pub remedy: &'static str,
+}
+
+/// Survey the state home for crew's boot (core#411). `snapshot` is the published generation crew
+/// hands the engine (`WICKED_SKILLS_SNAPSHOT`), or `None` when none is handed; `db_path` is the
+/// engine's own store, whose canonical parent is the operational state home
+/// ([`operational_home_of_db`]). Never panics, never touches the process environment.
+pub fn preflight_state_home(snapshot: Option<&Path>, db_path: &str) -> StateHomePreflight {
+    let remedy = REMEDY;
+    let none = |error: Option<String>| StateHomePreflight {
+        state_home: None,
+        derived_from: None,
+        unregistered: Vec::new(),
+        refuses_launches: false,
+        error,
+        remedy,
+    };
+    let (state_home, derived_from) = match snapshot {
+        Some(named) => {
+            let Some(root) = canonical_spelling(named) else {
+                return none(Some(format!(
+                    "the handed snapshot `{}` does not resolve to a real path",
+                    named.display()
+                )));
+            };
+            match of_snapshot(&root) {
+                Some(sh) => (sh, "snapshot"),
+                None => {
+                    return none(Some(format!(
+                        "the handed snapshot `{}` does not have the shape `<state \
+                         home>/skills/snapshots/<gen>`, so no state home derives from it",
+                        root.display()
+                    )))
+                }
+            }
+        }
+        None => match operational_home_of_db(db_path) {
+            Some(home) => (home, "db"),
+            None => return none(None),
+        },
+    };
+    match survey(&state_home) {
+        Ok(unregistered) => StateHomePreflight {
+            refuses_launches: derived_from == "snapshot" && !unregistered.is_empty(),
+            state_home: Some(state_home.display().to_string()),
+            derived_from: Some(derived_from),
+            unregistered,
+            error: None,
+            remedy,
+        },
+        Err(why) => StateHomePreflight {
+            state_home: Some(state_home.display().to_string()),
+            derived_from: Some(derived_from),
+            unregistered: Vec::new(),
+            refuses_launches: false,
+            error: Some(why),
+            remedy,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1024,11 +1294,22 @@ mod tests {
             "project-settings.json",
             "repo-graphs",
             "skills",
+            // core#411 / wicked-crew#497: the three entries an OPERATOR variable can place under
+            // the state home (`WICKED_WORKFLOWS_DIR`, `WICKED_STEERING_INBOX_DIR`,
+            // `WICKED_INTERACTIVE_ROOT`) — fenced when present, never a reason to refuse every
+            // launch; crew refuses to boot with the variable pointed there.
+            "workflows",
+            "steering-inbox",
+            "interactive",
         ] {
             assert!(r.classify(live).is_some(), "{live} must be classified");
         }
         assert!(r.classify("scratch.txt").is_none());
         assert!(r.classify(".DS_Store").is_none());
+        // Debris is deliberately unpatterned (core#411): a quarantine-by-rename INSIDE the state
+        // home is exactly what the fence must refuse — the live daemon's F-RC2-020 entry.
+        assert!(r.classify("skills.fixture-debris-20260909").is_none());
+        assert!(r.classify("workflows.bak").is_none());
         // v3.3: what the read-slot listing recognises — generation names are decimal digits; the
         // staging/temp patterns are the registry's `snapshots/<pattern>` denied children.
         for gen in ["000007", "1", "42"] {
@@ -1771,6 +2052,170 @@ mod tests {
             );
             assert!(same_dir(&alias, &denied));
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#411 / wicked-crew#497: an unregistered entry is a CONFIGURATION error with two typed
+    /// surfaces ahead of the launch-time refusal. The SURVEY names EVERY unclassified entry at
+    /// once — top level and skills root — where the fence stops at the first (the rig removed
+    /// `interactive` and was refused on `workflows` next); the INTAKE fence refuses a launch whose
+    /// handed snapshot derives such a state home with a typed error naming the entries, the state
+    /// home, the variable and the remedy — in operator terms, never a repository fixture path —
+    /// and admits the same tree once the entries are gone (the three env-placed names included);
+    /// the boot PREFLIGHT reports the same survey, says which input derived the state home, and
+    /// says `refuses_launches` only when a HANDED snapshot derives it. Inputs the intake fence does
+    /// NOT judge (unset, unresolvable, shapeless) fall through to the launch-time admission, unchanged.
+    #[test]
+    fn an_unregistered_entry_is_surveyed_all_at_once_and_refused_at_intake_in_operator_terms() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "wstate-intake-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let home = base.join("crew-state");
+        let skills = home.join("skills");
+        let gen7 = skills.join("snapshots").join("000007");
+        std::fs::create_dir_all(&gen7).unwrap();
+        std::fs::create_dir_all(skills.join("effective")).unwrap();
+        std::fs::write(home.join("core.db"), "db").unwrap();
+        // The three env-placed entries are REGISTERED: fenced when present, never a refusal.
+        for registered in ["workflows", "steering-inbox", "interactive"] {
+            std::fs::create_dir_all(home.join(registered)).unwrap();
+        }
+        assert_eq!(survey(&home).unwrap(), Vec::<UnregisteredEntry>::new());
+        assert_eq!(intake_fence_for(Some(&gen7)), Ok(()));
+        let clean = preflight_state_home(Some(&gen7), &home.join("core.db").display().to_string());
+        assert_eq!(
+            (
+                clean.state_home.as_deref(),
+                clean.derived_from,
+                clean.refuses_launches,
+                clean.error.as_deref()
+            ),
+            (Some(home.to_str().unwrap()), Some("snapshot"), false, None),
+            "{clean:?}"
+        );
+        assert!(clean.unregistered.is_empty());
+
+        // Two unregistered entries at the top level (the rig's debris shapes) and one under the
+        // skills root: the survey names ALL of them, sorted as listed, with their level.
+        std::fs::create_dir_all(home.join("skills.fixture-debris-20260909")).unwrap();
+        std::fs::write(home.join("stray.txt"), "").unwrap();
+        std::fs::create_dir_all(skills.join("scratch")).unwrap();
+        let found = survey(&home).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|u| (u.name.as_str(), u.level))
+                .collect::<Vec<_>>(),
+            vec![
+                ("skills.fixture-debris-20260909", "state-home"),
+                ("stray.txt", "state-home"),
+                ("scratch", "skills-root"),
+            ],
+            "{found:?}"
+        );
+        assert_eq!(found[2].path, skills.join("scratch").display().to_string());
+
+        // The intake fence refuses the launch with the TYPED error: the entries (all of them), the
+        // state home, the variable and the snapshot, and the remedy — operator terms only.
+        let err =
+            intake_fence_for(Some(&gen7)).expect_err("an unregistered entry refuses at intake");
+        assert_eq!(err.var, crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        assert_eq!(err.snapshot, gen7.display().to_string());
+        assert_eq!(err.state_home, home.display().to_string());
+        assert_eq!(err.unregistered, found);
+        assert_eq!(err.remedy, REMEDY);
+        let text = err.to_string();
+        for needle in [
+            "configuration error",
+            "`skills.fixture-debris-20260909`",
+            "`stray.txt`",
+            "`scratch` (under the skills root)",
+            "3 entries",
+            "WICKED_SKILLS_SNAPSHOT=",
+            "the run was not started",
+            "move each entry out of the state home",
+            "WICKED_*",
+        ] {
+            assert!(text.contains(needle), "missing `{needle}` in: {text}");
+        }
+        for banned in [
+            "tests/fixtures",
+            "state-home-subtrees.json",
+            "triage",
+            "judge",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "`{banned}` must not appear in: {text}"
+            );
+        }
+        // The launch-time refusal wording (the last line) also names no fixture path any more, and
+        // keeps the substrings its own tests and the runner's tests assert.
+        let launch = read_rules_around_snapshot(&home, "000007", &spell).expect_err("refused");
+        assert!(
+            launch.contains("not in the state-home registry")
+                && launch.contains("refused")
+                && launch.contains("move each entry out of the state home")
+                && !launch.contains("tests/fixtures"),
+            "{launch}"
+        );
+        // …and it is serializable for the wire (crew's 409 body / preflight JSON).
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            json["unregistered"][0]["name"],
+            "skills.fixture-debris-20260909"
+        );
+        assert_eq!(json["unregistered"][2]["level"], "skills-root");
+        assert_eq!(json["var"], "WICKED_SKILLS_SNAPSHOT");
+
+        // The boot preflight: the same survey, derived from the handed snapshot, refusing launches.
+        let dirty = preflight_state_home(Some(&gen7), &home.join("core.db").display().to_string());
+        assert_eq!(dirty.unregistered, found);
+        assert!(dirty.refuses_launches && dirty.error.is_none(), "{dirty:?}");
+        assert_eq!(dirty.derived_from, Some("snapshot"));
+        // No snapshot handed: the db's parent is surveyed for information, and NOT said to refuse
+        // launches (with no snapshot the fence is a blanket and refuses nothing by name).
+        let by_db = preflight_state_home(None, &home.join("core.db").display().to_string());
+        assert_eq!(by_db.derived_from, Some("db"));
+        assert_eq!(by_db.state_home.as_deref(), Some(home.to_str().unwrap()));
+        assert_eq!(by_db.unregistered, found);
+        assert!(!by_db.refuses_launches, "{by_db:?}");
+        // Inputs the intake fence leaves to the launch-time admission: unset, unresolvable, and a
+        // resolvable path without the snapshot shape — all admitted here, refused later as today.
+        assert_eq!(intake_fence_for(None), Ok(()));
+        assert_eq!(intake_fence_for(Some(&base.join("absent"))), Ok(()));
+        assert_eq!(intake_fence_for(Some(&skills.join("effective"))), Ok(()));
+        let shapeless = preflight_state_home(Some(&skills.join("effective")), ":memory:");
+        assert!(
+            shapeless.state_home.is_none()
+                && !shapeless.refuses_launches
+                && shapeless
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("skills/snapshots/<gen>")),
+            "{shapeless:?}"
+        );
+        let unresolvable = preflight_state_home(Some(&base.join("absent")), ":memory:");
+        assert!(
+            unresolvable
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("does not resolve")),
+            "{unresolvable:?}"
+        );
+        assert_eq!(preflight_state_home(None, ":memory:").state_home, None);
+        // Remove the entries: the same tree is admitted again.
+        std::fs::remove_dir_all(home.join("skills.fixture-debris-20260909")).unwrap();
+        std::fs::remove_file(home.join("stray.txt")).unwrap();
+        std::fs::remove_dir_all(skills.join("scratch")).unwrap();
+        assert_eq!(intake_fence_for(Some(&gen7)), Ok(()));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

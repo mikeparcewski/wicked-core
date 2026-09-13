@@ -158,6 +158,9 @@ pub use repo_intel::{
 pub use scope::{resolve_scope, EntityMode};
 pub use session_runner::PersistentStepRunner;
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use state_home::{
+    preflight_state_home, StateHomeConfigError, StateHomePreflight, UnregisteredEntry,
+};
 pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
     run_validator_reporting, sandbox_availability, AgentVerdict, DeterministicValidator,

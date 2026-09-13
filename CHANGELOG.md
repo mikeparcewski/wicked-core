@@ -15,6 +15,39 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **State-home fence: unregistered entries are a configuration error, refused at intake (core#411,
+  wicked-crew#497; acceptance findings F-RC1-011, F-RC2-020, F-032/F-033).** The worker Read fence
+  fails closed BY NAME on a state-home entry its static registry (`tests/fixtures/state-home-subtrees.json`,
+  embedded by `state_home.rs`) does not classify — right, but it fired at the run's FIRST WORKER
+  launch, after a planning council and the intake gate, as a failed unit the failure-triage judge
+  labelled "triage judge errored" and escalated with an "Approve to retry" that could only fail
+  again, while the daemon booted green. Twice in one day that shape cost every governed run on a
+  host: the acceptance rig's `WICKED_WORKFLOWS_DIR=<state home>/workflows` and a
+  `skills.fixture-debris-…` directory left in the operator's live state home. The message also cited
+  a repository test-fixture path and asked the operator to "register it in core AND crew". Now:
+  (1) `state_home::survey` lists EVERY unregistered entry at once (the fence stops at the first —
+  removing `interactive` only moved the rig's refusal to `workflows`); (2) `Core::launch_run`
+  runs the INTAKE fence in its synchronous fast path and refuses with a TYPED, downcastable
+  `StateHomeConfigError { var, snapshot, state_home, unregistered: [{name, path, level}], remedy }`
+  — no session persisted, nothing planned, no council, no judge; (3) `preflight_state_home(snapshot,
+  db_path)` (core-ts `Core.preflightStateHome(snapshotPath, dbPath)`, a static resolving to JSON
+  `{stateHome, derivedFrom, unregistered, refusesLaunches, error, remedy}`) is the boot-time call
+  crew's `serve` makes so the daemon reports the blocker before anyone launches; (4) every
+  refusal — intake and the launch-time fence that stays as the last line — is worded in operator
+  terms (the entry, the state home, the variable, what to do) and none cites a fixture path;
+  (5) the registry gains the three entries an OPERATOR variable can place under the state home —
+  `workflows` (`WICKED_WORKFLOWS_DIR`), `steering-inbox` (`WICKED_STEERING_INBOX_DIR`),
+  `interactive` (`WICKED_INTERACTIVE_ROOT`) — each carrying an `env` field, so a pre-existing
+  placement is fenced (denied) rather than refusing every launch; crew refuses to boot with such a
+  variable pointed inside the state home (wicked-crew#497). Debris is deliberately NOT patterned: a
+  quarantine-by-rename inside the state home is what the fence must refuse. **Behaviour change:** a
+  launch whose handed snapshot derives a state home with an unregistered entry now fails at intake
+  with the configuration error instead of at unit 1 with a worker error; kind mismatches, an
+  unset/empty/unresolvable/shapeless `WICKED_SKILLS_SNAPSHOT` keep their launch-time admission
+  unchanged. Tests: `tests/state_home_intake.rs` (real `Core`: refused synchronously + typed + no
+  session/event/worker; the same tree with the three env-placed names admitted), `state_home.rs`
+  unit tests (survey lists all levels; wording has no fixture path; preflight `refusesLaunches`
+  only for a handed snapshot; registry classifies the new names, not debris).
 - **Deliver gate (acceptance finding F-E2E-030).** Run `0ab5ccb8` launched under the studio
   composer's default posture (`humanConfirm: before:1`): the intake gate was the only human gate,
   verify passed, and the crew-composed `deliver` Tool unit pushed `wicked/<run>` and opened the PR
