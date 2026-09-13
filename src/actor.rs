@@ -4750,8 +4750,9 @@ fn apply_step_result(
     // A governed Creator/Neutral phase that folds Ok with (a) under 200 trimmed chars of prose AND
     // (b) an untouched worktree produced NOTHING a downstream phase or evaluator could review.
     // "Done" is re-derived from evidence, and here there is no evidence of ANY kind — so route it
-    // to the standard failure path (Rejected + denial_reason + StepFailed + fail_run) instead of
-    // letting a one-line "done." fold as a completed phase and starve every unit behind it of
+    // to the standard rejection path (Rejected + denial_reason + StepFailed, then the denial gate
+    // — core#464: a floor denial pauses for a retry/cancel decision, it never `fail_run`s) instead
+    // of letting a one-line "done." fold as a completed phase and starve every unit behind it of
     // context. Evaluator-role units are exempt: their output is a verdict over ANOTHER unit's
     // work, and they carry their own pinned floors (see `builtin_floors`).
     //
@@ -4808,14 +4809,21 @@ fn apply_step_result(
         // claims recorded before this rejection so the decisions log is not silently dropped.
         let phase = crate::scope::unit_phase(ord);
         let _ = crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
-        return Ok(fail_run(
+        // core#464: a floor denial pauses at the escalation gate (retry / cancel), never `fail_run`.
+        let note = denial_gate_note(session.human_confirm);
+        escalate_denied_unit(
             store,
             subscribers,
-            runner,
             self_tx,
             &mut session,
-            ord,
-        ));
+            unit,
+            output.attempt,
+            false,
+            !output.output.trim().is_empty(),
+            false,
+            note,
+        )?;
+        return Ok(StepApplied::Paused);
     }
 
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
@@ -4878,14 +4886,21 @@ fn apply_step_result(
             let phase = crate::scope::unit_phase(ord);
             let _ =
                 crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
-            return Ok(fail_run(
+            // core#464: a floor denial pauses at the escalation gate, never `fail_run`.
+            let note = denial_gate_note(session.human_confirm);
+            escalate_denied_unit(
                 store,
                 subscribers,
-                runner,
                 self_tx,
                 &mut session,
-                ord,
-            ));
+                unit,
+                output.attempt,
+                false,
+                !output.output.trim().is_empty(),
+                false,
+                note,
+            )?;
+            return Ok(StepApplied::Paused);
         }
     }
 
@@ -4934,89 +4949,55 @@ fn apply_step_result(
         coverage_db.as_deref(),
     )?;
 
-    // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit halts the run as `Failed` — never advancing
-    // past a rejection into a silent `Completed`. (`apply_and_finish_unit` already emitted UnitDenied
-    // + persisted the Rejected unit.)
+    // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit never advances past its rejection into a
+    // silent `Completed` (`apply_and_finish_unit` already emitted UnitDenied + persisted the
+    // Rejected unit). Until core#464 the contract's other half was `fail_run`: the run ENDED at
+    // the denial unless the unit's own def gate was `HumanConfirmIf(VerdictNotPass)` (the verify
+    // phase of `bug`/`feature`, seam finding #3) — so a `reproduce` rung that wrote one note into
+    // the tree lost the whole run (`unitDenied` → `sessionFailed`, no gate, no route back;
+    // F-RC2-037, three `bug` runs in one day), a governance deny on a recon command booked two
+    // seconds after `unitOutputCaptured ok` did the same (core#463 item 3), and the restored-tree
+    // prompt was unreachable for every phase but verify.
     //
-    // EXCEPTION — the CONDITIONAL human gate (seam finding #3): a phase declaring
-    // `HumanConfirmIf(VerdictNotPass)` ESCALATES a not-pass verdict to a HUMAN instead of hard-failing.
-    // This gate was previously UNREACHABLE — it was only ever consulted for the NEXT unit, but a deny
-    // always `fail_ran` first, so the run never advanced to check it. Evaluating it against THIS unit's
-    // own completed verdict (before `fail_run`) is what makes it fire. The cursor is left ON this unit,
-    // so a human `confirm_gate(Approve)` re-runs it and `Reject` cancels; every OTHER gate deny-dominates.
+    // Now EVERY fold denial opens the `escalation` gate (`escalate_denied_unit`). The cursor is
+    // left ON this unit, so a human `confirm_gate(Approve)` re-dispatches it (attempt+1: a fresh
+    // decisions log, a re-baselined tree — the one the guard RESTORED when it was the guard that
+    // denied) and `Reject` cancels (the worktree is kept when dirty, core#456). Nothing is
+    // "confirmed away": the denied attempt stays Rejected with its denial on record and its output
+    // persisted as a rejected transcript; the gate decides what happens NEXT, never whether the
+    // denied work was acceptable. That is why a hook (input-governance) veto routes here too —
+    // the retry it offers re-runs the phase under the same policies, it does not approve the
+    // refused call. `gateEscalated.condition` names the denial class so a consumer keys on it and
+    // never on the prompt; `def_gate` says whether the def or the engine authored the pause. No
+    // fold denial reaches `sessionFailed` without a decided gate — the benchmark's exit criterion.
     if !outcome.approved {
-        // Hook-sourced denials are hard policy vetoes — they MUST NOT be routed to human review.
-        // HumanConfirmIf is for semantic verdict escalation (evaluator disagrees, human decides);
-        // a governance hook bypass can never be "confirmed away" by an operator.
-        if !outcome.hook_denied
+        let def_gate = !outcome.hook_denied
             && matches!(
                 unit_gate,
                 crate::workflow::GateSpec::HumanConfirmIf(
                     crate::workflow::GateCond::VerdictNotPass
                 )
-            )
-        {
-            // (EVT-010) GateEscalated — the verdict was not-pass AND the gate spec says escalate
-            // to human review (not auto-deny). Fires just before AwaitingHuman so the studio can
-            // distinguish a pre-unit gate (HumanConfirm, fires before the unit runs) from a
-            // verdict escalation (HumanConfirmIf, fires after the unit ran and failed the gate).
-            emit(
-                subscribers,
-                CoreEvent::GateEscalated {
-                    session: run_id.clone(),
-                    ord,
-                    condition: "verdict_not_pass".to_string(),
-                    verdict_summary: outcome
-                        .denial_reason
-                        .clone()
-                        .unwrap_or_else(|| "verdict not pass".to_string()),
-                },
             );
-            let note = unsuppressed_gate_note(session.human_confirm);
-            // core#431 (F-3R2-010): when the denial is the worktree guard's AND the engine already
-            // restored the creator's tree, say so in the prompt — plain Approve used to read as
-            // "retry" while silently re-baselining on the evaluator's edit; now it means a retry
-            // against the restored, verified tree, and the operator is told that.
-            let guard_restored = unit
-                .denial
-                .as_ref()
-                .is_some_and(|d| d.source == "worktree_guard")
-                && unit.worktree_mutation.as_ref().is_some_and(|m| m.restored);
-            let prompt = if guard_restored {
-                format!(
-                    "Unit {ord} verdict is NOT PASS — the evaluator changed the tree under review; \
-                     its edit was discarded and the creator's verified tree restored. Approve to \
-                     retry the phase against the restored tree, or reject to cancel the run{note}"
-                )
-            } else {
-                format!(
-                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to \
-                     cancel the run{note}"
-                )
-            };
-            pause_for_human(
-                store,
-                subscribers,
-                self_tx,
-                &mut session,
-                ord,
-                // `HumanConfirmIf(VerdictNotPass)` is declared on unit `ord` itself and fires
-                // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
-                // reviewed unit coincide here.
-                Some(ord),
-                "escalation",
-                prompt,
-            )?;
-            return Ok(StepApplied::Paused);
-        }
-        return Ok(fail_run(
+        // FINDING-023: a def-authored pause discloses that run-level `human_confirm=none` did not
+        // suppress it; an engine-authored one (core#464) discloses the same for the denial gate.
+        let note = if def_gate {
+            unsuppressed_gate_note(session.human_confirm)
+        } else {
+            denial_gate_note(session.human_confirm)
+        };
+        escalate_denied_unit(
             store,
             subscribers,
-            runner,
             self_tx,
             &mut session,
-            ord,
-        ));
+            unit,
+            output.attempt,
+            outcome.hook_denied,
+            !output.output.trim().is_empty(),
+            def_gate,
+            note,
+        )?;
+        return Ok(StepApplied::Paused);
     }
 
     // (core#431, F-433-001) A checks floor that PASSED on this unit certified a tree: record it
@@ -5052,8 +5033,209 @@ fn apply_step_result(
     }
 }
 
-/// Halt a run as `Failed` (governance deny or worker failure): persist the terminal status and emit
-/// a terminal `SessionFailed`. Returns `Finished` so the actor clears `in_flight`.
+/// (core#464) The DENIAL CLASS a denied unit opens the escalation gate under — the token
+/// `gateEscalated.condition` carries and a consumer keys on (never the prose). Derived from the
+/// structured denial's source layer: the worktree guard; the input-governance hook (also when the
+/// fold flagged a hook veto whose source identity was folded away); the deterministic floors —
+/// repo checks, pinned validator, substance, deliverables; and everything else — the output
+/// gate's policy decision, the agent judge, the evaluator≠creator second pass — a verdict that
+/// did not pass.
+fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -> &'static str {
+    match denial.map(|d| d.source.as_str()) {
+        Some("worktree_guard") => "evaluator_mutated_worktree",
+        Some("input_governance") => "boundary_deny",
+        _ if hook_denied => "boundary_deny",
+        Some("repo_checks" | "pinned_validator" | "substance" | "deliverables") => "floor_failed",
+        _ => "verdict_not_pass",
+    }
+}
+
+/// (core#464, FINDING-023's sibling) The disclosure an ENGINE-authored denial gate appends under
+/// run-level `human_confirm: none`: the run was launched unattended, so the operator is told the
+/// pause is the engine's deny contract — not a run-level policy the launch could have silenced.
+/// [`unsuppressed_gate_note`] is the def-authored twin.
+fn denial_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'static str {
+    match human_confirm {
+        crate::domain::HumanConfirm::None => {
+            " [engine gate: a denied unit pauses for a decision instead of failing the run \
+             (core#464); run-level human_confirm=none silences only run-level pauses, never a \
+             denial gate]"
+        }
+        _ => "",
+    }
+}
+
+/// (core#464) Open the `escalation` gate on a DENIED unit: emit `GateEscalated` naming the denial
+/// class and the guard's restore outcome, then pause the run ON the unit (cursor unchanged, so
+/// Approve re-dispatches it and Reject cancels). The one route every denial takes — the
+/// deny-dominance fold, the substance gate and the deliverable floor all end here, never in
+/// `fail_run`. `output_captured` says the phase produced output text (persisted as the unit's
+/// rejected transcript — what an "accept the captured output" arm would read back); `def_gate`
+/// says the unit's own def declared the escalation (`HumanConfirmIf`) rather than the engine.
+#[allow(clippy::too_many_arguments)]
+fn escalate_denied_unit(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    self_tx: &Sender<Command>,
+    session: &mut crate::domain::AgentSession,
+    unit: &crate::domain::WorkUnit,
+    attempt: u32,
+    hook_denied: bool,
+    output_captured: bool,
+    def_gate: bool,
+    note: &str,
+) -> anyhow::Result<()> {
+    let ord = unit.ord;
+    let denial = unit.denial.as_ref();
+    let class = denial_class(denial, hook_denied);
+    let reason = unit
+        .denial_reason
+        .clone()
+        .or_else(|| denial.map(|d| d.reason.clone()))
+        .unwrap_or_else(|| "verdict not pass".to_string());
+    // The guard's restore outcome rides the gate only when the guard is what denied — a later
+    // layer's denial on a unit whose tree happened to be clean carries none.
+    let mutation = unit
+        .worktree_mutation
+        .as_ref()
+        .filter(|_| class == "evaluator_mutated_worktree");
+    emit(
+        subscribers,
+        CoreEvent::GateEscalated {
+            session: session.id.clone(),
+            ord,
+            condition: class.to_string(),
+            verdict_summary: reason.clone(),
+            attempt,
+            denial_source: denial.map(|d| d.source.clone()).unwrap_or_default(),
+            def_gate,
+            output_captured,
+            restored: mutation.is_some_and(|m| m.restored),
+            discarded: mutation.map(|m| m.changed.clone()).unwrap_or_default(),
+            suggestion_ref: mutation.and_then(|m| m.suggestion_ref.clone()),
+        },
+    );
+    let prompt = denial_gate_prompt(unit, class, &reason, mutation, note);
+    pause_for_human(
+        store,
+        subscribers,
+        self_tx,
+        session,
+        ord,
+        // The gate reviews the unit that just ran — the gating unit and the reviewed unit
+        // coincide, exactly as for the `HumanConfirmIf` escalation this generalises.
+        Some(ord),
+        "escalation",
+        prompt,
+    )
+}
+
+/// (core#464) The operator-facing prompt of a denial gate, per class. Approve always means "retry
+/// this phase" and Reject "cancel the run" — the wording says what the retry runs AGAINST: the
+/// RESTORED tree when the guard put the creator's tree back (core#431), the tree as it stands when
+/// the restore failed (the re-dispatch re-baselines, and says so), the same tree for every other
+/// class. The worktree-guard text names the paths that were reverted (bounded, core#464 item 3).
+fn denial_gate_prompt(
+    unit: &crate::domain::WorkUnit,
+    class: &str,
+    reason: &str,
+    mutation: Option<&crate::worktree_guard::WorktreeMutation>,
+    note: &str,
+) -> String {
+    let ord = unit.ord;
+    let source = unit
+        .denial
+        .as_ref()
+        .map(|d| d.source.as_str())
+        .unwrap_or("gate");
+    match class {
+        "evaluator_mutated_worktree" => {
+            let phase = unit.phase_id().unwrap_or("read-only");
+            let paths = mutation
+                .map(|m| discarded_paths_summary(&m.changed, m.head_moved))
+                .unwrap_or_else(|| "the tree".to_string());
+            if mutation.is_some_and(|m| m.restored) {
+                format!(
+                    "Unit {ord} verdict is NOT PASS — the read-only `{phase}` phase changed the \
+                     tree under review ({paths}); its edit was discarded and the creator's \
+                     verified tree restored. Approve to retry the phase against the restored \
+                     tree, or reject to cancel the run{note}"
+                )
+            } else {
+                format!(
+                    "Unit {ord} verdict is NOT PASS — the read-only `{phase}` phase changed the \
+                     tree under review ({paths}) and the engine could NOT restore the creator's \
+                     tree. Approve to retry the phase against the tree as it stands (the \
+                     re-dispatch re-baselines on it), or reject to cancel the run{note}"
+                )
+            }
+        }
+        "boundary_deny" => {
+            let tool = unit
+                .denial
+                .as_ref()
+                .and_then(|d| d.denied_tool.as_deref())
+                .map(|t| format!(" (`{t}`)"))
+                .unwrap_or_default();
+            format!(
+                "Unit {ord} was DENIED by input governance — a tool call was refused{tool}: {}. \
+                 The phase's output was captured. Approve to retry the phase under the same \
+                 policies, or reject to cancel the run{note}",
+                reason_head(reason)
+            )
+        }
+        "floor_failed" => format!(
+            "Unit {ord} failed its deterministic floor ({source}): {} — confirm to retry the \
+             phase, or reject to cancel the run{note}",
+            reason_head(reason)
+        ),
+        _ => format!(
+            "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel \
+             the run{note}"
+        ),
+    }
+}
+
+/// The first line of a denial reason, bounded for a prompt (the full text rides
+/// `gateEscalated.verdict_summary` and the unit's `denial_reason`).
+fn reason_head(reason: &str) -> String {
+    const HEAD: usize = 240;
+    let line = reason.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= HEAD {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(HEAD).collect();
+        format!("{cut}…")
+    }
+}
+
+/// `M src/app.ts, D src/fix.ts (+3 more), HEAD moved` — the reverted paths a guard prompt names.
+fn discarded_paths_summary(
+    changed: &[crate::worktree_guard::ChangedPath],
+    head_moved: bool,
+) -> String {
+    const SHOWN: usize = 6;
+    let mut parts: Vec<String> = changed
+        .iter()
+        .take(SHOWN)
+        .map(|c| format!("{} {}", c.status, c.path))
+        .collect();
+    if changed.len() > SHOWN {
+        parts.push(format!("(+{} more)", changed.len() - SHOWN));
+    }
+    if head_moved {
+        parts.push("HEAD moved".to_string());
+    }
+    if parts.is_empty() {
+        "the tree".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Halt a run as `Failed` (a worker failure, a triage `Fail`, or a pre-dispatch abort — never a
+/// fold denial, which pauses at the escalation gate instead, core#464): persist the terminal
+/// status and emit a terminal `SessionFailed`. Returns `Finished` so the actor clears `in_flight`.
 fn fail_run(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -5713,6 +5895,34 @@ fn dispatch_unit(
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
+    // (core#464) NOTES ROOT — the sanctioned place a READ-ONLY unit may write. A bound agent unit
+    // whose write posture is read-only (an evaluator or recon rung with a tree to protect) gets
+    // an engine-owned directory OUTSIDE the worktree (`worktree_guard::notes_root`): it rides the
+    // unit (persisted, so a redrive keeps the same path), widens THIS unit's write boundary in the
+    // governance context below, and the guard-only prompt names it. Created here so the seat's
+    // first write does not have to. A creator keeps its declared write roots; an unbound run's
+    // cwd is already a throwaway sandbox; a Tool unit is the engine's own command.
+    let notes_root = (unit.tool_cmd.is_none()
+        && session.workdir.is_some()
+        && crate::write_posture::WritePosture::of(&unit, true)
+            == crate::write_posture::WritePosture::ReadOnly)
+        .then(|| crate::worktree_guard::notes_root(run_id, unit.ord))
+        .and_then(|dir| match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir.to_string_lossy().into_owned()),
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not create the notes root {} for unit {} of run \
+                     {run_id}: {e} — the unit runs without one (its output is still its record)",
+                    dir.display(),
+                    unit.ord
+                );
+                None
+            }
+        });
+    if notes_root.is_some() && unit.notes_root != notes_root {
+        unit.notes_root = notes_root;
+        put_node(store, unit.to_node())?;
+    }
     // F-036 WORKTREE GUARD baseline. For a unit whose phase declared `executes_code: false`
     // (`worktree_guarded`, def-derived at plan time), snapshot the worktree's content NOW — before
     // the seat runs — and persist it ON the unit, so the comparison at the end of the unit's work
@@ -5887,8 +6097,16 @@ fn dispatch_unit(
                 GOV_DB_PATH.with(|c| c.borrow().clone()).as_deref(),
             ),
             // From the SESSION, so a resume/redrive re-arms exactly the boundary the launch
-            // declared and validated (core#259; the read mirror is core#294).
-            extra_write_roots: session.extra_write_roots.clone(),
+            // declared and validated (core#259; the read mirror is core#294) — plus THIS unit's
+            // notes root (core#464): an engine-derived, per-unit widening under the temp dir, so
+            // the boundary every carrier arms from this one list admits the read-only seat's
+            // note exactly where the guard never looks.
+            extra_write_roots: session
+                .extra_write_roots
+                .iter()
+                .cloned()
+                .chain(unit.notes_root.clone())
+                .collect(),
             extra_read_roots: session.extra_read_roots.clone(),
             ..g
         }),
@@ -7695,8 +7913,8 @@ mod substance_gate_tests {
     }
 
     /// The rejection: governed + Creator role + a one-liner + no worktree change ⇒ the standard
-    /// failure path — unit Rejected with the substance denial, StepFailed emitted with the same
-    /// detail, run terminally Failed.
+    /// rejection path — unit Rejected with the substance denial, StepFailed emitted with the same
+    /// detail, and (core#464) the run PAUSED at the escalation gate rather than terminally Failed.
     #[test]
     fn a_governed_no_substance_ok_fold_is_rejected() {
         let run_id = format!("substance-reject-{}", std::process::id());
@@ -7709,10 +7927,10 @@ mod substance_gate_tests {
         let (applied, session, unit) = fold(&mut store, &mut subs, &run_id, "done.", true);
 
         assert!(
-            matches!(applied, StepApplied::Finished),
-            "the substance rejection must terminate the run (standard failure path)"
+            matches!(applied, StepApplied::Paused),
+            "the substance rejection must pause the run at the denial gate (core#464), not end it"
         );
-        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
         assert_eq!(unit.status, UnitStatus::Rejected);
         assert_eq!(unit.denial_reason.as_deref(), Some(NO_SUBSTANCE));
         let saw_step_failed = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
@@ -7727,6 +7945,246 @@ mod substance_gate_tests {
             saw_step_failed,
             "the standard failure path emits StepFailed carrying the substance denial, \
              kinded SubstanceRejected (a core veto, not a worker failure)"
+        );
+    }
+
+    /// Every event the fold emitted, drained.
+    fn drain_events(erx: &std::sync::mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
+        std::iter::from_fn(|| erx.try_recv().ok()).collect()
+    }
+
+    /// The `(condition, denial_source, def_gate, output_captured, restored)` of the one
+    /// `gateEscalated` in `evs`, and the `(ord, reviewing_ord, gate_kind, prompt)` of the
+    /// `awaitingHuman` that followed it — the shape every denial class must produce.
+    #[allow(clippy::type_complexity)]
+    fn gate_shape(
+        evs: &[CoreEvent],
+    ) -> (
+        (String, String, bool, bool, bool),
+        (u32, Option<u32>, String, String),
+    ) {
+        let escalated = evs
+            .iter()
+            .find_map(|ev| match ev {
+                CoreEvent::GateEscalated {
+                    condition,
+                    denial_source,
+                    def_gate,
+                    output_captured,
+                    restored,
+                    ..
+                } => Some((
+                    condition.clone(),
+                    denial_source.clone(),
+                    *def_gate,
+                    *output_captured,
+                    *restored,
+                )),
+                _ => None,
+            })
+            .expect("a denial gate emits gateEscalated");
+        let paused = evs
+            .iter()
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman {
+                    ord,
+                    reviewing_ord,
+                    gate_kind,
+                    prompt,
+                    ..
+                } => Some((*ord, *reviewing_ord, gate_kind.clone(), prompt.clone())),
+                _ => None,
+            })
+            .expect("a denial gate pauses the run");
+        assert!(
+            !evs.iter()
+                .any(|ev| matches!(ev, CoreEvent::SessionFailed { .. })),
+            "no denial reaches sessionFailed without a decided gate (core#464)"
+        );
+        (escalated, paused)
+    }
+
+    /// core#464: a FLOOR denial (the substance floor here — the class every deterministic floor
+    /// shares) pauses the run at the escalation gate instead of failing it: `Paused`, the session
+    /// `AwaitingHuman` on the denied unit, `gateEscalated.condition = floor_failed` naming the
+    /// source layer, an engine-authored (`def_gate: false`) prompt that discloses why `human_confirm:
+    /// none` did not silence it, and the durable interaction request open under `escalation`.
+    #[test]
+    fn a_floor_denial_pauses_at_the_escalation_gate_and_names_its_class() {
+        let run_id = format!("substance-gate-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fold(&mut store, &mut subs, &run_id, "done.", true);
+
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        let evs = drain_events(&erx);
+        let (escalated, paused) = gate_shape(&evs);
+        assert_eq!(
+            escalated,
+            (
+                "floor_failed".to_string(),
+                "substance".to_string(),
+                false,
+                true,
+                false
+            )
+        );
+        assert_eq!(
+            (paused.0, paused.1, paused.2.as_str()),
+            (1, Some(1), "escalation"),
+            "the gate reviews the denied unit itself"
+        );
+        assert!(
+            paused.3.contains("deterministic floor (substance)")
+                && paused.3.contains(NO_SUBSTANCE)
+                && paused.3.contains("engine gate"),
+            "the prompt names the floor, the reason and the engine-authored precedence: {}",
+            paused.3
+        );
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(&run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(
+            open.len(),
+            1,
+            "the prompt is durable state, not only an event"
+        );
+        assert_eq!(open[0].gate_kind.as_deref(), Some("escalation"));
+    }
+
+    /// core#464 / core#463 item 3: an input-governance Deny recorded in the unit's decisions log —
+    /// the hook veto the fold used to hard-fail on without a gate — pauses as `boundary_deny`. The
+    /// output is a real, captured result long enough that no floor speaks; only the hook does.
+    #[test]
+    fn a_boundary_deny_pauses_at_the_escalation_gate_as_boundary_deny() {
+        let run_id = format!("boundary-gate-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Neutral);
+        let claim = wicked_apps_core::ConformanceClaim {
+            claim_id: "hookdeny-1".into(),
+            scope: format!("wicked-agent/{run_id}/unit/x"),
+            phase: "unit-1".into(),
+            policy_ids: vec!["pol-deny-write".into()],
+            decision: wicked_apps_core::Decision::Deny,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:test".into(),
+            criteria: "no writes outside the boundary".into(),
+            evaluator_identity: "wicked-governance".into(),
+            evaluated_at: 1_750_000_000,
+        };
+        let path = crate::gate_hook::decisions_path_for(&run_id, 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&claim).unwrap()),
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fold(
+            &mut store,
+            &mut subs,
+            &run_id,
+            &"a real recon result the operator can read. ".repeat(8),
+            false,
+        );
+
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("input_governance")
+        );
+        let evs = drain_events(&erx);
+        let (escalated, paused) = gate_shape(&evs);
+        assert_eq!(
+            escalated,
+            (
+                "boundary_deny".to_string(),
+                "input_governance".to_string(),
+                false,
+                true,
+                false
+            )
+        );
+        assert_eq!(paused.2, "escalation");
+        assert!(
+            paused.3.contains("DENIED by input governance")
+                && paused.3.contains("output was captured"),
+            "{}",
+            paused.3
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+    }
+
+    /// core#464: the output gate's own policy Deny — the original "a governance deny halts the
+    /// run as Failed" contract (`tests/p2_contract.rs`) — now pauses as `verdict_not_pass` with
+    /// the verdict prompt, the phase still Rejected and its deny still on record.
+    #[test]
+    fn an_output_gate_policy_deny_pauses_at_the_escalation_gate_as_verdict_not_pass() {
+        let run_id = format!("policy-gate-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Neutral);
+        wicked_governance::register_policy(
+            &mut store,
+            &wicked_governance::Policy {
+                id: "pol-deny-token".into(),
+                kind: "guard".into(),
+                applies_to: vec!["unit-1".into()],
+                effect: wicked_governance::Effect::Deny,
+                trigger: wicked_governance::Trigger {
+                    contains: Some("DENYME".into()),
+                },
+                obligations: vec![],
+                criteria: "no DENYME".into(),
+                severity: wicked_governance::Severity::High,
+                rule: "deny".into(),
+                retired: false,
+            },
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fold(
+            &mut store,
+            &mut subs,
+            &run_id,
+            &format!("{} DENYME", "a long, plausible result. ".repeat(10)),
+            false,
+        );
+
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("governance")
+        );
+        let evs = drain_events(&erx);
+        let (escalated, paused) = gate_shape(&evs);
+        assert_eq!(
+            (escalated.0.as_str(), escalated.1.as_str(), escalated.2),
+            ("verdict_not_pass", "governance", false)
+        );
+        assert!(
+            paused.3.starts_with("Unit 1 verdict is NOT PASS") && paused.3.contains("engine gate"),
+            "{}",
+            paused.3
         );
     }
 
@@ -8002,7 +8460,8 @@ mod code_evidence_floor_tests {
 
         let (session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
 
-        assert_eq!(session.status, SessionStatus::Failed);
+        // core#464: the floor denial pauses at the escalation gate rather than failing the run.
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
         assert_eq!(unit.status, UnitStatus::Rejected);
         assert_eq!(unit.denial_reason.as_deref(), Some(NO_DIFF));
         let saw_step_failed = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
@@ -8188,7 +8647,7 @@ mod code_evidence_floor_tests {
 
         let (session, unit) = fold(&mut store, &mut subs, run_id, "done.", true);
 
-        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
         assert_eq!(
             unit.denial_reason.as_deref(),
             Some(NO_SUBSTANCE),
@@ -8379,7 +8838,8 @@ mod deliverable_floor_tests {
             why.contains("report.json"),
             "the denial must name the artifact that never arrived: {why}"
         );
-        assert_eq!(session.status, SessionStatus::Failed);
+        // core#464: the floor denial pauses at the escalation gate rather than failing the run.
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
         // The EVENT, not just the node: a studio tailing the stream is where an operator learns
         // why the run stopped, so the detail must carry the same named artifact.
         let veto_event = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
@@ -8521,7 +8981,7 @@ mod deliverable_floor_tests {
         let (session, unit) = fold(&mut store, &mut subs, &run_id);
 
         assert_eq!(unit.status, UnitStatus::Rejected);
-        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
         let _ = std::fs::remove_dir_all(&inbox);
     }
 
@@ -8552,7 +9012,7 @@ mod deliverable_floor_tests {
             UnitStatus::Rejected,
             "an existing file outside the run's declared boundary is not this run's evidence"
         );
-        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
         let _ = std::fs::remove_dir_all(&elsewhere);
         let _ = std::fs::remove_dir_all(&inbox);
     }
@@ -9457,6 +9917,47 @@ mod def_gate_disclosure_tests {
         assert!(
             prompt.contains("workflow-declared gate") && prompt.contains("human_confirm=none"),
             "the terminal def gate must disclose under none exactly like a mid-run one: {prompt}"
+        );
+    }
+
+    /// core#464: the deny-dominance fold's branch never calls `fail_run` — every fold denial opens
+    /// the escalation gate (`escalate_denied_unit`), and so do the two pre-fold floors (substance,
+    /// deliverables) that used to fail the run. Bounded to `apply_step_result`'s body so the
+    /// worker-failure lanes, which legitimately still fail the run (triage is core#461's), can
+    /// neither satisfy nor trip it; the fold branch is framed by its two standing comment markers.
+    /// Functional twins: `substance_gate_tests::*_pauses_at_the_escalation_gate_*` and
+    /// `tests/evaluator_worktree_guard.rs`.
+    #[test]
+    fn no_fold_denial_reaches_fail_run_without_a_gate() {
+        let src = include_str!("actor.rs");
+        let body = src
+            .split("fn apply_step_result")
+            .nth(1)
+            .and_then(|b| b.split("\nfn fail_run").next())
+            .expect("apply_step_result is still a top-level fn ending before fail_run");
+        let marker = concat!("RUN-LEVEL DENY ", "CONTRACT");
+        let advance = concat!("Approved → advance the ", "resume cursor");
+        let fold = body
+            .split(marker)
+            .nth(1)
+            .and_then(|b| b.split(advance).next())
+            .expect("the fold's deny branch is still framed by its two markers");
+        let fail_call = concat!("fail_", "run(");
+        let gate_call = concat!("escalate_denied_", "unit(");
+        assert!(
+            !fold.contains(fail_call),
+            "the fold's deny branch fails the run again — a denial must pause at the escalation \
+             gate with a route back, never end the run (core#464)"
+        );
+        assert!(
+            fold.contains(gate_call),
+            "the fold's deny branch no longer opens the escalation gate"
+        );
+        let pre_fold = body.split(marker).next().expect("text before the marker");
+        assert_eq!(
+            pre_fold.matches(gate_call).count(),
+            2,
+            "the substance gate and the deliverable floor each open the escalation gate"
         );
     }
 

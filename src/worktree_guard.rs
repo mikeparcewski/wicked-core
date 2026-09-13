@@ -81,15 +81,39 @@
 //! pinned validator, does exactly that). An in-tree `.codegraph/` that moves under a recon phase
 //! is a defect to surface (core#406), not to hide.
 //!
+//! ## Where a read-only phase MAY write: the notes root (core#464)
+//!
+//! "No exemptions" is about the TREE. A read-only unit that insists on writing its analysis to
+//! disk gets a sanctioned place OUTSIDE the tree instead of tripping the guard for a harmless
+//! note: [`notes_root`] — `<temp>/wicked-core-notes/<run>/unit-<ord>`, set on
+//! `WorkUnit::notes_root` at dispatch for a bound `WritePosture::ReadOnly` agent unit, joined into
+//! that unit's write boundary (every carrier arms the same list), and named in the guard-only
+//! seat's prompt (`execute_wrapped::read_only_instruction`). The snapshot never sees it because it
+//! is not in the worktree — no filter, no exemption list. A claude/codex seat with a read-only
+//! lever is refused every write-class call at its boundary as before and is not told about it.
+//!
+//! ## A denial PAUSES the run; it does not fail it (core#464)
+//!
+//! A denying mutation used to END the run (`unitDenied` → `sessionFailed`) unless the phase's
+//! own def gate was `human_confirm_if: verdict_not_pass` — so a `reproduce` rung that wrote one
+//! note lost the whole run, with the restored-tree prompt unreachable (three `bug` runs in one
+//! day, F-RC2-037). Every denial the gate fold produces now opens the `escalation` gate
+//! (`actor::escalate_denied_unit`): `gateEscalated.condition` names the class —
+//! `evaluator_mutated_worktree` here — with the restore outcome and the discarded paths, and the
+//! operator decides. Approve retries the phase against the RESTORED tree (the edit stays pinned
+//! under `refs/wicked/suggestions/…`); Reject cancels and keeps the worktree (core#456). No fold
+//! denial reaches `sessionFailed` without a decided gate.
+//!
 //! ## Honest limits
 //!
 //! * A phase that legitimately must change code declares `executes_code: true` — the guard reads
 //!   the def, it does not guess. Prose-planned (def-less) runs carry no declaration and are not
 //!   guarded.
-//! * The guard DENIES; it does not revert. The creator's tree survives as the `before` tree
-//!   object, and the denial names the one-line restore. Auto-revert is a deliberate non-goal for
-//!   this change: discarding files an operator may still want to inspect is a bigger decision
-//!   than refusing to certify them.
+//! * The guard DENIES; it does not revert — as first shipped. Superseded by core#431: the worker
+//!   thread now pins the discarded edit under `refs/wicked/suggestions/<run>/<ord>/<attempt>` and
+//!   RESTORES the creator's tree ([`restore_creator_tree`]) before the result reaches the fold,
+//!   so nothing an operator may want to inspect is lost, and the retry a human approves runs
+//!   against the verified tree.
 //! * A process that escapes the seat's process group (a `setsid` daemon) can still write after
 //!   the final snapshot. The wrapped runner kills the seat's whole group when the seat exits,
 //!   and the final snapshot is taken as late as the pipeline allows; what lands after that is
@@ -191,6 +215,23 @@ pub enum WorktreeGuardOutcome {
 /// worker's `TMPDIR` points (`execute_wrapped::redirect_scratch_into_boundary`) and where the
 /// repo checks keep their isolated `HOME`/caches. Excluded from the snapshot by construction.
 pub const ENGINE_SCRATCH_DIR: &str = "tmp";
+
+/// (core#464) The NOTES ROOT a read-only unit may write to:
+/// `<temp>/wicked-core-notes/<run>/unit-<ord>` — an engine-owned directory OUTSIDE every
+/// worktree, keyed like the per-run governance dir (`gate_hook::run_dir_name`, the same injective
+/// run-id encoding), so it is never inside the tree the guard snapshots, never inside the
+/// customer's clone (a creator's `git add -A` cannot sweep a note into the PR), and needs no
+/// state-home registry entry. The actor sets [`crate::domain::WorkUnit::notes_root`] to it at
+/// dispatch for a bound `WritePosture::ReadOnly` agent unit and widens THAT unit's write boundary
+/// by it; the guard-only prompt names it. Scratch, not a deliverable: the unit's OUTPUT stays the
+/// record — this is where the analysis a seat insists on writing to disk goes instead of
+/// `evidence/<issue>/reproduce.md` in the tree (the run-loss shape core#464 closes).
+pub(crate) fn notes_root(run_id: &str, ord: u32) -> PathBuf {
+    std::env::temp_dir()
+        .join("wicked-core-notes")
+        .join(crate::gate_hook::run_dir_name(run_id))
+        .join(format!("unit-{ord}"))
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

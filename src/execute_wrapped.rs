@@ -1410,8 +1410,9 @@ impl WrappedCliStepRunner {
             );
         let prompt = if guard_only {
             format!(
-                "{}\n\n{READ_ONLY_INSTRUCTION}",
-                unit_prompt(input, form, handed)
+                "{}\n\n{}",
+                unit_prompt(input, form, handed),
+                read_only_instruction(input.unit.notes_root.as_deref())
             )
         } else if !is_claude
             && write_posture == crate::write_posture::WritePosture::DeliverableRoots
@@ -3064,6 +3065,22 @@ pub(crate) const READ_ONLY_INSTRUCTION: &str = "READ-ONLY PHASE (enforced after 
     phase declares executes_code: false. Do NOT edit, write, create, delete, move or format any \
     file in the worktree, and do not commit — report findings in your output only. Any change \
     you make is detected by the engine's worktree guard, discarded, and the phase is denied.";
+
+/// (core#464) [`READ_ONLY_INSTRUCTION`] plus, when the unit carries a notes root
+/// (`WorkUnit::notes_root`, set at dispatch for a bound read-only unit), the ONE sentence that
+/// tells the seat where a note MAY go — so a seat that insists on writing its analysis to disk has
+/// a sanctioned place outside the tree instead of `evidence/<issue>/reproduce.md` in the worktree
+/// (the guard trip that lost three `bug` runs in a day). Wrapped-argv path only: it crosses no pty
+/// line discipline, so the `PTY_PROMPT_LIMIT` budget is untouched.
+pub(crate) fn read_only_instruction(notes_root: Option<&str>) -> String {
+    match notes_root {
+        Some(root) => format!(
+            "{READ_ONLY_INSTRUCTION} If you must write notes, write them ONLY under {root} \
+             (outside the worktree; the guard ignores that directory)."
+        ),
+        None => READ_ONLY_INSTRUCTION.to_string(),
+    }
+}
 
 /// (F-4R2-004) The instruction a DELIVERABLE-ROOTS creator carries on a non-claude seat — a bound
 /// creator whose phase declared `executes_code: false`: no argv lever expresses "write these roots,
@@ -6818,6 +6835,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// core#464: the guard-only seat's read-only instruction names the unit's notes root when it
+    /// has one — and says nothing about notes when it has none, so a seat is never pointed at a
+    /// directory that was not created for it. The base instruction is unchanged in both.
+    #[test]
+    fn the_read_only_instruction_names_the_notes_root_only_when_the_unit_has_one() {
+        let bare = read_only_instruction(None);
+        assert_eq!(bare, READ_ONLY_INSTRUCTION);
+        let with = read_only_instruction(Some("/tmp/wicked-core-notes/run-1/unit-2"));
+        assert!(with.starts_with(READ_ONLY_INSTRUCTION));
+        assert!(
+            with.contains("write them ONLY under /tmp/wicked-core-notes/run-1/unit-2")
+                && with.contains("outside the worktree"),
+            "{with}"
+        );
+        assert!(
+            !bare.contains("notes"),
+            "no notes root ⇒ no notes sentence: {bare}"
+        );
+    }
+
     /// A pty turn is submitted as one line, and a canonical-mode terminal DISCARDS any line that
     /// reaches `MAX_CANON` (1024) — it does not truncate it and does not report anything, so the
     /// runner waits out its full timeout for output that can never come. Two `session_runner` tests
@@ -9885,6 +9922,10 @@ mod project_graph_end_to_end_tests {
         }
     }
 
+    /// Waits for `run_id` to SETTLE — terminal, or paused at a human gate. The stub's one-word
+    /// `ok` output trips the substance floor: that denial used to fail the run and (core#464) now
+    /// pauses it at the escalation gate. Either way the unit was dispatched and armed, which is
+    /// all this module measures.
     fn wait_terminal(core: &crate::Core, run_id: &str) -> Option<crate::SessionStatus> {
         let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
@@ -9895,6 +9936,7 @@ mod project_graph_end_to_end_tests {
                         crate::SessionStatus::Completed
                             | crate::SessionStatus::Failed
                             | crate::SessionStatus::Cancelled
+                            | crate::SessionStatus::AwaitingHuman
                     ) {
                         return Some(s.session.status);
                     }

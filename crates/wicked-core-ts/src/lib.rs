@@ -2768,11 +2768,31 @@ mod tests {
             CoreEvent::GateEscalated {
                 session: s(),
                 ord: 1,
-                condition: "verdict_not_pass".to_string(),
+                condition: "evaluator_mutated_worktree".to_string(),
                 verdict_summary: s(),
+                attempt: 0,
+                denial_source: "worktree_guard".to_string(),
+                def_gate: false,
+                output_captured: true,
+                restored: true,
+                discarded: Vec::new(),
+                suggestion_ref: None,
             },
             "gateEscalated",
-            &["type", "session", "ord", "condition", "verdictSummary"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "condition",
+                "verdictSummary",
+                "attempt",
+                "denialSource",
+                "defGate",
+                "outputCaptured",
+                "restored",
+                "discarded",
+                "suggestionRef",
+            ],
         );
         check(
             CoreEvent::ToolExecutorDispatched {

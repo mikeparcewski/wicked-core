@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use wicked_apps_core::{open_store, ConformanceClaim, Decision};
 use wicked_core::{
-    decisions_path_for, gov_run_dir, Core, EntityMode, HumanConfirm, LaunchSpec, SessionStatus,
-    StepInput, StepOutput, StepRunner, StepStatus,
+    decisions_path_for, gov_run_dir, Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec,
+    SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -249,10 +249,11 @@ fn cli(key: &str) -> AgenticCli {
 /// test reporting a governance defect that isn't there.
 const RUN_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Waits for `run_id` to reach a terminal status.
+/// Waits for `run_id` to reach a DECIDED status — terminal, or paused at a human gate (core#464:
+/// a denied unit parks the run `AwaitingHuman` instead of failing it).
 ///
 /// `Err` rather than `None` on timeout, because the two outcomes accuse different things: a run that
-/// terminated in the wrong status is a governance defect, while a run that never terminated is this
+/// settled in the wrong status is a governance defect, while a run that never settled is this
 /// host being slow. Collapsing them into `Option` made a timeout read as "governance did not fail
 /// the session".
 fn wait_terminal(core: &Core, run_id: &str) -> Result<SessionStatus, String> {
@@ -263,7 +264,10 @@ fn wait_terminal(core: &Core, run_id: &str) -> Result<SessionStatus, String> {
             if let Some(s) = v.iter().find(|s| s.session.id == run_id) {
                 if matches!(
                     s.session.status,
-                    SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
+                    SessionStatus::Completed
+                        | SessionStatus::Failed
+                        | SessionStatus::Cancelled
+                        | SessionStatus::AwaitingHuman
                 ) {
                     return Ok(s.session.status);
                 }
@@ -283,8 +287,12 @@ fn wait_terminal(core: &Core, run_id: &str) -> Result<SessionStatus, String> {
     ))
 }
 
+/// The keystone, re-cut by core#464: a recorded Deny still never lets the session complete — and
+/// it no longer ENDS it either. The unit is Rejected and the run pauses at the escalation gate
+/// (`boundary_deny`), where the operator can retry the phase or cancel; `sessionFailed` without a
+/// decided gate is the run-loss shape core#463 item 3 recorded (F-RC1-046).
 #[test]
-fn a_denied_tool_call_fails_the_session() {
+fn a_denied_tool_call_gates_the_session() {
     let dir = scratch("keystone");
     let db = dir.join("estate.db");
     // Clean any stale governance dir for this run id (launch_run_inner also clears it on a fresh launch).
@@ -295,6 +303,7 @@ fn a_denied_tool_call_fails_the_session() {
         Arc::new(FixedDispatcher),
         Arc::new(HookDenyRunner),
     );
+    let events = core.subscribe();
     core.launch_run(LaunchSpec {
         project_id: None,
         problem: "Build the thing".into(),
@@ -311,11 +320,53 @@ fn a_denied_tool_call_fails_the_session() {
     })
     .unwrap();
 
-    let status = wait_terminal(&core, "gov-fail").expect("the run reaches a terminal status");
+    let status = wait_terminal(&core, "gov-fail").expect("the run reaches a decided status");
     assert_eq!(
         status,
-        SessionStatus::Failed,
-        "a governance-denied tool-call drives the SESSION to Failed (not a silent Completed)"
+        SessionStatus::AwaitingHuman,
+        "a governance-denied tool-call drives the SESSION to the escalation gate — never a silent \
+         Completed, and (core#464) never an ungated Failed"
+    );
+    let views = core.sessions_detail().unwrap();
+    let v = views.iter().find(|v| v.session.id == "gov-fail").unwrap();
+    assert_eq!(v.units[0].status, wicked_core::UnitStatus::Rejected);
+    let mut evs = Vec::new();
+    while let Ok(ev) = events.recv_timeout(Duration::from_millis(300)) {
+        evs.push(ev);
+    }
+    let class = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::GateEscalated {
+                condition,
+                denial_source,
+                def_gate,
+                ..
+            } => Some((condition.clone(), denial_source.clone(), *def_gate)),
+            _ => None,
+        })
+        .expect("the denial opened the escalation gate");
+    assert_eq!(
+        class,
+        (
+            "boundary_deny".to_string(),
+            "input_governance".to_string(),
+            false
+        )
+    );
+    assert!(
+        evs.iter().any(|ev| matches!(
+            ev,
+            CoreEvent::AwaitingHuman { gate_kind, .. } if gate_kind == "escalation"
+        )),
+        "the pause is an escalation gate"
+    );
+    assert!(
+        !evs.iter().any(|ev| matches!(
+            ev,
+            CoreEvent::SessionFailed { .. } | CoreEvent::SessionCompleted { .. }
+        )),
+        "neither terminal frame fires on a denial: {evs:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(gov_run_dir("gov-fail"));

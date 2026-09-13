@@ -748,6 +748,7 @@ mod tests {
             worktree_guarded: false,
             worktree_baseline: None,
             worktree_mutation: None,
+            notes_root: None,
             repo_checks_floor: false,
             default_floor: false,
             repo_checks: None,

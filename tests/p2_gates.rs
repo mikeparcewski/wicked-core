@@ -457,7 +457,8 @@ fn t_d5_gate_evaluated_surfaces_the_evaluator_denial_reason() {
     let events = core.subscribe();
     core.launch_run(spec("r", wicked_core::HumanConfirm::None))
         .expect("launch");
-    assert!(wait_status(&core, "r", SessionStatus::Failed));
+    // core#464: the evaluator denial pauses the run at the escalation gate instead of failing it.
+    assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
 
     // Find the GateEvaluated for the denied unit (ord 1) and prove the denying layer is visible.
     let mut saw_evaluator_reject = false;

@@ -516,6 +516,15 @@ pub struct WorkUnit {
     /// (see [`crate::worktree_guard::WorktreeMutation::denies`]). Evidence on the unit record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_mutation: Option<crate::worktree_guard::WorktreeMutation>,
+    /// (core#464) The NOTES ROOT this read-only unit may write to — an absolute directory OUTSIDE
+    /// every worktree ([`crate::worktree_guard::notes_root`]), set at dispatch for a BOUND agent
+    /// unit whose write posture is read-only (an evaluator or recon rung of a run with a tree)
+    /// and joined into that unit's write boundary. The guard compares the worktree and nothing
+    /// else, so a note here never trips it; a guard-only seat is told the path in its prompt.
+    /// `None` for every other unit (a creator keeps its declared write roots; an unbound run's
+    /// cwd is already a throwaway sandbox). Persisted so a redrive keeps the same path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_root: Option<String>,
     /// TRUE when this unit's backing phase is the def's code-VERIFYING step (F-039): it declares
     /// `verified_evidence` and an `executes_code` Creator runs before it. The engine then runs the
     /// repository's own checks in the worktree after the seat's work and folds their exit codes
@@ -696,6 +705,7 @@ impl WorkUnit {
             worktree_guarded: false,
             worktree_baseline: None,
             worktree_mutation: None,
+            notes_root: None,
             repo_checks_floor: false,
             default_floor: false,
             repo_checks: None,
