@@ -784,6 +784,12 @@ pub(crate) fn lift_and_reverify(
             sandbox_level: checks.sandbox_level.clone(),
             sandbox_error: checks.sandbox_error.clone(),
             detect_error: checks.detect_error.clone(),
+            // The lift's re-verify is the verify floor over the lifted tree (no known base for a
+            // baseline diff, no creator claim).
+            outcome: checks.outcome().to_string(),
+            floor: crate::repo_checks::FloorStage::Verify.as_wire().to_string(),
+            claim: None,
+            env: checks.env.clone(),
         });
         Err(text)
     };

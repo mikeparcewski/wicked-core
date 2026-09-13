@@ -538,6 +538,14 @@ pub struct WorkUnit {
     /// cwd is already a throwaway sandbox). Persisted so a redrive keeps the same path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_root: Option<String>,
+    /// (F-RC2-009) The run base commit (`runBaseResolved.baseCommit`, the session's
+    /// `base_commit`) as of this unit's dispatch — the commit the repo-checks floor's BASELINE
+    /// DIFF runs a failing check on, so only a regression denies. Recorded beside
+    /// [`Self::worktree_baseline`] and preferred over its `head`: a creator that COMMITS its work
+    /// would otherwise hand `verify` a base equal to the head, and every failure would read as
+    /// `floor_env_mismatch`. `None` for an unbound run. `#[serde(default)]` back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_base_commit: Option<String>,
     /// TRUE when this unit's backing phase is the def's code-VERIFYING step (F-039): it declares
     /// `verified_evidence` and an `executes_code` Creator runs before it. The engine then runs the
     /// repository's own checks in the worktree after the seat's work and folds their exit codes
@@ -720,6 +728,7 @@ impl WorkUnit {
             worktree_baseline: None,
             worktree_mutation: None,
             notes_root: None,
+            run_base_commit: None,
             repo_checks_floor: false,
             default_floor: false,
             repo_checks: None,

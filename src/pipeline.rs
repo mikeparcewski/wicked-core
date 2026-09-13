@@ -1003,7 +1003,10 @@ pub(crate) fn apply_and_finish_unit(
             .repo_checks
             .as_ref()
             .is_some_and(|r| !r.passed && r.checks.is_empty() && r.sandbox_error.is_some());
-    let checks_denial: Option<String> =
+    // (core#469) The denial carries its SOURCE beside the reason: a floor that did not FINISH (a
+    // check hit its bound) is booked under `repo_checks_timeout`, never `repo_checks` — the gate
+    // keys on it to offer extend / targeted / accept instead of retry-the-same-tree.
+    let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
                 unit.repo_checks = Some(report.clone());
@@ -1018,6 +1021,16 @@ pub(crate) fn apply_and_finish_unit(
                     sandbox_level: report.sandbox_level.clone(),
                     sandbox_error: report.sandbox_error.clone(),
                     detect_error: report.detect_error.clone(),
+                    outcome: report.outcome().to_string(),
+                    floor: if unit.repo_checks_floor {
+                        crate::repo_checks::FloorStage::Verify
+                    } else {
+                        crate::repo_checks::FloorStage::Creator
+                    }
+                    .as_wire()
+                    .to_string(),
+                    claim: report.claim.clone(),
+                    env: report.env.clone(),
                 });
                 if default_floor_refused_unsandboxed {
                     eprintln!(
@@ -1029,7 +1042,7 @@ pub(crate) fn apply_and_finish_unit(
                 );
                     None
                 } else {
-                    (!report.passed).then(|| report.denial_reason())
+                    (!report.passed).then(|| (report.denial_source(), report.denial_reason()))
                 }
             }
             None if unit.repo_checks_floor
@@ -1037,11 +1050,15 @@ pub(crate) fn apply_and_finish_unit(
                 && workdir.is_some()
                 && guard_denial.is_none() =>
             {
-                Some(format!(
-                "repo checks floor did not run for this verified_evidence phase: {} — the result \
-                 reached the gate without the engine's own check evidence (fail-closed)",
-                crate::repo_checks::CRITERION
-            ))
+                Some((
+                    crate::repo_checks::DENIAL_SOURCE,
+                    format!(
+                        "repo checks floor did not run for this verified_evidence phase: {} — \
+                         the result reached the gate without the engine's own check evidence \
+                         (fail-closed)",
+                        crate::repo_checks::CRITERION
+                    ),
+                ))
             }
             // (F-7R2-005) The DEFAULT floor: an agent unit that CHANGED the tree it was handed owes
             // the repository's own checks — a changed tree with no report is the same fail-closed
@@ -1051,13 +1068,16 @@ pub(crate) fn apply_and_finish_unit(
                 && workdir.is_some()
                 && guard_denial.is_none() =>
             {
-                Some(format!(
-                "repo checks floor did not run although unit {} changed the worktree tree: {} — \
-                 the result reached the gate without the engine's own check evidence (fail-closed, \
-                 F-7R2-005)",
-                unit.ord,
-                crate::repo_checks::CRITERION
-            ))
+                Some((
+                    crate::repo_checks::DENIAL_SOURCE,
+                    format!(
+                        "repo checks floor did not run although unit {} changed the worktree \
+                         tree: {} — the result reached the gate without the engine's own check \
+                         evidence (fail-closed, F-7R2-005)",
+                        unit.ord,
+                        crate::repo_checks::CRITERION
+                    ),
+                ))
             }
             None => None,
         };
@@ -1251,7 +1271,7 @@ pub(crate) fn apply_and_finish_unit(
     let validator_denial = guard_denial
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
         .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
-        .or(checks_denial.map(|r| crate::domain::UnitDenial::new("repo_checks", r)))
+        .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(agent_denial.map(|r| crate::domain::UnitDenial::new("agent_validator", r)))
         .or(evaluator_denial)
         .or(hook_denial);

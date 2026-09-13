@@ -1015,11 +1015,40 @@ fn run_unit_and_judge_with_roster(
                     "F-7R2-005: the unit changed the worktree tree — default floor"
                 }
             );
-            let report = crate::repo_checks::run(wd);
+            // core#467 / core#469: WHOSE floor this is decides the test set (targeted first at
+            // the creator) and whether the transcript's "pre-existing" claim is judged; the RUN
+            // base (recorded on the unit at dispatch — or, unrecorded, the dispatch baseline's
+            // HEAD) is the base the baseline diff compares against, through the PINNED git dir
+            // the baseline was taken through.
+            let stage = if input.unit.repo_checks_floor {
+                crate::repo_checks::FloorStage::Verify
+            } else {
+                crate::repo_checks::FloorStage::Creator
+            };
+            let baseline = input.unit.worktree_baseline.as_ref();
+            let ctx = crate::repo_checks::FloorContext {
+                stage,
+                force_install: false,
+                // The run base first (F-RC2-009): a creator that committed its work has moved
+                // the baseline's HEAD onto the head itself, and base == head compares nothing.
+                base_head: input
+                    .unit
+                    .run_base_commit
+                    .clone()
+                    .filter(|h| !h.is_empty())
+                    .or_else(|| baseline.map(|b| b.head.clone()).filter(|h| !h.is_empty())),
+                git_dir: baseline
+                    .and_then(|b| b.git_dir.clone())
+                    .map(std::path::PathBuf::from),
+                claim_text: (stage == crate::repo_checks::FloorStage::Creator)
+                    .then(|| output.output.clone()),
+            };
+            let report = crate::repo_checks::run_floor(wd, &ctx);
             eprintln!(
-                "wicked-core: repo checks floor for unit {}: {} — {}",
+                "wicked-core: repo checks floor ({}) for unit {}: {} — {}",
+                stage.as_wire(),
                 input.unit.ord,
-                if report.passed { "PASS" } else { "FAIL" },
+                report.outcome().to_ascii_uppercase(),
                 report.summary()
             );
             Some(report)

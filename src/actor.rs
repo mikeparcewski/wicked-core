@@ -5063,7 +5063,12 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         Some("worktree_guard") => "evaluator_mutated_worktree",
         Some("input_governance") => "boundary_deny",
         _ if hook_denied => "boundary_deny",
-        Some("repo_checks" | "pinned_validator" | "substance" | "deliverables") => "floor_failed",
+        // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
+        // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
+        Some(
+            "repo_checks" | "repo_checks_timeout" | "pinned_validator" | "substance"
+            | "deliverables",
+        ) => "floor_failed",
         _ => "verdict_not_pass",
     }
 }
@@ -5957,6 +5962,10 @@ fn dispatch_unit(
         && unit.worktree_baseline.is_none()
     {
         if let Some(wd) = session.workdir.as_deref() {
+            // (F-RC2-009) The run base rides the unit beside the baseline: the repo-checks floor's
+            // baseline diff compares a failing check against IT, never against a HEAD a creator
+            // may have moved by committing its work.
+            unit.run_base_commit = session.base_commit.clone();
             // Pinned to the REGISTERED repository (adversarial review on #414): the git dir the
             // snapshot goes through comes from `<repo>/.git/worktrees/<id>`, never from the
             // worktree's own `.git` file, and rides the baseline so the final comparison reuses
@@ -12610,5 +12619,15 @@ mod turn_timeout_vs_cancel_tests {
             crate::domain::benched_summary(&session.benched_seats, 3).as_deref(),
             Some("1 of 3 seats benched: b (not_logged_in — worker)")
         );
+    }
+
+    /// core#469: a floor that did not FINISH (`repo_checks_timeout`) is a FLOOR class at the
+    /// escalation gate — never `verdict_not_pass`, exactly like `repo_checks`.
+    #[test]
+    fn a_repo_checks_timeout_denial_is_a_floor_class() {
+        let timeout = crate::domain::UnitDenial::new("repo_checks_timeout", "did not FINISH");
+        let failed = crate::domain::UnitDenial::new("repo_checks", "exit 1");
+        assert_eq!(super::denial_class(Some(&timeout), false), "floor_failed");
+        assert_eq!(super::denial_class(Some(&failed), false), "floor_failed");
     }
 }
