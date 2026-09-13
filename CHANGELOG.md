@@ -173,6 +173,44 @@ Two release tracks share this file, newest entry first regardless of track:
   clean-only, as before).
 
 ### Changed
+- **A denied unit pauses at the escalation gate; it no longer fails the run (core#464, core#463
+  item 3).** Three governed `bug` runs in one day (wicked-garden `e20a3ffb`, RC1 Phase 3 r3
+  `dd5b8f54`, garden L4 `b5c2739d`) ended `unitDenied` → `sessionFailed` at their second unit:
+  the read-only `reproduce` rung wrote a 146-line analysis note into the worktree, the guard
+  correctly restored the tree — and the engine then ended the run, because the escalation gate
+  only opened for a unit whose own def gate was `human_confirm_if: verdict_not_pass` (verify).
+  The restored-tree prompt and the studio banner ("approving this gate retries the phase")
+  existed and were unreachable; a governance deny on a recon command was booked two seconds after
+  `unitOutputCaptured ok` the same way. Now EVERY denial the gate fold produces — the worktree
+  guard, an input-governance (boundary) deny, a deterministic floor (repo checks, pinned
+  validator, substance, deliverables), the output gate's policy decision, the agent judge, the
+  evaluator≠creator pass — opens the `escalation` gate on the denied unit: Approve re-dispatches
+  the SAME unit (attempt+1, against the tree the guard restored), Approve+steer amends it, Reject
+  cancels (a dirty worktree is kept, `worktreeRetained`). `gateEscalated` gains the DENIAL CLASS on
+  `condition` (`verdict_not_pass` | `evaluator_mutated_worktree` | `boundary_deny` |
+  `floor_failed`) and additive fields `attempt`, `denialSource`, `defGate`, `outputCaptured`,
+  `restored`, `discarded`, `suggestionRef` — what a "reassign" / "accept the captured output"
+  arm (core#459, follow-up) needs without re-reading the unit. The worktree-guard prompt names
+  the reverted paths. `unitDenied` still fires (observability), followed by the gate instead of
+  the run end. **Behaviour change**: a `bug`/`feature`/prose-planned run whose unit is denied by
+  a policy, the hook, a floor or the guard now parks `awaiting_human` (gate kind `escalation`)
+  where it used to end `failed` — including under `human_confirm: none` (the prompt discloses
+  the precedence, as the def-authored escalation already did) and on the CLI / bus-bridge /
+  campaign lanes, whose runs need a `confirm_gate` to proceed. The legacy SYNC lane
+  (`Core::launch` → `run_session`) is untouched. Worker FAILURES (a CLI that exits non-zero,
+  triage `fail`, elicitation loss) still fail the run — that lane is core#461's. Consumers keying
+  on `condition`: a repo-checks / pinned-validator denial on the def-gated `verify` phase used to
+  escalate as `verdict_not_pass` and now reports `floor_failed` (`defGate: true` still marks the
+  def-authored pause); crew's `GateEscalatedEvent` type gains the additive fields (follow-up).
+- **Evaluator notes root (core#464 item 2).** A bound read-only agent unit (an evaluator or
+  recon rung of a run with a worktree) is given a per-unit NOTES ROOT —
+  `<temp>/wicked-core-notes/<run>/unit-<ord>`, engine-owned, OUTSIDE every worktree and the
+  customer's clone — on `WorkUnit.notes_root` (additive, `notesRoot` on the run DTO when set),
+  joined into that unit's write boundary (`extra_write_roots` of its governance context, so every
+  carrier arms it), and named in the guard-only seat's read-only instruction ("write them ONLY
+  under …"). The guard compares the worktree and nothing else, so a note there never trips it; a
+  creator keeps its declared write roots; a claude/codex seat with a read-only lever is refused
+  write-class calls at its boundary as before and is not told about it.
 - **Cancel keeps a dirty worktree (F-E2E-028).** `cancel_run` FORCE-discarded the worktree; run
   `01234444`'s creator fix (3 files) survived only as an unreferenced tree object after the
   operator rejected an escalation gate, while the evaluator's discarded edit was kept under

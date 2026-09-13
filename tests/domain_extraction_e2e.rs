@@ -498,8 +498,8 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
     }
     launch(&core, "run-deny", &repo_id);
 
-    wait_status(&core, "run-deny", SessionStatus::Failed)
-        .expect("a policy violation in the extractor phase's output denies it → the run fails");
+    wait_status(&core, "run-deny", SessionStatus::AwaitingHuman)
+        .expect("a policy violation in the extractor phase's output denies it → the run pauses at the escalation gate (core#464)");
     // Attribute the failure to the EXTRACTOR phase (ord 3 / unit_ix 2) specifically — not an unrelated
     // gate — so the test proves the policy-over-output deny, not just "some failure".
     let views = core.sessions_detail().unwrap();

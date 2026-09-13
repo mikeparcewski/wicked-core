@@ -558,15 +558,35 @@ pub enum CoreEvent {
         pin: String,
         criterion: String,
     },
-    /// (EVT-010) A `HumanConfirmIf(VerdictNotPass)` gate fired — the unit's verdict was not-pass
-    /// and the run was escalated to human review instead of being auto-denied. Fires alongside
-    /// `AwaitingHuman` to identify the escalation type. `condition` is currently always
-    /// `"verdict_not_pass"`; `verdict_summary` is the denial reason that triggered escalation.
+    /// (EVT-010) A unit's result was DENIED and the run was escalated to human review instead of
+    /// being auto-failed. Fires alongside `AwaitingHuman` (`gate_kind: escalation`) to identify
+    /// the escalation type. Until core#464 only a `HumanConfirmIf(VerdictNotPass)` def gate could
+    /// open it and `condition` was always `"verdict_not_pass"`; now EVERY denial the gate fold
+    /// produces opens it, and `condition` is the DENIAL CLASS a consumer keys on:
+    /// `verdict_not_pass` (the output gate's policy decision, the agent judge, the evaluator
+    /// second pass), `evaluator_mutated_worktree` (a read-only phase changed the tree — the
+    /// worktree guard), `boundary_deny` (input governance refused a tool call), `floor_failed` (a
+    /// deterministic floor — repo checks, pinned validator, substance, deliverables).
+    /// `verdict_summary` is the denial reason. The additive fields carry what a decision arm needs
+    /// without re-reading the unit: `attempt` (the attempt whose output — persisted as the unit's
+    /// REJECTED transcript — and decisions log the gate reviews), `denial_source` (the raw layer
+    /// token, `gateEvaluated.denial.source`), `def_gate` (the unit's own def declared the
+    /// escalation; `false` = engine-authored), `output_captured` (the phase produced output text —
+    /// the precondition of an "accept the captured output" arm), `restored` + `discarded` +
+    /// `suggestion_ref` (the guard's restore outcome, mirroring `worktreeRestored`; `false` /
+    /// empty / `null` for every other class).
     GateEscalated {
         session: String,
         ord: u32,
         condition: String,
         verdict_summary: String,
+        attempt: u32,
+        denial_source: String,
+        def_gate: bool,
+        output_captured: bool,
+        restored: bool,
+        discarded: Vec<crate::worktree_guard::ChangedPath>,
+        suggestion_ref: Option<String>,
     },
     /// (EVT-011) A unit's work was dispatched via the `PhaseExecutor::Tool` path (a direct
     /// subprocess command, bypassing the council and CLI runner entirely). Fires just before
@@ -1679,12 +1699,26 @@ impl CoreEvent {
                 ord,
                 condition,
                 verdict_summary,
+                attempt,
+                denial_source,
+                def_gate,
+                output_captured,
+                restored,
+                discarded,
+                suggestion_ref,
             } => json!({
                 "type": "gateEscalated",
                 "session": session,
                 "ord": ord,
                 "condition": condition,
                 "verdictSummary": verdict_summary,
+                "attempt": attempt,
+                "denialSource": denial_source,
+                "defGate": def_gate,
+                "outputCaptured": output_captured,
+                "restored": restored,
+                "discarded": discarded,
+                "suggestionRef": suggestion_ref,
             }),
             CoreEvent::ToolExecutorDispatched {
                 session,
@@ -2278,6 +2312,61 @@ mod tests {
         assert!(j["head"].is_null());
         assert_eq!(j["discarded"][0]["status"], "M");
         assert_eq!(j["discarded"][0]["path"], "src/App.tsx");
+    }
+
+    /// core#464: a denial gate names its CLASS on `condition` and carries the guard's restore
+    /// outcome beside it, camelCase, `null`/empty where the class has none. Mutation: drop any of
+    /// the additive fields from the arm and the key assertions fail; spell `restored` for a
+    /// boundary deny and the second block fails.
+    #[test]
+    fn a_denial_gate_escalation_names_its_class_and_restore_outcome() {
+        let j = CoreEvent::GateEscalated {
+            session: "run-1".into(),
+            ord: 2,
+            condition: "evaluator_mutated_worktree".into(),
+            verdict_summary: "the reproduce phase changed the tree".into(),
+            attempt: 0,
+            denial_source: "worktree_guard".into(),
+            def_gate: false,
+            output_captured: true,
+            restored: true,
+            discarded: vec![crate::worktree_guard::ChangedPath {
+                status: "A".into(),
+                path: "evidence/repro.md".into(),
+            }],
+            suggestion_ref: Some("refs/wicked/suggestions/run-1/2/0".into()),
+        }
+        .to_json();
+        assert_eq!(j["type"], "gateEscalated");
+        assert_eq!(j["condition"], "evaluator_mutated_worktree");
+        assert_eq!(j["denialSource"], "worktree_guard");
+        assert_eq!(j["defGate"], false);
+        assert_eq!(j["outputCaptured"], true);
+        assert_eq!(j["restored"], true);
+        assert_eq!(j["attempt"], 0);
+        assert_eq!(j["discarded"][0]["status"], "A");
+        assert_eq!(j["discarded"][0]["path"], "evidence/repro.md");
+        assert_eq!(j["suggestionRef"], "refs/wicked/suggestions/run-1/2/0");
+        let j = CoreEvent::GateEscalated {
+            session: "run-1".into(),
+            ord: 2,
+            condition: "boundary_deny".into(),
+            verdict_summary: "input governance denied a tool-call in unit-2".into(),
+            attempt: 1,
+            denial_source: "input_governance".into(),
+            def_gate: false,
+            output_captured: true,
+            restored: false,
+            discarded: Vec::new(),
+            suggestion_ref: None,
+        }
+        .to_json();
+        assert_eq!(j["condition"], "boundary_deny");
+        assert_eq!(j["restored"], false);
+        assert!(j["discarded"].as_array().is_some_and(|d| d.is_empty()));
+        assert!(
+            j.as_object().unwrap().contains_key("suggestionRef") && j["suggestionRef"].is_null()
+        );
     }
 
     /// core#431 (F-3R2-013 / F-3R2-009): the deliver-lift, run-base and evaluator-tool-denied

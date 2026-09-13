@@ -15,19 +15,24 @@
 //!    with nothing evaluated);
 //! 3. a clean evaluator passes, and the engine runs the repository's own checks (`cargo test` on
 //!    a Cargo fixture) as a deterministic floor whose exit code is attached to the gate;
-//! 4. a failing check DENIES the verify gate with the exit code and output tail as evidence.
+//! 4. a failing check DENIES the verify gate with the exit code and output tail as evidence;
+//! 5. (core#464) a denial on ANY unit — the read-only `reproduce` rung writing a note into the
+//!    tree, a governance deny on its output — PAUSES the run at the escalation gate with a route
+//!    back (retry against the restored tree / cancel) instead of ending it `sessionFailed`, and a
+//!    read-only unit has a NOTES ROOT outside the tree where a note never trips the guard.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use wicked_apps_core::{ConformanceClaim, Decision};
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 use wicked_core::{
-    Core, CoreEvent, HumanConfirm, LaunchSpec, RepoSpec, SessionStatus, StepInput, StepOutput,
-    StepRunner, StepStatus,
+    decisions_path_for, gov_run_dir, Core, CoreEvent, HumanConfirm, HumanDecision, LaunchSpec,
+    RepoSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 
 /// Route every fire-and-forget `wicked.*` emission this binary triggers to a per-process temp spool
@@ -65,7 +70,24 @@ enum VerifyBehaviour {
     LeavesTreeAlone,
 }
 
+/// What the fake seat does when it runs the `reproduce` phase — the read-only recon rung whose
+/// guard denial used to END the run (core#464).
+#[derive(Clone, Copy)]
+enum ReproduceBehaviour {
+    /// Reads and reports; writes nothing.
+    LeavesTreeAlone,
+    /// The core#464 shape (runs e20a3ffb / dd5b8f54): writes its analysis note INTO the worktree —
+    /// on its first attempt only, so the retry a human approves behaves.
+    WritesANoteIntoTheTree,
+    /// Writes the same note under the unit's NOTES ROOT, the sanctioned place outside the tree.
+    WritesANoteUnderTheNotesRoot,
+    /// Produces a real result, and a governance Deny lands in the run's decisions log for the
+    /// unit's phase — the retroactive `boundary-deny` of core#463 item 3 (F-RC1-046).
+    TripsTheBoundary,
+}
+
 /// A seat that plays every role of the `bug` workflow deterministically:
+/// * `reproduce` (a read-only Neutral rung) behaves per [`ReproduceBehaviour`];
 /// * `fix` (the Creator) writes the fix into the worktree — a real diff, so the evidence floors pass;
 /// * `verify` (the Evaluator) either rewrites that fix or leaves the tree alone;
 /// * the engine's own JUDGE sessions (`session_id == "validator"`) get a well-formed PASS, so the
@@ -73,18 +95,70 @@ enum VerifyBehaviour {
 /// * everything else reports prose.
 struct ScriptedSeat {
     verify: VerifyBehaviour,
+    reproduce: ReproduceBehaviour,
     ran: Arc<Mutex<Vec<String>>>,
+    /// Every governed-unit input the seat was handed, for the tests that inspect what the engine
+    /// told it (the notes root, the write boundary).
+    inputs: Arc<Mutex<Vec<StepInput>>>,
 }
 impl StepRunner for ScriptedSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         let phase = input.unit.phase_id().unwrap_or("").to_string();
         self.ran.lock().unwrap().push(phase.clone());
+        if input.unit.session_id != "validator" {
+            self.inputs.lock().unwrap().push(input.clone());
+        }
         let mut output = format!("did: {phase}");
         if input.unit.session_id == "validator" {
             // The agent judge's contract: the SAME verdict word on the first and the last line.
             output = "PASS\nthe work meets the criterion\nPASS".to_string();
         } else if let Some(wd) = &input.workdir {
             match phase.as_str() {
+                "reproduce" => match self.reproduce {
+                    ReproduceBehaviour::LeavesTreeAlone => {}
+                    ReproduceBehaviour::WritesANoteIntoTheTree => {
+                        if input.attempt == 0 {
+                            std::fs::create_dir_all(wd.join("evidence")).unwrap();
+                            std::fs::write(
+                                wd.join("evidence/repro.md"),
+                                "# reproduce\nthe bug reproduces on main\n",
+                            )
+                            .unwrap();
+                        }
+                    }
+                    ReproduceBehaviour::WritesANoteUnderTheNotesRoot => {
+                        if let Some(root) = input.unit.notes_root.as_deref() {
+                            std::fs::write(Path::new(root).join("repro.md"), "# reproduce\n")
+                                .unwrap();
+                        }
+                    }
+                    ReproduceBehaviour::TripsTheBoundary => {
+                        // Exactly what `wicked-core gate-hook` appends when a tool call trips a
+                        // deny policy — at the unit's REAL phase, after the work was done.
+                        let claim = ConformanceClaim {
+                            claim_id: format!("hookdeny-{}", input.unit.ord),
+                            scope: format!("wicked-agent/{}/unit/x", input.run_id),
+                            phase: format!("unit-{}", input.unit.ord),
+                            policy_ids: vec!["pol-deny-estate-index".into()],
+                            decision: Decision::Deny,
+                            obligations: vec![],
+                            evaluated_context_ref: "sha256:test".into(),
+                            criteria: "no `wicked-estate index` inside a governed unit".into(),
+                            evaluator_identity: "wicked-governance".into(),
+                            evaluated_at: 1_750_000_000,
+                        };
+                        let path = decisions_path_for(&input.run_id, input.attempt);
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(
+                            &path,
+                            format!("{}\n", serde_json::to_string(&claim).unwrap()),
+                        )
+                        .unwrap();
+                        output = "reproduced: src/app.ts still reads `buggy` on main; the fix \
+                                  must change that line"
+                            .to_string();
+                    }
+                },
                 "fix" => {
                     std::fs::write(wd.join("src/app.ts"), "fixed\n").unwrap();
                     std::fs::write(wd.join("src/fix.ts"), "the fix\n").unwrap();
@@ -187,7 +261,13 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
     repo
 }
 
-fn core_for(name: &str, verify: VerifyBehaviour) -> (Core, Arc<Mutex<Vec<String>>>) {
+type Inputs = Arc<Mutex<Vec<StepInput>>>;
+
+fn core_with(
+    name: &str,
+    verify: VerifyBehaviour,
+    reproduce: ReproduceBehaviour,
+) -> (Core, Arc<Mutex<Vec<String>>>, Inputs) {
     let dir = std::env::temp_dir().join(format!(
         "wicked-core-wtguard-db-{name}-{}-{:?}",
         std::process::id(),
@@ -197,14 +277,22 @@ fn core_for(name: &str, verify: VerifyBehaviour) -> (Core, Arc<Mutex<Vec<String>
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let ran = Arc::new(Mutex::new(Vec::new()));
+    let inputs: Inputs = Arc::new(Mutex::new(Vec::new()));
     let core = Core::spawn_with_engine(
         db,
         Arc::new(StubDispatcher),
         Arc::new(ScriptedSeat {
             verify,
+            reproduce,
             ran: ran.clone(),
+            inputs: inputs.clone(),
         }),
     );
+    (core, ran, inputs)
+}
+
+fn core_for(name: &str, verify: VerifyBehaviour) -> (Core, Arc<Mutex<Vec<String>>>) {
+    let (core, ran, _inputs) = core_with(name, verify, ReproduceBehaviour::LeavesTreeAlone);
     (core, ran)
 }
 
@@ -257,6 +345,99 @@ fn drain(events: &std::sync::mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
         out.push(ev);
     }
     out
+}
+
+/// Collect events until one satisfies `done` (returned WITH the match) or the wait budget runs
+/// out — an `Err` naming the timeout as a timeout, never as an outcome.
+fn wait_for_event(
+    events: &std::sync::mpsc::Receiver<CoreEvent>,
+    done: impl Fn(&CoreEvent) -> bool,
+) -> Result<Vec<CoreEvent>, String> {
+    let start = Instant::now();
+    let mut out = Vec::new();
+    while start.elapsed() < WAIT_BUDGET {
+        match events.recv_timeout(Duration::from_millis(250)) {
+            Ok(ev) => {
+                let hit = done(&ev);
+                out.push(ev);
+                if hit {
+                    return Ok(out);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Err(format!(
+        "the awaited event did not arrive within {WAIT_BUDGET:?} (a timeout, not an outcome); \
+         saw {} events",
+        out.len()
+    ))
+}
+
+fn session_failed(evs: &[CoreEvent]) -> bool {
+    evs.iter()
+        .any(|e| matches!(e, CoreEvent::SessionFailed { .. }))
+}
+
+/// The `awaitingHuman` for `ord`: `(reviewing_ord, gate_kind, prompt)`.
+fn gate_pause(evs: &[CoreEvent], want_ord: u32) -> (Option<u32>, String, String) {
+    evs.iter()
+        .find_map(|ev| match ev {
+            CoreEvent::AwaitingHuman {
+                ord,
+                reviewing_ord,
+                gate_kind,
+                prompt,
+                ..
+            } if *ord == want_ord => Some((*reviewing_ord, gate_kind.clone(), prompt.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no awaitingHuman for ord {want_ord}"))
+}
+
+/// The `gateEscalated` for `ord`, destructured into what the core#464 tests assert on.
+struct Escalation {
+    condition: String,
+    denial_source: String,
+    def_gate: bool,
+    output_captured: bool,
+    restored: bool,
+    discarded: Vec<String>,
+    suggestion_ref: Option<String>,
+    attempt: u32,
+}
+
+fn escalation_for(evs: &[CoreEvent], want_ord: u32) -> Escalation {
+    evs.iter()
+        .find_map(|ev| match ev {
+            CoreEvent::GateEscalated {
+                ord,
+                condition,
+                denial_source,
+                def_gate,
+                output_captured,
+                restored,
+                discarded,
+                suggestion_ref,
+                attempt,
+                ..
+            } if *ord == want_ord => Some(Escalation {
+                condition: condition.clone(),
+                denial_source: denial_source.clone(),
+                def_gate: *def_gate,
+                output_captured: *output_captured,
+                restored: *restored,
+                discarded: discarded
+                    .iter()
+                    .map(|c| format!("{} {}", c.status, c.path))
+                    .collect(),
+                suggestion_ref: suggestion_ref.clone(),
+                attempt: *attempt,
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no gateEscalated for ord {want_ord}"))
 }
 
 /// The `gateEvaluated` record for `ord`, destructured into what these tests assert on.
@@ -752,4 +933,412 @@ fn a_failing_repo_check_denies_the_verify_gate_with_the_exit_code_as_evidence() 
         format!("{}{}", checks[0].stdout_tail, checks[0].stderr_tail).contains("REPO CHECK BOOM")
     );
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// core#464, the run-loss shape itself (runs e20a3ffb / dd5b8f54): the read-only `reproduce` rung
+/// writes its analysis note INTO the worktree. The guard denies and restores exactly as before —
+/// and the run now PAUSES at the escalation gate (`evaluator_mutated_worktree`, the reverted path
+/// named, `unitDenied` still emitted first) instead of ending `sessionFailed`. Approving the gate
+/// re-dispatches the SAME unit (attempt 1) against the restored tree, and the run goes on to `fix`.
+#[test]
+fn a_recon_phase_that_writes_a_note_into_the_tree_pauses_at_a_gate_and_the_approved_retry_continues(
+) {
+    let repo = make_git_repo("recon-note", None);
+    let (core, ran, _inputs) = core_with(
+        "recon-note",
+        VerifyBehaviour::LeavesTreeAlone,
+        ReproduceBehaviour::WritesANoteIntoTheTree,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "recon-note".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-recon-note", &entry.id))
+        .expect("launch");
+    assert!(
+        wait_status(&core, "r-recon-note", SessionStatus::AwaitingHuman),
+        "a guard denial on a read-only recon rung must PAUSE the run at a gate, never fail it"
+    );
+    let evs = drain(&events);
+    assert!(
+        !session_failed(&evs),
+        "no sessionFailed without a decided gate"
+    );
+    assert!(
+        ran.lock().unwrap().iter().all(|p| p != "fix"),
+        "the creator has not run: the run stopped at the denied rung: {:?}",
+        ran.lock().unwrap()
+    );
+
+    // The gate: kind `escalation`, ON the reproduce unit (ord 2), reviewing itself, with the
+    // restored-tree prompt that used to be unreachable for every phase but verify — now naming the
+    // reverted path and the engine-authored precedence over `human_confirm: none`.
+    let (reviewing, kind, prompt) = gate_pause(&evs, 2);
+    assert_eq!((reviewing, kind.as_str()), (Some(2), "escalation"));
+    assert!(
+        prompt.contains("edit was discarded")
+            && prompt.contains("restored tree")
+            && prompt.contains("A evidence/repro.md")
+            && prompt.contains("`reproduce`")
+            && prompt.contains("engine gate"),
+        "the prompt says what Approve retries against, which path was reverted, and why the \
+         run-level policy did not silence it: {prompt}"
+    );
+    // The class and the restore outcome, on the wire — what a decision arm keys on.
+    let g = escalation_for(&evs, 2);
+    assert_eq!(g.condition, "evaluator_mutated_worktree");
+    assert_eq!(g.denial_source, "worktree_guard");
+    assert!(
+        !g.def_gate,
+        "the reproduce phase's def gate is `auto` — the ENGINE authored this pause"
+    );
+    assert!(g.output_captured, "the rung's output exists to be accepted");
+    assert!(g.restored, "the creator's tree was put back");
+    assert_eq!(g.discarded, vec!["A evidence/repro.md"]);
+    assert!(
+        g.suggestion_ref
+            .as_deref()
+            .is_some_and(|r| r.starts_with("refs/wicked/suggestions/")),
+        "the discarded note is pinned, not lost: {:?}",
+        g.suggestion_ref
+    );
+    assert_eq!(g.attempt, 0);
+    // Observability kept: the denial is still booked, THEN the gate — never the run end.
+    let denied_at = evs
+        .iter()
+        .position(|e| matches!(e, CoreEvent::UnitDenied { ord: 2, .. }))
+        .expect("unitDenied for the reproduce unit");
+    let gate_at = evs
+        .iter()
+        .position(|e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, .. }))
+        .unwrap();
+    assert!(denied_at < gate_at, "unitDenied precedes the gate");
+    assert_eq!(
+        gate_for(&evs, 2).denial_source.as_deref(),
+        Some("worktree_guard")
+    );
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            CoreEvent::EvaluatorMutatedWorktree { ord: 2, phase, restored: true, .. }
+                if phase == "reproduce"
+        )),
+        "the mutation event names the recon phase and the restore"
+    );
+    let wt = repo.join("wicked-worktrees").join("r-recon-note");
+    assert!(
+        !wt.join("evidence/repro.md").exists(),
+        "the restore discarded the note from the tree"
+    );
+
+    // Approve → the SAME unit re-dispatches (attempt 1, `resumed`), behaves against the restored
+    // tree, passes its gate, and the run reaches the creator.
+    assert_eq!(
+        core.confirm_gate("r-recon-note", HumanDecision::Approve { amend: None })
+            .expect("approve the denial gate"),
+        SessionStatus::Executing
+    );
+    let after = wait_for_event(&events, |e| {
+        matches!(e, CoreEvent::GateEvaluated { ord: 3, .. })
+    })
+    .expect("the fix unit ran and was gated after the approved retry");
+    assert!(after
+        .iter()
+        .any(|e| matches!(e, CoreEvent::Resumed { ord: 2, .. })));
+    assert!(
+        after.iter().any(|e| matches!(
+            e,
+            CoreEvent::UnitDispatched {
+                ord: 2,
+                attempt: 1,
+                ..
+            }
+        )),
+        "the retry is the same unit at attempt 1"
+    );
+    assert!(
+        after.iter().any(|e| matches!(
+            e,
+            CoreEvent::GateEvaluated {
+                ord: 2,
+                combined: true,
+                ..
+            }
+        )),
+        "the retried reproduce passed its gate"
+    );
+    assert!(!session_failed(&after));
+    let ran = ran.lock().unwrap().clone();
+    assert_eq!(
+        ran.iter().filter(|p| *p == "reproduce").count(),
+        2,
+        "reproduce ran twice: the denied attempt and the approved retry: {ran:?}"
+    );
+    assert!(
+        ran.iter().any(|p| p == "fix"),
+        "the run continued to the creator after the retry: {ran:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// core#464 / core#463 item 3 (F-RC1-046): a governance Deny recorded for a recon rung AFTER its
+/// output was captured — `unitOutputCaptured ok`, then the fold reads the log — pauses the run at
+/// the escalation gate as `boundary_deny`, never books a retroactive `sessionFailed`.
+#[test]
+fn a_boundary_deny_on_a_recon_phase_whose_output_was_captured_pauses_at_a_gate() {
+    let repo = make_git_repo("recon-boundary", None);
+    let (core, ran, _inputs) = core_with(
+        "recon-boundary",
+        VerifyBehaviour::LeavesTreeAlone,
+        ReproduceBehaviour::TripsTheBoundary,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "recon-boundary".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-recon-boundary", &entry.id))
+        .expect("launch");
+    assert!(
+        wait_status(&core, "r-recon-boundary", SessionStatus::AwaitingHuman),
+        "a boundary deny on a recon rung must pause the run at a gate, never fail it"
+    );
+    let evs = drain(&events);
+    assert!(!session_failed(&evs));
+    assert!(ran.lock().unwrap().iter().all(|p| p != "fix"));
+
+    let (reviewing, kind, prompt) = gate_pause(&evs, 2);
+    assert_eq!((reviewing, kind.as_str()), (Some(2), "escalation"));
+    assert!(
+        prompt.contains("DENIED by input governance")
+            && prompt.contains("output was captured")
+            && prompt.contains("hookdeny-2"),
+        "the prompt names the denial and the captured output: {prompt}"
+    );
+    let g = escalation_for(&evs, 2);
+    assert_eq!(g.condition, "boundary_deny");
+    assert_eq!(g.denial_source, "input_governance");
+    assert!(!g.def_gate);
+    assert!(g.output_captured);
+    assert!(!g.restored && g.discarded.is_empty() && g.suggestion_ref.is_none());
+    // The core#463 sequence: the output was captured `ok` BEFORE the denial gated the run.
+    let captured_at = evs
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                CoreEvent::UnitOutputCaptured { ord: 2, step_status, .. } if step_status == "ok"
+            )
+        })
+        .expect("the recon output was captured ok");
+    let gate_at = evs
+        .iter()
+        .position(|e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, .. }))
+        .unwrap();
+    assert!(captured_at < gate_at);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, CoreEvent::UnitDenied { ord: 2, .. })));
+    assert_eq!(
+        gate_for(&evs, 2).denial_source.as_deref(),
+        Some("input_governance")
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(gov_run_dir("r-recon-boundary"));
+}
+
+/// core#464 item 2 (cancel keeps today's behaviour): rejecting the denial gate cancels the run —
+/// here at the verify escalation over a DIRTY tree (the creator's uncommitted fix, restored after
+/// the evaluator's rewrite) — and the worktree is KEPT and named (`worktreeRetained`, core#456).
+#[test]
+fn rejecting_the_denial_gate_cancels_the_run_and_keeps_the_dirty_worktree() {
+    let repo = make_git_repo("reject-dirty", None);
+    let (core, _ran) = core_for("reject-dirty", VerifyBehaviour::RewritesTheFix);
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "reject-dirty".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-reject-dirty", &entry.id))
+        .expect("launch");
+    assert!(wait_status(
+        &core,
+        "r-reject-dirty",
+        SessionStatus::AwaitingHuman
+    ));
+    let before = drain(&events);
+    assert_eq!(gate_pause(&before, 4).1, "escalation");
+    assert_eq!(
+        core.confirm_gate("r-reject-dirty", HumanDecision::Reject)
+            .expect("reject the denial gate"),
+        SessionStatus::Cancelled
+    );
+    let evs = drain(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == "r-reject-dirty")));
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            CoreEvent::WorktreeRetained { session, .. } if session == "r-reject-dirty"
+        )),
+        "the creator's uncommitted fix keeps the worktree alive: {evs:?}"
+    );
+    assert!(!session_failed(&before) && !session_failed(&evs));
+    let wt = repo.join("wicked-worktrees").join("r-reject-dirty");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("src/fix.ts")).unwrap(),
+        "the fix\n",
+        "the retained tree is the creator's restored fix"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// The reject arm on a CLEAN tree (the reproduce gate: nothing but the base commit under it):
+/// cancelled, the clean tree reaped by the ordinary rule, and — still — no `sessionFailed`.
+#[test]
+fn rejecting_the_denial_gate_on_a_clean_recon_tree_cancels_without_failing() {
+    let repo = make_git_repo("reject-clean", None);
+    let (core, _ran, _inputs) = core_with(
+        "reject-clean",
+        VerifyBehaviour::LeavesTreeAlone,
+        ReproduceBehaviour::WritesANoteIntoTheTree,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "reject-clean".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-reject-clean", &entry.id))
+        .expect("launch");
+    assert!(wait_status(
+        &core,
+        "r-reject-clean",
+        SessionStatus::AwaitingHuman
+    ));
+    let before = drain(&events);
+    assert_eq!(gate_pause(&before, 2).1, "escalation");
+    assert_eq!(
+        core.confirm_gate("r-reject-clean", HumanDecision::Reject)
+            .unwrap(),
+        SessionStatus::Cancelled
+    );
+    let evs = drain(&events);
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == "r-reject-clean")));
+    assert!(!session_failed(&before) && !session_failed(&evs));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// core#464 item 2: a bound read-only unit carries a NOTES ROOT — outside the worktree and the
+/// clone, joined into its own write boundary, absent from the creator's — and a note written
+/// there never trips the guard: the rung passes, the run reaches the creator, the tree holds no
+/// note.
+#[test]
+fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
+    let repo = make_git_repo("notes-root", None);
+    let (core, _ran, inputs) = core_with(
+        "notes-root",
+        VerifyBehaviour::LeavesTreeAlone,
+        ReproduceBehaviour::WritesANoteUnderTheNotesRoot,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "notes-root".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-notes-root", &entry.id))
+        .expect("launch");
+    let evs = wait_for_event(&events, |e| {
+        matches!(e, CoreEvent::GateEvaluated { ord: 3, .. })
+    })
+    .expect("the run reached the creator's gate — the recon rung was not denied");
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, CoreEvent::EvaluatorMutatedWorktree { ord: 2, .. })),
+        "a note under the notes root is not a mutation"
+    );
+    assert!(
+        gate_for(&evs, 2).combined,
+        "the reproduce rung passed its gate"
+    );
+    assert!(!evs
+        .iter()
+        .any(|e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, .. })));
+
+    // What the engine told the seat.
+    let inputs = inputs.lock().unwrap().clone();
+    let repro = inputs
+        .iter()
+        .find(|i| i.unit.phase_id() == Some("reproduce"))
+        .expect("the reproduce input");
+    let root = repro
+        .unit
+        .notes_root
+        .as_deref()
+        .expect("a bound read-only unit carries a notes root");
+    let wt = repo.join("wicked-worktrees").join("r-notes-root");
+    assert!(
+        !Path::new(root).starts_with(&wt) && !Path::new(root).starts_with(&repo),
+        "the notes root is outside the worktree and the clone: {root}"
+    );
+    assert!(
+        Path::new(root).join("repro.md").is_file(),
+        "the note landed where the seat was told"
+    );
+    assert!(
+        repro
+            .governance
+            .as_ref()
+            .is_some_and(|g| g.extra_write_roots.iter().any(|r| r == root)),
+        "the unit's write boundary admits its notes root: {:?}",
+        repro.governance.as_ref().map(|g| &g.extra_write_roots)
+    );
+    let triage = inputs
+        .iter()
+        .find(|i| i.unit.phase_id() == Some("triage"))
+        .expect("the triage input");
+    assert!(
+        triage.unit.notes_root.is_some() && triage.unit.notes_root != repro.unit.notes_root,
+        "every bound read-only rung gets its own root"
+    );
+    let fix = inputs
+        .iter()
+        .find(|i| i.unit.phase_id() == Some("fix"))
+        .expect("the fix input");
+    assert!(
+        fix.unit.notes_root.is_none(),
+        "a creator keeps its declared write roots — no notes root"
+    );
+    assert!(
+        fix.governance
+            .as_ref()
+            .is_some_and(|g| !g.extra_write_roots.iter().any(|r| r == root)),
+        "the recon rung's notes root does not leak into the creator's boundary"
+    );
+    assert!(
+        !wt.join("repro.md").exists() && !wt.join("evidence").exists(),
+        "the worktree holds no note"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    if let Some(run_dir) = Path::new(root).parent() {
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
 }

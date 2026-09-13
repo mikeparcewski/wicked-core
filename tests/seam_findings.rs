@@ -394,8 +394,9 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
     .expect("launch");
 
     assert!(
-        wait_status(&core, "r", SessionStatus::Failed),
-        "an evaluator second-pass Deny halts the run as Failed (finding #9)"
+        wait_status(&core, "r", SessionStatus::AwaitingHuman),
+        "an evaluator second-pass Deny halts the run at the escalation gate (finding #9; core#464 \
+         turned the terminal Failed into a decided gate)"
     );
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();

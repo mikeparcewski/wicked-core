@@ -251,7 +251,7 @@ fn wait_status(core: &Core, run_id: &str, want: SessionStatus, context: &str) {
 }
 
 #[test]
-fn governance_deny_through_the_engine_halts_run_as_failed() {
+fn governance_deny_through_the_engine_halts_run_at_the_escalation_gate() {
     let db = db_path("deny");
     // Seed a deny policy on the first unit's phase BEFORE the actor opens the store.
     {
@@ -269,13 +269,15 @@ fn governance_deny_through_the_engine_halts_run_as_failed() {
         }),
     );
 
-    // Two units; unit 1's output trips the deny → the run must halt as Failed BEFORE unit 2.
+    // Two units; unit 1's output trips the deny → the run must halt BEFORE unit 2 — at the
+    // escalation gate (core#464: a denial pauses with a route back, it no longer fails the run).
     core.launch_run(spec("r", "task one. task two")).unwrap();
     wait_status(
         &core,
         "r",
-        SessionStatus::Failed,
-        "a governance-denied unit halts the run as Failed (never Completed)",
+        SessionStatus::AwaitingHuman,
+        "a governance-denied unit halts the run at the escalation gate (never Completed, never an \
+         ungated Failed)",
     );
 
     let views = core.sessions_detail().unwrap();
@@ -329,7 +331,7 @@ fn a_deny_policy_registered_through_the_engine_api_actually_halts_a_run() {
     );
     core.register_deny_policy("unit-1", "DEPLOY").unwrap();
     core.launch_run(spec("r", "task one. task two")).unwrap();
-    wait_status(&core, "r", SessionStatus::Failed, "a deny policy registered via the engine API halts the run (it targets the real unit phases)");
+    wait_status(&core, "r", SessionStatus::AwaitingHuman, "a deny policy registered via the engine API halts the run at the escalation gate (it targets the real unit phases)");
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
     assert_eq!(v.units[0].status, UnitStatus::Rejected);
@@ -368,8 +370,8 @@ fn a_retired_policy_stops_denying_and_the_same_run_then_completes() {
     wait_status(
         &core,
         "before",
-        SessionStatus::Failed,
-        "precondition: the policy denies",
+        SessionStatus::AwaitingHuman,
+        "precondition: the policy denies (and the denial parks the run at its gate, core#464)",
     );
 
     assert!(
@@ -432,7 +434,7 @@ fn deny_policy_fires_on_a_unit_beyond_the_64th() {
     wait_status(
         &core,
         "r",
-        SessionStatus::Failed,
+        SessionStatus::AwaitingHuman,
         "the deny policy fires on the 65th unit — governance covers beyond unit-64",
     );
     let views = core.sessions_detail().unwrap();
