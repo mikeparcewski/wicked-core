@@ -5066,7 +5066,10 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
         // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
         Some(
-            "repo_checks" | "repo_checks_timeout" | "pinned_validator" | "substance"
+            "repo_checks"
+            | "repo_checks_timeout"
+            | "pinned_validator"
+            | "substance"
             | "deliverables",
         ) => "floor_failed",
         _ => "verdict_not_pass",

@@ -939,7 +939,10 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
          either way the run PAUSES at a gate (core#464), never sessionFailed"
     );
     let evs = drain(&events);
-    assert!(!session_failed(&evs), "no sessionFailed without a decided gate");
+    assert!(
+        !session_failed(&evs),
+        "no sessionFailed without a decided gate"
+    );
     if gate_for(&evs, 3).denial_source.as_deref() != Some("repo_checks") {
         // No OS boundary on this host: the creator's DEFAULT floor is disclosed, not denied
         // (F-7R2-005), so the red tree reaches verify, whose DECLARED floor fails closed.

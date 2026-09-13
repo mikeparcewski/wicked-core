@@ -3477,8 +3477,12 @@ mod tests {
             !br.passed() && br.exit_code.is_some_and(|e| e != 0),
             "{br:?}"
         );
+        // First-seen order: cargo runs tests on several threads, so the two failures may be
+        // reported in either order (the macOS CI runner reports `shared` first) — compare sorted.
+        let mut base_ids = br.failure_ids.clone();
+        base_ids.sort();
         assert_eq!(
-            br.failure_ids,
+            base_ids,
             vec!["test t::other".to_string(), "test t::shared".to_string()]
         );
         assert_eq!(
