@@ -2067,8 +2067,12 @@ mod tests {
     /// NOT judge (unset, unresolvable, shapeless) fall through to the launch-time admission, unchanged.
     #[test]
     fn an_unregistered_entry_is_surveyed_all_at_once_and_refused_at_intake_in_operator_terms() {
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
+        // Spelled through `canonical_spelling` — the module's ONE spelling for every path it
+        // reports (on Windows `canonicalize` keeps the `\\?\` verbatim prefix; the module drops
+        // it) — so the expectations below compare equal on every OS: the windows CI job failed
+        // this test on the two spellings of one directory.
+        let base = canonical_spelling(&std::env::temp_dir())
+            .expect("the temp dir resolves")
             .join(format!(
                 "wstate-intake-{}-{}",
                 std::process::id(),
