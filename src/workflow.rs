@@ -462,6 +462,18 @@ pub enum PhaseRole {
     Evaluator,
 }
 
+impl PhaseRole {
+    /// The wire / prompt token — the same spelling serde uses (`snake_case`), so the base skill
+    /// directive's `§<role>` (core#468) and the `unitPlanned`/`unitDispatched` events agree.
+    pub fn token(self) -> &'static str {
+        match self {
+            PhaseRole::Neutral => "neutral",
+            PhaseRole::Creator => "creator",
+            PhaseRole::Evaluator => "evaluator",
+        }
+    }
+}
+
 /// How a phase executes: via a council-routed CLI agent, or a direct tool command.
 /// `Agent` is the default (preserves all existing behaviour); `Tool` bypasses the council
 /// and runs `cmd` as a subprocess with the session's `workdir` as the working directory.
@@ -684,6 +696,61 @@ impl PhaseDef {
 pub struct WorkflowDef {
     pub id: String,
     pub phases: Vec<PhaseDef>,
+    /// The BASE skill every agent unit of this workflow follows (core#468) — a role-keyed
+    /// discipline directive the engine prepends to EVERY unit prompt, independent of the phase's
+    /// own [`PhaseDef::skill_ref`]: `Invoke your skill "<base>" … and follow its §<role> section`
+    /// (`creator` | `evaluator` | `neutral`, from [`PhaseDef::role`]), spelled per CLI exactly as
+    /// the phase directive is (`execute_wrapped::skill_prompt`). The skill text lives in the
+    /// skills snapshot; the directive stays short (the PTY line budget).
+    ///
+    /// Resolution ([`base_skill_ref_for`]): `Some(name)` here wins; `Some("")` is an EXPLICIT
+    /// opt-out for this workflow; `None` (the default) defers to the engine-config default
+    /// [`BASE_SKILL_REF_ENV`], unset ⇒ no base skill. GATED AT INTAKE: a run whose skills
+    /// snapshot lacks the base skill is refused before any unit is planned
+    /// (`skills_snapshot::admit_base_skill`) — never at its first worker. The base skill is judged
+    /// for EXISTENCE only: it never narrows seat selection (a `portable: false` base skill does
+    /// not collapse the roster onto claude — `distribute::seat_candidates` reads `skill_ref`
+    /// alone), so its portability is the publisher's contract, not a routing input.
+    /// `skip_serializing_if`: an absent option stays absent on the wire, so defs authored before
+    /// this field serialize back byte-identical (the shipped mirrors don't gain `null`s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_skill_ref: Option<String>,
+}
+
+/// The engine-config default for [`WorkflowDef::base_skill_ref`] (core#468): the frontmatter
+/// name of the skill every agent unit follows when its workflow declares none. Read at INTAKE
+/// (plan time) only — the launcher (wicked-crew) sets it from its system settings; an empty or
+/// whitespace value is "no base skill". A workflow's own `base_skill_ref` (including the
+/// explicit `""` opt-out) always wins over this.
+pub const BASE_SKILL_REF_ENV: &str = "WICKED_BASE_SKILL_REF";
+
+/// The base skill in force for a run of `def` (or a prose-planned run, `None`): the def's own
+/// declaration, else the engine-config default — see [`WorkflowDef::base_skill_ref`] for the
+/// precedence. `None` ⇒ no base directive on any unit.
+pub fn base_skill_ref_for(def: Option<&WorkflowDef>) -> Option<String> {
+    let env = std::env::var(BASE_SKILL_REF_ENV).ok();
+    resolve_base_skill_ref(
+        def.and_then(|d| d.base_skill_ref.as_deref()),
+        env.as_deref(),
+    )
+}
+
+/// [`base_skill_ref_for`] with its two inputs explicit — pure, so the precedence is testable
+/// without touching the process environment. `declared` is the def's field (`Some("")` = the
+/// explicit opt-out), `default` the engine-config value.
+pub(crate) fn resolve_base_skill_ref(
+    declared: Option<&str>,
+    default: Option<&str>,
+) -> Option<String> {
+    let non_blank = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    match declared {
+        // Declared — a name, or the explicit `""` opt-out; the default is never consulted.
+        Some(s) => non_blank(s),
+        None => default.and_then(non_blank),
+    }
 }
 
 /// Why a `WorkflowDef` failed validation.
@@ -1004,6 +1071,7 @@ fn refuse_unpinned_verified_evidence(def: &WorkflowDef) -> Result<(), WorkflowDe
 /// point-by-point revision, honest verdicts).
 pub fn collab_def() -> WorkflowDef {
     WorkflowDef {
+        base_skill_ref: None,
         id: "collab".to_string(),
         phases: vec![
             PhaseDef::new("propose", StageKind::Recon)
@@ -1032,6 +1100,7 @@ pub fn collab_def() -> WorkflowDef {
 
 pub fn feature_def() -> WorkflowDef {
     WorkflowDef {
+        base_skill_ref: None,
         id: "feature".to_string(),
         phases: vec![
             PhaseDef::new("clarify", StageKind::Recon).gate(
@@ -1078,6 +1147,7 @@ pub fn feature_def() -> WorkflowDef {
 /// depends on `reproduce`; a bug is not fixed until the repro goes red→green.
 pub fn bug_def() -> WorkflowDef {
     WorkflowDef {
+        base_skill_ref: None,
         id: "bug".to_string(),
         phases: vec![
             PhaseDef::new("triage", StageKind::Recon).gate(GateType::Value, GateSpec::Auto),
@@ -1107,6 +1177,7 @@ pub fn bug_def() -> WorkflowDef {
 /// `cutover` is the one gate the engagement dial can never downgrade.
 pub fn migration_def() -> WorkflowDef {
     WorkflowDef {
+        base_skill_ref: None,
         id: "migration".to_string(),
         phases: vec![
             PhaseDef::new("plan", StageKind::Recon).gate(
@@ -1176,6 +1247,7 @@ pub const CODE_GRAPH_DB_TOKEN: &str = "{code_graph_db}";
 
 pub fn onboarding_def() -> WorkflowDef {
     WorkflowDef {
+        base_skill_ref: None,
         id: "onboarding".to_string(),
         phases: vec![
             PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
@@ -1234,6 +1306,7 @@ mod workflow_def_tests {
     #[test]
     fn preflight_refuses_a_missing_tool_binary_loudly() {
         let def = WorkflowDef {
+            base_skill_ref: None,
             id: "tooly".to_string(),
             phases: vec![
                 PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
@@ -1253,6 +1326,7 @@ mod workflow_def_tests {
     fn preflight_passes_agent_phases_and_resolvable_absolute_paths() {
         // Agent phases have no tool dependency — always pass.
         let agent_only = WorkflowDef {
+            base_skill_ref: None,
             id: "agenty".to_string(),
             phases: vec![PhaseDef::new("explore", StageKind::Recon)],
         };
@@ -1264,6 +1338,7 @@ mod workflow_def_tests {
         let file = dir.join("toolbin");
         std::fs::write(&file, b"#!/bin/sh\n").unwrap();
         let def = WorkflowDef {
+            base_skill_ref: None,
             id: "tooly".to_string(),
             phases: vec![
                 PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
@@ -1391,6 +1466,7 @@ mod workflow_def_tests {
         // A 2-cycle (a↔b) can't be laid out backward-only: whichever phase is declared first
         // depends on a later one, surfacing as a forward edge.
         let bad = WorkflowDef {
+            base_skill_ref: None,
             id: "cyclic".to_string(),
             phases: vec![
                 PhaseDef::new("a", StageKind::Build).after("b"),
@@ -1407,6 +1483,7 @@ mod workflow_def_tests {
     fn a_forward_or_self_dependency_is_rejected() {
         // Forward: "a" (declared first) depends on the later "b".
         let forward = WorkflowDef {
+            base_skill_ref: None,
             id: "fwd".to_string(),
             phases: vec![
                 PhaseDef::new("a", StageKind::Build).after("b"),
@@ -1419,6 +1496,7 @@ mod workflow_def_tests {
         ));
         // Self-dependency is also a forward edge (dp == i).
         let selfdep = WorkflowDef {
+            base_skill_ref: None,
             id: "self".to_string(),
             phases: vec![PhaseDef::new("a", StageKind::Build).after("a")],
         };
@@ -1433,6 +1511,7 @@ mod workflow_def_tests {
         // §4.1/§4.2: a phase's skill_ref + runtime allowlist ride onto its unit so the runner invokes
         // the right skill under least-privilege. A phase without a skill leaves both empty (authored path).
         let def = WorkflowDef {
+            base_skill_ref: None,
             id: "skilled".to_string(),
             phases: vec![
                 PhaseDef::new("build", StageKind::Build)
@@ -1460,6 +1539,7 @@ mod workflow_def_tests {
     fn a_backward_dep_listed_twice_is_not_a_false_cycle() {
         // Regression: the old Kahn indeg miscounted duplicate deps and reported a phantom cycle.
         let dup = WorkflowDef {
+            base_skill_ref: None,
             id: "dup".to_string(),
             phases: vec![
                 PhaseDef::new("a", StageKind::Build),
@@ -1475,6 +1555,7 @@ mod workflow_def_tests {
     #[test]
     fn an_unknown_dependency_is_rejected() {
         let bad = WorkflowDef {
+            base_skill_ref: None,
             id: "dangling".to_string(),
             phases: vec![PhaseDef::new("a", StageKind::Build).after("ghost")],
         };
@@ -1531,6 +1612,57 @@ mod workflow_def_tests {
                 def.id
             );
         }
+    }
+
+    /// core#468: the base skill's precedence — the def's own field wins (a name, or the explicit
+    /// `""` opt-out), else the engine-config default; blank anywhere means "no base skill" — and
+    /// the field round-trips through the drop-in JSON while a def that declares none serializes
+    /// WITHOUT the key (the shipped mirrors stay byte-identical; `deny_unknown_fields` still
+    /// refuses a misspelling).
+    #[test]
+    fn the_base_skill_ref_resolves_def_first_then_default_and_round_trips() {
+        let name = "wicked-garden-governed-worker";
+        assert_eq!(
+            resolve_base_skill_ref(Some(name), Some("other")).as_deref(),
+            Some(name),
+            "the def's declaration wins"
+        );
+        assert_eq!(
+            resolve_base_skill_ref(Some(""), Some(name)),
+            None,
+            "the explicit empty opt-out wins over the default"
+        );
+        assert_eq!(
+            resolve_base_skill_ref(Some("  "), Some(name)),
+            None,
+            "…and so does a blank one"
+        );
+        assert_eq!(
+            resolve_base_skill_ref(None, Some(&format!(" {name} "))).as_deref(),
+            Some(name),
+            "no declaration ⇒ the (trimmed) default"
+        );
+        assert_eq!(resolve_base_skill_ref(None, Some("")), None);
+        assert_eq!(resolve_base_skill_ref(None, None), None);
+
+        let mut def = bug_def();
+        assert!(
+            !serde_json::to_string(&def)
+                .unwrap()
+                .contains("base_skill_ref"),
+            "a def without a base skill serializes without the key"
+        );
+        def.base_skill_ref = Some(name.to_string());
+        let json = serde_json::to_string_pretty(&def).unwrap();
+        assert!(json.contains(&format!("\"base_skill_ref\": \"{name}\"")));
+        let back: WorkflowDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, def);
+        assert_eq!(base_skill_ref_for(Some(&back)).as_deref(), Some(name));
+        let err = serde_json::from_str::<WorkflowDef>(
+            r#"{"id":"x","base_skill":"typo","phases":[{"id":"a"}]}"#,
+        )
+        .expect_err("a misspelled def field is a loud parse error");
+        assert!(err.to_string().contains("base_skill"), "{err}");
     }
 
     #[test]
@@ -1630,6 +1762,7 @@ mod workflow_def_tests {
         // The same def through the runtime registration path names the phase.
         let err = reg
             .register(WorkflowDef {
+                base_skill_ref: None,
                 id: "feature".to_string(),
                 phases: vec![PhaseDef::new("build", StageKind::Build)
                     .codes()
@@ -1751,6 +1884,7 @@ mod workflow_def_tests {
     #[test]
     fn a_code_phase_whose_gate_evaluates_nothing_is_refused_at_registration() {
         let ungated = WorkflowDef {
+            base_skill_ref: None,
             id: "ungated".to_string(),
             phases: vec![
                 PhaseDef::new("triage", StageKind::Recon),
@@ -1790,6 +1924,7 @@ mod workflow_def_tests {
 
         // The three ways an author satisfies the rule — each registers and is left as authored.
         let with = |id: &str, fix: PhaseDef| WorkflowDef {
+            base_skill_ref: None,
             id: id.to_string(),
             phases: vec![fix],
         };
@@ -1883,6 +2018,7 @@ mod workflow_def_tests {
         let mut reg = WorkflowRegistry::default();
         let err = reg
             .register(WorkflowDef {
+                base_skill_ref: None,
                 id: "declares".to_string(),
                 phases: vec![
                     PhaseDef::new("work", StageKind::Build)
@@ -1909,6 +2045,7 @@ mod workflow_def_tests {
         assert!(reg.get("declares").is_none());
         // As authored with its own pin (or the floor) it registers, and nothing else is touched.
         reg.register(WorkflowDef {
+            base_skill_ref: None,
             id: "declares".to_string(),
             phases: vec![
                 PhaseDef::new("work", StageKind::Build)
@@ -2019,6 +2156,7 @@ mod workflow_def_tests {
                 .clone()
         };
         let pinned = |id: &str| WorkflowDef {
+            base_skill_ref: None,
             id: id.to_string(),
             phases: vec![
                 PhaseDef::new("work", StageKind::Build)
@@ -2061,6 +2199,7 @@ mod workflow_def_tests {
         );
         // A fresh id whose check is neither flagged nor pinned registers exactly as written.
         reg.register(WorkflowDef {
+            base_skill_ref: None,
             id: "wf-unverified".to_string(),
             phases: vec![
                 PhaseDef::new("work", StageKind::Build)

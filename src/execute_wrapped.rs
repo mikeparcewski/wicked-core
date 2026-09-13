@@ -3633,7 +3633,7 @@ pub(crate) fn skill_prompt(
     form: SkillForm,
     skills: Option<&SkillsSnapshot>,
 ) -> String {
-    let base = match unit.skill_ref.as_deref() {
+    let phase = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => {
             // NOT a slash line: plugin SKILLS are not slash commands — a "/name" prompt hits the
             // CLI's command parser and dies as "Unknown command" in ANY name form (core#126,
@@ -3663,11 +3663,20 @@ pub(crate) fn skill_prompt(
         }
         _ => unit.description.clone(),
     };
-    // Engine-internal judge/triage prompts are fully authored — no conventions appendix, and no
-    // layout either (their verdict contracts must stay byte-exact).
+    // Engine-internal judge/triage prompts are fully authored — no conventions appendix, no
+    // layout, and no base directive either (their verdict contracts must stay byte-exact).
     if is_engine_internal(unit) {
-        return base;
+        return phase;
     }
+    // core#468: the run's BASE skill LEADS the prompt — the role-keyed discipline the worker
+    // follows for the whole unit — and the phase directive follows it. Both spellings come from
+    // the same `form`/`skills` resolution, so a seat can never be told two different things about
+    // how it invokes a skill. Short by contract (`BASE_SKILL_DIRECTIVE_MAX`): the skill text is in
+    // the snapshot; this line only names it and the section.
+    let lead = match base_skill_directive(unit, form, skills) {
+        Some(directive) => format!("{directive} {phase}"),
+        None => phase,
+    };
     // FINDING-048: the unit knows WHAT to do and nothing about WHERE. 12 of 32 pilot sessions burned
     // turns on `cd: no such file or directory` guessing at a monorepo's shape. One line up front is
     // cheaper than the turns it saves. Placed before the conventions appendix so the appendix stays
@@ -3675,8 +3684,50 @@ pub(crate) fn skill_prompt(
     let layout = layout
         .map(|l| format!("{LAYOUT_PREFIX}{l}"))
         .unwrap_or_default();
-    format!("{base}{layout}{}", crate::assumptions::PROMPT_CONVENTION)
+    format!("{lead}{layout}{}", crate::assumptions::PROMPT_CONVENTION)
 }
+
+/// The BASE skill directive (core#468) that LEADS a work unit's prompt when its run declares one
+/// (`WorkUnit::base_skill_ref`): the role-keyed discipline the worker follows for the whole unit,
+/// BEFORE the phase directive built from `skill_ref`. Spelled per CLI exactly like the phase
+/// directive ([`SkillForm`], [`plugin_skill_invocation`]) and keyed on the unit's
+/// [`PhaseRole`](crate::workflow::PhaseRole) — `§creator` / `§evaluator` / `§neutral` — so ONE
+/// skill text tells a creator to run the repo's checks before declaring done and an evaluator to
+/// write nothing into the tree. Kept SHORT by contract: the assembled prompt rides a single pty
+/// line on the session runner ([`PTY_PROMPT_LIMIT`]), so the directive names the skill and the
+/// section and nothing more — the discipline itself lives in the skills snapshot. `None` when the
+/// unit has no base skill (or an empty one — the same "no skill" reading `skill_ref` gets).
+pub(crate) fn base_skill_directive(
+    unit: &WorkUnit,
+    form: SkillForm,
+    skills: Option<&SkillsSnapshot>,
+) -> Option<String> {
+    let base = unit.base_skill_ref.as_deref().filter(|s| !s.is_empty())?;
+    let name = plugin_skill_invocation(base, form, skills);
+    let role = unit.role.token();
+    Some(match form {
+        SkillForm::ClaudePlugin => format!(
+            "Invoke your skill \"{name}\" (via the Skill tool) and follow its §{role} section; then:"
+        ),
+        SkillForm::MirroredName => {
+            format!("Use your skill \"{name}\" and follow its §{role} section; then:")
+        }
+        // v3.2 §3: names the discipline, does not claim it is loaded — this CLI has no per-launch
+        // delivery, and the base skill is existence-only (never a seat refusal), so this spelling
+        // IS reached in production for such a seat.
+        SkillForm::Unloaded => format!(
+            "Your discipline is the skill \"{name}\" §{role} (NOT loaded in this session); then:"
+        ),
+    })
+}
+
+/// The byte ceiling the base skill directive is held to (core#468). The pty line budget is
+/// [`PTY_PROMPT_LIMIT`] and the conventions appendix already spends 514 of it, so every byte here
+/// is a byte of task text a pty-routed unit cannot carry; the directive names the skill and the
+/// role section and nothing else. Pinned by a test over the longest spelling with the real name
+/// (test-only: a custom base skill with a longer name is the operator's budget to spend).
+#[cfg(test)]
+pub(crate) const BASE_SKILL_DIRECTIVE_MAX: usize = 120;
 
 /// Frames the [`crate::repo::worktree_layout`] map inside a prompt. Single-line, like everything else
 /// appended here — the PTY session runner writes prompts line-based.
@@ -6740,6 +6791,201 @@ mod tests {
             "{unloaded}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#468: the BASE skill directive leads every work unit's prompt when the run declares
+    /// one — role-keyed (`§creator` / `§evaluator` / `§neutral`), spelled per CLI exactly as the
+    /// phase directive is, AHEAD of the phase directive (both present when both are set, the
+    /// phase half byte-exact), discovered from the snapshot's index when one is in hand, never
+    /// on an engine-internal judge/triage prompt, absent when the unit has none — and under
+    /// [`BASE_SKILL_DIRECTIVE_MAX`] bytes in every spelling with the real skill name and the
+    /// longest role, so the pty line keeps its task-text budget.
+    #[test]
+    fn the_base_skill_directive_is_role_keyed_cli_aware_and_short() {
+        use crate::skills_snapshot::test_support::{gen_dir, load, scratch, snapshot_root};
+        use crate::workflow::PhaseRole;
+        let appendix = crate::assumptions::PROMPT_CONVENTION;
+        let base = "wicked-garden-governed-worker";
+        let mk = |role: PhaseRole| {
+            let mut u = WorkUnit::pending("s:phase", "s", 3, "triage the report");
+            u.base_skill_ref = Some(base.to_string());
+            u.role = role;
+            u
+        };
+        let roles = [
+            (PhaseRole::Neutral, "neutral"),
+            (PhaseRole::Creator, "creator"),
+            (PhaseRole::Evaluator, "evaluator"),
+        ];
+        for (role, token) in roles {
+            let u = mk(role);
+            assert_eq!(
+                skill_prompt(&u, None, SkillForm::ClaudePlugin, None),
+                format!(
+                    "Invoke your skill \"wicked-garden:governed-worker\" (via the Skill tool) and \
+                     follow its §{token} section; then: triage the report{appendix}"
+                ),
+                "claude: plugin form, Skill-tool clause, §{token}"
+            );
+            let mirrored = skill_prompt(&u, None, SkillForm::MirroredName, None);
+            assert_eq!(
+                mirrored,
+                format!(
+                    "Use your skill \"wicked-garden-governed-worker\" and follow its §{token} \
+                     section; then: triage the report{appendix}"
+                )
+            );
+            assert!(
+                !mirrored.contains("Skill tool") && !mirrored.contains("wicked-garden:"),
+                "no Skill-tool clause and no plugin spelling for a non-Claude CLI: {mirrored}"
+            );
+            let unloaded = skill_prompt(&u, None, SkillForm::Unloaded, None);
+            assert!(
+                unloaded.starts_with(&format!(
+                    "Your discipline is the skill \"wicked-garden-governed-worker\" §{token} (NOT \
+                     loaded in this session); then: triage the report"
+                )) && !unloaded.contains("Invoke your skill")
+                    && !unloaded.contains("Use your skill"),
+                "{unloaded}"
+            );
+            for form in [
+                SkillForm::ClaudePlugin,
+                SkillForm::MirroredName,
+                SkillForm::Unloaded,
+            ] {
+                let d = base_skill_directive(&u, form, None).expect("a base skill is set");
+                assert!(
+                    d.len() <= BASE_SKILL_DIRECTIVE_MAX,
+                    "{:?} directive is {} bytes, over {BASE_SKILL_DIRECTIVE_MAX}: {d}",
+                    form,
+                    d.len()
+                );
+                assert!(!d.contains('\n'), "single-line by contract: {d}");
+            }
+        }
+        // Both directives when both are set: the base leads, the phase half is byte-exact.
+        let mut both = mk(PhaseRole::Creator);
+        both.skill_ref = Some("wicked-garden-domain".to_string());
+        assert_eq!(
+            skill_prompt(&both, None, SkillForm::ClaudePlugin, None),
+            format!(
+                "Invoke your skill \"wicked-garden:governed-worker\" (via the Skill tool) and follow \
+                 its §creator section; then: Invoke your skill \"wicked-garden:domain\" (via the \
+                 Skill tool) and complete this task under its instructions: triage the report{appendix}"
+            )
+        );
+        // The layout map still sits between the task and the appendix.
+        let map = "src/ [Cargo.toml]";
+        let with_map = skill_prompt(
+            &mk(PhaseRole::Neutral),
+            Some(map),
+            SkillForm::MirroredName,
+            None,
+        );
+        assert!(
+            with_map.ends_with(&format!("triage the report{LAYOUT_PREFIX}{map}{appendix}")),
+            "{with_map}"
+        );
+        // With a snapshot in hand the identity is RESOLVED from its index (ref → entry → top-level
+        // dir), exactly as the phase skill's is — and the mirrors get the indexed frontmatter name.
+        let scratch_root = scratch("base-directive");
+        let snap = load(&snapshot_root(
+            &gen_dir(&scratch_root, "5"),
+            "5",
+            &[("governed-worker", base)],
+        ));
+        let indexed = skill_prompt(
+            &mk(PhaseRole::Evaluator),
+            None,
+            SkillForm::ClaudePlugin,
+            Some(&snap),
+        );
+        assert!(
+            indexed.starts_with(
+                "Invoke your skill \"wicked-garden:governed-worker\" (via the Skill tool) and \
+                 follow its §evaluator section; then:"
+            ),
+            "{indexed}"
+        );
+        assert_eq!(
+            base_skill_directive(&mk(PhaseRole::Creator), SkillForm::MirroredName, Some(&snap))
+                .unwrap(),
+            "Use your skill \"wicked-garden-governed-worker\" and follow its §creator section; then:"
+        );
+        let _ = std::fs::remove_dir_all(&scratch_root);
+        // An empty base is no base; engine-internal prompts stay byte-exact even when handed one.
+        let mut none = mk(PhaseRole::Creator);
+        none.base_skill_ref = Some(String::new());
+        assert_eq!(
+            skill_prompt(&none, None, SkillForm::ClaudePlugin, None),
+            format!("triage the report{appendix}")
+        );
+        assert!(base_skill_directive(&none, SkillForm::ClaudePlugin, None).is_none());
+        for internal in ["validator", "triage"] {
+            let mut j = WorkUnit::pending("agent", internal, 1, "judge this");
+            j.base_skill_ref = Some(base.to_string());
+            assert_eq!(
+                skill_prompt(&j, None, SkillForm::ClaudePlugin, None),
+                "judge this",
+                "{internal} verdict contracts carry no base directive"
+            );
+        }
+    }
+
+    /// core#468 × the PTY line budget: a unit carrying the base skill still fits one terminal
+    /// line WITH a trimmed worktree map, and the directive's cost against the task-text budget is
+    /// bounded by [`BASE_SKILL_DIRECTIVE_MAX`] (+ the joining space) — measured on the assembled
+    /// prompt, not asserted from the constant.
+    #[test]
+    fn a_base_skill_directive_leaves_the_pty_line_its_task_budget() {
+        let root = std::env::temp_dir().join(format!("wicked-ptybase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for i in 0..40 {
+            std::fs::create_dir_all(root.join(format!("service-{i:03}"))).unwrap();
+            std::fs::write(root.join(format!("service-{i:03}")).join("Cargo.toml"), "").unwrap();
+        }
+        let mut unit = WorkUnit::pending("s:fix", "s", 3, "fix the API");
+        unit.role = crate::workflow::PhaseRole::Creator;
+        let mut input = StepInput {
+            run_id: "pty-base".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(root.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let claude = SkillForm::ClaudePlugin;
+        let without = skill_prompt(&input.unit, None, claude, None);
+        input.unit.base_skill_ref = Some("wicked-garden-governed-worker".to_string());
+        let with = skill_prompt(&input.unit, None, claude, None);
+        assert!(
+            with.len() - without.len() <= BASE_SKILL_DIRECTIVE_MAX + 1,
+            "the base directive costs {} bytes of the line: {with}",
+            with.len() - without.len()
+        );
+        let p = pty_unit_prompt(&input, claude).expect("a short description plus the base fits");
+        // The submitting newline occupies the same buffer, so the prompt itself must be shorter.
+        assert!(
+            p.len() < PTY_PROMPT_LIMIT,
+            "{} bytes with the newline: {p}",
+            p.len() + 1
+        );
+        assert!(
+            p.starts_with("Invoke your skill \"wicked-garden:governed-worker\" (via the Skill tool) and follow its §creator section; then: fix the API"),
+            "{p}"
+        );
+        assert!(
+            p.contains("service-000/ [Cargo.toml]"),
+            "the map still reaches the worker beside the directive: {p}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// FINDING-048. Three things have to hold at once for the map to be worth carrying: a real unit

@@ -50,6 +50,14 @@ Only `id` is required on a phase — everything else defaults:
 }
 ```
 
+## Workflow fields
+
+| Field | Default | Meaning |
+|---|---|---|
+| `id` | *(required)* | The workflow id a launch names (`--workflow <id>`). A drop-in whose `id` matches a built-in replaces it. |
+| `phases` | *(required)* | The ordered phases — see *Phase fields*. |
+| `base_skill_ref` | *(absent)* | The BASE skill every **agent** phase of this workflow follows (core#468): the engine leads every unit prompt with `Invoke your skill "<base>" … and follow its §<role> section` (`creator` \| `evaluator` \| `neutral`, from the phase's `role`) before the phase's own `skill_ref` directive. Absent ⇒ the engine-config default `WICKED_BASE_SKILL_REF` (unset ⇒ no base skill); `""` ⇒ an explicit opt-out for this workflow. Gated at intake: a run whose skills snapshot lacks the skill is refused before any unit is planned. Never narrows seat selection. |
+
 ## Phase fields
 
 | Field | Default | Meaning |

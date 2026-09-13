@@ -718,6 +718,7 @@ mod tests {
     /// session runner sends prompts via stdin, not as an argv element).
     fn make_unit(description: &str, invocation: &str) -> WorkUnit {
         WorkUnit {
+            base_skill_ref: None,
             id: "u-test".to_string(),
             session_id: "sess-test".to_string(),
             ord: 1,

@@ -400,6 +400,19 @@ pub struct WorkUnit {
     /// `allowed_skills`. The runner passes it as the invocation's skill/tool scope. Empty ⇒ unscoped.
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// The BASE skill this unit follows (core#468) — the run's role-keyed discipline skill,
+    /// resolved at plan time from the workflow def's `base_skill_ref` (else the engine-config
+    /// default, `workflow::BASE_SKILL_REF_ENV`) and copied onto every AGENT unit of the run
+    /// (`plan::apply_base_skill`); never onto a Tool unit, which has no prompt. The prompt
+    /// builder LEADS with `Invoke your skill "<base>" … and follow its §<role> section` — `role`
+    /// from [`Self::role`] — ahead of the phase directive built from [`Self::skill_ref`]
+    /// (`execute_wrapped::base_skill_directive`). Judged for EXISTENCE at intake
+    /// (`skills_snapshot::admit_base_skill`) and plan-wide at every launch (it rides
+    /// `StepInput::required_skills`), never for seat portability — a base skill must not narrow
+    /// routing. `None` ⇒ no base directive. `#[serde(default)]` + skip-if-none: units persisted
+    /// before this field deserialize, and runs without a base skill serialize byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_skill_ref: Option<String>,
     /// The backing phase's declared human-confirm gate (DES-EXEC-001 §3) — carried from the phase's
     /// `GateSpec` so the def, not just the run-level `--confirm` flag, drives when a run pauses for a
     /// human. A phase's gate fires AFTER its work (before the next unit). `Auto` (the default) ⇒ defer
@@ -683,6 +696,7 @@ impl WorkUnit {
             collection_scope: None,
             skill_ref: None,
             allowed_skills: Vec::new(),
+            base_skill_ref: None,
             gate: crate::workflow::GateSpec::default(),
             role: crate::workflow::PhaseRole::default(),
             validator: None,

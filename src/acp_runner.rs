@@ -12941,6 +12941,7 @@ os_sandbox = true
     #[allow(dead_code)]
     fn claude_unit_running_echo() -> crate::domain::WorkUnit {
         crate::domain::WorkUnit {
+            base_skill_ref: None,
             id: "u-gov".to_string(),
             session_id: "run-gov".to_string(),
             ord: 1,

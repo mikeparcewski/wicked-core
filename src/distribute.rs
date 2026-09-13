@@ -1923,6 +1923,68 @@ mod tests {
         );
     }
 
+    /// core#468: the run's BASE skill is EXISTENCE-only — it never joins the seat requirement, so a
+    /// `portable: false` base skill neither narrows the candidates onto claude nor records a
+    /// constraint: the council convenes over the WHOLE roster exactly as for a skill-free unit,
+    /// with or without a portable phase `skill_ref` beside it. Mutation: feed `base_skill_ref`
+    /// into `seat_requirement` inside `seat_candidates` and both units collapse onto claude with
+    /// a constraint naming `wicked-garden-repo-learn`.
+    #[test]
+    fn a_nonportable_base_skill_never_narrows_seating_onto_claude() {
+        let (_home, _env, _) = hermetic_home("route-base-skill-home");
+        let snapshot = published("route-base-skill");
+        let roster = [
+            seat_running("copilot", "copilot"),
+            seat_running("claude", "claude"),
+            seat_running("pi", "pi"),
+        ];
+        // The live shape: `wicked-garden-repo-learn` is `portable: false` in this generation.
+        let mut bare = WorkUnit::pending("u1", "s1", 1, "Triage the report");
+        bare.base_skill_ref = Some("wicked-garden-repo-learn".to_string());
+        let mut with_phase_skill = skilled(2, "wicked-garden-search");
+        with_phase_skill.base_skill_ref = Some("wicked-garden-repo-learn".to_string());
+
+        let (dispatcher, calls) = spy();
+        let (relay, convened) = convened_seats();
+        let dists = distribute_units_against(
+            &[bare, with_phase_skill],
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            Some(relay),
+            Some(&snapshot),
+            None,
+        )
+        .expect("a base skill constrains nothing at distribution");
+        assert_eq!(dists.len(), 2);
+        for (d, ord) in dists.iter().zip([1u32, 2]) {
+            assert!(
+                d.seat_constraint.is_none(),
+                "unit {ord}: no constraint is recorded, got {:?}",
+                d.seat_constraint
+            );
+            assert_eq!(
+                d.assigned_cli, "copilot",
+                "unit {ord}: the spy votes option 1 of the FULL roster"
+            );
+        }
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the council genuinely convened for both units"
+        );
+        let full: Vec<String> = vec!["copilot".into(), "claude".into(), "pi".into()];
+        // The two councils report in whatever order their threads land; the claim is about WHICH
+        // seats each convened over, not their interleaving.
+        let mut seen = convened.lock().unwrap().clone();
+        seen.sort_by_key(|(ord, _)| *ord);
+        assert_eq!(
+            seen,
+            vec![(1, full.clone()), (2, full)],
+            "…over every roster seat, both times"
+        );
+    }
+
     /// A Claude-less roster cannot seat a non-portable skill anywhere, so the run is refused at
     /// DISTRIBUTION — plan-wide, before any unit ran (the skill-free first unit included), with no
     /// council convened — naming the skill, its portability, the seat kind required and the roster

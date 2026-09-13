@@ -34,6 +34,21 @@ pub struct InjectedContext {
     pub output_bytes: usize,
 }
 
+/// (core#468) The BASE skill directive a dispatch carries — the run's role-keyed discipline
+/// skill (`WorkUnit::base_skill_ref`) and the `§<role>` section the unit was told to follow
+/// (`creator` | `evaluator` | `neutral`). Rides [`CoreEvent::UnitDispatched`] as `baseSkill`
+/// (`null` when the run declares none) so crew/studio can disclose "discipline: <name> §<role>"
+/// per unit; the generation it is handed from is the same unit's `skillsSnapshotHanded.gen` —
+/// the handoff is the one place the generation is known truthfully (a cached ACP session keeps
+/// the one it was opened with, whatever `current` points at by then).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BaseSkill {
+    /// The skill's frontmatter name as the def/config spells it (`wicked-garden-governed-worker`).
+    pub name: String,
+    /// The role section: `creator` | `evaluator` | `neutral` (`PhaseRole::token`).
+    pub role: String,
+}
+
 /// An event emitted by the core runtime as work progresses. Cheap to clone (fanned out to every
 /// subscriber). The taxonomy mirrors the plan → distribute → execute → evidence pipeline; P1 emits
 /// only `Heartbeat` (the rest land when the pipeline is lifted in P2).
@@ -303,6 +318,9 @@ pub enum CoreEvent {
         session: String,
         ord: u32,
         attempt: u32,
+        /// (core#468) The BASE skill directive this dispatch carries — `{name, role}`, see
+        /// [`BaseSkill`]. `None` (wire `null`) when the run declares no base skill. Additive.
+        base_skill: Option<BaseSkill>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B3) Token/cost burn for one unit run, emitted after the unit completes.
     /// `cost_usd` is `Some` when the CLI reports cost directly (claude) or a price table resolves it, else
@@ -1301,8 +1319,20 @@ impl CoreEvent {
                 session,
                 ord,
                 attempt,
+                base_skill,
             } => {
-                json!({ "type": "unitDispatched", "session": session, "ord": ord, "attempt": attempt })
+                // (core#468) `baseSkill` is emitted unconditionally — `null` when the run has
+                // none — the `degradedReason` rule: a consumer never guesses whether an absent
+                // key means "no base skill" or "field not sent".
+                json!({
+                    "type": "unitDispatched",
+                    "session": session,
+                    "ord": ord,
+                    "attempt": attempt,
+                    "baseSkill": base_skill
+                        .as_ref()
+                        .map(|b| json!({ "name": b.name, "role": b.role })),
+                })
             }
             // (DES-STUDIO-COCKPIT-001 §3 B3) Token/cost burn for one unit run. `costUsd` is nullable
             // (`None` → null when the CLI reports no cost and no price table resolves it).
@@ -2168,6 +2198,38 @@ mod tests {
         );
         assert!(
             j["judgeCli"].is_null() && j["judgeDistinct"].is_null(),
+            "{j}"
+        );
+    }
+
+    /// core#468: `unitDispatched` carries the base skill directive as `baseSkill: {name, role}`,
+    /// and `null` — the key present — when the run declares none. Mutation: drop `baseSkill`
+    /// from the arm and both blocks fail.
+    #[test]
+    fn unit_dispatched_carries_the_base_skill_or_null() {
+        let j = CoreEvent::UnitDispatched {
+            session: "run-1".into(),
+            ord: 4,
+            attempt: 1,
+            base_skill: Some(BaseSkill {
+                name: "wicked-garden-governed-worker".into(),
+                role: "evaluator".into(),
+            }),
+        }
+        .to_json();
+        assert_eq!(j["type"], "unitDispatched");
+        assert_eq!(j["attempt"], 1);
+        assert_eq!(j["baseSkill"]["name"], "wicked-garden-governed-worker");
+        assert_eq!(j["baseSkill"]["role"], "evaluator");
+        let j = CoreEvent::UnitDispatched {
+            session: "run-1".into(),
+            ord: 4,
+            attempt: 0,
+            base_skill: None,
+        }
+        .to_json();
+        assert!(
+            j.as_object().unwrap().contains_key("baseSkill") && j["baseSkill"].is_null(),
             "{j}"
         );
     }

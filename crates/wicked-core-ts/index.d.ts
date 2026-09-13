@@ -711,6 +711,9 @@ export declare class Subscription {
  * the assigned seat runs under — 'advisory' = no OS write boundary on the seat record, command-text
  * fences + worktree guard only); worktreeRetained {session, path, reason} (a terminal run's worktree
  * kept because it holds uncommitted work — cancel included).
+ * core#468 (additive): unitDispatched carries `baseSkill: {name, role} | null` — the run's
+ * role-keyed BASE skill directive (`role` is 'creator' | 'evaluator' | 'neutral'), null when the
+ * run declares none; the generation it is handed from is the same unit's skillsSnapshotHanded.gen.
  */
 export interface CoreEventJson {
   type: string

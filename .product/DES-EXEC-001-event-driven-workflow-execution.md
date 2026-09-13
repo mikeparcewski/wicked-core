@@ -527,6 +527,47 @@ exactly as `WorkflowDef` is at the *orchestration* layer. Three additions:
   and the reviewer are all just skills with their own per-phase allowlists, provisioned identically.
   The two-strategist independence (rev0.4) is two skill invocations under two distinct seats.
 
+### 4.3 The BASE skill — one role-keyed discipline directive on EVERY unit (core#468, 2026-09-13)
+
+§4.1's `skill_ref` is per phase and optional; the 2026-09-13 acceptance ledger (F-RC1-060/070/071,
+F-RC2-037/038) showed the failures that lose runs are cross-cutting discipline lapses — an evaluator
+writing into the tree, a creator declaring green without running the checks, a neutral rung
+implementing, a headless worker asking "shall I proceed?" — that no per-phase skill reaches. The
+fix is an ENGINE-level second directive, independent of `skill_ref`:
+
+- **`WorkflowDef.base_skill_ref: Option<String>`** (drop-in JSON, serde-default; absent on the wire
+  when unset so the shipped mirrors stay byte-identical) with an engine-config default
+  `WICKED_BASE_SKILL_REF`. Precedence: the def's field wins (a name, or the explicit `""` opt-out);
+  else the default; blank = none. Resolved once at the plan choke point (`pipeline::pre_distribute`)
+  and copied onto every AGENT unit as `WorkUnit.base_skill_ref` (`plan::apply_base_skill`) — never a
+  Tool unit (no prompt), def-driven and prose-planned runs alike.
+- **The prompt LEADS with it** (`execute_wrapped::base_skill_directive`, then the §4.1 phase
+  directive): `Invoke your skill "<base>" (via the Skill tool) and follow its §<role> section; then:
+  <phase directive or description>`, `role` = the unit's `PhaseRole` token (`creator` | `evaluator`
+  | `neutral`) — ONE skill text, three sections, the engine picks the section. Spelled per CLI with
+  the same `SkillForm` the phase directive uses (plugin form + Skill-tool clause for Claude, the
+  mirrored frontmatter name for the mirrors, the "NOT loaded" form for a lever-less seat). Held to
+  `BASE_SKILL_DIRECTIVE_MAX` (120 bytes): the assembled prompt rides a single pty line
+  (`PTY_PROMPT_LIMIT`), so the directive names the skill and the section and nothing else — the
+  discipline text lives in the skills snapshot. Engine-internal judge/triage prompts carry none.
+- **Gated at INTAKE, not at the first worker** (`skills_snapshot::admit_base_skill`): the skills
+  ladder is resolved and the base skill must EXIST (mandates included) before anything is planned or
+  persisted — on the actor's synchronous launch path (a launch `Err` naming the skill, no session)
+  and in `pre_distribute` (the `run_session` / re-plan choke point) — as
+  `SkillsError::BaseSkillRefused { skill, cause }`. It also rides `StepInput::required_skills`, so
+  every launch re-judges existence plan-wide.
+- **Existence-only — never a seat requirement.** The base skill joins the `plan` half of
+  `RequiredRefs` and never the `seat` half: it is not judged for a seat's portability or
+  invocability and `distribute::seat_candidates` never reads it, so a `portable: false` base skill
+  cannot collapse routing onto claude (pinned by `distribute` test with a non-portable fixture). A
+  discipline skill is plain text by contract (garden lint); its deliverability is the publisher's.
+- **Wire**: `unitDispatched.baseSkill: {name, role} | null` (additive, emitted unconditionally); the
+  generation it is handed from is the same unit's `skillsSnapshotHanded.gen` — the handoff is where
+  the generation is known truthfully (a cached ACP session keeps the one it was opened with).
+- **Ownership**: the engine ships the mechanism, default OFF. wicked-crew sets the default
+  (`wicked-garden-governed-worker`, crew#554) and discloses it; wicked-garden authors the skill
+  (garden#1131: `## creator` / `## evaluator` / `## neutral` sections, cross-CLI plain text).
+
 ---
 
 ## 5. Composition — self-contained by default, Campaign for cross-workflow
