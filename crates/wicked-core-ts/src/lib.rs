@@ -2165,6 +2165,7 @@ mod tests {
             dissent: None,
             degraded_reason: None,
             seat_constraint: None,
+            distinctness_fallback: None,
         });
         for key in emitted.as_object().expect("object").keys() {
             assert!(
@@ -2298,6 +2299,7 @@ mod tests {
                 dissent: None,
                 degraded_reason: None,
                 seat_constraint: None,
+                distinctness_fallback: None,
             },
             "unitDistributed",
             &[
@@ -2318,6 +2320,10 @@ mod tests {
                 // the unit's skill is Claude-only in the handed snapshot. Additive; emitted
                 // unconditionally (null when unconstrained), the `degradedReason` rule.
                 "seatConstraint",
+                // (core#461) The evaluator≠creator fallback as a field (`"creator_seat"` | null):
+                // a review/test unit that stays on a builder seat because no distinct eligible seat
+                // admits it. Additive; emitted unconditionally.
+                "distinctnessFallback",
             ],
         );
         check(

@@ -28,7 +28,7 @@ use wicked_core::{
     Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, RepoSpec, StepInput, StepOutput,
     StepRunner, StepStatus,
 };
-use wicked_council::types::{Confidence, Dispatcher, Vote};
+use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, SeatHealth, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 /// Per-process fixture root: the stub `wicked-estate`, its argv log, and the repo-graph root the
@@ -392,6 +392,135 @@ fn a_plan_with_an_agent_unit_launched_with_no_seats_is_still_refused() {
             .iter()
             .any(|e| matches!(e, CoreEvent::UnitDistributed { session, .. } if session == sid)),
         "nothing is distributed when a unit needs a seat and none is configured"
+    );
+    assert_eq!(
+        dispatcher.0.load(Ordering::SeqCst),
+        0,
+        "no ballot dispatched"
+    );
+}
+
+// ── core#461 / F-RC2-041: a roster with NO eligible seat is refused at INTAKE ────────────────
+
+/// A seat the launcher's health probe declared unusable — crew's roster after a refusal cascade
+/// (run e5999520: "5 of 5 seats benched", accepted, dead 2 s later at distribution).
+fn dead_seat(key: &str, reason: &str) -> AgenticCli {
+    AgenticCli {
+        key: key.into(),
+        display_name: key.into(),
+        binary: key.into(),
+        alt_binaries: Vec::new(),
+        headless_invocation: format!("{key} -p {{PROMPT}}"),
+        category: Category::AgenticCoder,
+        input_mode: InputMode::PromptArg,
+        version_probe: Vec::new(),
+        trust_flags: Vec::new(),
+        confidence: Confidence::default(),
+        enabled_for_council: true,
+        acp: None,
+        capabilities: None,
+        login_invocation: None,
+        health: Some(SeatHealth::unusable(reason)),
+    }
+}
+
+/// (core#461 d) A plan that NEEDS a seat, launched on a roster whose every seat the launcher
+/// declared unusable, is refused by `launch_run` itself — naming each seat and its cause — with
+/// no session persisted and nothing on the wire. Not a run that dies at distribution.
+#[test]
+fn a_roster_with_no_eligible_seat_is_refused_at_launch_by_name() {
+    let dispatcher = Arc::new(CountingDispatcher(AtomicUsize::new(0)));
+    let runner = Arc::new(CountingRunner(AtomicUsize::new(0)));
+    let core = Core::spawn_with_engine(db_path("dead-roster"), dispatcher.clone(), runner.clone());
+    core.register_workflow(
+        serde_json::json!({
+            "id": "fe2e011-dead-roster",
+            "phases": [
+                {"id": "index", "kind": "recon",
+                 "executor": {"type": "tool", "cmd": ["echo", "indexed"]}},
+                {"id": "implement", "kind": "build", "depends_on": ["index"]}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("register the mixed workflow");
+    let ev = core.subscribe();
+    let sid = "fe2e011-dead-roster";
+    let mut launch = spec(sid, "fe2e011-dead-roster", None);
+    launch.clis = vec![
+        dead_seat("codex", "signed out"),
+        dead_seat("pi", "inactive after a seat-level error"),
+    ];
+    let err = core
+        .launch_run(launch)
+        .expect_err("a roster with no eligible seat is refused at intake");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no eligible seat")
+            && msg.contains("2 of 2 seats benched")
+            && msg.contains("codex (signed out — launcher)")
+            && msg.contains("pi (inactive after a seat-level error — launcher)")
+            && msg.contains("sign a seat in"),
+        "the refusal names every seat and its cause: {msg}"
+    );
+    assert!(
+        err.downcast_ref::<wicked_core::NoEligibleSeat>().is_some(),
+        "a TYPED intake error (the RunBusy / RunExists rule), not a bare string: {msg}"
+    );
+    assert!(
+        core.sessions_detail()
+            .expect("views")
+            .iter()
+            .all(|v| v.session.id != sid),
+        "no session is persisted for a refused launch"
+    );
+    assert!(
+        ev.recv_timeout(Duration::from_millis(300)).is_err(),
+        "nothing reaches the wire for a refused launch"
+    );
+    assert_eq!(
+        dispatcher.0.load(Ordering::SeqCst),
+        0,
+        "no ballot dispatched"
+    );
+    assert_eq!(runner.0.load(Ordering::SeqCst), 0, "no worker turn");
+}
+
+/// Control (core#461 d): the SAME dead roster on a TOOL-ONLY def is accepted — rule 0 needs no
+/// seat (F-E2E-011), so the intake check judges only a plan that does.
+#[test]
+fn a_tool_only_plan_on_a_dead_roster_is_still_accepted() {
+    let dispatcher = Arc::new(CountingDispatcher(AtomicUsize::new(0)));
+    let core = Core::spawn_with_engine(
+        db_path("dead-roster-tools"),
+        dispatcher.clone(),
+        Arc::new(CountingRunner(AtomicUsize::new(0))),
+    );
+    core.register_workflow(
+        serde_json::json!({
+            "id": "fe2e011-dead-roster-tools",
+            "phases": [
+                {"id": "index", "kind": "recon",
+                 "executor": {"type": "tool", "cmd": ["echo", "indexed"]}}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("register the tool-only workflow");
+    let ev = core.subscribe();
+    let sid = "fe2e011-dead-roster-tools";
+    let mut launch = spec(sid, "fe2e011-dead-roster-tools", None);
+    launch.clis = vec![
+        dead_seat("codex", "signed out"),
+        dead_seat("pi", "signed out"),
+    ];
+    core.launch_run(launch)
+        .expect("a tool-only plan needs no seat, dead roster or not");
+    let events = drain_until_terminal(&ev, sid);
+    let errs = errors(&events, sid);
+    assert!(
+        !errs.iter().any(|m| m.contains("no eligible seat")),
+        "the dead roster was refused for a plan that seats nobody: {errs:?}"
     );
     assert_eq!(
         dispatcher.0.load(Ordering::SeqCst),

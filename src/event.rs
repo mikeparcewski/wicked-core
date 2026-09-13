@@ -131,6 +131,13 @@ pub enum CoreEvent {
         /// roster seat was a candidate. Additive: `routing_method` and its fields read exactly as
         /// before; a one-candidate narrowing is the truthful 1-of-1 `council` verdict.
         seat_constraint: Option<String>,
+        /// (core#461) The evaluator≠creator DISCLOSURE as a field: `Some("creator_seat")` when a
+        /// review/test unit STAYS on a seat that built what it checks because no eligible seat
+        /// distinct from the builders admits it — a single-eligible-seat roster, or a bench that
+        /// emptied the pool (`degraded_reason` then says which); `None` (wire `null`) otherwise.
+        /// The fallback seat is always a still-eligible one. Additive; emitted unconditionally,
+        /// the `degraded_reason` rule.
+        distinctness_fallback: Option<String>,
     },
     /// The council was convened to pick a CLI for a unit (distribution vote started).
     CouncilConvened {
@@ -1230,6 +1237,7 @@ impl CoreEvent {
                 dissent,
                 degraded_reason,
                 seat_constraint,
+                distinctness_fallback,
             } => {
                 json!({
                     "type": "unitDistributed",
@@ -1246,6 +1254,8 @@ impl CoreEvent {
                     // consumer never has to guess whether absence means "no constraint" or "field
                     // not sent" (core#401).
                     "seatConstraint": seat_constraint,
+                    // (core#461) Same rule: a consumer keys on `"creator_seat"`, never on prose.
+                    "distinctnessFallback": distinctness_fallback,
                 })
             }
             CoreEvent::CouncilConvened { session, ord, clis } => json!({
@@ -2203,6 +2213,7 @@ mod tests {
             dissent: Some(0),
             degraded_reason: None,
             seat_constraint: seat_constraint.map(str::to_string),
+            distinctness_fallback: None,
         };
         let j = ev(Some(
             "the skills snapshot marks wicked-garden-repo-learn as portable: false",
@@ -2222,6 +2233,41 @@ mod tests {
             "emitted unconditionally: {j}"
         );
         assert!(j["seatConstraint"].is_null(), "{j}");
+    }
+
+    /// core#461: `unitDistributed` carries `distinctnessFallback` — the evaluator≠creator fallback
+    /// as a FIELD (`"creator_seat"` when a review/test unit stays on a builder seat because no
+    /// distinct eligible seat admits it) — additively and unconditionally (`null` otherwise), the
+    /// `seatConstraint` rule. Mutation: drop the key from the to_json arm and the first assertion
+    /// fails; make it skip-if-none and the second does.
+    #[test]
+    fn unit_distributed_to_json_carries_the_distinctness_fallback_additively() {
+        let ev = |fallback: Option<&str>| CoreEvent::UnitDistributed {
+            session: "run-1".into(),
+            ord: 2,
+            cli: "claude".into(),
+            routing_method: "council".into(),
+            agreement_pct: Some(100),
+            returned: Some(1),
+            seated: Some(1),
+            dissent: Some(0),
+            degraded_reason: None,
+            seat_constraint: None,
+            distinctness_fallback: fallback.map(str::to_string),
+        };
+        let j = ev(Some("creator_seat")).to_json();
+        assert_eq!(j["type"], "unitDistributed");
+        assert_eq!(j["distinctnessFallback"], "creator_seat");
+        assert_eq!(
+            j["routingMethod"], "council",
+            "the routing fields read as before"
+        );
+        let j = ev(None).to_json();
+        assert!(
+            j.as_object().unwrap().contains_key("distinctnessFallback"),
+            "emitted unconditionally: {j}"
+        );
+        assert!(j["distinctnessFallback"].is_null(), "{j}");
     }
 
     /// F-031: `councilSeatFailed` carries the seat's stdout TAIL and the classified `reason`

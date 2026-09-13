@@ -156,6 +156,7 @@ impl Worker {
             votes: Vec::new(),
             verdict: None,
             seat_failures: Vec::new(),
+            seat_failure_history: Vec::new(),
             failure_detail: None,
         });
 
@@ -242,6 +243,7 @@ impl Worker {
             pending: rec.convened.len().saturating_sub(rec.votes.len()) as u32,
             verdict: rec.verdict,
             seat_failures: rec.seat_failures,
+            seat_failure_history: rec.seat_failure_history,
         })
     }
 }
@@ -275,6 +277,11 @@ pub struct PollStatus {
     /// list is only the second kind, and it is what the caller renders the degrade reason from
     /// instead of the old catch-all "council did not reach a vote".
     pub seat_failures: Vec<SeatFailureRecord>,
+    /// (core#461) The seat failures of EVERY ballot, one entry per round in order. `seat_failures`
+    /// is the latest round only — a runoff overwrites it, so a seat that failed round 1 on a
+    /// dead-class cause and abstained (`Benched`) on round 2 read as an abstention alone. The
+    /// engine's run-level bench tallies every round from here. Empty on a council that never ran.
+    pub seat_failure_history: Vec<Vec<SeatFailureRecord>>,
 }
 
 /// The body the detached thread runs: dispatch → collect → synthesize → rank → emit.
@@ -451,6 +458,10 @@ fn run_council(
         let collected_failures = failures.clone();
         ledger.update(&task.id, |rec| {
             rec.votes = collected;
+            // (core#461) …and every ballot is KEPT: the run-level bench must see a round-1
+            // dead-class failure even when the runoff replaced it with the health gate's
+            // abstention.
+            rec.seat_failure_history.push(collected_failures.clone());
             rec.seat_failures = collected_failures;
         });
 
@@ -1394,6 +1405,81 @@ mod tests {
         assert_eq!(
             status.seat_failures[0].failure.kind,
             SeatFailureKind::Benched
+        );
+    }
+
+    /// (core#461) Seat f fails round 1 on a quota refusal — a LIVE failure, it counts against the
+    /// bar — the live seats split so the council runs a runoff, and on round 2 the dispatcher's
+    /// health gate benches f. The latest round (`seat_failures`) is then the abstention alone —
+    /// exactly what the engine's run-level bench used to read as "no evidence" (smoke S04: codex
+    /// `r1 not_logged_in ×4, r2 benched`, copilot `r1 quota_exhausted ×4, r2 benched`, both
+    /// routed). The history keeps the round-1 cause beside it.
+    struct DeadThenBenchedDispatcher;
+    impl Dispatcher for DeadThenBenchedDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot_detailed");
+        }
+        fn dispatch_ballot_detailed(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> DispatchOutcome {
+            if cli.key == "f" {
+                return DispatchOutcome::Failed(if ctx.ballot == 1 {
+                    SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1").with_output(
+                        "",
+                        "Error: You have exceeded your monthly quota for premium requests.",
+                    )
+                } else {
+                    SeatFailure::new(
+                        SeatFailureKind::Benched,
+                        "seat benched after consecutive failures",
+                    )
+                });
+            }
+            // Round 1: a, b, c → option 1; d, e → option 2 — 3 of 6 seated (one live failure,
+            // no abstention) is 50%, below the bar. Every later round converges on option 1.
+            let rec = if ctx.ballot == 1 && !matches!(cli.key.as_str(), "a" | "b" | "c") {
+                "2 — other"
+            } else {
+                "1 — fits"
+            };
+            DispatchOutcome::Voted(vote(&cli.key, rec))
+        }
+    }
+
+    #[test]
+    fn every_ballots_seat_failures_are_kept_beside_the_latest_round() {
+        let worker = worker_with(
+            Arc::new(DeadThenBenchedDispatcher),
+            &["a", "b", "c", "d", "e", "f"],
+        );
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert_eq!(
+            status.seat_failure_history.len(),
+            2,
+            "a runoff ran: {:?}",
+            status.seat_failure_history
+        );
+        let r1 = &status.seat_failure_history[0];
+        assert_eq!(r1.len(), 1, "round 1: {r1:?}");
+        assert_eq!(r1[0].cli, "f");
+        assert_eq!(r1[0].failure.kind, SeatFailureKind::NonZeroExit);
+        assert_eq!(
+            r1[0].failure.reason,
+            Some(crate::types::SeatFailureReason::QuotaExhausted),
+            "the round-1 cause is classified and KEPT"
+        );
+        let r2 = &status.seat_failure_history[1];
+        assert_eq!(r2.len(), 1, "round 2: {r2:?}");
+        assert_eq!(r2[0].cli, "f");
+        assert_eq!(r2[0].failure.kind, SeatFailureKind::Benched);
+        assert_eq!(
+            status.seat_failures, *r2,
+            "`seat_failures` is still the latest round — existing readers see what they saw"
         );
     }
 

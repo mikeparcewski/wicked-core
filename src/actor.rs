@@ -79,6 +79,28 @@ impl std::fmt::Display for RunExists {
 }
 impl std::error::Error for RunExists {}
 
+/// (core#461 / F-RC2-041) A launch whose plan NEEDS a seat, on a roster with no eligible one —
+/// every configured seat benched by the launcher (`health.usable: false`). Refused at INTAKE,
+/// before a session exists or anything reaches the wire, as a TYPED error (the `RunBusy` /
+/// `RunExists` rule) so a caller can recognize a roster problem via `downcast_ref` instead of
+/// substring-matching the message. `run_id` is the refused run; `benched` the bench summary
+/// (`N of N seats benched: <seat> (<cause> — launcher), …`).
+#[derive(Debug)]
+pub struct NoEligibleSeat {
+    pub run_id: String,
+    pub benched: String,
+}
+impl std::fmt::Display for NoEligibleSeat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no eligible seat for {}: {} — sign a seat in, or add one, before launching",
+            self.run_id, self.benched
+        )
+    }
+}
+impl std::error::Error for NoEligibleSeat {}
+
 thread_local! {
     /// The estate store path for GOVERNED in-process dispatch (DES-OUTGOV-003 §4). Armed at actor
     /// startup; read by [`in_process_governance`] when building a governed unit's `StepInput`. A
@@ -1235,6 +1257,31 @@ pub(crate) fn run(
                     // it again on the deferred path (the choke point `run_session` also crosses).
                     if let Some(base) = crate::workflow::base_skill_ref_for(selected_def.as_ref()) {
                         crate::skills_snapshot::admit_base_skill(&base)?;
+                    }
+                    // (core#461 / F-RC2-041) A roster with NO eligible seat is refused HERE, in the
+                    // sync fast path, when the plan needs one: a roster whose every seat the
+                    // launcher declared unusable (`health.usable: false`) used to be ACCEPTED as a
+                    // run that died 2 s later at distribution with an `error` event and no gate —
+                    // after the launching UI had said "Ready to send". Now the launch itself fails,
+                    // naming every seat and its cause. An EMPTY roster is not judged here: a plan
+                    // whose every unit is a tool needs no seat (F-E2E-011, wicked-crew#533), and a
+                    // plan that does need one keeps its distribution-time refusal.
+                    let needs_seat = match &selected_def {
+                        Some(def) => def.phases.iter().any(|p| {
+                            !matches!(p.executor, crate::workflow::PhaseExecutor::Tool { .. })
+                        }),
+                        None => true,
+                    };
+                    if needs_seat && !spec.clis.is_empty() {
+                        let benched = crate::distribute::launcher_benched(&spec.clis);
+                        if crate::distribute::eligible_seats(&spec.clis, &benched).is_empty() {
+                            return Err(NoEligibleSeat {
+                                run_id: run_id.to_string(),
+                                benched: crate::domain::benched_summary(&benched, spec.clis.len())
+                                    .unwrap_or_default(),
+                            }
+                            .into());
+                        }
                     }
                     let n_units = match &selected_def {
                         Some(def) => crate::plan::plan_from_def(def, &spec.problem, &run_id).len(),
@@ -4518,9 +4565,16 @@ fn apply_step_result(
                     )?;
                     return Ok(StepApplied::Paused);
                 }
-            } else if human_present {
+            } else if human_present && seat_refusal.is_none() {
                 // UNRECOGNIZED failure → agent triage (the generalization of the signature
                 // table): a distinct judge seat reads the error and decides the remedy.
+                // (core#461) A CLASSIFIED seat refusal is not unrecognized: the seat is dead for
+                // this work (signed out, out of quota, not installed) and no judge can rule
+                // otherwise — run 390b273e convened one on copilot's quota exit, it ruled `fail`
+                // ("no flag can fix a quota cap") and the run died with healthy seats idle. Such a
+                // failure skips the judge and takes the failover ladder below (the seat is already
+                // benched; the work moves to the next eligible seat); with no seat left it pauses
+                // at the failure gate instead of failing.
                 // Blocking CLI work — runs off-thread; the decision returns as
                 // `FailureTriageReady` and the run stays Executing meanwhile.
                 // StepFailed fires IMMEDIATELY — it signals the worker failure, not the
@@ -4708,6 +4762,66 @@ fn apply_step_result(
                     is_acp,
                 )?;
                 return Ok(StepApplied::Continuing);
+            }
+            // (core#461) The ladder is EXHAUSTED on a seat refusal the engine CLASSIFIED — the
+            // seat is dead for this work (signed out, out of quota, not installed) and no other
+            // eligible seat remains. With an operator in the loop that is a decision, not a
+            // verdict on the work: take core#464's ONE denial route — a `dead_seat` denial on the
+            // unit, `gateEscalated` with that class, the `escalation` pause ON the unit — so the
+            // operator can sign a seat in or reassign the unit and approve the retry (run
+            // 390b273e died here with `sessionFailed` and no lever). Autonomous runs
+            // (`HumanConfirm::None`) keep the standard fail contract below.
+            if let (true, Some(reason)) = (human_present, seat_refusal) {
+                let unit = units
+                    .get_mut(unit_ix)
+                    .ok_or_else(|| anyhow::anyhow!("unit ix {unit_ix} vanished mid-failover"))?;
+                // Head+TAIL (crew#322): a refusal prints its reason last.
+                let raw_excerpt: String = failure_detail_excerpt(output.output.trim());
+                let bench =
+                    crate::domain::benched_summary(&session.benched_seats, session.clis.len())
+                        .unwrap_or_else(|| "no other seat is configured".to_string());
+                let why = format!(
+                    "dead seat: '{failed_cli}' {} on unit {ord} ({}) and no eligible seat remains \
+                     — {bench}",
+                    reason.verb(),
+                    reason.as_str()
+                );
+                unit.status = crate::domain::UnitStatus::Rejected;
+                unit.denial_reason = Some(format!("{why}: {raw_excerpt}"));
+                unit.denial = Some(crate::domain::UnitDenial::new(
+                    crate::domain::DENIAL_SOURCE_DEAD_SEAT,
+                    why.clone(),
+                ));
+                put_node(store, unit.to_node())?;
+                // Usability review #1: the seat's own words survive the rejection.
+                persist_rejected_transcript(store, &session, unit, &output.output);
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: format!("{why} — pausing for operator decision"),
+                        failure_kind: crate::event::StepFailureKind::WorkerError,
+                    },
+                );
+                // core#464's one route for a denied unit: `gateEscalated` carrying the
+                // `dead_seat` class, then the `escalation` pause on the unit (Approve
+                // re-dispatches it — after a reassign, on the new seat; Reject cancels).
+                let note = denial_gate_note(session.human_confirm);
+                escalate_denied_unit(
+                    store,
+                    subscribers,
+                    self_tx,
+                    &mut session,
+                    unit,
+                    output.attempt,
+                    false,
+                    !output.output.trim().is_empty(),
+                    false,
+                    note,
+                )?;
+                return Ok(StepApplied::Paused);
             }
         }
         let unit = units
@@ -5062,6 +5176,10 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
     match denial.map(|d| d.source.as_str()) {
         Some("worktree_guard") => "evaluator_mutated_worktree",
         Some("input_governance") => "boundary_deny",
+        // (core#461) A worker exit on a dead-seat class (signed out / quota / not installed) with
+        // no eligible seat left — a decision about SEATS, not a verdict on the work
+        // (`domain::DENIAL_SOURCE_DEAD_SEAT`).
+        Some("dead_seat") => "dead_seat",
         _ if hook_denied => "boundary_deny",
         // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
         // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
@@ -5215,6 +5333,17 @@ fn denial_gate_prompt(
              phase, or reject to cancel the run{note}",
             reason_head(reason)
         ),
+        // (core#461) The lever is REASSIGN: the seat is dead for this work and no eligible seat
+        // remains, so a plain retry re-runs the same refusal.
+        "dead_seat" => {
+            let cli = unit.assigned_cli.as_deref().unwrap_or("?");
+            format!(
+                "Unit {ord} ({cli}) failed on a dead seat: {}. Reassign the unit to a different \
+                 CLI (sign one in first if needed) and approve to retry, or reject to stop the \
+                 run{note}",
+                reason_head(reason)
+            )
+        }
         _ => format!(
             "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel \
              the run{note}"
@@ -9964,9 +10093,10 @@ mod def_gate_disclosure_tests {
 
     /// core#464: the deny-dominance fold's branch never calls `fail_run` — every fold denial opens
     /// the escalation gate (`escalate_denied_unit`), and so do the two pre-fold floors (substance,
-    /// deliverables) that used to fail the run. Bounded to `apply_step_result`'s body so the
-    /// worker-failure lanes, which legitimately still fail the run (triage is core#461's), can
-    /// neither satisfy nor trip it; the fold branch is framed by its two standing comment markers.
+    /// deliverables) that used to fail the run — and, since core#461, the attended dead-seat
+    /// worker exit with no eligible seat left. Bounded to `apply_step_result`'s body so the other
+    /// worker-failure lanes, which legitimately still fail the run, can neither satisfy nor trip
+    /// it; the fold branch is framed by its two standing comment markers.
     /// Functional twins: `substance_gate_tests::*_pauses_at_the_escalation_gate_*` and
     /// `tests/evaluator_worktree_guard.rs`.
     #[test]
@@ -9998,8 +10128,9 @@ mod def_gate_disclosure_tests {
         let pre_fold = body.split(marker).next().expect("text before the marker");
         assert_eq!(
             pre_fold.matches(gate_call).count(),
-            2,
-            "the substance gate and the deliverable floor each open the escalation gate"
+            3,
+            "the substance gate, the deliverable floor and the dead-seat worker exit (core#461) \
+             each open the escalation gate"
         );
     }
 

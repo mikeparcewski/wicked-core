@@ -330,3 +330,217 @@ fn resume_re_dispatches_the_cursor_unit_of_a_failed_run() {
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
 }
+
+// ── core#461: a worker that exits on a DEAD-SEAT refusal (quota / sign-in / missing binary) ──
+
+/// The wrapped runner's own exit frame around copilot's refusal from run 390b273e — a seat that is
+/// dead for this work, not a transient. The run died through the triage judge (`fail` → no gate).
+const QUOTA_EXIT: &str =
+    "(cli `a` exited 1) You have exceeded your monthly quota for premium requests.";
+
+/// Seat `a` exits on the quota refusal every time; every other seat succeeds. Counts how often
+/// the failure-triage judge was convened (the judge runs under a `triage-` run id) and rules FAIL
+/// when it is — the way the real judge did ("no flag can fix a quota cap").
+struct DeadSeatA {
+    judge_convened: AtomicU32,
+}
+impl StepRunner for DeadSeatA {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let (output, status) = if i.run_id.starts_with("triage-") {
+            self.judge_convened.fetch_add(1, Ordering::SeqCst);
+            (
+                "DECISION: FAIL\nno flag can fix a quota cap".to_string(),
+                StepStatus::Ok,
+            )
+        } else if i.unit.assigned_cli.as_deref() == Some("a") {
+            (QUOTA_EXIT.to_string(), StepStatus::Failed)
+        } else {
+            ("ok".to_string(), StepStatus::Ok)
+        };
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output,
+            status,
+            usage: None,
+            files: vec![],
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// An ATTENDED run — a human is present (any `HumanConfirm` but `None`) so failures may pause —
+/// with no gate ord that matches, so nothing pauses before the work.
+fn attended(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
+    LaunchSpec {
+        human_confirm: HumanConfirm::Before(99),
+        ..spec(session_id, clis)
+    }
+}
+
+/// Like [`drain_until_terminal`], but a human gate (`AwaitingHuman`) also ends the drain.
+fn drain_until_gate_or_terminal(
+    events: &std::sync::mpsc::Receiver<CoreEvent>,
+    session: &str,
+) -> Vec<CoreEvent> {
+    let mut collected = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            break;
+        }
+        match events.recv_timeout(remaining.min(Duration::from_millis(500))) {
+            Ok(ev) => {
+                let stop = matches!(&ev,
+                    CoreEvent::SessionCompleted { session: s, .. }
+                    | CoreEvent::SessionFailed { session: s, .. }
+                    | CoreEvent::AwaitingHuman { session: s, .. } if s == session);
+                collected.push(ev);
+                if stop {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    collected
+}
+
+/// (core#461 b) An ATTENDED run whose worker exits on a classified seat refusal does not convene
+/// the triage judge — the seat is dead for this work and no judge can rule otherwise — it takes
+/// the failover ladder: the seat is benched, the work moves to the next eligible seat, the run
+/// COMPLETES. (Run 390b273e convened the judge on this exact exit, it ruled `fail`, and the run
+/// died with claude and opencode idle.)
+#[test]
+fn a_dead_seat_worker_exit_fails_over_without_convening_the_triage_judge() {
+    let runner = Arc::new(DeadSeatA {
+        judge_convened: AtomicU32::new(0),
+    });
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        runner.clone(),
+    );
+    let ev = core.subscribe();
+    core.launch_run(attended("dead-seat-failover", vec![cli("a"), cli("b")]))
+        .expect("launch");
+
+    let collected = drain_until_gate_or_terminal(&ev, "dead-seat-failover");
+
+    assert!(
+        collected.iter().any(|e| matches!(e,
+            CoreEvent::StepFailed { session, detail, .. }
+                if session == "dead-seat-failover" && detail.contains("failing over to 'b'"))),
+        "the quota exit fails over to the eligible seat, got: {collected:?}"
+    );
+    assert!(
+        collected.iter().any(|e| matches!(
+            e,
+            CoreEvent::SessionCompleted { session, .. } if session == "dead-seat-failover"
+        )),
+        "the run COMPLETES on the failover seat, got: {collected:?}"
+    );
+    assert_eq!(
+        runner.judge_convened.load(Ordering::SeqCst),
+        0,
+        "a classified seat refusal never convenes the triage judge"
+    );
+}
+
+/// (core#461 b) The same exit on a roster with NO eligible seat left, attended: the run PAUSES at
+/// core#464's escalation gate — `gateEscalated` with the `dead_seat` class, a prompt naming the
+/// seat, the class and the reassign lever — instead of ending `sessionFailed` with no gate. The
+/// unit carries the `dead_seat` denial the gate's reassign arm keys on.
+#[test]
+fn a_dead_seat_worker_exit_with_no_seat_left_pauses_at_the_escalation_gate() {
+    let runner = Arc::new(DeadSeatA {
+        judge_convened: AtomicU32::new(0),
+    });
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        runner.clone(),
+    );
+    let ev = core.subscribe();
+    core.launch_run(attended("dead-seat-gate", vec![cli("a")]))
+        .expect("launch");
+
+    let collected = drain_until_gate_or_terminal(&ev, "dead-seat-gate");
+
+    let gate = collected.iter().find_map(|e| match e {
+        CoreEvent::AwaitingHuman {
+            session,
+            gate_kind,
+            prompt,
+            ..
+        } if session == "dead-seat-gate" => Some((gate_kind.clone(), prompt.clone())),
+        _ => None,
+    });
+    let (gate_kind, prompt) = gate.unwrap_or_else(|| {
+        panic!("a dead-seat exit with no seat left must PAUSE, got: {collected:?}")
+    });
+    assert_eq!(gate_kind, "escalation", "core#464's one denial route");
+    assert!(
+        collected.iter().any(|e| matches!(e,
+            CoreEvent::GateEscalated { session, condition, denial_source, .. }
+                if session == "dead-seat-gate" && condition == "dead_seat" && denial_source == "dead_seat")),
+        "the denial rides gateEscalated with the dead_seat class: {collected:?}"
+    );
+    assert!(
+        prompt.contains("Unit 1 (a) failed on a dead seat")
+            && prompt.contains("exhausted its quota")
+            && prompt.contains("quota_exhausted")
+            && prompt.contains("Reassign the unit"),
+        "the prompt names the seat, the class and the lever: {prompt}"
+    );
+    assert!(
+        !collected.iter().any(
+            |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "dead-seat-gate")
+        ),
+        "no sessionFailed — the operator decides: {collected:?}"
+    );
+    assert_eq!(runner.judge_convened.load(Ordering::SeqCst), 0);
+    let views = core.sessions_detail().expect("views");
+    let v = views
+        .iter()
+        .find(|v| v.session.id == "dead-seat-gate")
+        .expect("the run is on record");
+    assert_eq!(v.session.status, SessionStatus::AwaitingHuman);
+    assert_eq!(
+        v.units[0].denial.as_ref().map(|d| d.source.as_str()),
+        Some("dead_seat"),
+        "the structured denial names the class the gate's reassign arm keys on: {:?}",
+        v.units[0].denial
+    );
+}
+
+/// Control (core#461 b, disclosed scope): an AUTONOMOUS run (`HumanConfirm::None`) on a dead
+/// single seat keeps the standard fail contract — there is no operator to ask.
+#[test]
+fn an_autonomous_run_on_a_dead_single_seat_still_fails_closed() {
+    let runner = Arc::new(DeadSeatA {
+        judge_convened: AtomicU32::new(0),
+    });
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        runner.clone(),
+    );
+    let ev = core.subscribe();
+    core.launch_run(spec("dead-seat-solo", vec![cli("a")]))
+        .expect("launch");
+
+    let collected = drain_until_gate_or_terminal(&ev, "dead-seat-solo");
+    assert!(
+        collected.iter().any(
+            |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "dead-seat-solo")
+        ),
+        "no operator in the loop → the run fails as before, got: {collected:?}"
+    );
+    assert_eq!(runner.judge_convened.load(Ordering::SeqCst), 0);
+}

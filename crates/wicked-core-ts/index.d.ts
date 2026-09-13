@@ -721,6 +721,11 @@ export declare class Subscription {
  * entry carries `outcome`, `boundS`, `boundNote`, `failureIds`, `classification: 'regression' |
  * 'pre_existing_in_sandbox' | 'floor_env_mismatch' | null` (only a regression denies), `preExisting`,
  * `regressions` and `base: {head, cached, run, error} | null` (the same check run on the run base).
+ * core#461 (additive): unitDistributed.distinctnessFallback ('creator_seat' | null — the
+ * evaluator ≠ creator fallback as a field, see UnitDistributedEventJson); gateEscalated.condition
+ * gains the class 'dead_seat' (denialSource 'dead_seat'): a worker exited on a dead-seat refusal
+ * (signed out / quota / not installed) and no eligible seat remains — the attended run pauses at
+ * the escalation gate instead of failing.
  */
 export interface CoreEventJson {
   type: string
@@ -760,6 +765,14 @@ export interface UnitDistributedEventJson extends CoreEventJson {
    * `routingMethod` and its fields read exactly as before.
    */
   seatConstraint: string | null
+  /**
+   * (core#461) The evaluator ≠ creator DISCLOSURE as a field: `'creator_seat'` when a review/test
+   * unit STAYS on a seat that built what it checks because no eligible seat distinct from the
+   * builders admits it — a single-eligible-seat roster, or a bench that emptied the pool
+   * (`degradedReason` then says which). `null` otherwise. The fallback seat is always a
+   * still-eligible one: a benched or dead seat is never the fallback. Additive.
+   */
+  distinctnessFallback: 'creator_seat' | null
 }
 
 /**

@@ -145,7 +145,18 @@ pub struct Distribution {
     /// seats plus every seat whose ballot failed authentication — identical on every unit of one
     /// distribution; `apply_distributions` persists it on the session.
     pub benched: Vec<BenchedSeat>,
+    /// (core#461) The evaluator≠creator DISCLOSURE, first-class: `Some("creator_seat")` when this
+    /// is a review/test unit that STAYS on a seat that built what it checks because no eligible
+    /// seat distinct from the builders admits it — a single-eligible-seat roster, or a bench that
+    /// emptied the pool (`degraded_reason` then says which). `None` when the unit is separated, is
+    /// not an evaluator, or is a tool unit. Rides `unitDistributed.distinctnessFallback`. The
+    /// fallback seat is always a still-eligible one: the bench pass reseats every unit off a
+    /// benched seat BEFORE this is judged, so a benched or dead seat is never the fallback.
+    pub distinctness_fallback: Option<String>,
 }
+
+/// The one value [`Distribution::distinctness_fallback`] takes today (core#461).
+pub(crate) const DISTINCTNESS_FALLBACK_CREATOR_SEAT: &str = "creator_seat";
 
 /// The invocation template for `key` from the launch roster (`None` if not found).
 fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
@@ -172,6 +183,7 @@ fn tool_distribution(unit: &WorkUnit) -> Distribution {
         seat_constraint: None,
         degraded_reason: None,
         benched: Vec::new(),
+        distinctness_fallback: None,
     }
 }
 
@@ -365,11 +377,14 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
 ///    councils return (F-7R2-006 / F-7R3-001): a `not_logged_in` or `not_installed` ballot on
 ///    first occurrence; NO vote on any ballot with every failure quota-class
 ///    (`quota_exhausted`), or a timeout streak of at least the dispatcher's own bench threshold
-///    (`timed_out`). One vote keeps a seat; an unclassified failure proves nothing. A unit the
-///    council handed to a benched seat is reassigned to the first still-eligible seat its skills
-///    admit (routing `degraded`, naming both seats and the cause), and the evaluator≠creator
+///    (`timed_out`). One vote keeps a seat; an unclassified failure proves nothing; the
+///    dispatcher's own `Benched` abstention corroborates a dead-class ballot beside it and proves
+///    nothing alone (core#461 — the ledger sees EVERY round of every council, not the latest). A
+///    unit the council handed to a benched seat is reassigned to the first still-eligible seat its
+///    skills admit (routing `degraded`, naming both seats and the cause), and the evaluator≠creator
 ///    reassignment picks only among still-eligible seats — when none distinct from the builders
-///    remains, a review/test unit stays on its creator seat and `degraded_reason` says so.
+///    remains, a review/test unit stays on its creator seat, `distinctness_fallback` is
+///    `creator_seat` (core#461), and `degraded_reason` says so whenever the bench emptied the pool.
 /// 3. `degraded_reason` names the bench on EVERY unit whenever eligible < configured, and the
 ///    whole bench rides each `Distribution` for the actor to persist.
 #[allow(clippy::too_many_arguments)]
@@ -616,6 +631,12 @@ pub(crate) fn distribute_units_against_benched(
     let summary = crate::domain::benched_summary(&benched, configured.len());
     for (u, d) in units.iter().zip(dists.iter_mut()) {
         d.benched = benched.clone();
+        // (core#461) The evaluator≠creator fallback is a FIELD, not prose alone: a consumer keys on
+        // `distinctnessFallback == "creator_seat"` whatever emptied the pool — a bench (disclosed
+        // in `degraded_reason` below) or a roster that never had a second seat (which keeps its
+        // `null` `degraded_reason`, review F2 on #452).
+        d.distinctness_fallback = (u.tool_cmd.is_none() && same_seat.contains(&u.ord))
+            .then(|| DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string());
         let mut parts: Vec<String> = Vec::new();
         match &d.routing {
             RoutingInfo::Tool => {
@@ -859,10 +880,15 @@ impl SeatLedger {
     /// - Otherwise a seat that VOTED at least once is kept — one quota refusal beside a vote is a
     ///   flaky provider, not a dead seat — and a seat whose failures include one the council could
     ///   not classify is kept too: an unknown failure is not proof of a dead seat.
-    /// - With no vote and every failure dead-class: `quota_exhausted` if any ballot said so; else
-    ///   `timed_out` once the timeouts reach `threshold` (the dispatcher's own consecutive
-    ///   streak, `seat_bench_threshold`) — a seat charging its whole budget to every ballot and
-    ///   answering none.
+    /// - The dispatcher's own health-gate abstention (`Benched`, core#461) is NOT unclassified: it
+    ///   says the seat failed consecutively and is sitting out. It corroborates a dead-class ballot
+    ///   beside it (the smoke S04 shape — round 1 `quota_exhausted`, round 2 `Benched` — benches
+    ///   `quota_exhausted (1/2 ballots)`) and proves nothing on its own: a seat that only ever
+    ///   abstained was never asked.
+    /// - With no vote and every failure dead-class or an abstention: `quota_exhausted` if any
+    ///   ballot said so; else `timed_out` once the timeouts plus the abstentions that followed them
+    ///   reach `threshold` (the dispatcher's own consecutive streak, `seat_bench_threshold`) — a
+    ///   seat charging its whole budget to every ballot it answered and then benched for it.
     ///
     /// The count that proved it rides the reason (`quota_exhausted (3/3 ballots)`), so
     /// `degradedReason` names the seat, the kind and the evidence.
@@ -888,7 +914,13 @@ impl SeatLedger {
             .iter()
             .filter(|(k, r)| *k == SeatFailureKind::TimedOut && r.is_none())
             .count();
-        if quota + timeouts != self.failures.len() {
+        let abstained = self
+            .failures
+            .iter()
+            .filter(|(k, _)| *k == SeatFailureKind::Benched)
+            .count();
+        // An unclassified failure still proves nothing; abstentions alone are not evidence.
+        if quota + timeouts + abstained != self.failures.len() || quota + timeouts == 0 {
             return None;
         }
         if quota > 0 {
@@ -897,7 +929,7 @@ impl SeatLedger {
                 SeatFailureReason::QuotaExhausted.as_str()
             ));
         }
-        (timeouts >= threshold.max(1))
+        (timeouts + abstained >= threshold.max(1))
             .then(|| format!("timed_out ({timeouts}/{asked} ballots, no vote returned)"))
     }
 }
@@ -953,6 +985,7 @@ fn distribute_one(
                 seat_constraint: None,
                 degraded_reason: None,
                 benched: Vec::new(),
+                distinctness_fallback: None,
             },
             Vec::new(),
         ));
@@ -1040,40 +1073,46 @@ fn distribute_one(
             seat_constraint: None,
             degraded_reason: None,
             benched: Vec::new(),
+            distinctness_fallback: None,
         },
         ballots,
     ))
 }
 
-/// (F-7R2-006 / F-7R3-001) Every convened seat's outcome on this council, as the run-level bench
-/// tallies it. A seat with a failure record failed (its dispatch branch and the cause the council
-/// classified from its own words — `SeatFailure::reason`); a convened seat WITHOUT one voted —
-/// the council is complete when polled (`queue_blocking` joined it) and a convened seat is
-/// accounted for exactly once, in the votes or in the failures. The dispatcher's own health-gate
-/// ABSTENTIONS (`SeatFailureKind::Benched`) are neither: the seat was not asked, so they say
-/// nothing new about it — and counted as failures they would mask the very streak that caused
-/// them. A council that never ran (still queued / running when polled) yields no evidence.
+/// (F-7R2-006 / F-7R3-001 / core#461) Every convened seat's outcome on EVERY ballot of this
+/// council, as the run-level bench tallies it — one [`SeatBallot`] per seat per round. A seat with
+/// a failure record on a round failed it (its dispatch branch and the cause the council classified
+/// from its own words — `SeatFailure::reason`); a convened seat WITHOUT one voted on that round —
+/// a round is complete when polled (`queue_blocking` joined the council) and a convened seat is
+/// accounted for exactly once per round, in the votes or in the failures. The dispatcher's own
+/// health-gate ABSTENTIONS (`SeatFailureKind::Benched`) are recorded as what they are: the ledger
+/// reads one as corroboration of a dead-class ballot beside it and as proof of nothing on its own
+/// ([`SeatLedger::dead_seat_reason`]). They used to be dropped here, and the council reported the
+/// LATEST round only — so a seat that failed round 1 on quota and was health-gated for the runoff
+/// reached the ledger as no evidence at all and stayed routable (core#461, smoke S04). A council
+/// that never ran (still queued / running when polled) yields no evidence; a status that kept no
+/// history (a hand-built one) falls back to its latest round.
 fn seat_ballots(status: &PollStatus, convened: &[String]) -> Vec<SeatBallot> {
     if matches!(status.state, TaskState::Queued | TaskState::Running) {
         return Vec::new();
     }
-    convened
+    let latest = std::slice::from_ref(&status.seat_failures);
+    let rounds = if status.seat_failure_history.is_empty() {
+        latest
+    } else {
+        status.seat_failure_history.as_slice()
+    };
+    rounds
         .iter()
-        .filter_map(
-            |cli| match status.seat_failures.iter().find(|f| &f.cli == cli) {
-                Some(f) if f.failure.kind == wicked_council::types::SeatFailureKind::Benched => {
-                    None
-                }
-                Some(f) => Some(SeatBallot {
-                    cli: cli.clone(),
-                    failure: Some((f.failure.kind, f.failure.reason)),
-                }),
-                None => Some(SeatBallot {
-                    cli: cli.clone(),
-                    failure: None,
-                }),
-            },
-        )
+        .flat_map(|failures| {
+            convened.iter().map(move |cli| SeatBallot {
+                cli: cli.clone(),
+                failure: failures
+                    .iter()
+                    .find(|f| &f.cli == cli)
+                    .map(|f| (f.failure.kind, f.failure.reason)),
+            })
+        })
         .collect()
 }
 
@@ -1518,6 +1557,7 @@ mod tests {
                 dissent: vec![],
             }),
             seat_failures: vec![],
+            seat_failure_history: vec![],
             failure_detail: None,
         }
     }
@@ -2687,6 +2727,11 @@ mod tests {
             "degradedReason rides the evaluator_distinct arm too: {:?}",
             dists[1].degraded_reason
         );
+        assert!(
+            dists[1].distinctness_fallback.is_none(),
+            "separated — no fallback to disclose: {:?}",
+            dists[1].distinctness_fallback
+        );
     }
 
     // ── F-7R3-001: the ballot ledger — a seat dead for the run is never an evaluator target ──
@@ -2882,8 +2927,10 @@ mod tests {
             .degraded_reason
             .as_deref()
             .expect("degraded: a seat is benched");
+        // Every ROUND is a ballot the seat was asked (core#461): two live voters of three seated
+        // are 67 % — below the bar — so each council runs the 3-round cap; two councils = 6.
         assert!(
-            why.contains("1 of 3 seats benched: copilot (quota_exhausted (2/2 ballots) — ballot)"),
+            why.contains("1 of 3 seats benched: copilot (quota_exhausted (6/6 ballots) — ballot)"),
             "{why}"
         );
         assert_eq!(
@@ -2893,6 +2940,368 @@ mod tests {
         assert_eq!(dists[0].benched.len(), 1);
         assert_eq!(dists[0].benched[0].cli, "copilot");
         assert_eq!(dists[0].benched[0].source, "ballot");
+    }
+
+    /// (core#461, smoke S04 / F-SMOKE-002 / F-RC2-029) The shape the wave-6 bench missed: the
+    /// named seat fails ROUND 1 the way `failure` says and is then health-gated by the dispatcher —
+    /// on every later round it ABSTAINS (`Benched`, the gate's own verdict, no subprocess behind
+    /// it). The live seats split on round 1 (the `claude` seat votes option 1, every other live
+    /// seat option 2) so the council runs a runoff, and converge on option 1 from round 2 on.
+    /// With `votes_round_one` the named seat VOTES option 1 on round 1 instead of failing — the
+    /// health-gated flaky seat of acceptance (d).
+    struct DeadThenBenched {
+        seat: &'static str,
+        failure: fn() -> wicked_council::types::SeatFailure,
+        votes_round_one: bool,
+        rounds_seen: AtomicUsize,
+    }
+    impl Dispatcher for DeadThenBenched {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            Some(fit_vote(&cli.key, "1 — fit"))
+        }
+        fn dispatch_ballot_detailed(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &wicked_council::types::BallotContext,
+        ) -> wicked_council::types::DispatchOutcome {
+            use wicked_council::types::{DispatchOutcome, SeatFailure, SeatFailureKind};
+            self.rounds_seen
+                .fetch_max(ctx.ballot as usize, Ordering::SeqCst);
+            if cli.key == self.seat {
+                if ctx.ballot > 1 {
+                    return DispatchOutcome::Failed(SeatFailure::new(
+                        SeatFailureKind::Benched,
+                        "seat benched for 29s more (span 30s) after consecutive failures; \
+                         re-admission is one probationary ballot on expiry",
+                    ));
+                }
+                if !self.votes_round_one {
+                    return DispatchOutcome::Failed((self.failure)());
+                }
+            }
+            let rec = if ctx.ballot == 1 && cli.key != "claude" && cli.key != self.seat {
+                "2 — other"
+            } else {
+                "1 — fit"
+            };
+            DispatchOutcome::Voted(fit_vote(&cli.key, rec))
+        }
+    }
+    fn fit_vote(cli: &str, recommendation: &str) -> Vote {
+        Vote {
+            cli: cli.to_string(),
+            recommendation: recommendation.into(),
+            top_risk: "none".into(),
+            change_my_mind: "no".into(),
+            disqualifier: None,
+            confidence: Confidence::default(),
+            provenance: "test".into(),
+        }
+    }
+    fn dead_then_benched(
+        seat: &'static str,
+        failure: fn() -> wicked_council::types::SeatFailure,
+        votes_round_one: bool,
+    ) -> Arc<DeadThenBenched> {
+        Arc::new(DeadThenBenched {
+            seat,
+            failure,
+            votes_round_one,
+            rounds_seen: AtomicUsize::new(0),
+        })
+    }
+    /// claude's refusal on stdout with stderr empty (F-030/F-031), as a non-zero exit.
+    fn login_refusal() -> wicked_council::types::SeatFailure {
+        wicked_council::types::SeatFailure::new(
+            wicked_council::types::SeatFailureKind::NonZeroExit,
+            "exit 1",
+        )
+        .with_output("Not logged in · Please run /login", "")
+    }
+    /// The binary could not be spawned at all — judged structurally from the spawn error.
+    fn missing_binary() -> wicked_council::types::SeatFailure {
+        wicked_council::types::SeatFailure::spawn_failed(
+            "copilot",
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        )
+    }
+
+    /// (core#461 acceptance a) Round 1 `quota_exhausted`, round 2 the dispatcher's own `Benched`
+    /// abstention — the ledger reads the abstention as corroboration: the seat is benched for the
+    /// run with the quota cause and the count that proved it, `benched_seats` is non-empty on every
+    /// unit, `degradedReason` names it, and the evaluator≠creator reassignment moves the review
+    /// unit PAST it onto the alternative — never onto the benched seat (F-RC2-029's mechanism).
+    #[test]
+    fn a_round1_quota_ballot_plus_round2_abstention_benches_the_seat() {
+        let stub = dead_then_benched("copilot", quota_refusal, false);
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = stub.clone();
+        let roster = [seat("claude"), seat("copilot"), seat("codex")];
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("two seats still eligible");
+        assert!(
+            stub.rounds_seen.load(Ordering::SeqCst) >= 2,
+            "the councils ran a runoff, so the abstention happened"
+        );
+        assert_eq!(dists[0].assigned_cli, "claude", "{:?}", dists[0].routing);
+        assert_eq!(
+            dists[1].assigned_cli, "codex",
+            "the review moves past the quota-dead seat: {:?}",
+            dists[1].routing
+        );
+        assert!(matches!(
+            &dists[1].routing,
+            RoutingInfo::EvaluatorDistinct { winner, was } if winner == "codex" && was == "claude"
+        ));
+        assert_eq!(
+            dists[1].distinctness_fallback, None,
+            "separated — no fallback"
+        );
+        // Two councils × (one quota ballot + one abstention) = 2 of 4 ballots, no vote.
+        assert_eq!(dists[0].benched.len(), 1, "{:?}", dists[0].benched);
+        assert_eq!(dists[0].benched[0].cli, "copilot");
+        assert_eq!(dists[0].benched[0].source, "ballot");
+        assert_eq!(dists[0].benched[0].reason, "quota_exhausted (2/4 ballots)");
+        let why = dists[1]
+            .degraded_reason
+            .as_deref()
+            .expect("degraded: a seat is benched");
+        assert!(
+            why.contains("1 of 3 seats benched: copilot (quota_exhausted (2/4 ballots) — ballot)"),
+            "{why}"
+        );
+        assert_eq!(
+            dists[0].benched, dists[1].benched,
+            "the bench rides every unit"
+        );
+    }
+
+    /// (core#461 acceptance b, c) The first-occurrence causes beside a round-2 abstention: a
+    /// `not_logged_in` ballot (claude's stdout refusal) and a `not_installed` spawn each bench the
+    /// seat by name; the abstention never masks them. The review moves past the seat both times.
+    #[test]
+    fn a_login_or_missing_binary_ballot_plus_an_abstention_benches_on_first_occurrence() {
+        for (failure, reason) in [
+            (
+                login_refusal as fn() -> wicked_council::types::SeatFailure,
+                "not_logged_in",
+            ),
+            (missing_binary, "not_installed (2/4 ballots)"),
+        ] {
+            let stub = dead_then_benched("copilot", failure, false);
+            let dispatcher: Arc<dyn Dispatcher + Send + Sync> = stub.clone();
+            let roster = [seat("claude"), seat("copilot"), seat("codex")];
+            let dists = distribute_units_against_benched(
+                &build_and_review(),
+                &roster,
+                "s1",
+                None,
+                &dispatcher,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .expect("two seats still eligible");
+            assert!(
+                stub.rounds_seen.load(Ordering::SeqCst) >= 2,
+                "{reason}: a runoff ran"
+            );
+            assert_eq!(
+                dists[0].benched.len(),
+                1,
+                "{reason}: {:?}",
+                dists[0].benched
+            );
+            assert_eq!(dists[0].benched[0].cli, "copilot", "{reason}");
+            assert_eq!(dists[0].benched[0].reason, reason);
+            assert_eq!(dists[0].benched[0].source, "ballot");
+            assert_eq!(
+                dists[1].assigned_cli, "codex",
+                "{reason}: the review moves past the dead seat: {:?}",
+                dists[1].routing
+            );
+            let why = dists[1].degraded_reason.as_deref().expect("degraded");
+            assert!(
+                why.contains(&format!("copilot ({reason} — ballot)")),
+                "{why}"
+            );
+        }
+    }
+
+    /// (core#461 acceptance d) One VOTE on round 1 and the dispatcher's abstention on round 2 is a
+    /// health-gated flaky seat, not a dead one: nothing is benched, `degradedReason` stays `null`,
+    /// and the seat is still the reviewer — the abstention alone is not evidence.
+    #[test]
+    fn a_vote_followed_by_an_abstention_is_not_a_dead_seat() {
+        let stub = dead_then_benched("copilot", quota_refusal, true);
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = stub.clone();
+        let roster = [seat("claude"), seat("copilot"), seat("codex")];
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("routes");
+        assert!(
+            stub.rounds_seen.load(Ordering::SeqCst) >= 2,
+            "the councils ran a runoff, so the abstention happened"
+        );
+        assert!(
+            dists.iter().all(|d| d.benched.is_empty()),
+            "a vote keeps the seat: {:?}",
+            dists[0].benched
+        );
+        assert!(dists.iter().all(|d| d.degraded_reason.is_none()));
+        assert_eq!(
+            dists[1].assigned_cli, "copilot",
+            "still the first non-builder seat: {:?}",
+            dists[1].routing
+        );
+    }
+
+    /// (core#461) The ledger's reading of the dispatcher's abstention, one clause per case:
+    /// corroboration beside a dead-class ballot, part of the dispatcher's own streak after a
+    /// timeout, proof of nothing alone, never a mask over a vote or an unclassified failure.
+    #[test]
+    fn a_dispatcher_abstention_corroborates_a_dead_ballot_and_proves_nothing_alone() {
+        use wicked_council::types::{SeatFailureKind as K, SeatFailureReason as R};
+        let quota = Some((K::NonZeroExit, Some(R::QuotaExhausted)));
+        let login = Some((K::NonZeroExit, Some(R::NotLoggedIn)));
+        let missing = Some((K::SpawnFailed, Some(R::NotInstalled)));
+        let unclassified = Some((K::NonZeroExit, None));
+        let timeout = Some((K::TimedOut, None));
+        let abstained = Some((K::Benched, None));
+        let ledger = |records: &[Option<(K, Option<R>)>]| {
+            let mut l = SeatLedger::default();
+            for r in records {
+                l.record(*r);
+            }
+            l
+        };
+
+        assert_eq!(
+            ledger(&[abstained, abstained]).dead_seat_reason(2),
+            None,
+            "abstentions alone are not evidence — the seat was never asked"
+        );
+        assert_eq!(
+            ledger(&[quota, abstained]).dead_seat_reason(2).as_deref(),
+            Some("quota_exhausted (1/2 ballots)"),
+            "the smoke S04 shape"
+        );
+        assert_eq!(
+            ledger(&[login, abstained]).dead_seat_reason(2).as_deref(),
+            Some("not_logged_in")
+        );
+        assert_eq!(
+            ledger(&[missing, abstained]).dead_seat_reason(2).as_deref(),
+            Some("not_installed (1/2 ballots)")
+        );
+        assert_eq!(
+            ledger(&[timeout, abstained]).dead_seat_reason(2).as_deref(),
+            Some("timed_out (1/2 ballots, no vote returned)"),
+            "one timeout then the dispatcher's own bench for it is the streak it counted"
+        );
+        assert_eq!(
+            ledger(&[timeout, abstained]).dead_seat_reason(3),
+            None,
+            "below the streak threshold"
+        );
+        assert_eq!(
+            ledger(&[None, abstained]).dead_seat_reason(2),
+            None,
+            "a vote keeps the seat"
+        );
+        assert_eq!(
+            ledger(&[quota, None, abstained]).dead_seat_reason(2),
+            None,
+            "one refusal beside a vote is a flaky provider"
+        );
+        assert_eq!(
+            ledger(&[quota, unclassified, abstained]).dead_seat_reason(2),
+            None,
+            "an unclassified failure still proves nothing"
+        );
+    }
+
+    /// (core#461) `seat_ballots` tallies EVERY round of a council — one ballot per seat per round,
+    /// the abstention included — and a status that kept no history falls back to its latest round.
+    #[test]
+    fn seat_ballots_read_every_round_and_fall_back_to_the_latest_one() {
+        use wicked_council::store::SeatFailureRecord;
+        use wicked_council::types::{SeatFailureKind as K, SeatFailureReason as R};
+        /// One `(cli, failure)` per ballot, in tally order.
+        type Tally = Vec<(String, Option<(K, Option<R>)>)>;
+        let convened = vec![
+            "claude".to_string(),
+            "copilot".to_string(),
+            "codex".to_string(),
+        ];
+        let record = |cli: &str, failure: wicked_council::types::SeatFailure| SeatFailureRecord {
+            cli: cli.into(),
+            failure,
+        };
+        let benched =
+            || wicked_council::types::SeatFailure::new(K::Benched, "seat benched after failures");
+        let mut status = status_with_winner(Some("1 — fit"), TaskState::Voted);
+        status.seat_failures = vec![record("copilot", benched())];
+        status.seat_failure_history = vec![
+            vec![record("copilot", quota_refusal())],
+            vec![record("copilot", benched())],
+        ];
+        let ballots: Tally = seat_ballots(&status, &convened)
+            .into_iter()
+            .map(|b| (b.cli, b.failure))
+            .collect();
+        assert_eq!(
+            ballots,
+            vec![
+                ("claude".to_string(), None),
+                (
+                    "copilot".to_string(),
+                    Some((K::NonZeroExit, Some(R::QuotaExhausted)))
+                ),
+                ("codex".to_string(), None),
+                ("claude".to_string(), None),
+                ("copilot".to_string(), Some((K::Benched, None))),
+                ("codex".to_string(), None),
+            ],
+            "round 1 then round 2, every convened seat on each"
+        );
+        // No history (a status from a hand-built council): the latest round alone, abstention kept.
+        status.seat_failure_history.clear();
+        let ballots: Tally = seat_ballots(&status, &convened)
+            .into_iter()
+            .map(|b| (b.cli, b.failure))
+            .collect();
+        assert_eq!(
+            ballots,
+            vec![
+                ("claude".to_string(), None),
+                ("copilot".to_string(), Some((K::Benched, None))),
+                ("codex".to_string(), None),
+            ]
+        );
+        // A council that never ran yields no evidence at all.
+        status.state = TaskState::Running;
+        assert!(seat_ballots(&status, &convened).is_empty());
     }
 
     /// (b) A MIXED record — one quota refusal, one vote — is a flaky provider, not a dead seat:
@@ -2983,7 +3392,7 @@ mod tests {
         .expect("two seats still eligible");
         let why = dists[0].degraded_reason.as_deref().expect("benched");
         assert!(
-            why.contains("1 of 3 seats benched: copilot (not_installed (1/1 ballots) — ballot)"),
+            why.contains("1 of 3 seats benched: copilot (not_installed (3/3 ballots) — ballot)"),
             "{why}"
         );
         assert_eq!(dists[0].benched[0].source, "ballot");
@@ -3021,7 +3430,7 @@ mod tests {
         );
         let why = dists[1].degraded_reason.as_deref().unwrap();
         assert!(
-            why.contains("1 of 2 seats benched: copilot (quota_exhausted (2/2 ballots) — ballot)"),
+            why.contains("1 of 2 seats benched: copilot (quota_exhausted (6/6 ballots) — ballot)"),
             "{why}"
         );
         assert!(
@@ -3037,6 +3446,20 @@ mod tests {
                 .contains("evaluator≠creator"),
             "the build unit carries only the bench summary: {:?}",
             dists[0].degraded_reason
+        );
+        // (core#461) The same fallback as a FIELD, on the review unit only — and the fallback
+        // seat is the still-eligible creator, never the benched one.
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+        assert_eq!(dists[0].distinctness_fallback, None);
+        assert!(
+            dists[1]
+                .benched
+                .iter()
+                .all(|b| b.cli != dists[1].assigned_cli),
+            "the fallback never seats a benched seat"
         );
     }
 
@@ -3060,7 +3483,7 @@ mod tests {
         .expect("routes");
         let why = dists[0].degraded_reason.as_deref().expect("benched");
         assert!(
-            why.contains("copilot (timed_out (2/2 ballots, no vote returned) — ballot)"),
+            why.contains("copilot (timed_out (6/6 ballots, no vote returned) — ballot)"),
             "{why}"
         );
         assert_eq!(
@@ -3069,6 +3492,12 @@ mod tests {
             dists[1].routing
         );
 
+        // ONE timeout: a council that closes on its first ballot — three live votes of four
+        // seated clear the 75 % bar — so the seat is asked exactly once. (core#461: the ledger
+        // now counts every ROUND; on the 3-seat roster above two live votes of three are 67 %,
+        // the council runs the 3-round cap and a seat timing out on all three IS the streak the
+        // dispatcher's own threshold names — the old "1/1" there was the last round alone.)
+        let roster = [seat("claude"), seat("copilot"), seat("codex"), seat("pi")];
         let dispatcher = dead_seat("copilot", timed_out_ballot, false);
         let dists = distribute_units_against_benched(
             &[WorkUnit::pending("u1", "s1", 1, "Build the thing")],
@@ -3151,6 +3580,16 @@ mod tests {
             .iter()
             .all(|d| d.degraded_reason.is_none() && d.benched.is_empty()));
         assert_eq!(dists[1].assigned_cli, "claude");
+        // (core#461) …but the fallback is DISCLOSED as a field: the review stays on the seat that
+        // built, and the wire says so without prose (`degradedReason` stays `null` here).
+        assert_eq!(
+            dists[0].distinctness_fallback, None,
+            "the build unit is no evaluator"
+        );
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
 
         let keys = |ks: &[&str]| ks.iter().map(|k| k.to_string()).collect::<Vec<_>>();
         let builders = |ks: &[&str]| {
@@ -3222,7 +3661,7 @@ mod tests {
             RoutingInfo::Degraded { reason } => assert!(
                 reason.contains("council picked 'copilot'")
                     && reason.contains("exhausted its quota on its ballot")
-                    && reason.contains("(quota_exhausted (1/1 ballots))")
+                    && reason.contains("(quota_exhausted (3/3 ballots))")
                     && reason.contains("reassigned to 'claude'"),
                 "{reason}"
             ),

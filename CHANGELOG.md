@@ -370,6 +370,48 @@ Two release tracks share this file, newest entry first regardless of track:
     Failed/cancelled runs are unchanged.
 
 ### Fixed
+- **Seat-bench gap: a dead-class ballot followed by the dispatcher's own abstention benched
+  nothing (core#461; F-SMOKE-002, F-RC2-023/029).** The council reported ONE outcome per seat per
+  council — the latest ballot — so a seat that failed round 1 on `quota_exhausted` /
+  `not_logged_in` / `not_installed` and was then health-gated for the runoff reached the run-level
+  ledger as a `Benched` abstention alone, which `seat_ballots` dropped: the ledger saw no
+  evidence, the seat stayed routable, `degradedReason` did not name it, and `evaluator_distinct`
+  seated it (run 390b273e: copilot after 5/5 quota ballots; the worker died in 16 s). The council
+  now keeps EVERY ballot's seat failures (`PollStatus.seat_failure_history` / the task record's
+  `seat_failure_history`, additive; `seat_failures` is still the latest round) and the ledger
+  tallies every round, one ballot per seat per round. The dispatcher's `Benched` abstention is
+  recorded and read as CORROBORATION of a dead-class ballot beside it (`quota_exhausted (1/2
+  ballots)`; `not_logged_in` / `not_installed` still bench on first occurrence), as part of the
+  dispatcher's own streak after a timeout (`timed_out` once timeouts + abstentions reach the bench
+  threshold, with at least one timeout), and as proof of nothing on its own. One vote still keeps
+  a seat; an unclassified failure still proves nothing.
+- **A worker that exits on a dead-seat refusal no longer dies through the triage judge
+  (core#461 b).** With an operator in the loop, every non-environment worker failure on attempt 0
+  went to the LLM triage judge FIRST — a classified seat refusal (`quota_exhausted`,
+  `not_logged_in`, `not_installed`) included — and the judge's `fail` was run-fatal with no gate;
+  the failover ladder below it (bench + next eligible seat, crew#277) was never reached. A
+  classified seat refusal now skips the judge and takes the ladder: the seat is benched (as
+  before), the work moves to the next eligible seat and the run continues. When NO eligible seat
+  remains and a human is present, the run PAUSES at core#464's escalation gate
+  (`gateEscalated.condition: "dead_seat"`, `awaitingHuman.gateKind: "escalation"`, prompt naming
+  the seat, the class and the reassign lever) instead of `sessionFailed`;
+  the unit carries a structured `dead_seat` denial for the gate's reassign arm to key on.
+  Autonomous runs (`human_confirm: none`) keep the standard fail contract.
+- **`unitDistributed.distinctnessFallback` (core#461 c).** The evaluator≠creator fallback — a
+  review/test unit that STAYS on a seat that built what it checks because no eligible seat
+  distinct from the builders admits it — was disclosed in `degradedReason` prose only, and only
+  when a bench emptied the pool (a single-seat roster said nothing). It is now a first-class field
+  on the event, the `Distribution` and core-ts' `UnitDistributedEventJson`: `"creator_seat"` when
+  the fallback applies, `null` otherwise, emitted unconditionally (the `seatConstraint` rule);
+  `degradedReason` reads exactly as before. The fallback seat is always a still-eligible one.
+- **A roster with no eligible seat is refused at launch (core#461 d; F-RC2-041).** A launch whose
+  every configured seat the launcher declared unusable (`health.usable: false`) was ACCEPTED and
+  died 2 s later at distribution with an `error` event and no gate — after the composer had said
+  "Ready to send" (run e5999520: "5 of 5 seats benched"). `launch_run` now refuses it synchronously
+  when the plan needs a seat — the TYPED `NoEligibleSeat` error (the `RunBusy` / `RunExists` rule;
+  `no eligible seat for <run>: N of N seats benched: <seat> (<cause> — launcher), …`) — with no
+  session persisted; an empty roster is untouched (a tool-only plan needs no seat, F-E2E-011; a
+  plan that does keeps its distribution-time refusal).
 - **Routing benches a seat that is dead for the run, not only one that is signed out (F-7R3-001).**
   Run c7e42297 seated the review unit on copilot through `evaluator_distinct` after copilot had
   failed EVERY council ballot with "exceeded your monthly quota" — the wave-6 bench (#449) fired

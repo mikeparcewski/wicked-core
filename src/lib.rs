@@ -83,7 +83,7 @@ pub(crate) mod test_env {
 
 pub use acp_runner::AcpStepRunner;
 pub use acp_runner::{ChatInfo, ChatOpenOutcomes, ChatScope};
-pub use actor::{RunBusy, RunExists};
+pub use actor::{NoEligibleSeat, RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
     Application, SeedKind,
