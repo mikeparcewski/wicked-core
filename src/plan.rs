@@ -228,12 +228,25 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // F-7R2-005 — the DEFAULT floor marker for an agent phase that NO LATER phase
             // verifies: when no `verified_evidence` phase follows this one, no `repo_checks_floor`
             // will ever re-derive its work, so a unit that changes the tree owes the repository's
-            // own checks and a distinct judge itself. A phase FOLLOWED by a verify phase leaves
-            // the floor to it (the `bug`/`feature` `fix` gate is `auto` by design and must not
-            // hard-fail on checks the def routes to `verify`'s human gate); a creator AFTER the
-            // def's verify phase is floored (review of #449, FL-3).
+            // own checks and a distinct judge itself. A NON-creator phase FOLLOWED by a verify
+            // phase leaves the floor to it; a creator AFTER the def's verify phase is floored
+            // (review of #449, FL-3).
+            //
+            // core#467 — the def's `executes_code` CREATOR is floored EVEN WHEN a later phase
+            // verifies. The `bug` `fix` gate used to leave the checks to `verify` (its gate is
+            // `auto`, and hard-failing on checks the def routes to `verify`'s human gate was the
+            // worry); on 2026-09-13 that let a fix worker hand a tree failing typecheck AND lint
+            // to the read-only evaluator, which fixed it in place and tripped the guard — the run
+            // was lost with no route back. The creator now owes provision + typecheck + lint +
+            // (targeted) tests at the END of its own phase (`repo_checks::FloorStage::Creator`;
+            // a failure the run base shares never denies, a regression does). A red creator
+            // floor pauses the run at the escalation gate on the creator (core#464) one phase
+            // earlier, with the check tails on the record, instead of at the evaluator's guard
+            // escalation; the rework route (re-dispatch with the tails) is S4b.
             let later_verifies = def.phases[i + 1..].iter().any(|p| p.verified_evidence);
-            unit.default_floor = !is_tool && !later_verifies;
+            let code_creator =
+                phase.executes_code && phase.role == crate::workflow::PhaseRole::Creator;
+            unit.default_floor = !is_tool && (!later_verifies || code_creator);
             // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a
             // `verified_evidence` agent phase with an `executes_code` Creator before it. The engine
             // runs the repository's own checks in the worktree after the seat's work and folds the
@@ -529,6 +542,39 @@ mod tests {
         assert!(prose
             .iter()
             .all(|u| u.base_skill_ref.as_deref() == Some("wicked-garden-governed-worker")));
+    }
+
+    /// core#467: the def's `executes_code` Creator carries the DEFAULT floor even though `verify`
+    /// follows it — the repository's checks run at the end of the creator's own phase. The
+    /// read-only rungs before it still leave the floor to `verify`, and `verify` keeps its own
+    /// declared floor.
+    #[test]
+    fn plan_from_def_floors_the_code_creator_even_when_a_later_phase_verifies() {
+        let def = crate::workflow::bug_def();
+        let units = plan_from_def(&def, "fix the bug", "s1");
+        let floors = |id: &str| {
+            let u = units
+                .iter()
+                .find(|u| u.id == format!("s1:{id}"))
+                .unwrap_or_else(|| panic!("bug has a `{id}` phase"));
+            (u.default_floor, u.repo_checks_floor)
+        };
+        assert_eq!(
+            floors("triage"),
+            (false, false),
+            "a guarded recon rung leaves the floor to verify"
+        );
+        assert_eq!(floors("reproduce"), (false, false));
+        assert_eq!(
+            floors("fix"),
+            (true, false),
+            "the creator owes the floor at the end of its own phase (core#467)"
+        );
+        assert_eq!(
+            floors("verify"),
+            (true, true),
+            "verify keeps its declared floor"
+        );
     }
 
     /// FINDING-024, the join that makes the fix work at all. `prior_context_label` matches a prior's

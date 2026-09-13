@@ -75,6 +75,13 @@ const HAND_AUTHORED = `${BEGIN}
  * core#468 (additive): unitDispatched carries \`baseSkill: {name, role} | null\` — the run's
  * role-keyed BASE skill directive (\`role\` is 'creator' | 'evaluator' | 'neutral'), null when the
  * run declares none; the generation it is handed from is the same unit's skillsSnapshotHanded.gen.
+ * core#467/#469/F-RC2-009 additions (all additive): repoChecksEvaluated carries \`outcome: 'passed' |
+ * 'failed' | 'timed_out' | 'not_run'\` (a timed-out floor denies under source 'repo_checks_timeout',
+ * never 'repo_checks'), \`floor: 'creator' | 'verify'\`, \`claim: {phrase, check, verdict} | null\` and
+ * \`env: {home, tmpdir, locale, network, sandboxLevel, path, passthrough} | null\`; every \`checks[]\`
+ * entry carries \`outcome\`, \`boundS\`, \`boundNote\`, \`failureIds\`, \`classification: 'regression' |
+ * 'pre_existing_in_sandbox' | 'floor_env_mismatch' | null\` (only a regression denies), \`preExisting\`,
+ * \`regressions\` and \`base: {head, cached, run, error} | null\` (the same check run on the run base).
  */
 export interface CoreEventJson {
   type: string

@@ -45,6 +45,44 @@ Two release tracks share this file, newest entry first regardless of track:
   with core#464.
 
 ### Added
+- **The creator owes the repo-checks floor too; a timeout is not a failure; a base failure is
+  not a regression (core#467, core#469, F-RC2-009 — hardening train S4a).** On 2026-09-13 a `fix`
+  worker left a tree failing `npm run typecheck` (exit 2) and `npm run lint` (exit 1), wrote
+  "pre-existing typecheck error" although `main` was clean, and was judged PASS on "left a
+  change"; the red tree reached the read-only evaluator, which fixed it in place, tripped the
+  worktree guard, and the run was lost at an escalation gate with no route back (F-RC1-070/071).
+  The same day a correct crew fix passed typecheck and lint and was DENIED because the full
+  `npm test` exceeded the fixed 1200 s bound under host load (F-RC2-050), and a verify floor
+  reported 27 `cargo test` failures that pass on the run base outside its sandbox (F-RC2-009).
+  **Behaviour change — the `bug`/`feature` `fix` phase (every def phase with `executes_code` and
+  `role: creator`) is now floored** (`plan_from_def` sets `default_floor` regardless of a later
+  `verified_evidence` phase): provision + typecheck + lint + tests run at the END of the
+  creator's phase in its worktree (`repo_checks::FloorStage::Creator`), and a red floor denies
+  the creator's unit with the check tails on the record — the run pauses at the escalation gate
+  ON the creator (core#464, class `floor_failed`; retry / cancel) one phase earlier than before,
+  instead of at the evaluator's guard escalation; the rework route (re-dispatch the creator with
+  the tails) is S4b. What the
+  floor reports changed with it: every check carries `outcome: passed | failed | timed_out |
+  could_not_run`, the effective bound it ran under (`bound_s`, `bound_note`) and, when it
+  failed, a BASELINE DIFF — the same check run once per run on the run base (the run base commit
+  recorded on the unit at dispatch — never a HEAD a creator may have moved by committing — exported
+  through the pinned git dir into the checks' scratch for the base check only, then removed; cached
+  by base sha + check name; `baseline_diff: false` opts out) with failure identifiers streamed off the
+  runner's output (cargo, vitest/jest, tsc, pytest, go, eslint stylish): failures the base
+  shares are `pre_existing_in_sandbox`, identical base/head failure sets a `floor_env_mismatch`
+  (the floor's env is recorded on the verdict — `env`; the sandbox itself is unchanged), and
+  only head-only `regression`s deny. A check that hit its bound is `timed_out` and the unit is
+  denied under the NEW source `repo_checks_timeout` (never `repo_checks`), worded as "did not
+  FINISH" with the remedies; the bound is `base × clamp(load1/ncpu, 1, 3)`. Per-repo
+  `.wicked/checks.json` (`typecheck`, `lint`, `test`, `test_targeted` with `{files}`/`{base}`,
+  `timeout_s`, `full`, `baseline_diff`; fail-closed on a malformed file): the floor prefers
+  `test_targeted` at the creator always and at verify unless `full: true`. A creator transcript
+  claiming a failure is pre-existing is judged against the diff (`claim: claim_rejected |
+  claim_confirmed | unverified`). Wire (all additive): `repoChecksEvaluated` gains `outcome`,
+  `floor: creator | verify`, `claim`, `env`; each `checks[]` entry gains `outcome`, `boundS`,
+  `boundNote`, `failureIds`, `classification`, `preExisting`, `regressions`, `base`. Gate
+  ACTIONS on these classifications (re-dispatch the creator with the tails, extend / targeted /
+  accept on a timeout, accept an evaluator suggestion) are S4b. Design: `.product/DES-FLOOR-001`.
 - **Role-keyed BASE skill directive on every unit (core#468).** The engine handed a unit exactly
   one skill directive, built from its phase's `skill_ref`; nothing could force a discipline skill
   on EVERY unit. `WorkflowDef.base_skill_ref: Option<String>` (drop-in JSON field, serde-default,

@@ -3057,6 +3057,10 @@ mod tests {
                 sandbox_level: s(),
                 sandbox_error: None,
                 detect_error: None,
+                outcome: s(),
+                floor: s(),
+                claim: None,
+                env: None,
             },
             "repoChecksEvaluated",
             &[
@@ -3071,6 +3075,10 @@ mod tests {
                 "criterion",
                 "checks",
                 "skipped",
+                "outcome",
+                "floor",
+                "claim",
+                "env",
             ],
         );
         check(

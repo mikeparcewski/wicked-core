@@ -881,13 +881,16 @@ pub enum CoreEvent {
         run_branch: String,
     },
     /// (F-039) The engine ran the repository's OWN checks in the run's worktree for the def's
-    /// code-verifying unit (`verified_evidence` with an `executes_code` Creator upstream) and
-    /// folded them into the gate as a deterministic floor. One event per fold, emitted just before
-    /// `gateEvaluated` (whose `hasDeterministicFloor`/`criterion` include this floor). `checks` is
-    /// what actually ran, in order, with exit code, duration and stdout/stderr TAILS; `skipped`
-    /// names detected checks not run because an earlier one failed. `passed: false` ⇒ the unit is
-    /// denied (source `repo_checks`). An empty `checks` with `passed: true` means no checks were
-    /// detected (no package.json typecheck/lint/test script, no Cargo.toml) — disclosed as such.
+    /// code-verifying unit (`verified_evidence` with an `executes_code` Creator upstream) — and,
+    /// since core#467, for the def's `executes_code` Creator unit at the end of its own phase —
+    /// and folded them into the gate as a deterministic floor. One event per fold, emitted just
+    /// before `gateEvaluated` (whose `hasDeterministicFloor`/`criterion` include this floor).
+    /// `checks` is what actually ran, in order, with exit code, duration, stdout/stderr TAILS,
+    /// the bound it ran under and its classification; `skipped` names detected checks not run
+    /// because an earlier one denied. `passed: false` ⇒ the unit is denied (source `repo_checks`,
+    /// or `repo_checks_timeout` when a check hit its bound — core#469). An empty `checks` with
+    /// `passed: true` means no checks were detected (no package.json typecheck/lint/test script,
+    /// no Cargo.toml) — disclosed as such.
     RepoChecksEvaluated {
         session: String,
         ord: u32,
@@ -906,6 +909,18 @@ pub enum CoreEvent {
         /// `Some` when check DETECTION itself failed (an unreadable manifest) — distinct from
         /// "no checks detected".
         detect_error: Option<String>,
+        /// (core#469, additive) `passed` | `failed` | `timed_out` | `not_run` — a floor that did
+        /// not FINISH is never rendered as "checks failed".
+        outcome: String,
+        /// (core#467, additive) `creator` | `verify` — whose floor this was.
+        floor: String,
+        /// (core#467, additive) A creator transcript's "pre-existing" claim judged against the
+        /// baseline diff (`claim_rejected` when the run base is green); `None` when no claim was
+        /// made or the floor was green.
+        claim: Option<crate::repo_checks::ClaimCheck>,
+        /// (F-RC2-009, additive) The environment the checks ran under — read it beside a
+        /// `floor_env_mismatch` check. `None` when the checks did not run.
+        env: Option<crate::repo_checks::FloorEnv>,
     },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
@@ -1079,6 +1094,47 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         "durationMs": c.duration_ms,
         "stdoutTail": c.stdout_tail,
         "stderrTail": c.stderr_tail,
+        // core#469 / F-RC2-009 (additive): the classification and the bound, on every check.
+        "outcome": c.outcome(),
+        "boundS": c.bound_s,
+        "boundNote": c.bound_note,
+        "failureIds": c.failure_ids,
+        "classification": c.classification,
+        "preExisting": c.pre_existing,
+        "regressions": c.regressions,
+        "base": c.base.as_deref().map(base_run_json),
+    })
+}
+
+/// The wire form of the same check run on the run BASE (`checks[].base`).
+fn base_run_json(b: &crate::repo_checks::BaseRun) -> serde_json::Value {
+    serde_json::json!({
+        "head": b.head,
+        "cached": b.cached,
+        "run": b.run.as_ref().map(check_run_json),
+        "error": b.error,
+    })
+}
+
+/// The wire form of a judged "pre-existing" claim (`repoChecksEvaluated.claim`).
+fn claim_check_json(c: &crate::repo_checks::ClaimCheck) -> serde_json::Value {
+    serde_json::json!({
+        "phrase": c.phrase,
+        "check": c.check,
+        "verdict": c.verdict,
+    })
+}
+
+/// The wire form of the floor's environment record (`repoChecksEvaluated.env`).
+fn floor_env_json(e: &crate::repo_checks::FloorEnv) -> serde_json::Value {
+    serde_json::json!({
+        "home": e.home,
+        "tmpdir": e.tmpdir,
+        "locale": e.locale,
+        "network": e.network,
+        "sandboxLevel": e.sandbox_level,
+        "path": e.path,
+        "passthrough": e.passthrough,
     })
 }
 
@@ -1979,6 +2035,10 @@ impl CoreEvent {
                 sandbox_level,
                 sandbox_error,
                 detect_error,
+                outcome,
+                floor,
+                claim,
+                env,
             } => json!({
                 "type": "repoChecksEvaluated",
                 "session": session,
@@ -1991,6 +2051,10 @@ impl CoreEvent {
                 "sandboxLevel": sandbox_level,
                 "sandboxError": sandbox_error,
                 "detectError": detect_error,
+                "outcome": outcome,
+                "floor": floor,
+                "claim": claim.as_ref().map(claim_check_json),
+                "env": env.as_ref().map(floor_env_json),
             }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {

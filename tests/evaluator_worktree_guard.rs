@@ -15,7 +15,10 @@
 //!    with nothing evaluated);
 //! 3. a clean evaluator passes, and the engine runs the repository's own checks (`cargo test` on
 //!    a Cargo fixture) as a deterministic floor whose exit code is attached to the gate;
-//! 4. a failing check DENIES the verify gate with the exit code and output tail as evidence;
+//! 4. a check the creator BREAKS (green on the run base, red on the head) DENIES the creator's own
+//!    gate with the exit code, output tail and the base comparison as evidence — before verify
+//!    ever runs (core#467); a check the base fails IDENTICALLY is recorded and denies nothing
+//!    (F-RC2-009: the floor's sandbox, not the change, is the cause).
 //! 5. (core#464) a denial on ANY unit — the read-only `reproduce` rung writing a note into the
 //!    tree, a governance deny on its output — PAUSES the run at the escalation gate with a route
 //!    back (retry against the restored tree / cancel) instead of ending it `sessionFailed`, and a
@@ -162,6 +165,16 @@ impl StepRunner for ScriptedSeat {
                 "fix" => {
                     std::fs::write(wd.join("src/app.ts"), "fixed\n").unwrap();
                     std::fs::write(wd.join("src/fix.ts"), "the fix\n").unwrap();
+                    // core#467: when the fixture asks for it, the creator BREAKS the repo's own
+                    // test — a regression the creator's floor must catch before verify.
+                    if wd.join(".break-in-fix").is_file() {
+                        std::fs::write(
+                            wd.join("src/lib.rs"),
+                            "#[cfg(test)]\nmod t {\n    #[test]\n    fn boom() {\n        \
+                             assert!(false, \"REPO CHECK BOOM\");\n    }\n}\n",
+                        )
+                        .unwrap();
+                    }
                 }
                 "verify" => {
                     if let VerifyBehaviour::RewritesTheFix = self.verify {
@@ -874,63 +887,136 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// F-039, the floor biting: the evaluator leaves the tree alone but the repository's own check
-/// FAILS. The seat may claim whatever it likes — the engine ran `cargo test`, saw exit 101 and
-/// the assertion text, and the gate denies on THAT evidence.
+/// The `repoChecksEvaluated` record for `ord`: `(floor, outcome, passed, checks)`.
+fn checks_for(
+    events: &[CoreEvent],
+    want_ord: u32,
+) -> (String, String, bool, Vec<wicked_core::CheckRun>) {
+    events
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::RepoChecksEvaluated {
+                ord,
+                floor,
+                outcome,
+                passed,
+                checks,
+                ..
+            } if *ord == want_ord => {
+                Some((floor.clone(), outcome.clone(), *passed, checks.clone()))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no repoChecksEvaluated for ord {want_ord}"))
+}
+
+/// core#467, the creator floor biting: the fixture's base PASSES `cargo test`; the fix phase
+/// BREAKS it. The creator's own floor runs at the end of the fix phase, the baseline diff finds
+/// the base green ⇒ REGRESSION, and the fix unit is denied on that evidence — the seat may claim
+/// whatever it likes; verify never runs on a red tree. The run PAUSES at the escalation gate ON
+/// the fix unit (core#464, class `floor_failed` — the token S4b's rework route keys on) one phase
+/// earlier than before, with the check tails, the base comparison and the bound on the record.
 #[test]
-fn a_failing_repo_check_denies_the_verify_gate_with_the_exit_code_as_evidence() {
-    let repo = make_git_repo("failing", Some(false));
-    let (core, _ran) = core_for("failing", VerifyBehaviour::LeavesTreeAlone);
+fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_verify() {
+    let repo = make_git_repo("regression", Some(true));
+    std::fs::write(repo.join(".break-in-fix"), "").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "ask the fix to break the test"]);
+    let (core, ran) = core_for("regression", VerifyBehaviour::LeavesTreeAlone);
     let entry = core
         .register_repo(RepoSpec {
-            name: "failing".into(),
+            name: "regression".into(),
             root_path: repo.to_str().unwrap().into(),
             registered_at: 1,
         })
         .expect("register");
     let events = core.subscribe();
-    core.launch_run(bug_run("r-failing", &entry.id))
+    core.launch_run(bug_run("r-regression", &entry.id))
         .expect("launch");
     assert!(
-        wait_status(&core, "r-failing", SessionStatus::AwaitingHuman),
-        "a failing repo check must escalate the verify gate to a human"
+        wait_status(&core, "r-regression", SessionStatus::AwaitingHuman),
+        "a regression is denied at the creator gate (sandboxed) or fails closed at verify — \
+         either way the run PAUSES at a gate (core#464), never sessionFailed"
     );
     let evs = drain(&events);
-
-    let verify = gate_for(&evs, 4);
-    assert!(!verify.combined);
     assert!(
-        !verify.deterministic_pass,
-        "the deterministic layer failed — the repo checks are part of it"
+        !session_failed(&evs),
+        "no sessionFailed without a decided gate"
     );
-    assert_eq!(verify.denial_source.as_deref(), Some("repo_checks"));
-    if checks_refused_without_a_boundary(&verify) {
+    if gate_for(&evs, 3).denial_source.as_deref() != Some("repo_checks") {
+        // No OS boundary on this host: the creator's DEFAULT floor is disclosed, not denied
+        // (F-7R2-005), so the red tree reaches verify, whose DECLARED floor fails closed.
+        let verify = gate_for(&evs, 4);
+        assert!(
+            checks_refused_without_a_boundary(&verify),
+            "{:?}",
+            verify.denial_reason
+        );
         assert_fail_closed_without_boundary(&evs, &verify, 4);
         let _ = std::fs::remove_dir_all(&repo);
         return;
     }
-    let reason = verify.denial_reason.expect("reason");
+    // The creator's floor denied: the run paused at the ESCALATION gate on the fix unit
+    // (core#464), classed as a floor failure — the token S4b's rework route keys on.
+    let (reviewing, kind, _prompt) = gate_pause(&evs, 3);
+    assert_eq!((reviewing, kind.as_str()), (Some(3), "escalation"));
+    let g = escalation_for(&evs, 3);
+    assert_eq!(g.condition, "floor_failed");
+    assert_eq!(g.denial_source, "repo_checks");
     assert!(
-        reason.contains("cargo-test: exit 101") && reason.contains("test result: FAILED"),
-        "the denial carries the exit code and cargo's own verdict line from the captured tail: \
-         {reason}"
+        !ran.lock().unwrap().iter().any(|p| p == "verify"),
+        "verify never runs on a red creator tree: {:?}",
+        ran.lock().unwrap()
     );
-    let (passed, checks) = evs
-        .iter()
-        .find_map(|ev| match ev {
-            CoreEvent::RepoChecksEvaluated {
-                ord,
-                passed,
-                checks,
-                ..
-            } if *ord == 4 => Some((*passed, checks.clone())),
-            _ => None,
-        })
-        .expect("repoChecksEvaluated emitted");
-    assert!(!passed);
-    assert_eq!(checks[0].exit_code, Some(101));
+    let fix = gate_for(&evs, 3);
+    assert!(!fix.combined && !fix.deterministic_pass);
+    assert_eq!(
+        fix.denial_source.as_deref(),
+        Some("repo_checks"),
+        "{:?}",
+        fix.denial_reason
+    );
+    assert!(fix.has_floor);
+    let criterion = fix.criterion.expect("the fix gate names its criterion");
     assert!(
-        format!("{}{}", checks[0].stdout_tail, checks[0].stderr_tail).contains("REPO CHECK BOOM")
+        criterion.contains("the run left a change in its worktree")
+            && criterion.contains("repository's own checks pass"),
+        "the fix gate's criterion is the evidence floor AND the checks: {criterion}"
+    );
+    let reason = fix.denial_reason.expect("reason");
+    assert!(
+        reason.contains("cargo-test: exit 101")
+            && reason.contains("[regression]")
+            && reason.contains("REGRESSION: the run base")
+            && reason.contains("test result: FAILED"),
+        "the denial carries the exit code, the classification, the base comparison and cargo's \
+         own verdict line from the captured tail: {reason}"
+    );
+    let (floor, outcome, passed, checks) = checks_for(&evs, 3);
+    assert_eq!(floor, "creator");
+    assert_eq!(outcome, "failed");
+    assert!(!passed);
+    let c = &checks[0];
+    assert_eq!(c.name, "cargo-test");
+    assert_eq!(c.exit_code, Some(101));
+    assert_eq!(c.outcome(), "failed");
+    assert_eq!(c.classification.as_deref(), Some("regression"));
+    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
+    assert!(c.pre_existing.is_empty());
+    assert!(
+        format!("{}{}", c.stdout_tail, c.stderr_tail).contains("REPO CHECK BOOM"),
+        "the FULL tail on the record carries the assertion text the bounded denial excerpt cuts"
+    );
+    let base = c.base.as_deref().expect("the base run rides the check");
+    assert!(
+        base.run.as_ref().is_some_and(|b| b.passed()),
+        "the run base is green: {base:?}"
+    );
+    assert!(c.bound_s > 0, "the effective bound is on the record");
+    assert!(
+        !evs.iter()
+            .any(|ev| matches!(ev, CoreEvent::GateEvaluated { ord: 4, .. })),
+        "no verify gate — the run stopped at the creator"
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -1341,4 +1427,78 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
     if let Some(run_dir) = Path::new(root).parent() {
         let _ = std::fs::remove_dir_all(run_dir);
     }
+}
+
+/// F-RC2-009 — BASELINE-DIFF: the fixture's base ALREADY fails `cargo test` and the fix changes
+/// nothing about that. The floor's sandbox reports the failure on the head, runs the same check
+/// on the base, finds the failure sets IDENTICAL ⇒ `floor_env_mismatch`: recorded on both the
+/// creator's and the evaluator's floor, denying neither — the run COMPLETES, the shared failure
+/// is listed, and the base run is paid for once (verify reads the creator's cached run).
+#[test]
+fn a_check_the_base_fails_identically_is_recorded_not_denied() {
+    let repo = make_git_repo("shared-failure", Some(false));
+    let (core, _ran) = core_for("shared-failure", VerifyBehaviour::LeavesTreeAlone);
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "shared-failure".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-shared", &entry.id))
+        .expect("launch");
+    if !wait_status(&core, "r-shared", SessionStatus::Completed) {
+        // No OS boundary: nothing ran, the verify floor fails closed and escalates.
+        assert!(
+            wait_status(&core, "r-shared", SessionStatus::AwaitingHuman),
+            "a failure the base shares completes the run (sandboxed) or fails closed at verify"
+        );
+        let evs = drain(&events);
+        let verify = gate_for(&evs, 4);
+        assert!(
+            checks_refused_without_a_boundary(&verify),
+            "{:?}",
+            verify.denial_reason
+        );
+        assert_fail_closed_without_boundary(&evs, &verify, 4);
+        let _ = std::fs::remove_dir_all(&repo);
+        return;
+    }
+    let evs = drain(&events);
+    for (ord, want_floor) in [(3u32, "creator"), (4, "verify")] {
+        let g = gate_for(&evs, ord);
+        assert!(
+            g.combined && g.deterministic_pass,
+            "ord {ord}: a failure the base shares denies nothing: {:?}",
+            g.denial_reason
+        );
+        let (floor, outcome, passed, checks) = checks_for(&evs, ord);
+        assert_eq!(floor, want_floor);
+        assert_eq!(outcome, "passed");
+        assert!(passed);
+        let c = &checks[0];
+        assert_eq!(
+            c.exit_code,
+            Some(101),
+            "ord {ord}: the head DID fail the check"
+        );
+        assert_eq!(c.outcome(), "failed");
+        assert_eq!(
+            c.classification.as_deref(),
+            Some("floor_env_mismatch"),
+            "ord {ord}: {c:?}"
+        );
+        assert_eq!(c.pre_existing, vec!["test t::boom".to_string()]);
+        assert!(c.regressions.is_empty());
+        let base = c.base.as_deref().expect("the base run rides the check");
+        assert!(base.run.as_ref().is_some_and(|b| !b.passed()));
+        if ord == 4 {
+            assert!(
+                base.cached,
+                "verify reads the creator's base run from the run's cache"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&repo);
 }
