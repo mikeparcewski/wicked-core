@@ -1167,12 +1167,57 @@ pub(crate) fn apply_and_finish_unit(
                         .assigned_cli
                         .clone()
                         .unwrap_or_else(|| "claude".to_string()),
-                    carrier: "wrapped_cli".to_string(),
+                    // (issue #463) The carrier that armed the unit, read back off the armed
+                    // marker — this fold replays records BOTH carriers write; the wrapped label
+                    // stays the default for a log an older launcher wrote.
+                    carrier: rec
+                        .carrier
+                        .clone()
+                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
                     role: crate::write_posture::role_wire(unit.role).to_string(),
                     tool: rec.tool_name.clone(),
                     command,
                     reason,
                     remedy: remedy.to_string(),
+                });
+            }
+            // (issue #463) The ADVISORY arm of the estate-command fence — a recon / pre-build unit
+            // asked for a write-path estate command (a `wicked-estate` write subcommand, or the
+            // shim / MCP without `--readonly` or a pinned store): the call was blocked, the graph
+            // is untouched, the seat was handed the remedy and continued. Disclosed here with the
+            // tool and the command named (the record carries both; `(unknown)` never). The FATAL
+            // arm (a code-executing unit) rides `boundary-deny:` into `fold_input_denial` above
+            // and denies the unit — it is not a refusal the seat survived, so it is not echoed
+            // here.
+            if let Some((reason, command)) = rec.estate_refusal() {
+                eprintln!(
+                    "wicked-core: unit {} ({}) on '{}' asked to run a write-path estate command \
+                     and was refused by the gate hook: `{command}` — {} (issue #463)",
+                    unit.ord,
+                    crate::write_posture::role_wire(unit.role),
+                    unit.assigned_cli.as_deref().unwrap_or("claude"),
+                    crate::gate_hook::ESTATE_DENY_REMEDY,
+                );
+                emit(CoreEvent::WorkerToolCallDenied {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    cli: unit
+                        .assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string()),
+                    // (issue #463) The carrier that armed the unit, read back off the armed
+                    // marker — this fold replays records BOTH carriers write; the wrapped label
+                    // stays the default for a log an older launcher wrote.
+                    carrier: rec
+                        .carrier
+                        .clone()
+                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                    role: crate::write_posture::role_wire(unit.role).to_string(),
+                    tool: rec.tool_name.clone(),
+                    command,
+                    reason,
+                    remedy: crate::gate_hook::ESTATE_DENY_REMEDY.to_string(),
                 });
             }
             emit(CoreEvent::GovernanceHookFired {

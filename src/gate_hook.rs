@@ -83,6 +83,34 @@ pub const GATE_DB_ENV: &str = "WICKED_GATE_DB";
 /// the engine ever setting a thing.
 pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 
+/// (issue #463) The environment variables whose presence PINS the store an estate shim / MCP read
+/// resolves — the second half of the shim allow rule (`--readonly` AND a pinned store, DES-GROUNDING-001
+/// §7.1). The launcher re-sets [`ESTATE_DB_ENV`] on a governed WRAPPED worker whose repo has a graph
+/// (`execute_wrapped::arm_worker_estate_channel`) after `hardened()` stripped it; `WICKED_HOME` /
+/// `WICKED_MEMORY_DB` pin the memory + knowledge stores garden's `mem` backend reads and reach the
+/// worker on BOTH carriers by plain inheritance (neither is in `ENGINE_INTERNAL_ENV`).
+pub(crate) const ESTATE_STORE_PIN_ENV: [&str; 3] =
+    [ESTATE_DB_ENV, "WICKED_HOME", "WICKED_MEMORY_DB"];
+
+/// The env arm of the store-pin fact — read off the hook SUBPROCESS's own environment, which is
+/// the worker's (the hook is its grandchild), exactly as [`write_posture_from_env`] reads the posture.
+fn estate_store_pinned_from_env() -> bool {
+    ESTATE_STORE_PIN_ENV
+        .iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// The store-pin fact for the IN-PROCESS carrier (the ACP permission bridge): what the AGENT child
+/// inherits is the daemon's environment minus `hardened()`'s strip list — so a pin the daemon holds
+/// under a stripped name ([`ESTATE_DB_ENV`]) never reaches the child and must not count. Evaluated on
+/// the runner at boundary construction, where the daemon env IS the child's parent environment.
+pub(crate) fn estate_store_pinned_for_child() -> bool {
+    ESTATE_STORE_PIN_ENV
+        .iter()
+        .filter(|k| !wicked_apps_core::spawn::ENGINE_INTERNAL_ENV.contains(k))
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
+
 /// The store a VALIDATOR script may reach, carried under its own name.
 ///
 /// Validator scripts used to be handed `WICKED_ESTATE_DB` — the OPERATIONAL store — so that
@@ -247,6 +275,7 @@ fn boundary_denial(
         context,
         tool,
         Some(install_state),
+        estate_store_pinned_from_env(),
     )
 }
 
@@ -299,6 +328,12 @@ pub(crate) struct BoundaryCtx {
     /// ([`crate::write_posture::deliverable_roots_of`]), the same list the ACP fence judges (F-02).
     /// Empty for every other posture. The subprocess carrier reads [`DELIVERABLE_ROOTS_ENV`].
     pub deliverable_roots: Vec<std::path::PathBuf>,
+    /// (issue #463) Whether the worker's environment PINS the estate store its shim / MCP reads
+    /// resolve ([`ESTATE_STORE_PIN_ENV`]) — the second half of the shim allow rule. Rides here for
+    /// the same reason `pre_build_scope` does: the in-process carrier has no worker env to read it
+    /// from ([`estate_store_pinned_for_child`] derives it on the runner); the subprocess carrier
+    /// reads its own environment ([`estate_store_pinned_from_env`]).
+    pub estate_store_pinned: bool,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -330,6 +365,10 @@ fn in_system_temp(resolved: &std::path::Path) -> bool {
 /// The pure boundary judgement both carriers share: roots, cwd AND home are PARAMETERS, never
 /// ambient process state, so the wrapped subprocess (env-armed) and the in-process ACP bridge
 /// (context-armed, core#260) cannot diverge on what "outside the boundary" means.
+///
+/// Judged WITHOUT an ambient estate-store pin (issue #463): a shim / MCP call must carry its pin
+/// on argv here — the STRICT spelling the chat boundary and the boundary tests use. The governed
+/// carriers pass their pin fact through [`boundary_denial_tracked`] instead.
 pub(crate) fn boundary_denial_with(
     roots: &crate::path_policy::AllowedRoots,
     cwd: &std::path::Path,
@@ -338,7 +377,16 @@ pub(crate) fn boundary_denial_with(
     context: &serde_json::Value,
     tool: &str,
 ) -> Option<(String, bool)> {
-    boundary_denial_tracked(roots, cwd, home, claude_config_dir, context, tool, None)
+    boundary_denial_tracked(
+        roots,
+        cwd,
+        home,
+        claude_config_dir,
+        context,
+        tool,
+        None,
+        false,
+    )
 }
 
 /// The sidecar of the attempt's decisions log that carries the seat's shell cwd as the install
@@ -389,7 +437,9 @@ pub(crate) fn track_install_fence_cwd(
 }
 
 /// [`boundary_denial_with`] judging the install fence from the cwd persisted at `install_state`
-/// (the wrapped carrier's per-attempt sidecar), or from `cwd` when there is none.
+/// (the wrapped carrier's per-attempt sidecar), or from `cwd` when there is none, and the estate
+/// shim rule (issue #463) with `estate_store_pinned` — whether the WORKER's environment pins the
+/// store ([`ESTATE_STORE_PIN_ENV`]); a parameter, like the roots, so both carriers judge alike.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn boundary_denial_tracked(
     roots: &crate::path_policy::AllowedRoots,
@@ -399,6 +449,7 @@ pub(crate) fn boundary_denial_tracked(
     context: &serde_json::Value,
     tool: &str,
     install_state: Option<&std::path::Path>,
+    estate_store_pinned: bool,
 ) -> Option<(String, bool)> {
     // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
     if let Some(path) = context
@@ -473,21 +524,22 @@ pub(crate) fn boundary_denial_tracked(
                     return Some((format!("Bash write leaves the unit boundary: {d}"), fatal));
                 }
             }
-            // Close the residual bash-indexer write path on the SHARED project graph
-            // (DES-GROUNDING-001 §6). The estate `--db` path rides the worker-readable inbox
-            // mcp-config, and the MCP `--readonly` mode closed only the tool surface — a raw
-            // `wicked-estate index --db <that path>` via Bash would delete-sweep the graph
-            // concurrent runs share. Engine-level deny, unit-FATAL. Same defense-in-depth limit
-            // as bash_write_targets above (a renamed binary or raw-SQLite python still evades it).
-            if let Some(segment) = bash_denied_estate_indexer(command) {
+            // ESTATE COMMAND FENCE (DES-GROUNDING-001 §7, issue #463): guard write-path access to
+            // the SHARED project graph from a governed unit's Bash. Read-only `wicked-estate`
+            // subcommands, and the estate stdio shim / `wicked-estate-mcp` run with `--readonly`
+            // AND a pinned store, are ALLOWED — the grounding transport; write subcommands and any
+            // shim / MCP invocation missing either half are DENIED, with the reason naming the
+            // segment and why. `evaluate_tool_call` inspects the posture (recon/pre-build vs
+            // code-executing) to decide advisory vs fatal; the `false` placeholder here is never
+            // read for estate denies. Same defense-in-depth limit as bash_write_targets (a renamed
+            // binary / raw SQLite still evades a literal scan; the OS sandbox is the hermetic layer).
+            if let Some(hit) = classify_estate_command(command, estate_store_pinned) {
                 return Some((
                     format!(
-                        "Bash invokes the wicked-estate CLI, which can rewrite the SHARED \
-                         project graph (DES-GROUNDING-001 §6): `{segment}`. Grounding reaches \
-                         the graph through the estate MCP; the CLI is not available to a \
-                         governed unit."
+                        "{ESTATE_DENY_REASON_PREFIX} `{}` — {}; {ESTATE_DENY_REMEDY}",
+                        hit.segment, hit.why
                     ),
-                    true,
+                    false, // placeholder — posture-based advisory/fatal decided in evaluate_tool_call
                 ));
             }
         }
@@ -787,24 +839,48 @@ fn bash_write_targets(command: &str) -> Vec<String> {
     targets
 }
 
-/// Deny an in-run invocation of the wicked-estate CLI from Bash (DES-GROUNDING-001 §6).
+/// Classify an in-run Bash invocation of the `wicked-estate` CLI, the estate stdio MCP
+/// (`wicked-estate-mcp`), or wicked-garden's estate shim / backends (DES-GROUNDING-001 §7,
+/// issue #463).
 ///
-/// Grounding a governed run reaches the project graph through the estate MCP, whose config the
-/// worker sees over the inbox mcp-config. That config carries the graph's `--db` path, and the
-/// MCP's `--readonly` mode closed only the TOOL surface — it does nothing to a raw
-/// `wicked-estate index --db <that path>` run through Bash, which would delete-sweep and reindex
-/// the graph that concurrent runs SHARE. This closes that residual write path at the worker's Bash
-/// boundary by denying the estate binary family outright: a governed unit has no legitimate reason
-/// to drive the estate CLI in-run (grounding is via the MCP), so the WHOLE family is refused —
-/// not just the mutating subcommands — which is simplest and future-proof.
+/// Replaces the old deny-all rule with a per-command ALLOWLIST:
 ///
-/// DEFENSE-IN-DEPTH, not a hermetic sandbox — the SAME honest limit [`bash_write_targets`] and its
-/// caller document: the shell is Turing-complete, so a worker who copies/renames the binary, or
-/// writes raw SQLite via `python`, still evades a scan of the literal command. This closes the
-/// DIRECT, named escape; OS-level containment is the only hermetic guarantee and this codebase does
-/// not yet have it.
+/// * **`wicked-estate` CLI** — the read-only subcommands [`ESTATE_READ_VERBS`] (`query`,
+///   `blast-radius`, `rank`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`) and
+///   `clusters` WITHOUT `--annotate` are ALLOWED; the write subcommands (`index`, `scip`,
+///   `tfstate`, `import-telemetry`, `compact`, `watch`, `clusters --annotate`) and any
+///   unrecognised subcommand are DENIED (fail-closed: a future read verb must be added here).
+/// * **`wicked-estate-mcp`** and the **estate shim** — ALLOWED only when the segment carries
+///   BOTH `--readonly` AND a pinned store: `--db <path>` / `--db=<path>` on argv, a leading
+///   `WICKED_ESTATE_DB=…` / `WICKED_HOME=…` / `WICKED_MEMORY_DB=…` assignment
+///   ([`ESTATE_STORE_PIN_ENV`]), or `store_pinned_by_env` — the same variables in the WORKER's
+///   environment, handed in by the carrier ([`BoundaryCtx::estate_store_pinned`] /
+///   [`estate_store_pinned_from_env`]). `--readonly` alone is not enough: an unpinned shim
+///   resolves whatever store the cwd or the operator's defaults happen to name.
 ///
-/// Returns the offending pipeline/sequence segment (so the deny message can NAME it), or `None`.
+/// # The shim / backend pattern (the cross-repo contract, DES-GROUNDING-001 §7.3)
+///
+/// wicked-garden grounds through `scripts/_estate_client.py` — the stdio shim that spawns
+/// `wicked-estate-mcp` — and the backends that import it: every `scripts/mem/*.py`
+/// (`estate_memory.py`, `auto_memorize.py`, …) and `scripts/_context_backend.py`. Skills run
+/// them through a LAUNCHER, so the program word is never `wicked-estate`:
+/// `sh "$ROOT/scripts/_python.sh" "$ROOT/scripts/mem/estate_memory.py" recall '{…}'`. The
+/// classifier therefore recognises a shim invocation by the SCRIPT IN EXECUTING POSITION — the
+/// program word itself, or the first non-flag argument of a launcher (`python*`, `py`, `sh`,
+/// `bash`, `zsh`, `dash`, seen through garden's `_python.sh` / `_run.py` resolvers), or the
+/// module of `python -m <mod>` ([`ESTATE_SHIM_MODULES`]) — never by a mere mention
+/// (`grep readonly scripts/_estate_client.py` is not an invocation). The script is matched by
+/// basename ([`ESTATE_SHIM_SCRIPTS`]) or by the `scripts/mem/` path segment ([`ESTATE_SHIM_DIR`]).
+/// A new garden backend that spawns the shim from another directory must be added here (or live
+/// under `scripts/mem/`) — until then it is invisible to this scan, exactly as before.
+///
+/// DEFENSE-IN-DEPTH, same honest limit as [`bash_write_targets`]: a renamed binary, `sh -c '…'`,
+/// `python -c '…'`, raw SQLite via python, or the no-space glued operator still evades a literal
+/// scan. OS-level containment is the only hermetic guarantee; this is the secondary layer for
+/// sandbox-less hosts.
+///
+/// Returns the offending pipeline/sequence segment and WHY (so the deny message can NAME both),
+/// or `None` when every segment is in the allowlist.
 ///
 /// `is_env_assignment`: a `NAME=value` token with a shell-identifier NAME — a leading env-assignment
 /// prefix (`X=1 cmd`) that runs `cmd` with `X` set, so it is not the program word. `=foo`, `1a=b`, or
@@ -820,7 +896,163 @@ fn is_env_assignment(tok: &str) -> bool {
     }
 }
 
-fn bash_denied_estate_indexer(command: &str) -> Option<String> {
+/// One denied estate invocation: the pipeline/sequence segment (so the message can NAME it) and
+/// WHY it was refused (one of the `ESTATE_WHY_*` sentences).
+pub(crate) struct EstateDeny {
+    pub segment: String,
+    pub why: &'static str,
+}
+
+/// Why an estate invocation was refused — a `wicked-estate` write subcommand.
+pub(crate) const ESTATE_WHY_WRITE_VERB: &str =
+    "a write subcommand mutates the shared project graph";
+/// Why an estate invocation was refused — a `wicked-estate` subcommand not in the read allowlist.
+pub(crate) const ESTATE_WHY_UNKNOWN_VERB: &str =
+    "not a known read-only `wicked-estate` subcommand (fail-closed)";
+/// Why an estate invocation was refused — the shim / MCP runs without `--readonly`.
+pub(crate) const ESTATE_WHY_NO_READONLY: &str =
+    "the estate shim / `wicked-estate-mcp` runs without `--readonly`";
+/// Why an estate invocation was refused — the shim / MCP names no store.
+pub(crate) const ESTATE_WHY_NO_PIN: &str = "the estate shim / `wicked-estate-mcp` names no store \
+     (`--db <path>` on argv, or WICKED_ESTATE_DB / WICKED_HOME / WICKED_MEMORY_DB in the worker env)";
+
+/// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
+/// `clusters` joins them only WITHOUT `--annotate` (judged at the call site).
+const ESTATE_READ_VERBS: [&str; 8] = [
+    "query",
+    "blast-radius",
+    "rank",
+    "stats",
+    "source",
+    "semantic",
+    "cross-graph",
+    "subscribe",
+];
+/// The `wicked-estate` subcommands that WRITE the graph — named so the reason can say "write
+/// subcommand" rather than "unknown"; anything else unrecognised is denied fail-closed anyway.
+const ESTATE_WRITE_VERBS: [&str; 6] = [
+    "index",
+    "scip",
+    "tfstate",
+    "import-telemetry",
+    "compact",
+    "watch",
+];
+/// Basenames of wicked-garden scripts that ARE the estate stdio shim or spawn it from outside
+/// [`ESTATE_SHIM_DIR`] (DES-GROUNDING-001 §7.3).
+const ESTATE_SHIM_SCRIPTS: [&str; 2] = ["_estate_client.py", "_context_backend.py"];
+/// The path segment of garden's `mem` domain backends — every `.py` under it grounds through the shim.
+const ESTATE_SHIM_DIR: &str = "scripts/mem/";
+/// The same shim / backends spelled as `python -m <module>` (last dotted component).
+const ESTATE_SHIM_MODULES: [&str; 5] = [
+    "_estate_client",
+    "_context_backend",
+    "estate_memory",
+    "auto_memorize",
+    "session_fact_extractor",
+];
+
+/// A shell-quoted, possibly `\`-separated script token as a bare `/`-separated path — so
+/// `"${CLAUDE_PLUGIN_ROOT}/scripts/mem/x.py"` and `scripts\mem\x.py` classify like `scripts/mem/x.py`.
+fn script_path(tok: &str) -> String {
+    tok.trim_matches(|c| c == '"' || c == '\'')
+        .replace('\\', "/")
+}
+
+fn script_basename(tok: &str) -> String {
+    let p = script_path(tok);
+    p.rsplit('/').next().unwrap_or(p.as_str()).to_string()
+}
+
+/// Is `tok` (in executing position) the estate shim or a backend that spawns it?
+fn is_estate_shim_script(tok: &str) -> bool {
+    let p = script_path(tok);
+    let base = p.rsplit('/').next().unwrap_or(p.as_str());
+    ESTATE_SHIM_SCRIPTS.contains(&base) || (p.contains(ESTATE_SHIM_DIR) && base.ends_with(".py"))
+}
+
+/// Is `tok` a `python -m` module spelling of the shim / a backend?
+fn is_estate_shim_module(tok: &str) -> bool {
+    let m = tok.trim_matches(|c| c == '"' || c == '\'');
+    ESTATE_SHIM_MODULES.contains(&m.rsplit('.').next().unwrap_or(m))
+}
+
+/// Program words that LAUNCH the script named by their next non-flag argument.
+fn is_script_launcher(base: &str) -> bool {
+    base == "python"
+        || base == "python2"
+        || base.starts_with("python3")
+        || matches!(
+            base,
+            "py" | "sh" | "bash" | "zsh" | "dash" | "_python.sh" | "_run.py"
+        )
+}
+
+/// The estate shim / a backend in EXECUTING position within `words[idx..]` — the program word
+/// itself (`./scripts/_estate_client.py health`), or the script a launcher runs (`python3 x.py`,
+/// `sh …/_python.sh x.py`, `py -3 x.py`, `python -m mem.estate_memory`). Launcher flags are
+/// skipped; garden's `_python.sh` / `_run.py` resolvers are looked through to the script they run;
+/// `-c <code>` (inline python) is not modelled — the documented literal-scan limit.
+fn executed_estate_shim(words: &[&str], idx: usize) -> bool {
+    let prog = words[idx];
+    if is_estate_shim_script(prog) {
+        return true;
+    }
+    if !is_script_launcher(&script_basename(prog)) {
+        return false;
+    }
+    let mut i = idx + 1;
+    while i < words.len() {
+        let w = words[i];
+        if w == "-m" {
+            return words.get(i + 1).is_some_and(|m| is_estate_shim_module(m));
+        }
+        if w == "-c" {
+            return false;
+        }
+        if w.starts_with('-') || matches!(script_basename(w).as_str(), "_python.sh" | "_run.py") {
+            i += 1;
+            continue;
+        }
+        return is_estate_shim_script(w);
+    }
+    false
+}
+
+/// Does the segment itself PIN the store the shim / MCP resolves — `--db <path>` / `--db=<path>`
+/// on argv, or a leading env-assignment naming one of [`ESTATE_STORE_PIN_ENV`] with a value?
+fn argv_pins_store(words: &[&str], prefix_assignments: &[&str]) -> bool {
+    let db_on_argv = words.iter().enumerate().any(|(i, &t)| {
+        (t.starts_with("--db=") && t.len() > "--db=".len())
+            || (t == "--db" && words.get(i + 1).is_some_and(|v| !v.starts_with('-')))
+    });
+    let pinned_by_assignment = prefix_assignments.iter().any(|a| {
+        a.split_once('=')
+            .is_some_and(|(name, value)| ESTATE_STORE_PIN_ENV.contains(&name) && !value.is_empty())
+    });
+    db_on_argv || pinned_by_assignment
+}
+
+/// The `wicked-estate` subcommand: the first non-flag token after the program word, skipping the
+/// value of a leading `--db <path>` so `wicked-estate --db x stats` classifies as `stats`.
+fn estate_subcommand<'a>(rest: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < rest.len() {
+        let t = rest[i];
+        if t == "--db" {
+            i += 2;
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(t);
+    }
+    None
+}
+
+fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<EstateDeny> {
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -856,7 +1088,8 @@ fn bash_denied_estate_indexer(command: &str) -> Option<String> {
         // Find the program word, seeing through the common, LEGITIMATE prefixes that would otherwise
         // hide it (Copilot #385): leading `NAME=value` env-assignments (`X=1 wicked-estate …`) and an
         // `env [flags] [NAME=value]... cmd` wrapper (`env X=1 wicked-estate …`). Prefix redirects were
-        // already dropped above.
+        // already dropped above. The assignments are kept: a `WICKED_HOME=… ` prefix is one way the
+        // shim rule's store pin is spelled.
         //
         // BEST-EFFORT BY DESIGN: a literal scan cannot see through every invocation form (a renamed
         // binary, `sh -c '…'`, `xargs`/`nice`/`timeout` wrappers, `env -u VAR …`, raw SQLite via
@@ -865,8 +1098,10 @@ fn bash_denied_estate_indexer(command: &str) -> Option<String> {
         // sandbox: the shared graph db lives OUTSIDE the worktree, so a kernel write-deny stops EVERY
         // form when the sandbox is armed. This scan is the secondary layer for sandbox-less hosts.
         let mut idx = 0;
+        let mut prefix_assignments: Vec<&str> = Vec::new();
         loop {
             while idx < words.len() && is_env_assignment(words[idx]) {
+                prefix_assignments.push(words[idx]);
                 idx += 1;
             }
             let Some(prog) = words.get(idx) else { break };
@@ -880,19 +1115,52 @@ fn bash_denied_estate_indexer(command: &str) -> Option<String> {
                 while idx < words.len()
                     && (words[idx].starts_with('-') || is_env_assignment(words[idx]))
                 {
+                    if is_env_assignment(words[idx]) {
+                        prefix_assignments.push(words[idx]);
+                    }
                     idx += 1;
                 }
                 continue;
             }
-            if matches!(
-                base,
-                "wicked-estate"
-                    | "wicked-estate.exe"
-                    | "wicked-estate-mcp"
-                    | "wicked-estate-mcp.exe"
-            ) {
-                return Some(words.join(" "));
+            let deny = |why: &'static str| {
+                Some(EstateDeny {
+                    segment: words.join(" "),
+                    why,
+                })
+            };
+
+            if matches!(base, "wicked-estate" | "wicked-estate.exe") {
+                let rest = &words[idx + 1..];
+                match estate_subcommand(rest) {
+                    // READ-ONLY subcommands — ALLOW.
+                    Some(verb) if ESTATE_READ_VERBS.contains(&verb) => {}
+                    // `clusters` is read-only UNLESS `--annotate` is present (that flag writes).
+                    Some("clusters") if !rest.contains(&"--annotate") => {}
+                    Some("clusters") => return deny(ESTATE_WHY_WRITE_VERB),
+                    Some(verb) if ESTATE_WRITE_VERBS.contains(&verb) => {
+                        return deny(ESTATE_WHY_WRITE_VERB)
+                    }
+                    // Anything else — a verb this build does not know — DENY (fail-closed).
+                    _ => return deny(ESTATE_WHY_UNKNOWN_VERB),
+                }
+                break;
             }
+
+            // The estate stdio MCP, or garden's shim / a backend that spawns it (§7.3): ALLOWED only
+            // read-only AND pinned. Judged on the whole segment: the flags ride the outer argv the
+            // launcher hands the backend, which forwards them to the `wicked-estate-mcp` it spawns.
+            if matches!(base, "wicked-estate-mcp" | "wicked-estate-mcp.exe")
+                || executed_estate_shim(words, idx)
+            {
+                if !words.contains(&"--readonly") {
+                    return deny(ESTATE_WHY_NO_READONLY);
+                }
+                if !(store_pinned_by_env || argv_pins_store(words, &prefix_assignments)) {
+                    return deny(ESTATE_WHY_NO_PIN);
+                }
+                break;
+            }
+
             break;
         }
     }
@@ -1058,13 +1326,15 @@ pub(crate) fn evaluate_tool_call(
     // judges this call from where the seat's shell stood after its last ALLOWED call.
     let install_state = install_fence_cwd_path(decisions_path, phase);
     let boundary_verdict = match boundary {
-        Some(b) => boundary_denial_with(
+        Some(b) => boundary_denial_tracked(
             &b.roots,
             &b.cwd,
             b.home.as_deref(),
             b.claude_config_dir.as_deref(),
             context,
             tool,
+            None,
+            b.estate_store_pinned,
         ),
         None => boundary_denial(context, tool, &install_state),
     };
@@ -1087,6 +1357,31 @@ pub(crate) fn evaluate_tool_call(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             append_remote_write_deny(decisions_path, scope, phase, &reason, command);
+        } else if reason.starts_with(ESTATE_DENY_REASON_PREFIX) {
+            // ESTATE-COMMAND FENCE (issue #463): the POSTURE decides advisory vs fatal, and either
+            // arm is a real decision record naming the TOOL and the COMMAND (`append_estate_deny`).
+            // Recon / pre-build units (`fences_writes` or `pre_build_scope`): ADVISORY — the
+            // write-path call is blocked, the graph is untouched, the seat continues with the
+            // remedy, and the fold discloses it as `workerToolCallDenied`. Code-executing units:
+            // FATAL — a write escape on the shared graph is not recoverable, so the unit is denied
+            // under the same `boundary-deny:` class the fence always emitted.
+            let command = context
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let advisory = match boundary {
+                Some(b) => b.write_posture.fences_writes() || b.pre_build_scope,
+                None => write_posture_from_env().fences_writes() || pre_build_scope_from_env(),
+            };
+            append_estate_deny(
+                decisions_path,
+                scope,
+                phase,
+                tool,
+                &reason,
+                command,
+                !advisory,
+            );
         } else {
             append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
         }
@@ -1442,13 +1737,43 @@ pub(crate) fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// (issue #463) Companion key on the ARMED marker naming the CARRIER that armed the unit
+/// ([`CARRIER_WRAPPED_CLI`] | [`CARRIER_ACP`]) — the launch-context fact the fold reads back so a
+/// refusal replayed from this log is attributed to the carrier that recorded it, instead of the
+/// fold assuming the wrapped path. Absent on markers written before this key existed.
+const ARMED_CARRIER_KEY: &str = "_wicked_gov_carrier";
+
+/// The carrier label of the wrapped-CLI path (`--settings` gate-hook injection) — the vocabulary
+/// `GovernanceContextArmed.path` and `WorkerToolCallDenied.carrier` already use.
+pub(crate) const CARRIER_WRAPPED_CLI: &str = "wrapped_cli";
+/// The carrier label of the ACP permission-bridge path.
+pub(crate) const CARRIER_ACP: &str = "acp";
+
 /// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as claims).
-/// Called by the launcher when it arms input governance for a governed unit, BEFORE the CLI runs.
+/// The carrier-less spelling, kept for the tests that drive the fold directly (a log an older
+/// launcher wrote); both carriers call [`write_armed_marker_for`] in production.
+#[cfg(test)]
 pub fn write_armed_marker(decisions_path: &Path, phase: &str) -> anyhow::Result<()> {
+    write_armed_marker_for(decisions_path, phase, None)
+}
+
+/// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as
+/// claims), naming the CARRIER that armed the unit under [`ARMED_CARRIER_KEY`] (issue #463).
+/// Called by the launcher when it arms input governance for a governed unit, BEFORE the CLI runs;
+/// `collect_hook_decisions` stamps the carrier onto every record of the phase.
+pub fn write_armed_marker_for(
+    decisions_path: &Path,
+    phase: &str,
+    carrier: Option<&str>,
+) -> anyhow::Result<()> {
     if let Some(parent) = decisions_path.parent() {
         create_dir_all_private(parent)?;
     }
-    let mut line = serde_json::json!({ ARMED_MARKER_KEY: phase }).to_string();
+    let mut marker = serde_json::json!({ ARMED_MARKER_KEY: phase });
+    if let Some(c) = carrier {
+        marker[ARMED_CARRIER_KEY] = serde_json::Value::String(c.to_string());
+    }
+    let mut line = marker.to_string();
     line.push('\n');
     with_append_lock(decisions_path, || {
         let mut f = std::fs::OpenOptions::new()
@@ -1576,6 +1901,28 @@ pub(crate) const REMOTE_WRITE_DENY_PREFIX: &str = "remote-write-deny:";
 /// [`append_remote_write_deny`] instead of the boundary recorder.
 pub(crate) const REMOTE_WRITE_REASON_PREFIX: &str = "remote-write fence:";
 
+/// (issue #463) Claim-id prefix of the ADVISORY arm of an ESTATE-DENY refusal — a Bash invocation
+/// the estate fence ([`classify_estate_command`]) caught on a unit whose posture fences writes
+/// (recon / pre-build): a `wicked-estate` write subcommand, or the shim / MCP without `--readonly`
+/// or without a pinned store. Advisory by the allowlist (`is_advisory_deny`) and the one estate
+/// shape the fold discloses as `workerToolCallDenied` (`HookDecisionRecord::estate_refusal`). The
+/// FATAL arm (a code-executing unit) records the same refusal under `boundary-deny:` — the class the
+/// fence always emitted — so the unit is denied; both arms carry the offending command at
+/// `obligations[1]` and the tool-call annotation, so no record reads `(unknown)`.
+pub(crate) const ESTATE_DENY_PREFIX: &str = "estate-deny:";
+
+/// The leading text every estate-deny reason carries, by which `evaluate_tool_call` routes it to
+/// [`append_estate_deny`] instead of the default boundary recorder.
+pub(crate) const ESTATE_DENY_REASON_PREFIX: &str = "estate-deny fence:";
+
+/// The remedy every estate-deny refusal carries to the seat and onto the wire
+/// (`workerToolCallDenied.remedy`) — the allowed transport, spelled out (DES-GROUNDING-001 §7.1).
+pub(crate) const ESTATE_DENY_REMEDY: &str =
+    "ground through a read-only `wicked-estate` subcommand, or through the estate stdio shim / \
+     `wicked-estate-mcp` with `--readonly` AND a pinned store (`--db <path>`, or \
+     WICKED_ESTATE_DB / WICKED_HOME / WICKED_MEMORY_DB in the worker environment); indexing and \
+     every other graph write belong to repo onboarding, never to a governed unit";
+
 /// Record a remote-write refusal: `obligations[0]` is the reason (with the remedy), `obligations[1]`
 /// the OFFENDING COMMAND, so the fold can name what the seat tried without re-parsing prose.
 fn append_remote_write_deny(
@@ -1601,6 +1948,81 @@ fn append_remote_write_deny(
         evaluated_at: crate::clock::eval_now(),
     };
     let _ = append_decision(Path::new(decisions_path), &claim);
+}
+
+/// Record an estate-command refusal (issue #463) as a REAL decision record naming the tool and
+/// the command: the tool-call annotation ([`TOOL_CALL_KEY`]) rides IN THE SAME BUFFER as the
+/// claim — the boundary and scope checks return before the policy path writes its annotation, so
+/// without this every pre-policy block reads `(unknown)` in `collect_hook_decisions` — and
+/// `obligations[0]` is the reason (with the remedy), `obligations[1]` the OFFENDING COMMAND, so
+/// the fold can name what the seat tried without re-parsing prose.
+///
+/// `fatal` picks the arm: ADVISORY (recon / pre-build posture) records under
+/// [`ESTATE_DENY_PREFIX`] — advisory by the allowlist, disclosed as `workerToolCallDenied`; FATAL
+/// (a code-executing unit) records under [`BOUNDARY_WRITE_DENY_PREFIX`], the class the fence has
+/// always emitted for a write escape, so the fold denies the unit exactly as before — now with the
+/// tool named. Mirror of [`append_remote_write_deny`] for the record shape.
+fn append_estate_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+    command: &str,
+    fatal: bool,
+) {
+    let (prefix, criteria) = if fatal {
+        (
+            BOUNDARY_WRITE_DENY_PREFIX,
+            format!(
+                "estate command fence (fatal: a write path on the shared graph from a \
+                 code-executing unit): {reason}"
+            ),
+        )
+    } else {
+        (
+            ESTATE_DENY_PREFIX,
+            format!("estate command fence (advisory: blocked, worker continues): {reason}"),
+        )
+    };
+    let claim = ConformanceClaim {
+        // Keyed on `phase` only, for the same reason `append_infra_deny` is.
+        claim_id: format!("{prefix}{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec![],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string(), command.to_string()],
+        evaluated_context_ref: "sha256:estate-deny".to_string(),
+        criteria,
+        evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    // Annotation + claim as ONE buffer under the advisory lock — the same atomicity argument the
+    // policy path makes in `evaluate_tool_call`: a single `write_all` of a small buffer cannot be
+    // interleaved by a concurrent hook subprocess even if the lock degrades.
+    let annotation = serde_json::json!({
+        TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
+        TOOL_CALL_PHASE_KEY: phase,
+    })
+    .to_string()
+        + "\n";
+    let Ok(mut claim_line) = serde_json::to_string(&claim) else {
+        return;
+    };
+    claim_line.push('\n');
+    let combined = annotation + &claim_line;
+    let path = Path::new(decisions_path);
+    if let Some(parent) = path.parent() {
+        let _ = create_dir_all_private(parent);
+    }
+    let _ = with_append_lock(path, || {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(combined.as_bytes())
+    });
 }
 
 fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str, fatal: bool) {
@@ -1651,9 +2073,14 @@ fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
     // A refused `git push` / `gh pr create` (F-7R2-012) joins the blocked read here: the push
     // never happened, the seat was handed the remedy — prevention, not a violation to fail the
     // unit for.
+    // An estate-deny (issue #463, advisory arm only — written only when posture fences writes):
+    // the write-path command was prevented, the graph is untouched, and the seat was handed the
+    // remedy and can adapt. On a code-executing unit the deny is recorded as `boundary-deny:` (fatal)
+    // and never reaches this arm.
     (claim.evaluator_identity == BOUNDARY_EVALUATOR
         && (claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX)
-            || claim.claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX)))
+            || claim.claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX)
+            || claim.claim_id.starts_with(ESTATE_DENY_PREFIX)))
         || (claim.evaluator_identity == PHASE_SCOPE_EVALUATOR
             && claim.claim_id.starts_with(PHASE_SCOPE_DENY_PREFIX))
 }
@@ -1664,6 +2091,12 @@ fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
 /// its Deny (gemini/Copilot security-critical). A real `ConformanceClaim` never carries this root key.
 fn marker_phase(v: &serde_json::Value) -> Option<&str> {
     v.get(ARMED_MARKER_KEY).and_then(|x| x.as_str())
+}
+
+/// The carrier an ARMED marker names ([`ARMED_CARRIER_KEY`], issue #463), or `None` on an older
+/// marker. Only meaningful on a value `marker_phase` already accepted.
+fn marker_carrier(v: &serde_json::Value) -> Option<&str> {
+    v.get(ARMED_CARRIER_KEY).and_then(|x| x.as_str())
 }
 
 /// If `v` is a hook-fired sentinel, the phase it covers; else `None`. Root-key check for the same
@@ -1696,8 +2129,13 @@ pub struct HookDecisionRecord {
     /// `remote-write-deny:`, `phase-scope-deny:`, a policy claim's own id).
     pub claim_id: String,
     /// The claim's `obligations` — for a deny, `[0]` is the operator-facing reason; a
-    /// remote-write refusal (F-7R2-012) carries the offending command at `[1]`.
+    /// remote-write refusal (F-7R2-012) and an estate refusal (issue #463, either arm) carry the
+    /// offending command at `[1]`.
     pub obligations: Vec<String>,
+    /// (issue #463) The carrier that armed this unit's governance — [`CARRIER_WRAPPED_CLI`] |
+    /// [`CARRIER_ACP`] — read off the phase's ARMED marker, so a refusal the fold replays from the
+    /// log is attributed to the carrier that recorded it. `None` for a log an older launcher wrote.
+    pub carrier: Option<String>,
 }
 
 impl HookDecisionRecord {
@@ -1705,6 +2143,19 @@ impl HookDecisionRecord {
     /// `workerToolCallDenied`: `(reason, command)` when it is.
     pub fn remote_write_refusal(&self) -> Option<(String, String)> {
         if self.decision != "deny" || !self.claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX) {
+            return None;
+        }
+        Some((
+            self.obligations.first().cloned().unwrap_or_default(),
+            self.obligations.get(1).cloned().unwrap_or_default(),
+        ))
+    }
+
+    /// (issue #463) Whether this record is an advisory estate-deny refusal the fold discloses as
+    /// `workerToolCallDenied`: `(reason, command)` when it is. Only the advisory (recon-posture)
+    /// arm uses `ESTATE_DENY_PREFIX`; fatal denies ride `boundary-deny:` and do not reach here.
+    pub fn estate_refusal(&self) -> Option<(String, String)> {
+        if self.decision != "deny" || !self.claim_id.starts_with(ESTATE_DENY_PREFIX) {
             return None;
         }
         Some((
@@ -1731,6 +2182,7 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
     };
     let mut records: Vec<HookDecisionRecord> = Vec::new();
     let mut pending_tool: Option<String> = None; // tool name from the last annotation
+    let mut carrier: Option<String> = None; // from THIS phase's armed marker (issue #463)
     for line in raw.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -1743,8 +2195,14 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
                 continue;
             }
         };
-        // Skip armed-marker and hook-fired sentinel lines.
-        if marker_phase(&v).is_some() || fired_phase(&v).is_some() {
+        // The armed marker names the carrier that armed THIS phase; a hook-fired sentinel is skipped.
+        if let Some(mp) = marker_phase(&v) {
+            if mp == phase {
+                carrier = marker_carrier(&v).map(str::to_string);
+            }
+            continue;
+        }
+        if fired_phase(&v).is_some() {
             continue;
         }
         // Tool-call annotation — note the tool name for the next claim on this phase.
@@ -1791,6 +2249,7 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
             denying_policy,
             claim_id: claim.claim_id,
             obligations: claim.obligations,
+            carrier: carrier.clone(),
         });
     }
     records
@@ -3461,78 +3920,392 @@ mod boundary_tests {
         }
     }
 
-    /// DES-GROUNDING-001 §6 — a worker cannot reach the SHARED project graph by running the
-    /// wicked-estate CLI from Bash. The estate `--db` path rides the worker-readable inbox
-    /// mcp-config, and the MCP `--readonly` mode closed only the tool surface, so a raw
-    /// `wicked-estate index --db <shared>` would delete-sweep and reindex the graph concurrent
-    /// runs share. The engine denies the estate binary family outright (grounding is via the MCP),
-    /// unit-FATAL; benign read-only commands are untouched.
+    /// DES-GROUNDING-001 §7.1, issue #463 — the `wicked-estate` CLI allowlist. Read-only
+    /// subcommands are ALLOWED (the grounding path a recon unit takes — F-RC1-046 died on a
+    /// `wicked-estate stats`); the write subcommands and any unrecognised verb are DENIED
+    /// fail-closed, and the hit names the segment and WHY.
     #[test]
-    fn a_bash_wicked_estate_invocation_is_denied_fatal() {
-        let wt = std::env::temp_dir().join("wicked-boundary-wt-estate");
-        std::fs::create_dir_all(&wt).unwrap();
-        let roots = crate::path_policy::AllowedRoots {
-            write: vec![wt.clone()],
-            read: vec![],
-        };
+    fn read_only_estate_subcommands_are_allowed_and_write_subcommands_denied() {
         let shared = "/srv/estate/project.db";
+        for allowed in [
+            format!("wicked-estate stats --db {shared}"),
+            // a value-taking flag before the verb does not hide the verb
+            format!("wicked-estate --db {shared} stats"),
+            format!("wicked-estate query 'entity:Foo' --db {shared}"),
+            format!("wicked-estate blast-radius src/lib.rs --db {shared}"),
+            format!("wicked-estate rank --db {shared}"),
+            format!("wicked-estate source src/main.rs --json --db {shared}"),
+            format!("wicked-estate semantic 'design pattern' --db {shared}"),
+            format!("wicked-estate cross-graph --db {shared}"),
+            format!("wicked-estate subscribe --db {shared}"),
+            // clusters WITHOUT --annotate is read-only
+            format!("wicked-estate clusters --json --db {shared}"),
+            "wicked-estate.exe stats".to_string(),
+            "/usr/local/bin/wicked-estate rank".to_string(),
+        ] {
+            assert!(
+                classify_estate_command(&allowed, false).is_none(),
+                "read-only estate command must be ALLOWED: {allowed}"
+            );
+        }
+        for (denied, why) in [
+            (
+                format!("wicked-estate index . --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            (
+                format!("wicked-estate scip --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            (
+                format!("wicked-estate tfstate --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            (
+                format!("wicked-estate import-telemetry --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            (
+                format!("wicked-estate compact --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            (
+                format!("wicked-estate watch --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            // clusters WITH --annotate is a write
+            (
+                format!("wicked-estate clusters --annotate --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            // an unrecognised verb — fail-closed
+            (
+                format!("wicked-estate new-writer-verb --db {shared}"),
+                ESTATE_WHY_UNKNOWN_VERB,
+            ),
+            ("wicked-estate".to_string(), ESTATE_WHY_UNKNOWN_VERB),
+        ] {
+            let hit = classify_estate_command(&denied, false)
+                .unwrap_or_else(|| panic!("estate command must be DENIED: {denied}"));
+            assert_eq!(hit.why, why, "{denied}");
+            assert_eq!(hit.segment, denied, "the hit names the offending segment");
+        }
+    }
 
-        // The named escape: index the shared graph via the CLI → blocked, unit-FATAL.
-        let cmd = json!({ "command": format!("wicked-estate index . --db {shared}") });
-        let (reason, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
-            .expect("a Bash wicked-estate invocation must be denied");
-        assert!(
-            fatal,
-            "invoking the estate CLI on the shared graph is unit-FATAL: {reason}"
+    /// DES-GROUNDING-001 §7.1 — the estate stdio MCP and garden's shim are ALLOWED only with BOTH
+    /// `--readonly` AND a pinned store. `--readonly` alone (the pipeline-produced shape) is not
+    /// enough; a pin without `--readonly` is not either. The pin is any of: `--db <path>` /
+    /// `--db=<path>` on argv, a leading `WICKED_ESTATE_DB=` / `WICKED_HOME=` / `WICKED_MEMORY_DB=`
+    /// assignment (bare or through `env`), or the worker-env fact the carrier hands in.
+    #[test]
+    fn the_estate_shim_and_mcp_are_allowed_only_read_only_with_a_pinned_store() {
+        let shared = "/srv/estate/project.db";
+        for allowed in [
+            format!("wicked-estate-mcp --readonly --db {shared}"),
+            format!("wicked-estate-mcp.exe --db={shared} --readonly"),
+            format!("python _estate_client.py --readonly --db {shared} recall '{{}}'"),
+            format!("python3 scripts/_estate_client.py --readonly --db {shared} search 'foo'"),
+            "WICKED_HOME=/srv/estate python _estate_client.py --readonly recall '{}'".to_string(),
+            "WICKED_MEMORY_DB=/srv/estate/memory.db wicked-estate-mcp --readonly".to_string(),
+            "env WICKED_ESTATE_DB=/srv/estate/graph.db wicked-estate-mcp --readonly".to_string(),
+        ] {
+            assert!(
+                classify_estate_command(&allowed, false).is_none(),
+                "read-only + pinned shim/MCP must be ALLOWED: {allowed}"
+            );
+        }
+        // `--readonly` with no pin on argv: DENIED strictly, ALLOWED once the worker env pins it.
+        for unpinned in [
+            "wicked-estate-mcp --readonly",
+            "python _estate_client.py --readonly recall '{}'",
+        ] {
+            let hit = classify_estate_command(unpinned, false)
+                .unwrap_or_else(|| panic!("an unpinned shim must be DENIED: {unpinned}"));
+            assert_eq!(hit.why, ESTATE_WHY_NO_PIN, "{unpinned}");
+            assert!(
+                classify_estate_command(unpinned, true).is_none(),
+                "the worker-env pin satisfies the rule: {unpinned}"
+            );
+        }
+        // An empty assignment pins nothing.
+        assert_eq!(
+            classify_estate_command("WICKED_HOME= wicked-estate-mcp --readonly", false)
+                .map(|h| h.why),
+            Some(ESTATE_WHY_NO_PIN)
         );
-
-        // Absolute-path program, and the `-mcp` / `.exe` basename variants — all one family,
-        // and the whole family is denied even without a `--db` (a worker has no in-run use for it).
-        for c in [
-            format!("/usr/local/bin/wicked-estate index . --db {shared}"),
+        // No `--readonly`: DENIED whatever the pin says (the hole the old deny-all missed for the
+        // shim: its program word is `python`, invisible to a binary-name scan).
+        for rw in [
             format!("wicked-estate-mcp --db {shared}"),
-            "wicked-estate.exe index .".to_string(),
             "wicked-estate-mcp.exe --db x".to_string(),
-            // Env-assignment prefixes, the `env` wrapper, and prefix redirects do not hide the
-            // program (Copilot #385):
+            format!("python _estate_client.py --db {shared} recall '{{}}'"),
+            format!("python3 _estate_client.py --db {shared} search 'foo'"),
+        ] {
+            for env_pinned in [false, true] {
+                let hit = classify_estate_command(&rw, env_pinned)
+                    .unwrap_or_else(|| panic!("shim/MCP without --readonly must be DENIED: {rw}"));
+                assert_eq!(hit.why, ESTATE_WHY_NO_READONLY, "{rw}");
+            }
+        }
+    }
+
+    /// DES-GROUNDING-001 §7.3 — the backends garden's skills ACTUALLY run: the program word is a
+    /// LAUNCHER (`sh …/_python.sh`, `python3`, `py -3`, `python -m`) and the shim / backend is the
+    /// script in executing position. Recognised by script path/name under the same `--readonly` +
+    /// pin rule; a mere MENTION of the script (grep / cat / an argument to another script) is not
+    /// an invocation.
+    #[test]
+    fn garden_backends_that_spawn_the_shim_are_classified_by_script_path() {
+        // the exact shape `skills/mem/SKILL.md` documents
+        let mem = "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/_python.sh\" \
+                   \"${CLAUDE_PLUGIN_ROOT}/scripts/mem/estate_memory.py\"";
+        for backend in [
+            format!("{mem} recall '{{\"query\":\"x\"}}'"),
+            "python3 scripts/mem/estate_memory.py recall '{}'".to_string(),
+            "py -3 scripts\\mem\\auto_memorize.py".to_string(),
+            "./scripts/_estate_client.py health".to_string(),
+            "\"${CLAUDE_PLUGIN_ROOT}/scripts/_python.sh\" scripts/_context_backend.py stats"
+                .to_string(),
+            "python -m mem.estate_memory recall '{}'".to_string(),
+            "python3 -u \"${CLAUDE_PLUGIN_ROOT}/scripts/_run.py\" \
+             scripts/mem/session_fact_extractor.py"
+                .to_string(),
+        ] {
+            let hit = classify_estate_command(&backend, true).unwrap_or_else(|| {
+                panic!("a backend that spawns the shim must be classified: {backend}")
+            });
+            assert_eq!(hit.why, ESTATE_WHY_NO_READONLY, "{backend}");
+            let ro = format!("{backend} --readonly");
+            assert_eq!(
+                classify_estate_command(&ro, false).map(|h| h.why),
+                Some(ESTATE_WHY_NO_PIN),
+                "{ro}"
+            );
+            assert!(
+                classify_estate_command(&ro, true).is_none(),
+                "read-only + worker-env pin: {ro}"
+            );
+            assert!(
+                classify_estate_command(&format!("{ro} --db /srv/estate/graph.db"), false)
+                    .is_none(),
+                "read-only + argv pin: {ro}"
+            );
+        }
+        for benign in [
+            "grep readonly scripts/_estate_client.py",
+            "cat scripts/mem/estate_memory.py",
+            "ls scripts/mem/",
+            // the shim is an ARGUMENT of another script, not the script being run
+            "python3 scripts/other/tool.py scripts/mem/estate_memory.py",
+            "sed -n '1,10p' \"${CLAUDE_PLUGIN_ROOT}/scripts/_context_backend.py\"",
+        ] {
+            assert!(
+                classify_estate_command(benign, false).is_none(),
+                "a mention of the shim must not trip the fence: {benign}"
+            );
+        }
+    }
+
+    /// Evasion shapes and non-leading segments: env-assignment prefixes, the `env` wrapper, a
+    /// prefix redirect, `;` sequences and pipelines do not hide an estate write (Copilot #385);
+    /// the ordinary read-only commands around them are untouched.
+    #[test]
+    fn estate_evasion_shapes_and_later_segments_are_still_denied() {
+        let shared = "/srv/estate/project.db";
+        for evade in [
+            format!("/usr/local/bin/wicked-estate index . --db {shared}"),
             format!("WICKED_X=1 wicked-estate index . --db {shared}"),
             "A=b C=d wicked-estate index .".to_string(),
             "env wicked-estate index .".to_string(),
-            format!("env WICKED_X=1 wicked-estate index . --db {shared}"),
+            "env X=1 wicked-estate index .".to_string(),
             "env -i wicked-estate index .".to_string(),
             format!("> /dev/null wicked-estate index . --db {shared}"),
+            format!("cat notes.txt; wicked-estate index . --db {shared}"),
+            format!("echo x | wicked-estate index . --db {shared}"),
+            "ls && python3 scripts/mem/estate_memory.py store '{}'".to_string(),
         ] {
-            let cmd = json!({ "command": c.clone() });
-            let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
-                .unwrap_or_else(|| panic!("estate CLI variant must be denied: {c}"));
-            assert!(fatal, "every estate CLI variant is unit-FATAL: {c}");
+            assert!(
+                classify_estate_command(&evade, true).is_some(),
+                "evasion attempt must still be denied: {evade}"
+            );
         }
-
-        // A segment in a `;` sequence (or a pipeline) is caught, not just the leading program.
-        let cmd =
-            json!({ "command": format!("cat notes.txt; wicked-estate index . --db {shared}") });
-        let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
-            .expect("an estate invocation after `;` must still be denied");
-        assert!(
-            fatal,
-            "the estate deny scans every pipeline/sequence segment"
-        );
-
-        // No false positive: ordinary read-only commands are NOT denied by this rule — including
-        // one where `wicked-estate` appears only as an ARGUMENT (grep pattern), not the program.
         for benign in [
             "ls",
             "cat file.txt",
             "grep -r wicked-estate .",
             "env ls",
             "env X=1 ls",
+            "grep wicked-estate-mcp /etc/hosts",
+            "echo wicked-estate index",
         ] {
-            let cmd = json!({ "command": benign });
             assert!(
-                boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash").is_none(),
-                "a benign Bash command must not trip the estate deny: {benign}"
+                classify_estate_command(benign, false).is_none(),
+                "benign command must not trip the estate fence: {benign}"
             );
         }
+    }
+
+    /// The store pin an ACP child can see is exactly the pin set minus what `hardened()` strips:
+    /// `WICKED_ESTATE_DB` never reaches an ACP agent, `WICKED_HOME` / `WICKED_MEMORY_DB` do.
+    #[test]
+    fn the_acp_child_keeps_only_the_pins_hardening_does_not_strip() {
+        let surviving: Vec<&str> = ESTATE_STORE_PIN_ENV
+            .iter()
+            .copied()
+            .filter(|k| !wicked_apps_core::spawn::ENGINE_INTERNAL_ENV.contains(k))
+            .collect();
+        assert_eq!(surviving, ["WICKED_HOME", "WICKED_MEMORY_DB"]);
+        assert!(wicked_apps_core::spawn::ENGINE_INTERNAL_ENV.contains(&ESTATE_DB_ENV));
+    }
+
+    /// Issue #463 acceptance: an estate DENY is a real decision record naming the TOOL and the
+    /// COMMAND on BOTH arms — never `(unknown)`. The advisory arm (a recon / pre-build posture)
+    /// records `estate-deny:` — advisory by the allowlist, so the unit is NOT denied, and
+    /// disclosed as `workerToolCallDenied` through `estate_refusal()`; the fatal arm (a
+    /// code-executing unit) records the same `boundary-deny:` class the fence always emitted, so
+    /// the fold denies the unit with the tool named — the payload a gate over the denial
+    /// (issue #463 item 3 / core#464) reads. The carrier rides the armed marker onto every record.
+    #[test]
+    fn an_estate_deny_record_names_the_tool_and_the_command_on_both_arms() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-estate-record");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let command = "wicked-estate index . --db /srv/estate/project.db";
+        // The fence names the segment, why, and the remedy, under the prefix
+        // `evaluate_tool_call` routes on.
+        let (reason, _) = boundary_denial_tracked(
+            &roots,
+            &wt,
+            None,
+            None,
+            &json!({ "command": command }),
+            "Bash",
+            None,
+            false,
+        )
+        .expect("an estate write is denied");
+        assert!(reason.starts_with(ESTATE_DENY_REASON_PREFIX), "{reason}");
+        assert!(
+            reason.contains(command)
+                && reason.contains(ESTATE_WHY_WRITE_VERB)
+                && reason.contains(ESTATE_DENY_REMEDY),
+            "{reason}"
+        );
+
+        let run_id = format!("estate-deny-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let sentinel = |p: &Path| {
+            let line = serde_json::json!({ HOOK_FIRED_KEY: "unit-1" }).to_string() + "\n";
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        };
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+
+        // ── advisory arm (recon posture), attempt 0, armed by the ACP carrier ──
+        let p0 = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p0, "unit-1", Some(CARRIER_ACP)).unwrap();
+        sentinel(&p0);
+        append_estate_deny(
+            p0.to_str().unwrap(),
+            "wf/unit-1",
+            "unit-1",
+            "Bash",
+            &reason,
+            command,
+            false,
+        );
+        let recs = collect_hook_decisions(&run_id, 0, "unit-1");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].tool_name, "Bash",
+            "the record names the tool, never (unknown)"
+        );
+        assert_eq!(recs[0].decision, "deny");
+        assert_eq!(
+            recs[0].carrier.as_deref(),
+            Some(CARRIER_ACP),
+            "the carrier rides the marker"
+        );
+        assert!(
+            recs[0].claim_id.starts_with(ESTATE_DENY_PREFIX),
+            "{}",
+            recs[0].claim_id
+        );
+        let (rec_reason, rec_command) = recs[0]
+            .estate_refusal()
+            .expect("the advisory arm is disclosed as a refusal");
+        assert_eq!(rec_command, command, "obligations[1] names the command");
+        assert_eq!(rec_reason, reason);
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-1", true).unwrap(),
+            None,
+            "advisory: the unit is not denied for a blocked estate write"
+        );
+
+        // ── fatal arm (code-executing unit), attempt 1, armed by the wrapped carrier ──
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker_for(&p1, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        sentinel(&p1);
+        append_estate_deny(
+            p1.to_str().unwrap(),
+            "wf/unit-1",
+            "unit-1",
+            "Bash",
+            &reason,
+            command,
+            true,
+        );
+        let recs = collect_hook_decisions(&run_id, 1, "unit-1");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].tool_name, "Bash");
+        assert_eq!(recs[0].carrier.as_deref(), Some(CARRIER_WRAPPED_CLI));
+        assert!(
+            recs[0].claim_id.starts_with(BOUNDARY_WRITE_DENY_PREFIX),
+            "the fatal arm is the fence's own class: {}",
+            recs[0].claim_id
+        );
+        assert!(
+            recs[0].estate_refusal().is_none(),
+            "the fatal arm is a unit denial, not an advisory refusal"
+        );
+        assert_eq!(
+            recs[0].obligations.get(1).map(String::as_str),
+            Some(command),
+            "the command rides obligations[1] on the fatal arm too"
+        );
+        let denial = fold_input_denial(&mut store, &run_id, 1, "unit-1", true)
+            .unwrap()
+            .expect("fatal: the unit is denied");
+        assert_eq!(denial.denied_tool.as_deref(), Some("Bash"));
+        assert_eq!(denial.claim_id.as_deref(), Some("boundary-deny:unit-1"));
+
+        // A marker an older launcher wrote (no carrier) leaves the record unattributed, not wrong.
+        let p2 = decisions_path_for(&run_id, 2);
+        write_armed_marker(&p2, "unit-1").unwrap();
+        sentinel(&p2);
+        append_estate_deny(
+            p2.to_str().unwrap(),
+            "wf/unit-1",
+            "unit-1",
+            "Bash",
+            &reason,
+            command,
+            false,
+        );
+        assert_eq!(
+            collect_hook_decisions(&run_id, 2, "unit-1")[0].carrier,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),
@@ -3621,7 +4394,16 @@ mod boundary_tests {
         let _ = std::fs::remove_file(&state);
         let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
         let judge = |cmd: &str| {
-            boundary_denial_tracked(&roots, &wt, None, None, &ctx(cmd), "Bash", Some(&state))
+            boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &ctx(cmd),
+                "Bash",
+                Some(&state),
+                false,
+            )
         };
         // Fresh attempt: judged from the worktree.
         assert_eq!(judge("npm ci"), None);
