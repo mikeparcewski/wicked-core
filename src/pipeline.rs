@@ -393,10 +393,23 @@ pub(crate) fn pre_distribute(
     if let Some(def) = &selected_def {
         crate::workflow::preflight_tool_phases(def)?;
     }
+    // core#468: the run's BASE skill is admitted HERE, at intake — before anything is planned or
+    // persisted — in the same posture as the tool preflight above: the directive rides every
+    // agent unit, so a snapshot that lacks the skill has no unit that could run, and the refusal
+    // must name the skill and the fix rather than surface as the first unit's worker failure.
+    // (The actor's synchronous launch path judges it too, so an interactive caller gets an `Err`
+    // with no session persisted; this is the choke point `run_session` and a re-plan also cross.)
+    let base_skill = crate::workflow::base_skill_ref_for(selected_def.as_ref());
+    if let Some(base) = base_skill.as_deref() {
+        crate::skills_snapshot::admit_base_skill(base)?;
+    }
     let mut units = match &selected_def {
         Some(def) => plan::plan_from_def(def, problem, session_id),
         None => plan::plan_units(problem, session_id),
     };
+    // …and lands on every AGENT unit of the plan, def-driven or prose-planned alike (never on a
+    // Tool unit, which has no prompt).
+    plan::apply_base_skill(&mut units, base_skill.as_deref());
     // Bind THIS run's repo into the placeholders its Tool phases declare, before anything is
     // persisted. The def is shared by every run of its id; the paths are not. Rewriting a shared def
     // per launch instead is what made three concurrent registrations index one repo's tree into one

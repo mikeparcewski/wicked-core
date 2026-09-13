@@ -98,6 +98,15 @@
 //! elsewhere in the plan needs a non-portable skill, and vice versa. Never a silent proceed
 //! without the required method.
 //!
+//! The run's BASE skill (core#468, [`crate::workflow::WorkflowDef::base_skill_ref`] / the
+//! `WICKED_BASE_SKILL_REF` default) is judged for EXISTENCE at INTAKE ([`admit_base_skill`],
+//! before any unit is planned — a refusal there is a launch `Err` with no session persisted)
+//! and again plan-wide at every launch (it rides `required_skills`). It is deliberately NOT a
+//! seat requirement: it joins the `plan` half of [`RequiredRefs`] only, so a `portable: false`
+//! base skill neither refuses a non-Claude seat nor narrows routing onto claude
+//! (`distribute::seat_candidates` reads `skill_ref` alone) — a discipline skill is plain text by
+//! contract (garden lint), and its deliverability is the publisher's, not a routing input.
+//!
 //! On the ACP path a CACHED session is admitted against ITS pinned snapshot before any ambient
 //! resolution happens (v3.1 §4) — `acp_runner::exec_turn_inner` consults the session cache first
 //! and hands what it pinned to [`admit_turn`], ONE policy for fresh and cached turns alike: the
@@ -1575,6 +1584,15 @@ pub(crate) enum SkillsError {
         roster: Vec<String>,
         why: String,
     },
+    /// The run's BASE skill (core#468, `WorkflowDef::base_skill_ref` / `WICKED_BASE_SKILL_REF`)
+    /// cannot be handed — the skills root does not hold it, there is no root, or the explicit
+    /// snapshot is unusable (`cause`). Refused at INTAKE, before any unit is planned or
+    /// persisted: the base directive rides EVERY unit, so a run that cannot be handed it has no
+    /// unit that could run — and the refusal names the skill and the fix, never "unit 1 failed".
+    BaseSkillRefused {
+        skill: String,
+        cause: Box<SkillsError>,
+    },
 }
 
 impl std::fmt::Display for SkillsError {
@@ -1731,6 +1749,15 @@ impl std::fmt::Display for SkillsError {
                  this run requires skills: {}; repair the installation named in the reason, or \
                  publish a snapshot",
                 missing.join(", ")
+            ),
+            SkillsError::BaseSkillRefused { skill, cause } => write!(
+                f,
+                "the base skill \"{skill}\" (base_skill_ref — the role-keyed discipline every unit \
+                 of this run must follow) cannot be handed to the run's workers: {cause}. Publish \
+                 a skills snapshot that enables it, or clear base_skill_ref (the workflow def's \
+                 field, or {env}) to run without a base skill — refused at intake, before any unit \
+                 was planned",
+                env = crate::workflow::BASE_SKILL_REF_ENV
             ),
             SkillsError::NoEligibleSeat {
                 ord,
@@ -2966,8 +2993,12 @@ pub(crate) struct RequiredRefs<'a> {
 
 impl<'a> RequiredRefs<'a> {
     /// From a launch input: the run-wide set the actor computed ([`StepInput::required_skills`])
-    /// plus the unit's own `skill_ref` (so a directly-constructed input is still admitted on its
-    /// own terms) is the plan; the unit's own `skill_ref` is the seat.
+    /// plus the unit's own `skill_ref` AND `base_skill_ref` (so a directly-constructed input is
+    /// still admitted on its own terms) is the plan; the unit's own `skill_ref` ALONE is the
+    /// seat. The base skill (core#468) is deliberately EXISTENCE-only: it never joins `seat`, so
+    /// it is not judged for the seat's portability/invocability and never narrows routing — its
+    /// deliverability to a given CLI is the publisher's contract (a discipline skill is plain
+    /// text), and the intake admission (`admit_base_skill`) has already required it to exist.
     pub(crate) fn of(input: &'a StepInput) -> Self {
         let seat: Vec<&str> = input
             .unit
@@ -2981,6 +3012,7 @@ impl<'a> RequiredRefs<'a> {
             .iter()
             .map(String::as_str)
             .chain(seat.iter().copied())
+            .chain(input.unit.base_skill_ref.as_deref())
             .filter(|r| !r.is_empty())
             .collect();
         Self { plan, seat }
@@ -3241,6 +3273,36 @@ pub(crate) fn admit_plan(input: &StepInput) -> Result<Option<SkillsSnapshot>, Sk
             refuse_plan_on_failed_ladder(&plan, why)?;
             Ok(None)
         }
+    }
+}
+
+/// The INTAKE admission of a run's BASE skill (core#468): the ladder is resolved exactly as
+/// [`admit_plan`] resolves it and `skill` must EXIST in the root (transitive mandates included).
+/// Judged at PLAN time — `pipeline::pre_distribute`, and the actor's synchronous launch path so
+/// the caller gets an `Err` with NO session persisted — because the base directive rides EVERY
+/// unit: a run that cannot be handed it has no unit that could run, and "unit 1 failed: skills
+/// snapshot refused the launch" is the wrong shape for a configuration the operator set. Nothing
+/// seat-specific applies (no CLI is chosen yet) and no fence is opened (no worker reads the root).
+/// Every refusal is wrapped as [`SkillsError::BaseSkillRefused`] naming the skill; `Ok` carries
+/// the generation the run was judged against.
+pub(crate) fn admit_base_skill(skill: &str) -> Result<SkillsSnapshot, SkillsError> {
+    let refused = |cause: SkillsError| SkillsError::BaseSkillRefused {
+        skill: skill.to_string(),
+        cause: Box::new(cause),
+    };
+    match resolve_ladder().map_err(refused)? {
+        Ladder::Root(s) => {
+            require_existence(Some(&s), &[skill]).map_err(refused)?;
+            Ok(s)
+        }
+        Ladder::Absent => Err(refused(SkillsError::Missing {
+            root: None,
+            missing: vec![skill.to_string()],
+        })),
+        Ladder::Failed(why) => Err(refused(SkillsError::FallbackFailed {
+            why,
+            missing: vec![skill.to_string()],
+        })),
     }
 }
 
@@ -6276,6 +6338,112 @@ mod tests {
                  not even looked at"
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#468: the BASE skill is admitted at INTAKE, wrapped so the refusal names it AS the base
+    /// skill and names the fix — a present skill returns the generation judged against; a missing
+    /// one or an unusable explicit snapshot each refuse by name. And it is EXISTENCE only:
+    /// `RequiredRefs::of` carries it in the plan half, never the seat half, so no portability or
+    /// invocability judgement is ever made on it for a seat.
+    #[test]
+    fn the_base_skill_is_admitted_at_intake_by_existence_only() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Pin(&'static str, Option<std::ffi::OsString>);
+        impl Pin {
+            fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Pin(key, prev)
+            }
+        }
+        impl Drop for Pin {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let base = scratch("base-skill");
+        let root = snapshot_root(
+            &gen_dir(&base, "1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        {
+            let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, root.as_os_str());
+            assert_eq!(
+                admit_base_skill("wicked-garden-domain")
+                    .expect("the generation holds it")
+                    .root,
+                root,
+                "the generation the run was judged against is returned"
+            );
+            let err = admit_base_skill("wicked-garden-governed-worker")
+                .expect_err("the generation lacks the base skill");
+            assert!(
+                matches!(&err, SkillsError::BaseSkillRefused { skill, cause }
+                    if skill == "wicked-garden-governed-worker"
+                        && matches!(&**cause, SkillsError::Missing { root: Some(r), missing }
+                            if r == &root && missing == &["wicked-garden-governed-worker".to_string()])),
+                "{err:?}"
+            );
+            let text = err.to_string();
+            for needle in [
+                "base skill \"wicked-garden-governed-worker\"",
+                "base_skill_ref",
+                crate::workflow::BASE_SKILL_REF_ENV,
+                "refused at intake, before any unit was planned",
+                "does not hold the skills this run requires: wicked-garden-governed-worker",
+            ] {
+                assert!(text.contains(needle), "missing {needle:?} in: {text}");
+            }
+        }
+        {
+            let bad = base.join("no-such-snapshot");
+            let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, bad.as_os_str());
+            assert!(
+                matches!(admit_base_skill("wicked-garden-domain"),
+                    Err(SkillsError::BaseSkillRefused { skill, cause })
+                        if skill == "wicked-garden-domain"
+                            && matches!(&*cause, SkillsError::Config { var, path, .. }
+                                if *var == SKILLS_SNAPSHOT_ENV && path == &bad)),
+                "an unusable explicit snapshot is the same config error, named as the base skill's"
+            );
+        }
+        // Existence only: the base skill is in the PLAN half of the refs, never the SEAT half.
+        let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "triage");
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        u.base_skill_ref = Some("wicked-garden-governed-worker".to_string());
+        let input = StepInput {
+            run_id: "r".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let refs = RequiredRefs::of(&input);
+        assert_eq!(
+            refs.seat,
+            vec!["wicked-garden-domain"],
+            "the seat invokes the phase skill only"
+        );
+        assert_eq!(
+            refs.plan,
+            vec!["wicked-garden-domain", "wicked-garden-governed-worker"],
+            "the plan requires both to exist"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

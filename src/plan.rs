@@ -250,6 +250,21 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
         .collect()
 }
 
+/// Copy the run's BASE skill (core#468) onto every AGENT unit of the plan — never onto a Tool
+/// unit, whose description is argv context and never a prompt. `None` (or a blank name) leaves
+/// every unit as planned. Applied at the plan choke point (`pipeline::pre_distribute`), AFTER
+/// the def or the prose planner produced the units and after the intake admission judged the
+/// skill present (`skills_snapshot::admit_base_skill`), so def-driven and prose-planned runs get
+/// the same directive from the same code — and the planner itself stays pure data-in, units-out.
+pub(crate) fn apply_base_skill(units: &mut [WorkUnit], base: Option<&str>) {
+    let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) else {
+        return;
+    };
+    for u in units.iter_mut().filter(|u| u.tool_cmd.is_none()) {
+        u.base_skill_ref = Some(base.to_string());
+    }
+}
+
 /// Bind a run's repo into the placeholders its Tool phases declare.
 ///
 /// A Tool phase's argv is DATA from the workflow def, which is shared by every run of that id. The
@@ -465,6 +480,55 @@ mod tests {
         };
         assert!(marked("build"), "feature/build is the executes_code phase");
         assert!(!marked("clarify") && !marked("design") && !marked("adversarial-review"));
+    }
+
+    /// core#468: the base skill lands on every AGENT unit — def-driven and prose-planned alike —
+    /// and on NO Tool unit (a tool command has no prompt to lead). `None`/blank is a no-op, so a
+    /// run without a base skill plans byte-identical to before the field existed.
+    #[test]
+    fn the_base_skill_lands_on_every_agent_unit_and_no_tool_unit() {
+        use crate::domain::StageKind;
+        use crate::workflow::{PhaseDef, PhaseExecutor, PhaseRole, WorkflowDef};
+        let def = WorkflowDef {
+            base_skill_ref: None,
+            id: "bs".into(),
+            phases: vec![
+                PhaseDef::new("triage", StageKind::Recon),
+                PhaseDef::new("index", StageKind::Build).executor(PhaseExecutor::Tool {
+                    cmd: vec!["true".into()],
+                }),
+                {
+                    let mut p = PhaseDef::new("verify", StageKind::Test);
+                    p.role = PhaseRole::Evaluator;
+                    p
+                },
+            ],
+        };
+        let mut units = plan_from_def(&def, "fix it", "s");
+        let before = units.clone();
+        apply_base_skill(&mut units, None);
+        assert_eq!(units, before, "no base skill ⇒ the plan is untouched");
+        apply_base_skill(&mut units, Some("   "));
+        assert_eq!(units, before, "a blank base skill is no base skill");
+        apply_base_skill(&mut units, Some(" wicked-garden-governed-worker "));
+        assert_eq!(
+            units
+                .iter()
+                .map(|u| u.base_skill_ref.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("wicked-garden-governed-worker"),
+                None,
+                Some("wicked-garden-governed-worker")
+            ],
+            "trimmed onto both agent units, never onto the tool unit"
+        );
+        // Prose-planned units carry no def and still get it — the directive is engine-level.
+        let mut prose = plan_units("Investigate the flake. Then fix it.", "p");
+        apply_base_skill(&mut prose, Some("wicked-garden-governed-worker"));
+        assert!(prose
+            .iter()
+            .all(|u| u.base_skill_ref.as_deref() == Some("wicked-garden-governed-worker")));
     }
 
     /// FINDING-024, the join that makes the fix work at all. `prior_context_label` matches a prior's
@@ -707,6 +771,7 @@ mod tests {
         use crate::domain::StageKind;
         use crate::workflow::{PhaseDef, PhaseRole};
         let def = WorkflowDef {
+            base_skill_ref: None,
             id: "ladder".to_string(),
             phases: vec![
                 PhaseDef {
@@ -753,6 +818,7 @@ mod tests {
         let instr_a = "map the directory layout and nothing else";
         let instr_b = "identify the language stack and nothing else";
         let def = WorkflowDef {
+            base_skill_ref: None,
             id: "instructed".to_string(),
             phases: vec![
                 PhaseDef {
@@ -804,6 +870,7 @@ mod tests {
         use crate::domain::StageKind;
         use crate::workflow::PhaseDef;
         let def = WorkflowDef {
+            base_skill_ref: None,
             id: "instructed".to_string(),
             phases: vec![
                 PhaseDef {

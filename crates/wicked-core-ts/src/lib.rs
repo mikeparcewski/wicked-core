@@ -2408,9 +2408,12 @@ mod tests {
                 session: s(),
                 ord: 1,
                 attempt: 0,
+                base_skill: None,
             },
             "unitDispatched",
-            &["type", "session", "ord", "attempt"],
+            // `baseSkill` (core#468): `{name, role}` of the run's discipline skill, emitted
+            // unconditionally (null when the run declares none), the `degradedReason` rule.
+            &["type", "session", "ord", "attempt", "baseSkill"],
         );
         check(
             CoreEvent::CliUsage {

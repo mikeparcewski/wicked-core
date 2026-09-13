@@ -58,6 +58,7 @@ mod tests {
 
     fn make_unit(ord: u32, desc: &str, invocation: &str, cli_key: &str) -> WorkUnit {
         WorkUnit {
+            base_skill_ref: None,
             id: format!("u-opapi-{ord}"),
             session_id: "s-opapi".to_string(),
             ord,

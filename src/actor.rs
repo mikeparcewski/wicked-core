@@ -1228,6 +1228,14 @@ pub(crate) fn run(
                     if let Some(def) = &selected_def {
                         crate::workflow::preflight_tool_phases(def)?;
                     }
+                    // Base skill INTAKE admission (core#468) — the same sync fast path, for the
+                    // same reason: a snapshot that lacks the run's discipline skill is a
+                    // synchronous Err naming it, with NO session persisted — never "unit 1
+                    // failed" after the caller already holds a run id. `pre_distribute` judges
+                    // it again on the deferred path (the choke point `run_session` also crosses).
+                    if let Some(base) = crate::workflow::base_skill_ref_for(selected_def.as_ref()) {
+                        crate::skills_snapshot::admit_base_skill(&base)?;
+                    }
                     let n_units = match &selected_def {
                         Some(def) => crate::plan::plan_from_def(def, &spec.problem, &run_id).len(),
                         None => crate::plan::plan_units(&spec.problem, &run_id).len(),
@@ -5783,6 +5791,16 @@ fn dispatch_unit(
             session: run_id.to_string(),
             ord: unit.ord,
             attempt: session.attempt,
+            // (core#468) The discipline directive this dispatch carries, keyed on the unit's
+            // role — what the prompt builder will lead with (`execute_wrapped::skill_prompt`).
+            base_skill: unit
+                .base_skill_ref
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|name| crate::event::BaseSkill {
+                    name: name.to_string(),
+                    role: unit.role.token().to_string(),
+                }),
         },
     );
     emit(
@@ -6128,19 +6146,21 @@ fn dispatch_unit(
     Ok(true)
 }
 
-/// Every `skill_ref` the run's units name — sorted, deduplicated, empties dropped, of EVERY
-/// family — for [`StepInput::required_skills`] (core#396). Pure over the plan the actor already
-/// holds: `units` are the run's planned units, so refs from a crew-generated workflow def are
-/// here exactly like refs from a shipped one (they are units of this run either way). The
-/// transitive `mandates` closure is NOT expanded here — the actor holds no skills snapshot, and
-/// mandates are declared in each skill's frontmatter inside it — but at admission
+/// Every `skill_ref` the run's units name — and the run's `base_skill_ref` (core#468), which
+/// every agent unit carries — sorted, deduplicated, empties dropped, of EVERY family — for
+/// [`StepInput::required_skills`] (core#396). Pure over the plan the actor already holds:
+/// `units` are the run's planned units, so refs from a crew-generated workflow def are here
+/// exactly like refs from a shipped one (they are units of this run either way). The transitive
+/// `mandates` closure is NOT expanded here — the actor holds no skills snapshot, and mandates
+/// are declared in each skill's frontmatter inside it — but at admission
 /// (`skills_snapshot::admit_refs`, which has the snapshot in hand), where a missing mandate is
 /// refused by its own name. No family is filtered out: the snapshot is the worker's only skills
 /// source, so a ref it does not hold is a refusal whatever its prefix, not a notice.
 fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
     let mut refs: Vec<String> = units
         .iter()
-        .filter_map(|u| u.skill_ref.as_deref())
+        .flat_map(|u| [u.skill_ref.as_deref(), u.base_skill_ref.as_deref()])
+        .flatten()
         .filter(|r| !r.is_empty())
         .map(str::to_string)
         .collect();

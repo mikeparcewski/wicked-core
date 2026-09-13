@@ -45,6 +45,30 @@ Two release tracks share this file, newest entry first regardless of track:
   with core#464.
 
 ### Added
+- **Role-keyed BASE skill directive on every unit (core#468).** The engine handed a unit exactly
+  one skill directive, built from its phase's `skill_ref`; nothing could force a discipline skill
+  on EVERY unit. `WorkflowDef.base_skill_ref: Option<String>` (drop-in JSON field, serde-default,
+  absent on the wire when unset) — with the engine-config default `WICKED_BASE_SKILL_REF` (the
+  def's field wins; the def's `""` is an explicit opt-out) — now lands on every AGENT unit of the
+  plan as `WorkUnit.base_skill_ref` (`plan::apply_base_skill`; never on a Tool unit), and the
+  prompt builder LEADS with one short, role-keyed directive before the phase directive:
+  `Invoke your skill "<base>" (via the Skill tool) and follow its §<role> section; then: …`
+  (`§creator` | `§evaluator` | `§neutral` from the unit's `PhaseRole`), spelled per CLI exactly as
+  the phase directive is (core#396 forms; `execute_wrapped::base_skill_directive`) and held to
+  `BASE_SKILL_DIRECTIVE_MAX` = 120 bytes so a pty-routed unit keeps its task-text budget (the
+  skill text lives in the snapshot). Engine-internal judge/triage prompts carry none. GATED AT
+  INTAKE: `skills_snapshot::admit_base_skill` requires the skill to EXIST in the resolved skills
+  root before anything is planned — on the actor's synchronous launch path (a caller gets an
+  `Err` naming the skill with NO session persisted) and in `pre_distribute` — as
+  `SkillsError::BaseSkillRefused { skill, cause }` ("refused at intake, before any unit was
+  planned"), and again plan-wide at every launch (it rides `StepInput::required_skills`). It is
+  EXISTENCE-only by design: it never joins the seat half of `RequiredRefs`, so a `portable: false`
+  base skill neither refuses a non-Claude seat nor collapses routing onto claude
+  (`distribute::seat_candidates` reads `skill_ref` alone — pinned by a test with a non-portable
+  fixture base skill). Wire: `unitDispatched` gains `baseSkill: {name, role} | null` (additive,
+  emitted unconditionally; the handed generation is the same unit's `skillsSnapshotHanded.gen`).
+  Default OFF in the engine (no def field, no env) — wicked-crew turns it on with
+  `wicked-garden-governed-worker` (crew#554).
 - **State-home fence: unregistered entries are a configuration error, refused at intake (core#411,
   wicked-crew#497; acceptance findings F-RC1-011, F-RC2-020, F-032/F-033).** The worker Read fence
   fails closed BY NAME on a state-home entry its static registry (`tests/fixtures/state-home-subtrees.json`,
