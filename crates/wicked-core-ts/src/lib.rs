@@ -2229,9 +2229,10 @@ mod tests {
                 cli_key: "claude".into(),
                 text: "t".into(),
                 ok: true,
+                usage: None,
             },
             "chatReply",
-            &["type", "chat", "cliKey", "text", "ok"],
+            &["type", "chat", "cliKey", "text", "ok", "usage"],
         );
         check(
             CoreEvent::ChatClosed {

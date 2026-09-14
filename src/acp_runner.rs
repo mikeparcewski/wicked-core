@@ -4646,6 +4646,15 @@ impl ChatCloseReason {
 /// `chat_open`'s per-seat outcomes: `(cli_key, Ok(()) | Err(reason))`, in the order asked.
 pub type ChatOpenOutcomes = Vec<(String, Result<(), String>)>;
 
+/// One seat's completed chat turn (DES-L5): the assembled reply and the turn's token/cost usage
+/// when the bridge reported one — `None` on bridges that emit no usage (pi, agy). Surfaced to the
+/// wire as `ChatReply.usage`; the studio renders it on the bubble that cost it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatTurnReply {
+    pub text: String,
+    pub usage: Option<Usage>,
+}
+
 /// One live chat, for the enumerate surface. A leak nobody can list is a leak nobody can reclaim
 /// (FINDING-027 gap 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4852,9 +4861,15 @@ fn chat_boundary(
         pre_build_scope: false,
         write_posture: crate::write_posture::WritePosture::Full,
         deliverable_roots: Vec::new(),
-        // A chat is judged by `chat_boundary_result` → `boundary_denial_with`, the STRICT
-        // spelling: an estate shim call there must pin its store on argv (issue #463).
-        estate_store_pinned: false,
+        // (issue #463 / DES-L5 §5-5, R16c) Whether the SEAT's environment pins the estate store its
+        // shim calls resolve — the inherited pins that survive `hardened()` (`WICKED_HOME` /
+        // `WICKED_MEMORY_DB`), exactly as the unit boundary reads them, OR the scope's graph, which
+        // `build_cmd` sets on the child as `WICKED_ESTATE_DB` (D-7, DES-L4 PR-⑦). Judged here,
+        // where the daemon env is the child's parent; `chat_boundary_result` hands the fact to
+        // `boundary_denial_tracked`, so a `--readonly` shim call needs no argv `--db` on a bound
+        // chat (formerly hard-coded `false`: the strict argv-only spelling).
+        estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child()
+            || scope.code_graph_db.is_some(),
     }
 }
 
@@ -4963,11 +4978,16 @@ impl AcpStepRunner {
         format!("chat:{chat_id}")
     }
 
+    /// The per-turn wall budget (`WICKED_CHAT_TURN_SECS`, env-only). 600 s by default — DES-L5
+    /// R16, a HYPOTHESIS (2× the 323.8 s / 328.0 s cuts P6 observed on claude with 0 estate calls;
+    /// the shim adds a spawn per call and is unmeasured) re-derived from the P6 re-run's per-turn
+    /// durations. A TOTAL deadline (`exec_turn_acp_posture`), never idle-reset; crew derives its
+    /// stale-turn ceiling as 3× the same variable, so the two never drift apart.
     fn chat_timeout() -> Duration {
         let secs = std::env::var("WICKED_CHAT_TURN_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
+            .unwrap_or(600);
         Duration::from_secs(secs)
     }
 
@@ -5147,9 +5167,9 @@ impl AcpStepRunner {
                 return Ok(arc.clone());
             }
         }
-        // ONE registry read for this launch: the transport config AND the seat identity come off
-        // the same record (codex r2, PR#413).
-        let (config, seat_cli) =
+        // ONE registry read for this launch: the transport config, the seat identity AND the
+        // skills identity come off the same record (codex r2, PR#413; DES-L5 review #6).
+        let (config, seat_cli, worker_cli) =
             acp_launch_facts(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
         if config.transport == AcpTransport::Http {
             return Err(format!(
@@ -5170,11 +5190,44 @@ impl AcpStepRunner {
         // runs under the kernel write floor — may join one (Copilot, #426).
         scoped_seat_admission(cli_key, &scope, &config)?;
         ensure_chat_scratch_root(&scope.cwd).map_err(|e| format!("chat '{chat_id}': {e}"))?;
-        // Grounded on the scope's graph — the READ-ONLY estate MCP, the same seam governed
-        // workers get (DES-GROUNDING-001; formerly "chat is repo-less exploration → no estate
-        // MCP", FINDING-122) — in its scratch cwd, with the scoped repository roots advertised.
-        // No skills delivery, no per-session settings dir, no unit provenance: a chat is not a
-        // run unit.
+        // DES-L5 §5-2 (core #487, P6 criterion 1): a chat seat is handed the SAME skills delivery
+        // a work unit on this CLI gets — the published generation off the ladder, fence-checked,
+        // in the lever's shape for this carrier — so garden's `wicked-garden-mem` /
+        // `wicked-garden-search` and the read-only estate shim they run are REACHABLE
+        // (`launcher_env` hands `WICKED_GARDEN_ROOT` + the PATH prefix; `SkillsDelivery::None`
+        // handed nothing, and the seat could not ground even with garden installed). Inlined from
+        // `admit_turn`'s `Turn::Fresh` arm (a chat has no unit and no plan to admit): a FAILED
+        // ladder refuses the seat with its reason; an ABSENT root, or a root this lever is not
+        // handed, refuses it with the remedy — scoped and unscoped chats alike (D1: chat is the
+        // grounded product; stricter than a unit, which may run skill-less). Never a silent
+        // skill-less seat.
+        let snapshot = match crate::skills_snapshot::resolve_ladder()
+            .map_err(|e| format!("seat '{cli_key}': {e}"))?
+        {
+            crate::skills_snapshot::Ladder::Root(s) => {
+                crate::skills_snapshot::fence_admit(&s, self.operational_home.as_deref())
+                    .map_err(|e| format!("seat '{cli_key}': {e}"))?;
+                Some(s)
+            }
+            crate::skills_snapshot::Ladder::Absent => None,
+            crate::skills_snapshot::Ladder::Failed(why) => {
+                return Err(format!("seat '{cli_key}': skills ladder failed — {why}"));
+            }
+        };
+        let delivery = snapshot
+            .as_ref()
+            .map(|s| s.delivery(&worker_cli))
+            .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
+        if matches!(delivery, crate::skills_snapshot::SkillsDelivery::None) {
+            return Err(format!(
+                "seat '{cli_key}': no skills snapshot to hand (no published generation, or this \
+                 lever is not handed the live-cache root) — install wicked-garden or publish a \
+                 snapshot (System → Skills), then open the chat again"
+            ));
+        }
+        // In its scratch cwd, grounded on the scope's graph through the child's `WICKED_ESTATE_DB`
+        // (D-7, DES-L4 PR-⑦), with the scoped repository roots advertised. No per-session settings
+        // dir and no unit provenance — a chat is not a run unit — but it IS handed the skills.
         let mut proc = start_acp_process_with_write_roots(
             &config,
             &scope.cwd,
@@ -5183,7 +5236,7 @@ impl AcpStepRunner {
             &[],
             &scope.read_roots,
             &[],
-            &crate::skills_snapshot::SkillsDelivery::None,
+            &delivery,
             seat_cli,
             None,
             self.operational_home.as_deref(),
@@ -5202,6 +5255,16 @@ impl AcpStepRunner {
             eprintln!("[wicked-core] chat '{chat_id}': refusing seat '{cli_key}': {reason}");
             drop(proc);
             return Err(reason);
+        }
+        // core#396 parity with the unit path (`proc.skills = handed`): BIND the handed snapshot
+        // to the process — the generation this session loaded, never what `current` resolves to
+        // later — and say so in the daemon log (the S08 smoke reads this line).
+        proc.skills = snapshot;
+        if let Some(s) = proc.skills.as_ref() {
+            eprintln!(
+                "[wicked-core] chat '{chat_id}' seat '{cli_key}' handed skills gen {}",
+                s.generation_label()
+            );
         }
         // The chat's filesystem boundary, judged on every permission request of every turn on
         // this session (core#410, review): write = the scratch root; read = the scoped roots.
@@ -5469,10 +5532,15 @@ impl AcpStepRunner {
     }
 
     /// One seat's turn on a chat message. Streams deltas via `ChatDelta`, returns the
-    /// completed reply text. On failure the seat's session is EVICTED (next ensure
-    /// re-warms, into the chat's recorded scope) and the error is returned — never floored,
-    /// never faked.
-    pub fn chat_turn(&self, chat_id: &str, cli_key: &str, text: &str) -> Result<String, String> {
+    /// completed reply text with the turn's usage when the bridge reported one. On failure the
+    /// seat's session is EVICTED (next ensure re-warms, into the chat's recorded scope) and the
+    /// error is returned — never floored, never faked; a turn cut at the budget names the budget.
+    pub fn chat_turn(
+        &self,
+        chat_id: &str,
+        cli_key: &str,
+        text: &str,
+    ) -> Result<ChatTurnReply, String> {
         let arc = self.chat_ensure(chat_id, cli_key)?;
         let tx = self.tx.clone();
         let (chat_ev, cli_ev) = (chat_id.to_string(), cli_key.to_string());
@@ -5525,13 +5593,30 @@ impl AcpStepRunner {
         // out from under the operator the moment it finished.
         self.chat_touch(chat_id);
         match result {
-            Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.output),
+            Ok(turn) if turn.status == StepStatus::Ok => Ok(ChatTurnReply {
+                text: turn.output,
+                usage: turn.usage,
+            }),
             Ok(turn) => {
                 self.chat_evict(chat_id, cli_key, &arc);
-                let msg = format!(
-                    "seat '{cli_key}' turn ended {:?}: {}",
-                    turn.status, turn.output
-                );
+                let msg = if turn.status == StepStatus::TimedOut {
+                    // DES-L5 §4 (F-RC1-110): the budget is NAMED — the number, the variable, the
+                    // remedy — and it LEADS, so the seat chip's reason and the narrator's head
+                    // read it (the studio keeps the longer text on finalize); whatever streamed
+                    // before the cut follows, never dropped.
+                    format!(
+                        "seat '{cli_key}' exceeded the {} s turn budget (WICKED_CHAT_TURN_SECS) \
+                         and was released — target it on your next message to re-seat it. \
+                         Partial reply before the cut:\n{}",
+                        Self::chat_timeout().as_secs(),
+                        turn.output
+                    )
+                } else {
+                    format!(
+                        "seat '{cli_key}' turn ended {:?}: {}",
+                        turn.status, turn.output
+                    )
+                };
                 // Daemon-log the eviction (crew#267) — but SUMMARIZED: turn.output can be up
                 // to the 8MB cap and carry user/model content; the log gets status + size,
                 // the caller (and thus the ChatReply the user sees) keeps the full text
@@ -6988,16 +7073,28 @@ pub(crate) fn seat_identity_of(
     crate::skills_snapshot::WorkerCli::for_binaries(&seat_binary, &carrier_binary, cli_key)
 }
 
-/// ONE registry read for ONE ACP launch: the seat's `[cli.acp]` transport config AND whether the
-/// seat is claude (`seat_identity_of` on the SAME record), or `None` when the seat has no ACP
-/// config. The MERGED registry, not `builtin()`: a user record replaces its built-in wholesale,
-/// so its `[cli.acp]` table (or its absence) must decide the transport here exactly as it does
-/// everywhere else — and its `binary` decides the identity off that same record, never a second,
-/// independent read that a concurrent `clis.toml` edit could make disagree (codex r2, PR#413).
-fn acp_launch_facts(cli_key: &str) -> Option<(AcpConfig, wicked_apps_core::spawn::SeatCli)> {
+/// ONE registry read for ONE ACP launch: the seat's `[cli.acp]` transport config, whether the
+/// seat is claude (`seat_cli_of`) AND its skills identity (`seat_identity_of`, the `WorkerCli`
+/// the chat path hands to `SkillsSnapshot::delivery` — DES-L5 review #6) — all off the SAME
+/// record, or `None` when the seat has no ACP config. The MERGED registry, not `builtin()`: a
+/// user record replaces its built-in wholesale, so its `[cli.acp]` table (or its absence) must
+/// decide the transport here exactly as it does everywhere else — and its `binary` decides both
+/// identities off that same record, never a second, independent read that a concurrent
+/// `clis.toml` edit could make disagree (codex r2, PR#413).
+fn acp_launch_facts(
+    cli_key: &str,
+) -> Option<(
+    AcpConfig,
+    wicked_apps_core::spawn::SeatCli,
+    crate::skills_snapshot::WorkerCli,
+)> {
     let record = registry_record(cli_key);
     let config = record.as_ref().and_then(|c| c.acp.clone())?;
-    Some((config, seat_cli_of(record.as_ref(), cli_key)))
+    Some((
+        config,
+        seat_cli_of(record.as_ref(), cli_key),
+        seat_identity_of(record.as_ref(), cli_key),
+    ))
 }
 
 /// The CLI a seat RUNS, for the per-seat configuration decision (core#410) — judged off the SAME
@@ -7550,7 +7647,7 @@ transport = "stdio"
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
-        let (cfg_a, cli_a) = a.expect("the override has an ACP table");
+        let (cfg_a, cli_a, skills_a) = a.expect("the override has an ACP table");
         assert_eq!(
             cfg_a.binary, "/opt/overridden/bridge-a",
             "the bridge off THAT record"
@@ -7560,12 +7657,22 @@ transport = "stdio"
             wicked_apps_core::spawn::SeatCli::Claude,
             "the key says claude but THAT record's binary does not — identity follows the record"
         );
-        let (cfg_b, cli_b) = b.expect("the override has an ACP table");
+        // DES-L5 review #6: the SKILLS identity the chat path hands to `delivery` rides the same
+        // read — a `claude`-keyed record whose binary is not claude is not a claude worker.
+        assert!(
+            !matches!(skills_a, crate::skills_snapshot::WorkerCli::Claude),
+            "the skills identity follows THAT record too: {skills_a}"
+        );
+        let (cfg_b, cli_b, skills_b) = b.expect("the override has an ACP table");
         assert_eq!(cfg_b.binary, "/opt/overridden/bridge-b");
         assert_eq!(
             cli_b,
             wicked_apps_core::spawn::SeatCli::Claude,
             "a claude binary under another key IS a claude seat"
+        );
+        assert!(
+            matches!(skills_b, crate::skills_snapshot::WorkerCli::Claude),
+            "…and a claude worker for the skills delivery: {skills_b}"
         );
         assert!(none.is_none(), "no record, no launch facts");
         let _ = std::fs::remove_dir_all(&home);
@@ -9219,11 +9326,26 @@ sleep 30
         if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
             return;
         }
+        use crate::skills_snapshot::test_support::{
+            gen_dir, scratch as canonical_scratch, snapshot_root,
+        };
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("chat-scope");
         let worker = dir.join("worker");
         std::env::set_var("WICKED_WORKER_HOME", &worker);
+        // DES-L5 §5-2: a chat seat is handed the published skills snapshot like a unit — the
+        // fixture generation is pinned on the ladder, and the stub records `WICKED_GARDEN_ROOT`.
+        let skills_home = canonical_scratch("chat-scope-skills");
+        let snapshot = snapshot_root(
+            &gen_dir(&skills_home.join(".wicked-crew"), "7"),
+            "7",
+            &[
+                ("mem", "wicked-garden-mem"),
+                ("search", "wicked-garden-search"),
+            ],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
         let frame_ledger = dir.join("session-new.json");
         let env_ledger = dir.join("seen-config-dir.txt");
         let script = write_stub(
@@ -9231,7 +9353,7 @@ sleep 30
             &format!(
                 r#"#!/bin/sh
 printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{env_ledger}"
-printf 'ESTATE_DB=%s\nREADONLY=%s\n' "${{WICKED_ESTATE_DB:-UNSET}}" "${{WICKED_ESTATE_READONLY:-UNSET}}" > "{env_ledger}.estate"
+printf 'ESTATE_DB=%s\nREADONLY=%s\nGARDEN_ROOT=%s\n' "${{WICKED_ESTATE_DB:-UNSET}}" "${{WICKED_ESTATE_READONLY:-UNSET}}" "${{WICKED_GARDEN_ROOT:-UNSET}}" > "{env_ledger}.estate"
 read _init
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
 read new
@@ -9240,7 +9362,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"scoped"}}}}'
 read _prompt
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"pi v0.83.0\n---\n\n## Skills\n- /op/.pi/agent/skills/wicked-testing-x/SKILL.md\n\n## Extensions\n- /op/.pi/agent/extensions/wicked-testing.ts\n\n---\n"}}}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Hello from the scoped seat"}}}}}}}}'
-printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn","usage":{{"inputTokens":120,"outputTokens":8}}}}}}'
 sleep 30
 "#,
                 env_ledger = env_ledger.display(),
@@ -9294,6 +9416,20 @@ acp_input_governance = true
             .chat_open("c1", &["stubchat".to_string()], scope.clone())
             .expect("a valid scope is accepted");
         let turn = r.chat_turn("c1", "stubchat", "hello");
+        // core#396 parity: the handed generation is BOUND to the warm process.
+        let pinned_skills = {
+            let key = (AcpStepRunner::chat_pool_key("c1"), "stubchat".to_string());
+            let guard = r.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.get(&key) {
+                Some(Some(arc)) => arc
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .skills
+                    .as_ref()
+                    .map(|s| s.root.clone()),
+                _ => None,
+            }
+        };
         let listed = r.chat_list();
         r.chat_close("c1", ChatCloseReason::Requested);
         let after_close = r.chat_list();
@@ -9343,6 +9479,17 @@ acp_input_governance = true
             estate.contains("READONLY=1"),
             "the chat seat's env carries the read-only default: {estate}"
         );
+        // (2b) DES-L5 §5-2: the seat is handed the published skills snapshot — the launcher env
+        // a unit on this CLI gets — and the generation is pinned to the process.
+        assert!(
+            estate.contains(&format!("GARDEN_ROOT={}", snapshot.to_string_lossy())),
+            "the chat seat's env carries WICKED_GARDEN_ROOT (the handed generation): {estate}"
+        );
+        assert_eq!(
+            pinned_skills.as_deref(),
+            Some(snapshot.as_path()),
+            "the handed snapshot is bound to the warm process (core#396 parity)"
+        );
         // (3) The scoped roots are advertised to the claude seat.
         assert_eq!(
             frame["params"]["_meta"]["claudeCode"]["options"]["additionalDirectories"],
@@ -9354,11 +9501,17 @@ acp_input_governance = true
             std::path::PathBuf::from(std::fs::read_to_string(&env_ledger).unwrap().trim()),
             worker.join("claude")
         );
-        // (5) The assembled reply is the answer; the banner never reached a ChatDelta.
+        // (5) The assembled reply is the answer; the banner never reached a ChatDelta; the
+        // turn's usage rides the reply (DES-L5, F-RC1-116).
+        let reply = turn.expect("the turn completes");
+        assert_eq!(reply.text, "Hello from the scoped seat", "{reply:?}");
         assert_eq!(
-            turn.as_deref(),
-            Ok("Hello from the scoped seat"),
-            "{turn:?}"
+            reply
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens)),
+            Some((120, 8)),
+            "the bridge's usage block reaches the reply: {reply:?}"
         );
         let deltas: Vec<String> = rx
             .try_iter()
@@ -9380,6 +9533,7 @@ acp_input_governance = true
         assert_eq!(listed[0].scope.as_ref(), Some(&scope));
         assert!(after_close.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&skills_home);
     }
 
     /// D-7 (DES-L4 PR-⑦), the FINDING-122 seam inverted: `session/new` advertises NO estate MCP any
@@ -12163,6 +12317,16 @@ os_sandbox = true
         )
         .unwrap();
         let _home = EnvPin::set("HOME", &dir);
+        // DES-L5 §5-2: a chat seat needs a deliverable skills snapshot to be admitted at all —
+        // pin a published fixture so THIS test still exercises the floor admission, not the
+        // skills refusal (`chat_ensure_refuses_a_seat_with_nothing_deliverable…`).
+        let skills_home = crate::skills_snapshot::test_support::scratch("chat-floor-skills");
+        let snapshot = crate::skills_snapshot::test_support::snapshot_root(
+            &crate::skills_snapshot::test_support::gen_dir(&skills_home.join(".wicked-crew"), "2"),
+            "2",
+            &[("mem", "wicked-garden-mem")],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
         // No sandbox tool findable: the floor the record asks for cannot arm on this host.
         let empty_path = dir.join("empty-path");
         std::fs::create_dir_all(&empty_path).unwrap();
@@ -12758,6 +12922,241 @@ os_sandbox = true
         // Chat failures are retryable — nothing cached, seat list stays empty.
         assert!(r.chat_seats("c1").is_empty());
         assert!(r.sessions.lock().unwrap().is_empty());
+    }
+
+    /// DES-L5 §5-2 (core #487, P6 criterion 1): a chat seat is handed the SAME skills delivery a
+    /// unit on its CLI gets — and with NOTHING deliverable (no published generation on the ladder,
+    /// no live cache under the pinned HOME) the seat is REFUSED at open with the remedy, scoped
+    /// and unscoped alike: `chat_open` reports it as `ChatSessionFailed`, nothing is held, no
+    /// bridge is spawned. Fail loud, never a silent skill-less seat.
+    #[test]
+    #[cfg(unix)]
+    fn chat_ensure_refuses_a_seat_with_nothing_deliverable_and_names_the_remedy() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("chat-no-skills");
+        let _home = EnvPin::set("HOME", &dir);
+        let _no_snap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let _no_cfg = EnvPin::unset(CLAUDE_CONFIG_DIR_ENV);
+        let council = dir.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        // The bridge is a path that does not exist: the refusal is decided BEFORE any launch.
+        let never = dir.join("never-spawned.sh");
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "stubchat"
+display_name = "Stub chat seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{}"
+transport = "stdio"
+acp_input_governance = true
+"#,
+                never.display()
+            ),
+        )
+        .unwrap();
+        let unscoped = ChatScope {
+            cwd: dir.join("chats").join("c1"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let opened = r
+            .chat_open("c1", &["stubchat".to_string()], unscoped)
+            .expect("a valid scope is accepted");
+        assert_eq!(opened.len(), 1);
+        let reason = opened[0]
+            .1
+            .clone()
+            .expect_err("refused: nothing deliverable");
+        assert!(
+            reason.contains("stubchat")
+                && reason.contains("no skills snapshot to hand")
+                && reason.contains("install wicked-garden or publish a snapshot"),
+            "{reason}"
+        );
+        assert!(
+            r.chat_seats("c1").is_empty() && r.sessions.lock().unwrap().is_empty(),
+            "nothing is held for the refused seat"
+        );
+        let failed: Vec<(String, String)> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Command::EmitEvent(CoreEvent::ChatSessionFailed {
+                    cli_key, reason, ..
+                }) => Some((cli_key, reason)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            failed
+                .iter()
+                .any(|(cli, why)| cli == "stubchat" && why.contains("no skills snapshot to hand")),
+            "the refusal is an event with the remedy: {failed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DES-L5 §4 (F-RC1-110): a turn cut at the budget NAMES it — the number, the variable and
+    /// the re-seat remedy lead; whatever streamed before the cut follows — and the seat is
+    /// released (the next ensure re-warms it). `WICKED_CHAT_TURN_SECS=1` against a bridge that
+    /// streams one delta and never answers the prompt.
+    #[test]
+    #[cfg(unix)]
+    fn a_chat_turn_over_its_budget_names_the_budget_and_keeps_the_partial_reply() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        use crate::skills_snapshot::test_support::{
+            gen_dir, scratch as canonical_scratch, snapshot_root,
+        };
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("chat-budget");
+        let worker = dir.join("worker");
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        let skills_home = canonical_scratch("chat-budget-skills");
+        let snapshot = snapshot_root(
+            &gen_dir(&skills_home.join(".wicked-crew"), "3"),
+            "3",
+            &[("mem", "wicked-garden-mem")],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let _budget = EnvPin::set("WICKED_CHAT_TURN_SECS", std::path::Path::new("1"));
+        let script = write_stub(
+            &dir,
+            r#"#!/bin/sh
+read _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read _new
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"slow"}}'
+read _prompt
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"slow","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial answer before the cut"}}}}'
+sleep 30
+"#,
+        );
+        let council = dir.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "stubchat"
+display_name = "Stub chat seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{}"
+transport = "stdio"
+acp_input_governance = true
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let _home = EnvPin::set("HOME", &dir);
+        let scope = ChatScope {
+            cwd: dir.join("chats").join("c1"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let opened = r
+            .chat_open("c1", &["stubchat".to_string()], scope)
+            .expect("a valid scope is accepted");
+        assert!(opened[0].1.is_ok(), "the stub warms: {:?}", opened[0]);
+        let turn = r.chat_turn("c1", "stubchat", "take your time");
+        let seats_after = r.chat_seats("c1");
+        r.chat_close("c1", ChatCloseReason::Requested);
+        drop(_home);
+        restore_hermetic_worker_home();
+
+        let msg = turn.expect_err("the 1 s budget cuts the turn");
+        assert!(
+            msg.starts_with(
+                "seat 'stubchat' exceeded the 1 s turn budget (WICKED_CHAT_TURN_SECS) and was \
+                 released — target it on your next message to re-seat it."
+            ),
+            "the budget sentence LEADS: {msg}"
+        );
+        assert!(
+            msg.ends_with("Partial reply before the cut:\npartial answer before the cut"),
+            "the streamed partial follows, never dropped: {msg}"
+        );
+        assert!(
+            seats_after.is_empty(),
+            "the seat is released: {seats_after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&skills_home);
+    }
+
+    /// DES-L5 §5-5 (R16c, issue #463): the chat boundary reads the seat's store pin like the unit
+    /// boundary — the inherited env pins, OR the scope's graph (which rides the child's
+    /// `WICKED_ESTATE_DB`, D-7) — so a `--readonly` estate shim call on a graph-bound chat is
+    /// admitted without an argv `--db`, and refused on an unbound, unpinned one.
+    #[test]
+    #[cfg(unix)]
+    fn a_chat_boundary_counts_the_scopes_graph_as_the_estate_store_pin() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _a = EnvPin::unset("WICKED_HOME");
+        let _b = EnvPin::unset("WICKED_MEMORY_DB");
+        let _c = EnvPin::unset("WICKED_ESTATE_DB");
+        let dir = scratch("chat-boundary-pin");
+        let cwd = dir.join("scratch");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let graph = dir.join("estate.db");
+        std::fs::write(&graph, b"").unwrap();
+        let unbound = ChatScope {
+            cwd: cwd.clone(),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let bound = ChatScope {
+            code_graph_db: Some(graph.to_string_lossy().into_owned()),
+            ..unbound.clone()
+        };
+        let seat = wicked_apps_core::spawn::SeatCli::Codex;
+        assert!(
+            !chat_boundary(&unbound, seat).estate_store_pinned,
+            "no graph and no env pin ⇒ unpinned"
+        );
+        assert!(
+            chat_boundary(&bound, seat).estate_store_pinned,
+            "the scope's graph IS the pin (it rides the child's WICKED_ESTATE_DB)"
+        );
+        let shim = json!({
+            "sessionId": "s1",
+            "toolName": "Bash",
+            "toolCall": {"toolCallId": "t1", "rawInput": {
+                "command": "python3 scripts/_estate_client.py --readonly recall '{}'"}},
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "reject", "kind": "reject_once"},
+            ],
+        });
+        let (_, allowed_bound) =
+            crate::acp_permission::chat_boundary_result(&chat_boundary(&bound, seat), &shim);
+        let (_, allowed_unbound) =
+            crate::acp_permission::chat_boundary_result(&chat_boundary(&unbound, seat), &shim);
+        assert!(
+            allowed_bound,
+            "a read-only shim call needs no argv --db on a graph-bound chat"
+        );
+        assert!(
+            !allowed_unbound,
+            "…and stays refused where nothing pins the store (the silently-ungrounded class)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -16945,7 +17344,7 @@ transport = "stdio"
             fence_cwd: std::sync::Mutex::new(Some(clone.clone())),
         };
         // The governance verdict here is the boundary: a Bash write outside the worktree is
-        // refused (`chat_boundary_result` → `boundary_denial_with`).
+        // refused (`chat_boundary_result` → `boundary_denial_tracked`).
         let boundary = crate::gate_hook::BoundaryCtx {
             roots: crate::path_policy::AllowedRoots {
                 write: vec![wt.clone()],

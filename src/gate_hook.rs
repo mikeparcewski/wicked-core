@@ -376,8 +376,10 @@ fn in_system_temp(resolved: &std::path::Path) -> bool {
 /// (context-armed, core#260) cannot diverge on what "outside the boundary" means.
 ///
 /// Judged WITHOUT an ambient estate-store pin (issue #463): a shim / MCP call must carry its pin
-/// on argv here — the STRICT spelling the chat boundary and the boundary tests use. The governed
-/// carriers pass their pin fact through [`boundary_denial_tracked`] instead.
+/// on argv here — the STRICT spelling the boundary tests exercise. Every production carrier —
+/// the governed ones and, since DES-L5 (R16c), the chat boundary — passes its pin fact through
+/// [`boundary_denial_tracked`] instead, so this spelling is test-only.
+#[cfg(test)]
 pub(crate) fn boundary_denial_with(
     roots: &crate::path_policy::AllowedRoots,
     cwd: &std::path::Path,

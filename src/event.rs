@@ -72,12 +72,15 @@ pub enum CoreEvent {
         cli_key: String,
         text: String,
     },
-    /// One seat's completed reply to a chat message (terminal per message × seat).
+    /// One seat's completed reply to a chat message (terminal per message × seat). `usage`
+    /// (DES-L5, additive — wire `usage: {...} | null`): the turn's token/cost burn when the bridge
+    /// reported one; `None` on bridges that emit no usage (pi, agy). Mirrors `CliUsage`'s fields.
     ChatReply {
         chat: String,
         cli_key: String,
         text: String,
         ok: bool,
+        usage: Option<crate::workflow::Usage>,
     },
     /// The chat's warm sessions were closed and their processes reaped.
     ChatClosed {
@@ -2131,8 +2134,19 @@ impl CoreEvent {
                 cli_key,
                 text,
                 ok,
+                usage,
             } => {
-                json!({ "type": "chatReply", "chat": chat, "cliKey": cli_key, "text": text, "ok": ok })
+                json!({
+                    "type": "chatReply", "chat": chat, "cliKey": cli_key, "text": text, "ok": ok,
+                    // DES-L5: `null` when the bridge reported no usage — never a fabricated zero.
+                    "usage": usage.as_ref().map(|u| json!({
+                        "inputTokens": u.input_tokens,
+                        "outputTokens": u.output_tokens,
+                        "cacheReadTokens": u.cache_read_tokens,
+                        "cacheCreationTokens": u.cache_creation_tokens,
+                        "costUsd": u.cost_usd,
+                    })),
+                })
             }
             CoreEvent::ChatClosed { chat, reason } => {
                 json!({ "type": "chatClosed", "chat": chat, "reason": reason })

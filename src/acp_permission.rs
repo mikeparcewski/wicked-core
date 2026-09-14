@@ -421,7 +421,8 @@ pub(crate) fn permission_result(gate: &AcpGate<'_>, params: &Value) -> (Value, b
 /// policy store, no decisions log — but it HAS a filesystem boundary: its scratch root is writable,
 /// the scoped repository roots are READ-ONLY, and nothing path-bearing outside either is reachable.
 /// Judged through the same pure check the governed carriers share
-/// (`gate_hook::boundary_denial_with`), so "outside the boundary" means one thing everywhere; a
+/// (`gate_hook::boundary_denial_tracked`, with the seat's store-pin fact — DES-L5 R16c), so
+/// "outside the boundary" means one thing everywhere; a
 /// denied call is answered with the agent's own reject option. Fail-closed on an unreadable request
 /// or an agent that offers no way to say no, exactly like the governed answer — a read-only
 /// contract that only claude's `disallowedTools` honoured was a promise the other seats broke.
@@ -434,13 +435,18 @@ pub(crate) fn chat_boundary_result(
     };
     let (context, tool_name) =
         crate::gate_hook::claude_pretool_context(&payload.to_string(), "chat", "chat");
-    let allowed = crate::gate_hook::boundary_denial_with(
+    // DES-L5 §5-5 (R16c): the chat boundary carries the seat's store-pin fact like the unit
+    // boundary does, so a `--readonly` estate shim call on a graph-bound chat is admitted
+    // without an argv `--db` — through the SAME tracked judgement both carriers use (issue #463).
+    let allowed = crate::gate_hook::boundary_denial_tracked(
         &boundary.roots,
         &boundary.cwd,
         boundary.home.as_deref(),
         boundary.claude_config_dir.as_deref(),
         &context,
         &tool_name,
+        None,
+        boundary.estate_store_pinned,
     )
     .is_none();
     match choose_option(params.get("options").unwrap_or(&Value::Null), allowed) {
