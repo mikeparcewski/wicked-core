@@ -1299,7 +1299,6 @@ Two release tracks share this file, newest entry first regardless of track:
   (`acp_seat_identity` / `wrapped_seat_identity`; only their agreement reads `true`); additive on the wire (**core-ts** `index.d.ts` doc regenerated once through
   `scripts/finalize-dts.mjs`; api-types 0.38.0 already types `BaseSkill.handed?`).
 
-<!-- fixall L1 -->
 - **The fold reads the evaluator's OWN verdict; a missing or non-PASS `VERDICT:` line denies INTO
   THE HUMAN GATE, never `sessionFailed` (DES-L1 PR-1A, D-9; core #488, F-RC1-131; des-adjudicated
   §4.1).** A reviewer wrote `VERDICT: FAIL` and the run shipped the tree: the only verdict parser
@@ -1369,7 +1368,6 @@ Two release tracks share this file, newest entry first regardless of track:
   the escalation-gated node and holds the `human_confirm: all` node; `hold` parks both. core-ts
   `launchCampaign` doc lists the field (snake_case wire).
 
-<!-- fixall L2 -->
 - **Linux floor: bwrap masks only the secret dirs that EXIST (core #460 / #493 / #415, F-SMOKE-001;
   DES-L2 §5).** The checks-sandbox argv pushed `--tmpfs <HOME>/<dir>` for every one of the six curated
   secret dirs with no existence check; bwrap `mkdir`s a missing `--tmpfs` destination and, under
@@ -1421,7 +1419,6 @@ Two release tracks share this file, newest entry first regardless of track:
   a base known the floor prefers the repo's `test_targeted` (unless `full: true`) and runs `e2e`,
   like verify. `run_forcing_install` is deleted (its only caller). No base at all ⇒ any red check
   denies, as before.
-<!-- fixall L3 -->
 - **The repo-checks floor heartbeats on the unit's transcript stream (crew #581, F-BM-010).**
   After the worker returned, the floor (`typecheck`/`lint`/`test`, up to 3600 s per check) ran on
   the same thread with only `eprintln!` — the unit's live-output stream went silent for its whole
@@ -1476,7 +1473,6 @@ Two release tracks share this file, newest entry first regardless of track:
   on the raw text first; cap 4096 kept, not #466's 400 B). A `clis.toml` override that omits
   `[cli.acp]` over a built-in that carries one now warns on stderr (the seat runs wrapped and
   ungoverned; the wholesale-replace rule is unchanged).
-<!-- fixall L4 -->
 - **The opencode seat's harness config denies the `task` tool; a tool call the seat itself refused
   is recorded in the unit transcript (F-W1-002; FIX-IT-ALL L4; BC-75 — proposed, user decision
   owed).** opencode 1.17.18's ACP layer forwards a `permission.asked` only for sessions it opened
@@ -1495,6 +1491,32 @@ Two release tracks share this file, newest entry first regardless of track:
   text is appended unredacted — transcript redaction is the run-wide policy, not this change.
   Behaviour change register: **BC-75** (proposed — user decision owed: a seat-visible tool denial,
   and every failed tool call now in the transcript).
+- **core-ts 0.7.27** — 2026-09-14 — npm release carrying the fifteen engine changes since 0.7.26
+  (FIX-IT-ALL wave 3: L1 #513/#517/#518/#520, L2 #505/#510/#514, L3 #508/#511/#512/#523, L9 #522,
+  L5 #525, L4 #524, plus the #526 build hotfix), all on main tip 37633d8 (plus #519, the 0.7.26
+  platform-lockfile re-stamp). **Behaviour changes, in one place:** **#513** (L1-1A) — the acceptance
+  fold reads the evaluator's own `VERDICT:` line; a non-PASS verdict denies into the human gate
+  instead of auto-passing. **#517** (L1-1B) — the human gate gains `request_changes` and `amendScope`
+  arms; each unit's rework attempts mint from that unit's own history. **#518** (L1-1C) — amendment
+  scoping is proven end to end; `unitReworkAmended.scope` is rendered. **#520** (L1-1D) —
+  `denial_gate: hold | auto_reject` so an escalation gate can be answered instead of parking forever.
+  **#505** (L2-1) — the repo-checks floor uses a short private `TMPDIR`, splits cargo targets, bwrap
+  masks only existing secret dirs, and a launcher failure is never scored as the check's. **#510**
+  (L2-3) — `.wicked/checks.json` `e2e` runs at the verify stage only, after the test set. **#514**
+  (L2-4) — the deliver re-verify runs the baseline-diff floor against the lifted-onto tip (else the
+  run base); `run_forcing_install` deleted. **#508** (L3-3C) — a free-text problem plans ONE unit
+  with the brief verbatim; `split_problem` deleted. **#511** (L3-K) — Cancel run kills a live
+  Tool-executor child (the tool carrier takes the launch identity). **#512** (L3-H) — the repo-checks
+  floor heartbeats on the unit's live-output stream. **#523** (L3-3A) — every seat benched at
+  distribution parks at the `dead_seat` gate, not `sessionFailed`; council paths redacted. **#522**
+  (L9) — deliver refusals park at an escalation gate; an explicit run base for PR revision; a
+  `bug.fix` sweep line. **#525** (L5) — the chat reply is the answer after the last tool call, not
+  every assistant block concatenated. **#524** (L4, F-W1-002/BC-75) — the opencode seat denies the
+  `task` tool, and a tool call the seat itself refused now reaches the transcript. **#526** — the
+  #524 × #525 `"tool_call"` match-arm collision collapsed into one arm (`-D warnings` build hotfix;
+  no behaviour change). Wire shape: additive only; `index.d.ts` unchanged (zero drift on
+  `finalize-dts.mjs`, regenerated by the wave-3 PRs). **Coupling to note:** wicked-crew 0.7.36 pins
+  `wicked-core-ts ^0.7.27`.
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the
@@ -1900,7 +1922,6 @@ Two release tracks share this file, newest entry first regardless of track:
   embedded via `include_str!` with lift-fidelity + INV-C4 vocabulary guards; garden vendors from
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
-<!-- fixall L5 -->
 - **A chat reply is the ANSWER — the text after the turn's last tool call — not every assistant block concatenated (F-W1-004, wave-1 P6 gate; R-L5-2).** `exec_turn_acp_posture` appended every `agent_message_chunk` to `output`, so claude's Q1 `chatReply.text` opened with "Let me explore the key repos in parallel to trace this flow.Now let me read the core files in parallel.Now let me look at…" — the tool monologue the scope statement forbids, glued without separators before the answer (F-RC1-115 / F-069 narration class; the criterion-5 regex passes). Crew cannot separate the two: a `tool_call` start fell into `handle_update`'s `_ => {}` arm and left no mark in the frames it receives (only text deltas; no tool frames for chats). Now `handle_update` records `answer_from = output.len()` at every `tool_call` start (`TurnResult.answer_from`, additive), and `chat_turn` surfaces `TurnResult::chat_answer()` — the banner-stripped, trimmed text after the LAST tool call, or the whole output when nothing was said after it (loss-averse) or no tool was called (today's behaviour). The narration was already streamed as `chatDelta`s, where the studio narrates it; it never re-enters the reply or the at-rest transcript. UNIT outputs are untouched (`output` stays whole: prior-output injection and the evaluator verdict line read the full text). Tests: `a_tool_call_starts_the_answer_and_the_chat_reply_is_the_text_after_the_last_one`; the chat-seat scope test's stub now speaks narration → `tool_call` → answer and asserts the reply is the answer while the deltas carry both.
 
 ### Fixed
@@ -2117,7 +2138,6 @@ Two release tracks share this file, newest entry first regardless of track:
 - Seat failover keyed to phase idempotency, not input governance (#292 → #304).
 - Resume re-provisions a reaped worktree before re-dispatching into it (#290 → #303).
 
-<!-- fixall L9 -->
 - **Deliver refusals PARK instead of failing the run; an explicit run base for revising a pull
   request; the `bug` fix phase sweeps retired behaviour (DES-L9 r2 §5 PR-L9-core; crew #549 /
   #550 = F-RC1-010 / F-RC1-043 / F-RC1-061, core #432; BC-57..BC-60).** (a) `apply_step_result`
