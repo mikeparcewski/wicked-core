@@ -1342,6 +1342,15 @@ Two release tracks share this file, newest entry first regardless of track:
   Reject = cancel is unchanged (D-2). Real-engine journey test: FAIL review → gate → request changes
   → creator re-runs at attempt 1 with the review in context → review re-runs at attempt 1 → PASS →
   completed.
+- **Amendment scoping proven end to end; `unitReworkAmended.scope` renders the arm (DES-L1 PR-1C;
+  core #465).** A steer approved with `amendScope: creator` at a read-only unit's gate lands on the
+  first creator phase ONLY: the read-only cursor is dispatched with its own description, no unit's
+  prior-context block ever carries the steer (the engine hands OUTPUTS, never descriptions), and
+  exactly one `unitReworkAmended{ord: <creator>, scope: "creator"}` fires — a real-engine journey
+  pins it, beside the control that today's default (absent `amendScope` = `cursor`) still lands the
+  steer on the read-only cursor, the shape #465 reported, kept as the default by ruling (BC-04: the
+  studio sends `creator` whenever the cursor is not a creator). The `scope` token renders on the
+  wire for all three arms (`cursor` | `creator` | `request_changes`).
 
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
