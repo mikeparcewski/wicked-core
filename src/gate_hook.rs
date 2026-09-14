@@ -201,14 +201,15 @@ fn write_posture_from_env() -> crate::write_posture::WritePosture {
     crate::write_posture::WritePosture::parse_env(std::env::var_os(NO_CODE_SCOPE_ENV).as_deref())
 }
 
-/// Set by the launcher, alongside a `deliverable-roots` [`NO_CODE_SCOPE_ENV`], to the roots a
-/// fenced creator may write: EXACTLY the run's launch-validated `extra_write_roots`
-/// ([`crate::write_posture::deliverable_roots_of`]), PATH-separator-joined like [`WRITE_ROOTS_ENV`].
-/// Carried separately from the write roots on purpose (independent review of #444, F-02): the
-/// filesystem boundary's write set is cwd + extras + the repo-graph key dir, and a creator's
-/// deliverable belongs in the extras alone — judging "inside a declared root" off the write set
-/// would admit the graph dir here and refuse it on the ACP carrier. Unset or empty ⇒ no roots ⇒
-/// every creator write is refused (fail closed).
+/// Set by the launcher, alongside a fenced [`NO_CODE_SCOPE_ENV`], to the ADMITTED out-of-tree write
+/// roots of a FENCED posture ([`crate::write_posture::admitted_roots`], DES-L4 PR-②): the creator's
+/// launch-validated `extra_write_roots` under `deliverable-roots`, or the evaluator's NOTES ROOT
+/// under the read-only posture — PATH-separator-joined like [`WRITE_ROOTS_ENV`]. Same variable for
+/// both postures, no new env. Carried separately from the write roots on purpose (independent
+/// review of #444, F-02): the filesystem boundary's write set is cwd + extras + the repo-graph key
+/// dir, and a fenced unit's admitted writes are the extras / notes root alone — judging "inside an
+/// admitted root" off the write set would admit the graph dir here and refuse it on the ACP
+/// carrier. Unset or empty ⇒ no roots ⇒ every fenced write is refused (fail closed).
 pub const DELIVERABLE_ROOTS_ENV: &str = "WICKED_DELIVERABLE_ROOTS";
 
 /// Read [`DELIVERABLE_ROOTS_ENV`] off the hook subprocess's own environment.
@@ -334,7 +335,7 @@ pub(crate) struct BoundaryCtx {
     /// `pre_build_scope` does; the subprocess carrier reads [`NO_CODE_SCOPE_ENV`].
     pub write_posture: crate::write_posture::WritePosture,
     /// The roots a `DeliverableRoots` creator may write — EXACTLY the run's `extra_write_roots`
-    /// ([`crate::write_posture::deliverable_roots_of`]), the same list the ACP fence judges (F-02).
+    /// ([`crate::write_posture::admitted_roots`]), the same list the ACP fence judges (F-02).
     /// Empty for every other posture. The subprocess carrier reads [`DELIVERABLE_ROOTS_ENV`].
     pub deliverable_roots: Vec<std::path::PathBuf>,
     /// (issue #463) Whether the worker's environment PINS the estate store its shim / MCP reads
@@ -635,7 +636,25 @@ pub(crate) fn phase_scope_denial(
     deliverable_roots: &[std::path::PathBuf],
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
-    if !(pre_build_scope || posture.fences_writes()) || !WRITE_TOOLS.contains(&tool) {
+    if !(pre_build_scope || posture.fences_writes()) {
+        return None;
+    }
+    // R7/R7b (DES-L4 PR-②; core #483, F-RC1-080): `Bash` is judged by its WRITE TARGETS — a
+    // redirect, heredoc (`cat > f <<EOF`), `tee`, `cp`/`mv`/`install`, `dd of=`, `mkdir` — with the
+    // SAME admission a path-bearing write tool gets below (`bash_phase_scope_denial`). Before this
+    // the fence saw only `Write`/`Edit`/`NotebookEdit` and a heredoc walked straight through it
+    // (the guard then tripped and the unit died).
+    if tool == "Bash" {
+        return bash_phase_scope_denial(
+            pre_build_scope,
+            posture,
+            context,
+            cwd,
+            home,
+            deliverable_roots,
+        );
+    }
+    if !WRITE_TOOLS.contains(&tool) {
         return None;
     }
     let path = context
@@ -679,12 +698,20 @@ pub(crate) fn phase_scope_denial(
     // the wording when both apply (a pre-build phase is also a no-code one) so its established
     // message is unchanged.
     if !pre_build_scope {
+        // core#464 / R7: the ONE sanctioned place a read-only unit may write is its NOTES ROOT
+        // (outside the tree, minted at dispatch; `admitted_roots` hands it to both carriers) —
+        // admitted by the SAME judgement the creator fence uses, so a `..` hop or a symlink alias
+        // is judged where it lands. Everything else stays refused.
+        if crate::write_posture::deliverable_write_admitted(path, cwd, home, deliverable_roots) {
+            return None;
+        }
+        let notes = notes_root_remedy(deliverable_roots);
         return Some(format!(
             "phase scope: this phase declares `executes_code: false` (an evaluation/recon/review \
              phase) — `{tool}` to `{path}` would change the tree under review, so it is refused. \
-             Nothing in the worktree may be written here: report findings in this phase's output, \
-             and leave any change to the tree — code, docs or a report file — to a phase that \
-             declares `executes_code: true`."
+             Nothing in the worktree may be written here: report findings in this phase's output\
+             {notes}, and leave any change to the tree — code, docs or a report file — to a phase \
+             that declares `executes_code: true`."
         ));
     }
     // A refusal the worker cannot act on is not a refusal, it is a wall (FINDING-066): name the
@@ -696,6 +723,95 @@ pub(crate) fn phase_scope_denial(
          `.rst` files, and anything under a `docs/` or `.product/` directory. Implementation \
          belongs to the later build phase; describe it in this phase's deliverable instead."
     ))
+}
+
+/// The remedy the fold and the ACP bridge disclose with a phase-scope Bash refusal (DES-L4 PR-②).
+pub(crate) const PHASE_SCOPE_BASH_REMEDY: &str = "write notes only under the unit's notes root; a \
+    phase that must change the tree declares executes_code: true";
+
+/// `; write notes only under the unit's notes root (<root>)` when the admitted list names one,
+/// empty otherwise — the clause the read-only refusal appends so the seat is told WHERE it may write.
+fn notes_root_remedy(admitted: &[std::path::PathBuf]) -> String {
+    match admitted.first() {
+        Some(root) => format!(
+            "; write notes only under the unit's notes root ({})",
+            root.display()
+        ),
+        None => String::new(),
+    }
+}
+
+/// The `Bash` arm of [`phase_scope_denial`] (R7 / R7b / R8, DES-L4 PR-②): every WRITE TARGET of the
+/// command ([`bash_write_targets`]) must be admitted — inside one of the posture's admitted roots
+/// (the evaluator's notes root, the creator's deliverable roots;
+/// [`crate::write_posture::deliverable_write_admitted`], the same judgement the path-bearing tools
+/// get) or, for a PRE-BUILD phase, a documentation path ([`crate::actor::is_documentation_change`],
+/// the allowance core#296 grants `Write`). The first unadmitted target refuses the call, naming the
+/// target and where a write may go. ADVISORY like every phase-scope refusal: the call is blocked, the
+/// unit continues. A command with no write target, or no `command`, is not judged here. The honest
+/// limit is [`bash_write_targets`]'s: a stdin heredoc feeding an interpreter, `sed -i`, `git apply`
+/// and the other unmodelled shapes pass this scan — the worktree guard stays the backstop.
+fn bash_phase_scope_denial(
+    pre_build_scope: bool,
+    posture: crate::write_posture::WritePosture,
+    context: &serde_json::Value,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    admitted_roots: &[std::path::PathBuf],
+) -> Option<String> {
+    let command = context
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .filter(|c| !c.trim().is_empty())?;
+    bash_write_phase_scope(pre_build_scope, posture, command, cwd, home, admitted_roots)
+}
+
+/// The command-taking core of [`bash_phase_scope_denial`], shared with the ACP permission bridge
+/// (`acp_runner::answer_permission_request`, which holds the posture and the admitted roots
+/// in-process and has no JSON context to read): ONE rule on both carriers.
+pub(crate) fn bash_write_phase_scope(
+    pre_build_scope: bool,
+    posture: crate::write_posture::WritePosture,
+    command: &str,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    admitted_roots: &[std::path::PathBuf],
+) -> Option<String> {
+    use crate::write_posture::WritePosture;
+    for target in bash_write_targets(command) {
+        if crate::write_posture::deliverable_write_admitted(&target, cwd, home, admitted_roots) {
+            continue;
+        }
+        if pre_build_scope && crate::actor::is_documentation_change(&scope_relative(&target, cwd)) {
+            continue;
+        }
+        let allowed_where = match posture {
+            WritePosture::DeliverableRoots if !pre_build_scope => format!(
+                "this phase plays creator and declares `executes_code: false`; its deliverables \
+                 belong in the run's declared write roots ({})",
+                crate::write_posture::describe_deliverable_roots(admitted_roots)
+            ),
+            WritePosture::ReadOnly if !pre_build_scope => match admitted_roots.first() {
+                Some(root) => format!(
+                    "this phase declares `executes_code: false` (an evaluation/recon/review \
+                     phase); notes may be written ONLY under its notes root ({})",
+                    root.display()
+                ),
+                None => "this phase declares `executes_code: false` (an evaluation/recon/review \
+                         phase) and has no notes root — nothing may be written"
+                    .to_string(),
+            },
+            _ => "this is a PRE-BUILD phase; only documentation may be written (`.md`/`.txt`/\
+                  `.rst`, or under `docs/` / `.product/`)"
+                .to_string(),
+        };
+        return Some(format!(
+            "phase scope: `Bash` would write `{target}` — {allowed_where}. A shell redirect, \
+             heredoc, `tee`, `cp`/`mv`/`install`, `dd` or `mkdir` counts as a write here, so the \
+             call is refused; {PHASE_SCOPE_BASH_REMEDY}."
+        ));
+    }
+    None
 }
 
 /// Tokenize a Bash command on whitespace AND the control operators `;`, `(`, `)` — but ONLY when those
@@ -778,7 +894,7 @@ fn shell_tokens(command: &str) -> Vec<String> {
 /// `env`, `nice`, `timeout`, a quoted program word. Deliberately NOT a shell parser — see the
 /// caller's note on why this is defense-in-depth rather than a sandbox, and
 /// [`classify_estate_command`]'s doc for the complete list of shapes a literal scan does not model.
-fn bash_write_targets(command: &str) -> Vec<String> {
+pub(crate) fn bash_write_targets(command: &str) -> Vec<String> {
     let mut targets: Vec<String> = Vec::new();
     collect_bash_write_targets(command, true, &mut targets);
     // Drop standard shell write SINKS — writing to them discards or streams bytes, it does not place
@@ -861,6 +977,19 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                 for w in &words[idx + 1..] {
                     if let Some(f) = w.strip_prefix("of=") {
                         targets.push(f.to_string());
+                    }
+                }
+            }
+            // R8 (DES-L4 PR-②, F-RC1-092): a directory is a write target too — the guard's tree
+            // hash cannot see an empty dir, so `mkdir` is judged where it lands like a redirect
+            // is. Feeds the filesystem boundary (outside the write roots ⇒ unit-FATAL, as a
+            // redirect outside is today) and the phase-scope fence (advisory). Every non-flag
+            // word is a target (`mkdir -p a b` ⇒ `a`, `b`); a `-m MODE` value is a benign
+            // in-tree false target, stated not modelled.
+            "mkdir" => {
+                for w in &words[idx + 1..] {
+                    if !w.starts_with('-') {
+                        targets.push((*w).to_string());
                     }
                 }
             }
@@ -1653,7 +1782,14 @@ pub(crate) fn evaluate_tool_call(
         scope_home.as_deref(),
         &scope_roots,
     ) {
-        append_phase_scope_deny(decisions_path, scope, phase, &reason);
+        append_phase_scope_deny(
+            decisions_path,
+            scope,
+            phase,
+            tool,
+            &reason,
+            context.get("command").and_then(serde_json::Value::as_str),
+        );
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -1668,6 +1804,7 @@ pub(crate) fn evaluate_tool_call(
                 decisions_path,
                 scope,
                 phase,
+                tool,
                 &crate::diagnostic::with_cause("store open failed", &e),
             );
             eprintln!(
@@ -1686,6 +1823,7 @@ pub(crate) fn evaluate_tool_call(
                 decisions_path,
                 scope,
                 phase,
+                tool,
                 &crate::diagnostic::with_cause("policy select failed", &e),
             );
             eprintln!(
@@ -2020,7 +2158,38 @@ pub fn write_armed_marker_for(
 /// Best-effort append of a synthetic Deny when the hook must block a tool-call due to an INFRA failure
 /// (store won't open, policy select failed) — so the block leaves durable evidence the fold will see,
 /// rather than a silent exit-2 the run could Complete past. Errors are swallowed (already failing closed).
-fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
+/// Write a fence claim WITH its tool-call annotation as ONE buffer (F3, DES-L4 PR-②): the fence
+/// appenders return before the policy path writes its `TOOL_CALL_KEY` line, so a claim appended
+/// alone reads `(unknown)` in `collect_hook_decisions` — and the `workerToolCallDenied` the fold
+/// discloses from it would name no tool. Same atomicity argument as `evaluate_tool_call`'s policy
+/// path and `append_estate_deny`: one small `write_all` under the advisory lock cannot be
+/// interleaved by a concurrent hook subprocess even if the lock degrades.
+fn append_annotated_claim(decisions_path: &str, phase: &str, tool: &str, claim: &ConformanceClaim) {
+    let annotation = serde_json::json!({
+        TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
+        TOOL_CALL_PHASE_KEY: phase,
+    })
+    .to_string()
+        + "\n";
+    let Ok(mut claim_line) = serde_json::to_string(claim) else {
+        return;
+    };
+    claim_line.push('\n');
+    let combined = annotation + &claim_line;
+    let path = Path::new(decisions_path);
+    if let Some(parent) = path.parent() {
+        let _ = create_dir_all_private(parent);
+    }
+    let _ = with_append_lock(path, || {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(combined.as_bytes())
+    });
+}
+
+fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str, reason: &str) {
     let claim = ConformanceClaim {
         // Keyed on `phase` only — NOT the scope, which embeds `/` (`wicked-agent/<sess>/unit/<id>`) and
         // would make an unsafe/unbounded claim symbol (Copilot). One infra-deny node per phase is enough
@@ -2036,7 +2205,7 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
         evaluator_identity: "wicked-governance-infra".to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    let _ = append_decision(Path::new(decisions_path), &claim);
+    append_annotated_claim(decisions_path, phase, tool, &claim);
 }
 
 /// Record a BOUNDARY refusal — a tool call that reached outside the unit's worktree.
@@ -2098,7 +2267,18 @@ const PHASE_SCOPE_DENY_PREFIX: &str = "phase-scope-deny:";
 /// [`evaluate_tool_call`], after the boundary and scope checks have already returned. The tool and
 /// the path are in the `reason` either way, so the record names them — this is a shape shared with
 /// [`append_boundary_deny`], not a new hole.
-fn append_phase_scope_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
+/// Record a phase-scope refusal as a REAL decision record naming the tool (annotation, F3) and —
+/// for the `Bash` arm — the offending command at `obligations[1]`, so the fold can disclose
+/// `workerToolCallDenied{tool, command}` through [`HookDecisionRecord::phase_scope_refusal`]
+/// without re-parsing prose (DES-L4 PR-②). `command` is `None` for a path-bearing tool.
+fn append_phase_scope_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+    command: Option<&str>,
+) {
     let claim = ConformanceClaim {
         // Keyed on `phase` only, for the same reason `append_infra_deny` is: `scope` embeds `/`
         // and would make an unbounded claim symbol.
@@ -2107,13 +2287,16 @@ fn append_phase_scope_deny(decisions_path: &str, scope: &str, phase: &str, reaso
         phase: phase.to_string(),
         policy_ids: vec![PHASE_SCOPE_RULE_ID.to_string()],
         decision: Decision::Deny,
-        obligations: vec![reason.to_string()],
+        obligations: vec![
+            reason.to_string(),
+            command.map(str::to_string).unwrap_or_default(),
+        ],
         evaluated_context_ref: "sha256:phase-scope".to_string(),
         criteria: format!("phase scope (advisory: blocked, worker continues): {reason}"),
         evaluator_identity: PHASE_SCOPE_EVALUATOR.to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    let _ = append_decision(Path::new(decisions_path), &claim);
+    append_annotated_claim(decisions_path, phase, tool, &claim);
 }
 
 /// Record a filesystem-boundary block. `fatal` picks whether it ABORTS the unit (a write/escape) or
@@ -2179,7 +2362,8 @@ fn append_remote_write_deny(
         evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    let _ = append_decision(Path::new(decisions_path), &claim);
+    // A remote-write refusal is always a shell command (F3: annotated, never `(unknown)`).
+    append_annotated_claim(decisions_path, phase, "Bash", &claim);
 }
 
 /// Record an estate-command refusal (issue #463) as a REAL decision record naming the tool and
@@ -2388,6 +2572,19 @@ impl HookDecisionRecord {
     /// arm uses `ESTATE_DENY_PREFIX`; fatal denies ride `boundary-deny:` and do not reach here.
     pub fn estate_refusal(&self) -> Option<(String, String)> {
         if self.decision != "deny" || !self.claim_id.starts_with(ESTATE_DENY_PREFIX) {
+            return None;
+        }
+        Some((
+            self.obligations.first().cloned().unwrap_or_default(),
+            self.obligations.get(1).cloned().unwrap_or_default(),
+        ))
+    }
+
+    /// (DES-L4 PR-②, R7) Whether this record is a phase-scope refusal the fold discloses as
+    /// `workerToolCallDenied`: `(reason, command)` when it is — `command` is the offending shell
+    /// command for the `Bash` arm and empty for a path-bearing tool (the reason names the path).
+    pub fn phase_scope_refusal(&self) -> Option<(String, String)> {
+        if self.decision != "deny" || !self.claim_id.starts_with(PHASE_SCOPE_DENY_PREFIX) {
             return None;
         }
         Some((
@@ -2992,6 +3189,182 @@ pub(crate) fn legacy_scope(
 mod tests {
     use super::*;
 
+    /// R7 / R7b / R8 (DES-L4 PR-②; core #483, F-RC1-080, F-RC1-092): `Bash` is judged by its WRITE
+    /// TARGETS under a fenced posture with the SAME admission a path-bearing tool gets. Read-only:
+    /// a heredoc / redirect / tee / mkdir into the tree is refused (advisory), one under the notes
+    /// root is admitted, a command with no write target is not judged; a path-bearing `Write` under
+    /// the notes root is admitted too and the refusal names the root. Pre-build: documentation
+    /// targets pass, `> src/x` is refused (R7b). Deliverable-roots: inside a declared root passes,
+    /// the tree is refused. Full: no fence. Mutation: drop the `tool == "Bash"` arm → every `Some`
+    /// here becomes `None`.
+    #[test]
+    fn bash_write_targets_are_judged_under_a_fenced_posture_and_admitted_under_the_notes_root() {
+        use crate::write_posture::WritePosture as P;
+        // No `(`/`)` in the scratch path: `shell_tokens` splits bare parens as control operators,
+        // and `ThreadId(n)`'s Debug form would truncate every redirect target under it.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!(
+            "wicked-phase-scope-bash-{}-{tid}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let notes = base.join("notes");
+        let inbox = base.join("inbox");
+        for d in [&wt.join("src"), &wt.join("docs"), &notes, &inbox] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sh = |c: String| serde_json::json!({ "command": c });
+        let notes_roots = vec![notes.clone()];
+        let inbox_roots = vec![inbox.clone()];
+        let none: &[std::path::PathBuf] = &[];
+        let deny =
+            |pre: bool, posture: P, ctx: &serde_json::Value, roots: &[std::path::PathBuf]| {
+                phase_scope_denial(pre, posture, ctx, "Bash", &wt, None, roots)
+            };
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        // READ-ONLY: writes into the tree are refused, naming the target and the notes root.
+        for cmd in [
+            format!("cat > {} <<'EOF'\nfindings\nEOF", w(&wt.join("notes.md"))),
+            format!("echo x > {}", w(&wt.join("src").join("x.rs"))),
+            format!("cargo test 2>&1 | tee {}", w(&wt.join("build.log"))),
+            format!("mkdir -p {}", w(&wt.join("evidence"))),
+            format!("cp {} {}", w(&notes.join("a")), w(&wt.join("a"))),
+        ] {
+            let d = deny(false, P::ReadOnly, &sh(cmd.clone()), &notes_roots).unwrap_or_else(|| {
+                panic!("a read-only Bash write into the tree is refused: {cmd}")
+            });
+            assert!(
+                d.starts_with("phase scope: `Bash` would write")
+                    && d.contains(&w(&notes))
+                    && d.contains(PHASE_SCOPE_BASH_REMEDY),
+                "{d}"
+            );
+        }
+        // READ-ONLY: writes under the notes root are admitted; a command with no write target is
+        // not judged; a `/dev/null` sink is not a target.
+        for cmd in [
+            format!("echo x > {}", w(&notes.join("analysis.md"))),
+            format!(
+                "cat > {} <<'EOF'\nnotes\nEOF",
+                w(&notes.join("sub").join("n.md"))
+            ),
+            format!(
+                "cp {} {}",
+                w(&wt.join("src").join("x.rs")),
+                w(&notes.join("x.rs"))
+            ),
+            "ls -la src && cargo test".to_string(),
+            "cargo test > /dev/null 2>&1".to_string(),
+        ] {
+            assert_eq!(
+                deny(false, P::ReadOnly, &sh(cmd.clone()), &notes_roots),
+                None,
+                "admitted / not a write: {cmd}"
+            );
+        }
+        // READ-ONLY with NO notes root: refused, and the refusal says so.
+        let d = deny(
+            false,
+            P::ReadOnly,
+            &sh(format!("echo x > {}", w(&wt.join("n.md")))),
+            none,
+        )
+        .expect("no notes root ⇒ nothing may be written");
+        assert!(d.contains("has no notes root"), "{d}");
+        // The path-bearing tools get the SAME notes-root admission (was: refused everywhere).
+        assert_eq!(
+            phase_scope_denial(
+                false,
+                P::ReadOnly,
+                &serde_json::json!({ "path": w(&notes.join("x.md")) }),
+                "Write",
+                &wt,
+                None,
+                &notes_roots
+            ),
+            None,
+            "a Write under the notes root is admitted"
+        );
+        let d = phase_scope_denial(
+            false,
+            P::ReadOnly,
+            &serde_json::json!({ "path": w(&wt.join("x.md")) }),
+            "Write",
+            &wt,
+            None,
+            &notes_roots,
+        )
+        .expect("a Write into the tree stays refused");
+        assert!(
+            d.contains("Nothing in the worktree may be written here")
+                && d.contains("write notes only under the unit's notes root")
+                && d.contains(&w(&notes)),
+            "{d}"
+        );
+
+        // PRE-BUILD (R7b): documentation targets pass, production code is refused.
+        assert_eq!(
+            deny(
+                true,
+                P::Full,
+                &sh(format!(
+                    "cat > {} <<'EOF'\n# design\nEOF",
+                    w(&wt.join("docs").join("design.md"))
+                )),
+                none
+            ),
+            None,
+            "pre-build documentation via Bash is allowed"
+        );
+        let d = deny(
+            true,
+            P::Full,
+            &sh(format!("echo x > {}", w(&wt.join("src").join("x.rs")))),
+            none,
+        )
+        .expect("pre-build production code via Bash is refused");
+        assert!(
+            d.contains("PRE-BUILD") && d.contains("documentation"),
+            "{d}"
+        );
+
+        // DELIVERABLE-ROOTS creator: inside a declared root passes, the tree is refused.
+        assert_eq!(
+            deny(
+                false,
+                P::DeliverableRoots,
+                &sh(format!("echo x > {}", w(&inbox.join("out.html")))),
+                &inbox_roots
+            ),
+            None
+        );
+        let d = deny(
+            false,
+            P::DeliverableRoots,
+            &sh(format!("echo x > {}", w(&wt.join("index.html")))),
+            &inbox_roots,
+        )
+        .expect("a creator's Bash write into the tree is refused");
+        assert!(
+            d.contains("declared write roots") && d.contains(&w(&inbox)),
+            "{d}"
+        );
+
+        // FULL posture, not pre-build: no fence at all.
+        assert_eq!(
+            deny(
+                false,
+                P::Full,
+                &sh(format!("echo x > {}", w(&wt.join("src").join("x.rs")))),
+                none
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// F-036: the READ-ONLY posture — an `executes_code: false` phase that does not play creator
     /// (an evaluator reviewing a build, a recon rung) is refused the path-bearing write tools on
     /// EVERYTHING in the tree, documentation included (no exemptions — matching the worktree
@@ -3052,9 +3425,21 @@ mod tests {
             deny(false, P::ReadOnly, "/wt/out/report.json", "Write").is_some(),
             "so is anything under an output directory inside the tree"
         );
-        // An evaluator is read-only EVERYWHERE — a declared write root does not open it up
-        // (F-4R2-004: evaluators stay read-only; the creator fence is the one that widens).
+        // An evaluator is read-only EVERYWHERE except its NOTES ROOT (F-4R2-004 + DES-L4 PR-②):
+        // the roots this fn is handed under the read-only posture are `admitted_roots(ReadOnly,
+        // notes_root, extras)` = the notes root alone — a declared CREATOR write root never reaches
+        // it, so a declared root does not open the evaluator up. The fn itself admits exactly the
+        // list it is handed (the notes-root mechanism); the guarantee that the list is never the
+        // creator's extras is `admitted_roots`', asserted here from both sides.
         let inbox = std::path::PathBuf::from("/inbox");
+        assert!(
+            crate::write_posture::admitted_roots(
+                P::ReadOnly,
+                Some("/notes/unit-2"),
+                &["/inbox".to_string()]
+            ) == vec![std::path::PathBuf::from("/notes/unit-2")],
+            "an evaluator's admitted roots are its notes root — never a declared creator root"
+        );
         assert!(
             phase_scope_denial(
                 false,
@@ -3063,11 +3448,29 @@ mod tests {
                 "Write",
                 wt,
                 None,
-                std::slice::from_ref(&inbox),
+                &crate::write_posture::admitted_roots(
+                    P::ReadOnly,
+                    Some("/notes/unit-2"),
+                    &["/inbox".to_string()]
+                ),
             )
             .is_some(),
-            "an evaluator may not write into a declared root either"
+            "an evaluator may not write into a declared creator root"
         );
+        assert!(
+            phase_scope_denial(
+                false,
+                P::ReadOnly,
+                &ctx("/notes/unit-2/review.md"),
+                "Write",
+                wt,
+                None,
+                std::slice::from_ref(&std::path::PathBuf::from("/notes/unit-2")),
+            )
+            .is_none(),
+            "…but it may write under its notes root (core#464)"
+        );
+        let _ = inbox;
     }
 
     /// F-01 (independent review of #444): the hook is the standalone `wicked-core` binary the
@@ -3674,7 +4077,9 @@ mod tests {
             p0.to_str().unwrap(),
             "wf/unit-2",
             "unit-2",
+            "Write",
             "phase scope: this is a PRE-BUILD phase … `Write` to `src/board/attentionReason.ts`",
+            None,
         );
         assert_eq!(
             fold_input_denial(&mut store, &run_id, 0, "unit-2", true).unwrap(),
@@ -3695,7 +4100,9 @@ mod tests {
             p1.to_str().unwrap(),
             "wf/unit-2",
             "unit-2",
+            "Write",
             "phase scope: … `Write` to `src/lib.rs`",
+            None,
         );
         let mut policy_deny = allow_claim("POL-042", "unit-2");
         policy_deny.decision = Decision::Deny;
@@ -3714,7 +4121,9 @@ mod tests {
             p2.to_str().unwrap(),
             "wf/design",
             "design",
+            "Edit",
             "phase scope: … `Edit` to `src/lib.rs`",
+            None,
         );
         let summary = apply_hook_decisions(&mut store, "phasescope-drain", &p2).unwrap();
         assert_eq!(
@@ -4535,6 +4944,103 @@ mod boundary_tests {
         assert!(wicked_apps_core::spawn::ENGINE_INTERNAL_ENV.contains(&ESTATE_DB_ENV));
     }
 
+    /// F3 (DES-L4 PR-②): the three fence appenders that used to call `append_decision` bare —
+    /// phase-scope, infra, remote-write — now write the tool-call annotation IN THE SAME BUFFER, so
+    /// a replayed record names the tool (never `(unknown)`), and a phase-scope record surfaces
+    /// through `phase_scope_refusal()` with the reason AND the offending Bash command. Mutation:
+    /// route any of the three back through bare `append_decision` → its `tool_name` reads
+    /// `(unknown)` here.
+    #[test]
+    fn phase_scope_infra_and_remote_write_records_name_the_tool_never_unknown() {
+        let run_id = format!("fence-records-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p, "unit-3", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        let sentinel = serde_json::json!({ HOOK_FIRED_KEY: "unit-3" }).to_string() + "\n";
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .unwrap();
+            f.write_all(sentinel.as_bytes()).unwrap();
+        }
+        let heredoc = "cat > notes.md <<'EOF'\nfindings\nEOF";
+        append_phase_scope_deny(
+            p.to_str().unwrap(),
+            "wf/unit-3",
+            "unit-3",
+            "Bash",
+            "phase scope: `Bash` would write `notes.md` — …",
+            Some(heredoc),
+        );
+        append_phase_scope_deny(
+            p.to_str().unwrap(),
+            "wf/unit-3",
+            "unit-3",
+            "Write",
+            "phase scope: … `Write` to `x.md`",
+            None,
+        );
+        append_infra_deny(
+            p.to_str().unwrap(),
+            "wf/unit-3",
+            "unit-3",
+            "Edit",
+            "store open failed",
+        );
+        append_remote_write_deny(
+            p.to_str().unwrap(),
+            "wf/unit-3",
+            "unit-3",
+            "remote-write fence: …",
+            "git push origin main",
+        );
+        let recs = collect_hook_decisions(&run_id, 0, "unit-3");
+        assert_eq!(recs.len(), 4, "{recs:?}");
+        let tools: Vec<&str> = recs.iter().map(|r| r.tool_name.as_str()).collect();
+        assert_eq!(tools, vec!["Bash", "Write", "Edit", "Bash"], "{recs:?}");
+        assert!(
+            recs.iter()
+                .all(|r| r.tool_name != "(unknown)" && r.decision == "deny"),
+            "{recs:?}"
+        );
+        assert!(
+            recs.iter()
+                .all(|r| r.carrier.as_deref() == Some(CARRIER_WRAPPED_CLI)),
+            "the armed marker's carrier rides every record: {recs:?}"
+        );
+        // The phase-scope records surface with reason + command (empty for a path-bearing tool).
+        assert_eq!(
+            recs[0].phase_scope_refusal(),
+            Some((
+                "phase scope: `Bash` would write `notes.md` — …".to_string(),
+                heredoc.to_string()
+            ))
+        );
+        assert_eq!(
+            recs[1].phase_scope_refusal(),
+            Some((
+                "phase scope: … `Write` to `x.md`".to_string(),
+                String::new()
+            ))
+        );
+        assert_eq!(
+            recs[2].phase_scope_refusal(),
+            None,
+            "an infra deny is not a phase-scope one"
+        );
+        assert_eq!(
+            recs[3].remote_write_refusal(),
+            Some((
+                "remote-write fence: …".to_string(),
+                "git push origin main".to_string()
+            ))
+        );
+        assert_eq!(recs[3].phase_scope_refusal(), None);
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
     /// Issue #463 acceptance: an estate DENY is a real decision record naming the TOOL and the
     /// COMMAND on BOTH arms — never `(unknown)`. The advisory arm (a recon / pre-build posture)
     /// records `estate-deny:` — advisory by the allowlist, so the unit is NOT denied, and
@@ -5162,6 +5668,24 @@ mod boundary_tests {
                 .is_some(),
                 "tee to an outside file must be denied"
             );
+            // R8 (DES-L4 PR-②, F-RC1-092): `mkdir` is a write target — outside the boundary it is
+            // unit-FATAL exactly like a redirect outside; inside the tree it is allowed.
+            let d = boundary_denial_untracked(
+                &json!({"command": "mkdir -p /etc/evil-dir/sub"}),
+                "Bash",
+            );
+            assert!(
+                d.as_ref().is_some_and(|(_, is_write)| *is_write),
+                "a Bash mkdir outside the worktree must be a FATAL boundary deny: {d:?}"
+            );
+            assert!(
+                boundary_denial_untracked(
+                    &json!({ "command": format!("mkdir -p {}/new/dir", wt.display()) }),
+                    "Bash"
+                )
+                .is_none(),
+                "a mkdir inside the worktree must be allowed"
+            );
             // A write INSIDE the worktree is fine — the boundary is a fence, not a Bash ban.
             assert!(
                 boundary_denial_untracked(
@@ -5501,12 +6025,14 @@ mod phase_scope_tests {
         }
     }
 
-    /// The honest limit, stated as a test so nobody reports this as confinement. It judges the
-    /// path-bearing WRITE tools and nothing else: a READ is never refused (a design phase must read
-    /// the code it designs against), and a `Bash` heredoc carries no `path` for the gate to see —
-    /// which is exactly why `actor::phase_scope_warning` stays live as the completion backstop.
+    /// The honest limit, stated as a test so nobody reports this as confinement: a READ is never
+    /// refused (a design phase must read the code it designs against), and a write tool with no
+    /// usable path is not a judgeable call. Since DES-L4 PR-② (R7b) a `Bash` heredoc IS judged —
+    /// by its write targets, not by a `path` — so a pre-build shell write of production code is
+    /// refused (advisory) exactly like `Write` would be; `actor::phase_scope_warning` stays live as
+    /// the completion backstop for the shapes the target scan cannot see.
     #[test]
-    fn reads_and_shell_writes_are_outside_this_gates_reach() {
+    fn reads_are_outside_this_gates_reach_and_shell_writes_are_now_inside_it() {
         assert_eq!(
             legacy_scope(
                 true,
@@ -5527,16 +6053,28 @@ mod phase_scope_tests {
             ),
             None
         );
+        let shell = legacy_scope(
+            true,
+            false,
+            &json!({"command": "cat > src/lib.rs <<'EOF'\nx\nEOF", "path": null}),
+            "Bash",
+            std::path::Path::new("/wt"),
+        )
+        .expect("R7b: a pre-build shell write of production code is judged by its target");
+        assert!(
+            shell.contains("PRE-BUILD") && shell.contains("`src/lib.rs`"),
+            "{shell}"
+        );
         assert_eq!(
             legacy_scope(
                 true,
                 false,
-                &json!({"command": "cat > src/lib.rs <<'EOF'\nx\nEOF", "path": null}),
+                &json!({"command": "cat > docs/design.md <<'EOF'\nx\nEOF", "path": null}),
                 "Bash",
                 std::path::Path::new("/wt")
             ),
             None,
-            "a shell write carries no path argument — the completion-path warning catches it"
+            "a pre-build shell write of DOCUMENTATION keeps the core#296 allowance"
         );
         // A write tool with no usable path is not a judgeable call.
         assert_eq!(

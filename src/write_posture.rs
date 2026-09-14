@@ -141,32 +141,43 @@ impl WritePosture {
 }
 
 /// The DELIVERABLE ROOTS a fenced creator may write: EXACTLY the run's launch-validated
-/// `extra_write_roots` ([`crate::workflow::GovernanceContext::extra_write_roots`]) — nothing else.
-/// Not the unit cwd (the tree under review, which the fence excludes), not the repo-graph key
-/// directory the filesystem boundary also admits (engine scratch, written by the estate MCP —
-/// never a seat's deliverable), not the state home. ONE derivation for every carrier
-/// (independent review of #444, F-02): the ACP fence reads it in-process, the wrapped launcher
-/// arms it on [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`] for the hook subprocess, and the gate
-/// hook judges the same list — so the two carriers cannot disagree about where a creator's
-/// deliverable may land. No governance context ⇒ no roots ⇒ every creator write is refused
-/// (fail closed), the same rule the boundary applies to an unarmed run.
-pub(crate) fn deliverable_roots_of(
-    governance: Option<&crate::workflow::GovernanceContext>,
-) -> Vec<PathBuf> {
-    governance
-        .map(|g| deliverable_roots_from(&g.extra_write_roots))
-        .unwrap_or_default()
-}
-
-/// The slice-level core of [`deliverable_roots_of`]: the declared `extra_write_roots` as paths,
-/// in declaration order, nothing added and nothing dropped. The wrapped launcher calls this on its
-/// launch-resolved governance record (`execute_wrapped::GovLaunch`, which carries the same
-/// validated list) so every carrier derives from one function.
+/// `extra_write_roots` ([`crate::workflow::GovernanceContext::extra_write_roots`]) as paths, in
+/// declaration order, nothing added and nothing dropped — nothing else. Not the unit cwd (the tree
+/// under review, which the fence excludes), not the repo-graph key directory the filesystem
+/// boundary also admits (engine scratch, written by the estate MCP — never a seat's deliverable),
+/// not the state home. ONE derivation for every carrier (independent review of #444, F-02), reached
+/// through [`admitted_roots`]: the ACP fence holds it in-process, the wrapped launcher arms it on
+/// [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`] for the hook subprocess, and the gate hook judges
+/// the same list — so the two carriers cannot disagree about where a creator's deliverable may
+/// land. No declared roots ⇒ every creator write is refused (fail closed), the same rule the
+/// boundary applies to an unarmed run. (`deliverable_roots_of(Option<&GovernanceContext>)` was
+/// deleted with DES-L4 PR-②: `admitted_roots` is the one entry point.)
 pub(crate) fn deliverable_roots_from(extra_write_roots: &[String]) -> Vec<PathBuf> {
     extra_write_roots.iter().map(PathBuf::from).collect()
 }
 
-/// The env spelling of [`deliverable_roots_of`] for the hook-subprocess carrier: the roots joined
+/// The ADMITTED out-of-tree write roots of a posture (DES-L4 PR-②, D-12): the ONE list both
+/// carriers judge a fenced unit's writes against — path-bearing tools and Bash write targets alike.
+/// `DeliverableRoots` → the creator's launch-validated `extra_write_roots`
+/// ([`deliverable_roots_from`]); `ReadOnly` → the unit's NOTES ROOT (`WorkUnit::notes_root`, minted
+/// at dispatch for a bound read-only unit, core#464 — the sanctioned place outside the tree an
+/// evaluator may write its analysis; `[]` when the unit has none); `Full` → nothing (no fence).
+/// The wrapped launcher arms this list on [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`], the ACP
+/// carrier holds it in-process (`AcpWritePosture::deliverable_roots`), and the gate hook judges it —
+/// the same variable and the same judgement ([`deliverable_write_admitted`]) for both postures.
+pub(crate) fn admitted_roots(
+    posture: WritePosture,
+    notes_root: Option<&str>,
+    extra_write_roots: &[String],
+) -> Vec<PathBuf> {
+    match posture {
+        WritePosture::DeliverableRoots => deliverable_roots_from(extra_write_roots),
+        WritePosture::ReadOnly => notes_root.into_iter().map(PathBuf::from).collect(),
+        WritePosture::Full => Vec::new(),
+    }
+}
+
+/// The env spelling of [`admitted_roots`] for the hook-subprocess carrier: the roots joined
 /// with the platform's PATH separator, exactly as `WICKED_WRITE_ROOTS` is. `None` when a root
 /// contains the separator and cannot be joined — the launcher then arms an EMPTY list rather than
 /// a partial one, and the hook refuses every creator write (fail closed); `Some("")` for no roots.
@@ -368,7 +379,7 @@ mod tests {
             ],
             extra_read_roots: vec!["/somewhere/readonly".into()],
         };
-        let in_process = deliverable_roots_of(Some(&g));
+        let in_process = deliverable_roots_from(&g.extra_write_roots);
         assert_eq!(
             in_process,
             vec![inbox.clone(), second.clone()],
@@ -380,7 +391,7 @@ mod tests {
             via_hook, in_process,
             "the env carrier round-trips to the same list"
         );
-        assert!(deliverable_roots_of(None).is_empty());
+        assert!(deliverable_roots_from(&[]).is_empty());
         assert!(parse_deliverable_roots_env(None).is_empty());
         assert!(parse_deliverable_roots_env(Some(&deliverable_roots_env(&[]).unwrap())).is_empty());
         assert!(describe_deliverable_roots(&[]).contains("none declared"));
@@ -431,5 +442,40 @@ mod tests {
             &[]
         ));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// DES-L4 PR-②: ONE admitted-roots derivation per posture — the creator's extras under
+    /// deliverable-roots, the notes root (or nothing) under read-only, nothing under full — so the
+    /// wrapped env, the ACP fence and the gate hook cannot disagree about where a fenced write may go.
+    #[test]
+    fn admitted_roots_are_the_extras_for_a_creator_the_notes_root_for_read_only_and_none_for_full()
+    {
+        let extras = vec!["/run/inbox".to_string(), "/run/out".to_string()];
+        assert_eq!(
+            admitted_roots(WritePosture::DeliverableRoots, Some("/notes/u2"), &extras),
+            vec![PathBuf::from("/run/inbox"), PathBuf::from("/run/out")],
+            "a creator's admitted roots are exactly its extras — never the notes root"
+        );
+        assert_eq!(
+            admitted_roots(WritePosture::ReadOnly, Some("/notes/u2"), &extras),
+            vec![PathBuf::from("/notes/u2")],
+            "an evaluator's admitted root is its notes root — never the extras"
+        );
+        assert!(
+            admitted_roots(WritePosture::ReadOnly, None, &extras).is_empty(),
+            "no notes root ⇒ nothing admitted (fail closed)"
+        );
+        assert!(admitted_roots(WritePosture::Full, Some("/notes/u2"), &extras).is_empty());
+        // The env round-trip the wrapped carrier uses carries the read-only list too.
+        let env = deliverable_roots_env(&admitted_roots(
+            WritePosture::ReadOnly,
+            Some("/notes/u2"),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(
+            parse_deliverable_roots_env(Some(&env)),
+            vec![PathBuf::from("/notes/u2")]
+        );
     }
 }

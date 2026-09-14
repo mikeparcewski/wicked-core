@@ -1254,6 +1254,33 @@ pub(crate) fn apply_and_finish_unit(
                     remedy: crate::gate_hook::ESTATE_DENY_REMEDY.to_string(),
                 });
             }
+            // (DES-L4 PR-②, R7 — GRANTED to L4 by des-adjudicated §4.2) A PHASE-SCOPE refusal the
+            // seat survived — a read-only / pre-build / deliverable-roots unit asked to write
+            // outside its admitted roots (a path-bearing tool, or a `Bash` redirect / heredoc /
+            // tee / cp / mkdir): blocked, advisory, the unit continued. Disclosed with the tool
+            // and, for the `Bash` arm, the command (the record carries both; `(unknown)` never),
+            // so the wrapped carrier's Bash denies surface as `workerToolCallDenied` exactly as
+            // the ACP bridge's do — not on `governanceHookFired{deny}` alone.
+            if let Some((reason, command)) = rec.phase_scope_refusal() {
+                emit(CoreEvent::WorkerToolCallDenied {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    cli: unit
+                        .assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string()),
+                    carrier: rec
+                        .carrier
+                        .clone()
+                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                    role: crate::write_posture::role_wire(unit.role).to_string(),
+                    tool: rec.tool_name.clone(),
+                    command,
+                    reason,
+                    remedy: crate::gate_hook::PHASE_SCOPE_BASH_REMEDY.to_string(),
+                });
+            }
             emit(CoreEvent::GovernanceHookFired {
                 session: session_id.to_string(),
                 ord: unit.ord,
