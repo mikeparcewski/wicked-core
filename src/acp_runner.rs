@@ -2980,6 +2980,12 @@ struct TurnResult {
     /// Carried as a field now so the `ToolInvoked` event is uniform across runners; populating it
     /// from ACP frames is the scoped follow-up.
     tools: Vec<String>,
+    /// Byte offset into `output` where the text emitted AFTER the turn's last `tool_call` starts —
+    /// the ANSWER, as opposed to the narration a model speaks between tool calls ("Let me look
+    /// at…"). `0` when the turn made no tool call (the whole output is the answer). Chat replies
+    /// slice here (F-W1-004, R-L5-2); unit outputs stay whole (prior-output injection and the
+    /// evaluator verdict line read the full text).
+    answer_from: usize,
 }
 
 impl TurnResult {
@@ -2993,6 +2999,24 @@ impl TurnResult {
             usage: None,
             files: Vec::new(),
             tools: Vec::new(),
+            answer_from: 0,
+        }
+    }
+
+    /// The reply a CHAT surfaces (F-W1-004): the text after the turn's last tool call, banner-
+    /// stripped and trimmed — or, when nothing was said after the last tool call, the whole output
+    /// (loss-averse: a reply is never emptied by a trailing tool call). The narration before it was
+    /// already streamed as deltas, where the studio narrates it; it never re-enters the answer.
+    fn chat_answer(&self) -> String {
+        let tail = self
+            .output
+            .get(self.answer_from.min(self.output.len())..)
+            .unwrap_or("");
+        let answer = strip_pi_banner(tail).trim_end().to_string();
+        if answer.is_empty() {
+            strip_pi_banner(&self.output).trim_end().to_string()
+        } else {
+            answer
         }
     }
 }
@@ -3437,6 +3461,8 @@ fn exec_turn_acp_posture(
     let mut output = String::new();
     let mut usage: Option<Usage> = None;
     let mut files: Vec<String> = Vec::new();
+    // F-W1-004: where the answer starts — bumped to `output.len()` at every `tool_call` start.
+    let mut answer_from: usize = 0;
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
     let deadline = Instant::now() + timeout;
@@ -3746,6 +3772,7 @@ fn exec_turn_acp_posture(
                                                 &mut usage,
                                                 &mut files,
                                                 MAX_OUT,
+                                                &mut answer_from,
                                             );
                                         }
                                         // core#293: this arm did not exist. A permission request
@@ -3869,7 +3896,15 @@ fn exec_turn_acp_posture(
                 if let Some(method) = agent_method(&v) {
                     match method {
                         "session/update" => {
-                            handle_update(&v, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+                            handle_update(
+                                &v,
+                                emit,
+                                &mut output,
+                                &mut usage,
+                                &mut files,
+                                MAX_OUT,
+                                &mut answer_from,
+                            );
                         }
                         // The agent asking permission for a tool call. This is a REQUEST, not a
                         // notification: it carries an `id` and blocks the agent until answered.
@@ -3980,6 +4015,7 @@ fn exec_turn_acp_posture(
         // output injections derived from them, and chat replies alike. Deltas already streamed
         // raw — cosmetic only; every durable consumer reads this assembled form.
         output: strip_pi_banner(&output).trim_end().to_string(),
+        answer_from,
         status: if found {
             StepStatus::Ok
         } else if elicitation_timed_out
@@ -4238,6 +4274,7 @@ fn handle_update(
     usage: &mut Option<Usage>,
     files: &mut Vec<String>,
     max_out: usize,
+    answer_from: &mut usize,
 ) {
     let update = &v["params"]["update"];
     let kind = update
@@ -4245,6 +4282,11 @@ fn handle_update(
         .and_then(Value::as_str)
         .unwrap_or("");
     match kind {
+        // F-W1-004: a tool call STARTS — whatever was said before it was narration ("Let me look
+        // at…"), already streamed as deltas; the answer a chat surfaces begins after the last one.
+        "tool_call" => {
+            *answer_from = output.len();
+        }
         "agent_message_chunk" => {
             if let Some(text) = update["content"]["text"].as_str() {
                 emit(text);
@@ -5638,8 +5680,10 @@ impl AcpStepRunner {
         // out from under the operator the moment it finished.
         self.chat_touch(chat_id);
         match result {
+            // F-W1-004 (R-L5-2): the reply is the ANSWER — the text after the turn's last tool call;
+            // the narration before it was streamed as deltas and is not repeated in the reply.
             Ok(turn) if turn.status == StepStatus::Ok => Ok(ChatTurnReply {
-                text: turn.output,
+                text: turn.chat_answer(),
                 usage: turn.usage,
             }),
             Ok(turn) => {
@@ -9427,6 +9471,8 @@ printf '%s\n' "$new" > "{frame_ledger}"
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"scoped"}}}}'
 read _prompt
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"pi v0.83.0\n---\n\n## Skills\n- /op/.pi/agent/skills/wicked-testing-x/SKILL.md\n\n## Extensions\n- /op/.pi/agent/extensions/wicked-testing.ts\n\n---\n"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Let me look at the scope."}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read","kind":"read","status":"pending"}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Hello from the scoped seat"}}}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn","usage":{{"inputTokens":120,"outputTokens":8}}}}}}'
 sleep 30
@@ -9570,6 +9616,8 @@ acp_input_governance = true
         // (5) The assembled reply is the answer; the banner never reached a ChatDelta; the
         // turn's usage rides the reply (DES-L5, F-RC1-116).
         let reply = turn.expect("the turn completes");
+        // F-W1-004 (R-L5-2): the narration spoken BEFORE the tool call ("Let me look at the
+        // scope.") streamed as a delta but is NOT in the reply — the reply is the answer block.
         assert_eq!(reply.text, "Hello from the scoped seat", "{reply:?}");
         assert_eq!(
             reply
@@ -9593,7 +9641,10 @@ acp_input_governance = true
             !streamed.contains("pi v0.83.0") && !streamed.contains("SKILL.md"),
             "the startup banner must never enter the streamed transcript (F-068): {streamed:?}"
         );
-        assert_eq!(streamed, "Hello from the scoped seat", "{deltas:?}");
+        assert_eq!(
+            streamed, "Let me look at the scope.Hello from the scoped seat",
+            "the deltas carry the narration AND the answer (the studio narrates the former): {deltas:?}"
+        );
         // (6) The enumerate surface reports the scope; a closed chat holds none.
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].scope.as_ref(), Some(&scope));
@@ -13255,6 +13306,120 @@ acp_input_governance = true
         assert!(r.drain_operator_messages("run1", "claude").is_empty());
     }
 
+    /// F-W1-004 (R-L5-2): a `tool_call` START bumps `answer_from` to the output so far — the text
+    /// before it is narration a chat never repeats in its reply — and `chat_answer` slices there,
+    /// banner-stripped; when nothing follows the last tool call the whole output stands (loss-averse).
+    #[test]
+    fn a_tool_call_starts_the_answer_and_the_chat_reply_is_the_text_after_the_last_one() {
+        let mut output = String::new();
+        let mut usage: Option<Usage> = None;
+        let mut files = Vec::new();
+        let mut answer_from = 0usize;
+        let emit: Box<crate::workflow::DeltaSink> = Box::new(|_: &str| {});
+        let chunk = |text: &str| {
+            json!({"params": {"update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text}}}})
+        };
+        let tool_call = json!({"params": {"update": {"sessionUpdate": "tool_call",
+            "toolCallId": "t1", "title": "Read", "kind": "read", "status": "pending"}}});
+        handle_update(
+            &chunk("Let me look at the scope. "),
+            &emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
+        assert_eq!(
+            answer_from, 0,
+            "no tool call yet — the whole text would be the answer"
+        );
+        handle_update(
+            &tool_call,
+            &emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
+        assert_eq!(answer_from, "Let me look at the scope. ".len());
+        handle_update(
+            &chunk("Now the files. "),
+            &emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
+        handle_update(
+            &tool_call,
+            &emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
+        handle_update(
+            &chunk("The answer.\n"),
+            &emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
+        let turn = TurnResult {
+            output: output.clone(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            answer_from,
+        };
+        assert_eq!(
+            turn.output,
+            "Let me look at the scope. Now the files. The answer.\n"
+        );
+        assert_eq!(
+            turn.chat_answer(),
+            "The answer.",
+            "the reply is the block after the LAST tool call, trimmed"
+        );
+        // A trailing tool call with nothing said after it: the reply is not emptied.
+        handle_update(
+            &tool_call,
+            &emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
+        let trailing = TurnResult {
+            output: output.clone(),
+            answer_from,
+            ..turn
+        };
+        assert_eq!(
+            trailing.chat_answer(),
+            "Let me look at the scope. Now the files. The answer."
+        );
+        // No tool call at all: the whole output is the answer (today's behaviour).
+        let plain = TurnResult {
+            output: "Just an answer.".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            answer_from: 0,
+        };
+        assert_eq!(plain.chat_answer(), "Just an answer.");
+    }
+
     #[test]
     fn result_usage_parses_ecosystem_adapter_shape() {
         // Official claude adapter result: input + cached reads/writes sum into input.
@@ -13291,7 +13456,16 @@ acp_input_governance = true
                 "cost": {"amount": 0.19, "currency": "USD"}
             }}
         });
-        handle_update(&v, emit, &mut output, &mut usage, &mut files, 1024);
+        let mut answer_from = 0usize;
+        handle_update(
+            &v,
+            emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
         let u = usage.expect("cost-only frame lifts usage");
         assert_eq!(u.cost_usd, Some(0.19));
         assert_eq!(u.input_tokens, 0);
