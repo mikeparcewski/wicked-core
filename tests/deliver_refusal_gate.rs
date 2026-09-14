@@ -269,10 +269,20 @@ fn a_deliver_refusal_parks_at_an_escalation_gate_and_approve_re_runs_the_phase()
     let (f_ord, f_detail, f_worker) = failed.expect("stepFailed for the refusal");
     assert_eq!(f_ord, 1);
     assert!(f_worker);
-    assert!(
-        f_detail.contains("deliver: identity mismatch"),
-        "{f_detail}"
-    );
+    // On a host with NO OS-sandbox tool (bwrap / sandbox-exec) the deliver unit's own pre-run
+    // RE-VERIFY refuses fail-closed BEFORE the script runs (`deliver: the run recorded no verified
+    // tree, and the repository's own checks FAILED on it: checks not run: no OS write boundary
+    // could be armed …`) — an ENGINE-authored deliver refusal, which the arm must park exactly like
+    // the script's. The gate shape below is asserted either way; the script-refusal → fix →
+    // approve → completed leg needs armable checks and is skipped (printed) where they are not —
+    // never a silent pass.
+    let engine_floor_refusal = f_detail.contains("no OS write boundary could be armed");
+    if !engine_floor_refusal {
+        assert!(
+            f_detail.contains("deliver: identity mismatch"),
+            "{f_detail}"
+        );
+    }
     let parked = evs
         .iter()
         .find_map(|ev| match ev {
@@ -291,11 +301,13 @@ fn a_deliver_refusal_parks_at_an_escalation_gate_and_approve_re_runs_the_phase()
         (1, Some(1), "escalation"),
         "events: {evs:?}"
     );
+    let expected_head = if engine_floor_refusal {
+        "The deliver phase refused: deliver: the run recorded no verified tree"
+    } else {
+        "The deliver phase refused: deliver: identity mismatch"
+    };
     assert!(
-        parked
-            .3
-            .starts_with("The deliver phase refused: deliver: identity mismatch")
-            && parked.3.contains("no second deliver gate"),
+        parked.3.starts_with(expected_head) && parked.3.contains("no second deliver gate"),
         "{}",
         parked.3
     );
@@ -327,7 +339,7 @@ fn a_deliver_refusal_parks_at_an_escalation_gate_and_approve_re_runs_the_phase()
     assert!(
         unit.denial_reason
             .as_deref()
-            .is_some_and(|r| r.starts_with("deliver refused on unit 1: deliver: identity mismatch")),
+            .is_some_and(|r| r.starts_with("deliver refused on unit 1: deliver: ")),
         "{:?}",
         unit.denial_reason
     );
@@ -340,6 +352,16 @@ fn a_deliver_refusal_parks_at_an_escalation_gate_and_approve_re_runs_the_phase()
         Path::new(&workdir).is_dir(),
         "the worktree is KEPT while the run is parked: {workdir}"
     );
+    if engine_floor_refusal {
+        eprintln!(
+            "deliver_refusal_gate: no OS-sandbox tool on this host — the engine's own re-verify \
+             refusal parked the run at the escalation gate (proven above); the script-refusal → \
+             fix → approve → completed leg needs armable checks and is skipped here"
+        );
+        let _ = core.cancel_run(sid);
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
 
     // (3) Fix the identity, approve → the phase re-runs (attempt 1) and the run completes.
     std::fs::write(&flag, "fixed\n").unwrap();
