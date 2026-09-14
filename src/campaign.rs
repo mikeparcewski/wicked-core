@@ -333,8 +333,11 @@ impl Campaign {
             .map(|(k, amend)| {
                 (
                     k.clone(),
+                    // Rehydrated with the default scope: the durable half persists the text only
+                    // (DES-L1 PR-1B keeps `pending_decision_amend`'s shape).
                     HumanDecision::Approve {
                         amend: amend.clone(),
+                        amend_scope: Default::default(),
                     },
                 )
             })
@@ -348,8 +351,8 @@ impl Campaign {
             .iter()
             .map(|(k, d)| {
                 let amend = match d {
-                    HumanDecision::Approve { amend } => amend.clone(),
-                    HumanDecision::Reject => None,
+                    HumanDecision::Approve { amend, .. } => amend.clone(),
+                    HumanDecision::RequestChanges { .. } | HumanDecision::Reject => None,
                 };
                 (k.clone(), amend)
             })
@@ -779,10 +782,14 @@ fn dispatch(
         .map(|_| ())
     } else {
         // ReadyToResume: re-acquire the slot, then resume the paused Run via confirm_gate (§6.5).
-        let decision = campaign
-            .pending_decision
-            .remove(node_id)
-            .unwrap_or(HumanDecision::Approve { amend: None });
+        let decision =
+            campaign
+                .pending_decision
+                .remove(node_id)
+                .unwrap_or(HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: Default::default(),
+                });
         persist(store, campaign)?;
         crate::actor::confirm_gate(
             store,
@@ -981,9 +988,13 @@ pub(crate) fn confirm_gate(
             }
             // Do NOT resume core yet: store the decision, go ReadyToResume, and re-enter the dispatch
             // queue — the node re-acquires a slot before resuming (keeps the cap a true bound, §6.5).
-            campaign
-                .pending_decision
-                .insert(node_id.to_string(), HumanDecision::Approve { amend });
+            campaign.pending_decision.insert(
+                node_id.to_string(),
+                HumanDecision::Approve {
+                    amend,
+                    amend_scope: Default::default(),
+                },
+            );
             campaign
                 .node_status
                 .insert(node_id.to_string(), NodeStatus::ReadyToResume);
@@ -1802,6 +1813,7 @@ mod tests {
             "B".into(),
             HumanDecision::Approve {
                 amend: Some("go".into()),
+                amend_scope: Default::default(),
             },
         );
         c.sync_pending();
@@ -1813,7 +1825,7 @@ mod tests {
         // pending_decision rehydrated from its persisted amend shape.
         assert!(matches!(
             back.pending_decision.get("B"),
-            Some(HumanDecision::Approve { amend }) if amend.as_deref() == Some("go")
+            Some(HumanDecision::Approve { amend, .. }) if amend.as_deref() == Some("go")
         ));
         assert_eq!(back.def.nodes.len(), 2);
         assert_eq!(back.def.max_concurrency, 2);

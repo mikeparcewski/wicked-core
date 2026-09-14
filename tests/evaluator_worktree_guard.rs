@@ -1132,8 +1132,14 @@ fn a_recon_phase_that_writes_a_note_into_the_tree_pauses_at_a_gate_and_the_appro
     // Approve → the SAME unit re-dispatches (attempt 1, `resumed`), behaves against the restored
     // tree, passes its gate, and the run reaches the creator.
     assert_eq!(
-        core.confirm_gate("r-recon-note", HumanDecision::Approve { amend: None })
-            .expect("approve the denial gate"),
+        core.confirm_gate(
+            "r-recon-note",
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            }
+        )
+        .expect("approve the denial gate"),
         SessionStatus::Executing
     );
     let after = wait_for_event(&events, |e| {

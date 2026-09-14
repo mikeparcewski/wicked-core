@@ -50,8 +50,8 @@ use napi_derive::napi;
 const EVENT_QUEUE_BOUND: usize = 1024;
 
 use wicked_core::{
-    CampaignDef, CampaignStatus, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec,
-    RepoSpec, SessionStatus, StubStepRunner,
+    AmendScope, CampaignDef, CampaignStatus, CoreEvent, EntityMode, HumanConfirm, HumanDecision,
+    LaunchSpec, RepoSpec, SessionStatus, StubStepRunner,
 };
 use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
@@ -1015,21 +1015,54 @@ impl Core {
     }
 
     /// Resolve a human-confirm gate on a PAUSED run. `approve=true` proceeds (optionally applying
-    /// `amend` to the next unit's instruction); `approve=false` rejects → cancels the run. Resolves
-    /// to the resulting status token. Rejects if the run is not paused at a gate.
+    /// `amend` to a unit's instruction); `approve=false` rejects → cancels the run. Resolves to the
+    /// resulting status token. Rejects if the run is not paused at a gate.
+    ///
+    /// (DES-L1 PR-1B, additive — absent `action` = today's two-arm mapping.) `action` names the
+    /// arm: `approve` | `request_changes` | `reject`. `request_changes` requires `approve=false`
+    /// and sends a NOT-PASS review back to the creator phase (`amend` is the operator's note);
+    /// `amendScope` (`cursor` | `creator`, approve only) says where an approve's `amend` lands —
+    /// the cursor unit (default) or the first creator phase at/after it. A disagreement
+    /// (`action=request_changes` with `approve=true`, `action=approve` with `approve=false`, an
+    /// unknown token) rejects before the engine is asked.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn confirm_gate(
         &self,
         run_id: String,
         approve: bool,
         amend: Option<String>,
+        action: Option<String>,
+        amend_scope: Option<String>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
-            let decision = if approve {
-                HumanDecision::Approve { amend }
-            } else {
-                HumanDecision::Reject
+            let scope = match amend_scope.as_deref() {
+                None | Some("cursor") => AmendScope::Cursor,
+                Some("creator") => AmendScope::Creator,
+                Some(other) => {
+                    return Err(err(anyhow::anyhow!(
+                        "unknown amendScope `{other}` (expected `cursor` or `creator`)"
+                    )))
+                }
+            };
+            let decision = match (action.as_deref(), approve) {
+                (None, true) | (Some("approve"), true) => HumanDecision::Approve {
+                    amend,
+                    amend_scope: scope,
+                },
+                (None, false) | (Some("reject"), false) => HumanDecision::Reject,
+                (Some("request_changes"), false) => HumanDecision::RequestChanges { note: amend },
+                (Some(a @ ("approve" | "reject" | "request_changes")), _) => {
+                    return Err(err(anyhow::anyhow!(
+                        "action `{a}` disagrees with approve={approve} (request_changes and \
+                         reject require approve=false; approve requires approve=true)"
+                    )))
+                }
+                (Some(other), _) => {
+                    return Err(err(anyhow::anyhow!(
+                        "unknown action `{other}` (expected approve | request_changes | reject)"
+                    )))
+                }
             };
             core.confirm_gate(&run_id, decision)
                 .map(status_token)
@@ -3133,9 +3166,18 @@ mod tests {
                 ord: 1,
                 amendment: "add error handling".to_string(),
                 updated_description: s(),
+                scope: "cursor".to_string(),
             },
             "unitReworkAmended",
-            &["type", "session", "ord", "amendment", "updatedDescription"],
+            // `scope` (DES-L1 PR-1B): cursor | creator | request_changes.
+            &[
+                "type",
+                "session",
+                "ord",
+                "amendment",
+                "updatedDescription",
+                "scope",
+            ],
         );
         check(
             CoreEvent::UnitOutputCaptured {

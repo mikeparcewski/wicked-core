@@ -1025,13 +1025,17 @@ pub(crate) fn apply_and_finish_unit(
                     sandbox_error: report.sandbox_error.clone(),
                     detect_error: report.detect_error.clone(),
                     outcome: report.outcome().to_string(),
-                    floor: if unit.repo_checks_floor {
-                        crate::repo_checks::FloorStage::Verify
-                    } else {
-                        crate::repo_checks::FloorStage::Creator
-                    }
-                    .as_wire()
-                    .to_string(),
+                    // (L1↔L2 contract, review-L2-505 / DES-L2 §4) The deliver TOOL unit runs the
+                    // VERIFY floor over the tree it ships — its frame reads `verify`, never
+                    // `creator`, exactly like a declared `repo_checks_floor` phase.
+                    floor:
+                        if unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit) {
+                            crate::repo_checks::FloorStage::Verify
+                        } else {
+                            crate::repo_checks::FloorStage::Creator
+                        }
+                        .as_wire()
+                        .to_string(),
                     claim: report.claim.clone(),
                     env: report.env.clone(),
                 });
@@ -1353,6 +1357,12 @@ pub(crate) fn apply_and_finish_unit(
     wicked_orchestration::tick_workflow(store, workflow_id, outcome.approved)?;
 
     unit.phase_ref = Some(outcome.phase_id.clone());
+    // (DES-L1 PR-1B) The attempt this fold judged — the next dispatch of this unit mints `+ 1`
+    // (`actor::next_attempt`); an approved unit owes no rework any more.
+    unit.last_attempt = Some(attempt);
+    if outcome.approved {
+        unit.rework_of = None;
+    }
     unit.conformance_ref = outcome.claim_id.clone();
     unit.phase_status = Some(outcome.phase_status.clone());
     unit.collection_scope = Some(outcome.collection_scope.clone());
@@ -1699,7 +1709,7 @@ pub(crate) fn creator_output_for(
 }
 
 /// Pure selector: the highest-`ord` unit before `evaluator_ord` whose role is `Creator`.
-fn most_recent_prior_creator(
+pub(crate) fn most_recent_prior_creator(
     units: &[crate::domain::WorkUnit],
     evaluator_ord: u32,
 ) -> Option<&crate::domain::WorkUnit> {

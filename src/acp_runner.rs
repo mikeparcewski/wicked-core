@@ -13417,6 +13417,8 @@ acp_input_governance = true
             repo_checks_floor: false,
             default_floor: false,
             repo_checks: None,
+            last_attempt: None,
+            rework_of: None,
             status: crate::domain::UnitStatus::Pending,
         }
     }

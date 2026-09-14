@@ -332,8 +332,14 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
 
     // Approve → the ALREADY-RUN (Rejected) verify unit re-dispatches at a BUMPED attempt (the retry then
     // runs in-flight; we assert on the DISPATCH, not on where the re-run lands).
-    core.confirm_gate("r", HumanDecision::Approve { amend: None })
-        .expect("approve the retry");
+    core.confirm_gate(
+        "r",
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve the retry");
 
     // Collect UnitDispatched for the verify unit (ord 4): its first run (attempt 0) THEN the retry
     // (attempt 1). Drain until the retry dispatch is observed (or a generous ceiling), tolerating latency.

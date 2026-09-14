@@ -83,6 +83,9 @@ const HAND_AUTHORED = `${BEGIN}
  * is the only pass, every other token denies into the escalation gate); null when the layer did not
  * read the unit (creator/neutral/tool) or the evaluator wrote no \`VERDICT:\` line (then
  * \`denial.source === 'evaluator_verdict'\` and \`denial.reason\` is the contract text).
+ * DES-L1 PR-1B (additive): unitReworkAmended carries \`scope: 'cursor' | 'creator' | 'request_changes'\`
+ * — which gate arm landed the amendment; for \`request_changes\` the \`ord\` is the rewound creator and
+ * \`amendment\` is the rejected review's findings followed by the operator's note.
  * core#467/#469/F-RC2-009 additions (all additive): repoChecksEvaluated carries \`outcome: 'passed' |
  * 'failed' | 'timed_out' | 'not_run'\` (a timed-out floor denies under source 'repo_checks_timeout',
  * never 'repo_checks'), \`floor: 'creator' | 'verify'\`, \`claim: {phrase, check, verdict} | null\` and

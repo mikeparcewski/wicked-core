@@ -6932,6 +6932,75 @@ mod tests {
         );
     }
 
+    /// DES-L1 §7 (7) / review-L1-517 M5: the shipped `bug.fix` creator, planned from a realistic
+    /// intent, still fits a pty turn after TWO `request_changes` rounds (a full-width 160 B
+    /// marker, replaced not appended), newline-free — and the numbers are stated: the marker costs
+    /// at most [`crate::actor::REWORK_MARKER_MAX`] bytes of the creator's intent ceiling, once.
+    #[test]
+    fn a_pty_creator_after_two_rework_rounds_still_fits_one_turn() {
+        use crate::workflow::PhaseRole;
+        let def = crate::workflow::bug_def();
+        let intent = "the parser dereferences a null token at the end of a quoted string";
+        let units = crate::plan::plan_from_def(&def, intent, "s");
+        let fix = units
+            .iter()
+            .find(|u| u.role == PhaseRole::Creator)
+            .expect("bug.fix is the def's creator");
+        let input = |unit: WorkUnit| StepInput {
+            run_id: "s".into(),
+            unit_ix: 2,
+            attempt: 0,
+            unit,
+            workflow_id: "wf".into(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let fresh = pty_unit_prompt(&input(fix.clone()), SkillForm::MirroredName).expect("fits");
+        let head_room = PTY_PROMPT_LIMIT - (fresh.len() + 1);
+        // Two rounds with a head longer than the marker can carry: the second REPLACES the first.
+        let long_head =
+            "the regression test is still missing and src/app.ts still reads buggy on the \
+                         main branch after the change; also fix the off-by-one in the tokenizer";
+        let mut reworked = fix.clone();
+        reworked.description =
+            crate::actor::apply_rework_marker(&reworked.description, 1, long_head);
+        reworked.description =
+            crate::actor::apply_rework_marker(&reworked.description, 2, long_head);
+        let p = pty_unit_prompt(&input(reworked.clone()), SkillForm::MirroredName)
+            .expect("bug.fix after two rework rounds fits a pty turn");
+        assert!(
+            !p.contains('\n') && p.len() < PTY_PROMPT_LIMIT,
+            "{} bytes",
+            p.len()
+        );
+        let marker_cost = p.len() - fresh.len();
+        assert!(
+            marker_cost <= crate::actor::REWORK_MARKER_MAX,
+            "two rounds cost {marker_cost} B — the marker must replace, not grow"
+        );
+        assert_eq!(
+            reworked.description.matches("(requested changes r").count(),
+            1
+        );
+        // The ceiling for a pty-routed creator's intent, before and after a full marker — stated
+        // so the budget is a number, not a claim (a longer intent fails the re-dispatch with the
+        // named pty error and must route to a non-interactive seat).
+        let ceiling_after = head_room.saturating_sub(marker_cost);
+        assert!(
+            head_room >= 300 && ceiling_after >= 150,
+            "pty intent headroom: {head_room} B fresh, {ceiling_after} B after a full marker"
+        );
+        eprintln!(
+            "pty creator headroom: {head_room} B fresh → {ceiling_after} B after a {marker_cost} B marker"
+        );
+    }
+
     /// core#468: the BASE skill directive leads every work unit's prompt when the run declares
     /// one — role-keyed (`§creator` / `§evaluator` / `§neutral`), spelled per CLI exactly as the
     /// phase directive is, AHEAD of the phase directive (both present when both are set, the

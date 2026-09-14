@@ -173,9 +173,9 @@ pub use validator_vault::{
 };
 pub use wicked_council::AgenticCli;
 pub use workflow::{
-    bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
-    PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner, UnitEvidence, Usage,
-    WorkflowDef, WorkflowDefError, WorkflowRegistry,
+    bug_def, feature_def, migration_def, AmendScope, GateCond, GateSpec, GateType, HumanDecision,
+    PhaseDef, PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner,
+    UnitEvidence, Usage, WorkflowDef, WorkflowDefError, WorkflowRegistry,
 };
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 
