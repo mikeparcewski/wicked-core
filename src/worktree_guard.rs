@@ -558,8 +558,10 @@ fn compare_with_after(
 /// 1. `HEAD` moved (the phase committed/amended/reset the run branch) ⇒ `git reset --soft
 ///    <before.head>` — the branch pointer goes back; the phase's commit is left dangling.
 /// 2. `git read-tree --reset -u <before.tree>` against the REAL index: index and working tree
-///    now match the baseline. The creator's previously-untracked files become staged (`A`) —
-///    the deliver script's `git add -u` + commit handles a staged tree exactly like a dirty one.
+///    now match the baseline. `read-tree` leaves the creator's previously-untracked files staged
+///    (`A`); step 5 below unstages them again (`git reset -q`, index → HEAD, working tree
+///    untouched) so the tree reads `??`/` M` exactly as a never-restored tree does and deliver's
+///    untracked classifier judges those files like any other (DES-L4 PR-②, R13b).
 /// 3. Every path the phase ADDED is deleted by name: `read-tree -u` removes only paths the
 ///    index knew, and an evaluator-created file was never in it. Regular files and symlinks
 ///    only (`symlink_metadata`, never followed); a path that escapes the worktree is refused.
@@ -719,6 +721,23 @@ pub(crate) fn restore_creator_tree(
                     "after the restore HEAD is attached to {:?} but the baseline was {:?}",
                     now.head_ref,
                     m.before.head_ref
+                );
+            }
+        }
+        // 5. R13b (DES-L4 PR-②, F-RC1-074): AFTER the proof, index → HEAD, working tree untouched.
+        //    `read-tree --reset -u` staged the creator's previously-untracked files (`A`), which
+        //    `git diff` then showed as empty and `git commit` swept in unclassified; unstaged they
+        //    read `??` like a never-restored tree and pass deliver's untracked classifier. Same
+        //    pinned git dir / work-tree env as every step above. Skipped on an unborn HEAD (nothing
+        //    to reset to). NON-FATAL (review N6): the tree IS restored and proven by now — a failed
+        //    unstage (an index lock, say) leaves yesterday's honest state (staged `A`, which deliver
+        //    still commits) and must not flip a proven restore into a "restore failed" denial.
+        if !m.before.head.is_empty() {
+            if let Err(e) = git(worktree, &["reset", "-q"], &env) {
+                eprintln!(
+                    "wicked-core: worktree guard restored the creator's tree but could not unstage \
+                     it (`git reset -q`: {e}); the restored files stay staged — deliver commits \
+                     them as before"
                 );
             }
         }
@@ -1005,6 +1024,19 @@ mod tests {
         let pin = "refs/wicked/suggestions/restore/4/0";
         restore_creator_tree(&wt, &mut m, Some(pin)).expect("restore succeeds");
         assert!(m.restored, "{:?}", m.restore_error);
+        // R13b (DES-L4 PR-②, F-RC1-074): after the proof the index is reset to HEAD, so the
+        // creator's work reads exactly as a never-restored tree — the modified file unstaged, the
+        // new file untracked (`??`), never staged `A` (which `git diff` hid and `git commit` swept
+        // in unclassified).
+        let porcelain = run_git(&wt, &["status", "--porcelain"]);
+        assert!(
+            porcelain.contains("M src/a.ts") && porcelain.contains("?? src/b.ts"),
+            "the restored tree reads like a dirty tree, not a staged one: {porcelain}"
+        );
+        assert!(
+            !porcelain.lines().any(|l| l.starts_with("A ")),
+            "nothing is left staged as added after the restore: {porcelain}"
+        );
         // F-433-008: the discarded edit is pinned — reachable, so never gc-pruned — and is
         // exactly the tree the evaluator left.
         assert_eq!(m.suggestion_ref.as_deref(), Some(pin));

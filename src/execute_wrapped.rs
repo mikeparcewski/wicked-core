@@ -1833,13 +1833,18 @@ impl WrappedCliStepRunner {
                 if let Some(spelling) = write_posture.env_value() {
                     cmd.env(crate::gate_hook::NO_CODE_SCOPE_ENV, spelling);
                 }
-                // F-02: a DELIVERABLE-ROOTS creator's roots ride their own env — EXACTLY the
-                // launch-validated extras (`deliverable_roots_of`), the same list the ACP fence
-                // holds in-process — never the write set (which also admits the repo-graph key
-                // dir). An unjoinable root arms an EMPTY list: the hook then refuses every
-                // creator write (fail closed) rather than judging a partial list.
-                if write_posture == crate::write_posture::WritePosture::DeliverableRoots {
-                    let roots = crate::write_posture::deliverable_roots_from(&g.extra_write_roots);
+                // F-02 / DES-L4 PR-②: a FENCED posture's ADMITTED roots ride their own env — the
+                // creator's launch-validated extras under `deliverable-roots`, the evaluator's
+                // NOTES ROOT under read-only (`write_posture::admitted_roots`), the same list the
+                // ACP fence holds in-process — never the write set (which also admits the
+                // repo-graph key dir). An unjoinable root arms an EMPTY list: the hook then
+                // refuses every fenced write (fail closed) rather than judging a partial list.
+                if write_posture.fences_writes() {
+                    let roots = crate::write_posture::admitted_roots(
+                        write_posture,
+                        input.unit.notes_root.as_deref(),
+                        &g.extra_write_roots,
+                    );
                     let joined = crate::write_posture::deliverable_roots_env(&roots)
                         .unwrap_or_else(|| {
                             eprintln!(
@@ -2981,12 +2986,19 @@ pub(crate) const READ_ONLY_INSTRUCTION: &str = "READ-ONLY PHASE (enforced after 
 /// line discipline, so the `PTY_PROMPT_LIMIT` budget is untouched.
 pub(crate) fn read_only_instruction(notes_root: Option<&str>) -> String {
     match notes_root {
-        Some(root) => format!(
-            "{READ_ONLY_INSTRUCTION} If you must write notes, write them ONLY under {root} \
-             (outside the worktree; the guard ignores that directory)."
-        ),
+        Some(root) => format!("{READ_ONLY_INSTRUCTION} {}", notes_root_sentence(root)),
         None => READ_ONLY_INSTRUCTION.to_string(),
     }
+}
+
+/// The ONE sentence that names a read-only unit's notes root — shared by the wrapped instruction
+/// above and the ACP unit prompt (`acp_runner::exec_turn_inner`, DES-L4 PR-②), so both carriers
+/// point the seat at the same sanctioned place with the same words.
+pub(crate) fn notes_root_sentence(notes_root: &str) -> String {
+    format!(
+        "If you must write notes, write them ONLY under {notes_root} (outside the worktree; the \
+         guard ignores that directory)."
+    )
 }
 
 /// (F-4R2-004) The instruction a DELIVERABLE-ROOTS creator carries on a non-claude seat — a bound

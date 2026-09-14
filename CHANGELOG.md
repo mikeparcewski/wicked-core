@@ -15,6 +15,24 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Governed containment: Bash writes are judged under a fenced posture; the notes root is admitted
+  on both carriers; `mkdir` is a write target; the guard unstages after its restore; phase-scope
+  denies name the tool and surface as `workerToolCallDenied` (DES-L4 PR-②, D-12; core #483,
+  F-RC1-080, F-RC1-092, F-RC1-074).** The phase-scope fence saw only `Write`/`Edit`/`NotebookEdit`,
+  so a read-only evaluator's `cat > notes.md <<EOF`, `| tee build.log` or `mkdir evidence/` walked
+  through it and tripped the worktree guard (the unit died); at the same time the fence refused the
+  very notes root the engine minted for that unit. Now `phase_scope_denial` judges `Bash` by its
+  write targets (`bash_write_targets`, which gains `mkdir`) with the SAME admission a path-bearing
+  tool gets — `write_posture::admitted_roots` = the evaluator's notes root under read-only, the
+  creator's extras under deliverable-roots — armed on `WICKED_DELIVERABLE_ROOTS` for the hook and
+  held in-process by the ACP fence (`judge` admits the notes root; the ACP unit prompt names it with
+  the wrapped carrier's sentence). Pre-build phases' Bash writes to non-documentation paths are
+  refused (advisory); `mkdir` outside the boundary is unit-FATAL like a redirect outside. The three
+  fence appenders (phase-scope / infra / remote-write) now write their tool-call annotation in the
+  same buffer, so a replayed record never reads `(unknown)`, and the fold discloses phase-scope
+  refusals as `workerToolCallDenied{tool, command}` (the granted `pipeline.rs` arm). After a guard
+  restore `git reset -q` returns the index to HEAD, so the creator's files read `??`/` M` — not
+  staged `A` — and pass deliver's untracked classifier like a never-restored tree.
 - **The CLI-registered estate MCP hand-off is DELETED on both carriers, units and chats (D-7, DES-L4
   PR-⑦; F-084 = F-RC1-045/086/113 product half, F-RC1-048 C1, core #485/#486).** The wrapped carrier
   wrote a per-unit `--mcp-config` file (`wicked-estate-mcp --db <graph> --readonly`) and allow-listed

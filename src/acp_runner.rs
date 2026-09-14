@@ -3272,15 +3272,37 @@ impl AcpWritePosture {
         };
         match self.posture {
             WritePosture::Full => Ok(()),
-            WritePosture::ReadOnly => Err(format!(
-                "phase `{}` plays {} and declares executes_code:false — {} would change the tree \
-                 under review, so it is refused at the ACP permission boundary (F-036 read-only \
-                 posture). Report findings in this phase's output; a phase that must change code \
-                 declares executes_code:true in the workflow def.",
-                self.phase,
-                role_noun(self.role),
-                target(call),
-            )),
+            WritePosture::ReadOnly => {
+                // core#464 / DES-L4 PR-②: the NOTES ROOT is the one sanctioned place a read-only
+                // unit may write — admitted by the SAME judgement the gate hook and the creator
+                // fence use, so both carriers agree on where a note may land.
+                if call.path.as_deref().is_some_and(|p| {
+                    crate::write_posture::deliverable_write_admitted(
+                        p,
+                        &self.cwd,
+                        self.home.as_deref(),
+                        &self.deliverable_roots,
+                    )
+                }) {
+                    return Ok(());
+                }
+                let notes = match self.deliverable_roots.first() {
+                    Some(root) => format!(
+                        "; write notes only under the unit's notes root ({})",
+                        root.display()
+                    ),
+                    None => String::new(),
+                };
+                Err(format!(
+                    "phase `{}` plays {} and declares executes_code:false — {} would change the \
+                     tree under review, so it is refused at the ACP permission boundary (F-036 \
+                     read-only posture). Report findings in this phase's output{notes}; a phase \
+                     that must change code declares executes_code:true in the workflow def.",
+                    self.phase,
+                    role_noun(self.role),
+                    target(call),
+                ))
+            }
             WritePosture::DeliverableRoots => {
                 // ONE judgement with the gate hook's `phase_scope_denial` (F-02): exactly the
                 // declared roots, never the tree, never engine scratch the boundary admits.
@@ -4063,6 +4085,33 @@ fn answer_permission_request<W: Write>(
                         .hit
                         .clone()
                         .map(|hit| ("install fence", hit.reason(), crate::install_fence::REMEDY))
+                })
+                // R7 (DES-L4 PR-②): under a FENCED posture the command's WRITE TARGETS are judged
+                // against the posture's admitted roots (the evaluator's notes root, the creator's
+                // deliverable roots) — the same rule the gate hook applies on the wrapped carrier
+                // (`gate_hook::bash_write_phase_scope`). Advisory: blocked, the seat continues.
+                .or_else(|| {
+                    fence
+                        .posture
+                        .fences_writes()
+                        .then(|| {
+                            crate::gate_hook::bash_write_phase_scope(
+                                false,
+                                fence.posture,
+                                &command,
+                                &fence.cwd,
+                                fence.home.as_deref(),
+                                &fence.deliverable_roots,
+                            )
+                        })
+                        .flatten()
+                        .map(|reason| {
+                            (
+                                "phase scope",
+                                reason,
+                                crate::gate_hook::PHASE_SCOPE_BASH_REMEDY,
+                            )
+                        })
                 });
             if denial.is_none() {
                 // Not refused by either fence: IF the governance verdict below also allows the
@@ -6109,9 +6158,15 @@ impl AcpStepRunner {
                     // F-036 / F-4R2-004: the WRITE POSTURE, same route — the ACP carrier answers
                     // the seat's permission requests in-process, so the fact rides the boundary.
                     write_posture,
-                    // The creator fence's roots (F-02): exactly `g.extra_write_roots`, the list
-                    // the wrapped launcher arms on `WICKED_DELIVERABLE_ROOTS` for its hook.
-                    deliverable_roots: crate::write_posture::deliverable_roots_of(Some(g)),
+                    // The fence's ADMITTED roots (F-02 / DES-L4 PR-②): the creator's
+                    // `g.extra_write_roots` under deliverable-roots, the evaluator's notes root
+                    // under read-only — the list the wrapped launcher arms on
+                    // `WICKED_DELIVERABLE_ROOTS` for its hook (`write_posture::admitted_roots`).
+                    deliverable_roots: crate::write_posture::admitted_roots(
+                        write_posture,
+                        input.unit.notes_root.as_deref(),
+                        &g.extra_write_roots,
+                    ),
                     // (issue #463) Whether the AGENT child's environment pins the estate store
                     // its shim reads resolve — the inherited pins that survive `hardened()`
                     // (`WICKED_HOME` / `WICKED_MEMORY_DB`), OR — since D-7 (DES-L4 PR-⑦) — the
@@ -6504,7 +6559,16 @@ impl AcpStepRunner {
                 ));
             }
         }
-        let prompt = unit_prompt(input, skill_form, bound.as_ref());
+        let mut prompt = unit_prompt(input, skill_form, bound.as_ref());
+        // DES-L4 PR-② (core#464, F7): a read-only unit with a notes root is told where a note MAY
+        // go — the SAME sentence the wrapped carrier's `read_only_instruction` carries, so the two
+        // carriers never word the sanctioned place differently.
+        if write_posture == crate::write_posture::WritePosture::ReadOnly {
+            if let Some(root) = input.unit.notes_root.as_deref() {
+                prompt.push(' ');
+                prompt.push_str(&crate::execute_wrapped::notes_root_sentence(root));
+            }
+        }
 
         // A statically-admitted seat (`gate_ctx.is_some()`) can still fail its per-process
         // version pin (`AcpProcess::governance_verified`, computed once at spawn — DES-INPUT-
@@ -6599,10 +6663,16 @@ impl AcpStepRunner {
             cli: cli_key.clone(),
             phase: input.unit.phase_id().unwrap_or("").to_string(),
             cwd: unit_cwd.clone(),
-            // EXACTLY the launch-validated extra_write_roots — the same list the gate hook
-            // judges (`write_posture::deliverable_roots_of`, F-02).
-            deliverable_roots: crate::write_posture::deliverable_roots_of(
-                input.governance.as_ref(),
+            // The posture's ADMITTED roots — the creator's launch-validated extra_write_roots or
+            // the evaluator's notes root — the same list the gate hook judges
+            // (`write_posture::admitted_roots`, F-02 / DES-L4 PR-②).
+            deliverable_roots: crate::write_posture::admitted_roots(
+                write_posture,
+                input.unit.notes_root.as_deref(),
+                input
+                    .governance
+                    .as_ref()
+                    .map_or(&[][..], |g| g.extra_write_roots.as_slice()),
             ),
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             tx: self.tx.clone(),
@@ -14003,12 +14073,21 @@ os_sandbox = true
         assert!(output.contains("names no path"), "{output}");
         assert!(rx.try_recv().is_ok());
 
-        // 5. An EVALUATOR with the same roots is read-only even inside the inbox.
-        let evaluator = fence(
-            crate::write_posture::WritePosture::ReadOnly,
-            crate::workflow::PhaseRole::Evaluator,
-            &tx,
-        );
+        // 5. An EVALUATOR on the same run is read-only even inside the creator's inbox: its
+        // admitted roots are its NOTES ROOT (none here), never the creator's extras —
+        // `write_posture::admitted_roots` is what both carriers hand the fence (DES-L4 PR-②).
+        let evaluator = super::AcpWritePosture {
+            deliverable_roots: crate::write_posture::admitted_roots(
+                crate::write_posture::WritePosture::ReadOnly,
+                None,
+                &[inbox.to_string_lossy().into_owned()],
+            ),
+            ..fence(
+                crate::write_posture::WritePosture::ReadOnly,
+                crate::workflow::PhaseRole::Evaluator,
+                &tx,
+            )
+        };
         let (v, output) = ask(&evaluator, deliverable.to_str().unwrap(), 5);
         assert_eq!(v["result"]["outcome"]["optionId"], "reject", "{v}");
         assert!(
@@ -14054,7 +14133,7 @@ os_sandbox = true
             extra_read_roots: vec![],
         };
         // The ACP fence's roots (in-process) and the hook's roots (env round-trip) are one list.
-        let acp_roots = crate::write_posture::deliverable_roots_of(Some(&g));
+        let acp_roots = crate::write_posture::deliverable_roots_from(&g.extra_write_roots);
         let env = crate::write_posture::deliverable_roots_env(&acp_roots).unwrap();
         let hook_roots = crate::write_posture::parse_deliverable_roots_env(Some(&env));
         assert_eq!(acp_roots, vec![inbox.clone()]);
@@ -14105,6 +14184,111 @@ os_sandbox = true
             assert_eq!(gate, admitted, "gate hook on {what}: {}", path.display());
             assert_eq!(acp, gate, "the two carriers disagree on {what}");
         }
+        drop(rx);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// DES-L4 PR-② (core#464 / R7): under the READ-ONLY posture both carriers admit a write under
+    /// the unit's NOTES ROOT and refuse the tree — the same `admitted_roots` list, the same
+    /// judgement, the same verdict; and the ACP refusal names the notes root. Mutation: drop the
+    /// notes-root admission in `judge` → the first row disagrees between carriers.
+    #[test]
+    fn both_carriers_admit_a_read_only_write_under_the_notes_root_and_refuse_the_tree() {
+        // No `(`/`)` in the scratch path: `shell_tokens` splits bare parens, and `ThreadId(n)`'s
+        // Debug form would truncate the redirect targets the Bash-arm asserts below judge.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-notes-parity-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let notes = base.join("notes").join("unit-2");
+        for d in [&wt, &notes] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = crate::write_posture::admitted_roots(
+            crate::write_posture::WritePosture::ReadOnly,
+            Some(&notes.to_string_lossy()),
+            &["/run/inbox".to_string()],
+        );
+        assert_eq!(
+            roots,
+            vec![notes.clone()],
+            "read-only admits the notes root, not the extras"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let fence = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::ReadOnly,
+            role: crate::workflow::PhaseRole::Evaluator,
+            run_id: "run-notes".into(),
+            ord: 2,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: "review".into(),
+            cwd: wt.clone(),
+            deliverable_roots: roots.clone(),
+            home: None,
+            tx,
+            fence_cwd: std::sync::Mutex::new(None),
+        };
+        let call = |p: &std::path::Path| crate::acp_permission::WriteClassCall {
+            tool: "Write".into(),
+            kind: Some("edit".into()),
+            path: Some(p.to_string_lossy().into_owned()),
+        };
+        let hook = |p: &std::path::Path| {
+            crate::gate_hook::phase_scope_denial(
+                false,
+                crate::write_posture::WritePosture::ReadOnly,
+                &serde_json::json!({ "path": p.to_string_lossy() }),
+                "Write",
+                &wt,
+                None,
+                &roots,
+            )
+        };
+        for (what, path, admitted) in [
+            (
+                "a note under the notes root",
+                notes.join("analysis.md"),
+                true,
+            ),
+            ("a nested note", notes.join("sub").join("n.md"), true),
+            ("the tree under review", wt.join("notes.md"), false),
+            ("outside every root", base.join("elsewhere.md"), false),
+        ] {
+            let acp = fence.judge(&call(&path));
+            let gate = hook(&path);
+            assert_eq!(acp.is_ok(), admitted, "ACP fence on {what}: {acp:?}");
+            assert_eq!(gate.is_none(), admitted, "gate hook on {what}: {gate:?}");
+            if !admitted {
+                let reason = acp.unwrap_err();
+                assert!(
+                    reason.contains("write notes only under the unit's notes root")
+                        && reason.contains(&notes.to_string_lossy().into_owned()),
+                    "the ACP refusal names the notes root: {reason}"
+                );
+            }
+        }
+        // The Bash arm the bridge shares with the hook: a heredoc into the tree is refused, one
+        // under the notes root is admitted.
+        assert!(crate::gate_hook::bash_write_phase_scope(
+            false,
+            crate::write_posture::WritePosture::ReadOnly,
+            &format!("cat > {} <<'EOF'\nx\nEOF", wt.join("n.md").display()),
+            &wt,
+            None,
+            &roots,
+        )
+        .is_some());
+        assert!(crate::gate_hook::bash_write_phase_scope(
+            false,
+            crate::write_posture::WritePosture::ReadOnly,
+            &format!("echo x > {}", notes.join("n.md").display()),
+            &wt,
+            None,
+            &roots,
+        )
+        .is_none());
         drop(rx);
         let _ = std::fs::remove_dir_all(&base);
     }
