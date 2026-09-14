@@ -40,7 +40,7 @@
     {
       "id": "fix",
       "kind": "build",
-      "instructions": "Before finishing, sweep the repository for consumers of any behaviour this fix retires or changes — tests, e2e gates, docs, comments, CHANGELOG conventions — and update them or list each as a follow-up in your final output.",
+      "instructions": "Update every consumer of behaviour this fix retires or changes: tests, docs, comments.",
       "gate_type": "execution",
       "gate": "auto",
       "executes_code": true,

@@ -41,10 +41,10 @@ Two release tracks share this file, newest entry first regardless of track:
   `--single-branch` remedy) — never a silent fall-back to the default branch, which would push a
   duplicate PR. The run still lives on `wicked/<run>`; `None` = today's resolution. (c)
   `PhaseDef::instructions(..)` builder; `bug_def()`'s `fix` phase carries
-  `BUG_FIX_SWEEP_INSTRUCTIONS` ("Before finishing, sweep the repository for consumers of any
-  behaviour this fix retires or changes — tests, e2e gates, docs, comments, CHANGELOG conventions —
-  and update them or list each as a follow-up in your final output."), one line, folded onto the
-  creator's prompt after ` ||| `; `workflows/bug.json` mirrors it; crew's `BUILTIN_WORKFLOWS.bug`
+  `BUG_FIX_SWEEP_INSTRUCTIONS` ("Update every consumer of behaviour this fix retires or changes:
+  tests, docs, comments." — ≤ 90 ASCII bytes so the PTY carrier's 1000 B prompt keeps its intent
+  headroom; the DES's longer wording did not), one line, folded onto the creator's prompt after
+  ` ||| `; `workflows/bug.json` mirrors it; crew's `BUILTIN_WORKFLOWS.bug`
   carries the same literal. Tests: the arm (parks under `None` and under `auto_deliver`; a strand
   and a non-deliver Tool unit keep today's path), `repo.rs` explicit base (resolves / refused by
   name / not a name / no origin / `None` = today), the sweep literal + fold, and the real-engine

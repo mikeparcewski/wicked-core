@@ -1230,10 +1230,12 @@ pub fn feature_def() -> WorkflowDef {
 /// depends on `reproduce`; a bug is not fixed until the repro goes red→green.
 /// The `bug` def's `fix` phase instructions (DES-L9, BC-60) — ONE line, folded onto the creator's
 /// prompt after ` ||| `. Crew's `BUILTIN_WORKFLOWS.bug` mirror carries the same literal and pins
-/// it in a unit test, so the two carriers cannot drift silently.
-pub const BUG_FIX_SWEEP_INSTRUCTIONS: &str = "Before finishing, sweep the repository for \
-consumers of any behaviour this fix retires or changes — tests, e2e gates, docs, comments, \
-CHANGELOG conventions — and update them or list each as a follow-up in your final output.";
+/// it in a unit test, so the two carriers cannot drift silently. SHORT (≤ 90 ASCII bytes) on
+/// purpose: the PTY carrier's canonical line is 1000 B for the WHOLE prompt (`PTY_PROMPT_LIMIT`),
+/// and `execute_wrapped`'s budget test keeps ≥ 300 B of intent headroom fresh and ≥ 150 B after two
+/// rework markers — the DES's 227 B wording left 19 B.
+pub const BUG_FIX_SWEEP_INSTRUCTIONS: &str =
+    "Update every consumer of behaviour this fix retires or changes: tests, docs, comments.";
 
 pub fn bug_def() -> WorkflowDef {
     WorkflowDef {
@@ -1702,7 +1704,11 @@ mod workflow_def_tests {
             "one line — the PTY runner submits a newline as an early turn end"
         );
         assert!(BUG_FIX_SWEEP_INSTRUCTIONS
-            .starts_with("Before finishing, sweep the repository for consumers of any behaviour"));
+            .starts_with("Update every consumer of behaviour this fix retires or changes"));
+        assert!(
+            BUG_FIX_SWEEP_INSTRUCTIONS.is_ascii() && BUG_FIX_SWEEP_INSTRUCTIONS.len() <= 90,
+            "the line rides the PTY carrier's 1000 B prompt budget (execute_wrapped's headroom test)"
+        );
         for p in def.phases.iter().filter(|p| p.id != "fix") {
             assert!(
                 p.instructions.is_none(),
@@ -1718,7 +1724,7 @@ mod workflow_def_tests {
         assert!(
             fix_unit
                 .description
-                .contains(" ||| Before finishing, sweep the repository"),
+                .contains(" ||| Update every consumer of behaviour this fix retires"),
             "{}",
             fix_unit.description
         );
