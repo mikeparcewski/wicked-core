@@ -764,12 +764,29 @@ fn shell_tokens(command: &str) -> Vec<String> {
 
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
 /// Covers the direct escapes: `>`/`>>`/`N>` redirects (spaced or glued), `tee [-a] FILE...`, and the
-/// destination of `cp`/`mv`/`install` (last non-flag arg) and `dd of=FILE`. Deliberately NOT a shell
-/// parser — see the caller's note on why this is defense-in-depth rather than a sandbox.
+/// destination of `cp`/`mv`/`install` (last non-flag arg) and `dd of=FILE`. Sees through ONE level
+/// of the fixed wrapper table ([`unwrap_program`], core #475) — `sh -lc '…'`, `exec`, `xargs`,
+/// `env`, `nice`, `timeout`, a quoted program word. Deliberately NOT a shell parser — see the
+/// caller's note on why this is defense-in-depth rather than a sandbox, and
+/// [`classify_estate_command`]'s doc for the complete list of shapes a literal scan does not model.
 fn bash_write_targets(command: &str) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    collect_bash_write_targets(command, true, &mut targets);
+    // Drop standard shell write SINKS — writing to them discards or streams bytes, it does not place
+    // a file outside the worktree, so they are not escapes. `> /dev/null` is in ~every real command
+    // (the governed PageIndex pass failed on an `analyze` unit's `… > /dev/null` before this — a false
+    // positive that would fail essentially every workflow). FINDING-045 is a fence against files
+    // leaving the worktree, not a ban on discarding output.
+    targets.retain(|t| !is_safe_write_sink(t));
+    targets
+}
+
+/// The scan behind [`bash_write_targets`]. `unwrap_inline` is true for the command line the worker
+/// issued and false for the ONE inner rescan of a shell `-c` string — a `-c` wrapper found INSIDE
+/// that string is the documented two-level pass, not unwrapped again.
+fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut Vec<String>) {
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let mut targets: Vec<String> = Vec::new();
 
     // Redirection targets. `redirect_glob(tok)` returns Some(glued-filename-or-empty) for a write
     // redirect operator; an empty string means the filename is the NEXT token.
@@ -805,23 +822,34 @@ fn bash_write_targets(command: &str) -> Vec<String> {
         segments.push(seg);
     }
     for words in &segments {
-        let Some(prog) = words.first() else { continue };
-        let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
-        match base {
+        // See through one wrapper level to the real program word (core #475). A shell `-c` string
+        // is rescanned as its own command line — its redirects were quoted at this level, so the
+        // redirect pass above could not see them.
+        let idx = match unwrap_program(words) {
+            Unwrapped::Program { idx, .. } => idx,
+            Unwrapped::Inline(inner) => {
+                if unwrap_inline {
+                    collect_bash_write_targets(inner, false, targets);
+                }
+                continue;
+            }
+        };
+        let Some(prog) = words.get(idx) else { continue };
+        match program_basename(prog) {
             "cp" | "mv" | "install" => {
-                if let Some(dest) = words[1..].iter().rev().find(|w| !w.starts_with('-')) {
+                if let Some(dest) = words[idx + 1..].iter().rev().find(|w| !w.starts_with('-')) {
                     targets.push((*dest).to_string());
                 }
             }
             "tee" => {
-                for w in &words[1..] {
+                for w in &words[idx + 1..] {
                     if !w.starts_with('-') {
                         targets.push((*w).to_string());
                     }
                 }
             }
             "dd" => {
-                for w in &words[1..] {
+                for w in &words[idx + 1..] {
                     if let Some(f) = w.strip_prefix("of=") {
                         targets.push(f.to_string());
                     }
@@ -830,13 +858,133 @@ fn bash_write_targets(command: &str) -> Vec<String> {
             _ => {}
         }
     }
-    // Drop standard shell write SINKS — writing to them discards or streams bytes, it does not place
-    // a file outside the worktree, so they are not escapes. `> /dev/null` is in ~every real command
-    // (the governed PageIndex pass failed on an `analyze` unit's `… > /dev/null` before this — a false
-    // positive that would fail essentially every workflow). FINDING-045 is a fence against files
-    // leaving the worktree, not a ban on discarding output.
-    targets.retain(|t| !is_safe_write_sink(t));
-    targets
+}
+
+/// The basename of a program word with ONE layer of shell quotes stripped first, so `"cp"`,
+/// `'/usr/bin/tee'` and `C:\tools\tee` name the same family as `cp` / `tee` (core #475: a quoted
+/// program word used to match nothing). The one quoting rule both tokenizer consumers share.
+fn program_basename(prog: &str) -> &str {
+    let p = prog.trim_matches(|c| c == '"' || c == '\'');
+    p.rsplit(['/', '\\']).next().unwrap_or(p)
+}
+
+/// One layer of shell quotes off a token: `'echo x > f'` → `echo x > f`. Only a MATCHING outer pair
+/// is stripped (the string a `-c` wrapper hands the inner shell); anything else is left verbatim.
+fn strip_one_quote_layer(tok: &str) -> &str {
+    let b = tok.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
+        &tok[1..tok.len() - 1]
+    } else {
+        tok
+    }
+}
+
+/// What ONE level of wrapper-unwrapping found at the head of a pipeline/sequence segment (core #475).
+enum Unwrapped<'a> {
+    /// `words[idx]` is the program word; every wrapper before it and every leading `NAME=value`
+    /// assignment was skipped. The assignments are returned because a `WICKED_HOME=…` prefix is one
+    /// way the estate shim rule's store pin is spelled.
+    Program {
+        idx: usize,
+        assignments: Vec<&'a str>,
+    },
+    /// A shell `-c` family wrapper: the inner command string with one layer of quotes stripped, for
+    /// the caller to `shell_tokens` and rescan as its own command line.
+    Inline(&'a str),
+}
+
+/// See through ONE level of the fixed wrapper table that hides a segment's real program word
+/// (core #475 — `sh -lc 'echo x > src/y'`, `exec tee src/y`, `xargs tee src/y` and `"cp" a src/y`
+/// all matched nothing before this). The table, exactly:
+///
+/// * **shell `-c` family** — `sh`/`bash`/`zsh`/`dash` followed by a flag cluster ENDING in `c`
+///   (`-c`, `-lc`, `-ec`, `-xc`, …) then `<string>`: the string is handed back as
+///   [`Unwrapped::Inline`] for a rescan. ONE level only — the caller does not unwrap a `-c` found
+///   INSIDE the inner string (`sh -c 'sh -c "…"'` is the documented pass).
+/// * **`exec`** — the word dropped.
+/// * **`xargs [flags]`** — the word and its leading `-` flags dropped.
+/// * **`env [flags] [NAME=val]…`** — dropped; the assignments are kept as pin prefix, as before
+///   (arg-taking flags like `-u VAR` are not modelled).
+/// * **`nice [-n N]`** — the word, its flags and `-n`'s value dropped.
+/// * **`timeout [flags] <duration>`** — the word, its flags (with `-s`/`-k` values) and the
+///   duration dropped.
+/// * every wrapper word and the program word itself are matched through [`program_basename`] —
+///   one layer of quotes stripped, path prefix removed (the one quoting rule).
+///
+/// A `sh`/`bash` segment WITHOUT a `-c` cluster is not a wrapper here: it is a script LAUNCHER
+/// (`sh "$ROOT/scripts/_python.sh" x.py`), left for [`executed_estate_shim`] to look through.
+fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
+    let mut idx = 0;
+    let mut assignments: Vec<&'a str> = Vec::new();
+    // Every iteration consumes at least one word or returns, so the loop is bounded by `words.len()`.
+    loop {
+        while idx < words.len() && is_env_assignment(words[idx]) {
+            assignments.push(words[idx]);
+            idx += 1;
+        }
+        let Some(prog) = words.get(idx) else {
+            return Unwrapped::Program { idx, assignments };
+        };
+        match program_basename(prog) {
+            "exec" => idx += 1,
+            "xargs" => {
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    idx += 1;
+                }
+            }
+            "env" => {
+                idx += 1;
+                while idx < words.len()
+                    && (words[idx].starts_with('-') || is_env_assignment(words[idx]))
+                {
+                    if is_env_assignment(words[idx]) {
+                        assignments.push(words[idx]);
+                    }
+                    idx += 1;
+                }
+            }
+            "nice" => {
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    let takes_value = matches!(words[idx], "-n" | "--adjustment");
+                    idx += 1;
+                    if takes_value {
+                        idx += 1;
+                    }
+                }
+            }
+            "timeout" => {
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    let takes_value =
+                        matches!(words[idx], "-s" | "-k" | "--signal" | "--kill-after");
+                    idx += 1;
+                    if takes_value {
+                        idx += 1;
+                    }
+                }
+                idx += 1; // the DURATION
+            }
+            "sh" | "bash" | "zsh" | "dash" => {
+                // Walk the shell's own flags; a single-dash cluster ending in `c` means "the next
+                // word is the command string".
+                let mut j = idx + 1;
+                while j < words.len() && words[j].starts_with('-') {
+                    let flag = words[j];
+                    j += 1;
+                    if flag.len() >= 2 && !flag.starts_with("--") && flag.ends_with('c') {
+                        return match words.get(j) {
+                            Some(&inner) => Unwrapped::Inline(strip_one_quote_layer(inner)),
+                            None => Unwrapped::Program { idx, assignments },
+                        };
+                    }
+                }
+                return Unwrapped::Program { idx, assignments };
+            }
+            _ => return Unwrapped::Program { idx, assignments },
+        }
+    }
 }
 
 /// Classify an in-run Bash invocation of the `wicked-estate` CLI, the estate stdio MCP
@@ -874,10 +1022,14 @@ fn bash_write_targets(command: &str) -> Vec<String> {
 /// A new garden backend that spawns the shim from another directory must be added here (or live
 /// under `scripts/mem/`) — until then it is invisible to this scan, exactly as before.
 ///
-/// DEFENSE-IN-DEPTH, same honest limit as [`bash_write_targets`]: a renamed binary, `sh -c '…'`,
-/// `python -c '…'`, raw SQLite via python, or the no-space glued operator still evades a literal
-/// scan. OS-level containment is the only hermetic guarantee; this is the secondary layer for
-/// sandbox-less hosts.
+/// DEFENSE-IN-DEPTH, same honest limit as [`bash_write_targets`] — the complete list of shapes a
+/// literal scan does NOT model (core #475; [`unwrap_program`] sees through exactly one level of the
+/// wrapper table and nothing else): inline interpreters (`python3 -c`, `node -e`, `perl -e`,
+/// `sh <<EOF`, `python3 - <<EOF`), `$(…)`/backtick substitution, `$VAR`/`${VAR}` program or target
+/// words, in-place editors (`sed -i`, `perl -i`), `git apply`/`patch`, `rm`/`touch`/`ln`, a SECOND
+/// level of wrapping (`sh -c 'sh -c "…"'`), a renamed binary, raw SQLite via python, and the
+/// no-space glued operator (`a&&wicked-estate`). OS-level containment is the only hermetic
+/// guarantee; this is the secondary layer for sandbox-less hosts.
 ///
 /// Returns the offending pipeline/sequence segment and WHY (so the deny message can NAME both),
 /// or `None` when every segment is in the allowlist.
@@ -992,7 +1144,8 @@ fn is_script_launcher(base: &str) -> bool {
 /// itself (`./scripts/_estate_client.py health`), or the script a launcher runs (`python3 x.py`,
 /// `sh …/_python.sh x.py`, `py -3 x.py`, `python -m mem.estate_memory`). Launcher flags are
 /// skipped; garden's `_python.sh` / `_run.py` resolvers are looked through to the script they run;
-/// `-c <code>` (inline python) is not modelled — the documented literal-scan limit.
+/// `-c <code>` (inline python) is not modelled — the documented literal-scan limit. A shell `-c`
+/// string never reaches here: [`unwrap_program`] hands it back for a rescan first.
 fn executed_estate_shim(words: &[&str], idx: usize) -> bool {
     let prog = words[idx];
     if is_estate_shim_script(prog) {
@@ -1053,6 +1206,17 @@ fn estate_subcommand<'a>(rest: &[&'a str]) -> Option<&'a str> {
 }
 
 fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<EstateDeny> {
+    classify_estate_command_in(command, store_pinned_by_env, true)
+}
+
+/// The scan behind [`classify_estate_command`]. `unwrap_inline` is true for the command line the
+/// worker issued and false for the ONE inner rescan of a shell `-c` string (a nested `-c` is the
+/// documented pass — see the limit list above).
+fn classify_estate_command_in(
+    command: &str,
+    store_pinned_by_env: bool,
+    unwrap_inline: bool,
+) -> Option<EstateDeny> {
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -1086,82 +1250,70 @@ fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<E
     }
     for words in &segments {
         // Find the program word, seeing through the common, LEGITIMATE prefixes that would otherwise
-        // hide it (Copilot #385): leading `NAME=value` env-assignments (`X=1 wicked-estate …`) and an
-        // `env [flags] [NAME=value]... cmd` wrapper (`env X=1 wicked-estate …`). Prefix redirects were
-        // already dropped above. The assignments are kept: a `WICKED_HOME=… ` prefix is one way the
-        // shim rule's store pin is spelled.
+        // hide it (Copilot #385, core #475): leading `NAME=value` env-assignments
+        // (`X=1 wicked-estate …`) and ONE level of the wrapper table `unwrap_program` models
+        // (`env`, `exec`, `xargs`, `nice`, `timeout`, a quoted program word, and a shell `-c` string,
+        // which is rescanned as its own command line). Prefix redirects were already dropped above.
+        // The assignments are kept: a `WICKED_HOME=… ` prefix is one way the shim rule's store pin is
+        // spelled.
         //
-        // BEST-EFFORT BY DESIGN: a literal scan cannot see through every invocation form (a renamed
-        // binary, `sh -c '…'`, `xargs`/`nice`/`timeout` wrappers, `env -u VAR …`, raw SQLite via
-        // python, or the no-space glued operator `a&&wicked-estate` — the shared FINDING-045 tokenizer
-        // limit `bash_write_targets` also carries). The HERMETIC containment is Boundary 1's OS
-        // sandbox: the shared graph db lives OUTSIDE the worktree, so a kernel write-deny stops EVERY
-        // form when the sandbox is armed. This scan is the secondary layer for sandbox-less hosts.
-        let mut idx = 0;
-        let mut prefix_assignments: Vec<&str> = Vec::new();
-        loop {
-            while idx < words.len() && is_env_assignment(words[idx]) {
-                prefix_assignments.push(words[idx]);
-                idx += 1;
-            }
-            let Some(prog) = words.get(idx) else { break };
-            // Basename with the SAME logic [`bash_write_targets`] uses, so an absolute or
-            // `\`-separated path resolves to the same family name.
-            let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
-            if base == "env" {
-                // Unwrap `env [flags] [NAME=value]... cmd`: skip env, its flags, and assignments; the
-                // next word is the real program (arg-taking flags like `-u VAR` are not modeled — best-effort).
-                idx += 1;
-                while idx < words.len()
-                    && (words[idx].starts_with('-') || is_env_assignment(words[idx]))
-                {
-                    if is_env_assignment(words[idx]) {
-                        prefix_assignments.push(words[idx]);
+        // BEST-EFFORT BY DESIGN: a literal scan cannot see through every invocation form — the
+        // complete unmodelled list is in this function's doc. The HERMETIC containment is Boundary
+        // 1's OS sandbox: the shared graph db lives OUTSIDE the worktree, so a kernel write-deny
+        // stops EVERY form when the sandbox is armed. This scan is the secondary layer for
+        // sandbox-less hosts.
+        let (idx, prefix_assignments) = match unwrap_program(words) {
+            Unwrapped::Program { idx, assignments } => (idx, assignments),
+            Unwrapped::Inline(inner) => {
+                if unwrap_inline {
+                    let hit = classify_estate_command_in(inner, store_pinned_by_env, false);
+                    if hit.is_some() {
+                        return hit;
                     }
-                    idx += 1;
                 }
                 continue;
             }
-            let deny = |why: &'static str| {
-                Some(EstateDeny {
-                    segment: words.join(" "),
-                    why,
-                })
-            };
+        };
+        let Some(prog) = words.get(idx) else { continue };
+        // Basename with the SAME rule [`bash_write_targets`] uses (one quote layer off, path prefix
+        // removed), so an absolute, quoted or `\`-separated path resolves to the same family name.
+        let base = program_basename(prog);
+        let deny = |why: &'static str| {
+            Some(EstateDeny {
+                segment: words.join(" "),
+                why,
+            })
+        };
 
-            if matches!(base, "wicked-estate" | "wicked-estate.exe") {
-                let rest = &words[idx + 1..];
-                match estate_subcommand(rest) {
-                    // READ-ONLY subcommands — ALLOW.
-                    Some(verb) if ESTATE_READ_VERBS.contains(&verb) => {}
-                    // `clusters` is read-only UNLESS `--annotate` is present (that flag writes).
-                    Some("clusters") if !rest.contains(&"--annotate") => {}
-                    Some("clusters") => return deny(ESTATE_WHY_WRITE_VERB),
-                    Some(verb) if ESTATE_WRITE_VERBS.contains(&verb) => {
-                        return deny(ESTATE_WHY_WRITE_VERB)
-                    }
-                    // Anything else — a verb this build does not know — DENY (fail-closed).
-                    _ => return deny(ESTATE_WHY_UNKNOWN_VERB),
+        if matches!(base, "wicked-estate" | "wicked-estate.exe") {
+            let rest = &words[idx + 1..];
+            match estate_subcommand(rest) {
+                // READ-ONLY subcommands — ALLOW.
+                Some(verb) if ESTATE_READ_VERBS.contains(&verb) => {}
+                // `clusters` is read-only UNLESS `--annotate` is present (that flag writes).
+                Some("clusters") if !rest.contains(&"--annotate") => {}
+                Some("clusters") => return deny(ESTATE_WHY_WRITE_VERB),
+                Some(verb) if ESTATE_WRITE_VERBS.contains(&verb) => {
+                    return deny(ESTATE_WHY_WRITE_VERB)
                 }
-                break;
+                // Anything else — a verb this build does not know — DENY (fail-closed).
+                _ => return deny(ESTATE_WHY_UNKNOWN_VERB),
             }
+            continue;
+        }
 
-            // The estate stdio MCP, or garden's shim / a backend that spawns it (§7.3): ALLOWED only
-            // read-only AND pinned. Judged on the whole segment: the flags ride the outer argv the
-            // launcher hands the backend, which forwards them to the `wicked-estate-mcp` it spawns.
-            if matches!(base, "wicked-estate-mcp" | "wicked-estate-mcp.exe")
-                || executed_estate_shim(words, idx)
-            {
-                if !words.contains(&"--readonly") {
-                    return deny(ESTATE_WHY_NO_READONLY);
-                }
-                if !(store_pinned_by_env || argv_pins_store(words, &prefix_assignments)) {
-                    return deny(ESTATE_WHY_NO_PIN);
-                }
-                break;
+        // The estate stdio MCP, or garden's shim / a backend that spawns it (§7.3): ALLOWED only
+        // read-only AND pinned. Judged on the whole segment: the flags ride the outer argv the
+        // launcher hands the backend, which forwards them to the `wicked-estate-mcp` it spawns.
+        if matches!(base, "wicked-estate-mcp" | "wicked-estate-mcp.exe")
+            || executed_estate_shim(words, idx)
+        {
+            if !words.contains(&"--readonly") {
+                return deny(ESTATE_WHY_NO_READONLY);
             }
-
-            break;
+            if !(store_pinned_by_env || argv_pins_store(words, &prefix_assignments)) {
+                return deny(ESTATE_WHY_NO_PIN);
+            }
         }
     }
     None
@@ -4151,6 +4303,105 @@ mod boundary_tests {
                 "benign command must not trip the estate fence: {benign}"
             );
         }
+    }
+
+    /// core #475: ONE level of the fixed wrapper table is seen through by BOTH tokenizer consumers.
+    /// Every table row × a write target: the target behind `sh -c` / `bash -lc` / `sh -ec` /
+    /// `zsh -xc` / `dash -c`, `exec`, `xargs [flags]`, `env [flags] [X=1]`, `nice [-n N]`,
+    /// `timeout [flags] <dur>` or a QUOTED program word is found — before this every one of them
+    /// matched nothing (`"cp"` is not `cp`, `sh -lc '…'` hid its redirect inside the quotes).
+    /// Mutation: delete a row of `unwrap_program` → that row's cases fail.
+    #[test]
+    fn one_wrapper_level_is_unwrapped_for_write_targets() {
+        for (cmd, target) in [
+            ("sh -c 'echo x > src/y'", "src/y"),
+            ("bash -lc 'echo x > src/y'", "src/y"),
+            ("sh -ec \"echo x > src/y\"", "src/y"),
+            ("zsh -xc 'cat a | tee src/y'", "src/y"),
+            ("dash -c 'cp a src/y'", "src/y"),
+            ("/bin/bash -c 'dd if=a of=src/y'", "src/y"),
+            ("exec tee src/y", "src/y"),
+            ("xargs tee src/y", "src/y"),
+            ("xargs -0 -n1 tee src/y", "src/y"),
+            ("env tee src/y", "src/y"),
+            ("env -i X=1 tee src/y", "src/y"),
+            ("nice tee src/y", "src/y"),
+            ("nice -n 10 cp a src/y", "src/y"),
+            ("timeout 30 tee src/y", "src/y"),
+            ("timeout -s KILL 5s cp a src/y", "src/y"),
+            ("\"cp\" a src/y", "src/y"),
+            ("'/usr/bin/tee' src/y", "src/y"),
+            // a wrapper in a LATER segment, and an outer redirect around a `-c` string
+            ("echo x | exec tee src/y", "src/y"),
+            ("sh -c 'echo x' > src/y", "src/y"),
+        ] {
+            let targets = bash_write_targets(cmd);
+            assert!(
+                targets.iter().any(|t| t == target),
+                "{cmd}: expected write target {target}, got {targets:?}"
+            );
+        }
+        // The documented limits, unchanged: a SECOND `-c` level is not unwrapped, an inline
+        // interpreter is not modelled, and a shell running a SCRIPT (no `-c`) is a launcher, not a
+        // wrapper — none of these may invent a target.
+        for pass in [
+            "sh -c 'sh -c \"echo x > src/y\"'",
+            "python3 -c 'open(\"src/y\", \"w\")'",
+            "sh run.sh src/y",
+        ] {
+            assert!(
+                bash_write_targets(pass).is_empty(),
+                "documented literal-scan pass must yield no target: {pass}"
+            );
+        }
+    }
+
+    /// core #475, the estate half: the same wrapper table hides no estate WRITE from the fence, an
+    /// allowed shim call stays allowed through a wrapper (its flags ride the inner argv), and the
+    /// nested `-c` remains the documented pass.
+    #[test]
+    fn one_wrapper_level_is_unwrapped_for_the_estate_fence() {
+        for evade in [
+            "sh -c 'wicked-estate index .'",
+            "bash -lc 'wicked-estate index .'",
+            "exec wicked-estate index .",
+            "xargs -n1 wicked-estate index .",
+            "nice -n 5 wicked-estate index .",
+            "timeout 60 wicked-estate index .",
+            "\"wicked-estate\" index .",
+            "'/usr/local/bin/wicked-estate' index .",
+            // the shim without `--readonly`, behind a wrapper
+            "sh -c 'python3 scripts/_estate_client.py call x'",
+            "timeout 30 python3 scripts/mem/estate_memory.py store '{}'",
+            "exec wicked-estate-mcp --db /srv/g.db",
+        ] {
+            assert!(
+                classify_estate_command(evade, true).is_some(),
+                "a wrapped estate write must still be denied: {evade}"
+            );
+        }
+        for allowed in [
+            "timeout 30 python3 scripts/_estate_client.py --readonly call x",
+            "sh -c 'python3 scripts/_estate_client.py --readonly call x'",
+            "exec wicked-estate stats",
+            "nice -n 5 wicked-estate query 'x'",
+        ] {
+            assert!(
+                classify_estate_command(allowed, true).is_none(),
+                "an allowed estate read stays allowed through a wrapper: {allowed}"
+            );
+        }
+        // The inner segment carries its own pin.
+        assert!(classify_estate_command(
+            "sh -c 'python3 scripts/_estate_client.py --readonly --db /srv/g.db call x'",
+            false
+        )
+        .is_none());
+        // A `-c` string INSIDE a `-c` string is the documented pass.
+        assert!(
+            classify_estate_command("sh -c 'sh -c \"wicked-estate index .\"'", true).is_none(),
+            "a second wrapper level is the documented literal-scan limit"
+        );
     }
 
     /// The store pin an ACP child can see is exactly the pin set minus what `hardened()` strips:
