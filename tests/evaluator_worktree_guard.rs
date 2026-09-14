@@ -186,6 +186,14 @@ impl StepRunner for ScriptedSeat {
                 _ => {}
             }
         }
+        // DES-L1 PR-1A (D-9): `bug.verify` is an Evaluator agent unit — the seat answers the
+        // verdict contract the fold now parses (the guard, floors and judge still gate it).
+        if input.unit.session_id != "validator"
+            && input.unit.role == wicked_core::PhaseRole::Evaluator
+            && input.unit.tool_cmd.is_none()
+        {
+            output.push_str("\nVERDICT: PASS");
+        }
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,

@@ -77,7 +77,14 @@ impl StepRunner for RecordingOkRunner {
             run_id: i.run_id.clone(),
             unit_ix: i.unit_ix,
             attempt: i.attempt,
-            output: "ok".into(),
+            // DES-L1 PR-1A (D-9): the def's `review` phase is an Evaluator agent unit — answer the
+            // verdict contract the fold parses, or the run parks at the escalation gate.
+            output: if i.unit.role == wicked_core::PhaseRole::Evaluator && i.unit.tool_cmd.is_none()
+            {
+                "ok\nVERDICT: PASS".into()
+            } else {
+                "ok".into()
+            },
             status: StepStatus::Ok,
             usage: None,
             files: vec![],

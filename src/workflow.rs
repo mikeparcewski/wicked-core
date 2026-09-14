@@ -369,7 +369,22 @@ pub trait StepRunner: Send + Sync {
     fn close_cli_session(&self, _run_id: &str, _cli_key: &str) {}
 }
 
-/// The deterministic stub step — today's composition behavior (output = `stub-output for <desc>`),
+/// The deterministic stub's output for `unit` — `stub-output for <description>`, and for an
+/// Evaluator AGENT unit the `VERDICT: PASS` line the fold parses (DES-L1 PR-1A). The stub is a
+/// TEST SEAM (crew's stub-engine e2e, the legacy sync `run_session` path); a stub evaluator that
+/// never answered the contract would park every such run at the escalation gate under D-9. ONE
+/// emitter for both stub paths so they cannot diverge; the predicate is the fold's
+/// (`PhaseRole::Evaluator` + no `tool_cmd`).
+pub fn stub_output(unit: &WorkUnit) -> String {
+    let base = format!("stub-output for {}", unit.description);
+    if unit.role == PhaseRole::Evaluator && unit.tool_cmd.is_none() {
+        format!("{base}\nVERDICT: PASS")
+    } else {
+        base
+    }
+}
+
+/// The deterministic stub step — today's composition behavior (output = [`stub_output`]),
 /// moved behind the [`StepRunner`] seam unchanged.
 pub struct StubStepRunner;
 
@@ -379,7 +394,7 @@ impl StepRunner for StubStepRunner {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
             attempt: input.attempt,
-            output: format!("stub-output for {}", input.unit.description),
+            output: stub_output(&input.unit),
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),

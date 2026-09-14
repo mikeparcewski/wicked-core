@@ -78,6 +78,11 @@ const HAND_AUTHORED = `${BEGIN}
  * core#479 (additive, DES-L4 PR-⑥): \`baseSkill.handed: boolean\` — true when the seat's CLI has a
  * per-launch skills lever and the admitted generation holds the skill (the directive names a skill
  * the seat can invoke); false for a lever-less seat, which is told the discipline is NOT loaded.
+ * DES-L1 PR-1A (additive): gateEvaluated carries \`evaluatorVerdict: string | null\` — the Evaluator
+ * unit's OWN verdict token read from its output (\`'PASS'\` | \`'FAIL'\` | any other token it wrote; PASS
+ * is the only pass, every other token denies into the escalation gate); null when the layer did not
+ * read the unit (creator/neutral/tool) or the evaluator wrote no \`VERDICT:\` line (then
+ * \`denial.source === 'evaluator_verdict'\` and \`denial.reason\` is the contract text).
  * core#467/#469/F-RC2-009 additions (all additive): repoChecksEvaluated carries \`outcome: 'passed' |
  * 'failed' | 'timed_out' | 'not_run'\` (a timed-out floor denies under source 'repo_checks_timeout',
  * never 'repo_checks'), \`floor: 'creator' | 'verify'\`, \`claim: {phrase, check, verdict} | null\` and

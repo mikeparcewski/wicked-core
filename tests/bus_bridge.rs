@@ -31,15 +31,21 @@ impl Dispatcher for StubDispatcher {
     }
 }
 
-/// A runner that completes every unit immediately (no subprocess).
+/// A runner that completes every unit immediately (no subprocess). An Evaluator agent unit's
+/// output answers the verdict contract the fold parses (DES-L1 PR-1A, D-9) — the `feature` def's
+/// `adversarial-review` would otherwise park at the escalation gate.
 struct FastRunner;
 impl StepRunner for FastRunner {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let mut output = format!("stub-output for {}", input.unit.description);
+        if input.unit.role == wicked_core::PhaseRole::Evaluator && input.unit.tool_cmd.is_none() {
+            output.push_str("\nVERDICT: PASS");
+        }
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
             attempt: input.attempt,
-            output: format!("stub-output for {}", input.unit.description),
+            output,
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),

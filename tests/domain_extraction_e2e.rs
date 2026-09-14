@@ -283,6 +283,12 @@ impl StepRunner for DomainExtractionRunner {
                 output = text.clone();
             }
         }
+        // DES-L1 PR-1A (D-9): the `coverage` phase is the def's Evaluator agent unit — its output
+        // must answer the verdict contract or the fold parks the run at the escalation gate before
+        // the domain-graph phase; the pinned coverage validator stays the real coverage check.
+        if i.unit.role == wicked_core::PhaseRole::Evaluator && i.unit.tool_cmd.is_none() {
+            output.push_str("\nVERDICT: PASS");
+        }
         if let Some(wd) = workdir.as_ref() {
             // Surface any subprocess failure LOUDLY (stderr + exit) so a lock / missing-binary / CLI
             // error can't silently mask itself as a later "file missing" — never `let _ = …output()`.
