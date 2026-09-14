@@ -3414,6 +3414,15 @@ mod tests {
             launcher_failure(&sandbox.wrapper, stderr_head.lines().next().unwrap_or("")).is_none(),
             "{stderr_head}"
         );
+        // F-SMOKE-001 (crew 0.7.35 smoke, S04 ubuntu): `bwrap: Can't mkdir <run root>/home/.aws:
+        // Read-only file system` killed the creator floor's `npm ci` in 50 ms. A missing secret
+        // dir is SKIPPED — never a `--tmpfs` destination, so bwrap never tries to create it.
+        for missing in [".aws", ".gnupg", ".claude"] {
+            assert!(
+                !home.join(missing).exists(),
+                "a missing `{missing}` must be skipped, not created, by the jail"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
