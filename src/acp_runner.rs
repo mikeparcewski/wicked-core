@@ -1965,9 +1965,10 @@ fn start_acp_process_with_write_roots(
     // SDK's `additionalDirectories` (`SessionOptions`). Empty for unit sessions, whose read roots
     // are the in-process boundary's (`assemble_read_roots`), never the SDK's.
     additional_read_roots: &[String],
-    // Ordered `(name, value)` provenance for the estate MCP the worker's `session/new` advertises
-    // (`execute_wrapped::estate_provenance_env`) — stamped onto its `proposal.submit`s. Empty for a
-    // repo-less session (no estate server is advertised at all) or an ungoverned/chat caller.
+    // Ordered `(name, value)` provenance (`execute_wrapped::estate_provenance_env`): stamped on the
+    // worker `Command`'s OWN env as the run markers (R12 — garden's estate shim reads them
+    // marker-first) AND handed to the estate MCP the worker's `session/new` advertises for its
+    // `proposal.submit`s. Empty for a chat caller — a chat is not a run unit and carries no markers.
     estate_provenance: &[(String, String)],
     // core#396 / v3.2: what this session is handed, in its lever's shape — the snapshot as a LOCAL
     // PLUGIN for the Claude bridge (`session/new` `_meta.claudeCode.options.plugins`, the one
@@ -2169,6 +2170,11 @@ fn start_acp_process_with_write_roots(
         if config.os_sandbox {
             cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, &worker_write_roots_env);
         }
+        // Run markers on the worker's OWN environment (R12 — DES-L4 PR-③): the same pairs the
+        // `session/new` estate MCP env carries, stamped here through the one shared helper so the
+        // estate shim spawned from the worker's Bash detects governed mode marker-first and the
+        // `wicked-estate-mcp` behind it inherits them. `chat_ensure` passes `&[]` — no markers.
+        crate::execute_wrapped::stamp_run_markers(&mut cmd, estate_provenance);
         // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
         // to a known slate, then set exactly what this path intends. The seat's OWN
         // configuration-home variable(s) point into its root under the worker home (this also
@@ -9536,6 +9542,61 @@ sleep 30
             pairs.get("WICKED_RUN_AGENT").map(String::as_str),
             Some("codex"),
             "session/new must stamp the assigned CLI: {seen}"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R12 (DES-L4 PR-③): `build_cmd` stamps the run markers on the ACP worker `Command`'s OWN
+    /// environment (not only into the `session/new` MCP env array), so the estate shim the worker's
+    /// Bash spawns detects governed mode marker-first. Proven end-to-end: the stub records its own
+    /// environment on startup and the three markers are present with the provenance values.
+    /// Mutation: delete the `stamp_run_markers` call in `build_cmd` → the markers are absent → fail.
+    #[test]
+    #[cfg(unix)]
+    fn build_cmd_stamps_the_run_markers_on_the_child_env() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("run-markers");
+        let envfile = dir.join("child-env.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+env > "{envfile}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"m"}}}}'
+sleep 30
+"#,
+                envfile = envfile.display()
+            ),
+        );
+        let provenance = crate::execute_wrapped::estate_provenance_env("run-mk", 8, Some("pi"));
+        let proc = start_acp_process_with_write_roots(
+            &stub_config(&script, None),
+            &dir,
+            None,
+            None,
+            &[],
+            &provenance,
+            &crate::skills_snapshot::SkillsDelivery::None,
+            None,
+        )
+        .expect("start");
+        let seen = std::fs::read_to_string(&envfile).unwrap_or_default();
+        assert!(
+            seen.contains("WICKED_RUN_ID=run-mk"),
+            "the ACP child env must carry the run id: {seen}"
+        );
+        assert!(
+            seen.contains("WICKED_RUN_UNIT=8"),
+            "the ACP child env must carry the unit ordinal: {seen}"
+        );
+        assert!(
+            seen.contains("WICKED_RUN_AGENT=pi"),
+            "the ACP child env must carry the agent: {seen}"
         );
         drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
