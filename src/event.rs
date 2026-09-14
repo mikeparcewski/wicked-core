@@ -330,6 +330,15 @@ pub enum CoreEvent {
         /// (…)". Populated whether or not the floor gated the unit; `None` when a judge ran or
         /// none was wanted.
         judge_skipped_reason: Option<String>,
+        /// (DES-L1 PR-1A, D-9 — core#488 / F-RC1-131) The Evaluator-role unit's OWN stated verdict,
+        /// read by the fold from ITS output (des-adjudicated §4.1: the LAST `VERDICT[:=]` line
+        /// decides, `PASS` is the only pass): `Some("PASS")`, `Some("FAIL")`, or whatever other
+        /// token the evaluator wrote (`CONDITIONAL`, …) — every non-PASS denies under
+        /// `denial.source == "evaluator_verdict"` into the escalation gate. `None` (wire `null`)
+        /// when the layer did not read the unit (Creator/Neutral/Tool/engine-internal) AND when an
+        /// Evaluator unit wrote no verdict line at all — that case denies too, with the contract
+        /// text as `denial.reason`, so the denial is the machine-readable twin. Additive.
+        evaluator_verdict: Option<String>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
     /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;
@@ -1391,6 +1400,7 @@ impl CoreEvent {
                 ungated_reason,
                 floor_note,
                 judge_skipped_reason,
+                evaluator_verdict,
             } => json!({
                 "type": "gateEvaluated",
                 "session": session,
@@ -1411,6 +1421,8 @@ impl CoreEvent {
                 "ungatedReason": ungated_reason,
                 "floorNote": floor_note,
                 "judgeSkippedReason": judge_skipped_reason,
+                // (DES-L1 PR-1A) The evaluator's own verdict token; `null` when unread or missing.
+                "evaluatorVerdict": evaluator_verdict,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`
             // marks a re-dispatch.
@@ -2354,6 +2366,7 @@ mod tests {
             ungated_reason: None,
             floor_note: None,
             judge_skipped_reason: None,
+            evaluator_verdict: None,
         };
         let j = ev(Some(("codex", true))).to_json();
         assert_eq!(j["type"], "gateEvaluated");
@@ -2361,6 +2374,12 @@ mod tests {
         assert_eq!(j["judgeDistinct"], true);
         let j = ev(None).to_json();
         let obj = j.as_object().unwrap();
+        // (DES-L1 PR-1A) `evaluatorVerdict` is emitted unconditionally — `null` when the layer did
+        // not read the unit — so a consumer can key on its presence, never on a missing key.
+        assert!(
+            obj.contains_key("evaluatorVerdict") && obj["evaluatorVerdict"].is_null(),
+            "{j}"
+        );
         assert!(
             obj.contains_key("judgeCli") && obj.contains_key("judgeDistinct"),
             "{j}"

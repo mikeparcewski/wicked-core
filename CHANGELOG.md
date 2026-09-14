@@ -1297,6 +1297,26 @@ Two release tracks share this file, newest entry first regardless of track:
   (`acp_seat_identity` / `wrapped_seat_identity`; only their agreement reads `true`); additive on the wire (**core-ts** `index.d.ts` doc regenerated once through
   `scripts/finalize-dts.mjs`; api-types 0.38.0 already types `BaseSkill.handed?`).
 
+<!-- fixall L1 -->
+- **The fold reads the evaluator's OWN verdict; a missing or non-PASS `VERDICT:` line denies INTO
+  THE HUMAN GATE, never `sessionFailed` (DES-L1 PR-1A, D-9; core #488, F-RC1-131; des-adjudicated
+  §4.1).** A reviewer wrote `VERDICT: FAIL` and the run shipped the tree: the only verdict parser
+  was the layer-2 judge's over the CREATOR's cold output, and nothing read the Evaluator-role
+  unit's own words. `apply_and_finish_unit` now parses the unit's output for every Evaluator AGENT
+  unit (`PhaseRole::Evaluator`, no `tool_cmd`, not engine-internal — the same predicate as the
+  `EVALUATOR_VERDICT_CONVENTION` line `skill_prompt` hands the seat): after trim and leading
+  decoration, the LAST line whose first token splits on `:`/`=` into `VERDICT` decides, `PASS` is
+  the only pass, no alias table — `FAIL`, `CONDITIONAL`, any other token, a bare head and NO line
+  all deny as `UnitDenial{source: "evaluator_verdict"}` through the existing `escalate_denied_unit`
+  → `gateEscalated{condition: "verdict_not_pass", denialSource: "evaluator_verdict",
+  verdictSummary: <findings>}` → `awaitingHuman{gateKind: "escalation"}`. The slot sits after the
+  deterministic floors and before the judge, so the reviewer's findings name the gate when both
+  deny. `gateEvaluated` gains `evaluatorVerdict: string | null` (additive; the decisive token, null
+  when the layer did not read the unit or the evaluator wrote no line — then the denial is the
+  twin). The generic verdict-gate prompt names its three arms (retry · request changes · reject).
+  The deterministic stub (`StubStepRunner` and the legacy sync path — one `stub_output` emitter)
+  closes an Evaluator unit with `VERDICT: PASS` so stub-engine runs do not park.
+
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the

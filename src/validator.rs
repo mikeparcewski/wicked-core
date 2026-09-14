@@ -1644,6 +1644,118 @@ fn parse_triage_decision(raw: &str) -> (TriageDecision, String) {
     (decision, analysis)
 }
 
+/// The contract text the fold records when an Evaluator-role agent unit wrote NO `VERDICT:` line
+/// (DES-L1 PR-1A, D-9 — fail-closed INTO THE HUMAN GATE, never `sessionFailed`).
+pub(crate) const EVALUATOR_VERDICT_MISSING: &str = "no `VERDICT:` line in the evaluator's output \
+     (contract: end with `VERDICT: PASS` or `VERDICT: FAIL`)";
+
+/// The verdict an Evaluator-role work unit wrote into its OWN output (DES-L1 PR-1A; des-adjudicated
+/// §4.1 — ONE grammar, shared with the prompt line `assumptions::EVALUATOR_VERDICT_CONVENTION` the
+/// seat was handed and with garden's evaluator text). Distinct from [`AgentVerdict`]: that is the
+/// engine's layer-2 JUDGE over the creator's cold output (`PASS|REJECT`, bookended); this is the
+/// reviewer's own stated verdict (`PASS|FAIL`, LAST line wins), which core#488 / F-RC1-131 showed
+/// the fold never read — a reviewer wrote `VERDICT: FAIL` and the run shipped the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatorVerdict {
+    /// The normalised token after `VERDICT[:=]` on the decisive (LAST) verdict line —
+    /// `Some("PASS")`, `Some("FAIL")`, `Some("CONDITIONAL")`, …; `Some("")` when the head carried
+    /// no token; `None` when no line carried the head at all.
+    pub token: Option<String>,
+    /// `true` iff `token == Some("PASS")`. Every other token, an empty token and a missing line
+    /// are NOT PASS (D-9). No alias table: a condition is a FAIL whose condition is the finding.
+    pub pass: bool,
+    /// The evaluator's own words — the output's tail (≤ 4096 chars, the decisive line included;
+    /// the contract puts the findings ABOVE the verdict line) — for `gateEscalated.verdictSummary`
+    /// and the rework context a `request_changes` hands the creator (PR-1B).
+    pub findings: String,
+}
+
+impl EvaluatorVerdict {
+    /// The fold's denial prose when `!pass`: the contract text for a missing line, the token named
+    /// for any other non-PASS token, then the evaluator's own words (the first line is what the
+    /// gate prompt shows — `actor::reason_head`; the whole text rides `verdictSummary`).
+    pub(crate) fn denial_reason(&self) -> String {
+        let head = match self.token.as_deref() {
+            None => EVALUATOR_VERDICT_MISSING.to_string(),
+            Some("FAIL") => "the evaluator's verdict is FAIL".to_string(),
+            Some("") => "the evaluator's `VERDICT:` line carries no token (contract: `VERDICT: \
+                         PASS` or `VERDICT: FAIL`)"
+                .to_string(),
+            Some(t) => format!(
+                "the evaluator's verdict token `{t}` is not PASS (contract: `VERDICT: PASS` or \
+                 `VERDICT: FAIL`; a condition is a FAIL whose condition is the finding)"
+            ),
+        };
+        if self.findings.is_empty() {
+            head
+        } else {
+            format!("{head}\n{}", self.findings)
+        }
+    }
+}
+
+/// Leading decoration a model wraps a verdict line in — markdown emphasis, headings, list bullets,
+/// quote gutters, code ticks — stripped before the first token is read.
+const VERDICT_LINE_DECORATION: [char; 5] = ['#', '*', '-', '>', '`'];
+const EVALUATOR_FINDINGS_CAP: usize = 4096;
+
+/// Parse an Evaluator-role unit's OWN verdict from its output (des-adjudicated §4.1, verbatim):
+/// for every line, trim and strip leading decoration ([`VERDICT_LINE_DECORATION`] + whitespace);
+/// the line counts when its FIRST token splits on `:`/`=` into a head that normalises
+/// (edge punctuation trimmed, uppercased — `parse_agent_verdict`'s `norm`) to `VERDICT`; its token
+/// is the rest of that first token when non-empty (`VERDICT=PASS REVIEWER=x`), else the next
+/// word (`VERDICT: PASS`, `**VERDICT: PASS**`, `## Verdict: FAIL`, `VERDICT: PASS.`), normalised
+/// the same way. The LAST such line decides; `pass` iff its token is `PASS`. No alias table, no
+/// count rule: `CONDITIONAL`, `APPROVE`, `REJECT`, `SKIP`, a bare head and no line at all are all
+/// NOT PASS, each named in [`EvaluatorVerdict::denial_reason`]. Pure; never sees a unit that is not
+/// an Evaluator agent unit (the fold gates on the same predicate as the prompt line).
+pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
+    let norm = |t: &str| {
+        t.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_uppercase()
+    };
+    let mut decisive: Option<String> = None;
+    for line in raw.lines() {
+        let bare = line.trim_start_matches(|c: char| {
+            c.is_whitespace() || VERDICT_LINE_DECORATION.contains(&c)
+        });
+        let mut words = bare.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        let Some(sep) = first.find([':', '=']) else {
+            continue;
+        };
+        if norm(&first[..sep]) != "VERDICT" {
+            continue;
+        }
+        let inline = norm(&first[sep + 1..]);
+        let token = if inline.is_empty() {
+            words.next().map(norm).unwrap_or_default()
+        } else {
+            inline
+        };
+        // The LAST verdict line decides — a model that reasons past an early token and restates
+        // its verdict at the end (where the contract asks for it) is read at the end.
+        decisive = Some(token);
+    }
+    let trimmed = raw.trim();
+    let count = trimmed.chars().count();
+    let findings = if count <= EVALUATOR_FINDINGS_CAP {
+        trimmed.to_string()
+    } else {
+        let tail: String = trimmed
+            .chars()
+            .skip(count - EVALUATOR_FINDINGS_CAP)
+            .collect();
+        format!("…{tail}")
+    };
+    let pass = decisive.as_deref() == Some("PASS");
+    EvaluatorVerdict {
+        token: decisive,
+        pass,
+        findings,
+    }
+}
+
 /// Parse the reviewer's verdict FAIL-CLOSED (core#128). Keyword-FREE lines (CLI warning banners,
 /// blank noise) are skipped; the FIRST line naming a verdict keyword is the single decision point.
 /// At that line: line 1 keeps the rich rule (first token equals `PASS`/`REJECT` after trimming edge
@@ -2235,6 +2347,94 @@ mod tests {
             prompt.contains(&final_line) && prompt.contains(&repeat_it),
             "the judge prompt never asks for a closing verdict, but the parser requires one — \
              every compliant-by-the-old-contract reviewer would be denied. Prompt was: {prompt}"
+        );
+    }
+
+    /// DES-L1 PR-1A §7 (4): the evaluator's OWN verdict grammar (des-adjudicated §4.1) — decoration
+    /// tolerated, `:` or `=` head, case-insensitive, trailing punctuation trimmed, the LAST verdict
+    /// line wins, `PASS` is the only pass; every other token, a bare head and no line are NOT PASS
+    /// and each names itself in the denial prose. The findings carry the output's tail.
+    #[test]
+    fn parse_evaluator_verdict_reads_the_last_verdict_line_pass_only_decoration_tolerant() {
+        let tok = |raw: &str| {
+            let v = parse_evaluator_verdict(raw);
+            (v.token.clone(), v.pass)
+        };
+        let some = |s: &str| Some(s.to_string());
+        // The contract line, plain.
+        assert_eq!(tok("looks correct\nVERDICT: PASS"), (some("PASS"), true));
+        assert_eq!(tok("missing tests\nVERDICT: FAIL"), (some("FAIL"), false));
+        // Decoration models add: emphasis, headings, bullets, quote gutters, code ticks.
+        assert_eq!(tok("**VERDICT: PASS**"), (some("PASS"), true));
+        assert_eq!(tok("## Verdict: FAIL"), (some("FAIL"), false));
+        assert_eq!(tok("- VERDICT: PASS"), (some("PASS"), true));
+        assert_eq!(tok("> `VERDICT: PASS`"), (some("PASS"), true));
+        // Trailing punctuation and case.
+        assert_eq!(tok("VERDICT: PASS."), (some("PASS"), true));
+        assert_eq!(tok("verdict: pass"), (some("PASS"), true));
+        // garden's qe specialists: `VERDICT=PASS REVIEWER=x RUN_ID=y` — `=` head, inline token.
+        assert_eq!(
+            tok("VERDICT=PASS REVIEWER=qe-security RUN_ID=r1"),
+            (some("PASS"), true)
+        );
+        assert_eq!(
+            tok("VERDICT=CONDITIONAL MODE=produced-test"),
+            (some("CONDITIONAL"), false),
+            "a condition is NOT PASS (no alias table)"
+        );
+        // Every other token is not-PASS and is quoted, not aliased.
+        for other in ["APPROVE", "REJECT", "SKIP", "PASSED", "PASSABLE"] {
+            let v = parse_evaluator_verdict(&format!("VERDICT: {other}"));
+            assert!(!v.pass, "{other} must not pass");
+            assert_eq!(v.token.as_deref(), Some(other));
+            assert!(
+                v.denial_reason()
+                    .contains(&format!("`{other}` is not PASS")),
+                "{}",
+                v.denial_reason()
+            );
+        }
+        // The LAST verdict line decides, in both directions.
+        assert_eq!(
+            tok("VERDICT: PASS\nwait, no:\nVERDICT: FAIL"),
+            (some("FAIL"), false)
+        );
+        assert_eq!(
+            tok("VERDICT: FAIL\nre-checked, all good\nVERDICT: PASS"),
+            (some("PASS"), true)
+        );
+        // A bare head carries no token — not PASS, named as such.
+        let bare = parse_evaluator_verdict("VERDICT:");
+        assert_eq!((bare.token.as_deref(), bare.pass), (Some(""), false));
+        assert!(bare.denial_reason().contains("carries no token"));
+        // Prose that merely mentions the word is not a verdict line.
+        assert_eq!(tok("the verdict is that this passes"), (None, false));
+        assert_eq!(
+            tok("VERDICT PASS"),
+            (None, false),
+            "the head must split on `:` or `=`"
+        );
+        // No line at all: fail-closed, the contract text is the reason (D-9).
+        let missing = parse_evaluator_verdict("I reviewed the diff and it looks fine.");
+        assert_eq!((missing.token.clone(), missing.pass), (None, false));
+        assert!(
+            missing
+                .denial_reason()
+                .starts_with(EVALUATOR_VERDICT_MISSING),
+            "{}",
+            missing.denial_reason()
+        );
+        assert!(missing.denial_reason().contains("looks fine"));
+        // Findings = the output's tail, decisive line included, capped at 4096 chars from the end.
+        let long = format!("{}\nVERDICT: FAIL", "x".repeat(5000));
+        let v = parse_evaluator_verdict(&long);
+        assert!(!v.pass);
+        assert!(v.findings.starts_with('…') && v.findings.ends_with("VERDICT: FAIL"));
+        assert_eq!(v.findings.chars().count(), EVALUATOR_FINDINGS_CAP + 1);
+        let fail = parse_evaluator_verdict("the fix breaks X\nVERDICT: FAIL");
+        assert_eq!(
+            fail.denial_reason(),
+            "the evaluator's verdict is FAIL\nthe fix breaks X\nVERDICT: FAIL"
         );
     }
 

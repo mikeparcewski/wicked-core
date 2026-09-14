@@ -6812,6 +6812,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// DES-L1 PR-1A §7 (6)/(7) — the L1↔L4 contract closes end-to-end (des-adjudicated §4.1): an
+    /// Evaluator AGENT unit's assembled prompt ENDS with the pinned `EVALUATOR_VERDICT_CONVENTION`
+    /// on every `SkillForm` (plugin, mirrored, unloaded) and on the no-skill arm, so the words the
+    /// fold parses (`validator::parse_evaluator_verdict`) are the words every seat was asked for;
+    /// never on a Creator/Neutral unit, a `tool_cmd` unit or an engine-internal judge/triage
+    /// prompt. An output that obeys the line parses PASS. The shipped `bug.verify` unit, planned
+    /// as the planner plans it, still fits a pty turn with the line appended, newline-free.
+    #[test]
+    fn an_evaluator_prompt_ends_with_the_verdict_contract_on_every_form() {
+        use crate::workflow::PhaseRole;
+        let line = crate::assumptions::EVALUATOR_VERDICT_CONVENTION;
+        let forms = [
+            SkillForm::ClaudePlugin,
+            SkillForm::MirroredName,
+            SkillForm::Unloaded,
+        ];
+        let mut evaluator =
+            WorkUnit::pending("s:verify", "s", 4, "verify the fix against the report");
+        evaluator.role = PhaseRole::Evaluator;
+        for skill in [None, Some("wicked-garden-domain-coverage")] {
+            evaluator.skill_ref = skill.map(str::to_string);
+            for form in forms {
+                let p = skill_prompt(&evaluator, Some("src/ [Cargo.toml]"), form, None);
+                assert!(p.ends_with(line), "{form:?} skill={skill:?}: {p}");
+                assert_eq!(
+                    p.matches("VERDICT (evaluator unit)").count(),
+                    1,
+                    "exactly one contract line: {p}"
+                );
+            }
+        }
+        // The convention's own words, obeyed, parse PASS — the ask and the parser agree.
+        assert!(crate::validator::parse_evaluator_verdict("findings: none\nVERDICT: PASS").pass);
+        assert!(!crate::validator::parse_evaluator_verdict("findings: X\nVERDICT: FAIL").pass);
+        // Not on the other roles, not on a tool unit, not on an engine-internal prompt.
+        for role in [PhaseRole::Creator, PhaseRole::Neutral] {
+            let mut u = WorkUnit::pending("s:fix", "s", 3, "fix it");
+            u.role = role;
+            for form in forms {
+                assert!(
+                    !skill_prompt(&u, None, form, None).contains(line),
+                    "{role:?}"
+                );
+            }
+        }
+        let mut tool = evaluator.clone();
+        tool.tool_cmd = Some(vec!["cargo".into(), "test".into()]);
+        assert!(!skill_prompt(&tool, None, SkillForm::ClaudePlugin, None).contains(line));
+        let mut judge = evaluator.clone();
+        judge.session_id = "validator".into();
+        assert!(!skill_prompt(&judge, None, SkillForm::ClaudePlugin, None).contains(line));
+
+        // (7) pty budget: the shipped bug def's verify unit carries the line and fits one turn.
+        let def = crate::workflow::bug_def();
+        let units = crate::plan::plan_from_def(&def, "fix the null deref in the parser", "s");
+        let verify = units
+            .iter()
+            .find(|u| u.role == PhaseRole::Evaluator)
+            .expect("bug.verify is the def's evaluator");
+        let input = StepInput {
+            run_id: "s".into(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: verify.clone(),
+            workflow_id: "wf".into(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        for form in forms {
+            let p = pty_unit_prompt(&input, form)
+                .expect("bug.verify fits a pty turn with the verdict line appended");
+            assert!(
+                p.ends_with(line) && !p.contains('\n') && p.len() + 1 <= PTY_PROMPT_LIMIT,
+                "{form:?}: {} bytes: {p}",
+                p.len()
+            );
+        }
+    }
+
     /// core#468: the BASE skill directive leads every work unit's prompt when the run declares
     /// one — role-keyed (`§creator` / `§evaluator` / `§neutral`), spelled per CLI exactly as the
     /// phase directive is, AHEAD of the phase directive (both present when both are set, the

@@ -2386,6 +2386,7 @@ mod tests {
                 ungated_reason: None,
                 floor_note: None,
                 judge_skipped_reason: None,
+                evaluator_verdict: None,
             },
             "gateEvaluated",
             &[
@@ -2408,6 +2409,8 @@ mod tests {
                 "ungatedReason",
                 "floorNote",
                 "judgeSkippedReason",
+                // (DES-L1 PR-1A) the evaluator's own verdict token, `null` when unread/missing.
+                "evaluatorVerdict",
             ],
         );
         check(

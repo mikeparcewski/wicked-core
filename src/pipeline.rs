@@ -89,7 +89,9 @@ pub fn run_session(
             session: session_id.to_string(),
             ord: u.ord,
         });
-        let output = format!("stub-output for {}", u.description);
+        // ONE stub emitter with `StubStepRunner` (DES-L1 PR-1A): an Evaluator unit's stub output
+        // carries the `VERDICT: PASS` line the fold below now parses.
+        let output = crate::workflow::stub_output(u);
         let outcome = apply_and_finish_unit(
             store,
             u,
@@ -1092,6 +1094,31 @@ pub(crate) fn apply_and_finish_unit(
     // REJECT denies; the agent can never be the SOLE approver. `None` ⇒ no pinned validator.
     let agent_denial = agent_verdict_denial(agent_verdict);
 
+    // (DES-L1 PR-1A, D-9 — core#488 / F-RC1-131) EVALUATOR VERDICT — the reviewer's OWN stated
+    // verdict, read from THIS unit's output (which the fold already holds). Until now the only
+    // parser was the layer-2 judge's over the CREATOR's cold output: an Evaluator-role unit that
+    // wrote `VERDICT: FAIL` had its words recorded and the run shipped the tree anyway. Same
+    // predicate as the prompt line the seat was handed (`assumptions::EVALUATOR_VERDICT_CONVENTION`
+    // via `execute_wrapped::skill_prompt`): an Evaluator AGENT unit — never a scripted `tool_cmd`
+    // step (it emits no verdict) and never an engine-internal judge/triage unit. The LAST
+    // `VERDICT[:=]` line wins and PASS is the only pass (des-adjudicated §4.1: no alias table);
+    // FAIL, any other token and a MISSING line all deny INTO THE HUMAN GATE (the existing
+    // `escalate_denied_unit` → `gateEscalated{condition: verdict_not_pass, denialSource:
+    // evaluator_verdict}`), never `sessionFailed`. Creator/Neutral/Tool units are not parsed
+    // (`evaluatorVerdict: null` on the wire).
+    let evaluator_verdict = (unit.role == crate::workflow::PhaseRole::Evaluator
+        && unit.tool_cmd.is_none()
+        && !crate::execute_wrapped::is_engine_internal(unit))
+    .then(|| crate::validator::parse_evaluator_verdict(output));
+    let evaluator_verdict_denial = evaluator_verdict
+        .as_ref()
+        .filter(|v| !v.pass)
+        .map(|v| crate::domain::UnitDenial::new("evaluator_verdict", v.denial_reason()));
+    // The wire token (`gateEvaluated.evaluatorVerdict`): the decisive line's token for a unit the
+    // layer read; `None` for every other unit AND for an Evaluator unit that wrote no verdict line
+    // (that case denies with the contract text as its reason — the denial is the twin).
+    let evaluator_verdict_token = evaluator_verdict.as_ref().and_then(|v| v.token.clone());
+
     // (evaluator≠creator) a SECOND governance pass with a DISTINCT evaluator identity whose verdict now
     // GATES (finding #9 — previously discarded). For an Evaluator-role unit it reviews the COLD output
     // of the most recent prior Creator (real artifact-passing, finding #8 on the governance claim);
@@ -1292,14 +1319,18 @@ pub(crate) fn apply_and_finish_unit(
         }
     }
 
-    // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
-    // Each layer is wrapped as a STRUCTURED denial naming its source (usability review #1); the
-    // hook layer already carries claim id / rule ids / denied tool from the decisions log.
-    // The worktree guard leads: a rewritten tree invalidates every verdict rendered over it.
+    // DENY-DOMINATES ordering: deterministic re-verify, the evaluator's own verdict, agent judge,
+    // evaluator pass, input governance. Each layer is wrapped as a STRUCTURED denial naming its
+    // source (usability review #1); the hook layer already carries claim id / rule ids / denied
+    // tool from the decisions log. The worktree guard leads: a rewritten tree invalidates every
+    // verdict rendered over it. The evaluator's own verdict sits after the floors and BEFORE the
+    // judge (DES-L1 review Q2): when both deny, the reviewer's findings — not the judge's prose —
+    // name the gate and feed the rework; deny-dominant either way.
     let validator_denial = guard_denial
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
         .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
+        .or(evaluator_verdict_denial)
         .or(agent_denial.map(|r| crate::domain::UnitDenial::new("agent_validator", r)))
         .or(evaluator_denial)
         .or(hook_denial);
@@ -1494,6 +1525,7 @@ pub(crate) fn apply_and_finish_unit(
         ungated_reason,
         floor_note,
         judge_skipped_reason,
+        evaluator_verdict: evaluator_verdict_token,
     });
     emit(CoreEvent::GateDecided {
         session: session_id.to_string(),
