@@ -1251,6 +1251,23 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+<!-- fixall L4 -->
+- **Wrapped units see their prior context; ASSUMPTION markers are anchored; `unitDispatched.baseSkill`
+  says whether the discipline was handed (DES-L4 PR-⑥; core #470 / F-RC1-094, F-RC1-096, #479).**
+  The ACP carrier injected a `depends_on` unit's prior-phase outputs as text blocks behind a
+  FINDING-024 preamble, but the wrapped (argv) carrier's `unit_prompt` read `prior_outputs` nowhere —
+  a pi/codex reviewer or creator saw no findings to act on. The preamble is now ONE const
+  (`PRIOR_CONTEXT_PREAMBLE`, read by both carriers) and the wrapped exec prepends it plus the
+  `<label>\n<output>` blocks to the argv prompt (empty when the unit has none; the pty composer is
+  unreachable in production and untouched); each block's output is clipped like the evaluator's review
+  target (`clip_review_target`, 24 KiB head + 24 KiB tail, elision marked) so the argv prompt stays
+  under Linux's 128 KiB per-argument cap (E2BIG) after verbose creators. `assumptions::parse` anchors the marker after the list /
+  quote gutters (`strip_prefix`, not `find`): a token quoted mid-sentence is prose, no longer a
+  malformed record. `BaseSkill` gains `handed: bool` — the seat's CLI has a per-launch skills lever
+  and intake proved the admitted generation holds the skill — derived at dispatch from BOTH carriers' seat identities
+  (`acp_seat_identity` / `wrapped_seat_identity`; only their agreement reads `true`); additive on the wire (**core-ts** `index.d.ts` doc regenerated once through
+  `scripts/finalize-dts.mjs`; api-types 0.38.0 already types `BaseSkill.handed?`).
+
 - **core-ts 0.7.25** — 2026-09-14 — npm release carrying the six engine changes since 0.7.24 (the
   hardening train, Tier 1), all on main tip ef6c0f9 (plus #458, the 0.7.24 platform-lockfile
   re-stamp). **Behaviour changes, in one place:** **#477** (core#464, S1) — **every denial pauses

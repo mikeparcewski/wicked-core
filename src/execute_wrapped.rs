@@ -1408,7 +1408,7 @@ impl WrappedCliStepRunner {
                     ..
                 })
             );
-        let prompt = if guard_only {
+        let task = if guard_only {
             format!(
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
@@ -1424,6 +1424,11 @@ impl WrappedCliStepRunner {
         } else {
             unit_prompt(input, form, handed)
         };
+        // DES-L4 PR-⑥ (core #470 / F-RC1-094): the run's PRIOR CONTEXT rides the argv prompt
+        // exactly as the ACP carrier sends it as text blocks — same preamble, same
+        // `<label>\n<output>` blocks — so a wrapped reviewer/creator with `depends_on` sees the
+        // work it depends on. Empty (no change) for a unit with no prior outputs.
+        let prompt = format!("{}{task}", prior_context_prefix(&input.prior_outputs));
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
         // F-036: set below when a NO-CODE phase lands on a non-claude seat that exposes no
         // read-only lever — folded into the governance disclosure so the record says which
@@ -3762,6 +3767,46 @@ impl SkillForm {
 /// is a directory read; this is the one place the two meet, so every runner (wrapped, PTY, ACP) gets
 /// the same prompt from the same code rather than three chances to diverge. `form` and `skills`
 /// are the caller's directive inputs (core#396) — see [`skill_prompt`].
+/// The preamble both carriers put before a unit's PRIOR-CONTEXT blocks (FINDING-024 (3); DES-L4
+/// PR-⑥ makes it ONE text): STATE the contract — labelled blobs alone were read as background, and
+/// an `adversarial-review` phase handed the build's output re-solved the original task. The ACP
+/// carrier emits it as its own `session/prompt` text block (`acp_runner`); the wrapped carrier
+/// prepends it to the argv prompt (`prior_context_prefix`). Byte-identical on both.
+pub(crate) const PRIOR_CONTEXT_PREAMBLE: &str = "CONTEXT (prior phases of this run): the block(s) below are the verbatim output \
+of earlier phases in this same workflow run. Blocks marked `depends_on` are the artifacts your \
+phase explicitly declared it consumes — treat them as the SUBJECT of your task, not as background. \
+Build on this work; do not re-solve the original problem from scratch, and do not choose a different \
+target than the one the prior phase worked on. If your phase reviews, tests, or revises, it is that \
+prior output you are reviewing, testing, or revising.";
+
+/// The wrapped carrier's spelling of a unit's prior context (DES-L4 PR-⑥; core #470 / F-RC1-094):
+/// [`PRIOR_CONTEXT_PREAMBLE`], a blank line, then `<label>\n<output>` per block, each followed by a
+/// blank line — the same blocks the ACP carrier sends as separate text parts, flattened for an argv
+/// prompt. Empty when the unit has no prior outputs, so a unit with no declared dependency keeps
+/// the exact prompt it had. Argv path ONLY: the pty composer (`pty_unit_prompt`) is unreachable in
+/// production (its runner has no callers) and is left alone.
+///
+/// BOUNDED (review M3): the whole prefix rides ONE `execve` argument — Linux caps a single argument
+/// at 128 KiB (`MAX_ARG_STRLEN`, E2BIG ⇒ the unit fails to spawn) and a cross-CLI unit receives
+/// EVERY earlier other-CLI output — so each block's output is clipped exactly like the evaluator's
+/// review target ([`crate::cli_runner::clip_review_target`], core#282: 24 KiB head + 24 KiB tail,
+/// elision marked, under the cap untouched). The ACP carrier ships the same blocks over JSON-RPC,
+/// which has no such limit, so it stays unclipped.
+pub(crate) fn prior_context_prefix(prior_outputs: &[crate::workflow::PriorUnitOutput]) -> String {
+    if prior_outputs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(PRIOR_CONTEXT_PREAMBLE);
+    out.push_str("\n\n");
+    for p in prior_outputs {
+        out.push_str(&p.label);
+        out.push('\n');
+        out.push_str(&crate::cli_runner::clip_review_target(p.output.clone()));
+        out.push_str("\n\n");
+    }
+    out
+}
+
 pub(crate) fn unit_prompt(
     input: &StepInput,
     form: SkillForm,
@@ -4926,9 +4971,9 @@ mod tests {
             "scope pinned to resolve_scope: {}",
             g.scope
         );
-        // `--settings <file>` inserted right after the binary (parses as a flag, before the prompt).
-        // `--mcp-config` is injected FIRST, so `--settings` still lands at position 1/2 — the layout
-        // other callers read (DES-GROUNDING-001 §3.1).
+        // `--settings <file>` inserted right after the binary (parses as a flag, before the prompt) —
+        // the ONLY per-unit config file since D-7 (DES-L4 PR-⑦ deleted the `--mcp-config` hand-off),
+        // so it lands at position 1/2, the layout other callers read.
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "--settings");
         let settings_path = std::path::PathBuf::from(&argv[2]);
@@ -7117,6 +7162,75 @@ mod tests {
         assert!(
             !skill_prompt(&internal, None, SkillForm::ClaudePlugin, None).contains(verdict),
             "an engine-internal evaluator session must not carry the VERDICT line"
+        );
+    }
+
+    /// DES-L4 PR-⑥ (core #470 / F-RC1-094): the wrapped argv prompt carries the run's prior
+    /// context in the ACP carrier's exact shape — the ONE preamble, a blank line, then
+    /// `<label>\n<output>` per block — before the task; a unit with no prior outputs keeps the exact
+    /// prompt it had (empty prefix). The preamble is the same const the ACP carrier's text block
+    /// reads, so the two carriers cannot word the contract differently.
+    #[test]
+    fn the_wrapped_prompt_carries_prior_context_in_the_acp_shape() {
+        use crate::workflow::PriorUnitOutput;
+        assert_eq!(
+            prior_context_prefix(&[]),
+            "",
+            "no prior outputs ⇒ no prefix"
+        );
+        let priors = vec![
+            PriorUnitOutput {
+                label: "[claude — unit 1 — depends_on `build`]".into(),
+                output: "diff --git a/x b/x\n+fixed".into(),
+            },
+            PriorUnitOutput {
+                label: "[codex — unit 2]".into(),
+                output: "review notes".into(),
+            },
+        ];
+        let prefix = prior_context_prefix(&priors);
+        assert_eq!(
+            prefix,
+            format!(
+                "{PRIOR_CONTEXT_PREAMBLE}\n\n[claude — unit 1 — depends_on `build`]\ndiff --git \
+                 a/x b/x\n+fixed\n\n[codex — unit 2]\nreview notes\n\n"
+            )
+        );
+        assert!(
+            PRIOR_CONTEXT_PREAMBLE.starts_with("CONTEXT (prior phases of this run):")
+                && PRIOR_CONTEXT_PREAMBLE.contains("treat them as the SUBJECT of your task")
+                && !PRIOR_CONTEXT_PREAMBLE.contains('\n'),
+            "the preamble is the FINDING-024 contract, single-line"
+        );
+        // Review M3: a verbose prior output is clipped per block (the prefix rides ONE execve
+        // argument; Linux caps it at 128 KiB), with the elision marked; a small block is untouched.
+        let huge = vec![PriorUnitOutput {
+            label: "[codex — unit 3]".into(),
+            output: "x".repeat(200 * 1024),
+        }];
+        let clipped = prior_context_prefix(&huge);
+        assert!(
+            clipped.len() < 64 * 1024 && clipped.contains("[...elided by harness:"),
+            "a 200 KiB prior output must be clipped to the review-target bound: {} bytes",
+            clipped.len()
+        );
+        // The launcher only carries it if `exec` calls the helper — production-scoped guard, the
+        // same pattern as `the_launcher_wires_the_worker_estate_channel`.
+        let src = include_str!("execute_wrapped.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production prefix before any test module");
+        assert!(
+            production.contains("prior_context_prefix(&input.prior_outputs)"),
+            "the wrapped exec no longer prepends the run's prior context (core #470)"
+        );
+        // And the ACP carrier reads the SAME const (no second wording).
+        let acp = include_str!("acp_runner.rs");
+        assert!(
+            acp.contains("crate::execute_wrapped::PRIOR_CONTEXT_PREAMBLE")
+                && !acp.contains("\"CONTEXT (prior phases of this run)"),
+            "the ACP carrier must read the shared preamble const, not its own literal"
         );
     }
 
@@ -10034,22 +10148,24 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
     }
 }
 
-/// END-TO-END: the project graph a launcher binds becomes the `--db` in the worker's real
-/// `settings.json`.
+/// END-TO-END: the project graph a launcher binds becomes the worker's estate store pin — the
+/// `GovLaunch::code_graph_db` that `arm_worker_estate_channel` hands the worker as
+/// `WICKED_ESTATE_DB` (D-7, DES-L4 PR-⑦: the CLI-registered estate MCP and its `--mcp-config` file
+/// are gone; the env pin is the one graph hand-off).
 ///
 /// Every other test of this seam stops somewhere short of that. The unit tests call
-/// `actor::project_code_graph_db` directly; the proof harness stops at `repo_estate_mcp_parts`;
+/// `actor::project_code_graph_db` directly; the proof harness stops at `run_code_graph_db`;
 /// `arm_input_governance_writes_a_pretool_settings_file_and_returns_env` starts from a
 /// hand-built `GovernanceContext`. None of them shows the value SURVIVING the whole trip, and the
 /// trip is where a binding gets dropped: `LaunchSpec` → actor → `AgentSession` → `dispatch_unit`
 /// → `run_code_graph_db` → `StepInput.governance` → `arm_input_governance` →
-/// `repo_estate_mcp_parts` → the `--mcp-config` file's `mcpServers.wicked-estate.args` → the argv a
-/// worker is launched with.
+/// `GovLaunch::code_graph_db` → `arm_worker_estate_channel` → `WICKED_ESTATE_DB` on the worker
+/// Command a unit is launched with.
 ///
 /// This drives a REAL run through a REAL actor against a file-backed store (so governance arms),
 /// with a real registered git repo that has its OWN graph on disk — so a broken preference shows
-/// up as the repo graph rather than as nothing — and reads the answer out of the mcp-config file the
-/// engine wrote.
+/// up as the repo graph rather than as nothing — and reads the answer off the launch record the
+/// `ArmingRunner` captured from `arm_input_governance`.
 #[cfg(test)]
 mod project_graph_end_to_end_tests {
     use super::*;

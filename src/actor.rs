@@ -6148,9 +6148,36 @@ fn dispatch_unit(
                 .base_skill_ref
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .map(|name| crate::event::BaseSkill {
-                    name: name.to_string(),
-                    role: unit.role.token().to_string(),
+                .map(|name| {
+                    // (#479, DES-L4 PR-⑥; review M2) Handed iff the seat's CLI has a per-launch
+                    // skills lever ON THE CARRIER THAT WILL RUN IT: intake (`admit_base_skill`)
+                    // already proved the admitted generation holds the skill, so the seat's FORM
+                    // is the remaining fact. Routing cannot know which carrier a launch takes
+                    // (ACP first, the wrapped runner as its fallback), so BOTH carriers' own
+                    // identity resolutions are judged — the same pair `distribute::seat_is_claude`
+                    // composes — and only their agreement reads `true`; a seat the two would
+                    // disagree about (copilot behind a separate ACP bridge, a `clis.toml` override
+                    // whose binary is not its key, an ad-hoc template) reads `false`: the run only
+                    // NAMED the discipline. Default seat = claude, as `exec`'s `cli_key` resolves it.
+                    use crate::execute_wrapped::SkillForm;
+                    let seat = unit
+                        .assigned_cli
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .unwrap_or("claude");
+                    let acp = SkillForm::for_cli(&crate::acp_runner::acp_seat_identity(seat));
+                    let wrapped =
+                        SkillForm::for_cli(&crate::execute_wrapped::wrapped_seat_identity(
+                            seat,
+                            unit.assigned_invocation.clone(),
+                        ));
+                    crate::event::BaseSkill {
+                        name: name.to_string(),
+                        role: unit.role.token().to_string(),
+                        handed: !matches!(acp, SkillForm::Unloaded)
+                            && !matches!(wrapped, SkillForm::Unloaded),
+                    }
                 }),
         },
     );

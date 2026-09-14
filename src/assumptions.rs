@@ -65,12 +65,15 @@ pub const EVALUATOR_VERDICT_CONVENTION: &str = " ||| VERDICT (evaluator unit): m
 pub fn parse(output: &str) -> Vec<ExternalTransform> {
     let mut found = Vec::new();
     for line in output.lines() {
-        let line = line.trim();
-        // Tolerate leading list markers / quote gutters agents love to add.
-        let Some(ix) = line.find(MARKER) else {
+        // Tolerate leading list markers / quote gutters agents love to add — but ANCHOR the marker
+        // (DES-L4 PR-⑥, F-RC1-096): after the gutters the line must START with it. A token quoted
+        // mid-sentence ("… the ASSUMPTION[external-transform] convention says …") is prose, not a
+        // record; `find` used to parse every such mention as a malformed marker.
+        let line = strip_gutters(line.trim());
+        let Some(rest) = line.strip_prefix(MARKER) else {
             continue;
         };
-        let rest = line[ix + MARKER.len()..].trim();
+        let rest = rest.trim();
 
         let (fields, detail) = match rest.split_once("::") {
             Some((f, d)) => (f.trim(), d.trim()),
@@ -121,6 +124,31 @@ pub fn parse(output: &str) -> Vec<ExternalTransform> {
         }
     }
     found
+}
+
+/// Strip the list / quote gutters agents put before a marker line — `- `, `* `, `> ` (repeated,
+/// in any order) and a numbered `12. ` — and nothing else, so a marker buried mid-sentence stays
+/// prose. Pure; returns a slice of the input.
+fn strip_gutters(mut s: &str) -> &str {
+    loop {
+        let t = s.trim_start();
+        if let Some(rest) = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| t.strip_prefix("> "))
+        {
+            s = rest;
+            continue;
+        }
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 {
+            if let Some(rest) = t[digits..].strip_prefix(". ") {
+                s = rest;
+                continue;
+            }
+        }
+        return t;
+    }
 }
 
 /// The single whitespace-delimited token following `key`, if present.
@@ -183,6 +211,23 @@ mod tests {
             parse("ASSUMPTION[external-transform] library=x transform=y confidence=certain :: z");
         assert_eq!(got.len(), 1);
         assert!(!got[0].known);
+    }
+
+    /// F-RC1-096 (DES-L4 PR-⑥): the marker is ANCHORED — gutters are stripped, but a token quoted
+    /// mid-sentence is prose, not a record. Mutation: `find` instead of `strip_prefix` → the prose
+    /// line parses as a malformed placeholder and the count is 3.
+    #[test]
+    fn a_marker_mentioned_mid_sentence_is_prose_and_gutters_are_stripped() {
+        let out = "The skill text says: record each one as ASSUMPTION[external-transform] library=… \
+                   — and I found none.\n\
+                   > ASSUMPTION[external-transform] library=libpostal transform=normalization confidence=known :: ok\n\
+                   2. * ASSUMPTION[external-transform] library=stripe transform=tax confidence=needs-research :: tbd\n";
+        let got = parse(out);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].library, "libpostal");
+        assert_eq!(got[1].library, "stripe");
+        assert_eq!(strip_gutters("  - > * 3. ASSUMPTION[x]"), "ASSUMPTION[x]");
+        assert_eq!(strip_gutters("prose ASSUMPTION[x]"), "prose ASSUMPTION[x]");
     }
 
     #[test]

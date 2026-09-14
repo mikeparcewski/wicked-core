@@ -72,9 +72,12 @@ const HAND_AUTHORED = `${BEGIN}
  * the assigned seat runs under — 'advisory' = no OS write boundary on the seat record, command-text
  * fences + worktree guard only); worktreeRetained {session, path, reason} (a terminal run's worktree
  * kept because it holds uncommitted work — cancel included).
- * core#468 (additive): unitDispatched carries \`baseSkill: {name, role} | null\` — the run's
+ * core#468 (additive): unitDispatched carries \`baseSkill: {name, role, handed} | null\` — the run's
  * role-keyed BASE skill directive (\`role\` is 'creator' | 'evaluator' | 'neutral'), null when the
  * run declares none; the generation it is handed from is the same unit's skillsSnapshotHanded.gen.
+ * core#479 (additive, DES-L4 PR-⑥): \`baseSkill.handed: boolean\` — true when the seat's CLI has a
+ * per-launch skills lever and the admitted generation holds the skill (the directive names a skill
+ * the seat can invoke); false for a lever-less seat, which is told the discipline is NOT loaded.
  * core#467/#469/F-RC2-009 additions (all additive): repoChecksEvaluated carries \`outcome: 'passed' |
  * 'failed' | 'timed_out' | 'not_run'\` (a timed-out floor denies under source 'repo_checks_timeout',
  * never 'repo_checks'), \`floor: 'creator' | 'verify'\`, \`claim: {phrase, check, verdict} | null\` and

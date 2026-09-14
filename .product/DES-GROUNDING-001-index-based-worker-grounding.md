@@ -1,6 +1,7 @@
 # DES-GROUNDING-001 — Index-based grounding for governed workers
 
 - **Status:** PROPOSED (rev 2 — incorporates adversarial review)
+- **Superseded in part (2026-09-14, FIX-IT-ALL L4-⑦ / decision D-7):** the §3.1 `--mcp-config` + `permissions.allow` hand-off and the ACP `session/new` `mcpServers` estate server are DELETED on both carriers, units and chats (wicked-core PR-⑦, core-ts 0.7.26). Grounding is the §7 shim path ONLY: the graph rides `WICKED_ESTATE_DB` on every worker child (both carriers now), read-only rides garden's `WICKED_ESTATE_READONLY=1`, and the gate hook's estate fence audits `--readonly` + the store pin on each call. §2, §3.1, §4 items 2–3 and §5 describe the retired transport and stand as history; §3.0 (read-only binary mode) and §7 stand.
 - **Date:** 2026-09-05
 - **Scope:** wicked-estate (read-only MCP mode), wicked-core (carrier wiring — keystone), wicked-crew (interactive grounding clause)
 - **Related:** DES-INPUT-GOV-008 (governed MCP tool server), CREW-UX-8 (repo-snapshot grounding, superseded in part), FINDING-067 (operational-store wipe), FINDING-122 (one estate-MCP helper, two carrier shapes)
