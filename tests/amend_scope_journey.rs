@@ -226,6 +226,8 @@ fn a_creator_scoped_steer_reaches_fix_only_and_no_prior_context_block() {
             .find(|(o, _, _)| *o == ord)
             .unwrap_or_else(|| panic!("ord {ord} ran: {handed:?}"))
     };
+    // triage ran BEFORE the gate, so its "no steer" is trivially true (review-L1-stack LOW 2);
+    // reproduce (the read-only cursor) and verify are the load-bearing assertions.
     assert!(
         !by_ord(1).1.contains("Implement X"),
         "triage: {}",
