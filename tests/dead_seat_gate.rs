@@ -132,6 +132,7 @@ impl StepRunner for OkRunner {
 
 fn spec(sid: &str) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Build the thing.".into(),
         clis: vec![cli("codex"), cli("claude")],
