@@ -6864,37 +6864,72 @@ mod tests {
         judge.session_id = "validator".into();
         assert!(!skill_prompt(&judge, None, SkillForm::ClaudePlugin, None).contains(line));
 
-        // (7) pty budget: the shipped bug def's verify unit carries the line and fits one turn.
-        let def = crate::workflow::bug_def();
-        let units = crate::plan::plan_from_def(&def, "fix the null deref in the parser", "s");
-        let verify = units
-            .iter()
-            .find(|u| u.role == PhaseRole::Evaluator)
-            .expect("bug.verify is the def's evaluator");
-        let input = StepInput {
-            run_id: "s".into(),
-            unit_ix: 3,
-            attempt: 0,
-            unit: verify.clone(),
-            workflow_id: "wf".into(),
-            entity_mode: crate::scope::EntityMode::Shared,
-            workdir: None,
-            governance: None,
-            prior_outputs: Vec::new(),
-            elicitation_epoch: 0,
-            process_gen: None,
-            launch_seq: 0,
-            required_skills: Vec::new(),
-        };
-        for form in forms {
-            let p = pty_unit_prompt(&input, form)
-                .expect("bug.verify fits a pty turn with the verdict line appended");
-            assert!(
-                p.ends_with(line) && !p.contains('\n') && p.len() + 1 <= PTY_PROMPT_LIMIT,
-                "{form:?}: {} bytes: {p}",
-                p.len()
-            );
+        // (7) EVERY shipped Evaluator agent unit — the drop-in `workflows/*.json` are what reach the
+        // engine (a same-id file replaces the compiled def; `builtin_floors` tests the same set) —
+        // planned as the planner plans it, carries the line on all three forms and fits a pty turn
+        // newline-free. The set is PINNED (review-L1-513: a FIFTH evaluator, `domain-graph-slice/
+        // validate`, was not in the DES's list) so a sixth shipped evaluator fails here by name.
+        let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+        let mut evaluators: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let def = crate::workflow::WorkflowRegistry::def_from_file(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let units = crate::plan::plan_from_def(&def, "fix the null deref in the parser", "s");
+            for (ix, u) in units.iter().enumerate() {
+                if u.role != PhaseRole::Evaluator || u.tool_cmd.is_some() {
+                    continue;
+                }
+                evaluators.push(format!("{}/{}", def.id, u.phase_id().unwrap_or("?")));
+                let input = StepInput {
+                    run_id: "s".into(),
+                    unit_ix: ix,
+                    attempt: 0,
+                    unit: u.clone(),
+                    workflow_id: "wf".into(),
+                    entity_mode: crate::scope::EntityMode::Shared,
+                    workdir: None,
+                    governance: None,
+                    prior_outputs: Vec::new(),
+                    elicitation_epoch: 0,
+                    process_gen: None,
+                    launch_seq: 0,
+                    required_skills: Vec::new(),
+                };
+                for form in forms {
+                    let p = skill_prompt(u, None, form, None);
+                    assert!(p.ends_with(line), "{}/{} {form:?}: {p}", def.id, u.ord);
+                    let p = pty_unit_prompt(&input, form).unwrap_or_else(|e| {
+                        panic!(
+                            "{}/{} fits a pty turn with the verdict line: {e}",
+                            def.id, u.ord
+                        )
+                    });
+                    assert!(
+                        p.ends_with(line) && !p.contains('\n') && p.len() < PTY_PROMPT_LIMIT,
+                        "{}/{} {form:?}: {} bytes: {p}",
+                        def.id,
+                        u.ord,
+                        p.len()
+                    );
+                }
+            }
         }
+        evaluators.sort();
+        assert_eq!(
+            evaluators,
+            vec![
+                "bug/verify",
+                "domain-extraction/coverage",
+                "domain-graph-slice/validate",
+                "feature/adversarial-review",
+                "migration/verify",
+            ],
+            "the shipped Evaluator agent units the verdict contract reaches — pinned by name"
+        );
     }
 
     /// core#468: the BASE skill directive leads every work unit's prompt when the run declares

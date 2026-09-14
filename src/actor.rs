@@ -8087,6 +8087,35 @@ mod substance_gate_tests {
         output_text: &str,
         governed: bool,
     ) -> (StepApplied, AgentSession, WorkUnit) {
+        fold_inner(
+            store,
+            subs,
+            run_id,
+            output_text,
+            governed,
+            crate::workflow::UnitEvidence::default(),
+        )
+    }
+
+    /// [`fold`] with the worker's evidence attached (an ungoverned fold) — for the floor cases.
+    fn fold_with_evidence(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        output_text: &str,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (StepApplied, AgentSession, WorkUnit) {
+        fold_inner(store, subs, run_id, output_text, false, evidence)
+    }
+
+    fn fold_inner(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        output_text: &str,
+        governed: bool,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (StepApplied, AgentSession, WorkUnit) {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let out = StepOutput {
@@ -8107,7 +8136,7 @@ mod substance_gate_tests {
             &tx,
             out,
             None,
-            crate::workflow::UnitEvidence::default(),
+            evidence,
             "",
             &None,
             &None,
@@ -8611,6 +8640,92 @@ mod substance_gate_tests {
             ("verdict_not_pass", "evaluator_verdict")
         );
         assert!(paused.3.contains("no `VERDICT:` line"), "{}", paused.3);
+    }
+
+    /// Review-L1-513 LOW 4 (DES §7 (5)): a NEUTRAL unit is not read either — its prose may quote
+    /// a `VERDICT: FAIL` line (a triage phase summarising a failed review) and it completes with
+    /// `evaluatorVerdict: null`.
+    #[test]
+    fn a_neutral_unit_is_never_parsed_for_an_evaluator_verdict() {
+        let run_id = format!("evaluator-verdict-neutral-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Neutral);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (applied, session, unit) = fold(
+            &mut store,
+            &mut subs,
+            &run_id,
+            "triage: the previous review ended `VERDICT: FAIL`; the report reproduces on main.",
+            false,
+        );
+        assert!(
+            matches!(applied, StepApplied::Finished),
+            "an approved fold finalizes the single-unit run"
+        );
+        assert_eq!(session.status, SessionStatus::Completed);
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(evaluator_verdict_of(&drain_events(&erx)), Some(None));
+    }
+
+    /// Review-L1-513 LOW 5 — the OTHER ordering direction: an Evaluator that wrote `VERDICT: PASS`
+    /// over a RED deterministic floor is denied by the FLOOR (the chain leads with the floors; the
+    /// verdict slot sits after them) — `gateEscalated{floor_failed, repo_checks}` names the gate
+    /// while the record still carries the evaluator's own `evaluatorVerdict: "PASS"`.
+    #[test]
+    fn a_pass_verdict_over_a_red_floor_is_denied_by_the_floor_which_names_the_gate() {
+        let run_id = format!("evaluator-verdict-red-floor-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Evaluator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        // A verify floor that RAN and FAILED — the shape `repo_checks::run_floor` reports when the
+        // repository's own test command exits non-zero (no sandbox error: the floor did run).
+        let report: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [],
+                "checks": [{
+                    "name": "test", "argv": ["cargo", "test"], "source": "Cargo.toml",
+                    "exit_code": 101, "timed_out": false, "duration_ms": 1200,
+                    "stdout_tail": "", "stderr_tail": "test result: FAILED. 1 failed"
+                }],
+                "skipped": [],
+                "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap();
+        let evidence = crate::workflow::UnitEvidence {
+            repo_checks: Some(report),
+            ..Default::default()
+        };
+        let (applied, session, unit) = fold_with_evidence(
+            &mut store,
+            &mut subs,
+            &run_id,
+            "Reviewed the fix; the change is correct.\nVERDICT: PASS",
+            evidence,
+        );
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("repo_checks"),
+            "the floor, not the verdict, is the denying layer"
+        );
+        let evs = drain_events(&erx);
+        assert_eq!(
+            evaluator_verdict_of(&evs),
+            Some(Some("PASS".to_string())),
+            "the evaluator's own token is still recorded beside the floor's denial"
+        );
+        let (escalated, _paused) = gate_shape(&evs);
+        assert_eq!(
+            (escalated.0.as_str(), escalated.1.as_str()),
+            ("floor_failed", "repo_checks")
+        );
     }
 
     /// The layer reads ONLY Evaluator agent units: a Creator whose prose quotes a `VERDICT: FAIL`

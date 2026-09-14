@@ -1709,6 +1709,15 @@ const EVALUATOR_FINDINGS_CAP: usize = 4096;
 /// count rule: `CONDITIONAL`, `APPROVE`, `REJECT`, `SKIP`, a bare head and no line at all are all
 /// NOT PASS, each named in [`EvaluatorVerdict::denial_reason`]. Pure; never sees a unit that is not
 /// an Evaluator agent unit (the fold gates on the same predicate as the prompt line).
+///
+/// Grammar-inherent limits (review-L1-513 LOW 6 — for the evaluator TEXT garden/crew carry, not
+/// this parser): `VERDICT: PASS (with conditions)` reads PASS (the token is the first word — a
+/// condition must be spelled `VERDICT: FAIL` with the condition as the finding); a numbered-list
+/// line `1. VERDICT: FAIL` is not a verdict line (`1.` is the first token) → MISSING → the gate
+/// (fail-closed, harmless); an echoed contract sentence as the LAST line (`VERDICT: PASS or
+/// VERDICT: FAIL`) reads PASS — the text forbids quoting another `VERDICT:` line and asks for the
+/// verdict LAST. No ambiguity rule is added here by ruling (des-adjudicated §4.1: no alias table,
+/// no count rule).
 pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
     let norm = |t: &str| {
         t.trim_matches(|c: char| !c.is_alphanumeric())
