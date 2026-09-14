@@ -2349,6 +2349,32 @@ mod tests {
         assert!(j["reason"].is_null(), "{j}");
     }
 
+    /// DES-L1 PR-1C: `unitReworkAmended.scope` renders WHICH arm landed the amendment — `cursor`
+    /// (today's approve), `creator` (`amendScope: creator`), `request_changes` (the rewound
+    /// creator) — beside the ord it landed on, so a skin can say "steer landed on fix (creator)"
+    /// and a consumer can tell an intake steer from a rework without diffing descriptions.
+    #[test]
+    fn unit_rework_amended_to_json_names_the_scope() {
+        for scope in ["cursor", "creator", "request_changes"] {
+            let j = CoreEvent::UnitReworkAmended {
+                session: "run-1".into(),
+                ord: 3,
+                amendment: "Implement X".into(),
+                updated_description: "fix the bug (operator amendment: Implement X)".into(),
+                scope: scope.into(),
+            }
+            .to_json();
+            assert_eq!(j["type"], "unitReworkAmended");
+            assert_eq!(j["ord"], 3);
+            assert_eq!(j["scope"], scope);
+            assert_eq!(j["amendment"], "Implement X");
+            assert_eq!(
+                j["updatedDescription"],
+                "fix the bug (operator amendment: Implement X)"
+            );
+        }
+    }
+
     /// core#431 (F-3R2-007): `gateEvaluated` names the judge — `judgeCli` + `judgeDistinct` ride
     /// beside the verdict, emitted unconditionally (`null` when no judge ran), so evaluator ≠
     /// creator is auditable from the event stream. Mutation: drop either key from the to_json arm
