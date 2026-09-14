@@ -2980,12 +2980,14 @@ struct TurnResult {
     /// Carried as a field now so the `ToolInvoked` event is uniform across runners; populating it
     /// from ACP frames is the scoped follow-up.
     tools: Vec<String>,
-    /// Byte offset into `output` where the text emitted AFTER the turn's last `tool_call` starts —
-    /// the ANSWER, as opposed to the narration a model speaks between tool calls ("Let me look
-    /// at…"). `0` when the turn made no tool call (the whole output is the answer). Chat replies
-    /// slice here (F-W1-004, R-L5-2); unit outputs stay whole (prior-output injection and the
-    /// evaluator verdict line read the full text).
-    answer_from: usize,
+    /// The turn's ANSWER — the text emitted AFTER its last `tool_call`, as opposed to the narration
+    /// a model speaks between tool calls ("Let me look at…"). Assembled by
+    /// [`answer_after_last_tool_call`] from the RAW accumulation (never an offset into `output`,
+    /// which the banner strip and the trim rewrite), and EMPTY only when the turn produced nothing
+    /// — a turn that answered before its last tool call, or called no tool at all, carries its
+    /// whole output here. Chat replies surface it (F-W1-004, R-L5-2); unit outputs stay `output`
+    /// (prior-output injection and the evaluator verdict line read the full text).
+    answer: String,
 }
 
 impl TurnResult {
@@ -2999,24 +3001,20 @@ impl TurnResult {
             usage: None,
             files: Vec::new(),
             tools: Vec::new(),
-            answer_from: 0,
+            answer: String::new(),
         }
     }
 
-    /// The reply a CHAT surfaces (F-W1-004): the text after the turn's last tool call, banner-
-    /// stripped and trimmed — or, when nothing was said after the last tool call, the whole output
-    /// (loss-averse: a reply is never emptied by a trailing tool call). The narration before it was
-    /// already streamed as deltas, where the studio narrates it; it never re-enters the answer.
+    /// The reply a CHAT surfaces (F-W1-004): the turn's [`TurnResult::answer`] — the text after its
+    /// last tool call — falling back to the whole output on any path that filled no answer (a
+    /// directly-constructed result, [`TurnResult::default_failed`]). The narration before the
+    /// answer was already streamed as deltas, where the studio narrates it; it never re-enters the
+    /// reply. NEVER empty unless the turn produced no text at all.
     fn chat_answer(&self) -> String {
-        let tail = self
-            .output
-            .get(self.answer_from.min(self.output.len())..)
-            .unwrap_or("");
-        let answer = strip_pi_banner(tail).trim_end().to_string();
-        if answer.is_empty() {
-            strip_pi_banner(&self.output).trim_end().to_string()
+        if self.answer.is_empty() {
+            self.output.clone()
         } else {
-            answer
+            self.answer.clone()
         }
     }
 }
@@ -4015,7 +4013,9 @@ fn exec_turn_acp_posture(
         // output injections derived from them, and chat replies alike. Deltas already streamed
         // raw — cosmetic only; every durable consumer reads this assembled form.
         output: strip_pi_banner(&output).trim_end().to_string(),
-        answer_from,
+        // F-W1-004: the answer is cut from the RAW accumulation (`answer_from` indexes it), not
+        // from the stripped/trimmed `output` above — see `answer_after_last_tool_call`.
+        answer: answer_after_last_tool_call(&output, answer_from),
         status: if found {
             StepStatus::Ok
         } else if elicitation_timed_out
@@ -4267,6 +4267,34 @@ fn answer_permission_request<W: Write>(
 }
 
 /// Process one `session/update` notification — extract text chunks and usage.
+/// The turn's ANSWER out of the RAW accumulated output and the offset of its last `tool_call`
+/// start (F-W1-004, R-L5-2).
+///
+/// Sliced BEFORE the banner strip on purpose: `answer_from` indexes the raw accumulation, while
+/// `TurnResult.output` is that text banner-stripped and trimmed — a strip at the head shifts every
+/// offset, so slicing the stripped copy would cut mid-answer (or off a char boundary) on exactly
+/// the seats that print a banner. The slice is then stripped and trimmed on BOTH ends: the cut
+/// falls at a tool-call boundary, so the leading blank line an agent writes after a tool result is
+/// an artifact of where we cut, not content.
+///
+/// Falls back to the whole (stripped, trimmed) output whenever the slice yields nothing — the turn
+/// called no tool (`answer_from == 0`), or it wrote its answer BEFORE its last tool call and said
+/// nothing after it. So the reply is never emptied by where the tool calls happened to fall; the
+/// worst case is today's behaviour, narration included.
+fn answer_after_last_tool_call(raw: &str, answer_from: usize) -> String {
+    let tail = if answer_from == 0 || answer_from >= raw.len() {
+        ""
+    } else {
+        raw.get(answer_from..).unwrap_or("")
+    };
+    let answer = strip_pi_banner(tail).trim().to_string();
+    if answer.is_empty() {
+        strip_pi_banner(raw).trim_end().to_string()
+    } else {
+        answer
+    }
+}
+
 fn handle_update(
     v: &Value,
     emit: &DeltaSink,
@@ -13306,11 +13334,13 @@ acp_input_governance = true
         assert!(r.drain_operator_messages("run1", "claude").is_empty());
     }
 
-    /// F-W1-004 (R-L5-2): a `tool_call` START bumps `answer_from` to the output so far — the text
-    /// before it is narration a chat never repeats in its reply — and `chat_answer` slices there,
-    /// banner-stripped; when nothing follows the last tool call the whole output stands (loss-averse).
+    /// F-W1-004 (R-L5-2): a `tool_call` START bumps `answer_from` to the output so far, and
+    /// `answer_after_last_tool_call` cuts the answer there — out of the RAW accumulation, so a
+    /// stripped banner cannot shift the cut. Every "nothing after the last tool call" shape
+    /// (answer BEFORE the tool call, a trailing tool call, a whitespace-only tail, no tool call at
+    /// all) falls back to the whole output: a reply is never empty when the turn said anything.
     #[test]
-    fn a_tool_call_starts_the_answer_and_the_chat_reply_is_the_text_after_the_last_one() {
+    fn the_chat_answer_is_the_text_after_the_last_tool_call_and_is_never_emptied() {
         let mut output = String::new();
         let mut usage: Option<Usage> = None;
         let mut files = Vec::new();
@@ -13322,102 +13352,86 @@ acp_input_governance = true
         };
         let tool_call = json!({"params": {"update": {"sessionUpdate": "tool_call",
             "toolCallId": "t1", "title": "Read", "kind": "read", "status": "pending"}}});
-        handle_update(
+        let mut feed = |v: &Value, output: &mut String, answer_from: &mut usize| {
+            handle_update(v, &emit, output, &mut usage, &mut files, 1024, answer_from);
+        };
+
+        // Narration, a tool call, more narration, a tool call, then the answer.
+        feed(
             &chunk("Let me look at the scope. "),
-            &emit,
             &mut output,
-            &mut usage,
-            &mut files,
-            1024,
             &mut answer_from,
         );
         assert_eq!(
             answer_from, 0,
             "no tool call yet — the whole text would be the answer"
         );
-        handle_update(
-            &tool_call,
-            &emit,
-            &mut output,
-            &mut usage,
-            &mut files,
-            1024,
-            &mut answer_from,
-        );
+        feed(&tool_call, &mut output, &mut answer_from);
         assert_eq!(answer_from, "Let me look at the scope. ".len());
-        handle_update(
-            &chunk("Now the files. "),
-            &emit,
-            &mut output,
-            &mut usage,
-            &mut files,
-            1024,
-            &mut answer_from,
-        );
-        handle_update(
-            &tool_call,
-            &emit,
-            &mut output,
-            &mut usage,
-            &mut files,
-            1024,
-            &mut answer_from,
-        );
-        handle_update(
-            &chunk("The answer.\n"),
-            &emit,
-            &mut output,
-            &mut usage,
-            &mut files,
-            1024,
-            &mut answer_from,
-        );
-        let turn = TurnResult {
-            output: output.clone(),
-            status: StepStatus::Ok,
-            usage: None,
-            files: Vec::new(),
-            tools: Vec::new(),
-            answer_from,
-        };
+        feed(&chunk("Now the files. "), &mut output, &mut answer_from);
+        feed(&tool_call, &mut output, &mut answer_from);
+        feed(&chunk("\n\nThe answer.\n"), &mut output, &mut answer_from);
+        // Trimmed BOTH ends: the blank line after a tool result is where we cut, not content.
         assert_eq!(
-            turn.output,
-            "Let me look at the scope. Now the files. The answer.\n"
-        );
-        assert_eq!(
-            turn.chat_answer(),
+            answer_after_last_tool_call(&output, answer_from),
             "The answer.",
-            "the reply is the block after the LAST tool call, trimmed"
+            "the answer is the block after the LAST tool call"
         );
-        // A trailing tool call with nothing said after it: the reply is not emptied.
-        handle_update(
-            &tool_call,
-            &emit,
-            &mut output,
-            &mut usage,
-            &mut files,
-            1024,
-            &mut answer_from,
-        );
-        let trailing = TurnResult {
-            output: output.clone(),
-            answer_from,
-            ..turn
-        };
+
+        // A trailing tool call with nothing after it — the reviewer's case: the seat answered
+        // BEFORE its last tool call. The reply is the whole output, never empty.
+        let mut trailing = output.clone();
+        let mut tf = answer_from;
+        feed(&tool_call, &mut trailing, &mut tf);
+        assert_eq!(tf, trailing.len());
+        let whole = "Let me look at the scope. Now the files. \n\nThe answer.";
+        assert_eq!(answer_after_last_tool_call(&trailing, tf), whole);
+        // Same when only whitespace follows the last tool call.
+        let mut ws = trailing.clone();
+        let wf = tf;
+        ws.push_str("   \n");
+        assert_eq!(answer_after_last_tool_call(&ws, wf), whole);
+        // No tool call at all: the whole output, exactly as before this change.
         assert_eq!(
-            trailing.chat_answer(),
-            "Let me look at the scope. Now the files. The answer."
+            answer_after_last_tool_call("Just an answer.", 0),
+            "Just an answer."
         );
-        // No tool call at all: the whole output is the answer (today's behaviour).
-        let plain = TurnResult {
-            output: "Just an answer.".into(),
+        // An offset past the end (a truncated accumulation) degrades to the whole output.
+        assert_eq!(
+            answer_after_last_tool_call("Just an answer.", 9_999),
+            "Just an answer."
+        );
+        // A BANNER at the head shifts every offset in the stripped copy — the cut is taken from
+        // the raw text, so the answer survives (slicing `output` here would have cut mid-word).
+        let banner = "pi v0.83.0\n---\n\n## Skills\n- /x/SKILL.md\n\n---\n";
+        let raw = format!("{banner}Let me look. THE ANSWER after the tool call.");
+        let at = raw.len() - "THE ANSWER after the tool call.".len();
+        assert_eq!(
+            answer_after_last_tool_call(&raw, at),
+            "THE ANSWER after the tool call."
+        );
+
+        // `chat_answer()` surfaces the field, and falls back to `output` for a result that
+        // carries none (a directly-constructed one, `default_failed`).
+        let turn = TurnResult {
+            output: "Let me look. The answer.".into(),
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
             tools: Vec::new(),
-            answer_from: 0,
+            answer: "The answer.".into(),
         };
-        assert_eq!(plain.chat_answer(), "Just an answer.");
+        assert_eq!(turn.chat_answer(), "The answer.");
+        assert_eq!(
+            TurnResult {
+                answer: String::new(),
+                ..turn
+            }
+            .chat_answer(),
+            "Let me look. The answer.",
+            "a result with no answer replies with its whole output, never empty"
+        );
+        assert_eq!(TurnResult::default_failed().chat_answer(), "");
     }
 
     #[test]
