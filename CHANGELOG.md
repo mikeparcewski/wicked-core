@@ -15,6 +15,17 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Governance Bash scan sees through one wrapper level (core #475).** `bash_write_targets` (the
+  FINDING-045 write fence) and `classify_estate_command` (the estate allowlist) matched only a bare
+  program word: `sh -lc 'echo x > src/y'`, `exec tee src/y`, `xargs tee src/y`, `nice`/`timeout`
+  wrappers and a QUOTED program word (`"cp" a src/y`) all matched nothing. Both consumers now share
+  `unwrap_program`: a fixed seven-word table (`sh`/`bash`/`zsh`/`dash` with a flag cluster ending in
+  `c` → the string is rescanned as its own command line; `exec`; `xargs [flags]`; `env [flags]
+  [NAME=val]…`; `nice [-n N]`; `timeout [flags] <duration>`) plus one quoting rule (one layer of
+  quotes off the program word before the basename match). ONE level only — a nested `-c`, inline
+  interpreters (`python3 -c`, `node -e`, `perl -e`), `$(…)`/`$VAR`, `sed -i`, `git apply`,
+  `rm`/`touch` and a renamed binary remain the documented literal-scan limits (the list is now
+  complete in the classifier's doc); the OS sandbox stays the only hermetic layer.
 - **Estate grounding allowlist — read-only estate reads are allowed in governed units, writes stay
   denied, every estate deny names the tool and the command (DES-GROUNDING-001 §7, issue #463 items
   1 + 2, F-RC1-046 / F-RC1-047).** The governance gate denied every `wicked-estate` /
