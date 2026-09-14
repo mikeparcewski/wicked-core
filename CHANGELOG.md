@@ -1363,6 +1363,24 @@ Two release tracks share this file, newest entry first regardless of track:
   and every 5 min until the floor returns. No new frame, hook, setting or `FloorContext` change;
   per-check durations stay on `repoChecksEvaluated.checks[].durationMs`. Disclosed: a
   `workerStallMinutes` below 5 would still read a live floor as stalled (default 15).
+- **Cancel run KILLS a live Tool executor child (core#500, F-BM-008 — a cancelled run opened a PR
+  2.5 h later).** The tool carrier had no lifecycle: `dispatch_unit` gave a tool unit `launch_seq
+  0` (the "no launch" sentinel) and `run_tool_cmd` blocked on `Command::output`, so `CancelRun`,
+  `ReassignUnit` and shutdown — which invalidate every other carrier's launch identity — reached
+  nothing, and run 6's deliver script committed, pushed and opened a PR hours after `runCancelled`.
+  A tool unit now takes the run's launch identity (`begin_launch(.., false)`, no epoch), the child
+  runs in its own process group and is polled every 50 ms with the wrapped carrier's own
+  `has_exited_unreaped` / `kill_child_tree` / `reap_bounded` loop; an invalidated identity kills
+  the group (SIGKILL; Windows: the leader only), posts `StepStatus::Cancelled` with a `[killed:
+  <reason>]` transcript tail (discarded by the existing stale guards) and ONE additive frame
+  `toolExecutorKilled{session, ord, attempt, pid, reason, ranMs}` after `runCancelled` (or after
+  `unitReassigned` → `toolExecutorDispatched` on a supersede). `reason` is the signal the child
+  observed and may read `superseded` on an operator cancel — consumers key on order. Shutdown kills
+  best-effort with no frame. Natural exits are byte-identical. Disclosed: SIGKILL skips the deliver
+  script's `trap … EXIT` (one temp dir leaks per killed deliver); a cancel between `git push` and
+  `gh pr create` leaves `wicked/<run>` on the remote with no PR; on Windows only the leader dies —
+  a `gh pr create` already running completes; on a NATURAL exit the leader's group is quiesced
+  (anything the script backgrounded and left running is killed with the phase, as for seats).
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the
