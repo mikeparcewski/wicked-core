@@ -1106,9 +1106,19 @@ const ESTATE_SHIM_MODULES: [&str; 5] = [
 
 /// A shell-quoted, possibly `\`-separated script token as a bare `/`-separated path — so
 /// `"${CLAUDE_PLUGIN_ROOT}/scripts/mem/x.py"` and `scripts\mem\x.py` classify like `scripts/mem/x.py`.
+/// Also collapses repeated slashes and strips leading `./` (#474): `./scripts//mem/x.py` and
+/// `scripts/mem/x.py` are the same script to the fence.
 fn script_path(tok: &str) -> String {
-    tok.trim_matches(|c| c == '"' || c == '\'')
-        .replace('\\', "/")
+    let mut p = tok
+        .trim_matches(|c| c == '"' || c == '\'')
+        .replace('\\', "/");
+    while p.contains("//") {
+        p = p.replace("//", "/");
+    }
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest.to_string();
+    }
+    p
 }
 
 fn script_basename(tok: &str) -> String {
@@ -1120,7 +1130,52 @@ fn script_basename(tok: &str) -> String {
 fn is_estate_shim_script(tok: &str) -> bool {
     let p = script_path(tok);
     let base = p.rsplit('/').next().unwrap_or(p.as_str());
-    ESTATE_SHIM_SCRIPTS.contains(&base) || (p.contains(ESTATE_SHIM_DIR) && base.ends_with(".py"))
+    ESTATE_SHIM_SCRIPTS.contains(&base)
+        || (p.contains(ESTATE_SHIM_DIR) && base.ends_with(".py"))
+        // #474: a mem backend run by BASENAME after a `cd scripts` (`python3 mem/estate_memory.py`)
+        // no longer carries the `scripts/mem/` segment — recognise it by its stem in the module set.
+        || ESTATE_SHIM_MODULES.contains(&base.strip_suffix(".py").unwrap_or(base))
+}
+
+/// The wicked-garden launcher basenames (#463 §7.3). Skills run the shim through it —
+/// `wicked-garden run scripts/_estate_client.py …` / `wicked-garden python <script>` — directly or
+/// via `node <…/wicked-garden.mjs>` / `npx wicked-garden`.
+const GARDEN_LAUNCHERS: [&str; 3] = ["wicked-garden", "wicked-garden.cmd", "wicked-garden.mjs"];
+
+fn is_garden_launcher(base: &str) -> bool {
+    GARDEN_LAUNCHERS.contains(&base)
+}
+
+/// If `words[idx..]` opens with a wicked-garden launcher (directly, or through one `node <script>` /
+/// `npx <pkg>` indirection), return the index of the first word AFTER its mandatory `run`/`python`
+/// verb — where the shim script (or a `python -m`) is scanned for. `None` when the segment is not a
+/// garden launcher or names no `run`/`python` verb. The launcher forwards the outer argv
+/// (`--readonly`, `--db`) to the `wicked-estate-mcp` it spawns, so the caller still judges the whole
+/// segment; this only finds the script in executing position past the launcher.
+fn garden_launcher_script_start(words: &[&str], idx: usize) -> Option<usize> {
+    let base = script_basename(words[idx]);
+    let after_launcher = if matches!(base.as_str(), "node" | "npx") {
+        let mut j = idx + 1;
+        while j < words.len() && words[j].starts_with('-') {
+            j += 1;
+        }
+        if !is_garden_launcher(&script_basename(words.get(j)?)) {
+            return None;
+        }
+        j + 1
+    } else if is_garden_launcher(&base) {
+        idx + 1
+    } else {
+        return None;
+    };
+    let mut i = after_launcher;
+    while i < words.len() && words[i].starts_with('-') {
+        i += 1;
+    }
+    match words.get(i) {
+        Some(&"run") | Some(&"python") => Some(i + 1),
+        _ => None,
+    }
 }
 
 /// Is `tok` a `python -m` module spelling of the shim / a backend?
@@ -1145,16 +1200,24 @@ fn is_script_launcher(base: &str) -> bool {
 /// `sh …/_python.sh x.py`, `py -3 x.py`, `python -m mem.estate_memory`). Launcher flags are
 /// skipped; garden's `_python.sh` / `_run.py` resolvers are looked through to the script they run;
 /// `-c <code>` (inline python) is not modelled — the documented literal-scan limit. A shell `-c`
-/// string never reaches here: [`unwrap_program`] hands it back for a rescan first.
+/// string never reaches here: [`unwrap_program`] hands it back for a rescan first. The
+/// `wicked-garden run|python <script>` launcher (#463 §7.3) is looked through the same way — see
+/// [`garden_launcher_script_start`].
 fn executed_estate_shim(words: &[&str], idx: usize) -> bool {
     let prog = words[idx];
     if is_estate_shim_script(prog) {
         return true;
     }
-    if !is_script_launcher(&script_basename(prog)) {
+    // Where the script arguments begin: past a wicked-garden launcher's run|python verb, else
+    // straight after a python/sh launcher; anything else is not a launcher.
+    let scan_from = if let Some(i) = garden_launcher_script_start(words, idx) {
+        i
+    } else if is_script_launcher(&script_basename(prog)) {
+        idx + 1
+    } else {
         return false;
-    }
-    let mut i = idx + 1;
+    };
+    let mut i = scan_from;
     while i < words.len() {
         let w = words[i];
         if w == "-m" {
@@ -4262,6 +4325,52 @@ mod boundary_tests {
             assert!(
                 classify_estate_command(benign, false).is_none(),
                 "a mention of the shim must not trip the fence: {benign}"
+            );
+        }
+    }
+
+    /// #463 §7.3 / #474: the `wicked-garden run|python <script>` launcher is recognised as the
+    /// shim's executing position (directly, and through `node <…/wicked-garden.mjs>` / `npx`), and
+    /// the store-pin rule is enforced on it; the #474 spellings (`//`, leading `./`, a `mem`
+    /// backend by basename after a `cd scripts`) all classify as the shim.
+    #[test]
+    fn the_wicked_garden_launcher_and_474_spellings_are_recognised() {
+        let shared = "/srv/estate/project.db";
+        // Recognised AND missing --readonly → deny; with --readonly + a pin → allow.
+        for run in [
+            "wicked-garden run scripts/_estate_client.py call '{}'",
+            "wicked-garden python scripts/_estate_client.py call '{}'",
+            "npx wicked-garden run scripts/_estate_client.py call '{}'",
+            "node /opt/g/scripts/wicked-garden.mjs run scripts/_estate_client.py call '{}'",
+            // #474 spellings, still through the launcher
+            "wicked-garden run ./scripts//mem/estate_memory.py store '{}'",
+            "wicked-garden run mem/estate_memory.py store '{}'",
+        ] {
+            assert_eq!(
+                classify_estate_command(run, false).map(|h| h.why),
+                Some(ESTATE_WHY_NO_READONLY),
+                "a garden-launched shim without --readonly must be denied: {run}"
+            );
+            let ok = format!("{run} --readonly --db {shared}");
+            assert!(
+                classify_estate_command(&ok, false).is_none(),
+                "a garden-launched shim, read-only and pinned, is allowed: {ok}"
+            );
+        }
+        // The launcher WITHOUT a run/python verb is not a shim invocation (e.g. `wicked-garden --help`).
+        assert!(
+            classify_estate_command("wicked-garden --help", false).is_none(),
+            "a garden launcher with no run/python verb is not a shim call"
+        );
+        // #474 direct spellings: a mem backend run by basename after a cd, and a `//`/`./` path.
+        for direct in [
+            "python3 mem/estate_memory.py store '{}'",
+            "python3 ./scripts//_estate_client.py call '{}'",
+        ] {
+            assert_eq!(
+                classify_estate_command(direct, false).map(|h| h.why),
+                Some(ESTATE_WHY_NO_READONLY),
+                "a #474-spelled shim without --readonly must be denied: {direct}"
             );
         }
     }

@@ -3728,7 +3728,19 @@ pub(crate) fn skill_prompt(
     let layout = layout
         .map(|l| format!("{LAYOUT_PREFIX}{l}"))
         .unwrap_or_default();
-    format!("{lead}{layout}{}", crate::assumptions::PROMPT_CONVENTION)
+    let mut prompt = format!("{lead}{layout}{}", crate::assumptions::PROMPT_CONVENTION);
+    // L1↔L4 contract (des-adjudicated §4.1): an Evaluator work unit's prompt ends with the one
+    // VERDICT line L1's fold parses — on every `SkillForm`, both carriers (`unit_prompt` is the one
+    // composer). NOT a `tool_cmd` unit (a scripted step emits no verdict) and NOT engine-internal
+    // (the early return above already excludes validator/triage; the guard is kept explicit so the
+    // predicate matches the contract). Creator/Neutral prompts never carry it.
+    if unit.role == crate::workflow::PhaseRole::Evaluator
+        && unit.tool_cmd.is_none()
+        && !is_engine_internal(unit)
+    {
+        prompt.push_str(crate::assumptions::EVALUATOR_VERDICT_CONVENTION);
+    }
+    prompt
 }
 
 /// The BASE skill directive (core#468) that LEADS a work unit's prompt when its run declares one
@@ -6921,11 +6933,18 @@ mod tests {
         ];
         for (role, token) in roles {
             let u = mk(role);
+            // An Evaluator work unit's prompt additionally ends with the pinned VERDICT line
+            // (L1↔L4 contract); Creator/Neutral do not.
+            let verdict = if role == PhaseRole::Evaluator {
+                crate::assumptions::EVALUATOR_VERDICT_CONVENTION
+            } else {
+                ""
+            };
             assert_eq!(
                 skill_prompt(&u, None, SkillForm::ClaudePlugin, None),
                 format!(
                     "Invoke your skill \"wicked-garden:governed-worker\" (via the Skill tool) and \
-                     follow its §{token} section; then: triage the report{appendix}"
+                     follow its §{token} section; then: triage the report{appendix}{verdict}"
                 ),
                 "claude: plugin form, Skill-tool clause, §{token}"
             );
@@ -6934,7 +6953,7 @@ mod tests {
                 mirrored,
                 format!(
                     "Use your skill \"wicked-garden-governed-worker\" and follow its §{token} \
-                     section; then: triage the report{appendix}"
+                     section; then: triage the report{appendix}{verdict}"
                 )
             );
             assert!(
@@ -7187,6 +7206,57 @@ mod tests {
         assert!(
             !bare.contains("notes"),
             "no notes root ⇒ no notes sentence: {bare}"
+        );
+    }
+
+    /// L1↔L4 contract (des-adjudicated §4.1): an Evaluator work unit's prompt ends with the pinned
+    /// VERDICT line on ALL THREE `SkillForm`s (so an `Unloaded` seat still knows the shape), and no
+    /// other role, tool-command unit, or engine-internal session carries it. Mutation: drop the
+    /// append in `skill_prompt` → the evaluator asserts fail; widen the predicate → the exclusion
+    /// asserts fail.
+    #[test]
+    fn an_evaluator_units_prompt_ends_with_the_verdict_line_on_every_form() {
+        use crate::workflow::PhaseRole;
+        let verdict = crate::assumptions::EVALUATOR_VERDICT_CONVENTION;
+        let forms = [
+            SkillForm::ClaudePlugin,
+            SkillForm::MirroredName,
+            SkillForm::Unloaded,
+        ];
+        // Evaluator, no tool_cmd → the line is present and LAST, on every form.
+        let mut ev = WorkUnit::pending("s:review", "s", 2, "review the change");
+        ev.role = PhaseRole::Evaluator;
+        for form in forms {
+            let p = skill_prompt(&ev, None, form, None);
+            assert!(
+                p.ends_with(verdict),
+                "{form:?}: an evaluator prompt must END with the VERDICT line: {p}"
+            );
+        }
+        // Creator and Neutral never carry it.
+        for role in [PhaseRole::Creator, PhaseRole::Neutral] {
+            let mut u = WorkUnit::pending("s:x", "s", 1, "do the work");
+            u.role = role;
+            assert!(
+                !skill_prompt(&u, None, SkillForm::ClaudePlugin, None).contains(verdict),
+                "{role:?} must not carry the VERDICT line"
+            );
+        }
+        // A scripted (tool_cmd) evaluator step emits no verdict — excluded.
+        let mut tool = WorkUnit::pending("s:gate", "s", 3, "run the checks");
+        tool.role = PhaseRole::Evaluator;
+        tool.tool_cmd = Some(vec!["cargo".to_string(), "test".to_string()]);
+        assert!(
+            !skill_prompt(&tool, None, SkillForm::ClaudePlugin, None).contains(verdict),
+            "a tool_cmd evaluator step must not carry the VERDICT line"
+        );
+        // Engine-internal sessions (validator/triage) stay byte-exact — never the line.
+        let mut internal = WorkUnit::pending("s:judge", "s", 4, "authored verdict contract");
+        internal.role = PhaseRole::Evaluator;
+        internal.session_id = "validator".to_string();
+        assert!(
+            !skill_prompt(&internal, None, SkillForm::ClaudePlugin, None).contains(verdict),
+            "an engine-internal evaluator session must not carry the VERDICT line"
         );
     }
 
