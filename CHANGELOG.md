@@ -1352,6 +1352,17 @@ Two release tracks share this file, newest entry first regardless of track:
   studio sends `creator` whenever the cursor is not a creator). The `scope` token renders on the
   wire for all three arms (`cursor` | `creator` | `request_changes`).
 
+<!-- fixall L3 -->
+- **The repo-checks floor heartbeats on the unit's transcript stream (crew #581, F-BM-010).**
+  After the worker returned, the floor (`typecheck`/`lint`/`test`, up to 3600 s per check) ran on
+  the same thread with only `eprintln!` — the unit's live-output stream went silent for its whole
+  duration, and crew's stall watchdog read run 8's 25-min `test` as a wedged worker and
+  re-dispatched a second creator into the same worktree. `run_floor` is now wrapped in
+  `with_floor_heartbeat`: the EXISTING `emit_delta` sink (→ `unitOutputDelta`) carries
+  `repo checks floor (creator|verify): running the repository's own checks — N min` at the start
+  and every 5 min until the floor returns. No new frame, hook, setting or `FloorContext` change;
+  per-check durations stay on `repoChecksEvaluated.checks[].durationMs`. Disclosed: a
+  `workerStallMinutes` below 5 would still read a live floor as stalled (default 15).
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the

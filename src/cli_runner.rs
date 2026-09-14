@@ -702,6 +702,46 @@ pub(crate) fn run_unit_and_judge(
     )
 }
 
+/// Cadence of the repo-checks floor heartbeat (crew #581 / F-BM-010): 5 min — well under the
+/// watchdog's default `workerStallMinutes` (15). A setting below 5 would still read a live
+/// floor as stalled (disclosed; the engine does not read crew settings).
+const FLOOR_HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
+
+/// Run `work` while a scoped side thread emits `"<label> — N min"` through `emit` at `t = 0` and
+/// then every `every` until `work` returns — liveness for a long, otherwise silent phase on the
+/// unit's EXISTING live-output stream (`Command::CliOutputDelta` → the coalesced, durable,
+/// relayed `unitOutputDelta`). The sink is `Send + Sync` (`workflow::DeltaSink`), and the
+/// runner's own stdout/stderr drains already call it from scoped threads. The heartbeat thread
+/// is stopped (channel send) and joined by the scope before the result is returned, so no frame
+/// is ever emitted after `work` completed.
+fn with_floor_heartbeat<R>(
+    emit: &DeltaSink,
+    label: &str,
+    every: Duration,
+    work: impl FnOnce() -> R,
+) -> R {
+    std::thread::scope(|s| {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        s.spawn(move || {
+            let t0 = std::time::Instant::now();
+            emit(&format!("{label} — 0 min"));
+            // Tick ONLY on a timeout. `Disconnected` means `stop_tx` was dropped without a send —
+            // `work` panicked and the closure unwound — and the ticker must exit so the scope can
+            // join it and propagate the panic; `is_err()` would spin here forever, emitting false
+            // liveness for a floor that is already dead (review on #512).
+            while matches!(
+                stop_rx.recv_timeout(every),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                emit(&format!("{label} — {} min", t0.elapsed().as_secs() / 60));
+            }
+        });
+        let r = work();
+        let _ = stop_tx.send(());
+        r
+    })
+}
+
 /// The roster-injectable core of [`run_unit_and_judge`] — split out ONLY so the seat-selection (C1) is
 /// unit-testable with a fabricated roster and no live registry. Production always passes the live
 /// [`crate::registry_roster`].
@@ -1043,7 +1083,24 @@ fn run_unit_and_judge_with_roster(
                 claim_text: (stage == crate::repo_checks::FloorStage::Creator)
                     .then(|| output.output.clone()),
             };
-            let report = crate::repo_checks::run_floor(wd, &ctx);
+            // crew #581 (F-BM-010): the floor runs on THIS thread after the runner returned, so
+            // the unit's live-output stream went silent for its whole duration (run 8: crew's
+            // `test` > 25 min under a 3600 s bound → the stall watchdog read 30 min of silence as
+            // a wedged worker and re-dispatched a second creator into the same worktree). The
+            // floor now heartbeats through the sink this thread ALREADY holds — an ordinary
+            // `unitOutputDelta` at the start and every 5 min until `run_floor` returns — so the
+            // watchdog's ladder resets on the existing frame (crew clocks any frame carrying the
+            // session). No new frame, hook, exemption or `FloorContext` change; the per-check
+            // durations stay on `repoChecksEvaluated.checks[].durationMs`.
+            let report = with_floor_heartbeat(
+                emit_delta,
+                &format!(
+                    "repo checks floor ({}): running the repository's own checks",
+                    stage.as_wire()
+                ),
+                FLOOR_HEARTBEAT_EVERY,
+                || crate::repo_checks::run_floor(wd, &ctx),
+            );
             eprintln!(
                 "wicked-core: repo checks floor ({}) for unit {}: {} — {}",
                 stage.as_wire(),
@@ -3556,5 +3613,115 @@ mod tests {
             "a benched judge seat is never tried again"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// crew #581 / F-BM-010 — the repo-checks floor heartbeats on the unit's live-output sink.
+#[cfg(test)]
+mod floor_heartbeat_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    type Seen = Arc<Mutex<Vec<(Duration, String)>>>;
+
+    fn recording_sink(seen: &Seen, t0: Instant) -> impl Fn(&str) + Send + Sync {
+        let seen = Arc::clone(seen);
+        move |s: &str| {
+            seen.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((t0.elapsed(), s.to_string()))
+        }
+    }
+
+    /// Design test (7): `every = 300 ms` around a 1.2 s closure → a delta at t = 0 and then one
+    /// roughly every 300 ms, none after the closure returned, the closure's result passed through.
+    #[test]
+    fn the_floor_heartbeat_ticks_on_the_sink_while_the_work_runs_and_stops_when_it_returns() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let sink = recording_sink(&seen, t0);
+        let label = "repo checks floor (verify): running the repository's own checks";
+        let r = with_floor_heartbeat(&sink, label, Duration::from_millis(300), || {
+            std::thread::sleep(Duration::from_millis(1200));
+            42
+        });
+        assert_eq!(r, 42, "the work's result passes through");
+        let at_return = seen.lock().unwrap().clone();
+        std::thread::sleep(Duration::from_millis(500));
+        let after = seen.lock().unwrap().clone();
+        assert_eq!(
+            after.len(),
+            at_return.len(),
+            "no heartbeat after the work returned (the thread is joined by the scope)"
+        );
+        assert_eq!(after[0].1, format!("{label} — 0 min"), "{after:?}");
+        assert!(
+            after[0].0 < Duration::from_millis(200),
+            "the first heartbeat is immediate: {after:?}"
+        );
+        // 0, ~300, ~600, ~900 (and possibly ~1200 racing the return). A loaded host may wake a
+        // tick late, so the floor is 3 frames, the ceiling 6.
+        assert!(
+            (3..=6).contains(&after.len()),
+            "one heartbeat per `every` over 1.2 s: {after:?}"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|(_, s)| s.starts_with(&format!("{label} — "))),
+            "{after:?}"
+        );
+        for w in after.windows(2) {
+            assert!(
+                w[1].0 >= w[0].0 + Duration::from_millis(250),
+                "ticks are spaced by `every`, not a busy loop: {after:?}"
+            );
+        }
+    }
+
+    /// Review on #512: a floor that PANICS must not leave the ticker spinning with false liveness.
+    /// `stop_tx` is dropped by the unwinding closure without a send → `Disconnected` → the ticker
+    /// exits, the scope joins it, the panic propagates — promptly, with no further heartbeat.
+    #[test]
+    fn a_panicking_floor_stops_the_heartbeat_and_propagates() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let sink = recording_sink(&seen, t0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_floor_heartbeat(&sink, "floor", Duration::from_millis(50), || -> u8 {
+                std::thread::sleep(Duration::from_millis(120));
+                panic!("the floor blew up");
+            })
+        }));
+        assert!(result.is_err(), "the panic propagates through the scope");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "no hang: the ticker exited on Disconnected"
+        );
+        let at_return = seen.lock().unwrap_or_else(|p| p.into_inner()).len();
+        std::thread::sleep(Duration::from_millis(300));
+        let after = seen.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(after, at_return, "no heartbeat after the panic");
+    }
+
+    /// Work that returns at once emits exactly the start heartbeat, and the call returns
+    /// promptly — the stop channel wakes the ticker; the scope never waits out `every`.
+    #[test]
+    fn a_short_floor_emits_exactly_the_start_heartbeat_and_returns_at_once() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let sink = recording_sink(&seen, t0);
+        let r = with_floor_heartbeat(&sink, "floor", FLOOR_HEARTBEAT_EVERY, || "done");
+        assert_eq!(r, "done");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "returned without waiting out the 5 min cadence"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
+            vec!["floor — 0 min"]
+        );
     }
 }
