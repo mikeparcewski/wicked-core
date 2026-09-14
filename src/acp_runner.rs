@@ -2980,6 +2980,14 @@ struct TurnResult {
     /// Carried as a field now so the `ToolInvoked` event is uniform across runners; populating it
     /// from ACP frames is the scoped follow-up.
     tools: Vec<String>,
+    /// The turn's ANSWER — the text emitted AFTER its last `tool_call`, as opposed to the narration
+    /// a model speaks between tool calls ("Let me look at…"). Assembled by
+    /// [`answer_after_last_tool_call`] from the RAW accumulation (never an offset into `output`,
+    /// which the banner strip and the trim rewrite), and EMPTY only when the turn produced nothing
+    /// — a turn that answered before its last tool call, or called no tool at all, carries its
+    /// whole output here. Chat replies surface it (F-W1-004, R-L5-2); unit outputs stay `output`
+    /// (prior-output injection and the evaluator verdict line read the full text).
+    answer: String,
 }
 
 impl TurnResult {
@@ -2993,6 +3001,20 @@ impl TurnResult {
             usage: None,
             files: Vec::new(),
             tools: Vec::new(),
+            answer: String::new(),
+        }
+    }
+
+    /// The reply a CHAT surfaces (F-W1-004): the turn's [`TurnResult::answer`] — the text after its
+    /// last tool call — falling back to the whole output on any path that filled no answer (a
+    /// directly-constructed result, [`TurnResult::default_failed`]). The narration before the
+    /// answer was already streamed as deltas, where the studio narrates it; it never re-enters the
+    /// reply. NEVER empty unless the turn produced no text at all.
+    fn chat_answer(&self) -> String {
+        if self.answer.is_empty() {
+            self.output.clone()
+        } else {
+            self.answer.clone()
         }
     }
 }
@@ -3437,6 +3459,8 @@ fn exec_turn_acp_posture(
     let mut output = String::new();
     let mut usage: Option<Usage> = None;
     let mut files: Vec<String> = Vec::new();
+    // F-W1-004: where the answer starts — bumped to `output.len()` at every `tool_call` start.
+    let mut answer_from: usize = 0;
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
     let deadline = Instant::now() + timeout;
@@ -3746,6 +3770,7 @@ fn exec_turn_acp_posture(
                                                 &mut usage,
                                                 &mut files,
                                                 MAX_OUT,
+                                                &mut answer_from,
                                             );
                                         }
                                         // core#293: this arm did not exist. A permission request
@@ -3869,7 +3894,15 @@ fn exec_turn_acp_posture(
                 if let Some(method) = agent_method(&v) {
                     match method {
                         "session/update" => {
-                            handle_update(&v, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+                            handle_update(
+                                &v,
+                                emit,
+                                &mut output,
+                                &mut usage,
+                                &mut files,
+                                MAX_OUT,
+                                &mut answer_from,
+                            );
                         }
                         // The agent asking permission for a tool call. This is a REQUEST, not a
                         // notification: it carries an `id` and blocks the agent until answered.
@@ -3980,6 +4013,9 @@ fn exec_turn_acp_posture(
         // output injections derived from them, and chat replies alike. Deltas already streamed
         // raw — cosmetic only; every durable consumer reads this assembled form.
         output: strip_pi_banner(&output).trim_end().to_string(),
+        // F-W1-004: the answer is cut from the RAW accumulation (`answer_from` indexes it), not
+        // from the stripped/trimmed `output` above — see `answer_after_last_tool_call`.
+        answer: answer_after_last_tool_call(&output, answer_from),
         status: if found {
             StepStatus::Ok
         } else if elicitation_timed_out
@@ -4231,6 +4267,41 @@ fn answer_permission_request<W: Write>(
 }
 
 /// Process one `session/update` notification — extract text chunks and usage.
+/// The turn's ANSWER out of the RAW accumulated output and the offset of its last `tool_call`
+/// start (F-W1-004, R-L5-2).
+///
+/// Sliced BEFORE the banner strip on purpose: `answer_from` indexes the raw accumulation, while
+/// `TurnResult.output` is that text banner-stripped and trimmed — a strip at the head shifts every
+/// offset, so slicing the stripped copy would cut mid-answer (or off a char boundary) on exactly
+/// the seats that print a banner. The slice is then stripped and trimmed on BOTH ends: the cut
+/// falls at a tool-call boundary, so the leading blank line an agent writes after a tool result is
+/// an artifact of where we cut, not content.
+///
+/// Falls back to the whole (stripped, trimmed) output whenever the slice yields nothing — the turn
+/// called no tool (`answer_from == 0`), or it wrote its answer BEFORE its last tool call and said
+/// nothing after it. So the reply is never emptied by where the tool calls happened to fall; the
+/// worst case is today's behaviour, narration included.
+fn answer_after_last_tool_call(raw: &str, answer_from: usize) -> String {
+    let whole = strip_pi_banner(raw).trim_end().to_string();
+    if answer_from == 0 || answer_from >= raw.len() {
+        return whole;
+    }
+    let head = strip_pi_banner(raw.get(..answer_from).unwrap_or("")).trim();
+    let tail = strip_pi_banner(raw.get(answer_from..).unwrap_or("")).trim();
+    // The head is dropped ONLY when the answer outweighs it (review MED-1). Narration is the short
+    // thing a model says on its way to work ("Let me look at…") and the answer is the long thing it
+    // says afterwards, so `tail > head` drops the P6 shape's monologue; the inverse shape — a long
+    // answer, a citation-checking tool call, then "Confirmed." — keeps BOTH, because dropping a
+    // long head to keep a short coda would destroy the substance durably (the transcript records
+    // this text). A long narration before a short answer therefore ships today's whole output: the
+    // trade is always toward keeping text, never toward losing it.
+    if !tail.is_empty() && tail.len() > head.len() {
+        tail.to_string()
+    } else {
+        whole
+    }
+}
+
 fn handle_update(
     v: &Value,
     emit: &DeltaSink,
@@ -4238,6 +4309,7 @@ fn handle_update(
     usage: &mut Option<Usage>,
     files: &mut Vec<String>,
     max_out: usize,
+    answer_from: &mut usize,
 ) {
     let update = &v["params"]["update"];
     let kind = update
@@ -4245,6 +4317,11 @@ fn handle_update(
         .and_then(Value::as_str)
         .unwrap_or("");
     match kind {
+        // F-W1-004: a tool call STARTS — whatever was said before it was narration ("Let me look
+        // at…"), already streamed as deltas; the answer a chat surfaces begins after the last one.
+        "tool_call" => {
+            *answer_from = output.len();
+        }
         "agent_message_chunk" => {
             if let Some(text) = update["content"]["text"].as_str() {
                 emit(text);
@@ -5638,10 +5715,29 @@ impl AcpStepRunner {
         // out from under the operator the moment it finished.
         self.chat_touch(chat_id);
         match result {
-            Ok(turn) if turn.status == StepStatus::Ok => Ok(ChatTurnReply {
-                text: turn.output,
-                usage: turn.usage,
-            }),
+            // F-W1-004 (R-L5-2): the reply is the ANSWER — the text after the turn's last tool call;
+            // the narration before it was streamed as deltas and is not repeated in the reply.
+            Ok(turn) if turn.status == StepStatus::Ok => {
+                let answer = turn.chat_answer();
+                // The rule's observable (review NIT-5 / MED-1's measurement): every turn says how
+                // much of its own output it shipped, so "the fallback fired" and "the adapter
+                // announced no tool call" are readable in the daemon log instead of being
+                // indistinguishable from an unfixed engine. The P6 re-run reads this line.
+                eprintln!(
+                    "[wicked-core] chat '{chat_id}' seat '{cli_key}' reply {} of {} output bytes ({})",
+                    answer.len(),
+                    turn.output.len(),
+                    if answer.len() == turn.output.len() {
+                        "whole output — narration retained"
+                    } else {
+                        "answer after the last tool call"
+                    }
+                );
+                Ok(ChatTurnReply {
+                    text: answer,
+                    usage: turn.usage,
+                })
+            }
             Ok(turn) => {
                 self.chat_evict(chat_id, cli_key, &arc);
                 let msg = if turn.status == StepStatus::TimedOut {
@@ -9427,6 +9523,8 @@ printf '%s\n' "$new" > "{frame_ledger}"
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"scoped"}}}}'
 read _prompt
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"pi v0.83.0\n---\n\n## Skills\n- /op/.pi/agent/skills/wicked-testing-x/SKILL.md\n\n## Extensions\n- /op/.pi/agent/extensions/wicked-testing.ts\n\n---\n"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Let me look at the scope."}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read","kind":"read","status":"pending"}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"scoped","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Hello from the scoped seat"}}}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn","usage":{{"inputTokens":120,"outputTokens":8}}}}}}'
 sleep 30
@@ -9570,6 +9668,8 @@ acp_input_governance = true
         // (5) The assembled reply is the answer; the banner never reached a ChatDelta; the
         // turn's usage rides the reply (DES-L5, F-RC1-116).
         let reply = turn.expect("the turn completes");
+        // F-W1-004 (R-L5-2): the narration spoken BEFORE the tool call ("Let me look at the
+        // scope.") streamed as a delta but is NOT in the reply — the reply is the answer block.
         assert_eq!(reply.text, "Hello from the scoped seat", "{reply:?}");
         assert_eq!(
             reply
@@ -9593,7 +9693,10 @@ acp_input_governance = true
             !streamed.contains("pi v0.83.0") && !streamed.contains("SKILL.md"),
             "the startup banner must never enter the streamed transcript (F-068): {streamed:?}"
         );
-        assert_eq!(streamed, "Hello from the scoped seat", "{deltas:?}");
+        assert_eq!(
+            streamed, "Let me look at the scope.Hello from the scoped seat",
+            "the deltas carry the narration AND the answer (the studio narrates the former): {deltas:?}"
+        );
         // (6) The enumerate surface reports the scope; a closed chat holds none.
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].scope.as_ref(), Some(&scope));
@@ -13255,6 +13358,156 @@ acp_input_governance = true
         assert!(r.drain_operator_messages("run1", "claude").is_empty());
     }
 
+    /// F-W1-004 (R-L5-2): a `tool_call` START bumps `answer_from` to the output so far, and
+    /// `answer_after_last_tool_call` cuts the answer there — out of the RAW accumulation, so a
+    /// stripped banner cannot shift the cut. Every "nothing after the last tool call" shape
+    /// (answer BEFORE the tool call, a trailing tool call, a whitespace-only tail, no tool call at
+    /// all) falls back to the whole output: a reply is never empty when the turn said anything.
+    #[test]
+    fn the_chat_answer_is_the_text_after_the_last_tool_call_and_is_never_emptied() {
+        let mut output = String::new();
+        let mut usage: Option<Usage> = None;
+        let mut files = Vec::new();
+        let mut answer_from = 0usize;
+        let emit: Box<crate::workflow::DeltaSink> = Box::new(|_: &str| {});
+        let chunk = |text: &str| {
+            json!({"params": {"update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text}}}})
+        };
+        let tool_call = json!({"params": {"update": {"sessionUpdate": "tool_call",
+            "toolCallId": "t1", "title": "Read", "kind": "read", "status": "pending"}}});
+        let mut feed = |v: &Value, output: &mut String, answer_from: &mut usize| {
+            handle_update(v, &emit, output, &mut usage, &mut files, 1024, answer_from);
+        };
+
+        // Narration, a tool call, more narration, a tool call, then the answer.
+        feed(
+            &chunk("Let me look at the scope. "),
+            &mut output,
+            &mut answer_from,
+        );
+        assert_eq!(
+            answer_from, 0,
+            "no tool call yet — the whole text would be the answer"
+        );
+        feed(&tool_call, &mut output, &mut answer_from);
+        assert_eq!(answer_from, "Let me look at the scope. ".len());
+        feed(&chunk("Now the files. "), &mut output, &mut answer_from);
+        feed(&tool_call, &mut output, &mut answer_from);
+        // The answer OUTWEIGHS the narration it followed — the P6 shape, where the rule fires.
+        let answer_text = "The skill reaches the worker through the published snapshot. ".repeat(2);
+        feed(
+            &chunk(&format!("\n\n{answer_text}\n")),
+            &mut output,
+            &mut answer_from,
+        );
+        // Trimmed BOTH ends: the blank line after a tool result is where we cut, not content.
+        assert_eq!(
+            answer_after_last_tool_call(&output, answer_from),
+            answer_text.trim(),
+            "the answer is the block after the LAST tool call"
+        );
+        // The INVERSE shape, stated as a rule and not an accident: when what follows the last tool
+        // call is SHORTER than what precedes it, the whole output ships — narration included —
+        // because dropping the longer text to keep the shorter one would lose substance (MED-1).
+        let mut short = String::new();
+        let mut sf = 0usize;
+        feed(
+            &chunk(&"Let me read every file in the repository. ".repeat(3)),
+            &mut short,
+            &mut sf,
+        );
+        feed(&tool_call, &mut short, &mut sf);
+        feed(&chunk("42."), &mut short, &mut sf);
+        assert_eq!(
+            answer_after_last_tool_call(&short, sf),
+            short.trim(),
+            "a short answer after long narration keeps BOTH — the trade is toward keeping text"
+        );
+
+        // A trailing tool call with nothing after it — the reviewer's case: the seat answered
+        // BEFORE its last tool call. The reply is the whole output, never empty.
+        let mut trailing = output.clone();
+        let mut tf = answer_from;
+        feed(&tool_call, &mut trailing, &mut tf);
+        assert_eq!(tf, trailing.len());
+        let whole = strip_pi_banner(&trailing).trim_end().to_string();
+        assert_eq!(answer_after_last_tool_call(&trailing, tf), whole);
+        // Same when only whitespace follows the last tool call.
+        let mut ws = trailing.clone();
+        let wf = tf;
+        ws.push_str("   \n");
+        assert_eq!(answer_after_last_tool_call(&ws, wf), whole);
+        assert!(
+            whole.contains("The skill reaches the worker"),
+            "the answer survived: {whole}"
+        );
+        // MULTI-PART ANSWER (review MED-1): a long answer, a citation-checking tool call, then a
+        // short coda. Dropping the head to keep "Confirmed." would destroy the substance durably
+        // (the transcript records this text), so BOTH ship.
+        let multi = format!(
+            "Let me check. {}\n\nConfirmed.",
+            "The skill reaches the worker through the published snapshot. ".repeat(4)
+        );
+        let coda_at = multi.len() - "Confirmed.".len();
+        let kept = answer_after_last_tool_call(&multi, coda_at);
+        assert!(
+            kept.contains("The skill reaches the worker") && kept.ends_with("Confirmed."),
+            "a short coda after a long answer keeps BOTH: {kept}"
+        );
+        // …while the P6 shape — short narration, then the answer — still drops the monologue.
+        let p6 = format!(
+            "Let me explore the key repos. Now let me read the core files. {}",
+            "The answer, at length. ".repeat(8)
+        );
+        let p6_at = p6.find("The answer, at length.").unwrap();
+        assert!(
+            !answer_after_last_tool_call(&p6, p6_at).contains("Let me explore"),
+            "the narration a model speaks on its way to work is dropped"
+        );
+        // No tool call at all: the whole output, exactly as before this change.
+        assert_eq!(
+            answer_after_last_tool_call("Just an answer.", 0),
+            "Just an answer."
+        );
+        // An offset past the end (a truncated accumulation) degrades to the whole output.
+        assert_eq!(
+            answer_after_last_tool_call("Just an answer.", 9_999),
+            "Just an answer."
+        );
+        // A BANNER at the head shifts every offset in the stripped copy — the cut is taken from
+        // the raw text, so the answer survives (slicing `output` here would have cut mid-word).
+        let banner = "pi v0.83.0\n---\n\n## Skills\n- /x/SKILL.md\n\n---\n";
+        let raw = format!("{banner}Let me look. THE ANSWER after the tool call.");
+        let at = raw.len() - "THE ANSWER after the tool call.".len();
+        assert_eq!(
+            answer_after_last_tool_call(&raw, at),
+            "THE ANSWER after the tool call."
+        );
+
+        // `chat_answer()` surfaces the field, and falls back to `output` for a result that
+        // carries none (a directly-constructed one, `default_failed`).
+        let turn = TurnResult {
+            output: "Let me look. The answer.".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            answer: "The answer.".into(),
+        };
+        assert_eq!(turn.chat_answer(), "The answer.");
+        assert_eq!(
+            TurnResult {
+                answer: String::new(),
+                ..turn
+            }
+            .chat_answer(),
+            "Let me look. The answer.",
+            "a result with no answer replies with its whole output, never empty"
+        );
+        assert_eq!(TurnResult::default_failed().chat_answer(), "");
+    }
+
     #[test]
     fn result_usage_parses_ecosystem_adapter_shape() {
         // Official claude adapter result: input + cached reads/writes sum into input.
@@ -13291,7 +13544,16 @@ acp_input_governance = true
                 "cost": {"amount": 0.19, "currency": "USD"}
             }}
         });
-        handle_update(&v, emit, &mut output, &mut usage, &mut files, 1024);
+        let mut answer_from = 0usize;
+        handle_update(
+            &v,
+            emit,
+            &mut output,
+            &mut usage,
+            &mut files,
+            1024,
+            &mut answer_from,
+        );
         let u = usage.expect("cost-only frame lifts usage");
         assert_eq!(u.cost_usd, Some(0.19));
         assert_eq!(u.input_tokens, 0);
