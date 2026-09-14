@@ -411,9 +411,17 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // with no lockfile.
                 acp_input_governance: true,
                 os_sandbox: false,
+                // `"task":"deny"` (F-W1-002 / BC-75): opencode 1.17.18's ACP layer forwards a
+                // `permission.asked` only for sessions it opened itself (`acp/permission.ts`
+                // `process()` → `tryGet(sessionID)` → return when absent; the session store holds
+                // only `session/new|load|resume|fork`). A `task` subagent's session is never in
+                // that store, so its asks reach neither the client nor a reject — the seat sits on
+                // a dead turn until the budget kills it (upstream anomalyco/opencode#48232). The
+                // seat's own config denies the tool, so no subagent spawns under ACP; the root
+                // session's asks are answered exactly as before.
                 acp_governance_env: Some((
                     "OPENCODE_CONFIG_CONTENT".into(),
-                    r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask"}}"#.into(),
+                    r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask","task":"deny"}}"#.into(),
                 )),
                 verified_version: Some("1.17.18".into()),
             }),
@@ -636,6 +644,15 @@ mod tests {
             .expect("admitted opencode must carry its forcing-function env var");
         assert_eq!(env_key, "OPENCODE_CONFIG_CONTENT");
         assert!(env_val.contains("\"read\":\"ask\""));
+        // F-W1-002 / BC-75: the seat's own harness denies `task` — a subagent session's asks never
+        // reach an ACP client (anomalyco/opencode#48232), so the subagent must never spawn under
+        // ACP. The three governed tools still ASK.
+        let doc: serde_json::Value =
+            serde_json::from_str(env_val).expect("governance content is a JSON object");
+        assert_eq!(doc["permission"]["task"], "deny", "{env_val}");
+        for tool in ["read", "edit", "bash"] {
+            assert_eq!(doc["permission"][tool], "ask", "{tool}: {env_val}");
+        }
         assert!(env_val.contains("\"edit\":\"ask\""));
         assert!(env_val.contains("\"bash\":\"ask\""));
         assert_eq!(

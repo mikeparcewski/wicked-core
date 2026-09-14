@@ -1474,6 +1474,25 @@ Two release tracks share this file, newest entry first regardless of track:
   on the raw text first; cap 4096 kept, not #466's 400 B). A `clis.toml` override that omits
   `[cli.acp]` over a built-in that carries one now warns on stderr (the seat runs wrapped and
   ungoverned; the wholesale-replace rule is unchanged).
+<!-- fixall L4 -->
+- **The opencode seat's harness config denies the `task` tool; a tool call the seat itself refused
+  is recorded in the unit transcript (F-W1-002; FIX-IT-ALL L4; BC-75 — proposed, user decision
+  owed).** opencode 1.17.18's ACP layer forwards a `permission.asked` only for sessions it opened
+  itself (`acp/permission.ts` `process()` → `tryGet(sessionID)` → return when absent; the session
+  store holds only `session/new|load|resume|fork`): a `task` (explore) subagent's asks — six
+  `external_directory` reads in the wave-1 P6 chat — never reached wicked-core and were never
+  rejected either, so the seat sat on a 600 s dead turn until the budget killed it (upstream
+  anomalyco/opencode#48232; fix PRs #48326 / #37902 open). One token in the one mechanism that
+  already governs the seat: `OPENCODE_CONFIG_CONTENT` `permission` gains `"task":"deny"`
+  (`wicked-council` registry) — the subagent is never spawned under ACP; the root session's own
+  asks are answered exactly as before. And so the refusal is visible: `handle_update` records
+  **any** `tool_call` / `tool_call_update` that ends `status: failed` — on every ACP seat, a seat's
+  own refusal or a failed read / shell command alike — as `[tool call failed] <title>: <the seat's
+  text>` in the unit transcript (bounded like a chunk; `locations` still collected from the update
+  frame only), so the governance token scan over the transcript now also sees tool-error text; the
+  text is appended unredacted — transcript redaction is the run-wide policy, not this change.
+  Behaviour change register: **BC-75** (proposed — user decision owed: a seat-visible tool denial,
+  and every failed tool call now in the transcript).
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the

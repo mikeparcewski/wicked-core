@@ -4248,19 +4248,7 @@ fn handle_update(
         "agent_message_chunk" => {
             if let Some(text) = update["content"]["text"].as_str() {
                 emit(text);
-                let used = output.len();
-                if used < max_out {
-                    // Clamp to remaining capacity at a valid UTF-8 boundary so
-                    // a single large chunk never pushes output past max_out.
-                    let remaining = max_out - used;
-                    let safe = text
-                        .char_indices()
-                        .take_while(|(i, c)| *i + c.len_utf8() <= remaining)
-                        .last()
-                        .map(|(i, c)| i + c.len_utf8())
-                        .unwrap_or(0);
-                    output.push_str(&text[..safe]);
-                }
+                push_bounded(output, text, max_out);
             }
         }
         "usage_update" => {
@@ -4308,18 +4296,67 @@ fn handle_update(
                 });
             }
         }
-        "tool_call_update" => {
-            // Collect file paths reported by the CLI (e.g. read/edit locations).
-            if let Some(locs) = update["locations"].as_array() {
-                for loc in locs {
-                    if let Some(path) = loc["path"].as_str() {
-                        files.push(path.to_string());
+        "tool_call" | "tool_call_update" => {
+            // Collect file paths reported by the CLI (e.g. read/edit locations) — from the UPDATE
+            // frame only, as before: opencode repeats `locations` on the initial `tool_call`, and
+            // `dataUsed.files` goes out without dedup (review of #524, finding 2).
+            if kind == "tool_call_update" {
+                if let Some(locs) = update["locations"].as_array() {
+                    for loc in locs {
+                        if let Some(path) = loc["path"].as_str() {
+                            files.push(path.to_string());
+                        }
                     }
                 }
+            }
+            // F-W1-002 / BC-75: ANY tool call that ends `status: failed` on the ACP stream — on
+            // every ACP seat — is recorded, bounded like a chunk: the call's title and the seat's
+            // own text, never the raw input. The case that made it necessary: a tool the SEAT
+            // ITSELF refused (opencode's config `permission.task: deny`, registry.rs — the subagent
+            // never spawns under ACP) used to leave no trace, so a dead turn and a refusal read the
+            // same. A failed `Read` on a missing file or a failed shell command is recorded the same
+            // way — better, and said so in the register.
+            if update["status"].as_str() == Some("failed") {
+                let title = update["title"].as_str().unwrap_or("tool call");
+                let note = match failed_tool_call_text(update) {
+                    Some(text) => format!("\n[tool call failed] {title}: {text}\n"),
+                    None => format!("\n[tool call failed] {title}\n"),
+                };
+                push_bounded(output, &note, max_out);
             }
         }
         _ => {}
     }
+}
+
+/// Append `text` to `output`, clamped to `max_out` at a valid UTF-8 boundary so a single large
+/// chunk never pushes the transcript past its cap.
+fn push_bounded(output: &mut String, text: &str, max_out: usize) {
+    let used = output.len();
+    if used >= max_out {
+        return;
+    }
+    let remaining = max_out - used;
+    let safe = text
+        .char_indices()
+        .take_while(|(i, c)| *i + c.len_utf8() <= remaining)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    output.push_str(&text[..safe]);
+}
+
+/// The first text the agent attached to a failed tool call — `content[].content.text` per the
+/// ACP schema (a bare `content[].text` is tolerated): the seat's own words for the refusal.
+fn failed_tool_call_text(update: &Value) -> Option<String> {
+    update["content"].as_array()?.iter().find_map(|item| {
+        item["content"]["text"]
+            .as_str()
+            .or_else(|| item["text"].as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Parse the authoritative usage object from a `session/prompt` RESULT. All ecosystem
@@ -15455,6 +15492,31 @@ elif behavior == "unknown_request":
         "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}
     }})
 
+elif behavior == "task_denied":
+    # F-W1-002 / BC-75: the seat's OWN harness refused a tool (opencode `permission.task: deny`):
+    # the call is announced, then ends `failed` with the seat's text. No permission request ever
+    # reaches the client — the refusal must still be visible in the transcript.
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "tool_call", "toolCallId": "call-task-1", "title": "task",
+                   "kind": "other", "status": "pending", "rawInput": {"description": "explore"}}
+    }})
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "tool_call_update", "toolCallId": "call-task-1", "title": "task",
+                   "status": "failed",
+                   "content": [{"type": "content", "content": {"type": "text",
+                                "text": "permission denied: task (permission.task = deny)"}}]}
+    }})
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "TASK_DENIED_DONE"}}
+    }})
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 3, "outputTokens": 2}
+    }})
+
 elif behavior == "elicit_disconnect":
     # Send elicitation, then close stdout (simulate adapter death mid-suspension).
     w({"jsonrpc": "2.0", "id": "elicit-disc", "method": "elicitation/create", "params": {
@@ -16079,6 +16141,47 @@ transport = "stdio"
     }
 
     // ── core#293: agent request ids cross client prompt ids ───────────────────────
+
+    /// F-W1-002 / BC-75: a tool call the SEAT ITSELF refused — opencode's `permission.task: deny`
+    /// (registry.rs) means the `task` subagent never spawns under ACP, so no permission ask can be
+    /// dropped by opencode's ACP layer (anomalyco/opencode#48232). The refusal ends the call
+    /// `failed`; the transcript must say so — a denial nobody can see is the 600 s dead turn again.
+    #[test]
+    #[cfg(unix)]
+    fn a_tool_call_the_seat_itself_refused_is_recorded_in_the_transcript() {
+        let dir = std::env::temp_dir().join(format!("wicked-fw1-002-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut proc = start_mock_proc(&dir, "task_denied");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+        let turn = exec_turn_acp(
+            &mut proc,
+            "explore the repo",
+            &[],
+            noop,
+            Duration::from_secs(10),
+            Arc::clone(&maps),
+            "run-fw1-002",
+            0,
+            &tx,
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn.status, StepStatus::Ok, "{:?}", turn.output);
+        assert!(
+            turn.output.contains(
+                "[tool call failed] task: permission denied: task (permission.task = deny)"
+            ),
+            "the seat's own refusal must reach the transcript: {:?}",
+            turn.output
+        );
+        assert!(
+            turn.output.contains("TASK_DENIED_DONE"),
+            "the turn still completes after the refused call: {:?}",
+            turn.output
+        );
+    }
 
     /// THE core#293 REGRESSION TEST — two turns on ONE session, driven until the agent's own
     /// request counter walks into the client's prompt-id space.
