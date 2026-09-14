@@ -623,7 +623,13 @@ fn detect_sandbox_launcher_for_roots(
                 }
             }
             // C3: mask each curated secret dir with an empty tmpfs so its real contents are unreadable.
-            for dir in secret_read_block_dirs() {
+            // ONLY the dirs that EXIST (core#460/#493): bwrap `mkdir`s a missing `--tmpfs`
+            // destination, and under `--ro-bind / /` that dies BEFORE exec — `bwrap: Can't mkdir
+            // <HOME>/.aws: Read-only file system`, exit 1 — so every floor check and every pinned
+            // validator on a Linux daemon whose HOME lacked one of the six failed, blamed on the
+            // work. A missing dir has nothing to mask, and its parent is read-only inside the jail
+            // so a check cannot create it either: zero widening.
+            for dir in secret_read_block_dirs().into_iter().filter(|d| d.is_dir()) {
                 w.push("--tmpfs".to_string());
                 w.push(dir.to_string_lossy().to_string());
             }
@@ -742,6 +748,15 @@ pub(crate) fn detect_worker_sandbox(write_roots: &[std::path::PathBuf]) -> Worke
                 ),
             )
         }
+        // Windows (core#416): "no tool on PATH" is true and silent about "never on this OS" — say
+        // that the floor cannot arm here at all, what that means for a run, and what to do instead.
+        _ if cfg!(windows) => (
+            SandboxLevel::BestEffort,
+            "Windows has no OS write boundary the engine can arm — no sandbox-exec/bwrap \
+             equivalent; the repository-checks floor never runs on this OS and a code-verifying \
+             phase fails closed at its gate; run the daemon on macOS/Linux or verify in CI"
+                .to_string(),
+        ),
         _ => (
             SandboxLevel::BestEffort,
             "no OS-sandbox tool on PATH".to_string(),
@@ -751,6 +766,28 @@ pub(crate) fn detect_worker_sandbox(write_roots: &[std::path::PathBuf]) -> Worke
         wrapper: Vec::new(),
         level,
         downgrade_reason: Some(reason),
+    }
+}
+
+/// The ONE predicate for "the OS sandbox launcher itself failed to arm", shared by both floor
+/// spawn sites ([`crate::repo_checks::run_one`] → `could_not_run`; [`run_validator_reporting`] →
+/// [`ValidatorOutcome::Unrunnable`]). `Some(reason)` iff a wrapper was armed AND the child's FIRST
+/// stderr line is the launcher's own diagnostic — `bwrap: …` (`Can't mkdir`, `setting up uid map`,
+/// …) or `sandbox-exec: …` (`sandbox_apply`, a profile error). Both launchers print exactly that
+/// prefix and exit non-zero BEFORE exec'ing the command, so the wrapped program never ran and the
+/// exit says nothing about the check or the criterion (core#460/#493). With no wrapper there is no
+/// launcher to blame. Callers apply it to a non-zero exit only, so a program that merely PRINTS
+/// such a line and passes is never reclassified; one that prints it and fails lands on the
+/// fail-closed side (`could_not_run` / `Unrunnable` deny too).
+pub(crate) fn launcher_failure(wrapper: &[String], stderr_first_line: &str) -> Option<String> {
+    if wrapper.is_empty() {
+        return None;
+    }
+    let line = stderr_first_line.trim_end();
+    if line.starts_with("bwrap:") || line.starts_with("sandbox-exec:") {
+        Some(format!("the OS sandbox launcher failed to arm: {line}"))
+    } else {
+        None
     }
 }
 
@@ -850,30 +887,98 @@ pub(crate) fn has_exited_unreaped(child: &mut std::process::Child) -> std::io::R
 /// the spawn failing, or (rarer) a `try_wait` on a child that had started. On unix the child is spawned
 /// in its OWN process group so a timeout kills the GROUP (C4),
 /// and the post-kill reap is BOUNDED (C5) so it can never hang. Non-unix keeps the single-child kill.
+/// The production validator path uses [`run_bounded_status_capturing_stderr`] (same wait, stderr
+/// teed for launcher-failure classification); this inherited-stdio shape stays for the sandbox
+/// probes in the tests.
+#[cfg(test)]
 fn run_bounded_status(
     mut cmd: Command,
     timeout: Duration,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
+    own_process_group(&mut cmd);
+    let mut child = cmd.spawn()?;
+    wait_bounded(&mut child, timeout)
+}
+
+/// Put the child (and, by inheritance, its descendants) in a NEW process group whose id is the
+/// child's own pid, so `killpg` on timeout targets the whole tree and never the launcher (unix;
+/// non-unix keeps the single-child kill).
+fn own_process_group(cmd: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Put the child (and, by inheritance, its descendants) in a NEW process group whose id is the
-        // child's own pid, so `killpg` on timeout targets the whole tree and never the launcher.
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn()?;
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// The bounded wait behind [`run_bounded_status`]: poll; at the bound kill the tree and reap bounded.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
         if start.elapsed() >= timeout {
-            kill_child_tree(&mut child);
-            reap_bounded(&mut child);
+            kill_child_tree(child);
+            reap_bounded(child);
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// How much of the child's stderr is kept for launcher-failure classification. The launcher's
+/// diagnostic is one short FIRST line; everything still streams through to this process's stderr.
+const STDERR_HEAD_BYTES: usize = 4096;
+
+/// [`run_bounded_status`] with the child's stderr TEED: every byte still reaches this process's
+/// stderr (the daemon log — exactly what inherited stdio gave before), and the FIRST 4 KiB are kept
+/// so the caller can ask [`launcher_failure`] whether the jail died before exec (core#460). The
+/// drain is bounded: once the status is known the head read so far is taken, so a detached
+/// descendant holding the pipe cannot wedge the gate.
+fn run_bounded_status_capturing_stderr(
+    mut cmd: Command,
+    timeout: Duration,
+) -> (std::io::Result<Option<std::process::ExitStatus>>, String) {
+    own_process_group(&mut cmd);
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (Err(e), String::new()),
+    };
+    let head = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    if let Some(mut err) = child.stderr.take() {
+        let shared = std::sync::Arc::clone(&head);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut chunk = [0u8; 4096];
+            let mut out = std::io::stderr();
+            loop {
+                match err.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = out.write_all(&chunk[..n]);
+                        let mut kept = shared.lock().unwrap_or_else(|p| p.into_inner());
+                        let room = STDERR_HEAD_BYTES.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..n.min(room)]);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+    }
+    let status = wait_bounded(&mut child, timeout);
+    let _ = done_rx.recv_timeout(Duration::from_millis(500));
+    let kept = head.lock().unwrap_or_else(|p| p.into_inner());
+    (status, String::from_utf8_lossy(&kept).into_owned())
 }
 
 /// The deterministic RE-VERIFY (no LLM at run time): run the validator's script in `cwd` and report
@@ -1087,8 +1192,37 @@ pub fn run_validator_reporting(
 
     // Every non-Passed outcome denies, exactly as before; the variant only records WHY, so the gate can
     // say "the shell could not be spawned" instead of attributing that to the operator's worktree.
-    let outcome = ValidatorOutcome::from_bounded(run_bounded_status(cmd, VALIDATOR_TIMEOUT));
+    // The child's stderr is captured for classification (teed — it reaches the daemon log as
+    // before) so a jail that died before exec reads as `Unrunnable`, never as the criterion's
+    // `Failed` (core#460).
+    let (res, stderr_head) = run_bounded_status_capturing_stderr(cmd, VALIDATOR_TIMEOUT);
+    let outcome = classify_launcher_exit(
+        ValidatorOutcome::from_bounded(res),
+        &launcher.wrapper,
+        &stderr_head,
+    );
     Ok((outcome, launcher.level))
+}
+
+/// A `Failed` whose first stderr line is the LAUNCHER's own diagnostic is
+/// [`ValidatorOutcome::Unrunnable`]: the jail never exec'd `sh`, so the criterion was never
+/// evaluated (core#460 — `bwrap: Can't mkdir <HOME>/.aws: Read-only file system` rendered as
+/// `pinned validator failed: <criterion>`). Every other outcome passes through: a script that ran
+/// and said no is still the only `Failed`; a passing exit is never reclassified whatever it printed.
+fn classify_launcher_exit(
+    outcome: ValidatorOutcome,
+    wrapper: &[String],
+    stderr_head: &str,
+) -> ValidatorOutcome {
+    match outcome {
+        ValidatorOutcome::Failed => {
+            match launcher_failure(wrapper, stderr_head.lines().next().unwrap_or("")) {
+                Some(reason) => ValidatorOutcome::Unrunnable(reason),
+                None => ValidatorOutcome::Failed,
+            }
+        }
+        other => other,
+    }
 }
 
 /// The AGENT half of the rev0.4 dual validator: a reviewer seat judges whether `work` satisfies
@@ -3037,14 +3171,20 @@ mod tests {
                 }
             }
             (SandboxLevel::Sandboxed, Some("bwrap")) => {
-                for d in &blocked {
+                // Only the dirs that EXIST are masked (core#460/#493): a `--tmpfs` on a missing
+                // path makes bwrap `mkdir` under `--ro-bind / /` and die before exec.
+                let masked = |d: &std::path::PathBuf| {
                     let s = d.to_string_lossy().to_string();
-                    assert!(
-                        launcher
-                            .wrapper
-                            .windows(2)
-                            .any(|w| w[0] == "--tmpfs" && w[1] == s),
-                        "bwrap argv must tmpfs-mask {}: {:?}",
+                    launcher
+                        .wrapper
+                        .windows(2)
+                        .any(|w| w[0] == "--tmpfs" && w[1] == s)
+                };
+                for d in &blocked {
+                    assert_eq!(
+                        masked(d),
+                        d.is_dir(),
+                        "bwrap argv must tmpfs-mask {} iff it exists: {:?}",
                         d.display(),
                         launcher.wrapper
                     );
@@ -3080,6 +3220,173 @@ mod tests {
             assert!(launcher.wrapper.iter().any(|a| a == "--die-with-parent"));
             assert!(launcher.wrapper.iter().any(|a| a == "--unshare-pid"));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#460/#493/#415 — the Linux regression gate (the CI ubuntu leg installs bubblewrap for
+    /// it). A daemon whose `HOME` lacks one of the six curated secret dirs must still arm: before
+    /// the `is_dir()` filter the argv carried `--tmpfs <HOME>/.aws` for a missing `.aws`, bwrap
+    /// tried to `mkdir` it under `--ro-bind / /` and died before exec (`Can't mkdir … Read-only
+    /// file system`, exit 1) — every floor check and every pinned validator failed, blamed on the
+    /// work. Prints its skip where bwrap is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_arms_on_a_home_lacking_secret_dirs_and_masks_only_those_that_exist_460() {
+        if find_on_path("bwrap").is_none() {
+            eprintln!(
+                "validator: bwrap not on PATH — the Linux floor regression test cannot run here"
+            );
+            return;
+        }
+        let _guard = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("wicked-val-460-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let real_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let sandbox = detect_worker_sandbox(std::slice::from_ref(&wt));
+        match &real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(sandbox.level, SandboxLevel::Sandboxed, "{sandbox:?}");
+        let masked = |rel: &str| {
+            let s = home.join(rel).to_string_lossy().to_string();
+            sandbox
+                .wrapper
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == s)
+        };
+        assert!(
+            masked(".ssh"),
+            "the existing secret dir is masked: {:?}",
+            sandbox.wrapper
+        );
+        for missing in [".aws", ".gnupg", ".claude"] {
+            assert!(
+                !masked(missing),
+                "a missing `{missing}` must not be a --tmpfs destination: {:?}",
+                sandbox.wrapper
+            );
+        }
+        // The jail arms and execs: `/bin/true` exits 0 under the wrapper.
+        let mut argv = sandbox.wrapper.clone();
+        argv.push("/bin/true".to_string());
+        // spawn-audit: test-only — the wrapper probe itself, under the same cleared env the floor applies.
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(&wt);
+        apply_minimal_env(&mut cmd);
+        let (status, stderr_head) =
+            run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+        let status = status.expect("bwrap spawns");
+        assert!(
+            matches!(status, Some(s) if s.success()),
+            "bwrap must arm on a HOME lacking secret dirs — status {status:?}, stderr: {stderr_head}"
+        );
+        assert!(
+            launcher_failure(&sandbox.wrapper, stderr_head.lines().next().unwrap_or("")).is_none(),
+            "{stderr_head}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#460/#493: the ONE launcher-failure predicate shared by the floor (`run_one`) and the
+    /// validator. Only the launcher's OWN first line, only under an armed wrapper.
+    #[test]
+    fn launcher_failure_names_only_the_launchers_own_first_line() {
+        let armed = vec!["/usr/bin/bwrap".to_string(), "--".to_string()];
+        let hit = launcher_failure(
+            &armed,
+            "bwrap: Can't mkdir /nonexistent-home/.aws: Read-only file system",
+        )
+        .expect("bwrap's own diagnostic under an armed wrapper is a launcher failure");
+        assert!(
+            hit.starts_with("the OS sandbox launcher failed to arm: bwrap: Can't mkdir"),
+            "{hit}"
+        );
+        assert!(
+            launcher_failure(
+                &armed,
+                "sandbox-exec: sandbox_apply: Operation not permitted\n"
+            )
+            .is_some(),
+            "the macOS launcher speaks with the same shape"
+        );
+        assert!(launcher_failure(&armed, "error: test failed, to rerun pass `--lib`").is_none());
+        assert!(launcher_failure(&armed, "").is_none());
+        assert!(
+            launcher_failure(&[], "bwrap: Can't mkdir /x: Read-only file system").is_none(),
+            "no wrapper ⇒ no launcher to blame, whatever the program printed"
+        );
+    }
+
+    /// core#460: the validator site — a `Failed` behind the launcher's diagnostic is `Unrunnable`
+    /// (fail-closed, rendered "COULD NOT BE RUN", honest); a script that ran and said no stays
+    /// `Failed`; a passing exit is never reclassified; timeouts pass through.
+    #[test]
+    fn a_launcher_that_died_before_exec_makes_the_validator_unrunnable_not_failed() {
+        let armed = vec!["/usr/bin/bwrap".to_string(), "--".to_string()];
+        let bwrap_line = "bwrap: Can't mkdir /nonexistent-home/.aws: Read-only file system\n";
+        match classify_launcher_exit(ValidatorOutcome::Failed, &armed, bwrap_line) {
+            ValidatorOutcome::Unrunnable(reason) => assert!(
+                reason.contains("failed to arm") && reason.contains("Can't mkdir"),
+                "{reason}"
+            ),
+            other => panic!("a launcher exit must read as Unrunnable, got {other:?}"),
+        }
+        assert_eq!(
+            classify_launcher_exit(
+                ValidatorOutcome::Failed,
+                &armed,
+                "coverage below threshold\n"
+            ),
+            ValidatorOutcome::Failed
+        );
+        assert_eq!(
+            classify_launcher_exit(ValidatorOutcome::Failed, &[], bwrap_line),
+            ValidatorOutcome::Failed,
+            "no wrapper ⇒ the script's own exit"
+        );
+        assert_eq!(
+            classify_launcher_exit(ValidatorOutcome::Passed, &armed, bwrap_line),
+            ValidatorOutcome::Passed
+        );
+        assert_eq!(
+            classify_launcher_exit(ValidatorOutcome::TimedOut, &armed, bwrap_line),
+            ValidatorOutcome::TimedOut
+        );
+    }
+
+    /// The captured-stderr run keeps the child's FIRST line for classification while the bytes
+    /// still stream to this process's stderr (the daemon log); the exit status is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn capturing_stderr_keeps_the_first_line_and_the_status() {
+        let dir = std::env::temp_dir().join(format!("wicked-val-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // spawn-audit: test-only — `apply_minimal_env` below is strictly stronger than the chokepoint.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo 'bwrap: fake launcher line' >&2; echo second >&2; exit 1")
+            .current_dir(&dir);
+        apply_minimal_env(&mut cmd);
+        let (status, head) = run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+        assert!(
+            matches!(status, Ok(Some(s)) if s.code() == Some(1)),
+            "{status:?}"
+        );
+        assert_eq!(
+            head.lines().next(),
+            Some("bwrap: fake launcher line"),
+            "{head}"
+        );
+        assert!(head.contains("second"), "{head}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -109,6 +109,14 @@
 //! the gate turns into a denial an operator can read and act on (install the sandbox tool, or run
 //! the verify phase where one exists).
 //!
+//! Two leaves are special. `TMPDIR` (with `TMP`/`TEMP`) is NOT under the worktree: it is a short
+//! random per-floor directory (`<system temp>/wc-<6 hex>`, mode 0700), armed as the boundary's
+//! second write root and reaped with the floor — a `TMPDIR` under a deep worktree overflowed the
+//! Unix-socket `sun_path` limit (104 bytes on macOS) and manufactured `listen EINVAL` failures the
+//! code did not have (core#489). `CARGO_TARGET_DIR` is split `cargo-target/head` vs
+//! `cargo-target/base`, so cargo's freshness check can never hand a head check the base run's test
+//! binaries through one shared target dir (core#480).
+//!
 //! ## Minimal environment
 //!
 //! A check process does NOT inherit the daemon's environment (adversarial review on #414: a
@@ -1278,6 +1286,88 @@ const CHECK_ENV_PASSTHROUGH: &[&str] = &[
 #[derive(Debug)]
 pub(crate) struct CheckScratch {
     root: PathBuf,
+    /// The checks' `TMPDIR`: `<system temp>/wc-<6 hex>`, private (0700), drawn fresh per floor and
+    /// reaped by `Drop` (core#489 — a socket path must stay short; the worktree may not be).
+    tmp: PathBuf,
+}
+
+/// Which tree a check runs on — selects the `CARGO_TARGET_DIR` leaf (`cargo-target/head` vs
+/// `cargo-target/base`, core#480): with ONE shared target dir cargo's mtime freshness check could
+/// hand a head check the base's test binaries (the contamination the program saw as a false
+/// regression), so each tree builds into its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tree {
+    Head,
+    Base,
+}
+
+impl Tree {
+    fn target_leaf(self) -> &'static str {
+        match self {
+            Tree::Head => "head",
+            Tree::Base => "base",
+        }
+    }
+}
+
+/// The scratch leaves under `<worktree>/tmp/wicked-checks/`. No `tmp` leaf: the checks' `TMPDIR`
+/// lives under the system temp dir (see [`CheckScratch::tmp`]).
+const SCRATCH_LEAVES: &[&str] = &[
+    "home",
+    "npm-cache",
+    "cargo-home",
+    "cargo-target",
+    "cargo-target/head",
+    "cargo-target/base",
+    "xdg-config",
+    "xdg-cache",
+];
+
+/// Bounded attempts at an unused random name under the system temp dir before giving up.
+const TMP_NAME_ATTEMPTS: usize = 16;
+
+/// The production name draw for the checks' `TMPDIR`: `wc-` + 6 random hex (24 bits; with
+/// refuse-existing a collision only costs a redraw). Six, not eight: the macOS per-user temp dir
+/// is 49 bytes and the recorded floor check (`env.tmpdir.len() < 60`) leaves room for exactly
+/// `wc-` + 6; the worst realistic socket (`mkdtemp` one level + `/x.sock`) then stays under 104.
+fn random_tmp_name() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("wc-{}", &id[..6])
+}
+
+/// Create the checks' private `TMPDIR` under `base`: draw a name, `mkdir` it (never `_all`; mode
+/// 0700 on unix) and REFUSE an existing path — a pre-created directory or symlink at the drawn
+/// name (a shared sticky `/tmp` lets any local user plant one) is skipped for a fresh draw, so a
+/// foreign entry is neither followed nor able to fail-close the floor. Only the scratch knows the
+/// name; nothing else is told.
+fn create_private_tmp(base: &Path, mut draw: impl FnMut() -> String) -> std::io::Result<PathBuf> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    for _ in 0..TMP_NAME_ATTEMPTS {
+        let candidate = base.join(draw());
+        match builder.create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "no unused `wc-*` name under `{}` after {TMP_NAME_ATTEMPTS} draws",
+        base.display()
+    )))
+}
+
+impl Drop for CheckScratch {
+    /// Reap the private `TMPDIR` with the floor. `remove_dir_all` does not follow a symlink at the
+    /// top, and the path is one this floor `mkdir`ed itself. A crash before `Drop` (SIGKILL) leaves
+    /// one `wc-*` dir for the OS temp cleaner — LOW, nothing in it is ever reused.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.tmp);
+    }
 }
 
 impl CheckScratch {
@@ -1310,15 +1400,7 @@ impl CheckScratch {
         let root = scratch_root.join(SCRATCH_SUBDIR);
         // The leaves too (adversarial review on #414, LOW): `create_dir_all` would follow a
         // committed symlink-to-directory at a leaf. Refuse a link at any leaf before creating.
-        for sub in [
-            "home",
-            "npm-cache",
-            "cargo-home",
-            "cargo-target",
-            "xdg-config",
-            "xdg-cache",
-            "tmp",
-        ] {
+        for sub in SCRATCH_LEAVES {
             if let Ok(m) = std::fs::symlink_metadata(root.join(sub)) {
                 if m.file_type().is_symlink() {
                     return Err(std::io::Error::new(
@@ -1332,18 +1414,13 @@ impl CheckScratch {
                 }
             }
         }
-        for sub in [
-            "home",
-            "npm-cache",
-            "cargo-home",
-            "cargo-target",
-            "xdg-config",
-            "xdg-cache",
-            "tmp",
-        ] {
+        for sub in SCRATCH_LEAVES {
             std::fs::create_dir_all(root.join(sub))?;
         }
-        Ok(Self { root })
+        // The checks' `TMPDIR` lives OUTSIDE the worktree, short (core#489) — drawn last, so a
+        // refusal above leaves nothing behind under the system temp dir.
+        let tmp = create_private_tmp(&std::env::temp_dir(), random_tmp_name)?;
+        Ok(Self { root, tmp })
     }
 
     fn home(&self) -> PathBuf {
@@ -1354,8 +1431,9 @@ impl CheckScratch {
     /// (`hardened()` already stripped the engine-internal variables; this drops everything else —
     /// tokens, API keys, `WICKED_*`), only [`CHECK_ENV_PASSTHROUGH`] is copied from the daemon, and
     /// every home-shaped variable is set under the scratch, so the check reads none of the
-    /// operator's per-user configuration or credentials and writes nothing outside the worktree.
-    fn apply_env(&self, cmd: &mut Command) {
+    /// operator's per-user configuration or credentials and writes nothing outside the worktree
+    /// but its private `TMPDIR`. `tree` picks the `CARGO_TARGET_DIR` leaf (core#480).
+    fn apply_env(&self, cmd: &mut Command, tree: Tree) {
         let real_home = std::env::var_os("HOME");
         cmd.env_clear();
         for key in CHECK_ENV_PASSTHROUGH {
@@ -1370,9 +1448,9 @@ impl CheckScratch {
             }
         }
         cmd.env("HOME", self.home())
-            .env("TMPDIR", self.root.join("tmp"))
-            .env("TMP", self.root.join("tmp"))
-            .env("TEMP", self.root.join("tmp"))
+            .env("TMPDIR", &self.tmp)
+            .env("TMP", &self.tmp)
+            .env("TEMP", &self.tmp)
             .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
             .env("XDG_CACHE_HOME", self.root.join("xdg-cache"))
             .env("npm_config_cache", self.root.join("npm-cache"))
@@ -1382,8 +1460,12 @@ impl CheckScratch {
             .env("CARGO_HOME", self.root.join("cargo-home"))
             // Build artifacts go under the scratch, not `./target`: a repo that does not ignore
             // `target/` would otherwise fail the worktree guard's final comparison on a PASSING
-            // `cargo test` (Copilot on #414).
-            .env("CARGO_TARGET_DIR", self.root.join("cargo-target"))
+            // `cargo test` (Copilot on #414). One leaf PER TREE (core#480): the base run's
+            // binaries must never satisfy a head check's freshness check, or the reverse.
+            .env(
+                "CARGO_TARGET_DIR",
+                self.root.join("cargo-target").join(tree.target_leaf()),
+            )
             .env("CI", "1")
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0");
@@ -1420,7 +1502,7 @@ impl CheckScratch {
             .collect();
         FloorEnv {
             home: self.home().to_string_lossy().into_owned(),
-            tmpdir: self.root.join("tmp").to_string_lossy().into_owned(),
+            tmpdir: self.tmp.to_string_lossy().into_owned(),
             locale,
             network: "open".to_string(),
             sandbox_level: sandbox_level.to_string(),
@@ -1454,21 +1536,64 @@ pub(crate) fn run_forcing_install(worktree: &Path, force_install: bool) -> RepoC
 /// ([`CheckRun::denies`]): a failure the run base shares is recorded and the floor moves on
 /// (F-RC2-009). Fail-closed on a detection error and when no OS write boundary can be armed.
 pub fn run_floor(worktree: &Path, ctx: &FloorContext) -> RepoChecksReport {
-    let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
-    run_with_sandbox_ctx(worktree, sandbox, ctx)
+    // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
+    // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
+    // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
+    // same fail-closed detection error as before, reported against a worktree-only probe.
+    let scratch = match CheckScratch::prepare(worktree) {
+        Ok(s) => s,
+        Err(e) => {
+            let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+            return scratch_refused(worktree, ctx, &sandbox, &e);
+        }
+    };
+    let sandbox =
+        crate::validator::detect_worker_sandbox(&[worktree.to_path_buf(), scratch.tmp.clone()]);
+    run_with_sandbox_ctx(worktree, sandbox, ctx, scratch)
 }
 
 /// [`run_floor`] against an explicit sandbox probe — the injectable seam, so the fail-closed branch
 /// is testable on a host that HAS a sandbox tool by handing it a best-effort probe.
 #[cfg(test)]
 pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoChecksReport {
-    run_with_sandbox_ctx(worktree, sandbox, &FloorContext::default())
+    let ctx = FloorContext::default();
+    match CheckScratch::prepare(worktree) {
+        Ok(scratch) => run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch),
+        Err(e) => scratch_refused(worktree, &ctx, &sandbox, &e),
+    }
+}
+
+/// The fail-closed report for a scratch that could not be prepared (a symlinked `tmp`, an
+/// unwritable temp dir): detection is still reported so the record says what WOULD have run.
+fn scratch_refused(
+    worktree: &Path,
+    ctx: &FloorContext,
+    sandbox: &WorkerSandbox,
+    e: &std::io::Error,
+) -> RepoChecksReport {
+    RepoChecksReport {
+        detected: detect_with(worktree, ctx).unwrap_or_default(),
+        checks: Vec::new(),
+        skipped: Vec::new(),
+        passed: false,
+        detect_error: Some(format!(
+            "the checks' isolated scratch under `{}/{SCRATCH_SUBDIR}` could not be created: {e}",
+            crate::worktree_guard::ENGINE_SCRATCH_DIR
+        )),
+        sandbox_level: sandbox.level.as_wire().to_string(),
+        sandbox_note: sandbox.downgrade_reason.clone(),
+        sandbox_error: None,
+        engine_writes_removed: Vec::new(),
+        claim: None,
+        env: None,
+    }
 }
 
 pub(crate) fn run_with_sandbox_ctx(
     worktree: &Path,
     sandbox: WorkerSandbox,
     ctx: &FloorContext,
+    scratch: CheckScratch,
 ) -> RepoChecksReport {
     let sandbox_level = sandbox.level.as_wire().to_string();
     let sandbox_note = sandbox.downgrade_reason.clone();
@@ -1516,28 +1641,6 @@ pub(crate) fn run_with_sandbox_ctx(
             }
         }
     };
-    let scratch = match CheckScratch::prepare(worktree) {
-        Ok(s) => s,
-        Err(e) => {
-            return RepoChecksReport {
-                detected,
-                checks: Vec::new(),
-                skipped: Vec::new(),
-                passed: false,
-                detect_error: Some(format!(
-                    "the checks' isolated scratch under `{}/{SCRATCH_SUBDIR}` could not be \
-                     created: {e}",
-                    crate::worktree_guard::ENGINE_SCRATCH_DIR
-                )),
-                sandbox_level,
-                sandbox_note,
-                sandbox_error: None,
-                engine_writes_removed: Vec::new(),
-                claim: None,
-                env: None,
-            }
-        }
-    };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
     let baseline_diff = baseline_diff_enabled(worktree);
@@ -1554,7 +1657,7 @@ pub(crate) fn run_with_sandbox_ctx(
             skipped.push(check.name.clone());
             continue;
         }
-        let mut run = run_one(worktree, check, &sandbox, &scratch);
+        let mut run = run_one(worktree, check, &sandbox, &scratch, Tree::Head);
         // BASELINE-DIFF (F-RC2-009): a FAILURE (not a timeout, not a spawn failure, not the
         // install — those say nothing about the base) is compared against the run base before it
         // may deny. No known base ⇒ the failure denies as it always did.
@@ -1772,7 +1875,7 @@ impl BaseTree {
             }
         };
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
-            let r = run_one(&self.dir, install, sandbox, scratch);
+            let r = run_one(&self.dir, install, sandbox, scratch, Tree::Base);
             if !r.passed() {
                 return fail(format!(
                     "the base's dependency install did not pass ({})",
@@ -1780,7 +1883,7 @@ impl BaseTree {
                 ));
             }
         }
-        let run = run_one(&self.dir, &target, sandbox, scratch);
+        let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
         let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
         if let Ok(json) = serde_json::to_string(&run) {
             let _ = std::fs::write(&cache, json);
@@ -2158,12 +2261,15 @@ fn lossy(bytes: Vec<u8>) -> String {
 }
 
 /// Run one check in `worktree` under its timeout, inside `sandbox`'s write boundary with the
-/// isolated `scratch` homes, capturing exit code + stream tails.
+/// isolated `scratch` homes (`tree` picks the cargo target leaf), capturing exit code + stream
+/// tails. A LAUNCHER that fails to arm (`bwrap: …` / `sandbox-exec: …` as the first stderr line,
+/// non-zero exit) is `could_not_run`, never the check's own `failed` (core#493).
 pub(crate) fn run_one(
     worktree: &Path,
     check: &RepoCheck,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
+    tree: Tree,
 ) -> CheckRun {
     let started = Instant::now();
     let mut result = CheckRun {
@@ -2223,7 +2329,7 @@ pub(crate) fn run_one(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    scratch.apply_env(&mut cmd);
+    scratch.apply_env(&mut cmd, tree);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2276,6 +2382,19 @@ pub(crate) fn run_one(
     let (err_tail, err_ids) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
     result.stdout_tail = lossy(out_tail);
     result.stderr_tail = lossy(err_tail);
+    // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
+    // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 — the check never ran,
+    // so recording `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
+    // (`validator::launcher_failure`) reads the first stderr line; a hit is `could_not_run`
+    // (denies, fail-closed, attribution honest). Never applied to a passing exit or a timeout.
+    if !result.timed_out && result.exit_code != Some(0) {
+        if let Some(msg) = crate::validator::launcher_failure(
+            &sandbox.wrapper,
+            result.stderr_tail.lines().next().unwrap_or(""),
+        ) {
+            result.spawn_error = Some(msg);
+        }
+    }
     // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
     // stderr), de-duplicated, in order of first sight.
     let mut ids = out_ids;
@@ -2667,8 +2786,12 @@ mod tests {
             .join(SCRATCH_SUBDIR);
         assert!(scratch.join("cargo-home").is_dir());
         assert!(
-            scratch.join("cargo-target").join("debug").is_dir(),
-            "cargo built into the scratch target dir"
+            scratch
+                .join("cargo-target")
+                .join("head")
+                .join("debug")
+                .is_dir(),
+            "cargo built into the scratch target dir's HEAD leaf (core#480)"
         );
         assert!(
             !wt.join("target").exists(),
@@ -2797,7 +2920,7 @@ mod tests {
             source: "fixture".into(),
             timeout_s: None,
         };
-        if !run_one(&wt, &inside, &sandbox, &scratch).passed() {
+        if !run_one(&wt, &inside, &sandbox, &scratch, Tree::Head).passed() {
             eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping the kernel claim");
             return;
         }
@@ -2814,7 +2937,7 @@ mod tests {
             source: "fixture".into(),
             timeout_s: None,
         };
-        let r = run_one(&wt, &escaping, &sandbox, &scratch);
+        let r = run_one(&wt, &escaping, &sandbox, &scratch, Tree::Head);
         assert!(!r.passed(), "an outside write must fail the check: {r:?}");
         assert!(!pwned.exists(), "the outside write must never land on disk");
         assert!(
@@ -2830,7 +2953,7 @@ mod tests {
             source: "fixture".into(),
             timeout_s: None,
         };
-        let r = run_one(&wt, &home_probe, &sandbox, &scratch);
+        let r = run_one(&wt, &home_probe, &sandbox, &scratch, Tree::Head);
         assert!(r.passed());
         assert!(
             r.stdout_tail
@@ -2861,7 +2984,7 @@ mod tests {
             source: "fixture".into(),
             timeout_s: None,
         };
-        let r = run_one(&wt, &env_dump, &sandbox, &scratch);
+        let r = run_one(&wt, &env_dump, &sandbox, &scratch, Tree::Head);
         std::env::remove_var(PLANTED);
         assert!(r.passed(), "{r:?}");
         let out = &r.stdout_tail;
@@ -2895,6 +3018,226 @@ mod tests {
             out.lines().any(|l| l.starts_with("CARGO_TARGET_DIR=")),
             "{out}"
         );
+        // core#480: the head run builds into its own target leaf, the base run into another;
+        // core#489: `TMPDIR` is the scratch's private dir under the system temp dir, not a leaf
+        // of the worktree.
+        let head_target = format!(
+            "CARGO_TARGET_DIR={}",
+            scratch.root.join("cargo-target").join("head").display()
+        );
+        assert!(out.lines().any(|l| l == head_target), "{out}");
+        let tmp_line = format!("TMPDIR={}", scratch.tmp.display());
+        assert!(out.lines().any(|l| l == tmp_line), "{out}");
+        assert!(
+            !scratch.tmp.starts_with(&wt),
+            "TMPDIR must leave the worktree: {}",
+            scratch.tmp.display()
+        );
+        let base = run_one(&wt, &env_dump, &sandbox, &scratch, Tree::Base);
+        assert!(base.passed(), "{base:?}");
+        let base_target = format!(
+            "CARGO_TARGET_DIR={}",
+            scratch.root.join("cargo-target").join("base").display()
+        );
+        assert!(
+            base.stdout_tail.lines().any(|l| l == base_target),
+            "{}",
+            base.stdout_tail
+        );
+    }
+
+    /// core#489: the checks' `TMPDIR` is a short private dir under the system temp dir — a socket
+    /// bound under it stays inside `sun_path` however deep the worktree is — recorded on the env
+    /// payload, inside the armed boundary, and gone when the floor is. Skips without python3 (the
+    /// socket binder) or a sandbox tool.
+    #[cfg(unix)]
+    #[test]
+    fn the_checks_tmpdir_is_short_private_outside_the_worktree_and_reaped_489() {
+        if crate::validator::find_on_path("python3").is_none() {
+            eprintln!("repo_checks: python3 not on PATH — the socket binder cannot run here");
+            return;
+        }
+        // A worktree nested past the socket limit (104 bytes on macOS): a `TMPDIR` under it would
+        // put `x.sock` well past that.
+        let mut wt = scratch("deep-tmpdir");
+        while wt.to_string_lossy().len() < 120 {
+            wt = wt.join("a-deeper-directory-level");
+        }
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        let binder = "import os, socket, stat\n\
+                      t = os.environ['TMPDIR']\n\
+                      assert os.environ['TMP'] == t and os.environ['TEMP'] == t\n\
+                      print('TMPDIR=' + t)\n\
+                      print('MODE=' + oct(stat.S_IMODE(os.stat(t).st_mode)))\n\
+                      s = socket.socket(socket.AF_UNIX)\n\
+                      s.bind(os.path.join(t, 'x.sock'))\n\
+                      s.listen(1)\n\
+                      print('BOUND')\n";
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            serde_json::json!({ "test": ["python3", "-c", binder] }).to_string(),
+        )
+        .unwrap();
+        let report = run_floor(&wt, &FloorContext::default());
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+            return;
+        }
+        assert!(report.passed, "{report:?}");
+        let env = report
+            .env
+            .as_ref()
+            .expect("the env record rides a floor that ran");
+        let tmpdir = Path::new(&env.tmpdir);
+        assert!(
+            env.tmpdir.len() < 60,
+            "TMPDIR must stay short: {} ({} bytes)",
+            env.tmpdir,
+            env.tmpdir.len()
+        );
+        assert!(tmpdir.starts_with(std::env::temp_dir()), "{}", env.tmpdir);
+        assert!(
+            !tmpdir.starts_with(&wt),
+            "TMPDIR left the worktree: {}",
+            env.tmpdir
+        );
+        assert!(
+            tmpdir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.len() == 9 && n.starts_with("wc-")),
+            "{}",
+            env.tmpdir
+        );
+        let out = &report.checks[0].stdout_tail;
+        assert!(out.contains(&format!("TMPDIR={}", env.tmpdir)), "{out}");
+        assert!(out.contains("MODE=0o700"), "{out}");
+        assert!(out.contains("BOUND"), "{out}");
+        assert!(
+            !tmpdir.exists(),
+            "the private TMPDIR is reaped with the floor: {}",
+            env.tmpdir
+        );
+        // And the worktree scratch carries no `tmp` leaf any more.
+        assert!(!wt
+            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+            .join(SCRATCH_SUBDIR)
+            .join("tmp")
+            .exists());
+    }
+
+    /// The private `TMPDIR` refuses an existing path at the drawn name — a directory or a SYMLINK
+    /// another local user planted on a shared sticky temp dir — and simply draws again: nothing
+    /// is followed, nothing fail-closes, and the result is mode 0700. Every draw taken is an
+    /// error, never a follow.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_tmpdir_refuses_a_planted_name_and_draws_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("tmp-draw");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("wc-taken1")).unwrap();
+        std::fs::create_dir_all(base.join("wc-taken2")).unwrap();
+        let mut draws = ["wc-taken1", "wc-taken2", "wc-fresh0"].into_iter();
+        let tmp =
+            create_private_tmp(&base, || draws.next().expect("bounded draws").to_string()).unwrap();
+        assert_eq!(tmp, base.join("wc-fresh0"));
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            std::fs::symlink_metadata(base.join("wc-taken1"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is untouched"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing was created through the link"
+        );
+        let err = create_private_tmp(&base, || "wc-taken1".to_string())
+            .expect_err("every draw taken is an error");
+        assert!(err.to_string().contains("no unused"), "{err}");
+    }
+
+    /// core#493: a launcher that dies before exec (`bwrap: Can't mkdir <HOME>/.aws: Read-only
+    /// file system`, exit 1) never ran the check — the record is `could_not_run` carrying the
+    /// launcher's line, not the check's `failed`. A check that RAN and exited 1 under the same
+    /// wrapper is still `failed`; a passing exit is never reclassified whatever it printed.
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_that_fails_to_arm_is_could_not_run_never_the_checks_failure_493() {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = scratch("launcher-fail");
+        let fake = wt.join("fake-bwrap");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--fail\" ]; then\n\
+               echo \"bwrap: Can't mkdir /nonexistent-home/.aws: Read-only file system\" >&2\n\
+               exit 1\n\
+             fi\n\
+             shift\n\
+             exec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let armed = |flag: &str| WorkerSandbox {
+            wrapper: vec![fake.to_string_lossy().into_owned(), flag.to_string()],
+            level: SandboxLevel::Sandboxed,
+            downgrade_reason: None,
+        };
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        let check = |script: &str| RepoCheck {
+            name: "test".into(),
+            argv: s(&["sh", "-c", script]),
+            source: "fixture".into(),
+            timeout_s: None,
+        };
+        let dead = run_one(
+            &wt,
+            &check("exit 0"),
+            &armed("--fail"),
+            &scratch,
+            Tree::Head,
+        );
+        assert_eq!(dead.outcome(), "could_not_run", "{dead:?}");
+        assert_eq!(dead.exit_code, Some(1));
+        assert!(
+            dead.spawn_error.as_deref().is_some_and(|e| {
+                e.starts_with("the OS sandbox launcher failed to arm: bwrap: Can't mkdir")
+            }),
+            "{dead:?}"
+        );
+        assert!(
+            dead.denies(),
+            "fail-closed: a floor that could not run still denies"
+        );
+        assert!(
+            dead.summary().contains("failed to arm"),
+            "{}",
+            dead.summary()
+        );
+        let red = run_one(
+            &wt,
+            &check("echo 'error: test failed' >&2; exit 1"),
+            &armed("--"),
+            &scratch,
+            Tree::Head,
+        );
+        assert_eq!(red.outcome(), "failed", "{red:?}");
+        assert!(red.spawn_error.is_none());
+        let green = run_one(
+            &wt,
+            &check("echo 'bwrap: only printed' >&2; exit 0"),
+            &armed("--"),
+            &scratch,
+            Tree::Head,
+        );
+        assert_eq!(green.outcome(), "passed", "{green:?}");
     }
 
     /// Adversarial review on #414: a descendant that escapes the process group (`setsid`) and
@@ -2923,7 +3266,7 @@ mod tests {
             timeout_s: None,
         };
         let started = Instant::now();
-        let r = run_one(&wt, &holder, &sandbox, &scratch);
+        let r = run_one(&wt, &holder, &sandbox, &scratch, Tree::Head);
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "the drain must be bounded (took {:?})",
@@ -3020,7 +3363,7 @@ mod tests {
                 skipped.push(c.name.clone());
                 continue;
             }
-            let r = run_one(&wt, c, &sandbox, &scratch);
+            let r = run_one(&wt, c, &sandbox, &scratch, Tree::Head);
             failed = !r.passed();
             runs.push(r);
         }
@@ -3068,7 +3411,7 @@ mod tests {
         }
         let sandbox = sandbox_for(&wt);
         let scratch = CheckScratch::prepare(&wt).unwrap();
-        let r = run_one(&wt, &echo, &sandbox, &scratch);
+        let r = run_one(&wt, &echo, &sandbox, &scratch, Tree::Head);
         assert!(r.passed(), "{r:?}");
         assert!(
             r.stdout_tail.len() <= TAIL_BYTES,
@@ -3123,7 +3466,7 @@ mod tests {
             timeout_s: Some(1),
         };
         let started = Instant::now();
-        let r = run_one(&wt, &slow, &sandbox, &scratch);
+        let r = run_one(&wt, &slow, &sandbox, &scratch, Tree::Head);
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "killed at the bound, not after the sleep: {:?}",

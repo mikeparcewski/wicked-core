@@ -64,6 +64,21 @@ jobs:
       - name: cargo build
         run: cargo build --workspace
 
+      # Linux: arm bubblewrap so the `#[cfg(unix)]` sandbox tests exercise the REAL bwrap jail
+      # (core#415). Until now the ubuntu leg had no `bwrap`, every bwrap-gated test printed its skip,
+      # and the Linux floor shipped through a green gate — the `--tmpfs` on a missing secret dir that
+      # killed every floor and pinned validator on Linux (core#460/#493) was never CI-visible. Same
+      # recipe as wicked-ci's smoke harness; the `/bin/true` probe proves the runner can arm at all.
+      - name: Arm the checks sandbox (bubblewrap) on Linux
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent -- /bin/true
+          echo "bwrap can arm a boundary on this runner"
+
       - name: cargo test
         run: cargo test --workspace
 
