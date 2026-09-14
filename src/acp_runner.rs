@@ -4317,11 +4317,6 @@ fn handle_update(
         .and_then(Value::as_str)
         .unwrap_or("");
     match kind {
-        // F-W1-004: a tool call STARTS — whatever was said before it was narration ("Let me look
-        // at…"), already streamed as deltas; the answer a chat surfaces begins after the last one.
-        "tool_call" => {
-            *answer_from = output.len();
-        }
         "agent_message_chunk" => {
             if let Some(text) = update["content"]["text"].as_str() {
                 emit(text);
@@ -4374,6 +4369,12 @@ fn handle_update(
             }
         }
         "tool_call" | "tool_call_update" => {
+            // F-W1-004: a tool call STARTS — whatever was said before it was narration ("Let me look
+            // at…"), already streamed as deltas; the answer a chat surfaces begins after the last one.
+            // Reply boundary advances on `tool_call` ONLY (#525, L5), never on an update frame.
+            if kind == "tool_call" {
+                *answer_from = output.len();
+            }
             // Collect file paths reported by the CLI (e.g. read/edit locations) — from the UPDATE
             // frame only, as before: opencode repeats `locations` on the initial `tool_call`, and
             // `dataUsed.files` goes out without dedup (review of #524, finding 2).
