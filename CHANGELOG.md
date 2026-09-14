@@ -1403,6 +1403,12 @@ Two release tracks share this file, newest entry first regardless of track:
   equivalent; the repository-checks floor never runs on this OS and a code-verifying phase fails
   closed at its gate; run the daemon on macOS/Linux or verify in CI` instead of the (true, silent)
   `no OS-sandbox tool on PATH`.
+- **`.wicked/checks.json` `e2e` (core #482 item 3 / F-3R2-023; DES-L2 §5 2D).** An end-to-end
+  suite the floor runs at the VERIFY stage only, after `test`/`test_targeted` — never at the
+  creator floor; the deliver re-verify is a verify-stage floor and runs it too (BC-12 / BC-07). Nothing is auto-detected (absent or `false` ⇒ no `e2e` check); `timeout_s` and
+  the baseline diff apply, and a run base that lacks the key fails the diff CLOSED ("the run base
+  declares no `e2e` check (the change introduced it)"). The key set is now `typecheck · lint ·
+  test · test_targeted · e2e · full · baseline_diff · timeout_s`; unknown keys are still refused.
 <!-- fixall L3 -->
 - **The repo-checks floor heartbeats on the unit's transcript stream (crew #581, F-BM-010).**
   After the worker returned, the floor (`typecheck`/`lint`/`test`, up to 3600 s per check) ran on
