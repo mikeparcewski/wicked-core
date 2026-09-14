@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Build fix: collapse the duplicate `"tool_call"` arm in the ACP `sessionUpdate` handler (#524 × #525 unreachable-pattern collision; main red at `-D warnings`).** #525 (L5) added `"tool_call" => { *answer_from = … }` and #524 (L4) added `"tool_call" | "tool_call_update" => { … }`; composed on main the first shadows the second, so `-D unreachable-patterns` failed the lib compile on all three OS legs. The two arms are merged into one — `*answer_from` still advances on `tool_call` only (never on an update frame, exactly as #525 shipped) and #524's failed-tool-call recording and update-frame `locations` collection run unchanged. No behaviour change.
+
 - **Chat seats are handed the skills a unit gets; the turn budget is named; `chatReply.usage`; the
   chat boundary reads the seat's store pin (DES-L5 wave 1 "chat first", journey P6; core #487 +
   crew #563 core half, core #412 chat half, F-RC1-110/113/116).** `chat_ensure` handed every seat
