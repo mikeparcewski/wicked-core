@@ -6772,11 +6772,33 @@ enum ToolExit {
 /// tool cannot OOM the daemon.
 const TOOL_MAX_OUT: u64 = 8 * 1024 * 1024;
 
+/// Drain a child's pipe to EOF, RETAINING at most [`TOOL_MAX_OUT`] bytes: past the cap the
+/// bytes are read and discarded, never left unread — a reader that stopped at the cap would
+/// close its end of the pipe and the child's next write would die with EPIPE, turning a verbose
+/// but healthy tool into a failed one (review on #511; `run_bounded`'s drains keep reading too).
 fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
-    use std::io::Read;
     let mut buf = Vec::new();
-    if let Some(r) = r {
-        let _ = r.take(TOOL_MAX_OUT).read_to_end(&mut buf);
+    let Some(mut r) = r else {
+        return buf;
+    };
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = (TOOL_MAX_OUT as usize).saturating_sub(buf.len());
+                if room >= n {
+                    buf.extend_from_slice(&chunk[..n]);
+                } else {
+                    buf.extend_from_slice(&chunk[..room]);
+                    if !capped {
+                        buf.extend_from_slice("\n… (output truncated)\n".as_bytes());
+                        capped = true;
+                    }
+                }
+            }
+        }
     }
     buf
 }
@@ -14160,6 +14182,27 @@ mod tool_cmd_tests {
         );
         assert_eq!(st, StepStatus::Ok);
         assert!(out.starts_with("reached\n"), "{out}");
+    }
+
+    /// Review on #511: a tool that writes MORE than the retained cap must still exit on its own
+    /// terms — the drain keeps reading (and discarding) past the cap, so the child never sees
+    /// EPIPE. 9 MiB of stdout → exit 0, `Ok`, the retained text capped and marked.
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_retained_cap_is_discarded_not_left_unread() {
+        // 9 × 1 MiB lines of 'x' — past the 8 MiB cap.
+        let script = "i=0; while [ $i -lt 9 ]; do head -c 1048576 /dev/zero | tr '\\0' x; echo; \
+                      i=$((i+1)); done; exit 0";
+        let (out, st, k) = run_tool_cmd(&sh(script), None, &[], &never);
+        assert_eq!(
+            st,
+            StepStatus::Ok,
+            "no EPIPE: the child exited 0 — {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(k.is_none());
+        assert!(out.len() <= (TOOL_MAX_OUT as usize) + 64, "{}", out.len());
+        assert!(out.contains("(output truncated)"), "the cap is marked");
     }
 
     #[test]
