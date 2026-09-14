@@ -1538,10 +1538,7 @@ impl WrappedCliStepRunner {
             if !flags.is_empty() {
                 apply_seat_posture(&mut argv, &flags);
             }
-            if let (Some(s), false) = (
-                handed,
-                matches!(delivery, crate::skills_snapshot::SkillsDelivery::None),
-            ) {
+            if let (Some(s), true) = (handed, delivery.delivers_skills()) {
                 s.report(&format!(
                     "path=wrapped run={} unit={} cli={cli_key}",
                     input.run_id, input.unit.ord
@@ -9444,8 +9441,10 @@ mod tests {
         assert_eq!(tree_fingerprint(&codex_skills), populated);
 
         // agy: no lever. A skill-invoking unit is refused by name, never launched; one that names
-        // none runs with nothing delivered and no launcher environment: no root, no path-list,
-        // and the PATH is the daemon's own, unprefixed.
+        // none runs with no LEVER delivered — no --skill/--add-dir/--plugin-dir, no CODEX_HOME, no
+        // path-list — but, since DES-L4 PR-⑤ (R9), it IS handed the generation's LAUNCHER
+        // (`LauncherOnly`): `WICKED_GARDEN_ROOT` + `<snapshot>/scripts` on PATH, so the estate shim
+        // reaches it too.
         let (out, argv) = launch("agy", Some("wicked-garden-domain"));
         assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
@@ -9467,14 +9466,10 @@ mod tests {
             "{argv:?}"
         );
         assert_eq!(env_line(&argv), "UNSET");
-        assert_eq!(env_of(&argv, "WICKED_GARDEN_ROOT"), "UNSET");
         assert_eq!(env_of(&argv, "WICKED_PI_SKILL_DIRS"), "UNSET");
         assert_eq!(env_of(&argv, "CODEX_HOME"), "UNSET");
-        assert!(
-            !env_of(&argv, "PATH").starts_with(&scripts_prefix),
-            "{}",
-            env_of(&argv, "PATH")
-        );
+        // R9 / BC-24: the launcher env reaches a lever-less seat (was UNSET before PR-⑤).
+        assert_launcher_env(&argv, "agy");
 
         // No side channel: the user's CLI trees and the snapshot are byte-identical.
         for (d, fp) in user_dirs.iter().zip(before.iter()) {
@@ -10040,7 +10035,9 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
         };
         {
             let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
-            // Skill-less: runs, nothing delivered, nothing populated, nothing minted.
+            // Skill-less: runs, no LEVER delivered and nothing minted/populated — but since DES-L4
+            // PR-⑤ the generation's LAUNCHER still reaches it (`LauncherOnly`): WICKED_GARDEN_ROOT
+            // is the snapshot, CODEX_HOME stays UNSET (the hatch mints no seat home).
             let (out, argv) = launch(None, "hatch-plain");
             assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
             let argv = argv.expect("the skill-less codex unit was launched under the hatch");
@@ -10053,8 +10050,8 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
             );
             assert_eq!(
                 env_of(&argv, "WICKED_GARDEN_ROOT"),
-                "UNSET",
-                "no delivery ⇒ no launcher env"
+                snapshot.to_string_lossy(),
+                "the launcher reaches a lever-less codex seat under the hatch (PR-⑤)"
             );
             assert_eq!(
                 env_of(&argv, "CODEX_HOME"),

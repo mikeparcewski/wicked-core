@@ -5904,7 +5904,7 @@ impl AcpStepRunner {
         let delivery = handed
             .map(|s| s.delivery(&worker_cli))
             .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
-        let delivers = !matches!(delivery, crate::skills_snapshot::SkillsDelivery::None);
+        let delivers = delivery.delivers_skills();
 
         // Deliver queued operator messages on this turn (the inject path for ACP runs):
         // appended AFTER the cross-CLI context blocks so they read as the most recent
@@ -6500,12 +6500,10 @@ impl AcpStepRunner {
                     bound.as_ref().map(|s| s.root.as_path()),
                 );
             }
-            if let Some(s) = bound.as_ref().filter(|s| {
-                !matches!(
-                    s.delivery(&worker_cli),
-                    crate::skills_snapshot::SkillsDelivery::None
-                )
-            }) {
+            if let Some(s) = bound
+                .as_ref()
+                .filter(|s| s.delivery(&worker_cli).delivers_skills())
+            {
                 s.report(&format!(
                     "path=acp run={run_id} cli={cli_key} unit={} reused=true",
                     input.unit.ord

@@ -393,6 +393,12 @@ pub(crate) enum SkillsDelivery {
         generation: String,
         skills: Vec<crate::codex_skills::CodexSkill>,
     },
+    /// No skills LEVER on this CLI (or none deliverable to it), but the generation HAS a published
+    /// root: the seat is still handed the generation's LAUNCHER (`WICKED_GARDEN_ROOT` + a `PATH`
+    /// prefix of `<root>/scripts`) so `wicked-garden run …` in a skill's text — and the estate shim
+    /// behind it — resolves to THIS generation on every seat (D1, DES-L4 PR-⑤). No plugin, no
+    /// argv flags, no seat-home population: the launcher only.
+    LauncherOnly(PathBuf),
 }
 
 /// The env var opencode reads its whole configuration from (the seat's governance content
@@ -519,6 +525,7 @@ impl SkillsDelivery {
         match self {
             SkillsDelivery::None => None,
             SkillsDelivery::ClaudePlugin(root)
+            | SkillsDelivery::LauncherOnly(root)
             | SkillsDelivery::PiSkillFlags { root, .. }
             | SkillsDelivery::CopilotAddDir { root, .. }
             | SkillsDelivery::OpencodeConfig { root, .. }
@@ -526,12 +533,21 @@ impl SkillsDelivery {
         }
     }
 
+    /// Does this delivery hand the seat a skills LEVER (a plugin, `--skill`/`--add-dir` flags, an
+    /// opencode config, or a populated codex home)? `false` for [`SkillsDelivery::None`] AND
+    /// [`SkillsDelivery::LauncherOnly`] — the latter hands the launcher env but no lever, so the
+    /// `skillsSnapshotHanded` event (which means "a lever was handed", R9) does not fire for it.
+    pub(crate) fn delivers_skills(&self) -> bool {
+        !matches!(self, SkillsDelivery::None | SkillsDelivery::LauncherOnly(_))
+    }
+
     /// The launcher environment a seat handed THIS delivery receives alongside it (F-079,
     /// core#441): `WICKED_GARDEN_ROOT=<root>` and `PATH` with `<root>/scripts` pushed to the
     /// front of `inherited_path` (the daemon's own, as the child would otherwise inherit it).
     /// Both name read-only paths inside the fence's allowed slot — the generation the skills
-    /// themselves came from — and nothing is written anywhere. Empty for [`SkillsDelivery::None`]:
-    /// a seat handed no skills is handed no launcher either.
+    /// themselves came from — and nothing is written anywhere. Non-empty for every delivery with a
+    /// root, [`SkillsDelivery::LauncherOnly`] included (that IS its whole payload); empty only for
+    /// [`SkillsDelivery::None`] (no root — a live-cache root on a non-Claude seat, or no snapshot).
     pub(crate) fn launcher_env(&self, inherited_path: Option<&std::ffi::OsStr>) -> EnvPairs {
         let Some(root) = self.root() else {
             return Vec::new();
@@ -1128,7 +1144,11 @@ impl SkillsSnapshot {
             return SkillsDelivery::None;
         }
         match cli.lever() {
-            SkillsLever::CodexSkillsDir if inherits_operator_config => SkillsDelivery::None,
+            SkillsLever::CodexSkillsDir if inherits_operator_config => {
+                // The hatch mints no seat home, so codex has nothing to populate — but the
+                // generation's launcher still reaches it (DES-L4 PR-⑤). LauncherOnly, not None.
+                SkillsDelivery::LauncherOnly(self.root.clone())
+            }
             SkillsLever::ClaudePlugin => SkillsDelivery::ClaudePlugin(self.root.clone()),
             SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags {
                 root: self.root.clone(),
@@ -1139,7 +1159,9 @@ impl SkillsSnapshot {
                     root: self.root.clone(),
                     view,
                 },
-                None => SkillsDelivery::None,
+                // No copilot view in this snapshot: no `--add-dir` lever, but the launcher still
+                // reaches the seat (DES-L4 PR-⑤).
+                None => SkillsDelivery::LauncherOnly(self.root.clone()),
             },
             SkillsLever::OpencodeConfig => SkillsDelivery::OpencodeConfig {
                 root: self.root.clone(),
@@ -1150,7 +1172,8 @@ impl SkillsSnapshot {
                 generation: self.generation_label(),
                 skills: self.codex_skills(),
             },
-            SkillsLever::Absent => SkillsDelivery::None,
+            // No lever on this CLI (agy): the launcher only, never a plugin/flags/home (DES-L4 PR-⑤).
+            SkillsLever::Absent => SkillsDelivery::LauncherOnly(self.root.clone()),
         }
     }
 
@@ -5044,7 +5067,15 @@ mod tests {
         let handed = admit_refs(Some(s.clone()), &RequiredRefs::seat([]), &agy)
             .unwrap()
             .expect("the root is still handed for the record");
-        assert_eq!(handed.delivery(&agy), SkillsDelivery::None);
+        // DES-L4 PR-⑤: agy has no lever, but the published generation's LAUNCHER still reaches it.
+        assert_eq!(
+            handed.delivery(&agy),
+            SkillsDelivery::LauncherOnly(handed.root.clone())
+        );
+        assert!(
+            !handed.delivery(&agy).delivers_skills(),
+            "LauncherOnly is not a lever — skillsSnapshotHanded must not fire for it"
+        );
         assert!(admit_refs(
             Some(s.clone()),
             &RequiredRefs::plan_and_seat(["wicked-garden-domain"], []),
@@ -5113,8 +5144,8 @@ mod tests {
         assert!(codex_hatch_reason(false).is_none());
         assert_eq!(
             handed.delivery_with(&codex, true),
-            SkillsDelivery::None,
-            "no minted home ⇒ codex is handed nothing (a skill-less unit runs, nothing is populated)"
+            SkillsDelivery::LauncherOnly(handed.root.clone()),
+            "no minted home ⇒ no codex lever, but the generation's launcher still reaches it (PR-⑤)"
         );
         assert!(matches!(
             handed.delivery_with(&codex, false),
@@ -5376,7 +5407,11 @@ mod tests {
                 ),
                 "refused at admission too, even when nothing is invoked"
             );
-            assert_eq!(ls.delivery(&copilot), SkillsDelivery::None);
+            // DES-L4 PR-⑤: no usable copilot view ⇒ no `--add-dir` lever, but the launcher reaches it.
+            assert_eq!(
+                ls.delivery(&copilot),
+                SkillsDelivery::LauncherOnly(ls.root.clone())
+            );
         }
         // pi: discovery OFF, then one --skill per PORTABLE skill (the non-portable extractor is
         // not delivered; nested portable skills are).
@@ -7117,6 +7152,8 @@ mod tests {
                 root: root.clone(),
                 dirs: dirs.clone(),
             },
+            // DES-L4 PR-⑤: a launcher-only seat carries the SAME launcher env as any lever.
+            SkillsDelivery::LauncherOnly(root.clone()),
         ];
         let inherited = OsString::from(["/usr/bin", "/bin"].join(PATH_LIST_SEPARATOR));
         for d in &deliveries {
@@ -7139,6 +7176,11 @@ mod tests {
         assert!(SkillsDelivery::None
             .launcher_env(Some(inherited.as_os_str()))
             .is_empty());
+        // `delivers_skills()` separates a lever from launcher-only/none (R9 — the
+        // `skillsSnapshotHanded` event means "a lever was handed").
+        assert!(SkillsDelivery::ClaudePlugin(root.clone()).delivers_skills());
+        assert!(!SkillsDelivery::LauncherOnly(root.clone()).delivers_skills());
+        assert!(!SkillsDelivery::None.delivers_skills());
 
         // The pure helper, both separators.
         assert_eq!(
@@ -7224,6 +7266,7 @@ mod tests {
                 root: root.clone(),
                 dirs: vec![a.clone()],
             },
+            SkillsDelivery::LauncherOnly(root.clone()),
             SkillsDelivery::None,
         ] {
             assert_eq!(
