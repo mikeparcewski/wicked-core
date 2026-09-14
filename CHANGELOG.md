@@ -15,6 +15,15 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Every seat with a published generation is handed the launcher (`SkillsDelivery::LauncherOnly`,
+  D1 / DES-L4 PR-⑤).** A seat with no skills lever — codex under the inherit-operator-config hatch,
+  copilot with no view, or a CLI with no lever at all (agy) — was handed `SkillsDelivery::None`, so
+  it got no `WICKED_GARDEN_ROOT` / `PATH` prefix and `wicked-garden run …` (the estate shim) was
+  unreachable there. Those three sites now return `LauncherOnly(root)`: the launcher env reaches
+  every seat that has a published root. A LIVE-CACHE root on a non-Claude seat still hands NOTHING
+  (deliberate — no publish-time verdict). `skillsSnapshotHanded` keeps meaning "a lever was handed"
+  via the new `delivers_skills()` (false for `None` and `LauncherOnly`); `LauncherOnly` is internal
+  (`pub(crate)`, no serde) — no wire/d.ts change.
 - **Run markers on every worker's own environment (R12, DES-L4 PR-③).** `WICKED_RUN_ID` /
   `WICKED_RUN_UNIT` / `WICKED_RUN_AGENT` — the pairs `estate_provenance_env` already produced — were
   handed ONLY to the estate MCP (the wrapped `--mcp-config` env object, the ACP `session/new` env
