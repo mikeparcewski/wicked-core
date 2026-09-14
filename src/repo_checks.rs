@@ -76,6 +76,9 @@
 //! Optional, fail-closed on a malformed file (an unknown key or a bad value is a detection error,
 //! never a silent default): `typecheck` / `lint` / `test` / `test_targeted` (a command as an argv
 //! array or a whitespace-split string — no shell; `false` disables the auto-detected check),
+//! `e2e` (an end-to-end suite, run at the VERIFY stage only, after the test set — the creator
+//! floor never pays for it; the deliver re-verify is a verify-stage floor and runs it too;
+//! nothing is auto-detected, so it runs only where declared),
 //! `timeout_s` (the per-check base bound, replacing the 20-minute default), `full` (run the FULL
 //! `test` at verify even when `test_targeted` exists) and `baseline_diff` (default `true`). The
 //! floor PREFERS `test_targeted` — at the creator stage always, at verify unless `full: true` —
@@ -869,6 +872,11 @@ struct ChecksConfig {
     test: Option<CheckCommand>,
     /// The change-scoped test command the floor PREFERS (`{files}` / `{base}` placeholders).
     test_targeted: Option<CheckCommand>,
+    /// An end-to-end suite, run at the VERIFY stage only, after `test`/`test_targeted` — never at
+    /// the creator floor (core#482 / F-3R2-023). Nothing is auto-detected: absent ⇒ no `e2e`
+    /// check; `false` is accepted and means the same. `timeout_s` and the baseline diff apply
+    /// (a base lacking the key fails closed: "the change introduced it").
+    e2e: Option<CheckCommand>,
     /// The per-check BASE bound in seconds (install keeps its own); scaled by the host-load factor.
     timeout_s: Option<u64>,
     /// Run the FULL `test` at verify even when `test_targeted` is declared.
@@ -1017,11 +1025,24 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let r_lint = resolve(&cfg.lint, "lint")?;
     let r_test = resolve(&cfg.test, "test")?;
     let r_targeted = resolve(&cfg.test_targeted, "test_targeted")?;
-    // A configured Node-shaped command needs the tree provisioned even when package.json names
-    // no matching script (`npx vitest …` resolves from node_modules).
+    let r_e2e = resolve(&cfg.e2e, "e2e")?;
+    // `e2e` is a VERIFY-stage check only (the base run copies the stage, so never at the creator).
+    let e2e = match r_e2e {
+        Resolved::Command(argv) if ctx.stage == FloorStage::Verify => Some(RepoCheck {
+            name: "e2e".into(),
+            argv,
+            source: format!("{CONFIG_PATH} e2e"),
+            timeout_s: None,
+        }),
+        _ => None,
+    };
+    // A configured command (Node-shaped or not — the rule is the same for every configured slot)
+    // needs the tree provisioned when a `package.json` is present and `node_modules` is missing:
+    // `npx vitest …` resolves from node_modules.
     let configured_node = [&r_typecheck, &r_lint, &r_test, &r_targeted]
         .iter()
-        .any(|r| matches!(r, Resolved::Command(_)));
+        .any(|r| matches!(r, Resolved::Command(_)))
+        || e2e.is_some();
     let mut install: Option<RepoCheck> = None;
     let mut typecheck: Option<RepoCheck> = None;
     let mut lint: Option<RepoCheck> = None;
@@ -1174,7 +1195,8 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             cargo = None;
         }
     }
-    let mut out: Vec<RepoCheck> = [install, typecheck, lint, test, cargo]
+    // `e2e` LAST: after the test set, only where the stage admits it (see above).
+    let mut out: Vec<RepoCheck> = [install, typecheck, lint, test, cargo, e2e]
         .into_iter()
         .flatten()
         .collect();
@@ -3959,5 +3981,111 @@ mod tests {
             "{}",
             report.denial_reason()
         );
+    }
+
+    /// core#482 / F-3R2-023 (DES-L2 2D): `e2e` in `.wicked/checks.json` runs at the VERIFY stage
+    /// only, after the test set; never at the creator; `false` and absence mean no `e2e` check;
+    /// `timeout_s` rides it; and a base that lacks the key fails the baseline diff CLOSED ("the
+    /// change introduced it") — a declared e2e suite is never excused by a base that had none.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_runs_at_verify_only_after_the_test_set_and_a_base_lacking_it_fails_closed() {
+        let repo = scratch("e2e");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+        // The base: a `test` only, no `e2e`.
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        // The change declares an e2e suite that fails.
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"e2e":["sh","-c","echo e2e-red >&2; exit 1"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let creator = detect_with(
+            &repo,
+            &FloorContext {
+                stage: FloorStage::Creator,
+                ..FloorContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            names(&creator),
+            vec!["test"],
+            "never at the creator: {creator:?}"
+        );
+        let verify = detect_with(&repo, &FloorContext::default()).unwrap();
+        assert_eq!(
+            names(&verify),
+            vec!["test", "e2e"],
+            "after the test set: {verify:?}"
+        );
+        assert_eq!(verify[1].argv, s(&["sh", "-c", "echo e2e-red >&2; exit 1"]));
+        assert_eq!(verify[1].source, format!("{CONFIG_PATH} e2e"));
+        assert_eq!(verify[1].timeout_s, Some(45), "timeout_s rides e2e too");
+        // `false` ⇒ no e2e; unknown keys still refused.
+        std::fs::write(repo.join(CONFIG_PATH), r#"{"test":["true"],"e2e":false}"#).unwrap();
+        assert_eq!(
+            names(&detect_with(&repo, &FloorContext::default()).unwrap()),
+            vec!["test"]
+        );
+        let bad = detect_with_bad_key(&repo);
+        assert!(bad.contains("unknown field"), "{bad}");
+        // The floor at verify with the base known: `e2e` fails, the base declares none ⇒ the
+        // baseline diff cannot excuse it (fail-closed), the check denies with the base's error.
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"e2e":["sh","-c","echo e2e-red >&2; exit 1"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the e2e floor cannot run");
+            return;
+        }
+        assert!(!report.passed, "{report:?}");
+        assert_eq!(names_run(&report), vec!["test", "e2e"]);
+        let e2e = &report.checks[1];
+        assert_eq!(e2e.outcome(), "failed");
+        assert!(e2e.denies(), "{e2e:?}");
+        assert!(
+            e2e.classification.is_none(),
+            "no base verdict ⇒ no classification: {e2e:?}"
+        );
+        let base_err = e2e
+            .base
+            .as_ref()
+            .and_then(|b| b.error.clone())
+            .unwrap_or_default();
+        assert!(
+            base_err.contains("declares no `e2e` check") && base_err.contains("introduced it"),
+            "{base_err}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn detect_with_bad_key(repo: &Path) -> String {
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"e2e_suite":["x"]}"#,
+        )
+        .unwrap();
+        detect_with(repo, &FloorContext::default()).expect_err("unknown key is refused")
+    }
+
+    #[cfg(unix)]
+    fn names_run(report: &RepoChecksReport) -> Vec<&str> {
+        report.checks.iter().map(|c| c.name.as_str()).collect()
     }
 }
