@@ -106,6 +106,19 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
+/// D-11 (core#393): free text plans ONE unit; the cursor-resume proof needs a second unit to
+/// advance onto — a 2-phase def, registered by [`launch`] on whichever `Core` launches (the store
+/// persists it, so a fresh Core resuming the run reads it too).
+const REENTRANT_DEF: &str = r#"{"id":"reentrant-2","phases":[
+  {"id":"one","kind":"build","gate":"auto"},
+  {"id":"two","kind":"build","gate":"auto","depends_on":["one"]}]}"#;
+
+fn launch(core: &Core, session_id: &str) -> anyhow::Result<String> {
+    core.register_workflow(REENTRANT_DEF)
+        .expect("register the 2-phase def");
+    core.launch_run(spec(session_id))
+}
+
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
         project_id: None,
@@ -116,7 +129,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow: Some("reentrant-2".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
@@ -144,7 +157,7 @@ fn engine_is_off_thread_guards_inflight_and_resumes_from_cursor() {
     });
     let core_a = Core::spawn_with_engine(db.clone(), Arc::new(StubDispatcher), gated);
 
-    let returned = core_a.launch_run(spec(run_id)).expect("launch_run");
+    let returned = launch(&core_a, run_id).expect("launch_run");
     assert_eq!(
         returned, run_id,
         "launch_run returns the run id immediately"
@@ -176,7 +189,7 @@ fn engine_is_off_thread_guards_inflight_and_resumes_from_cursor() {
                 .contains("busy"),
         "resume of an in-flight run must return RunBusy, got {busy_resume:?}"
     );
-    let busy_launch = core_a.launch_run(spec(run_id));
+    let busy_launch = launch(&core_a, run_id);
     assert!(
         busy_launch.is_err()
             && busy_launch
@@ -325,7 +338,7 @@ fn resume_of_completed_run_is_a_noop() {
 
     // A normal 2-unit run to completion.
     let events = core.subscribe();
-    core.launch_run(spec("done-run")).expect("launch");
+    launch(&core, "done-run").expect("launch");
     let mut completed = false;
     while let Ok(ev) = events.recv_timeout(Duration::from_secs(5)) {
         if matches!(ev, wicked_core::CoreEvent::SessionCompleted { session } if session == "done-run")

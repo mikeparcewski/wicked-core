@@ -88,10 +88,25 @@ fn tmp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The two-unit plan the seam proofs need (one `task.dispatched` per unit). D-11 (core#393): a
+/// free-text problem plans ONE unit now, so the multi-unit shape is workflow DATA — a 2-phase def
+/// registered by [`launch`] on whichever `Core` runs the test.
+const SEAM_DEF: &str = r#"{"id":"seam-2","phases":[
+  {"id":"one","kind":"build","gate":"auto"},
+  {"id":"two","kind":"build","gate":"auto","depends_on":["one"]}]}"#;
+
+/// Register the 2-phase def on `core` (idempotent — re-registration on a reopened store is judged
+/// as authored) and launch `spec(session_id)` against it.
+fn launch(core: &Core, session_id: &str) -> anyhow::Result<String> {
+    core.register_workflow(SEAM_DEF)
+        .expect("register the 2-phase def");
+    core.launch_run(spec(session_id))
+}
+
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
         project_id: None,
-        // Two sentences → the free-text planner decomposes into 2 units.
+        // Two phases (the def) → two units; the prose is the run's intent, no longer its plan.
         problem: "Do step one. Do step two".into(),
         clis: vec![cli("fake-a"), cli("fake-b")],
         entity_mode: EntityMode::Shared,
@@ -99,7 +114,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow: Some("seam-2".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
@@ -149,7 +164,7 @@ fn exec_seam_round_trip_matches_in_process() {
     );
     let events = core.subscribe();
 
-    let run_id = core.launch_run(spec("exec-run")).expect("launch_run");
+    let run_id = launch(&core, "exec-run").expect("launch_run");
     assert_eq!(run_id, "exec-run");
     wait_for_completion(&events, "exec-run");
 
@@ -211,7 +226,7 @@ fn exec_seam_round_trip_matches_in_process() {
         }),
     );
     let events2 = core2.subscribe();
-    core2.launch_run(spec("inproc-run")).expect("launch_run");
+    launch(&core2, "inproc-run").expect("launch_run");
     wait_for_completion(&events2, "inproc-run");
     let inproc_outputs = unit_outputs(&core2, "inproc-run");
 
@@ -247,7 +262,7 @@ fn work_output_survives_a_daemon_restart() {
             }),
         );
         let events = core1.subscribe();
-        core1.launch_run(spec("durable-run")).expect("launch");
+        launch(&core1, "durable-run").expect("launch");
         wait_for_completion(&events, "durable-run");
 
         let detail = core1
@@ -440,7 +455,7 @@ fn a_dispatched_but_uncompleted_task_re_runs_after_a_restart() {
             }),
             bus_db.clone(),
         );
-        core1.launch_run(spec("restart-run")).expect("launch");
+        launch(&core1, "restart-run").expect("launch");
         assert!(
             wait_status(&core1, "restart-run", SessionStatus::Executing),
             "the run reached Executing (a unit was dispatched)"
@@ -615,7 +630,7 @@ fn partial_arm_falls_back_to_in_process_when_a_consumer_cannot_init() {
         bad_bus.clone(),
     );
     let events = core.subscribe();
-    core.launch_run(spec("fallback-run")).expect("launch_run");
+    launch(&core, "fallback-run").expect("launch_run");
     wait_for_completion(&events, "fallback-run");
 
     // The work ran IN-PROCESS (the counter advanced) despite the unusable bus, and no bus db was ever
@@ -676,7 +691,7 @@ fn live_output_streams_from_the_cli_runner_under_exec_mediation() {
     );
     let events = core.subscribe();
 
-    core.launch_run(spec("live-run")).expect("launch_run");
+    launch(&core, "live-run").expect("launch_run");
 
     // Collect deltas for this run until it completes (or a deadline). The cli-runner runs OFF the actor
     // and forwards each chunk over the command channel; the actor fans them out as CliOutputDelta.

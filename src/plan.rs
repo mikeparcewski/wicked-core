@@ -1,7 +1,9 @@
 //! PLAN — deterministic decomposition of a problem into ordered work units.
 //! Two planners, both pure and deterministic (no randomness, no model):
-//!   * [`plan_units`] — free-text: splits a prose problem on newlines / sentence terminators /
-//!     semicolons and *classifies* each piece's stage by keyword. The legacy path.
+//!   * [`plan_units`] — free-text: ONE unit, the brief verbatim (D-11). The operator's prose is the
+//!     unit's description as written — no sentence / line / semicolon split (core#393: a
+//!     three-paragraph recon brief became 11 councils per repo; "launch nothing until approved"
+//!     became its own unit). The legacy path; def runs take [`plan_from_def`].
 //!   * [`plan_from_def`] — data-driven: derives one unit per [`WorkflowDef`] phase, taking each
 //!     unit's [`StageKind`] from the phase's declared `kind` (never a keyword guess); the backing
 //!     phase is encoded in the unit id (`<session>:<phase_id>`). The plan is a function of workflow
@@ -57,37 +59,30 @@ fn phase_scope_preamble(phase_id: &str) -> String {
     )
 }
 
-/// Decompose `problem` into ordered [`WorkUnit`]s owned by `session_id`. Unit ids are
-/// `<session_id>:u<ord>` (1-based, stable).
+/// Plan a free-text `problem` as exactly ONE [`WorkUnit`] owned by `session_id`: the unit's
+/// description is the trimmed problem verbatim (newlines kept — the live carriers pass the prompt
+/// as an argv element / a JSON string and carry no line limit; the production-dead PTY runner keeps
+/// its own named refusal). An empty problem plans the unit `"unit"`. Unit id `<session_id>:u1`.
+///
+/// D-11 (core#393 / crew #471 / #473): the old planner split the prose on newlines, sentence
+/// terminators and semicolons and minted one unit per piece, so a multi-paragraph brief fanned
+/// out into a council per sentence. The split had no journey; deleting it makes "a free-text
+/// problem plans one unit" literally true. Def-driven runs are unaffected ([`plan_from_def`]).
 pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
-    let pieces = split_problem(problem);
-    let descriptions: Vec<String> = if pieces.is_empty() {
-        let trimmed = problem.trim();
-        vec![if trimmed.is_empty() {
-            "unit".to_string()
-        } else {
-            trimmed.to_string()
-        }]
+    let trimmed = problem.trim();
+    let description = if trimmed.is_empty() {
+        "unit".to_string()
     } else {
-        pieces
+        trimmed.to_string()
     };
-
-    descriptions
-        .into_iter()
-        .enumerate()
-        .map(|(i, description)| {
-            let ord = (i + 1) as u32;
-            let mut unit =
-                WorkUnit::pending(format!("{session_id}:u{ord}"), session_id, ord, description);
-            // F-7R2-005: a prose-planned unit declares nothing — no `executes_code`, no
-            // `verified_evidence`, no pinned validator — so nothing else will ever gate its
-            // work. It carries the DEFAULT floor: if it changes the worktree tree, the
-            // repository's own checks run and a distinct judge is convened (or the gate says
-            // `ungated`, and why).
-            unit.default_floor = true;
-            unit
-        })
-        .collect()
+    let mut unit = WorkUnit::pending(format!("{session_id}:u1"), session_id, 1, description);
+    // F-7R2-005: a prose-planned unit declares nothing — no `executes_code`, no
+    // `verified_evidence`, no pinned validator — so nothing else will ever gate its
+    // work. It carries the DEFAULT floor: if it changes the worktree tree, the
+    // repository's own checks run and a distinct judge is convened (or the gate says
+    // `ungated`, and why).
+    unit.default_floor = true;
+    vec![unit]
 }
 
 /// Decompose a run into ordered [`WorkUnit`]s from a [`WorkflowDef`] — one unit per phase, in the
@@ -336,68 +331,43 @@ pub fn unbound_repo_tokens(units: &[WorkUnit]) -> Vec<String> {
     out
 }
 
-/// Split on newlines, sentence terminators (`.`/`!`/`?` followed by whitespace), or semicolons.
-fn split_problem(problem: &str) -> Vec<String> {
-    let mut pieces = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = problem.chars().collect();
-
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            '\n' => {
-                push_trimmed(&mut pieces, &mut current);
-                while i + 1 < chars.len() && chars[i + 1] == '\n' {
-                    i += 1;
-                }
-            }
-            ';' => {
-                push_trimmed(&mut pieces, &mut current);
-                while i + 1 < chars.len() && chars[i + 1].is_whitespace() {
-                    i += 1;
-                }
-            }
-            '.' | '!' | '?' => {
-                current.push(c);
-                if i + 1 < chars.len() && chars[i + 1].is_whitespace() {
-                    push_trimmed(&mut pieces, &mut current);
-                    while i + 1 < chars.len() && chars[i + 1].is_whitespace() {
-                        i += 1;
-                    }
-                }
-            }
-            _ => current.push(c),
-        }
-        i += 1;
-    }
-    push_trimmed(&mut pieces, &mut current);
-    pieces
-}
-
-fn push_trimmed(pieces: &mut Vec<String>, current: &mut String) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        pieces.push(trimmed.to_string());
-    }
-    current.clear();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::UnitStatus;
 
+    /// D-11 (core#393): free text is ONE unit, the brief verbatim — newlines, sentence
+    /// terminators and semicolons are content, not unit boundaries.
     #[test]
-    fn splits_on_newlines_and_terminators_and_semicolons() {
+    fn free_text_is_one_unit() {
         let units = plan_units("First task.\nSecond task; third task", "s1");
-        assert_eq!(units.len(), 3);
-        assert_eq!(units[0].description, "First task.");
-        assert_eq!(units[1].description, "Second task");
-        assert_eq!(units[2].description, "third task");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].description, "First task.\nSecond task; third task");
         assert_eq!(units[0].id, "s1:u1");
-        assert_eq!(units[2].ord, 3);
-        assert!(units.iter().all(|u| u.status == UnitStatus::Pending));
+        assert_eq!(units[0].ord, 1);
+        assert_eq!(units[0].status, UnitStatus::Pending);
+        assert!(
+            units[0].default_floor,
+            "a prose-planned unit carries the default floor"
+        );
+    }
+
+    /// The studio's recon launcher joins its prefix and the operator's brief with a blank line
+    /// (`\n\n`); a paragraph rule would read that as two units per repo — it is one.
+    #[test]
+    fn a_blank_line_joined_brief_is_still_one_unit() {
+        let brief = "Recon: survey the attached codebases.\n\nLaunch nothing until approved.\n\n\
+                     Third paragraph; with a semicolon. And a sentence!";
+        let units = plan_units(brief, "s1");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].description, brief);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_but_inner_newlines_are_kept() {
+        let units = plan_units("  \n keep\nthese\nlines \n\n", "s");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].description, "keep\nthese\nlines");
     }
 
     #[test]

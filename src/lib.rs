@@ -1487,18 +1487,19 @@ mod tests {
         )
         .expect("run_session");
 
-        // Composition result.
-        assert_eq!(result.units.len(), 2);
-        assert_eq!(result.approved, 2, "no deny policy ⇒ both approve");
+        // Composition result — D-11: the free-text planner mints ONE unit, the brief verbatim
+        // ("Do step one. Do step two" is no longer split on its sentence terminator).
+        assert_eq!(result.units.len(), 1);
+        assert_eq!(result.approved, 1, "no deny policy ⇒ approve");
         assert_eq!(result.rejected, 0);
 
         // Live event sequence — emitted in order, bookended by Started/Completed.
         let n = |pred: fn(&CoreEvent) -> bool| events.iter().filter(|e| pred(e)).count();
         assert_eq!(n(|e| matches!(e, CoreEvent::SessionStarted { .. })), 1);
-        assert_eq!(n(|e| matches!(e, CoreEvent::UnitPlanned { .. })), 2);
-        assert_eq!(n(|e| matches!(e, CoreEvent::UnitDistributed { .. })), 2);
-        assert_eq!(n(|e| matches!(e, CoreEvent::GateDecided { .. })), 2);
-        assert_eq!(n(|e| matches!(e, CoreEvent::UnitDone { .. })), 2);
+        assert_eq!(n(|e| matches!(e, CoreEvent::UnitPlanned { .. })), 1);
+        assert_eq!(n(|e| matches!(e, CoreEvent::UnitDistributed { .. })), 1);
+        assert_eq!(n(|e| matches!(e, CoreEvent::GateDecided { .. })), 1);
+        assert_eq!(n(|e| matches!(e, CoreEvent::UnitDone { .. })), 1);
         assert!(matches!(
             events.first(),
             Some(CoreEvent::SessionStarted { .. })
@@ -1510,7 +1511,7 @@ mod tests {
 
         // Persisted + readable through the same domain the read API serves.
         let units = session_units(&store, "test-pipeline").unwrap();
-        assert_eq!(units.len(), 2);
+        assert_eq!(units.len(), 1);
         assert!(units.iter().all(|u| u.status == UnitStatus::Done));
         let out = get_work_output(&store, "test-pipeline:u1").expect("unit 1 output");
         assert!(out.contains("stub-output"), "transcript: {out}");

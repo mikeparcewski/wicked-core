@@ -1396,6 +1396,13 @@ Two release tracks share this file, newest entry first regardless of track:
   `gh pr create` leaves `wicked/<run>` on the remote with no PR; on Windows only the leader dies —
   a `gh pr create` already running completes; on a NATURAL exit the leader's group is quiesced
   (anything the script backgrounded and left running is killed with the phase, as for seats).
+- **A free-text problem plans exactly ONE unit, the brief verbatim (D-11; core#393, crew #471 /
+  #473, F-090).** `plan_units` split the operator's prose on newlines, sentence terminators
+  (`.`/`!`/`?`) and semicolons and minted one unit — one council — per piece, so a three-paragraph
+  recon brief became 11 councils per repo and the sentence "launch nothing until approved" ran as its
+  own `build` unit. `split_problem` is deleted: the trimmed problem is the single unit's description
+  (newlines kept — the live carriers pass the prompt as an argv element / JSON string and carry no
+  line limit). Def-driven plans (`plan_from_def`) are unchanged.
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the
