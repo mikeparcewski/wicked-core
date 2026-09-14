@@ -401,15 +401,18 @@ impl Core {
             let (chat_id, cli, text) = (chat_id.to_string(), cli.clone(), text.to_string());
             std::thread::spawn(move || {
                 let outcome = runner.chat_turn(&chat_id, &cli, &text);
-                let (ok, body) = match outcome {
-                    Ok(reply) => (true, reply),
-                    Err(e) => (false, e),
+                // DES-L5: the reply carries the turn's usage when the bridge reported one; a
+                // failed turn (evicted seat) carries the reason as its text and no usage.
+                let (ok, body, usage) = match outcome {
+                    Ok(reply) => (true, reply.text, reply.usage),
+                    Err(e) => (false, e, None),
                 };
                 let _ = tx.send(Command::EmitEvent(CoreEvent::ChatReply {
                     chat: chat_id,
                     cli_key: cli,
                     text: body,
                     ok,
+                    usage,
                 }));
             });
         }

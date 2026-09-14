@@ -14,6 +14,37 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+<!-- fixall L5 -->
+- **Chat seats are handed the skills a unit gets; the turn budget is named; `chatReply.usage`; the
+  chat boundary reads the seat's store pin (DES-L5 wave 1 "chat first", journey P6; core #487 +
+  crew #563 core half, core #412 chat half, F-RC1-110/113/116).** `chat_ensure` handed every seat
+  `SkillsDelivery::None` ("a chat is not a run unit"), so `launcher_env` set no `WICKED_GARDEN_ROOT`
+  and no PATH prefix — garden's `wicked-garden-mem` / `-search` and the read-only estate shim were
+  unreachable on every chat seat even with garden installed (P6: claude evicted twice with 0 estate
+  calls). Now the SAME delivery a unit on that CLI gets — `resolve_ladder()` + `fence_admit`
+  (inlined from `admit_turn`'s fresh arm; two `pub(crate)` words in `skills_snapshot.rs`), the
+  `WorkerCli` off the ONE `acp_launch_facts` registry read — is handed on `session/new`, pinned to
+  the process (`proc.skills`, core#396 parity) and logged (`chat <id> seat <cli> handed skills gen
+  <gen> <hash>`); a seat with NOTHING deliverable is refused at open with the remedy ("install
+  wicked-garden or publish a snapshot (System → Skills), then open the chat again"), scoped AND
+  unscoped chats alike — fail loud, never a silent skill-less seat (BC-32 / R14). The per-turn
+  budget `WICKED_CHAT_TURN_SECS` defaults 300 → **600 s** (env-only; a HYPOTHESIS re-derived from
+  the P6 re-run's per-turn durations — BC-34 / R16) and a turn cut at it now says so first:
+  `seat '<cli>' exceeded the <N> s turn budget (WICKED_CHAT_TURN_SECS) and was released — target it
+  on your next message to re-seat it. Partial reply before the cut: …` (was `turn ended TimedOut:
+  …`); other statuses keep their text. `chat_turn` returns `ChatTurnReply { text, usage }` and
+  `CoreEvent::ChatReply` gains `usage: Option<Usage>` — wire `usage: {inputTokens, outputTokens,
+  cacheReadTokens, cacheCreationTokens, costUsd} | null` (`null` on pi/agy, which emit none;
+  additive). `chat_boundary.estate_store_pinned` was hard-coded `false` (argv `--db` required on
+  every shim call); it now reads `estate_store_pinned_for_child() || scope.code_graph_db.is_some()`
+  — the unit boundary's rule plus the scope's graph, which PR-⑦ sets on the child as
+  `WICKED_ESTATE_DB` — and `chat_boundary_result` judges through `boundary_denial_tracked` with it
+  (BC-36 / R16c). Tests: the chat-seat scope test pins a published fixture and asserts
+  `WICKED_GARDEN_ROOT`, the bound snapshot and the reply's usage; nothing-deliverable refusal;
+  budget-eviction text with the partial kept; boundary pin with a `--readonly` shim call admitted
+  only when bound; `acp_launch_facts` couples all three identities; core-ts `chatReply` key set
+  gains `usage`.
+
 ### Fixed
 - **Governed containment: Bash writes are judged under a fenced posture; the notes root is admitted
   on both carriers; `mkdir` is a write target; the guard unstages after its restore; phase-scope

@@ -1207,7 +1207,7 @@ impl SkillsSnapshot {
     /// The generation label the codex marker is keyed by: the verified generation directory name
     /// and the index's content hash (`-` where a fallback root has neither — which codex is never
     /// handed).
-    fn generation_label(&self) -> String {
+    pub(crate) fn generation_label(&self) -> String {
         format!(
             "{} {}",
             self.gen.as_deref().unwrap_or("-"),
@@ -3555,7 +3555,7 @@ pub(crate) fn admit_turn(
 /// one is published is the fail-open ladder's opposite mistake), but it is said out loud — the
 /// plugin loads, its support files stay unreadable to the worker's file tools, and the fix is to
 /// publish a snapshot.
-fn fence_admit(
+pub(crate) fn fence_admit(
     snapshot: &SkillsSnapshot,
     operational_home: Option<&Path>,
 ) -> Result<(), SkillsError> {
