@@ -1143,6 +1143,46 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.25** — 2026-09-14 — npm release carrying the six engine changes since 0.7.24 (the
+  hardening train, Tier 1), all on main tip ef6c0f9 (plus #458, the 0.7.24 platform-lockfile
+  re-stamp). **Behaviour changes, in one place:** **#477** (core#464, S1) — **every denial pauses
+  at the escalation gate instead of failing the run.** Whatever the gate fold denies a unit for —
+  the worktree guard, a boundary deny, a deterministic floor, the output gate, the agent judge,
+  the evaluator≠creator pass — the run parks `awaiting_human` (`gateKind: 'escalation'`,
+  `gateEscalated.condition` names the denial class) where it used to end `failed`: Approve
+  re-dispatches the same unit, Approve+steer amends it, Reject cancels (a dirty worktree is kept).
+  Bound read-only units get an engine-owned notes root outside every worktree. **Campaign nodes
+  park `AwaitingHuman` on a denial too** — an unattended campaign has no auto-decider for that
+  gate yet (core#484, open; a campaign denial policy follows). **#476** (core#467, core#469,
+  F-RC2-009, S4a) — **the creator owes the repo-checks floor**: the `fix` phase provisions,
+  typechecks, lints and tests in its own worktree and a red floor denies there, before the
+  evaluator; a floor that exceeds its bound is classified `timed_out` (denial source
+  `repo_checks_timeout`), never a failure; **baseline-diff** runs the same check on the run base,
+  so a base-shared failure never denies — only a regression does. `repoChecksEvaluated` gains
+  `outcome`, `floor`, `claim`, `env` and per-check `classification` / `preExisting` /
+  `regressions` / `base` (additive). **#473** (core#461, S5) — a dead-class ballot corroborated
+  by the dispatcher's own abstention **benches the seat for the run**; a worker exiting on a
+  dead-seat refusal skips the triage judge and takes the failover ladder (bench → next eligible
+  seat → the `dead_seat` escalation gate, never `sessionFailed`); the evaluator≠creator fallback
+  is **disclosed** as `unitDistributed.distinctnessFallback: 'creator_seat' | null`; a roster
+  with **no eligible seat is refused synchronously at intake** with the typed `NoEligibleSeat`
+  error. **#472** (core#411, S6) — **state-home preflight + intake refusal**: `preflightStateHome`
+  surveys the state home at boot and `launch_run` refuses an unregistered entry at intake with
+  the remedy, instead of a first-worker fence failure; env-placed subtrees are registered.
+  **#471** (#463 items 1+2, F-RC1-046/047, S8) — **estate shim allowlist**: read-only
+  `wicked-estate` CLI subcommands and the `--readonly` + store-pinned estate shim /
+  `wicked-estate-mcp` are ALLOWED in governed units, writes and unknown verbs stay denied
+  fail-closed, every estate deny names the tool and the command with a remedy (advisory on fenced
+  units, fatal on code-executing ones). **Requires wicked-garden ≥ 12.36.0**: the shim rule
+  admits only a backend argv that spells `--readonly` with a pinned store (garden #1130, shipped
+  by #1134 in 12.36.0) — an older garden's shim invocations are still denied. **#478** (core#468,
+  S7) — **role-keyed BASE skill directive** on every agent unit (`WorkflowDef.base_skill_ref` /
+  `WICKED_BASE_SKILL_REF`, intake-gated, existence-only seating, disclosed as
+  `unitDispatched.baseSkill: {name, role} | null`) — **default OFF**: unset means no base
+  directive; crew ships it warn-first. Wire shape: additive only. **Coupling to note:**
+  wicked-crew 0.7.34 pins `wicked-core-ts ^0.7.25`; its mirrors are crew #558
+  (`distinctnessFallback` + the 409 intake refusal), #567 (gate-on-denial tests), #557 (base
+  skill default + disclosure) and #555 (state-home boot warning).
 - **core-ts 0.7.24** — npm release carrying the one engine change since 0.7.23, on main tip
   11d3b66 (plus #455, the 0.7.23 platform-lockfile re-stamp): **#456** (acceptance findings
   F-E2E-030 / F-E2E-029 / F-E2E-028). **The deliver phase is always human-gated.** The engine
