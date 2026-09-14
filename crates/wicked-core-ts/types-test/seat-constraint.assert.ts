@@ -23,6 +23,11 @@ const tagIsLiteral: Equal<UnitDistributedEventJson['type'], 'unitDistributed'> =
 const degradedReasonIsStringOrNull: Equal<UnitDistributedEventJson['degradedReason'], string | null> =
   true
 const seatedIsNumberOrNull: Equal<UnitDistributedEventJson['seated'], number | null> = true
+// (core#461) The evaluator ≠ creator fallback is a REAL property with a closed token set.
+const distinctnessFallbackIsTokenOrNull: Equal<
+  UnitDistributedEventJson['distinctnessFallback'],
+  'creator_seat' | null
+> = true
 
 // Reading a parsed event: narrow on the tag, then the field is `string | null`.
 declare const parsed: CoreEventJson
@@ -59,6 +64,7 @@ const omitted: UnitDistributedEventJson = {
   seated: 1,
   dissent: 0,
   degradedReason: null,
+  distinctnessFallback: null,
 }
 const complete: UnitDistributedEventJson = { ...omitted, seatConstraint: null }
 const constrained: UnitDistributedEventJson = {
@@ -67,6 +73,9 @@ const constrained: UnitDistributedEventJson = {
 }
 // @ts-expect-error — an unknown routing method is not part of the contract
 const unknownMethod: UnitDistributedEventJson = { ...complete, routingMethod: 'ranked' }
+const fallback: UnitDistributedEventJson = { ...complete, distinctnessFallback: 'creator_seat' }
+// @ts-expect-error — the fallback token set is closed
+const unknownFallback: UnitDistributedEventJson = { ...complete, distinctnessFallback: 'other_seat' }
 
 void seatConstraintIsStringOrNull
 void tagIsLiteral
@@ -74,3 +83,6 @@ void degradedReasonIsStringOrNull
 void seatedIsNumberOrNull
 void constrained
 void unknownMethod
+void distinctnessFallbackIsTokenOrNull
+void fallback
+void unknownFallback

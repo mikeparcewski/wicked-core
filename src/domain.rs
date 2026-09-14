@@ -293,6 +293,10 @@ impl FromNode for AgentSession {
     }
 }
 
+/// [`UnitDenial::source`] of a worker exit on a dead-seat class with no eligible seat left
+/// (core#461) — the payload the escalation gate's reassign arm keys on.
+pub const DENIAL_SOURCE_DEAD_SEAT: &str = "dead_seat";
+
 /// The MACHINE-READABLE twin of a unit's prose `denial_reason` (usability review #1): which layer
 /// denied, which rule/policy fired, which claim recorded it, and — for an input-governance deny —
 /// which tool-call was refused. Additive everywhere it appears (unit record, work-output record,
@@ -306,7 +310,10 @@ pub struct UnitDenial {
     /// `worker_failure` (the CLI process failed), `substance` (no reviewable substance),
     /// `deliverables` (declared deliverables missing), `elicitation` (ACP elicitation ended),
     /// `worktree_guard` (an `executes_code: false` phase changed the worktree it was reviewing,
-    /// F-036), `repo_checks` (the repository's own checks failed in the worktree, F-039).
+    /// F-036), `repo_checks` (the repository's own checks failed in the worktree, F-039),
+    /// `dead_seat` (the worker exited on a classified seat refusal — signed out, out of quota, not
+    /// installed — and no eligible seat remains; the run is PAUSED at core#464's escalation gate
+    /// (`gateEscalated.condition: "dead_seat"`), not failed, core#461 — [`DENIAL_SOURCE_DEAD_SEAT`]).
     pub source: String,
     /// The operator-facing prose — byte-identical to the `denial_reason` the record carries.
     pub reason: String,

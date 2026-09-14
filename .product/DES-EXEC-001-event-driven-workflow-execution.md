@@ -128,6 +128,32 @@ the sections are kept for the architecture shape (which held up) but their code 
 4. **THEN the bus** — as a *mirror* of already-working events, via the wicked-bus **CLI/library**.
 5. **THEN bridge Campaign through napi** (`launch_run` is bridged; Campaign is not) → reachable from studio.
 
+**Seat routing — revision 0.3 (2026-09-13, core#461; the seat-distinct guard as it stands).** The
+"≥2-seat degradation" above is now a governed, disclosed seam in `src/distribute.rs` +
+`src/actor.rs`:
+- **Eligibility is one rule** (`distribute::eligible_seats`): the launcher's `health.usable: false`
+  bench, the run's persisted `benched_seats`, and the run-level **ballot ledger** (`SeatLedger`) —
+  every seat's outcome on EVERY ballot of every council the distribution convened (the council
+  reports `seat_failure_history`, one entry per round; the latest round alone lost a round-1
+  dead-class failure behind the runoff's `Benched` abstention). `not_logged_in` / `not_installed`
+  bench on first occurrence; `quota_exhausted` with no vote benches; a timeout streak reaching the
+  dispatcher's own threshold benches; the dispatcher's `Benched` abstention corroborates a
+  dead-class ballot beside it and proves nothing alone; one vote keeps a seat; an unclassified
+  failure proves nothing.
+- **`enforce_evaluator_distinct`** picks only among still-eligible seats the unit's skills admit.
+  When none distinct from the builders remains, the review/test unit stays on its creator seat and
+  the fallback is a FIELD — `unitDistributed.distinctnessFallback: "creator_seat"` (also on a
+  bench-free single-seat roster; `degradedReason` still carries the prose only when a bench emptied
+  the pool). The fallback seat is always still-eligible: units are reseated off benched seats before
+  the guard runs. Zero eligible seats is refused — at INTAKE when the plan needs a seat and the
+  roster is non-empty (`launch_run` → typed `NoEligibleSeat`, no session), else at distribution.
+- **Worker time**: a worker exit the engine classifies as a seat refusal (`SeatFailureReason`) is
+  not "unrecognized" — it skips the LLM triage judge, benches the seat (source `worker`) and takes
+  the failover ladder (next eligible seat, never the creator of what it reviews). With no eligible
+  seat left and a human present the run pauses at core#464's `escalation` gate
+  (`gateEscalated.condition: "dead_seat"`) with a `dead_seat` denial on the unit (the reassign
+  arm's payload); autonomous runs fail closed as before.
+
 **§4.1 SKILLS — corrected by adversarial review round 2 (findings 9–12). The skills layer is a
 DEFERRED, SPIKE-GATED refinement, NOT a slice-1 foundation. Corrections:**
 - **F9 (HIGH) — RESOLVED by spike, 2026-07-09 (GO).** The round-2 concern ("no deterministic headless

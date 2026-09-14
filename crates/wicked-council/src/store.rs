@@ -168,6 +168,10 @@ pub fn task_to_node(rec: &TaskRecord) -> Node {
     m.insert("votes".into(), serde_json::json!(rec.votes));
     m.insert("seat_failures".into(), serde_json::json!(rec.seat_failures));
     m.insert(
+        "seat_failure_history".into(),
+        serde_json::json!(rec.seat_failure_history),
+    );
+    m.insert(
         "failure_detail".into(),
         serde_json::json!(rec.failure_detail),
     );
@@ -192,6 +196,10 @@ pub fn task_from_node(node: &Node) -> anyhow::Result<TaskRecord> {
     // reading of "this row does not say", and matches a run where every seat voted.
     let seat_failures: Vec<SeatFailureRecord> =
         json_meta(node, "seat_failures").unwrap_or_default();
+    // Absent on rows written before every ballot was kept (core#461) — an empty history reads
+    // as "only the latest ballot is known", which `seat_failures` still carries.
+    let seat_failure_history: Vec<Vec<SeatFailureRecord>> =
+        json_meta(node, "seat_failure_history").unwrap_or_default();
     // Absent on rows written before council-level failures were recorded, and `null` on every
     // row where the council did not fail — both read as `None`.
     let failure_detail: Option<String> = json_meta(node, "failure_detail").unwrap_or_default();
@@ -212,6 +220,7 @@ pub fn task_from_node(node: &Node) -> anyhow::Result<TaskRecord> {
         votes,
         verdict: None,
         seat_failures,
+        seat_failure_history,
         failure_detail,
     })
 }
@@ -438,6 +447,12 @@ pub struct TaskRecord {
     /// this, `convened.len() > votes.len()` was the only trace a seat had failed at all, and the
     /// reason was gone.
     pub seat_failures: Vec<SeatFailureRecord>,
+    /// (core#461) EVERY ballot's seat failures, one entry per round in dispatch order — the
+    /// record the engine's run-level bench tallies. `seat_failures` keeps only the LATEST ballot,
+    /// so a seat that failed round 1 (`quota_exhausted`) and was then health-gated on round 2
+    /// (`Benched`) reached the engine as an abstention alone: the runoff overwrote the dead-class
+    /// evidence and the seat stayed routable.
+    pub seat_failure_history: Vec<Vec<SeatFailureRecord>>,
     /// Why the COUNCIL itself failed, as opposed to a seat within it.
     ///
     /// Set when the worker thread unwound: a panic in synthesis, ranking or event emission is
@@ -583,6 +598,7 @@ mod tests {
                 }
                 .with_stderr("agy: unknown flag --headless"),
             }],
+            seat_failure_history: vec![],
             failure_detail: None,
         };
         let node = task_to_node(&rec);
@@ -618,6 +634,7 @@ mod tests {
             votes: vec![sample_vote("claude")],
             verdict: None,
             seat_failures: vec![],
+            seat_failure_history: vec![],
             failure_detail: None,
         };
         let mut node = task_to_node(&rec);
@@ -687,6 +704,7 @@ mod tests {
             votes: vec![],
             verdict: None,
             seat_failures: vec![],
+            seat_failure_history: vec![],
             failure_detail: None,
         });
         ledger.update("t-persist", |rec| {
