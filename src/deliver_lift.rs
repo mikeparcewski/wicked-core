@@ -529,6 +529,10 @@ pub(crate) struct LiftContext {
     /// passed, or a previous deliver re-verify) — persisted on the session (F-433-001). `None`
     /// when nothing was recorded: every deliver then re-verifies.
     pub verified_tree: Option<String>,
+    /// The run's base commit (`AgentSession::base_commit`) — the baseline-diff base for the
+    /// deliver re-verify when the lift was skipped (no tip to measure against); a lift that
+    /// reached the remote tip measures against THAT instead (DES-L2 2E, D-22 / core #489).
+    pub base_commit: Option<String>,
 }
 
 /// Resolve the [`LiftContext`] for `unit` on the actor thread (store access).
@@ -547,6 +551,7 @@ pub(crate) fn lift_context(
         worktree,
         repo_root: PathBuf::from(repo.root_path),
         verified_tree: session.verified_tree.clone(),
+        base_commit: session.base_commit.clone(),
     })
 }
 
@@ -766,7 +771,24 @@ pub(crate) fn lift_and_reverify(
         },
         short(&now.tree)
     );
-    let checks = crate::repo_checks::run_forcing_install(&ctx.worktree, !drift.is_empty());
+    // ONE floor for verify and deliver (DES-L2 2E, D-22 / core #489): the same baseline-diff
+    // floor the verify phase runs, measured against the tip the work was lifted onto (what
+    // merges), else the run base; a failure the base shares is `pre_existing_in_sandbox` and
+    // does not deny, a head-only failure is a `regression` and does. With a base known the
+    // floor prefers the repo's `test_targeted` (unless `full: true`) and runs `e2e`, exactly as
+    // at verify. No base at all (no remote, no recorded run base) ⇒ any red check denies, as
+    // before. The git dir is the PINNED one — never the worktree's own `.git` file.
+    let base_head = verified_base.clone().or_else(|| ctx.base_commit.clone());
+    let checks = crate::repo_checks::run_floor(
+        &ctx.worktree,
+        &crate::repo_checks::FloorContext {
+            stage: crate::repo_checks::FloorStage::Verify,
+            force_install: !drift.is_empty(),
+            base_head,
+            git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
+            claim_text: None,
+        },
+    );
     eprintln!(
         "wicked-core: deliver re-verify for unit {ord}: {} — {}",
         if checks.passed { "PASS" } else { "FAIL" },
@@ -784,8 +806,8 @@ pub(crate) fn lift_and_reverify(
             sandbox_level: checks.sandbox_level.clone(),
             sandbox_error: checks.sandbox_error.clone(),
             detect_error: checks.detect_error.clone(),
-            // The lift's re-verify is the verify floor over the lifted tree (no known base for a
-            // baseline diff, no creator claim).
+            // The lift's re-verify is the verify floor over the lifted tree, baseline-diffed
+            // against the lifted-onto tip (else the run base); no creator claim.
             outcome: checks.outcome().to_string(),
             floor: crate::repo_checks::FloorStage::Verify.as_wire().to_string(),
             claim: None,
@@ -1204,6 +1226,7 @@ mod tests {
             worktree: wt.to_path_buf(),
             repo_root: clone.to_path_buf(),
             verified_tree,
+            base_commit: None,
         }
     }
 
