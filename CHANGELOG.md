@@ -101,26 +101,6 @@ Two release tracks share this file, newest entry first regardless of track:
   with core#464.
 
 ### Added
-- **Each `wicked-core-ts` platform package carries the standalone `wicked-core` hook binary,
-  stripped, thin-LTO, stamped with the engine semver it was built from (core#405, F-009, F-SMOKE-006
-  — FIX-IT-ALL L10-9, register BC-68).** The per-tool-call governance hook binary was published
-  NOWHERE: crew located it in a home-dir install (`<home>/.local/bin`, `<home>/.cargo/bin`, a dev
-  path, PATH) — the stale-copy class the operator hit when a symlink there pointed at an old build —
-  and the installer registry lacked it. `napi-release.yml` now (build job, per target) asserts the
-  root `Cargo.lock` and `crates/wicked-core-ts/Cargo.lock` pin the same `wicked-estate*` versions
-  (two lockfiles, one tree — the binary and the addon must embed the same estate), builds
-  `--bin wicked-core` for the same triple with `--config profile.release.strip=true --config
-  'profile.release.lto="thin"'` (the root crate declares neither; unstripped it measured 19.2 MB
-  against a 14.3 MB platform package) and uploads it beside the `.node` under a per-target name;
-  (publish job) moves each binary into its platform package as `wicked-core[.exe]`, `chmod +x`,
-  appends it to `files[]` and stamps `wickedCoreVersion` = the ROOT crate's semver — the value the
-  addon's gate compares against the binary's `--version` (`our_semver = env!("CARGO_PKG_VERSION")`,
-  the root crate's, not this package's) — so `<pkg>/wicked-core --version == wickedCoreVersion ==
-  GET /diagnostics.engineBinaries.wicked-core` from one tree at the tag. The root crate version is
-  NOT bumped to core-ts's. Crew's locator prefers the bundled binary in a follow-up (crew half;
-  `WICKED_CORE_EXE` still wins). **Merge before the `core-ts-v0.7.26` tag; rehearse the size on a
-  `workflow_dispatch` of a branch first (every leg builds, nothing publishes) — the measured delta
-  fills register L10-e.**
 - **The creator owes the repo-checks floor too; a timeout is not a failure; a base failure is
   not a regression (core#467, core#469, F-RC2-009 — hardening train S4a).** On 2026-09-13 a `fix`
   worker left a tree failing `npm run typecheck` (exit 2) and `npm run lint` (exit 1), wrote
@@ -287,20 +267,6 @@ Two release tracks share this file, newest entry first regardless of track:
   clean-only, as before).
 
 ### Changed
-- **State-home registry: `chats` registered; `interactive` is a crew-placed root (the ONE fence
-  rule change of this RC — FIX-IT-ALL L10-5, core half).** wicked-crew persists chat transcripts
-  at `<state home>/chats/<id>.jsonl` (crew BC-33) and moves the interactive bridge's default docs
-  root and recorder browser under `<state home>/interactive/` (crew BC-49, D-L7-1 MOVE); both
-  would be refused by the intake fence as unregistered entries the moment crew creates them.
-  `tests/fixtures/state-home-subtrees.json` gains the `chats` entry (`kind: dir`, `owner: crew`,
-  `worker_read: none`), and the `interactive` entry drops its `env` field and names both crew
-  placements in `source` — `WICKED_INTERACTIVE_ROOT` may now name any path (the crew boot-refuse
-  row is crew's to delete, in the same crew release as its joins). The fence RULE SET changes once:
-  one new deny (`chats`); `env` is crew's boot-preflight classification, not a deny rule. Core's
-  survey is directory-driven, so the row is inert until crew's release creates the directory — the
-  crew copy of the fixture re-converges byte for byte when crew lands its halves. Tests:
-  `state_home_intake.rs` admits `chats/` and refuses `chats-x` (a name claim is exact, never a
-  prefix); the unit list names `chats`.
 - **A denied unit pauses at the escalation gate; it no longer fails the run (core#464, core#463
   item 3).** Three governed `bug` runs in one day (wicked-garden `e20a3ffb`, RC1 Phase 3 r3
   `dd5b8f54`, garden L4 `b5c2739d`) ended `unitDenied` → `sessionFailed` at their second unit:
@@ -1233,6 +1199,43 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+
+<!-- fixall L10 -->
+- **State-home registry: `chats` registered; `interactive` is a crew-placed root (the ONE fence
+  rule change of this RC — FIX-IT-ALL L10-5, core half).** wicked-crew persists chat transcripts
+  at `<state home>/chats/<id>.jsonl` (crew BC-33) and moves the interactive bridge's default docs
+  root and recorder browser under `<state home>/interactive/` (crew BC-49, D-L7-1 MOVE); both
+  would be refused by the intake fence as unregistered entries the moment crew creates them.
+  `tests/fixtures/state-home-subtrees.json` gains the `chats` entry (`kind: dir`, `owner: crew`,
+  `worker_read: none`), and the `interactive` entry drops its `env` field and names both crew
+  placements in `source` — `WICKED_INTERACTIVE_ROOT` may now name any path (the crew boot-refuse
+  row is crew's to delete, in the same crew release as its joins). The fence RULE SET changes once:
+  one new deny (`chats`); `env` is crew's boot-preflight classification, not a deny rule. Core's
+  survey is directory-driven, so the row is inert until crew's release creates the directory — the
+  crew copy of the fixture re-converges byte for byte when crew lands its halves. Tests:
+  `state_home_intake.rs` admits `chats/` and refuses `chats-x` (a name claim is exact, never a
+  prefix); the unit list names `chats`.
+- **Each `wicked-core-ts` platform package carries the standalone `wicked-core` hook binary,
+  stripped, thin-LTO, stamped with the engine semver it was built from (core#405, F-009, F-SMOKE-006
+  — FIX-IT-ALL L10-9, register BC-68).** The per-tool-call governance hook binary was published
+  NOWHERE: crew located it in a home-dir install (`<home>/.local/bin`, `<home>/.cargo/bin`, a dev
+  path, PATH) — the stale-copy class the operator hit when a symlink there pointed at an old build —
+  and the installer registry lacked it. `napi-release.yml` now (build job, per target) asserts the
+  root `Cargo.lock` and `crates/wicked-core-ts/Cargo.lock` pin the same `wicked-estate*` versions
+  (two lockfiles, one tree — the binary and the addon must embed the same estate), builds
+  `--bin wicked-core` for the same triple with `--config profile.release.strip=true --config
+  'profile.release.lto="thin"'` (the root crate declares neither; unstripped it measured 19.2 MB
+  against a 14.3 MB platform package) and uploads it beside the `.node` under a per-target name;
+  (publish job) moves each binary into its platform package as `wicked-core[.exe]`, `chmod +x`,
+  appends it to `files[]` and stamps `wickedCoreVersion` = the ROOT crate's semver — the value the
+  addon's gate compares against the binary's `--version` (`our_semver = env!("CARGO_PKG_VERSION")`,
+  the root crate's, not this package's) — so `<pkg>/wicked-core --version == wickedCoreVersion ==
+  GET /diagnostics.engineBinaries.wicked-core` from one tree at the tag. The root crate version is
+  NOT bumped to core-ts's. Crew's locator prefers the bundled binary in a follow-up (crew half;
+  `WICKED_CORE_EXE` still wins). **Merge before the `core-ts-v0.7.26` tag; rehearse the size on a
+  `workflow_dispatch` of a branch first (every leg builds, nothing publishes) — the measured delta
+  fills register L10-e.**
+
 - **core-ts 0.7.25** — 2026-09-14 — npm release carrying the six engine changes since 0.7.24 (the
   hardening train, Tier 1), all on main tip ef6c0f9 (plus #458, the 0.7.24 platform-lockfile
   re-stamp). **Behaviour changes, in one place:** **#477** (core#464, S1) — **every denial pauses
