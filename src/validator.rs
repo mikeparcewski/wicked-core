@@ -454,6 +454,13 @@ enum NetworkPolicy {
 /// are the credential stores an untrusted validator has no legitimate reason to read; the rest of the FS
 /// stays readable ON PURPOSE (see the module HONEST LIMITS note — this is a denylist, not a read jail).
 fn secret_read_block_dirs() -> Vec<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    secret_read_block_dirs_under(home.as_deref())
+}
+
+/// [`secret_read_block_dirs`] for an explicit home — the seam the Linux regression test uses so it
+/// never mutates the process-global `HOME` (tests elsewhere read it without a lock).
+fn secret_read_block_dirs_under(home: Option<&Path>) -> Vec<std::path::PathBuf> {
     // Relative-to-HOME components (nested paths handled per component join). Kept as forward-slash
     // segments and joined so the platform separator is applied correctly on each OS.
     const REL: &[&[&str]] = &[
@@ -464,10 +471,10 @@ fn secret_read_block_dirs() -> Vec<std::path::PathBuf> {
         &[".claude"],
         &[".config", "gh"],
     ];
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = home else {
         return Vec::new();
     };
-    let home = std::path::PathBuf::from(home);
+    let home = home.to_path_buf();
     REL.iter()
         .map(|segs| {
             let mut p = home.clone();
@@ -565,6 +572,16 @@ fn detect_sandbox_launcher_for_roots(
     write_roots: &[&Path],
     network: NetworkPolicy,
 ) -> SandboxLauncher {
+    launcher_for_roots_masking(write_roots, network, secret_read_block_dirs())
+}
+
+/// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
+/// Linux regression test uses (a home lacking some of the six) without touching the process env.
+fn launcher_for_roots_masking(
+    write_roots: &[&Path],
+    network: NetworkPolicy,
+    secret_dirs: Vec<std::path::PathBuf>,
+) -> SandboxLauncher {
     let floor = SandboxLauncher {
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
@@ -581,9 +598,10 @@ fn detect_sandbox_launcher_for_roots(
             };
         }
     }
-    // Linux bwrap: read-only-bind the whole FS, rw-bind ONLY the run dir, unshare the network, mask the
-    // curated secret dirs with an empty tmpfs, give a writable tmpfs at the system temp dir (C8), and put
-    // the sandbox in its own PID namespace tied to the launcher so the whole tree dies on timeout (C4).
+    // Linux bwrap: read-only-bind the whole FS, rw-bind ONLY the run dir (plus the extra roots the
+    // caller names — a validator's private `TMPDIR`, the coverage store's dir), unshare the network,
+    // mask the curated secret dirs that exist with an empty tmpfs, and put the sandbox in its own PID
+    // namespace tied to the launcher so the whole tree dies on timeout (C4).
     if let Some(tool) = find_on_path("bwrap") {
         if let Some(primary) = write_roots
             .first()
@@ -613,15 +631,12 @@ fn detect_sandbox_launcher_for_roots(
             if matches!(network, NetworkPolicy::Deny) {
                 w.push("--unshare-net".to_string());
             }
-            // C8: a fresh writable tmpfs at the system temp dir so validators writing to $TMPDIR work
-            // (parity with the macOS profile that allows temp writes). Placed BEFORE the run-dir bind so a
-            // run dir living under the temp dir is re-exposed by the later bind rather than masked.
-            if matches!(network, NetworkPolicy::Deny) {
-                if let Ok(tmp) = std::env::temp_dir().canonicalize() {
-                    w.push("--tmpfs".to_string());
-                    w.push(tmp.to_string_lossy().to_string());
-                }
-            }
+            // C8 (revised, core#460 CI leg): NO `--tmpfs` over the system temp dir. A validator's
+            // writable temp is a PRIVATE dir under it, handed in as an extra root (`--bind` below)
+            // and set as its `TMPDIR` by `run_validator_reporting`. The whole-temp tmpfs hid every
+            // sibling under the temp dir — a repo whose gitdir lives there (CI fixtures; a state
+            // home under the temp dir) made the pinned floor's `git status` fail and DENY work
+            // that was plainly there.
             // C3: mask each curated secret dir with an empty tmpfs so its real contents are unreadable.
             // ONLY the dirs that EXIST (core#460/#493): bwrap `mkdir`s a missing `--tmpfs`
             // destination, and under `--ro-bind / /` that dies BEFORE exec — `bwrap: Can't mkdir
@@ -629,7 +644,7 @@ fn detect_sandbox_launcher_for_roots(
             // validator on a Linux daemon whose HOME lacked one of the six failed, blamed on the
             // work. A missing dir has nothing to mask, and its parent is read-only inside the jail
             // so a check cannot create it either: zero widening.
-            for dir in secret_read_block_dirs().into_iter().filter(|d| d.is_dir()) {
+            for dir in secret_dirs.into_iter().filter(|d| d.is_dir()) {
                 w.push("--tmpfs".to_string());
                 w.push(dir.to_string_lossy().to_string());
             }
@@ -642,12 +657,15 @@ fn detect_sandbox_launcher_for_roots(
                 w.push(exs.clone());
                 w.push(exs);
             }
-            // The primary root is bound LAST so it wins over any overlapping tmpfs above.
+            // The primary root is bound LAST so it wins over any overlapping tmpfs above. NO
+            // `--chdir`: bwrap keeps the caller's cwd (`Command::current_dir`) inside the jail, and
+            // the repo-checks floor runs the BASE's check in its export under the worktree scratch
+            // — a baked `--chdir <primary>` ran that check on the HEAD tree instead, so head and
+            // base always failed alike and every regression read as pre-existing (found by the CI
+            // bwrap leg, core#415; on a Linux daemon the baseline diff was never a diff).
             let c = roots[0].to_string_lossy().to_string();
             w.push("--bind".to_string());
             w.push(c.clone());
-            w.push(c.clone());
-            w.push("--chdir".to_string());
             w.push(c);
             w.push("--".to_string());
             return SandboxLauncher {
@@ -675,6 +693,7 @@ fn detect_sandbox_launcher_for_roots(
     floor
 }
 
+#[cfg(test)]
 fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLauncher {
     let mut roots = vec![cwd];
     if let Some(extra) = extra_write {
@@ -1068,6 +1087,32 @@ fn decide_core_exe<'a>(resolved: Option<&'a str>, script: &str) -> CoreExeDecisi
     }
 }
 
+/// A validator run's private, writable `TMPDIR`: `<system temp>/wc-<6 hex>` (mode 0700, drawn fresh,
+/// an existing path at the drawn name refused — the repo-checks floor's own draw), bound read-write
+/// as an extra sandbox root and reaped on drop. Replaces the tmpfs over the WHOLE system temp dir
+/// (C8, revised): the script keeps a writable temp, and nothing else under the temp dir is hidden.
+struct ValidatorTmp(std::path::PathBuf);
+
+impl ValidatorTmp {
+    fn create() -> std::io::Result<Self> {
+        crate::repo_checks::create_private_tmp(
+            &std::env::temp_dir(),
+            crate::repo_checks::random_tmp_name,
+        )
+        .map(Self)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ValidatorTmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Like [`run_validator`], but ALSO reports the [`SandboxLevel`] the child actually ran under — the
 /// honest "was a real OS sandbox applied?" disclosure. Same fail-closed refusals (unapproved / denylist).
 ///
@@ -1101,7 +1146,28 @@ pub fn run_validator_reporting(
         .filter(|d| !d.is_empty() && *d != ":memory:" && !d.contains("://"))
         .map(std::path::Path::new)
         .and_then(std::path::Path::parent);
-    let launcher = detect_sandbox_launcher(cwd, store_dir);
+    // C8 (revised): the script's `TMPDIR` is a PRIVATE dir under the system temp dir — created
+    // here (before the probe: bwrap binds an existing directory), handed in as an extra root, set
+    // on the child below, reaped when `tmp` drops. One that cannot be created ⇒ no verdict.
+    let mut roots: Vec<&Path> = vec![cwd];
+    if let Some(store) = store_dir {
+        roots.push(store);
+    }
+    let tmp = match ValidatorTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            let level = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny).level;
+            return Ok((
+                ValidatorOutcome::Unrunnable(format!(
+                    "the validator's private TMPDIR could not be created under the system temp \
+                     dir: {e}"
+                )),
+                level,
+            ));
+        }
+    };
+    roots.push(tmp.path());
+    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny);
     let mut argv = launcher.wrapper.clone();
     argv.push("sh".to_string());
     argv.push("-c".to_string());
@@ -1115,6 +1181,11 @@ pub fn run_validator_reporting(
     cmd.hardened();
     cmd.args(&argv[1..]).current_dir(cwd);
     apply_minimal_env(&mut cmd);
+    // The isolation override on top of the allow-list (the allow-list itself is unchanged): the
+    // daemon's `TMPDIR` passes through, but the script must see the private dir the jail can write.
+    cmd.env("TMPDIR", tmp.path())
+        .env("TMP", tmp.path())
+        .env("TEMP", tmp.path());
     // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
     // relying on PATH — essential in CI where the binary is invoked by absolute path.
     //
@@ -3196,10 +3267,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// C8: under bwrap the system temp dir is a writable tmpfs so a validator writing to $TMPDIR does not
-    /// spuriously fail (parity with the macOS profile). Verified structurally on the built argv.
+    /// C8 (revised): under bwrap the system temp dir is NOT masked by a tmpfs (the validator gets a
+    /// private `TMPDIR` as an extra root instead — see the behavioural test below) and the argv has
+    /// no `--chdir` (the caller's cwd governs). The tree-kill flags (C4) are present.
     #[test]
-    fn bwrap_binds_a_writable_temp_dir_c8() {
+    fn bwrap_never_masks_the_system_temp_dir_and_keeps_the_callers_cwd_c8() {
         let dir = std::env::temp_dir().join(format!("wicked-val-tmp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3208,19 +3280,92 @@ mod tests {
             if let Ok(tmp) = std::env::temp_dir().canonicalize() {
                 let s = tmp.to_string_lossy().to_string();
                 assert!(
-                    launcher
+                    !launcher
                         .wrapper
                         .windows(2)
                         .any(|w| w[0] == "--tmpfs" && w[1] == s),
-                    "bwrap argv must give the system temp dir a writable tmpfs: {:?}",
+                    "the system temp dir must not be hidden behind a tmpfs: {:?}",
                     launcher.wrapper
                 );
             }
+            assert!(
+                !launcher.wrapper.iter().any(|a| a == "--chdir"),
+                "no baked cwd — the base export must run where it lives: {:?}",
+                launcher.wrapper
+            );
             // And the tree-kill flags (C4) are present.
             assert!(launcher.wrapper.iter().any(|a| a == "--die-with-parent"));
             assert!(launcher.wrapper.iter().any(|a| a == "--unshare-pid"));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C8 (revised), behavioural: a validator writing under `$TMPDIR` PASSES — its `TMPDIR` is a
+    /// private `wc-*` dir under the system temp dir (not the daemon's own), writable inside the
+    /// jail, and gone once the run is over.
+    #[cfg(unix)]
+    #[test]
+    fn a_validator_gets_a_private_writable_tmpdir_that_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("wicked-val-ptmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("tmpdir-seen");
+        let v = DeterministicValidator {
+            criterion: "a script can write under its TMPDIR".to_string(),
+            // No `>` — the denylist refuses redirection; `touch` + `tee` say the same thing.
+            script: format!(
+                "touch \"$TMPDIR/probe\" && [ -e \"$TMPDIR/probe\" ] && printf %s \"$TMPDIR\" | tee \"{}\"",
+                marker.display()
+            ),
+            approved: true,
+        };
+        let (outcome, _) = run_validator_reporting(&v, &dir, None).expect("validator runs");
+        assert_eq!(outcome, ValidatorOutcome::Passed);
+        let seen = std::fs::read_to_string(&marker).expect("the script recorded its TMPDIR");
+        let seen = Path::new(seen.trim());
+        assert!(seen.starts_with(std::env::temp_dir()), "{}", seen.display());
+        assert!(
+            seen.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wc-") && n.len() == 9),
+            "{}",
+            seen.display()
+        );
+        assert!(!seen.exists(), "reaped after the run: {}", seen.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Found by the CI bwrap leg (core#415): the wrapper must keep the CALLER's cwd — the baseline
+    /// diff runs the base's check in its export under the worktree scratch, and a baked
+    /// `--chdir <primary>` ran it on the HEAD tree (head vs head ⇒ every regression read as
+    /// pre-existing). Skips without bwrap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_keeps_the_callers_cwd_so_the_base_export_runs_where_it_lives() {
+        if find_on_path("bwrap").is_none() {
+            eprintln!("validator: bwrap not on PATH — the cwd test cannot run here");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("wicked-val-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("tmp").join("wicked-checks").join("base");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sandbox = detect_worker_sandbox(std::slice::from_ref(&base));
+        assert_eq!(sandbox.level, SandboxLevel::Sandboxed, "{sandbox:?}");
+        let mut argv = sandbox.wrapper.clone();
+        argv.extend(["sh".to_string(), "-c".to_string(), "pwd".to_string()]);
+        // spawn-audit: test-only — the wrapper probe itself, under the same cleared env the floor applies.
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(&sub);
+        apply_minimal_env(&mut cmd);
+        let out = cmd.output().expect("bwrap spawns");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            Path::new(String::from_utf8_lossy(&out.stdout).trim()),
+            sub.canonicalize().unwrap(),
+            "the jail must start in the caller's cwd, not the primary root"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// core#460/#493/#415 — the Linux regression gate (the CI ubuntu leg installs bubblewrap for
@@ -3238,22 +3383,17 @@ mod tests {
             );
             return;
         }
-        let _guard = crate::test_env::ENV_LOCK
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
+        // The home is HANDED IN (never `set_var("HOME")`: tests elsewhere read HOME without a
+        // lock, and a process-global mutation raced them on the CI leg).
         let base = std::env::temp_dir().join(format!("wicked-val-460-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let home = base.join("home");
         let wt = base.join("wt");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::create_dir_all(&wt).unwrap();
-        let real_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
-        let sandbox = detect_worker_sandbox(std::slice::from_ref(&wt));
-        match &real_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        let secrets = secret_read_block_dirs_under(Some(&home));
+        assert_eq!(secrets.len(), 6, "{secrets:?}");
+        let sandbox = launcher_for_roots_masking(&[wt.as_path()], NetworkPolicy::Allow, secrets);
         assert_eq!(sandbox.level, SandboxLevel::Sandboxed, "{sandbox:?}");
         let masked = |rel: &str| {
             let s = home.join(rel).to_string_lossy().to_string();
@@ -4057,8 +4197,11 @@ mod worker_sandbox_tests {
             "outside write must not land on disk"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // macOS `sandbox-exec` says EPERM/EACCES; Linux `bwrap` surfaces its `--ro-bind` as EROFS.
         assert!(
-            stderr.contains("Permission denied") || stderr.contains("Operation not permitted"),
+            stderr.contains("Permission denied")
+                || stderr.contains("Operation not permitted")
+                || stderr.contains("Read-only file system"),
             "the child must observe an OS permission denial, got: {stderr}"
         );
         let _ = std::fs::remove_dir_all(&base);

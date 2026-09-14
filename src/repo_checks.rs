@@ -1330,7 +1330,7 @@ const TMP_NAME_ATTEMPTS: usize = 16;
 /// refuse-existing a collision only costs a redraw). Six, not eight: the macOS per-user temp dir
 /// is 49 bytes and the recorded floor check (`env.tmpdir.len() < 60`) leaves room for exactly
 /// `wc-` + 6; the worst realistic socket (`mkdtemp` one level + `/x.sock`) then stays under 104.
-fn random_tmp_name() -> String {
+pub(crate) fn random_tmp_name() -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     format!("wc-{}", &id[..6])
 }
@@ -1340,13 +1340,19 @@ fn random_tmp_name() -> String {
 /// name (a shared sticky `/tmp` lets any local user plant one) is skipped for a fresh draw, so a
 /// foreign entry is neither followed nor able to fail-close the floor. Only the scratch knows the
 /// name; nothing else is told.
-fn create_private_tmp(base: &Path, mut draw: impl FnMut() -> String) -> std::io::Result<PathBuf> {
-    let mut builder = std::fs::DirBuilder::new();
+pub(crate) fn create_private_tmp(
+    base: &Path,
+    mut draw: impl FnMut() -> String,
+) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700);
+        b
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     for _ in 0..TMP_NAME_ATTEMPTS {
         let candidate = base.join(draw());
         match builder.create(&candidate) {
@@ -2940,9 +2946,11 @@ mod tests {
         let r = run_one(&wt, &escaping, &sandbox, &scratch, Tree::Head);
         assert!(!r.passed(), "an outside write must fail the check: {r:?}");
         assert!(!pwned.exists(), "the outside write must never land on disk");
+        // macOS `sandbox-exec` says EPERM/EACCES; Linux `bwrap` surfaces its `--ro-bind` as EROFS.
         assert!(
             r.stderr_tail.contains("Permission denied")
-                || r.stderr_tail.contains("Operation not permitted"),
+                || r.stderr_tail.contains("Operation not permitted")
+                || r.stderr_tail.contains("Read-only file system"),
             "the check observed the OS denial: {}",
             r.stderr_tail
         );
