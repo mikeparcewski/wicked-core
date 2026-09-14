@@ -14,7 +14,6 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-<!-- fixall L5 -->
 - **Chat seats are handed the skills a unit gets; the turn budget is named; `chatReply.usage`; the
   chat boundary reads the seat's store pin (DES-L5 wave 1 "chat first", journey P6; core #487 +
   crew #563 core half, core #412 chat half, F-RC1-110/113/116).** `chat_ensure` handed every seat
@@ -1282,7 +1281,6 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
-<!-- fixall L4 -->
 - **Wrapped units see their prior context; ASSUMPTION markers are anchored; `unitDispatched.baseSkill`
   says whether the discipline was handed (DES-L4 PR-⑥; core #470 / F-RC1-094, F-RC1-096, #479).**
   The ACP carrier injected a `depends_on` unit's prior-phase outputs as text blocks behind a
@@ -1299,6 +1297,33 @@ Two release tracks share this file, newest entry first regardless of track:
   (`acp_seat_identity` / `wrapped_seat_identity`; only their agreement reads `true`); additive on the wire (**core-ts** `index.d.ts` doc regenerated once through
   `scripts/finalize-dts.mjs`; api-types 0.38.0 already types `BaseSkill.handed?`).
 
+- **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
+  (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
+  platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the
+  CLI-registered estate MCP hand-off is DELETED on both carriers, units and chats**: `mcpServers`
+  is always `[]`, `permissions.allow` is `[]`, no `--mcp-config` file, no argv flag; workers ground
+  through garden's estate SHIM — the graph pin is `WICKED_ESTATE_DB` and read-only is
+  `WICKED_ESTATE_READONLY=1` on every worker child. **Requires wicked-garden ≥ 12.37.0** (the shim +
+  the verdict text). **#498** (④) — the estate fence holds the `wicked-garden run|python` launcher
+  spellings to the same read-only + pinned-store rule, and **every Evaluator-role unit's prompt
+  carries the engine-owned `EVALUATOR_VERDICT_CONVENTION` line** (the evaluator convention is ON;
+  the acceptance fold that parses it is core-ts 0.7.27). **#495** (①) — the Bash write and estate
+  scans see through one wrapper level. **#496** (③) — `WICKED_RUN_*` markers on both worker
+  Commands. **#499** (⑤) — every seat with a published generation is handed the launcher
+  (`SkillsDelivery::LauncherOnly`). **#501** (②) — Bash writes judged under a fenced posture (a
+  ReadOnly seat's write is a deny), the notes root admitted on both carriers, `mkdir` a write target,
+  the guard unstages after its restore. **#502** (⑥) — wrapped units see their prior context
+  (`PRIOR_CONTEXT_PREAMBLE`, clipped), ASSUMPTION markers anchored, `unitDispatched.baseSkill.handed`
+  (the role-keyed base skill directive stays intake-gated; unset = none). **#507** (1.8) — **chat
+  seats are handed the skills a unit gets** (`admit_chat`; a seat with nothing deliverable is
+  refused at open with a remedy), the turn budget is named (600 s, a hypothesis), typed `TimedOut`,
+  `chatReply.usage`, the chat boundary reads the seat's store pin. **#494** (L10-5) — state-home
+  registry: `chats` registered, `interactive` a crew-placed root. **#497** (L10-8) —
+  `.wicked/checks.json` for the repo-checks floor. **#504** (L10-9) — each of the five platform
+  packages carries the stripped `wicked-core` hook binary stamped `wickedCoreVersion` (= the ROOT
+  crate's 0.4.0); the release workflow asserts both lockfiles pin the same `wicked-estate*`. Wire
+  shape: additive only. **Coupling to note:** wicked-crew 0.7.35 pins `wicked-core-ts ^0.7.26`
+  (crew mirrors: L4-⑧, L5-crew-1, the L10-9 locator half).
 - **core-ts 0.7.25** — 2026-09-14 — npm release carrying the six engine changes since 0.7.24 (the
   hardening train, Tier 1), all on main tip ef6c0f9 (plus #458, the 0.7.24 platform-lockfile
   re-stamp). **Behaviour changes, in one place:** **#477** (core#464, S1) — **every denial pauses
