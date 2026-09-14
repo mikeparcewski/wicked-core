@@ -85,10 +85,17 @@ impl std::error::Error for RunExists {}
 /// `RunExists` rule) so a caller can recognize a roster problem via `downcast_ref` instead of
 /// substring-matching the message. `run_id` is the refused run; `benched` the bench summary
 /// (`N of N seats benched: <seat> (<cause> — launcher), …`).
+///
+/// (D-10 / core#473-M1 = F-RC2-007) The SAME type is what distribution returns when every seat
+/// is benched at plan time — by the launcher on a re-plan, or by its own council ballots
+/// (`distribute.rs`): the `PlanFailed` arm downcasts it and parks the run at the cursor's
+/// `dead_seat` escalation gate instead of `sessionFailed`. `benched_seats` carries the bench as
+/// DATA for that arm (additive; `Display` is byte-identical — crew's intake parser keys on it).
 #[derive(Debug)]
 pub struct NoEligibleSeat {
     pub run_id: String,
     pub benched: String,
+    pub benched_seats: Vec<crate::domain::BenchedSeat>,
 }
 impl std::fmt::Display for NoEligibleSeat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1279,6 +1286,7 @@ pub(crate) fn run(
                                 run_id: run_id.to_string(),
                                 benched: crate::domain::benched_summary(&benched, spec.clis.len())
                                     .unwrap_or_default(),
+                                benched_seats: benched,
                             }
                             .into());
                         }
@@ -1458,15 +1466,16 @@ pub(crate) fn run(
                                     });
                                 }
                                 Ok(Err(e)) => {
+                                    // Typed: the arm downcasts `NoEligibleSeat` (D-10).
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
-                                        error: e.to_string(),
+                                        error: e,
                                     });
                                 }
                                 Err(_panic) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
-                                        error: {
+                                        error: anyhow::Error::msg({
                                             let payload = _panic;
                                             payload
                                                 .downcast_ref::<&str>()
@@ -1481,7 +1490,7 @@ pub(crate) fn run(
                                                 .unwrap_or_else(|| {
                                                     "distribution thread panicked".to_string()
                                                 })
-                                        },
+                                        }),
                                     });
                                 }
                             }
@@ -1643,15 +1652,16 @@ pub(crate) fn run(
                                     });
                                 }
                                 Ok(Err(e)) => {
+                                    // Typed: the arm downcasts `NoEligibleSeat` (D-10).
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
-                                        error: e.to_string(),
+                                        error: e,
                                     });
                                 }
                                 Err(_panic) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
-                                        error: {
+                                        error: anyhow::Error::msg({
                                             let payload = _panic;
                                             payload
                                                 .downcast_ref::<&str>()
@@ -1666,7 +1676,7 @@ pub(crate) fn run(
                                                 .unwrap_or_else(|| {
                                                     "distribution thread panicked".to_string()
                                                 })
-                                        },
+                                        }),
                                     });
                                 }
                             }
@@ -1791,16 +1801,45 @@ pub(crate) fn run(
             }
             Command::PlanFailed { run_id, error } => {
                 in_flight.remove(&run_id);
-                // `fail_run_by_id` guards the terminal statuses: do not clobber Cancelled with
-                // Failed if the run was cancelled while the council thread was running.
-                fail_run_by_id(
-                    &mut store,
-                    &mut subscribers,
-                    &runner,
-                    &self_tx,
-                    &run_id,
-                    anyhow::anyhow!("council distribution failed: {error}"),
-                );
+                // (D-10 / core#473-M1 = F-RC2-007) EVERY SEAT BENCHED IS A DECISION, NOT A
+                // VERDICT: the typed refusal parks the run at the cursor's `dead_seat` escalation
+                // gate — sign a seat in and approve, reassign, or reject — instead of dying in
+                // ~2 s with `sessionFailed` and nothing to approve after the sign-in (run
+                // 390b273e's launch-time twin). Every other distribution error keeps the fail
+                // contract. `fail_run_by_id` guards the terminal statuses: do not clobber
+                // Cancelled with Failed if the run was cancelled while the council thread ran.
+                let parked = match error.downcast_ref::<NoEligibleSeat>() {
+                    Some(refusal) => park_at_dead_seat_gate(
+                        &mut store,
+                        &mut subscribers,
+                        &self_tx,
+                        &run_id,
+                        refusal,
+                    ),
+                    None => Ok(false),
+                };
+                match parked {
+                    Ok(true) => {}
+                    Ok(false) => fail_run_by_id(
+                        &mut store,
+                        &mut subscribers,
+                        &runner,
+                        &self_tx,
+                        &run_id,
+                        anyhow::anyhow!("council distribution failed: {error:#}"),
+                    ),
+                    Err(gate_err) => fail_run_by_id(
+                        &mut store,
+                        &mut subscribers,
+                        &runner,
+                        &self_tx,
+                        &run_id,
+                        anyhow::anyhow!(
+                            "council distribution failed: {error:#} (and the dead-seat gate \
+                             could not be raised: {gate_err:#})"
+                        ),
+                    ),
+                }
             }
             Command::ResumeRun { run_id, reply } => {
                 let res = resume_run_inner(
@@ -2766,7 +2805,12 @@ pub(crate) fn run(
                         let run_id_c = run_id.clone();
                         let prev_cli_c = previous_cli.clone();
                         // (F-7R2-006) The one-unit re-council honours the run's bench too.
-                        let benched_c = session.benched_seats.clone();
+                        // An explicit operator reassign (`{cli:null}`) — the environment may have
+                        // been fixed since the run's bench was written (a sign-in, a quota reset):
+                        // the re-council runs over a CLEARED bench and its own ballots re-bench
+                        // whatever is still dead (DES-L3 §4; the `:3775` precedent). Without this
+                        // the lever was a no-op after a sign-in (F-RC2-007).
+                        let benched_c: Vec<crate::domain::BenchedSeat> = Vec::new();
                         let units_for_council = units.clone();
                         let clis_keys = session.clis.clone();
                         let ord_c = ord;
@@ -2830,17 +2874,20 @@ pub(crate) fn run(
                                 Ok(Err(e)) => {
                                     // Post PlanFailed so the actor thread marks the run Failed
                                     // and emits the error event — prevents a permanent wedge.
+                                    // `.context` keeps the typed `NoEligibleSeat` reachable by
+                                    // `downcast_ref` (anyhow looks through context), so an
+                                    // all-benched `{cli:null}` re-council parks at the gate too.
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: run_id_c,
-                                        error: format!(
-                                            "reassign council re-run failed for ord={ord_c}: {e}"
-                                        ),
+                                        error: e.context(format!(
+                                            "reassign council re-run failed for ord={ord_c}"
+                                        )),
                                     });
                                 }
                                 Err(_panic) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: run_id_c,
-                                        error: {
+                                        error: anyhow::Error::msg({
                                             let payload = _panic;
                                             let msg = payload
                                                 .downcast_ref::<&str>()
@@ -2852,7 +2899,7 @@ pub(crate) fn run(
                                                 })
                                                 .unwrap_or_else(|| format!("reassign council thread panicked for ord={ord_c}"));
                                             msg
-                                        },
+                                        }),
                                     });
                                 }
                             }
@@ -4791,7 +4838,12 @@ fn apply_step_result(
                     reason.as_str()
                 );
                 unit.status = crate::domain::UnitStatus::Rejected;
-                unit.denial_reason = Some(format!("{why}: {raw_excerpt}"));
+                // (core#466) The seat's own words ride the gate's `verdictSummary` — with the
+                // operator's home / worker-home / temp prefixes redacted first.
+                unit.denial_reason = Some(format!(
+                    "{why}: {}",
+                    wicked_apps_core::emit::redact_paths(&raw_excerpt)
+                ));
                 unit.denial = Some(crate::domain::UnitDenial::new(
                     crate::domain::DENIAL_SOURCE_DEAD_SEAT,
                     why.clone(),
@@ -8098,6 +8150,84 @@ fn emit_run_error(subscribers: &mut crate::event_log::EventSink, run_id: &str, e
 /// reason, `SessionFailed` carries the lifecycle transition. Neither substitutes for the other.
 /// `ord` mirrors `apply_step_result`'s convention — the cursor unit, which is `0` for a run that
 /// never dispatched one.
+/// (D-10 / core#473-M1 = F-RC2-007) Every seat benched at distribution → the run PARKS at the
+/// escalation gate on its cursor (`gateEscalated{condition: dead_seat}` → `awaitingHuman{
+/// gateKind: escalation}`) instead of failing. The store already holds the session `Distributing`
+/// (or `Executing` on a `{cli:null}` reassign), every agent unit `Pending`, the launch worktree
+/// untouched: nothing ran. What this does: persists the bench on the session (ONE bench ledger),
+/// seats every still-undistributed agent unit PROVISIONALLY on the roster's first seat (so a
+/// later Approve dispatches a nameable seat that IS on the roster — never a literal default; if
+/// that seat is still dead the EXISTING `dead_seat` worker gate re-gates it, one gate per unit,
+/// bounded), writes the `dead_seat` denial on the cursor and takes L1's one denial route
+/// (`escalate_denied_unit`). Unit status stays `Pending` (never ran — `attempt` is the session's,
+/// 0 on launch). Reject cancels + reaps; Approve retries on that seat; `/reassign {cli}` names
+/// another; `{cli:null}` re-councils over a cleared bench. Returns `Ok(false)` when the run is
+/// already terminal (a cancel landed while the council ran — never resurrect) so the caller keeps
+/// the standard fail contract.
+fn park_at_dead_seat_gate(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    self_tx: &Sender<Command>,
+    run_id: &str,
+    refusal: &NoEligibleSeat,
+) -> anyhow::Result<bool> {
+    let Some(mut session) = crate::domain::get_session(store, run_id)? else {
+        anyhow::bail!("run not found: {run_id}");
+    };
+    if matches!(
+        session.status,
+        SessionStatus::Cancelled | SessionStatus::Failed | SessionStatus::Completed
+    ) {
+        return Ok(false);
+    }
+    for seat in &refusal.benched_seats {
+        crate::domain::bench_seat(&mut session.benched_seats, seat.clone());
+    }
+    let mut units = crate::domain::session_units(store, run_id)?;
+    if units.is_empty() {
+        anyhow::bail!("run {run_id} has no units to park");
+    }
+    let roster = crate::registry_roster();
+    let seat = session.clis.first().cloned();
+    let invocation = seat
+        .as_deref()
+        .and_then(|k| crate::distribute::invocation_of(&roster, k));
+    for u in units
+        .iter_mut()
+        .filter(|u| u.tool_cmd.is_none() && u.assigned_cli.is_none())
+    {
+        u.assigned_cli = seat.clone();
+        u.assigned_invocation = invocation.clone();
+    }
+    let ix = session.unit_ix.min(units.len() - 1);
+    let why = wicked_apps_core::emit::redact_paths(&format!(
+        "{refusal}; provisionally seated on '{}'",
+        seat.as_deref().unwrap_or("?")
+    ));
+    units[ix].denial_reason = Some(why.clone());
+    units[ix].denial = Some(crate::domain::UnitDenial::new(
+        crate::domain::DENIAL_SOURCE_DEAD_SEAT,
+        why,
+    ));
+    let nodes: Vec<_> = units.iter().map(|u| u.to_node()).collect();
+    crate::domain::put_nodes(store, &nodes)?;
+    let attempt = session.attempt;
+    let note = denial_gate_note(session.human_confirm);
+    escalate_denied_unit(
+        store,
+        subscribers,
+        self_tx,
+        &mut session,
+        &units[ix],
+        attempt,
+        false,
+        false,
+        false,
+        note,
+    )?;
+    Ok(true)
+}
+
 fn fail_run_by_id(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -14293,5 +14423,83 @@ mod tool_cmd_tests {
             "the backgrounded sleep {bg} survived the group kill"
         );
         let _ = std::fs::remove_file(&pidfile);
+    }
+}
+
+/// DES-L3 §7 (9): a run that went terminal while its council ran is NEVER resurrected by the
+/// dead-seat arm — `park_at_dead_seat_gate` answers `Ok(false)` (the caller keeps the fail
+/// contract, which itself guards terminal statuses) and emits nothing.
+#[cfg(test)]
+mod dead_seat_park_tests {
+    use super::*;
+    use crate::domain::{AgentSession, HumanConfirm, UnitStatus, WorkUnit};
+    use std::sync::mpsc::channel;
+
+    fn seed_cancelled(store: &mut dyn GraphStore, run_id: &str) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["codex".into(), "claude".into()],
+            status: SessionStatus::Cancelled,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(store, session.to_node()).unwrap();
+        let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_run_is_not_resurrected_by_the_dead_seat_arm() {
+        let run_id = format!("dead-seat-cancelled-{}", std::process::id());
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        seed_cancelled(&mut store, &run_id);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let refusal = NoEligibleSeat {
+            run_id: run_id.clone(),
+            benched: "2 of 2 seats benched".into(),
+            benched_seats: vec![crate::domain::BenchedSeat {
+                cli: "codex".into(),
+                reason: "not_logged_in".into(),
+                source: "ballot".into(),
+            }],
+        };
+        let parked = park_at_dead_seat_gate(&mut store, &mut subs, &tx, &run_id, &refusal).unwrap();
+        assert!(!parked, "a terminal run is left alone");
+        assert!(
+            std::iter::from_fn(|| erx.try_recv().ok()).next().is_none(),
+            "nothing emitted for a cancelled run"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert!(
+            session.benched_seats.is_empty(),
+            "no bench written on a terminal run"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[0].status, UnitStatus::Pending);
+        assert!(units[0].denial.is_none() && units[0].assigned_cli.is_none());
     }
 }

@@ -1439,6 +1439,25 @@ Two release tracks share this file, newest entry first regardless of track:
   own `build` unit. `split_problem` is deleted: the trimmed problem is the single unit's description
   (newlines kept — the live carriers pass the prompt as an argv element / JSON string and carry no
   line limit). Def-driven plans (`plan_from_def`) are unchanged.
+- **A run whose EVERY seat is benched at distribution parks at a `dead_seat` escalation gate
+  instead of dying in ~2 s (D-10; core#473-M1 = F-RC2-007, core#466, core#379, R5b).** The two
+  all-benched `bail!`s in `distribute` (launcher bench on a re-plan; every seat benched on its own
+  council ballots) now return the SAME typed `NoEligibleSeat` the intake raises (+ `benched_seats`
+  as data; `Display` byte-identical — crew's intake parser still matches); `Command::PlanFailed`
+  carries `anyhow::Error`; the arm downcasts and — instead of `sessionFailed` — persists the bench,
+  seats every still-undistributed agent unit provisionally on the roster's first seat, writes the
+  `dead_seat` denial on the cursor (still `Pending`, attempt unchanged) and takes the one denial
+  route (`gateEscalated{condition: dead_seat}` → `awaitingHuman{gateKind: escalation}`): Reject
+  cancels, Approve retries on that seat (a still-dead seat re-gates one unit at a time),
+  `/reassign {cli}` names another, `{cli:null}` re-councils over a CLEARED bench (was the run's
+  bench — a no-op after a sign-in). The skills-constraint refusal still fails the run. The ballot
+  ledger gains one arm: an UNCLASSIFIED persistent failure (non-zero exit on every ballot, no vote)
+  benches the seat at the threshold — crew's cross-run council-count ledger is deleted in its wave-3
+  release. `councilSeatFailed.stderr/stdout/detail` and the dead-seat gate's `verdictSummary` are
+  redacted (`redact_paths`: home, worker home, temp roots, other users' homes → tokens; classified
+  on the raw text first; cap 4096 kept, not #466's 400 B). A `clis.toml` override that omits
+  `[cli.acp]` over a built-in that carries one now warns on stderr (the seat runs wrapped and
+  ungoverned; the wholesale-replace rule is unchanged).
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
   platform-lockfile re-stamp). **Behaviour changes, in one place:** **#506** (⑦) — **the

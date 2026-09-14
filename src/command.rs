@@ -381,9 +381,15 @@ pub(crate) enum Command {
         pre: Box<crate::pipeline::PreDistributed>,
         distributions: Vec<crate::distribute::Distribution>,
     },
-    /// Distribution failed (council error or pre-distribute error). The actor arm marks the session
-    /// `Failed` and emits a `SessionFailed` event. Sent by the off-actor distribute thread.
-    PlanFailed { run_id: String, error: String },
+    /// Distribution failed (council error or pre-distribute error). Sent by the off-actor
+    /// distribute thread. The actor arm marks the session `Failed` and emits `SessionFailed` —
+    /// EXCEPT for the typed [`crate::NoEligibleSeat`] (every seat benched; D-10 / core#473-M1),
+    /// which it downcasts and parks at the cursor's `dead_seat` escalation gate instead, so the
+    /// error rides as `anyhow::Error` (`Command` derives nothing, so the field compiles as is).
+    PlanFailed {
+        run_id: String,
+        error: anyhow::Error,
+    },
     /// Inject an operator message into one or all active PTY workers for a run.
     /// ACP-backed sessions (no PTY) are skipped with a warning logged to stderr.
     InjectWorkerMessage {

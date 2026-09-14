@@ -159,7 +159,7 @@ pub struct Distribution {
 pub(crate) const DISTINCTNESS_FALLBACK_CREATOR_SEAT: &str = "creator_seat";
 
 /// The invocation template for `key` from the launch roster (`None` if not found).
-fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
+pub(crate) fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
     clis.iter()
         .find(|c| c.key == key)
         .map(|c| c.headless_invocation.clone())
@@ -422,13 +422,26 @@ pub(crate) fn distribute_units_against_benched(
         .into_iter()
         .cloned()
         .collect();
-    if eligible.is_empty() {
+    if eligible.is_empty() && configured.is_empty() {
+        // An EMPTY roster with a unit that needs a seat is a configuration error, not a bench:
+        // there is no seat to sign in, so the run fails as before (F-E2E-011: crew hands a
+        // tool-only def `clis: []` by design; an agent unit on that roster is crew's bug).
         anyhow::bail!(
             "no eligible seat for {session_id}: every configured seat is benched — {} (sign a \
              seat in, or add one; a council over dead seats would only park the run at a human \
              gate per unit)",
             crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default()
         );
+    }
+    if eligible.is_empty() {
+        // (D-10) The SAME typed refusal the intake uses, with the bench as data: the actor's
+        // `PlanFailed` arm parks the run at the cursor's `dead_seat` gate instead of failing it.
+        return Err(crate::NoEligibleSeat {
+            run_id: session_id.to_string(),
+            benched: crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default(),
+            benched_seats: benched.clone(),
+        }
+        .into());
     }
     if benched.len() > prior_benched.len() {
         eprintln!(
@@ -578,11 +591,15 @@ pub(crate) fn distribute_units_against_benched(
         .map(|c| c.key.clone())
         .collect();
     if still_eligible.is_empty() {
-        anyhow::bail!(
-            "no eligible seat for {session_id}: every seat was benched on its council ballot \
-             (signed out, quota exhausted, not installed or timing out) — {}",
-            crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default()
-        );
+        // (D-10) Every seat benched on its own council ballots — typed, bench as data (above).
+        // The skills-constraint refusal BELOW stays a plain error: it is NOT all-benched (a live
+        // council seated the other units) and fails the run as today (DES-L3 r2 F1).
+        return Err(crate::NoEligibleSeat {
+            run_id: session_id.to_string(),
+            benched: crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default(),
+            benched_seats: benched.clone(),
+        }
+        .into());
     }
     // A unit the council handed to a seat the ledger then benched is moved to the first
     // still-eligible seat its skills admit — routing `degraded`, naming both seats and the cause.
@@ -919,7 +936,27 @@ impl SeatLedger {
             .iter()
             .filter(|(k, _)| *k == SeatFailureKind::Benched)
             .count();
-        // An unclassified failure still proves nothing; abstentions alone are not evidence.
+        // (R5b / DES-L3 3D′) An UNCLASSIFIED PERSISTENT failure — the seat exited non-zero on
+        // every ballot it was asked, said nothing the engine recognises, and never voted — is
+        // dead for this run once it reaches the ballot threshold, mirroring the timeout rule
+        // below. crew used to carry this class across runs in its own 30-min council-count
+        // ledger; that ledger is deleted (one bench ledger), so the engine judges it here, per
+        // run. One unclassified exit beside a vote stays "flaky, not dead" (`voted > 0` above);
+        // a mixed bag (unclassified + quota, say) still proves nothing (the `None` below).
+        let unclassified = self
+            .failures
+            .iter()
+            .filter(|(k, r)| *k == SeatFailureKind::NonZeroExit && r.is_none())
+            .count();
+        if unclassified > 0
+            && unclassified + abstained == self.failures.len()
+            && unclassified + abstained >= threshold.max(1)
+        {
+            return Some(format!(
+                "non_zero_exit ({unclassified}/{asked} ballots, unclassified)"
+            ));
+        }
+        // Any other unclassified failure still proves nothing; abstentions alone are not evidence.
         if quota + timeouts + abstained != self.failures.len() || quota + timeouts == 0 {
             return None;
         }
@@ -2461,12 +2498,17 @@ mod tests {
             &[],
         )
         .expect_err("no eligible seat");
-        let msg = err.to_string();
-        assert!(msg.contains("every configured seat is benched"), "{msg}");
-        assert!(
-            msg.contains("codex (signed out — launcher)")
-                && msg.contains("pi (dispatch budget — launcher)"),
-            "{msg}"
+        // (D-10) The SAME typed refusal the intake raises, carrying the bench as data, with the
+        // intake's byte-identical `Display` (crew's parser keys on it).
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .expect("an all-benched roster is a typed NoEligibleSeat, not a bare message");
+        assert_eq!(refusal.run_id, "s1");
+        assert_eq!(refusal.benched_seats.len(), 2);
+        assert_eq!(
+            err.to_string(),
+            "no eligible seat for s1: 2 of 2 seats benched: codex (signed out — launcher), pi \
+             (dispatch budget — launcher) — sign a seat in, or add one, before launching"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");
     }
@@ -2602,11 +2644,14 @@ mod tests {
             &[],
         )
         .expect_err("no eligible seat for the agent unit");
-        let msg = err.to_string();
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .expect("typed NoEligibleSeat");
+        assert_eq!(refusal.benched_seats[0].cli, "codex");
         assert!(
-            msg.contains("every configured seat is benched")
-                && msg.contains("codex (signed out — launcher)"),
-            "{msg}"
+            err.to_string()
+                .contains("1 of 1 seats benched: codex (signed out — launcher)"),
+            "{err}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no ballot dispatched");
     }
@@ -2833,7 +2878,28 @@ mod tests {
         assert_eq!(
             l.dead_seat_reason(2),
             None,
-            "an unclassified failure is not proof of a dead seat"
+            "a mixed bag (quota + unclassified) is not proof of a dead seat"
+        );
+
+        // (R5b / 3D′) UNCLASSIFIED and PERSISTENT: non-zero exits on every ballot asked, nothing
+        // recognisable said, no vote — benched at the threshold, like a timeout streak.
+        let mut l = SeatLedger::default();
+        l.record(unclassified);
+        assert_eq!(
+            l.dead_seat_reason(2),
+            None,
+            "one unclassified exit is flaky, not dead"
+        );
+        l.record(unclassified);
+        assert_eq!(
+            l.dead_seat_reason(2).as_deref(),
+            Some("non_zero_exit (2/2 ballots, unclassified)")
+        );
+        l.record(None);
+        assert_eq!(
+            l.dead_seat_reason(2),
+            None,
+            "one vote beside two unclassified exits keeps the seat"
         );
 
         let mut l = SeatLedger::default();
@@ -3306,9 +3372,11 @@ mod tests {
 
     /// (b) A MIXED record — one quota refusal, one vote — is a flaky provider, not a dead seat:
     /// nothing is benched, `degradedReason` stays `null`, and the seat is still the reviewer.
-    /// Likewise a seat that fails every ballot with words the council cannot classify.
+    /// A seat that fails EVERY ballot with words the council cannot classify, on the other hand,
+    /// is dead for the run by persistence (R5b / DES-L3 3D′ — the class crew used to carry in
+    /// its own cross-run ledger): benched with the unclassified reason, never a guessed one.
     #[test]
-    fn a_seat_with_one_quota_refusal_and_one_vote_is_not_benched_nor_is_an_unclassified_failure() {
+    fn a_seat_with_one_quota_refusal_and_one_vote_is_not_benched_but_a_persistent_crash_is() {
         let dispatcher = dead_seat("copilot", quota_refusal, true);
         let roster = [seat("claude"), seat("copilot"), seat("codex")];
         let dists = distribute_units_against_benched(
@@ -3359,11 +3427,18 @@ mod tests {
             &[],
         )
         .expect("routes");
+        let bench = dists[0]
+            .benched
+            .iter()
+            .find(|b| b.cli == "copilot")
+            .expect("a seat that crashes on every ballot is dead for the run (3D′)");
         assert!(
-            dists.iter().all(|d| d.benched.is_empty()),
-            "an unclassified failure is not proof of a dead seat: {:?}",
-            dists[0].benched
+            bench.reason.starts_with("non_zero_exit (")
+                && bench.reason.ends_with("ballots, unclassified)"),
+            "{}",
+            bench.reason
         );
+        assert_eq!(bench.source, "ballot");
     }
 
     /// (c) A seat whose binary cannot be spawned (`NotFound`) is benched `not_installed` on its
@@ -3515,11 +3590,13 @@ mod tests {
         assert_eq!(dists[0].degraded_reason, None);
     }
 
-    /// (review F1 on #452) A seat whose ballot exits non-zero after printing a vote ABOUT a rate
-    /// limiter — subject words, no refusal — is NOT benched: the council leaves the failure
-    /// unclassified and the seat stays routable, exactly as on main.
+    /// (review F1 on #452; re-baselined for R5b / DES-L3 3D′) A seat whose ballot exits
+    /// non-zero after printing a vote ABOUT a rate limiter — subject words, no refusal — is
+    /// never CLASSIFIED `quota_exhausted` from those words. It IS benched, but by the
+    /// unclassified-PERSISTENT arm (it failed every ballot it was asked and never voted), with
+    /// the reason saying exactly that — the count is the evidence, not the words.
     #[test]
-    fn a_failed_ballot_whose_words_are_about_rate_limiting_does_not_bench_the_seat() {
+    fn a_failed_ballot_whose_words_are_about_rate_limiting_never_classifies_as_quota() {
         fn subject_words() -> wicked_council::types::SeatFailure {
             wicked_council::types::SeatFailure::new(
                 wicked_council::types::SeatFailureKind::NonZeroExit,
@@ -3544,15 +3621,25 @@ mod tests {
             &[],
         )
         .expect("routes");
+        let bench = dists[0]
+            .benched
+            .iter()
+            .find(|b| b.cli == "copilot")
+            .expect("a seat that failed every ballot without a vote is benched (3D′)");
         assert!(
-            dists.iter().all(|d| d.benched.is_empty()),
-            "subject words in a FAILED ballot benched the seat: {:?}",
-            dists[0].benched
+            bench.reason.starts_with("non_zero_exit (")
+                && bench.reason.ends_with("ballots, unclassified)"),
+            "the words never classify — the count does: {}",
+            bench.reason
         );
-        assert!(dists.iter().all(|d| d.degraded_reason.is_none()));
-        assert_eq!(
+        assert!(
+            !bench.reason.contains("quota"),
+            "subject words about a rate limiter must not read as a quota refusal: {}",
+            bench.reason
+        );
+        assert_ne!(
             dists[1].assigned_cli, "copilot",
-            "still the first non-builder seat: {:?}",
+            "the review unit leaves the benched seat: {:?}",
             dists[1].routing
         );
     }
