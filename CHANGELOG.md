@@ -1409,6 +1409,16 @@ Two release tracks share this file, newest entry first regardless of track:
   the baseline diff apply, and a run base that lacks the key fails the diff CLOSED ("the run base
   declares no `e2e` check (the change introduced it)"). The key set is now `typecheck · lint ·
   test · test_targeted · e2e · full · baseline_diff · timeout_s`; unknown keys are still refused.
+- **Deliver honours the baseline diff (core #489 / F-RC1-132 / P7; DES-L2 §5 2E, D-22).** The
+  deliver re-verify ran the floor with no base (`run_forcing_install` → `FloorContext::default()`),
+  so ANY red check denied the deliver — including 35 failures the tip shared and qe verify had
+  just passed. Deliver now calls the ONE floor entry `run_floor` with a real context: stage
+  `verify`, the install forced on lockfile drift as before, base = the tip the work was lifted onto
+  (else the run's base commit, now carried on `LiftContext`), the PINNED git dir. A failure the
+  base shares is classified and does not deny; a head-only failure is a `regression` and does. With
+  a base known the floor prefers the repo's `test_targeted` (unless `full: true`) and runs `e2e`,
+  like verify. `run_forcing_install` is deleted (its only caller). No base at all ⇒ any red check
+  denies, as before.
 <!-- fixall L3 -->
 - **The repo-checks floor heartbeats on the unit's transcript stream (crew #581, F-BM-010).**
   After the worker returned, the floor (`typecheck`/`lint`/`test`, up to 3600 s per check) ran on

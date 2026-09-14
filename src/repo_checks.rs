@@ -1563,18 +1563,6 @@ pub(crate) fn run(worktree: &Path) -> RepoChecksReport {
     run_floor(worktree, &FloorContext::default())
 }
 
-/// [`run_floor`] as the historical verify floor with the install step FORCED (F-433-003): the
-/// deliver re-verify after a lift that moved a lockfile.
-pub(crate) fn run_forcing_install(worktree: &Path, force_install: bool) -> RepoChecksReport {
-    run_floor(
-        worktree,
-        &FloorContext {
-            force_install,
-            ..FloorContext::default()
-        },
-    )
-}
-
 /// Detect and run the checks in `worktree` for `ctx`, stopping at the first DENYING failure
 /// ([`CheckRun::denies`]): a failure the run base shares is recorded and the floor moves on
 /// (F-RC2-009). Fail-closed on a detection error and when no OS write boundary can be armed.

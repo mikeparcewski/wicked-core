@@ -529,6 +529,10 @@ pub(crate) struct LiftContext {
     /// passed, or a previous deliver re-verify) — persisted on the session (F-433-001). `None`
     /// when nothing was recorded: every deliver then re-verifies.
     pub verified_tree: Option<String>,
+    /// The run's base commit (`AgentSession::base_commit`) — the baseline-diff base for the
+    /// deliver re-verify when the lift was skipped (no tip to measure against); a lift that
+    /// reached the remote tip measures against THAT instead (DES-L2 2E, D-22 / core #489).
+    pub base_commit: Option<String>,
 }
 
 /// Resolve the [`LiftContext`] for `unit` on the actor thread (store access).
@@ -547,6 +551,7 @@ pub(crate) fn lift_context(
         worktree,
         repo_root: PathBuf::from(repo.root_path),
         verified_tree: session.verified_tree.clone(),
+        base_commit: session.base_commit.clone(),
     })
 }
 
@@ -766,7 +771,24 @@ pub(crate) fn lift_and_reverify(
         },
         short(&now.tree)
     );
-    let checks = crate::repo_checks::run_forcing_install(&ctx.worktree, !drift.is_empty());
+    // ONE floor for verify and deliver (DES-L2 2E, D-22 / core #489): the same baseline-diff
+    // floor the verify phase runs, measured against the tip the work was lifted onto (what
+    // merges), else the run base; a failure the base shares is `pre_existing_in_sandbox` and
+    // does not deny, a head-only failure is a `regression` and does. With a base known the
+    // floor prefers the repo's `test_targeted` (unless `full: true`) and runs `e2e`, exactly as
+    // at verify. No base at all (no remote, no recorded run base) ⇒ any red check denies, as
+    // before. The git dir is the PINNED one — never the worktree's own `.git` file.
+    let base_head = verified_base.clone().or_else(|| ctx.base_commit.clone());
+    let checks = crate::repo_checks::run_floor(
+        &ctx.worktree,
+        &crate::repo_checks::FloorContext {
+            stage: crate::repo_checks::FloorStage::Verify,
+            force_install: !drift.is_empty(),
+            base_head,
+            git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
+            claim_text: None,
+        },
+    );
     eprintln!(
         "wicked-core: deliver re-verify for unit {ord}: {} — {}",
         if checks.passed { "PASS" } else { "FAIL" },
@@ -784,8 +806,8 @@ pub(crate) fn lift_and_reverify(
             sandbox_level: checks.sandbox_level.clone(),
             sandbox_error: checks.sandbox_error.clone(),
             detect_error: checks.detect_error.clone(),
-            // The lift's re-verify is the verify floor over the lifted tree (no known base for a
-            // baseline diff, no creator claim).
+            // The lift's re-verify is the verify floor over the lifted tree, baseline-diffed
+            // against the lifted-onto tip (else the run base); no creator claim.
             outcome: checks.outcome().to_string(),
             floor: crate::repo_checks::FloorStage::Verify.as_wire().to_string(),
             claim: None,
@@ -1184,12 +1206,15 @@ mod tests {
         assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), head, "nothing moved");
     }
 
-    /// A worktree with a `test` script that FAILS (`exit 1`), `node_modules/` present so the
-    /// floor installs nothing — the repository's own check, always red.
+    /// A worktree with a `test` script that FAILS exactly when the tree carries `red.txt`,
+    /// `node_modules/` present so the floor installs nothing. Landed on the TIP it passes there;
+    /// the run's own (uncommitted) `red.txt` makes it fail on the head only — since DES-L2 2E the
+    /// deliver re-verify is baseline-diffed against the tip, so only a HEAD-ONLY failure refuses
+    /// (a failure the tip shares is classified and clears; see the 2E tests below).
     fn add_failing_npm_check(repo: &Path) {
         std::fs::write(
             repo.join("package.json"),
-            r#"{"name":"lift-reverify","version":"0.0.0","scripts":{"test":"exit 1"}}"#,
+            r#"{"name":"lift-reverify","version":"0.0.0","scripts":{"test":"[ ! -e red.txt ]"}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(repo.join("node_modules")).unwrap();
@@ -1204,6 +1229,7 @@ mod tests {
             worktree: wt.to_path_buf(),
             repo_root: clone.to_path_buf(),
             verified_tree,
+            base_commit: None,
         }
     }
 
@@ -1228,6 +1254,9 @@ mod tests {
         });
         let other = clone.parent().unwrap().join("other-reverify-retry");
         add_failing_npm_check(&other);
+        // The run's own work is what makes the landed check fail (head-only ⇒ a regression, which
+        // refuses; 2E excuses a failure the tip shares).
+        std::fs::write(wt.join("red.txt"), "the run broke it\n").unwrap();
         // The run's verify unit certified the PRE-lift tree.
         let verified = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
         let ctx = ctx_for(&clone, &wt, Some(verified.clone()));
@@ -1386,5 +1415,216 @@ mod tests {
         );
         let agent = crate::domain::WorkUnit::pending("s:deliver", "s", 5, "deliver");
         assert!(agent.tool_cmd.is_none() && !is_deliver_unit(&agent));
+    }
+
+    /// DES-L2 2E (D-22 / core #489, F-RC1-132 — P7 "verify said PASS, deliver denied the same
+    /// tree"): the deliver re-verify is the SAME baseline-diff floor the verify phase runs,
+    /// measured against the tip the work was lifted onto. A failure the tip shares does not
+    /// refuse the deliver (classified, not denying); a head-only failure is a `regression` and
+    /// refuses with `passed: false` evidence; with a base known the repo's `test_targeted` is
+    /// preferred, exactly as at verify. `.wicked/checks.json` only — `sh` is the runner, every
+    /// `tests/*.red` marker is a failing test (cargo-style id lines).
+    #[cfg(unix)]
+    #[test]
+    fn deliver_reverify_excuses_failures_the_tip_shares_and_refuses_regressions() {
+        const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
+                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+        let config = serde_json::json!({
+            "test": ["sh", "-c", CHECK],
+            "test_targeted": ["sh", "-c", CHECK],
+            "timeout_s": 60
+        })
+        .to_string();
+        let land_red_check = |o: &Path| {
+            std::fs::create_dir_all(o.join(".wicked")).unwrap();
+            std::fs::create_dir_all(o.join("tests")).unwrap();
+            std::fs::write(o.join(".wicked/checks.json"), &config).unwrap();
+            std::fs::write(o.join("tests/shared.red"), "").unwrap();
+            std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+        };
+        let checks_evaluated = |evs: &[CoreEvent], passed_wanted: bool| {
+            evs.iter()
+                .filter(|e| matches!(e, CoreEvent::RepoChecksEvaluated { passed, .. } if *passed == passed_wanted))
+                .count()
+        };
+
+        // (A) The tip's own red test is not this run's fault: the deliver is CLEARED, the
+        // failure classified against the tip, the targeted command preferred.
+        let (clone, wt) = stale_base_layout("reverify-shared");
+        land_on_origin("reverify-shared", &clone, land_red_check);
+        let ctx = ctx_for(&clone, &wt, None);
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let clearance = match lift_and_reverify(&ctx, "reverify-shared", 5, 0, &emit) {
+            Ok(c) => c,
+            Err(e) if e.contains("no OS write boundary") => {
+                eprintln!("deliver_lift: no sandbox tool here — the re-verify floor cannot run");
+                return;
+            }
+            Err(e) => panic!("a failure the tip shares must not refuse the deliver: {e}"),
+        };
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_eq!(clearance.verified_base.as_deref(), Some(tip.as_str()));
+        let report = clearance
+            .checks
+            .expect("the tree was not verified before ⇒ the checks ran");
+        assert!(report.passed, "{report:?}");
+        let c = &report.checks[0];
+        assert_eq!(
+            c.name, "test_targeted",
+            "with a base known the targeted set is preferred"
+        );
+        assert_eq!(c.failure_ids, vec!["test shared".to_string()]);
+        assert!(!c.denies(), "{c:?}");
+        assert!(
+            matches!(
+                c.classification.as_deref(),
+                Some(crate::repo_checks::FLOOR_ENV_MISMATCH)
+                    | Some(crate::repo_checks::PRE_EXISTING_IN_SANDBOX)
+            ),
+            "a failure the tip shares is classified, never a bare failure: {c:?}"
+        );
+        let base = c.base.as_ref().expect("the base run rides the record");
+        assert_eq!(
+            base.head, tip,
+            "measured against the tip the work was lifted onto"
+        );
+        assert_eq!(
+            base.run.as_ref().map(|r| r.failure_ids.clone()),
+            Some(vec!["test shared".to_string()])
+        );
+        assert_eq!(
+            checks_evaluated(&events.borrow(), false),
+            0,
+            "nothing refused"
+        );
+
+        // (B) A red test only the run's tree has is a REGRESSION: refused, with evidence.
+        let (clone, wt) = stale_base_layout("reverify-regression");
+        land_on_origin("reverify-regression", &clone, land_red_check);
+        std::fs::create_dir_all(wt.join("tests")).unwrap();
+        std::fs::write(wt.join("tests/new.red"), "").unwrap();
+        let ctx = ctx_for(&clone, &wt, None);
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let err = lift_and_reverify(&ctx, "reverify-regression", 5, 0, &emit)
+            .err()
+            .expect("a head-only failure refuses the deliver");
+        assert!(
+            err.contains(crate::repo_checks::REGRESSION) && err.contains("Nothing was pushed"),
+            "{err}"
+        );
+        assert_eq!(
+            checks_evaluated(&events.borrow(), false),
+            1,
+            "the refusal carries evidence"
+        );
+        let regressions = events
+            .borrow()
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::RepoChecksEvaluated { checks, .. } => {
+                    checks.first().map(|c| c.regressions.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(regressions, vec!["test new".to_string()]);
+    }
+
+    /// DES-L2 2E, the SKIPPED-lift arm: with no remote there is no tip to measure against, so the
+    /// deliver re-verify falls back to the run's own base commit (`LiftContext::base_commit`) —
+    /// a failure the base shares clears, a head-only failure refuses. Without `base_commit` the
+    /// floor has no base and any red check denies, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_lift_measures_the_reverify_against_the_run_base() {
+        const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
+                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+        let layout = |tag: &str| {
+            let base = scratch(tag);
+            let repo = base.join("repo");
+            std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+            std::fs::create_dir_all(repo.join("tests")).unwrap();
+            run_git(&repo, &["init", "-q", "-b", "main", "."]);
+            identity(&repo);
+            std::fs::write(
+                repo.join(".wicked/checks.json"),
+                serde_json::json!({ "test": ["sh", "-c", CHECK], "timeout_s": 60 }).to_string(),
+            )
+            .unwrap();
+            std::fs::write(repo.join("tests/shared.red"), "").unwrap();
+            std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-qm", "base"]);
+            let base_commit = run_git(&repo, &["rev-parse", "HEAD"]);
+            let wt = base.join("wt");
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    wt.to_str().unwrap(),
+                    "-b",
+                    &format!("wicked/{tag}"),
+                ],
+            );
+            std::fs::write(wt.join("work.txt"), "the run's work\n").unwrap();
+            (repo, wt, base_commit)
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+
+        // (A) The base's own red test, no remote: cleared against the run base.
+        let (repo, wt, base_commit) = layout("skipped-shared");
+        let ctx = LiftContext {
+            base_commit: Some(base_commit.clone()),
+            ..ctx_for(&repo, &wt, None)
+        };
+        let clearance = match lift_and_reverify(&ctx, "skipped-shared", 5, 0, &emit) {
+            Ok(c) => c,
+            Err(e) if e.contains("no OS write boundary") => {
+                eprintln!("deliver_lift: no sandbox tool here — the re-verify floor cannot run");
+                return;
+            }
+            Err(e) => panic!("a failure the run base shares must not refuse the deliver: {e}"),
+        };
+        assert!(
+            clearance.verified_base.is_none(),
+            "a skipped lift names no verified base"
+        );
+        let report = clearance.checks.expect("the checks ran");
+        assert!(report.passed, "{report:?}");
+        let c = &report.checks[0];
+        assert!(!c.denies(), "{c:?}");
+        assert_eq!(
+            c.base.as_ref().map(|b| b.head.as_str()),
+            Some(base_commit.as_str()),
+            "measured against the run base: {c:?}"
+        );
+
+        // (B) A head-only red with no remote: a regression against the run base — refused.
+        let (repo, wt, base_commit) = layout("skipped-regression");
+        std::fs::write(wt.join("tests/new.red"), "").unwrap();
+        let ctx = LiftContext {
+            base_commit: Some(base_commit),
+            ..ctx_for(&repo, &wt, None)
+        };
+        let err = lift_and_reverify(&ctx, "skipped-regression", 5, 0, &emit)
+            .err()
+            .expect("a head-only failure refuses the deliver");
+        assert!(err.contains(crate::repo_checks::REGRESSION), "{err}");
+
+        // (C) No base recorded at all: today's behaviour — any red check denies.
+        let (repo, wt, _) = layout("skipped-nobase");
+        let ctx = ctx_for(&repo, &wt, None);
+        let err = lift_and_reverify(&ctx, "skipped-nobase", 5, 0, &emit)
+            .err()
+            .expect("with no base the shared failure still denies (fail-closed)");
+        assert!(
+            err.contains("FAILED") && !err.contains(crate::repo_checks::REGRESSION),
+            "{err}"
+        );
     }
 }
