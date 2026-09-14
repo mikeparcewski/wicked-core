@@ -4587,16 +4587,8 @@ fn apply_step_result(
                     failure_kind: crate::event::StepFailureKind::WorkerError,
                 },
             );
-            if output.governed {
-                let phase = crate::scope::unit_phase(ord);
-                let _ = crate::gate_hook::fold_input_denial(
-                    store,
-                    &run_id,
-                    output.attempt,
-                    &phase,
-                    true,
-                );
-            }
+            // (No `fold_input_denial` here — a Tool unit is never `governed`: `dispatch_unit`
+            // hands `run_tool_cmd` no gate hook and reports `governed: false`; review N6.)
             let prompt = format!(
                 "The deliver phase refused: {}. Approve to re-run the deliver phase now (the \
                  engine re-lifts and re-verifies first; no second deliver gate), reject to cancel \
@@ -8776,8 +8768,8 @@ mod deliver_refusal_gate_tests {
     /// output (the identity block runs before `git fetch`).
     const IDENTITY_REFUSAL: &str = "deliver: identity mismatch — GH_ACCOUNT is release-bot but \
 gh's active login is someone-else; nothing was staged, committed or pushed. Fix the daemon's gh \
-login (gh auth switch, or GH_TOKEN in the daemon environment) and approve to retry the deliver \
-phase";
+login (switch gh's active account, or export GH_TOKEN in the daemon environment) and approve to \
+retry the deliver phase";
 
     struct NoopRunner;
     impl StepRunner for NoopRunner {
