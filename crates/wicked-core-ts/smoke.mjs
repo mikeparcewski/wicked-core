@@ -117,7 +117,7 @@ async function main() {
   const gates = events.filter((e) => e.type === 'gateDecided')
   assert(gates.length >= 1 && gates.every((g) => g.allow === true), 'gates should decide allow=true')
   assert(events.filter((e) => e.type === 'unitDone').length === 1, 'the one unit should be done')
-  console.log('[smoke] ✓ run advanced past the gate to SessionCompleted (2 units done)')
+  console.log('[smoke] ✓ run advanced past the gate to SessionCompleted (1 unit done)')
 
   // Read back the captured stub transcript for unit 1.
   const out = JSON.parse(await core.workOutput(`${sessionId}:u1`))

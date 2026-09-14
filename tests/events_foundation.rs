@@ -764,17 +764,15 @@ fn unit_distributed_evaluator_distinct_routing() {
         "at least one UnitDistributed emitted with a known routing_method, got: {dists:?}"
     );
 
-    // If there are 2+ units and the council picked the same seat, expect evaluator_distinct on the
-    // review unit. With the stub NumericDispatcher both units degrade → first seat for both, then
-    // evaluator_distinct fires IF the review stage is detected AND both seats differ.
-    let has_eval_distinct = dists.contains(&"evaluator_distinct");
-    if dists.len() >= 2 {
-        // With 2 CLIs and a build+review problem, evaluator_distinct should fire for the review unit.
-        assert!(
-            has_eval_distinct,
-            "review unit should have evaluator_distinct routing with 2 CLIs, got: {dists:?}"
-        );
-    }
+    // D-11 (core#393): the two-sentence prose is ONE unit now, so there is no review unit here for
+    // the evaluator≠creator pass to move — that pass is proven on a def-driven build+review plan by
+    // `p10_methodology::review_unit_runs_a_distinct_cli_from_the_builder`. This test pins that the
+    // single prose unit was distributed with a known routing method (above) and nothing more.
+    assert_eq!(
+        dists.len(),
+        1,
+        "one prose unit, one distribution: {dists:?}"
+    );
 }
 
 /// A dispatcher that never returns a vote degrades to the first seat and carries a degraded_reason.
