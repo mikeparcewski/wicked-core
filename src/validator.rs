@@ -643,7 +643,9 @@ fn launcher_for_roots_masking(
             // <HOME>/.aws: Read-only file system`, exit 1 — so every floor check and every pinned
             // validator on a Linux daemon whose HOME lacked one of the six failed, blamed on the
             // work. A missing dir has nothing to mask, and its parent is read-only inside the jail
-            // so a check cannot create it either: zero widening.
+            // so a check cannot create it either: zero widening. `is_dir()` narrows to DIRECTORIES:
+            // a regular file at one of the six paths (none is, in practice) is left readable rather
+            // than failing the jail closed on it — a tmpfs cannot mount over a file.
             for dir in secret_dirs.into_iter().filter(|d| d.is_dir()) {
                 w.push("--tmpfs".to_string());
                 w.push(dir.to_string_lossy().to_string());
@@ -788,23 +790,26 @@ pub(crate) fn detect_worker_sandbox(write_roots: &[std::path::PathBuf]) -> Worke
     }
 }
 
-/// The ONE predicate for "the OS sandbox launcher itself failed to arm", shared by both floor
-/// spawn sites ([`crate::repo_checks::run_one`] → `could_not_run`; [`run_validator_reporting`] →
-/// [`ValidatorOutcome::Unrunnable`]). `Some(reason)` iff a wrapper was armed AND the child's FIRST
-/// stderr line is the launcher's own diagnostic — `bwrap: …` (`Can't mkdir`, `setting up uid map`,
-/// …) or `sandbox-exec: …` (`sandbox_apply`, a profile error). Both launchers print exactly that
-/// prefix and exit non-zero BEFORE exec'ing the command, so the wrapped program never ran and the
-/// exit says nothing about the check or the criterion (core#460/#493). With no wrapper there is no
-/// launcher to blame. Callers apply it to a non-zero exit only, so a program that merely PRINTS
-/// such a line and passes is never reclassified; one that prints it and fails lands on the
-/// fail-closed side (`could_not_run` / `Unrunnable` deny too).
+/// The ONE predicate for "the OS sandbox launcher exited before the wrapped command ran", shared
+/// by both floor spawn sites ([`crate::repo_checks::run_one`] → `could_not_run`;
+/// [`run_validator_reporting`] → [`ValidatorOutcome::Unrunnable`]). `Some(reason)` iff a wrapper
+/// was armed AND the child's FIRST stderr line is the launcher's own diagnostic — `bwrap: …`
+/// (`Can't mkdir`, `setting up uid map`, `execvp …: No such file`) or `sandbox-exec: …`
+/// (`sandbox_apply`, a profile error, `execvp() of … failed`). Both launchers print exactly that
+/// prefix and exit non-zero without the command having run — the jail could not arm, or armed and
+/// could not exec — so the exit says nothing about the check or the criterion (core#460/#493).
+/// With no wrapper there is no launcher to blame. Callers apply it to a non-zero exit only, so a
+/// program that merely PRINTS such a line and passes is never reclassified; one that prints it and
+/// fails lands on the fail-closed side (`could_not_run` / `Unrunnable` deny too).
 pub(crate) fn launcher_failure(wrapper: &[String], stderr_first_line: &str) -> Option<String> {
     if wrapper.is_empty() {
         return None;
     }
     let line = stderr_first_line.trim_end();
     if line.starts_with("bwrap:") || line.starts_with("sandbox-exec:") {
-        Some(format!("the OS sandbox launcher failed to arm: {line}"))
+        Some(format!(
+            "the OS sandbox launcher exited before the check ran: {line}"
+        ))
     } else {
         None
     }
@@ -1087,32 +1092,6 @@ fn decide_core_exe<'a>(resolved: Option<&'a str>, script: &str) -> CoreExeDecisi
     }
 }
 
-/// A validator run's private, writable `TMPDIR`: `<system temp>/wc-<6 hex>` (mode 0700, drawn fresh,
-/// an existing path at the drawn name refused — the repo-checks floor's own draw), bound read-write
-/// as an extra sandbox root and reaped on drop. Replaces the tmpfs over the WHOLE system temp dir
-/// (C8, revised): the script keeps a writable temp, and nothing else under the temp dir is hidden.
-struct ValidatorTmp(std::path::PathBuf);
-
-impl ValidatorTmp {
-    fn create() -> std::io::Result<Self> {
-        crate::repo_checks::create_private_tmp(
-            &std::env::temp_dir(),
-            crate::repo_checks::random_tmp_name,
-        )
-        .map(Self)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for ValidatorTmp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Like [`run_validator`], but ALSO reports the [`SandboxLevel`] the child actually ran under — the
 /// honest "was a real OS sandbox applied?" disclosure. Same fail-closed refusals (unapproved / denylist).
 ///
@@ -1146,14 +1125,17 @@ pub fn run_validator_reporting(
         .filter(|d| !d.is_empty() && *d != ":memory:" && !d.contains("://"))
         .map(std::path::Path::new)
         .and_then(std::path::Path::parent);
-    // C8 (revised): the script's `TMPDIR` is a PRIVATE dir under the system temp dir — created
-    // here (before the probe: bwrap binds an existing directory), handed in as an extra root, set
-    // on the child below, reaped when `tmp` drops. One that cannot be created ⇒ no verdict.
+    // C8 (revised): the script's `TMPDIR` is a PRIVATE dir under the system temp dir
+    // (`repo_checks::PrivateTmp` — the floor's own newtype: 0700, refuse-existing, reaped on drop),
+    // created here BEFORE the probe (bwrap binds an existing directory), handed in as an extra
+    // root, set on the child below. Replaces the tmpfs over the WHOLE system temp dir: the script
+    // keeps a writable temp and nothing else under the temp dir is hidden. Cannot create one ⇒ no
+    // verdict.
     let mut roots: Vec<&Path> = vec![cwd];
     if let Some(store) = store_dir {
         roots.push(store);
     }
-    let tmp = match ValidatorTmp::create() {
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
         Ok(t) => t,
         Err(e) => {
             let level = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny).level;
@@ -3446,7 +3428,9 @@ mod tests {
         )
         .expect("bwrap's own diagnostic under an armed wrapper is a launcher failure");
         assert!(
-            hit.starts_with("the OS sandbox launcher failed to arm: bwrap: Can't mkdir"),
+            hit.starts_with(
+                "the OS sandbox launcher exited before the check ran: bwrap: Can't mkdir"
+            ),
             "{hit}"
         );
         assert!(
@@ -3474,7 +3458,7 @@ mod tests {
         let bwrap_line = "bwrap: Can't mkdir /nonexistent-home/.aws: Read-only file system\n";
         match classify_launcher_exit(ValidatorOutcome::Failed, &armed, bwrap_line) {
             ValidatorOutcome::Unrunnable(reason) => assert!(
-                reason.contains("failed to arm") && reason.contains("Can't mkdir"),
+                reason.contains("exited before the check ran") && reason.contains("Can't mkdir"),
                 "{reason}"
             ),
             other => panic!("a launcher exit must read as Unrunnable, got {other:?}"),

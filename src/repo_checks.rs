@@ -1287,8 +1287,35 @@ const CHECK_ENV_PASSTHROUGH: &[&str] = &[
 pub(crate) struct CheckScratch {
     root: PathBuf,
     /// The checks' `TMPDIR`: `<system temp>/wc-<6 hex>`, private (0700), drawn fresh per floor and
-    /// reaped by `Drop` (core#489 — a socket path must stay short; the worktree may not be).
-    tmp: PathBuf,
+    /// reaped with it (core#489 — a socket path must stay short; the worktree may not be).
+    tmp: PrivateTmp,
+}
+
+/// A private, writable temp dir for ONE floor or ONE validator run: `<system temp>/wc-<6 hex>`
+/// (mode 0700, drawn fresh, an existing path at the drawn name refused for a redraw), reaped on
+/// drop. One newtype for both users (review of #505, D2): the repo-checks floor's `TMPDIR`
+/// (`CheckScratch::tmp`) and the deterministic validator's `TMPDIR`, which the bwrap jail binds
+/// read-write as an extra root.
+#[derive(Debug)]
+pub(crate) struct PrivateTmp(PathBuf);
+
+impl PrivateTmp {
+    pub(crate) fn create() -> std::io::Result<Self> {
+        create_private_tmp(&std::env::temp_dir(), random_tmp_name).map(Self)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateTmp {
+    /// `remove_dir_all` does not follow a symlink at the top, and the path is one this process
+    /// `mkdir`ed itself. A crash before `Drop` (SIGKILL) leaves one `wc-*` dir for the OS temp
+    /// cleaner — LOW, nothing in it is ever reused.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Which tree a check runs on — selects the `CARGO_TARGET_DIR` leaf (`cargo-target/head` vs
@@ -1330,7 +1357,7 @@ const TMP_NAME_ATTEMPTS: usize = 16;
 /// refuse-existing a collision only costs a redraw). Six, not eight: the macOS per-user temp dir
 /// is 49 bytes and the recorded floor check (`env.tmpdir.len() < 60`) leaves room for exactly
 /// `wc-` + 6; the worst realistic socket (`mkdtemp` one level + `/x.sock`) then stays under 104.
-pub(crate) fn random_tmp_name() -> String {
+fn random_tmp_name() -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     format!("wc-{}", &id[..6])
 }
@@ -1340,10 +1367,7 @@ pub(crate) fn random_tmp_name() -> String {
 /// name (a shared sticky `/tmp` lets any local user plant one) is skipped for a fresh draw, so a
 /// foreign entry is neither followed nor able to fail-close the floor. Only the scratch knows the
 /// name; nothing else is told.
-pub(crate) fn create_private_tmp(
-    base: &Path,
-    mut draw: impl FnMut() -> String,
-) -> std::io::Result<PathBuf> {
+fn create_private_tmp(base: &Path, mut draw: impl FnMut() -> String) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     let builder = {
         use std::os::unix::fs::DirBuilderExt;
@@ -1365,15 +1389,6 @@ pub(crate) fn create_private_tmp(
         "no unused `wc-*` name under `{}` after {TMP_NAME_ATTEMPTS} draws",
         base.display()
     )))
-}
-
-impl Drop for CheckScratch {
-    /// Reap the private `TMPDIR` with the floor. `remove_dir_all` does not follow a symlink at the
-    /// top, and the path is one this floor `mkdir`ed itself. A crash before `Drop` (SIGKILL) leaves
-    /// one `wc-*` dir for the OS temp cleaner — LOW, nothing in it is ever reused.
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.tmp);
-    }
 }
 
 impl CheckScratch {
@@ -1425,7 +1440,7 @@ impl CheckScratch {
         }
         // The checks' `TMPDIR` lives OUTSIDE the worktree, short (core#489) — drawn last, so a
         // refusal above leaves nothing behind under the system temp dir.
-        let tmp = create_private_tmp(&std::env::temp_dir(), random_tmp_name)?;
+        let tmp = PrivateTmp::create()?;
         Ok(Self { root, tmp })
     }
 
@@ -1454,9 +1469,9 @@ impl CheckScratch {
             }
         }
         cmd.env("HOME", self.home())
-            .env("TMPDIR", &self.tmp)
-            .env("TMP", &self.tmp)
-            .env("TEMP", &self.tmp)
+            .env("TMPDIR", self.tmp.path())
+            .env("TMP", self.tmp.path())
+            .env("TEMP", self.tmp.path())
             .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
             .env("XDG_CACHE_HOME", self.root.join("xdg-cache"))
             .env("npm_config_cache", self.root.join("npm-cache"))
@@ -1508,7 +1523,7 @@ impl CheckScratch {
             .collect();
         FloorEnv {
             home: self.home().to_string_lossy().into_owned(),
-            tmpdir: self.tmp.to_string_lossy().into_owned(),
+            tmpdir: self.tmp.path().to_string_lossy().into_owned(),
             locale,
             network: "open".to_string(),
             sandbox_level: sandbox_level.to_string(),
@@ -1553,8 +1568,10 @@ pub fn run_floor(worktree: &Path, ctx: &FloorContext) -> RepoChecksReport {
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
-    let sandbox =
-        crate::validator::detect_worker_sandbox(&[worktree.to_path_buf(), scratch.tmp.clone()]);
+    let sandbox = crate::validator::detect_worker_sandbox(&[
+        worktree.to_path_buf(),
+        scratch.tmp.path().to_path_buf(),
+    ]);
     run_with_sandbox_ctx(worktree, sandbox, ctx, scratch)
 }
 
@@ -2389,8 +2406,9 @@ pub(crate) fn run_one(
     result.stdout_tail = lossy(out_tail);
     result.stderr_tail = lossy(err_tail);
     // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
-    // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 — the check never ran,
-    // so recording `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
+    // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 (so does a launcher
+    // whose `execvp` of the check's binary fails) — the check never ran, so recording
+    // `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
     // (`validator::launcher_failure`) reads the first stderr line; a hit is `could_not_run`
     // (denies, fail-closed, attribution honest). Never applied to a passing exit or a timeout.
     if !result.timed_out && result.exit_code != Some(0) {
@@ -3034,12 +3052,12 @@ mod tests {
             scratch.root.join("cargo-target").join("head").display()
         );
         assert!(out.lines().any(|l| l == head_target), "{out}");
-        let tmp_line = format!("TMPDIR={}", scratch.tmp.display());
+        let tmp_line = format!("TMPDIR={}", scratch.tmp.path().display());
         assert!(out.lines().any(|l| l == tmp_line), "{out}");
         assert!(
-            !scratch.tmp.starts_with(&wt),
+            !scratch.tmp.path().starts_with(&wt),
             "TMPDIR must leave the worktree: {}",
-            scratch.tmp.display()
+            scratch.tmp.path().display()
         );
         let base = run_one(&wt, &env_dump, &sandbox, &scratch, Tree::Base);
         assert!(base.passed(), "{base:?}");
@@ -3216,7 +3234,9 @@ mod tests {
         assert_eq!(dead.exit_code, Some(1));
         assert!(
             dead.spawn_error.as_deref().is_some_and(|e| {
-                e.starts_with("the OS sandbox launcher failed to arm: bwrap: Can't mkdir")
+                e.starts_with(
+                    "the OS sandbox launcher exited before the check ran: bwrap: Can't mkdir",
+                )
             }),
             "{dead:?}"
         );
@@ -3225,7 +3245,7 @@ mod tests {
             "fail-closed: a floor that could not run still denies"
         );
         assert!(
-            dead.summary().contains("failed to arm"),
+            dead.summary().contains("exited before the check ran"),
             "{}",
             dead.summary()
         );
