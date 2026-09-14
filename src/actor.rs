@@ -7146,6 +7146,43 @@ pub(crate) fn confirm_gate(
         );
     }
 
+    // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
+    // are checked here, before the durable prompt below is marked `answered` — a refused answer
+    // must leave the gate row OPEN (the run stays paused and re-answerable, and the prompts surface
+    // keeps showing it). The same rules are re-derived where the arms execute; these are the gate.
+    {
+        let units = crate::domain::session_units(store, run_id)?;
+        let cursor = units.get(session.unit_ix);
+        let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+        match &decision {
+            crate::workflow::HumanDecision::RequestChanges { .. } => {
+                let has_creator = cursor
+                    .is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
+                    || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
+                if !has_creator {
+                    anyhow::bail!(
+                        "no creator phase precedes unit {cursor_ord} — approve (retry) or reject"
+                    );
+                }
+            }
+            crate::workflow::HumanDecision::Approve {
+                amend: Some(a),
+                amend_scope: crate::workflow::AmendScope::Creator,
+            } if !a.is_empty()
+                && !units
+                    .iter()
+                    .skip(session.unit_ix)
+                    .any(|u| u.role == crate::workflow::PhaseRole::Creator) =>
+            {
+                anyhow::bail!(
+                    "amendScope \"creator\": no creator phase at or after unit {cursor_ord} — \
+                     approve without a scope to amend the cursor unit"
+                );
+            }
+            _ => {}
+        }
+    }
+
     // DES-PROJECT-001 §5.3: the durable prompt resolves on the SAME command that resolves the
     // gate — `answered`, with the decision payload. This is what empties `/projects/:id/prompts`
     // the moment ANY skin answers. (The Reject arm still cancels below; the human DID answer.)
@@ -9230,6 +9267,18 @@ mod request_changes_tests {
             u.assigned_cli = Some("claude".into());
             if at_verify {
                 u.last_attempt = Some(0);
+                // The guard's baseline the worker thread compares against (F-036): seeded on the
+                // creator and the evaluator so the rewind test can prove BOTH are dropped — a
+                // stale baseline on the re-run evaluator would make it restore the OLD tree.
+                if ix >= 2 {
+                    u.worktree_baseline = Some(crate::worktree_guard::WorktreeSnapshot {
+                        head: "h-a".into(),
+                        head_ref: None,
+                        tree: "tree-a".into(),
+                        taken_at_ms: 1,
+                        git_dir: None,
+                    });
+                }
                 if ix < 3 {
                     u.status = UnitStatus::Done;
                 } else {
@@ -9316,6 +9365,20 @@ mod request_changes_tests {
         assert_eq!(verify.status, UnitStatus::Pending);
         assert!(verify.denial.is_none() && verify.denial_reason.is_none());
         assert_eq!(verify.rework_of, None);
+        // Hazard 1 (F-036): the seeded baselines are GONE on both the creator and the evaluator —
+        // the re-run evaluator re-snapshots at its dispatch (`worktree_baseline.is_none()`), so it
+        // compares against the tree the re-run creator leaves and can never restore the pre-fix one.
+        assert!(
+            fix.worktree_baseline.is_none() && verify.worktree_baseline.is_none(),
+            "baselines cleared from the target on: fix={:?} verify={:?}",
+            fix.worktree_baseline,
+            verify.worktree_baseline
+        );
+        assert!(fix.worktree_mutation.is_none() && verify.worktree_mutation.is_none());
+        assert!(
+            units[1].worktree_baseline.is_none(),
+            "units before the creator never had one and gain none"
+        );
         assert_eq!(
             units[0].status,
             UnitStatus::Done,
@@ -9456,6 +9519,32 @@ mod request_changes_tests {
         );
         assert!(long.ends_with("…)") && !long.contains('\n'));
         assert_eq!(long.matches("(requested changes r").count(), 1);
+    }
+
+    /// review-L1-517 HIGH-1 / des-adjudicated §4.7: the dead-seat gate's wording keys on the unit's
+    /// DISPATCH history — a unit that was seated and died (`last_attempt` recorded at dispatch,
+    /// core#461's worker-exit path, which never folds) keeps the REASSIGN remedy; only a unit that
+    /// was never dispatched (L3's plan-time gate) reads "never seated … Sign a seat in".
+    #[test]
+    fn the_dead_seat_prompt_keeps_the_reassign_remedy_for_a_seated_unit_that_died() {
+        let mut u = WorkUnit::pending("s:triage", "s", 1, "triage the bug");
+        u.assigned_cli = Some("a".into());
+        u.denial = Some(UnitDenial::new("dead_seat", "seat a exhausted its quota"));
+        u.last_attempt = Some(0);
+        let seated = denial_gate_prompt(&u, "dead_seat", "seat a exhausted its quota", None, "");
+        assert!(
+            seated.starts_with("Unit 1 (a) failed on a dead seat")
+                && seated.contains("Reassign the unit"),
+            "{seated}"
+        );
+        u.last_attempt = None;
+        let never = denial_gate_prompt(&u, "dead_seat", "no eligible seat for the run", None, "");
+        assert!(
+            never.starts_with("Unit 1 was never seated: no eligible seat")
+                && never.contains("Sign a seat in, then approve to retry on 'a'")
+                && never.contains("reassign to another seat, or reject"),
+            "{never}"
+        );
     }
 
     /// DES §7 (12): attempts mint from each unit's own history — the crash redrive moves past the

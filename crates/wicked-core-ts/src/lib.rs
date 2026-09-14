@@ -50,8 +50,8 @@ use napi_derive::napi;
 const EVENT_QUEUE_BOUND: usize = 1024;
 
 use wicked_core::{
-    CampaignDef, CampaignStatus, CoreEvent, EntityMode, HumanConfirm, AmendScope, HumanDecision, LaunchSpec,
-    RepoSpec, SessionStatus, StubStepRunner,
+    AmendScope, CampaignDef, CampaignStatus, CoreEvent, EntityMode, HumanConfirm, HumanDecision,
+    LaunchSpec, RepoSpec, SessionStatus, StubStepRunner,
 };
 use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
@@ -3170,7 +3170,14 @@ mod tests {
             },
             "unitReworkAmended",
             // `scope` (DES-L1 PR-1B): cursor | creator | request_changes.
-            &["type", "session", "ord", "amendment", "updatedDescription", "scope"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "amendment",
+                "updatedDescription",
+                "scope",
+            ],
         );
         check(
             CoreEvent::UnitOutputCaptured {
