@@ -3409,12 +3409,8 @@ fn exec_turn_acp_posture(
         // dependency keep the exact prompt they had before.
         blocks.push(json!({
             "type": "text",
-            "text": "CONTEXT (prior phases of this run): the block(s) below are the verbatim output \
-of earlier phases in this same workflow run. Blocks marked `depends_on` are the artifacts your \
-phase explicitly declared it consumes — treat them as the SUBJECT of your task, not as background. \
-Build on this work; do not re-solve the original problem from scratch, and do not choose a different \
-target than the one the prior phase worked on. If your phase reviews, tests, or revises, it is that \
-prior output you are reviewing, testing, or revising."
+            // ONE text with the wrapped carrier (DES-L4 PR-⑥).
+            "text": crate::execute_wrapped::PRIOR_CONTEXT_PREAMBLE
         }));
     }
     blocks.extend(prior_outputs.iter().map(|p| {

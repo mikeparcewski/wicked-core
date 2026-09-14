@@ -47,6 +47,16 @@ pub struct BaseSkill {
     pub name: String,
     /// The role section: `creator` | `evaluator` | `neutral` (`PhaseRole::token`).
     pub role: String,
+    /// (#479, DES-L4 PR-⑥) Whether the seat is actually HANDED the discipline: `true` when the
+    /// seat's CLI has a per-launch skills lever (`SkillForm` ≠ `Unloaded`) on BOTH carriers'
+    /// identity resolutions (`acp_seat_identity` / `wrapped_seat_identity` — routing cannot know
+    /// which carrier a launch takes, so their agreement is the honest answer) — intake
+    /// (`admit_base_skill`) already proved the admitted generation holds the skill, else the
+    /// launch was refused — so the directive names a skill the seat can invoke; `false` for a
+    /// lever-less seat (agy) or one the two carriers would disagree about (copilot behind a
+    /// separate ACP bridge, a `clis.toml` override, an ad-hoc template): the run only NAMED the
+    /// discipline. Additive on the wire (`baseSkill.handed`; api-types `BaseSkill.handed?: boolean`).
+    pub handed: bool,
 }
 
 /// An event emitted by the core runtime as work progresses. Cheap to clone (fanned out to every
@@ -1418,9 +1428,10 @@ impl CoreEvent {
                     "session": session,
                     "ord": ord,
                     "attempt": attempt,
+                    // (#479, DES-L4 PR-⑥) `handed` rides beside name/role — additive.
                     "baseSkill": base_skill
                         .as_ref()
-                        .map(|b| json!({ "name": b.name, "role": b.role })),
+                        .map(|b| json!({ "name": b.name, "role": b.role, "handed": b.handed })),
                 })
             }
             // (DES-STUDIO-COCKPIT-001 §3 B3) Token/cost burn for one unit run. `costUsd` is nullable
@@ -2372,6 +2383,7 @@ mod tests {
             base_skill: Some(BaseSkill {
                 name: "wicked-garden-governed-worker".into(),
                 role: "evaluator".into(),
+                handed: true,
             }),
         }
         .to_json();
@@ -2379,6 +2391,10 @@ mod tests {
         assert_eq!(j["attempt"], 1);
         assert_eq!(j["baseSkill"]["name"], "wicked-garden-governed-worker");
         assert_eq!(j["baseSkill"]["role"], "evaluator");
+        assert_eq!(
+            j["baseSkill"]["handed"], true,
+            "(#479) the wire says whether the discipline was handed"
+        );
         let j = CoreEvent::UnitDispatched {
             session: "run-1".into(),
             ord: 4,

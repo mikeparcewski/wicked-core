@@ -258,6 +258,10 @@ fn the_base_skill_is_refused_at_intake_when_missing_and_rides_every_unit_when_pr
         Some(BaseSkill {
             name: "wicked-garden-domain".to_string(),
             role: role.to_string(),
+            // (#479, DES-L4 PR-⑥) The `stub` seat has no per-launch skills lever
+            // (`SkillsLever::for_binary("stub")` is `Absent` ⇒ `SkillForm::Unloaded`), so the
+            // dispatch truthfully reports the discipline as NOT handed.
+            handed: false,
         })
     };
     assert_eq!(
