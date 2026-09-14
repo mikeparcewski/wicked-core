@@ -129,7 +129,8 @@ pub struct GovernanceContext {
     /// The project graph is SHARED: every concurrent run in the project opens the same file, and
     /// this handle is writable. That is a wider blast radius than the repo-local case, where the
     /// worst a worker could do to a graph was to its own repo's — see the write-scope note on
-    /// `execute_wrapped::repo_estate_mcp_parts`.
+    /// `execute_wrapped::arm_worker_estate_channel` — the `WICKED_ESTATE_DB` the worker child is
+    /// handed (D-7, DES-L4 PR-⑦: the one graph hand-off; no CLI-registered estate MCP any more).
     ///
     /// `#[serde(default)]` so a `DispatchedTask` serialized by an older peer still deserializes — as
     /// `None`, i.e. no estate tools, which is the safe reading of "this peer never told me a repo".

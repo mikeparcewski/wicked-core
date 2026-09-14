@@ -15,6 +15,22 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **The CLI-registered estate MCP hand-off is DELETED on both carriers, units and chats (D-7, DES-L4
+  PR-⑦; F-084 = F-RC1-045/086/113 product half, F-RC1-048 C1, core #485/#486).** The wrapped carrier
+  wrote a per-unit `--mcp-config` file (`wicked-estate-mcp --db <graph> --readonly`) and allow-listed
+  `mcp__wicked-estate`; the ACP carrier advertised the same server on `session/new` — a SECOND
+  grounding transport that only claude had, that an org-managed MCP allowlist silently dropped
+  (ungrounding the worker without a trace), and that put the graph's `--db` path in a worker-readable
+  file. Both are gone: `mcpServers` is always `[]`, `permissions.allow` is `[]`, no config file, no
+  argv flag (`repo_estate_mcp_parts` / `resolve_estate_mcp_exe` deleted). Grounding is the estate
+  SHIM garden's skills run on every seat: the graph pin moves to `WICKED_ESTATE_DB` on the child
+  (the ACP carrier now sets it like the wrapped `arm_worker_estate_channel`), and the read-only
+  default moves from the server's `--readonly` flag to garden's existing `WICKED_ESTATE_READONLY=1`
+  on EVERY worker child — so the shim spawns `wicked-estate-mcp --readonly` by default, while the
+  estate fence keeps auditing the `--readonly` token and the store pin on each call. The ACP
+  boundary's `estate_store_pinned` counts the child's `WICKED_ESTATE_DB` too. Provenance
+  (`WICKED_RUN_*`) reaches the shim's MCP through the worker env (R12), no longer through a server
+  `env` block.
 - **Governed grounding recognises the `wicked-garden` launcher + more shim spellings (#463 §7.3,
   #474); Evaluator prompts carry the engine-owned VERDICT line (L1↔L4 contract).** The estate fence
   classified the shim only when it was spawned as a python/sh script; garden's own launcher —

@@ -1967,8 +1967,8 @@ fn start_acp_process_with_write_roots(
     additional_read_roots: &[String],
     // Ordered `(name, value)` provenance (`execute_wrapped::estate_provenance_env`): stamped on the
     // worker `Command`'s OWN env as the run markers (R12 — garden's estate shim reads them
-    // marker-first) AND handed to the estate MCP the worker's `session/new` advertises for its
-    // `proposal.submit`s. Empty for a chat caller — a chat is not a run unit and carries no markers.
+    // marker-first; the `wicked-estate-mcp` it spawns inherits them for `proposal.submit`). Empty
+    // for a chat caller — a chat is not a run unit and carries no markers.
     estate_provenance: &[(String, String)],
     // core#396 / v3.2: what this session is handed, in its lever's shape — the snapshot as a LOCAL
     // PLUGIN for the Claude bridge (`session/new` `_meta.claudeCode.options.plugins`, the one
@@ -2175,6 +2175,16 @@ fn start_acp_process_with_write_roots(
         // estate shim spawned from the worker's Bash detects governed mode marker-first and the
         // `wicked-estate-mcp` behind it inherits them. `chat_ensure` passes `&[]` — no markers.
         crate::execute_wrapped::stamp_run_markers(&mut cmd, estate_provenance);
+        // D-7 (DES-L4 PR-⑦): the graph PIN and the READ-ONLY default move from the deleted
+        // `session/new` estate server (`--db <graph> --readonly`) onto the child's env — the same
+        // `WICKED_ESTATE_DB` the wrapped carrier arms (`arm_worker_estate_channel`), and garden's
+        // `WICKED_ESTATE_READONLY` so the shim spawns `wicked-estate-mcp --readonly` by default on
+        // EVERY ACP child, units AND chats (this is the shared spawn). Set deliberately AFTER
+        // `hardened()` stripped the daemon's own `WICKED_ESTATE_DB`: the repo's graph or nothing.
+        if let Some(db) = code_graph_db.map(str::trim).filter(|db| !db.is_empty()) {
+            cmd.env(crate::gate_hook::ESTATE_DB_ENV, db);
+        }
+        cmd.env(crate::gate_hook::ESTATE_READONLY_ENV, "1");
         // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
         // to a known slate, then set exactly what this path intends. The seat's OWN
         // configuration-home variable(s) point into its root under the worker home (this also
@@ -2445,30 +2455,13 @@ fn start_acp_process_with_write_roots(
         auth_attempt = Some((method_id, outcome.err()));
     }
 
-    // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp)
-    // reject session/new with -32602 when it is absent; bridges ignore it. When the run has a code
-    // graph the engine vouched for — its repo's own, or its project's (`actor::run_code_graph_db`)
-    // — advertise the estate MCP server over it (FINDING-122) — the ACP stdio-server shape
-    // ({name,command,args,env}) of the same parts the wrapped path writes into settings.json. A
-    // repo-less session keeps the empty array exactly as before.
-    let mcp_servers = crate::execute_wrapped::repo_estate_mcp_parts(code_graph_db)
-        .map(|(command, args)| {
-            // Server-side provenance for the estate MCP's `proposal.submit` (DES-MEM-FACETED-001
-            // follow-on): the ACP `env` is the spec's `{name,value}` ARRAY (vs the wrapped carrier's
-            // object) — same pairs, formatted for this carrier so a proposal from an ACP worker carries
-            // the run/unit/agent that produced it.
-            let env: Vec<serde_json::Value> = estate_provenance
-                .iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
-                .collect();
-            json!([{
-                "name": "wicked-estate",
-                "command": command,
-                "args": args,
-                "env": env
-            }])
-        })
-        .unwrap_or_else(|| json!([]));
+    // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp) reject
+    // session/new with -32602 when it is absent; bridges ignore it. D-7 (DES-L4 PR-⑦): it is ALWAYS
+    // the empty array now — the CLI-registered estate MCP is no longer advertised (units or chats;
+    // this is the shared spawn). The graph rides the child's `WICKED_ESTATE_DB` and the read-only
+    // default its `WICKED_ESTATE_READONLY=1` (`build_cmd`); grounding is the estate shim garden's
+    // skills run, audited by the estate fence on every call.
+    let mcp_servers = json!([]);
     let session_new = session_new_params(cwd, mcp_servers, &session_options);
     let session_new_id = next_id;
     next_id += 1;
@@ -6120,12 +6113,13 @@ impl AcpStepRunner {
                     // the wrapped launcher arms on `WICKED_DELIVERABLE_ROOTS` for its hook.
                     deliverable_roots: crate::write_posture::deliverable_roots_of(Some(g)),
                     // (issue #463) Whether the AGENT child's environment pins the estate store
-                    // its shim / MCP reads resolve — the pins that survive `hardened()`; this
-                    // carrier never sets `WICKED_ESTATE_DB` on the child (its graph rides
-                    // `session/new` `mcpServers`), so only the inherited `WICKED_HOME` /
-                    // `WICKED_MEMORY_DB` count. Judged HERE, where the daemon env is the child's
-                    // parent — the wrapped carrier's hook reads its own environment instead.
-                    estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child(),
+                    // its shim reads resolve — the inherited pins that survive `hardened()`
+                    // (`WICKED_HOME` / `WICKED_MEMORY_DB`), OR — since D-7 (DES-L4 PR-⑦) — the
+                    // `WICKED_ESTATE_DB` `build_cmd` sets on the child when the run has a graph.
+                    // Judged HERE, where the daemon env is the child's parent — the wrapped
+                    // carrier's hook reads its own environment instead.
+                    estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child()
+                        || g.code_graph_db.is_some(),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -9237,6 +9231,7 @@ sleep 30
             &format!(
                 r#"#!/bin/sh
 printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{env_ledger}"
+printf 'ESTATE_DB=%s\nREADONLY=%s\n' "${{WICKED_ESTATE_DB:-UNSET}}" "${{WICKED_ESTATE_READONLY:-UNSET}}" > "{env_ledger}.estate"
 read _init
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
 read new
@@ -9331,23 +9326,23 @@ acp_input_governance = true
             json!(std::env::current_dir().unwrap().to_string_lossy().as_ref()),
             "never the process's own working directory (F-067)"
         );
-        // (2) Grounded: the READ-ONLY estate MCP over the scope's graph (DES-GROUNDING-001).
-        let servers = frame["params"]["mcpServers"]
-            .as_array()
-            .expect("mcpServers is an array");
-        assert_eq!(servers.len(), 1, "one estate server: {frame}");
-        assert_eq!(servers[0]["name"], "wicked-estate");
-        let args: Vec<&str> = servers[0]["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(
-            args.contains(&graph_db.to_string_lossy().as_ref()),
-            "bound to the scope's graph: {args:?}"
+        // (2) Grounded WITHOUT a registered MCP (D-7, DES-L4 PR-⑦): `session/new` advertises no
+        // server; the scope's graph rides the seat's `WICKED_ESTATE_DB` and read-only rides
+        // `WICKED_ESTATE_READONLY=1`, so the estate shim the seat runs is pinned and read-only.
+        assert_eq!(
+            frame["params"]["mcpServers"],
+            json!([]),
+            "no CLI-registered estate MCP on a chat seat: {frame}"
         );
-        assert!(args.contains(&"--readonly"), "read-only: {args:?}");
+        let estate = std::fs::read_to_string(format!("{}.estate", env_ledger.display())).unwrap();
+        assert!(
+            estate.contains(&format!("ESTATE_DB={}", graph_db.to_string_lossy())),
+            "the chat seat's env pins the scope's graph: {estate}"
+        );
+        assert!(
+            estate.contains("READONLY=1"),
+            "the chat seat's env carries the read-only default: {estate}"
+        );
         // (3) The scoped roots are advertised to the claude seat.
         assert_eq!(
             frame["params"]["_meta"]["claudeCode"]["options"]["additionalDirectories"],
@@ -9387,161 +9382,82 @@ acp_input_governance = true
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FINDING-122, ACP half: a run WITH a repo graph must advertise the estate MCP server on
-    /// `session/new`, scoped to that repo's OWN store — the ACP-array twin of the wrapped path's
-    /// settings.json injection — so the worker consumes the graph instead of re-deriving it. A
-    /// repo-less session (`None`) advertises no server. The stub echoes the `session/new` frame it
-    /// received; reverting `mcpServers` to a bare `[]` empties the echo and fails the assertions.
+    /// D-7 (DES-L4 PR-⑦), the FINDING-122 seam inverted: `session/new` advertises NO estate MCP any
+    /// more — with or without a repo graph, `mcpServers` is `[]` — and the graph a run vouched for
+    /// rides the CHILD's `WICKED_ESTATE_DB` (the ACP twin of the wrapped `arm_worker_estate_channel`),
+    /// with `WICKED_ESTATE_READONLY=1` on every child so garden's shim spawns its MCP read-only. A
+    /// repo-less session carries no `WICKED_ESTATE_DB` (no store beats the wrong store, FINDING-067)
+    /// but still the read-only default. The stub records its own env and echoes the frame.
     #[test]
     #[cfg(unix)]
-    fn session_new_advertises_the_repo_scoped_estate_mcp_server() {
-        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
+    fn session_new_advertises_no_estate_server_and_the_graph_rides_the_child_env() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = scratch("estate-mcp");
-        let ledger = dir.join("session-new.json");
-        let script = write_stub(
-            &dir,
-            &format!(
-                r#"#!/bin/sh
+        let dir = scratch("estate-env");
+        let stub = |tag: &str| {
+            let ledger = dir.join(format!("session-new-{tag}.json"));
+            let envfile = dir.join(format!("child-env-{tag}.txt"));
+            let script = write_stub(
+                &dir.join(tag),
+                &format!(
+                    r#"#!/bin/sh
+env > "{envfile}"
 read _init
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
 read new
 printf '%s\n' "$new" > "{ledger}"
-printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"mcp"}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{tag}"}}}}'
 sleep 30
 "#,
-                ledger = ledger.display()
-            ),
-        );
+                    envfile = envfile.display(),
+                    ledger = ledger.display()
+                ),
+            );
+            (script, ledger, envfile)
+        };
+        std::fs::create_dir_all(dir.join("with")).unwrap();
+        std::fs::create_dir_all(dir.join("none")).unwrap();
 
-        // WITH a repo graph → the estate server, scoped to that exact db.
+        // WITH a repo graph → no server advertised; the graph pins the child's env, read-only.
         let graph_db = std::path::Path::new("/tmp/wicked-122-repo")
             .join(crate::code_graph::code_graph_rel())
             .to_string_lossy()
             .into_owned();
-        let graph_db = graph_db.as_str();
-        let proc = start_acp_process(&stub_config(&script, None), &dir, Some(graph_db), None)
+        let (script, ledger, envfile) = stub("with");
+        let proc = start_acp_process(&stub_config(&script, None), &dir, Some(&graph_db), None)
             .expect("start");
-        let seen = std::fs::read_to_string(&ledger).unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(
+            frame["params"]["mcpServers"],
+            serde_json::json!([]),
+            "D-7: no CLI-registered estate MCP, even with a bound graph: {frame}"
+        );
+        let env = std::fs::read_to_string(&envfile).unwrap();
         assert!(
-            seen.contains("\"mcpServers\""),
-            "session/new must carry mcpServers: {seen}"
+            env.contains(&format!("WICKED_ESTATE_DB={graph_db}")),
+            "the bound graph rides the child's WICKED_ESTATE_DB: {env}"
         );
         assert!(
-            seen.contains("wicked-estate"),
-            "session/new must advertise the estate MCP server (FINDING-122): {seen}"
-        );
-        assert!(
-            seen.contains(graph_db),
-            "the estate server must be scoped to the REPO graph, not the daemon store: {seen}"
+            env.contains("WICKED_ESTATE_READONLY=1"),
+            "every ACP child carries garden's read-only default: {env}"
         );
         drop(proc);
 
-        // WITHOUT a repo graph → no estate server (repo-less parity with the wrapped path).
-        let ledger2 = dir.join("session-new-none.json");
-        let script2 = write_stub(
-            &dir,
-            &format!(
-                r#"#!/bin/sh
-read _init
-printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
-read new
-printf '%s\n' "$new" > "{ledger}"
-printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"none"}}}}'
-sleep 30
-"#,
-                ledger = ledger2.display()
-            ),
-        );
+        // WITHOUT a repo graph → still no server, no graph pin, still read-only.
+        let (script2, ledger2, envfile2) = stub("none");
         let proc2 =
             start_acp_process(&stub_config(&script2, None), &dir, None, None).expect("start");
-        let seen2 = std::fs::read_to_string(&ledger2).unwrap();
-        // Judged on the `mcpServers` field, not a substring: the session's fence now rides the same
-        // frame (`_meta.claudeCode.options.disallowedTools`) and names `~/.wicked-estate` there.
-        let frame2: serde_json::Value = serde_json::from_str(&seen2).unwrap();
-        assert_eq!(
-            frame2["params"]["mcpServers"],
-            serde_json::json!([]),
-            "a repo-less session must advertise no estate server: {seen2}"
+        let frame2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger2).unwrap()).unwrap();
+        assert_eq!(frame2["params"]["mcpServers"], serde_json::json!([]));
+        let env2 = std::fs::read_to_string(&envfile2).unwrap();
+        assert!(
+            !env2.lines().any(|l| l.starts_with("WICKED_ESTATE_DB=")),
+            "no repo graph ⇒ no WICKED_ESTATE_DB on the child (no store beats the wrong store): {env2}"
         );
+        assert!(env2.contains("WICKED_ESTATE_READONLY=1"), "{env2}");
         drop(proc2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// DES-MEM-FACETED-001 follow-on, ACP half: the estate MCP the worker's `session/new` advertises
-    /// must carry the run/unit/agent provenance the `proposal.submit` tool server-stamps, formatted as
-    /// the ACP `{name,value}` env array. Mirrors the wrapped carrier's `--mcp-config` env object over
-    /// the same `estate_provenance_env` pairs. The stub echoes the `session/new` frame it received.
-    #[test]
-    #[cfg(unix)]
-    fn session_new_stamps_estate_mcp_provenance_env() {
-        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
-        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = scratch("estate-prov");
-        let ledger = dir.join("session-new.json");
-        let script = write_stub(
-            &dir,
-            &format!(
-                r#"#!/bin/sh
-read _init
-printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
-read new
-printf '%s\n' "$new" > "{ledger}"
-printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"prov"}}}}'
-sleep 30
-"#,
-                ledger = ledger.display()
-            ),
-        );
-
-        let graph_db = std::path::Path::new("/tmp/wicked-prov-repo")
-            .join(crate::code_graph::code_graph_rel())
-            .to_string_lossy()
-            .into_owned();
-        let provenance =
-            crate::execute_wrapped::estate_provenance_env("run-prov", 5, Some("codex"));
-        let proc = start_acp_process_with_write_roots(
-            &stub_config(&script, None),
-            &dir,
-            Some(graph_db.as_str()),
-            None,
-            &[],
-            &provenance,
-            &crate::skills_snapshot::SkillsDelivery::None,
-            None,
-        )
-        .expect("start");
-        let seen = std::fs::read_to_string(&ledger).unwrap();
-        let frame: serde_json::Value = serde_json::from_str(&seen).unwrap();
-        let env = &frame["params"]["mcpServers"][0]["env"];
-        // The ACP env is an array of {name, value} — collect it into a lookup for order-independent checks.
-        let pairs: std::collections::HashMap<String, String> = env
-            .as_array()
-            .expect("estate MCP env must be an array on the ACP carrier")
-            .iter()
-            .map(|e| {
-                (
-                    e["name"].as_str().unwrap().to_string(),
-                    e["value"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            pairs.get("WICKED_RUN_ID").map(String::as_str),
-            Some("run-prov"),
-            "session/new must stamp the run id: {seen}"
-        );
-        assert_eq!(
-            pairs.get("WICKED_RUN_UNIT").map(String::as_str),
-            Some("5"),
-            "session/new must stamp the unit ordinal: {seen}"
-        );
-        assert_eq!(
-            pairs.get("WICKED_RUN_AGENT").map(String::as_str),
-            Some("codex"),
-            "session/new must stamp the assigned CLI: {seen}"
-        );
-        drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

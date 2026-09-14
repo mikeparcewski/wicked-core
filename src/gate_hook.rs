@@ -83,10 +83,19 @@ pub const GATE_DB_ENV: &str = "WICKED_GATE_DB";
 /// the engine ever setting a thing.
 pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 
+/// (D-7, DES-L4 PR-⑦) Garden's EXISTING read-only switch for the estate shim
+/// (`scripts/_estate_client.py` `READONLY_ENV`): when set, the shim spawns `wicked-estate-mcp
+/// --readonly` whether or not the caller passed `--readonly`. Both carriers set it to `1` on EVERY
+/// worker child (units and chats) now that the CLI-registered estate MCP — whose `--readonly` process
+/// flag used to be the read-only default — is no longer handed; the estate fence's `--readonly` token
+/// check stays the audit. Not in `ENGINE_INTERNAL_ENV`, so it survives `hardened()` to the shim.
+pub const ESTATE_READONLY_ENV: &str = "WICKED_ESTATE_READONLY";
+
 /// (issue #463) The environment variables whose presence PINS the store an estate shim / MCP read
 /// resolves — the second half of the shim allow rule (`--readonly` AND a pinned store, DES-GROUNDING-001
-/// §7.1). The launcher re-sets [`ESTATE_DB_ENV`] on a governed WRAPPED worker whose repo has a graph
-/// (`execute_wrapped::arm_worker_estate_channel`) after `hardened()` stripped it; `WICKED_HOME` /
+/// §7.1). BOTH launchers re-set [`ESTATE_DB_ENV`] on a worker whose run has a vouched-for graph
+/// (`execute_wrapped::arm_worker_estate_channel`; the ACP `build_cmd`, DES-L4 PR-⑦ — the one graph
+/// hand-off since the CLI-registered estate MCP was deleted) after `hardened()` stripped it; `WICKED_HOME` /
 /// `WICKED_MEMORY_DB` pin the memory + knowledge stores garden's `mem` backend reads and reach the
 /// worker on BOTH carriers by plain inheritance (neither is in `ENGINE_INTERNAL_ENV`).
 pub(crate) const ESTATE_STORE_PIN_ENV: [&str; 3] =
