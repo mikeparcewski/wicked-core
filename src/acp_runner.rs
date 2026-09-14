@@ -4282,16 +4282,23 @@ fn answer_permission_request<W: Write>(
 /// nothing after it. So the reply is never emptied by where the tool calls happened to fall; the
 /// worst case is today's behaviour, narration included.
 fn answer_after_last_tool_call(raw: &str, answer_from: usize) -> String {
-    let tail = if answer_from == 0 || answer_from >= raw.len() {
-        ""
+    let whole = strip_pi_banner(raw).trim_end().to_string();
+    if answer_from == 0 || answer_from >= raw.len() {
+        return whole;
+    }
+    let head = strip_pi_banner(raw.get(..answer_from).unwrap_or("")).trim();
+    let tail = strip_pi_banner(raw.get(answer_from..).unwrap_or("")).trim();
+    // The head is dropped ONLY when the answer outweighs it (review MED-1). Narration is the short
+    // thing a model says on its way to work ("Let me look at…") and the answer is the long thing it
+    // says afterwards, so `tail > head` drops the P6 shape's monologue; the inverse shape — a long
+    // answer, a citation-checking tool call, then "Confirmed." — keeps BOTH, because dropping a
+    // long head to keep a short coda would destroy the substance durably (the transcript records
+    // this text). A long narration before a short answer therefore ships today's whole output: the
+    // trade is always toward keeping text, never toward losing it.
+    if !tail.is_empty() && tail.len() > head.len() {
+        tail.to_string()
     } else {
-        raw.get(answer_from..).unwrap_or("")
-    };
-    let answer = strip_pi_banner(tail).trim().to_string();
-    if answer.is_empty() {
-        strip_pi_banner(raw).trim_end().to_string()
-    } else {
-        answer
+        whole
     }
 }
 
@@ -5710,10 +5717,27 @@ impl AcpStepRunner {
         match result {
             // F-W1-004 (R-L5-2): the reply is the ANSWER — the text after the turn's last tool call;
             // the narration before it was streamed as deltas and is not repeated in the reply.
-            Ok(turn) if turn.status == StepStatus::Ok => Ok(ChatTurnReply {
-                text: turn.chat_answer(),
-                usage: turn.usage,
-            }),
+            Ok(turn) if turn.status == StepStatus::Ok => {
+                let answer = turn.chat_answer();
+                // The rule's observable (review NIT-5 / MED-1's measurement): every turn says how
+                // much of its own output it shipped, so "the fallback fired" and "the adapter
+                // announced no tool call" are readable in the daemon log instead of being
+                // indistinguishable from an unfixed engine. The P6 re-run reads this line.
+                eprintln!(
+                    "[wicked-core] chat '{chat_id}' seat '{cli_key}' reply {} of {} output bytes ({})",
+                    answer.len(),
+                    turn.output.len(),
+                    if answer.len() == turn.output.len() {
+                        "whole output — narration retained"
+                    } else {
+                        "answer after the last tool call"
+                    }
+                );
+                Ok(ChatTurnReply {
+                    text: answer,
+                    usage: turn.usage,
+                })
+            }
             Ok(turn) => {
                 self.chat_evict(chat_id, cli_key, &arc);
                 let msg = if turn.status == StepStatus::TimedOut {
@@ -13370,12 +13394,35 @@ acp_input_governance = true
         assert_eq!(answer_from, "Let me look at the scope. ".len());
         feed(&chunk("Now the files. "), &mut output, &mut answer_from);
         feed(&tool_call, &mut output, &mut answer_from);
-        feed(&chunk("\n\nThe answer.\n"), &mut output, &mut answer_from);
+        // The answer OUTWEIGHS the narration it followed — the P6 shape, where the rule fires.
+        let answer_text = "The skill reaches the worker through the published snapshot. ".repeat(2);
+        feed(
+            &chunk(&format!("\n\n{answer_text}\n")),
+            &mut output,
+            &mut answer_from,
+        );
         // Trimmed BOTH ends: the blank line after a tool result is where we cut, not content.
         assert_eq!(
             answer_after_last_tool_call(&output, answer_from),
-            "The answer.",
+            answer_text.trim(),
             "the answer is the block after the LAST tool call"
+        );
+        // The INVERSE shape, stated as a rule and not an accident: when what follows the last tool
+        // call is SHORTER than what precedes it, the whole output ships — narration included —
+        // because dropping the longer text to keep the shorter one would lose substance (MED-1).
+        let mut short = String::new();
+        let mut sf = 0usize;
+        feed(
+            &chunk(&"Let me read every file in the repository. ".repeat(3)),
+            &mut short,
+            &mut sf,
+        );
+        feed(&tool_call, &mut short, &mut sf);
+        feed(&chunk("42."), &mut short, &mut sf);
+        assert_eq!(
+            answer_after_last_tool_call(&short, sf),
+            short.trim(),
+            "a short answer after long narration keeps BOTH — the trade is toward keeping text"
         );
 
         // A trailing tool call with nothing after it — the reviewer's case: the seat answered
@@ -13384,13 +13431,40 @@ acp_input_governance = true
         let mut tf = answer_from;
         feed(&tool_call, &mut trailing, &mut tf);
         assert_eq!(tf, trailing.len());
-        let whole = "Let me look at the scope. Now the files. \n\nThe answer.";
+        let whole = strip_pi_banner(&trailing).trim_end().to_string();
         assert_eq!(answer_after_last_tool_call(&trailing, tf), whole);
         // Same when only whitespace follows the last tool call.
         let mut ws = trailing.clone();
         let wf = tf;
         ws.push_str("   \n");
         assert_eq!(answer_after_last_tool_call(&ws, wf), whole);
+        assert!(
+            whole.contains("The skill reaches the worker"),
+            "the answer survived: {whole}"
+        );
+        // MULTI-PART ANSWER (review MED-1): a long answer, a citation-checking tool call, then a
+        // short coda. Dropping the head to keep "Confirmed." would destroy the substance durably
+        // (the transcript records this text), so BOTH ship.
+        let multi = format!(
+            "Let me check. {}\n\nConfirmed.",
+            "The skill reaches the worker through the published snapshot. ".repeat(4)
+        );
+        let coda_at = multi.len() - "Confirmed.".len();
+        let kept = answer_after_last_tool_call(&multi, coda_at);
+        assert!(
+            kept.contains("The skill reaches the worker") && kept.ends_with("Confirmed."),
+            "a short coda after a long answer keeps BOTH: {kept}"
+        );
+        // …while the P6 shape — short narration, then the answer — still drops the monologue.
+        let p6 = format!(
+            "Let me explore the key repos. Now let me read the core files. {}",
+            "The answer, at length. ".repeat(8)
+        );
+        let p6_at = p6.find("The answer, at length.").unwrap();
+        assert!(
+            !answer_after_last_tool_call(&p6, p6_at).contains("Let me explore"),
+            "the narration a model speaks on its way to work is dropped"
+        );
         // No tool call at all: the whole output, exactly as before this change.
         assert_eq!(
             answer_after_last_tool_call("Just an answer.", 0),
