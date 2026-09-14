@@ -40,6 +40,7 @@
     {
       "id": "fix",
       "kind": "build",
+      "instructions": "Update every consumer of behaviour this fix retires or changes: tests, docs, comments.",
       "gate_type": "execution",
       "gate": "auto",
       "executes_code": true,

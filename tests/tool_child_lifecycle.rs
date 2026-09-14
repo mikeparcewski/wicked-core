@@ -106,6 +106,7 @@ impl StepRunner for OkRunner {
 
 fn spec(sid: &str, workflow: &str) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Run the tool.".into(),
         clis: vec![cli("stub")],

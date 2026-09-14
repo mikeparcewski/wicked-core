@@ -410,6 +410,7 @@ fn setup(
 
 fn launch(core: &Core, run_id: &str, repo_ref: &str) {
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "extract the domain model".into(),
         clis: vec![cli("a")],

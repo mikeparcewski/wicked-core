@@ -166,6 +166,7 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
     let ev = core.subscribe();
     let run = "rcj-run";
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "fix the reported bug".into(),
         clis: vec![cli("a"), cli("b")],

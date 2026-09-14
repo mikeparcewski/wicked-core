@@ -2093,6 +2093,44 @@ Two release tracks share this file, newest entry first regardless of track:
 - Seat failover keyed to phase idempotency, not input governance (#292 → #304).
 - Resume re-provisions a reaped worktree before re-dispatching into it (#290 → #303).
 
+<!-- fixall L9 -->
+- **Deliver refusals PARK instead of failing the run; an explicit run base for revising a pull
+  request; the `bug` fix phase sweeps retired behaviour (DES-L9 r2 §5 PR-L9-core; crew #549 /
+  #550 = F-RC1-010 / F-RC1-043 / F-RC1-061, core #432; BC-57..BC-60).** (a) `apply_step_result`
+  gains ONE deterministic arm ahead of the environment-refusal and triage arms: a FAILED `deliver`
+  Tool unit (`is_deliver_unit` — tool_cmd + phase id `deliver`) whose output does not carry the
+  `LIFT-CONFLICT` strand marker is `Rejected` (`denial.source: deliver_refusal`, `denial_reason:
+  "deliver refused on unit N: <head+tail excerpt>"`, the full transcript persisted), `stepFailed
+  {workerError, detail: <the script's own words>}` fires, and the run PARKS at
+  `awaitingHuman{gateKind: "escalation", ord: N, reviewingOrd: N}` — regardless of `human_confirm`
+  (the API default `None` used to fall through to `sessionFailed`, a clean tree reaped to the
+  branch, committed work with no recovery — the crew#432 class) and of `auto_deliver` (D-5's
+  opt-out gates the PUSH, not the refusal); no LLM judge reads a deterministic refusal (0
+  `failureTriaged`). Approve re-dispatches the deliver unit through `confirm_gate` (attempt bumped;
+  the lift + re-verify run again first — no second deliver gate); Reject cancels and keeps the
+  worktree. A `LIFT-CONFLICT` output keeps today's terminal path end to end (crew derives
+  `completed` + `delivery: stranded` and offers the post-hoc lift). `deliver_lift.rs` hoists the
+  marker into `LIFT_CONFLICT_MARKER` (the engine's own Conflict refusal formats through it).
+  (b) `LaunchSpec.base_ref: Option<String>` (additive; core-ts `LaunchOptions.baseRef`) names a
+  branch on `origin` — an open PR's head — that `repo::resolve_run_base` resolves AFTER its fetch as
+  `origin/<base_ref>` and mints the fresh worktree from (`runBaseResolved{baseRef: "origin/<x>",
+  baseCommit: <tip>, lifted: false, behind: 0, note: "explicit base — the launch named origin/<x>
+  (revises a pull request)"}`); a ref that does not resolve, a non-name, or a clone with no `origin`
+  FAILS the launch by name (`WorktreeFailed` → `sessionFailed` + `error` naming the ref and the
+  `--single-branch` remedy) — never a silent fall-back to the default branch, which would push a
+  duplicate PR. The run still lives on `wicked/<run>`; `None` = today's resolution. (c)
+  `PhaseDef::instructions(..)` builder; `bug_def()`'s `fix` phase carries
+  `BUG_FIX_SWEEP_INSTRUCTIONS` ("Update every consumer of behaviour this fix retires or changes:
+  tests, docs, comments." — ≤ 90 ASCII bytes so the PTY carrier's 1000 B prompt keeps its intent
+  headroom; the DES's longer wording did not), one line, folded onto the creator's prompt after
+  ` ||| `; `workflows/bug.json` mirrors it; crew's `BUILTIN_WORKFLOWS.bug`
+  carries the same literal. Tests: the arm (parks under `None` and under `auto_deliver`; a strand
+  and a non-deliver Tool unit keep today's path), `repo.rs` explicit base (resolves / refused by
+  name / not a name / no origin / `None` = today), the sweep literal + fold, and the real-engine
+  launch test `tests/deliver_refusal_gate.rs` (deliver gate → approve → refusal → `escalation` gate
+  → fix → approve → `sessionCompleted` with the unit re-dispatched at attempt 1; `base_ref` on
+  `runBaseResolved` and the unresolvable-ref failure).
+
 ## [core-ts 0.7.1] — 2026-08-25
 
 ### Added

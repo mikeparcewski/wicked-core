@@ -831,6 +831,7 @@ fn launch_from_event(
     let human_confirm = HumanConfirm::parse(req.args.human_confirm.as_deref())
         .map_err(|e| BridgeError::Permanent(anyhow::anyhow!(e)))?;
     let spec = LaunchSpec {
+        base_ref: None,
         problem: req.problem.clone(),
         clis: roster.to_vec(),
         entity_mode,

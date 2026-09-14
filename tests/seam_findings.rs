@@ -216,6 +216,7 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
     // never Completed. "Nothing runs after a denial" is proven on two units by the async twin,
     // `p2_contract::governance_deny_through_the_engine_halts_run_at_the_escalation_gate`.
     let _ = core.launch(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "please DENYME this task. then a second task".into(),
         clis: vec![cli("a"), cli("b")],
@@ -260,6 +261,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
     core.register_workflow(CONDGATE_WORKFLOW)
         .expect("register the bug-shaped conditional-gate def");
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "fix the bug".into(),
         clis: vec![cli("a"), cli("b")],
@@ -321,6 +323,7 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         .expect("register the bug-shaped conditional-gate def");
     let events = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "fix the bug".into(),
         clis: vec![cli("a"), cli("b")],
@@ -396,6 +399,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
     core.register_workflow(TWO_UNIT_WORKFLOW)
         .expect("register the two-unit def");
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "task one. task two".into(),
         clis: vec![cli("a"), cli("b")],
@@ -510,6 +514,7 @@ fn a_triage_fail_rejection_persists_the_full_failure_transcript() {
         }),
     );
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "one thing".into(),
         clis: vec![cli("a"), cli("b")],

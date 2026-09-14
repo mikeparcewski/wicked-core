@@ -259,6 +259,7 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
     let ro_id = "r-w6-floor-ro";
     let launch = |id: &str, problem: &str| {
         core.launch_run(LaunchSpec {
+            base_ref: None,
             project_id: None,
             problem: problem.into(),
             clis: vec![cli("a"), cli("b")],
@@ -611,6 +612,7 @@ fn deliver_reverify_runs_the_baseline_diff_floor_against_the_run_base_2e() {
     let events = core.subscribe();
     let run_id = "r-l2-2e";
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Fix the bug.".into(),
         clis: vec![cli("a"), cli("b")],

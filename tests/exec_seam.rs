@@ -105,6 +105,7 @@ fn launch(core: &Core, session_id: &str) -> anyhow::Result<String> {
 
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         // Two phases (the def) → two units; the prose is the run's intent, no longer its plan.
         problem: "Do step one. Do step two".into(),
@@ -535,6 +536,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
     core.register_workflow(CONDGATE_WORKFLOW)
         .expect("register the bug-shaped conditional-gate def");
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "fix the bug".into(),
         clis: vec![cli("fake-a"), cli("fake-b")],

@@ -66,6 +66,7 @@ impl RunSpec {
     /// Build the [`LaunchSpec`] for this node's Run under the dispatch-derived `run_id` (§2.1).
     pub(crate) fn to_launch_spec(&self, run_id: String) -> LaunchSpec {
         LaunchSpec {
+            base_ref: None,
             problem: self.problem.clone(),
             clis: self.clis.clone(),
             entity_mode: self.entity_mode,

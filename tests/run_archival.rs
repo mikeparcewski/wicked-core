@@ -67,6 +67,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(session_id: &str, problem: &str, human_confirm: HumanConfirm) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: problem.into(),
         clis: vec![cli("a")],

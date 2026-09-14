@@ -54,6 +54,7 @@ impl Dispatcher for NumericDispatcher {
 
 fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
         clis,
@@ -375,6 +376,7 @@ impl StepRunner for DeadSeatA {
 /// with no gate ord that matches, so nothing pauses before the work.
 fn attended(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         human_confirm: HumanConfirm::Before(99),
         ..spec(session_id, clis)
     }

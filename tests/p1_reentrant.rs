@@ -121,6 +121,7 @@ fn launch(core: &Core, session_id: &str) -> anyhow::Result<String> {
 
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two".into(),
         clis: vec![cli("fake-a"), cli("fake-b")],

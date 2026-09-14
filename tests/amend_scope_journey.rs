@@ -149,6 +149,7 @@ fn launch(core: &Core, run: &str) -> std::sync::mpsc::Receiver<CoreEvent> {
         .expect("register the bug-shaped def");
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "fix the reported bug".into(),
         clis: vec![cli("a"), cli("b")],

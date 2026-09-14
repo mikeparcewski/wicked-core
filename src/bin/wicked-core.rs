@@ -516,6 +516,7 @@ fn main() {
             };
             let events = core.subscribe();
             let sid = core.launch(LaunchSpec {
+                base_ref: None,
                 problem,
                 clis: registry_roster(),
                 entity_mode: EntityMode::Shared,
@@ -823,6 +824,7 @@ fn run_interactive(core: &Core, args: &[String]) {
     };
     let events = core.subscribe();
     let run_id = match core.launch_run(LaunchSpec {
+        base_ref: None,
         problem,
         clis,
         entity_mode: EntityMode::Shared,

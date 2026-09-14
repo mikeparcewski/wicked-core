@@ -199,6 +199,17 @@ pub struct LaunchSpec {
     /// The id of a registered repo to run within (P3). When set, COE creates an isolated git
     /// worktree for the run and executes there; `None` runs without a repo (no worktree).
     pub repo_ref: Option<String>,
+    /// An EXPLICIT base for the run worktree (DES-L9 / crew#550 `revisesPr`, BC-59): the name of
+    /// a branch on `origin` — the head of an OPEN pull request (`wicked/<prior run>`) the run
+    /// revises — that the run starts from instead of the remote default branch. Resolved by
+    /// [`crate::repo::create_worktree_based`] AFTER its `git fetch origin` as `origin/<base_ref>`
+    /// and recorded on `runBaseResolved` (`baseRef: "origin/<x>"`, `lifted: false`); a ref that
+    /// does not resolve fails the launch loudly (`WorktreeFailed` → `sessionFailed`) naming it —
+    /// never a silent fall-back to the default branch, which would push a duplicate PR. The run
+    /// still lives on its own `wicked/<run>` branch; only the base commit changes. `None` (an
+    /// absent wire field) ⇒ today's resolution: the remote default tip when the clone is behind
+    /// it, else the clone's `HEAD`.
+    pub base_ref: Option<String>,
     /// The registered `WorkflowDef` id to run (`feature`/`bug`/`migration` or a drop-in). When set,
     /// planning is DATA-DRIVEN: units come from the def's phases (stage from the phase's declared
     /// `kind`) via [`crate::plan_from_def`]. `None` ⇒ the legacy free-text planner (prose split +

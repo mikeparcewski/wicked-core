@@ -1116,6 +1116,7 @@ pub(crate) fn run(
                     human_confirm: _, // legacy straight-through path ignores gates
                     auto_deliver: _,  // …and composes no deliver unit to gate
                     repo_ref: _,      // legacy path has no worktree
+                    base_ref: _,      // …so no base to choose for one (DES-L9)
                     workflow,
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
                     extra_write_roots: _, // legacy sync path widens nothing (core#259)
@@ -1366,7 +1367,14 @@ pub(crate) fn run(
                         let tx = self_tx.clone();
                         let rid = run_id.clone();
                         std::thread::spawn(move || {
-                            let cmd = match crate::repo::create_worktree_based(&root, &rid) {
+                            // (DES-L9 / crew#550) An explicit base — the open PR's head branch a
+                            // revision run starts from — reaches the mint here; `None` keeps the
+                            // remote-default resolution. Read before `spec` moves into the reply.
+                            let cmd = match crate::repo::create_worktree_based(
+                                &root,
+                                &rid,
+                                spec.base_ref.as_deref(),
+                            ) {
                                 Ok((wt, base)) => {
                                     // core#431 (F-3R2-013): say which base the run starts from
                                     // — the remote tip after a fetch when the clone was stale.
@@ -4525,6 +4533,84 @@ fn apply_step_result(
         // (HumanConfirm::None — the campaign/fail-fast contract) keep mechanical
         // self-heal only; unknown failures fail exactly as they always did.
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
+        // (DES-L9 F1 arm, BC-58; crew #549 / #550, the crew#432 class) A DELIVER refusal is
+        // deterministic: the crew-composed `deliver` Tool script printed WHY it would not push
+        // (an identity mismatch, a moved PR head, nothing to deliver, a moved verified base, a
+        // preflight change, a failed `gh`) — or the engine's own lift / re-verify did — and needs
+        // no seat to read it. It PARKS the run at an `escalation` gate on the deliver unit
+        // regardless of `human_confirm` (the API default is `None`, which fell through to
+        // `fail_run` below: `sessionFailed`, a clean tree reaped to the branch, committed work with
+        // no recovery) and of `auto_deliver` (D-5's opt-out gates the PUSH, not the refusal).
+        // Approve re-dispatches the deliver unit through `confirm_gate` (the attempt bumps;
+        // `dispatch_unit` re-lifts and re-verifies first — no second deliver gate); Reject cancels
+        // and keeps the worktree (dirty by construction — every refusal precedes staging). ONE
+        // exemption: a `LIFT-CONFLICT` strand keeps today's terminal path end to end — crew derives
+        // `completed` + `delivery: stranded` from `failed` + that marker and offers the post-hoc
+        // lift (`delivery-index.ts`), a contract this arm must not move. Judged BEFORE the
+        // environment-refusal and triage arms so no LLM judge ever reads a deterministic refusal;
+        // `is_deliver_unit` (tool_cmd + phase id `deliver`) leaves every other Tool unit — and
+        // `should_pause`'s deliver GATE — exactly as they are.
+        if crate::deliver_lift::is_deliver_unit(unit)
+            && !output
+                .output
+                .contains(crate::deliver_lift::LIFT_CONFLICT_MARKER)
+        {
+            let unit = units.get_mut(output.unit_ix).ok_or_else(|| {
+                anyhow::anyhow!("unit ix {} vanished on a deliver refusal", output.unit_ix)
+            })?;
+            unit.status = crate::domain::UnitStatus::Rejected;
+            // Head+TAIL (crew#322): the script's operative line comes LAST, after fetch chatter.
+            let raw = output.output.trim();
+            let snippet: String = bounded_excerpt(raw, FAILURE_EXCERPT_HEAD, FAILURE_EXCERPT_TAIL);
+            let reason = if raw.is_empty() {
+                format!("deliver refused on unit {ord} (no output)")
+            } else {
+                format!("deliver refused on unit {ord}: {snippet}")
+            };
+            unit.denial_reason = Some(reason.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new(
+                crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
+                reason,
+            ));
+            put_node(store, unit.to_node())?;
+            // The FULL refusal transcript survives the rejection (usability review #1).
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            // `detail` is the bare bounded excerpt — no framing — so seat health and the studio
+            // read the script's own words (crew `deliver-triage.ts` classifies them).
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: snippet.clone(),
+                    failure_kind: crate::event::StepFailureKind::WorkerError,
+                },
+            );
+            // (No `fold_input_denial` here — a Tool unit is never `governed`: `dispatch_unit`
+            // hands `run_tool_cmd` no gate hook and reports `governed: false`; review N6.)
+            let prompt = format!(
+                "The deliver phase refused: {}. Approve to re-run the deliver phase now (the \
+                 engine re-lifts and re-verifies first; no second deliver gate), reject to cancel \
+                 the run and keep the worktree.",
+                if raw.is_empty() {
+                    "the deliver script exited non-zero with no output"
+                } else {
+                    snippet.as_str()
+                }
+            );
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                Some(ord),
+                "escalation",
+                prompt,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
         if output.attempt == 0 {
             if let Some(refusal) = environment_refusal(&output.output) {
                 let cli = unit
@@ -8658,6 +8744,324 @@ mod terminal_gate_tests {
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
         );
+    }
+}
+
+/// DELIVER-REFUSAL GATE (DES-L9 F1 arm, BC-58; crew #549 / #550) — a FAILED `deliver` Tool unit
+/// whose output is not a `LIFT-CONFLICT` strand is Rejected and the run PARKS at an `escalation`
+/// gate on that unit, regardless of `human_confirm` (`None` here — the API default that used to
+/// fall through to `sessionFailed`) and of `auto_deliver`; no judge, no `failureTriaged`. A strand,
+/// and any OTHER Tool unit's failure, keep today's terminal path. Driven through
+/// `apply_step_result` — the real fold site — with an in-memory store and no subprocesses.
+#[cfg(test)]
+mod deliver_refusal_gate_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    /// DES-L9 §4 — the deliver script's identity refusal (D-18), verbatim; it is the unit's WHOLE
+    /// output (the identity block runs before `git fetch`).
+    const IDENTITY_REFUSAL: &str = "deliver: identity mismatch — GH_ACCOUNT is release-bot but \
+gh's active login is someone-else; nothing was staged, committed or pushed. Fix the daemon's gh \
+login (switch gh's active account, or export GH_TOKEN in the daemon environment) and approve to \
+retry the deliver phase";
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// One Executing session (`human_confirm: None`) at cursor 0 over ONE Tool unit whose phase id
+    /// is `phase` — `deliver` is what crew composes; anything else is a plain tool phase.
+    fn seed(store: &mut dyn GraphStore, run_id: &str, phase: &str, auto_deliver: bool) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            auto_deliver,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(
+            format!("{run_id}:{phase}"),
+            run_id,
+            1,
+            format!("{phase} — push the run branch"),
+        );
+        u.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "exit 1".into()]);
+        u.status = UnitStatus::Distributed;
+        put_node(store, u.to_node()).unwrap();
+        wicked_orchestration::register_workflow(
+            store,
+            format!("wf-{run_id}"),
+            "p",
+            &[(format!("wf-{run_id}:unit-1"), phase)],
+        )
+        .unwrap();
+    }
+
+    /// Fold a FAILED result carrying `output_text` for the seeded unit.
+    fn fail(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        output_text: &str,
+    ) -> (StepApplied, AgentSession, WorkUnit) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: output_text.into(),
+            status: StepStatus::Failed,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        let applied = apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            crate::workflow::UnitEvidence::default(),
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .remove(0);
+        (applied, session, unit)
+    }
+
+    fn drain(erx: &std::sync::mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
+        std::iter::from_fn(|| erx.try_recv().ok()).collect()
+    }
+
+    fn assert_parked_on_the_refusal(
+        store: &dyn GraphStore,
+        run_id: &str,
+        applied: StepApplied,
+        session: &AgentSession,
+        unit: &WorkUnit,
+        evs: &[CoreEvent],
+    ) {
+        assert!(
+            matches!(applied, StepApplied::Paused),
+            "a deliver refusal parks the run, never ends it"
+        );
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("deliver_refusal")
+        );
+        let reason = unit.denial_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("deliver refused on unit 1: deliver: identity mismatch"),
+            "{reason}"
+        );
+        let step_failed = evs.iter().find_map(|ev| match ev {
+            CoreEvent::StepFailed {
+                ord,
+                detail,
+                failure_kind,
+                ..
+            } => Some((
+                *ord,
+                detail.clone(),
+                matches!(failure_kind, crate::event::StepFailureKind::WorkerError),
+            )),
+            _ => None,
+        });
+        assert_eq!(
+            step_failed,
+            Some((1, IDENTITY_REFUSAL.to_string(), true)),
+            "stepFailed carries the script's own words, bare, kinded workerError"
+        );
+        let paused = evs
+            .iter()
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman {
+                    ord,
+                    reviewing_ord,
+                    gate_kind,
+                    prompt,
+                    ..
+                } => Some((*ord, *reviewing_ord, gate_kind.clone(), prompt.clone())),
+                _ => None,
+            })
+            .expect("the refusal pauses the run");
+        assert_eq!(
+            (paused.0, paused.1, paused.2.as_str()),
+            (1, Some(1), "escalation")
+        );
+        assert!(
+            paused
+                .3
+                .starts_with("The deliver phase refused: deliver: identity mismatch")
+                && paused.3.contains("no second deliver gate")
+                && paused.3.contains("keep the worktree"),
+            "{}",
+            paused.3
+        );
+        assert!(
+            !evs.iter()
+                .any(|ev| matches!(ev, CoreEvent::SessionFailed { .. })),
+            "no sessionFailed"
+        );
+        assert!(
+            !evs.iter()
+                .any(|ev| matches!(ev, CoreEvent::FailureTriaged { .. })),
+            "no judge reads a deterministic refusal"
+        );
+        let open = crate::interaction::list_interactions(
+            store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the prompt is durable state");
+        assert_eq!(open[0].gate_kind.as_deref(), Some("escalation"));
+        // The FULL refusal transcript survives the rejection.
+        let transcript = crate::domain::get_unit_transcript(store, &unit.id);
+        assert!(transcript.is_some(), "the rejected transcript is persisted");
+    }
+
+    /// The API default: `human_confirm: None`, the deliver gate on. The refusal parks.
+    #[test]
+    fn a_deliver_refusal_parks_at_the_escalation_gate_with_no_human_in_the_loop() {
+        let run_id = format!("deliver-refusal-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "deliver", false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, IDENTITY_REFUSAL);
+        let evs = drain(&erx);
+        assert_parked_on_the_refusal(&store, &run_id, applied, &session, &unit, &evs);
+    }
+
+    /// `auto_deliver: true` opts out of the deliver GATE (D-5), not of the refusal — the arm parks
+    /// the run all the same.
+    #[test]
+    fn a_deliver_refusal_parks_under_auto_deliver_too() {
+        let run_id = format!("deliver-refusal-auto-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "deliver", true);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, IDENTITY_REFUSAL);
+        let evs = drain(&erx);
+        assert_parked_on_the_refusal(&store, &run_id, applied, &session, &unit, &evs);
+    }
+
+    /// A `LIFT-CONFLICT` strand keeps today's terminal path exactly: crew derives `completed` +
+    /// `delivery: stranded` from `failed` + the marker and offers the post-hoc lift — the arm
+    /// exempts the marker so that contract does not move.
+    #[test]
+    fn a_lift_conflict_strand_keeps_todays_terminal_path() {
+        let run_id = format!("deliver-strand-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "deliver", false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let strand = format!(
+            "remote: HTTP 403 authentication failed\n{} — push of wicked/x was rejected because \
+             the remote branch moved (non-fast-forward); rebase and re-run; nothing was pushed",
+            crate::deliver_lift::LIFT_CONFLICT_MARKER
+        );
+
+        let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, &strand);
+        let evs = drain(&erx);
+        assert!(
+            !matches!(applied, StepApplied::Paused),
+            "a strand is terminal"
+        );
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("worker_failure"),
+            "today's framing, so crew's strand derivation keys on it unchanged"
+        );
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::SessionFailed { .. })));
+        assert!(!evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::AwaitingHuman { .. })));
+    }
+
+    /// Only the DELIVER unit takes the arm: another Tool unit printing the same words is a plain
+    /// tool failure and keeps today's path.
+    #[test]
+    fn a_non_deliver_tool_units_failure_keeps_todays_terminal_path() {
+        let run_id = format!("tool-fail-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "domain-graph", false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, IDENTITY_REFUSAL);
+        let evs = drain(&erx);
+        assert!(!matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::SessionFailed { .. })));
+        assert!(!evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::AwaitingHuman { .. })));
     }
 }
 
