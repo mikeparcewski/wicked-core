@@ -93,7 +93,7 @@
 //! [`preflight_state_home`] is the engine call crew makes at `serve` so the daemon reports the
 //! blocker before anyone launches. Every message is in operator terms — the entry, the state
 //! home, the variable, what to do — and none cites a repository fixture path. Entries an OPERATOR
-//! variable can place under the state home (`workflows`, `steering-inbox`, `interactive`) are
+//! variable can place under the state home (`workflows`, `steering-inbox`) are
 //! registered so a pre-existing placement is fenced rather than refusing every launch; crew
 //! refuses to boot with such a variable pointed inside the state home. Debris is deliberately NOT
 //! patterned: a quarantine-by-rename inside the state home is what the fence must refuse.
@@ -1294,13 +1294,16 @@ mod tests {
             "project-settings.json",
             "repo-graphs",
             "skills",
-            // core#411 / wicked-crew#497: the three entries an OPERATOR variable can place under
-            // the state home (`WICKED_WORKFLOWS_DIR`, `WICKED_STEERING_INBOX_DIR`,
-            // `WICKED_INTERACTIVE_ROOT`) — fenced when present, never a reason to refuse every
-            // launch; crew refuses to boot with the variable pointed there.
+            // crew-placed by a `join(<state home>, …)`: the chat transcripts (`chats`) and the
+            // interactive bridge's docs root + recorder browser (`interactive`).
+            "chats",
+            "interactive",
+            // core#411 / wicked-crew#497: the two entries an OPERATOR variable can place under
+            // the state home (`WICKED_WORKFLOWS_DIR`, `WICKED_STEERING_INBOX_DIR`) — fenced when
+            // present, never a reason to refuse every launch; crew refuses to boot with the
+            // variable pointed there.
             "workflows",
             "steering-inbox",
-            "interactive",
         ] {
             assert!(r.classify(live).is_some(), "{live} must be classified");
         }
