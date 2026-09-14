@@ -325,7 +325,9 @@ fn replace_path_prefix(text: &str, prefix_norm: &str, token: &str) -> String {
     while let Some(pos) = hay[i..].find(prefix_norm) {
         let start = i + pos;
         let end = start + prefix_norm.len();
-        let before_ok = start == 0 || !continues_path(hb[start - 1]);
+        // A path start — or a `file://` URL body (Node ESM stack frames: `file:///Users/…`).
+        let before_ok =
+            start == 0 || !continues_path(hb[start - 1]) || hay[..start].ends_with("file://");
         let after_ok = end == hb.len() || !continues_component(hb[end]);
         if before_ok && after_ok && text.is_char_boundary(start) && text.is_char_boundary(end) {
             out.push_str(&text[last..start]);
@@ -364,7 +366,8 @@ fn redact_user_dirs(text: &str) -> String {
             if i >= 2 && hb[i - 1] == b':' && hb[i - 2].is_ascii_alphabetic() {
                 start = i - 2;
             }
-            let before_ok = start == 0 || !continues_path(hb[start - 1]);
+            let before_ok =
+                start == 0 || !continues_path(hb[start - 1]) || hay[..start].ends_with("file://");
             let name_start = i + m.len();
             let mut name_end = name_start;
             while name_end < hb.len() && (continues_component(hb[name_end]) || hb[name_end] >= 0x80)
@@ -1175,6 +1178,23 @@ mod redact_paths_tests {
         assert_eq!(
             redact_prefixes(r"D:\Users\Zed\q and e:/Users/Ann/r", &t),
             r"<home>\q and <home>/r"
+        );
+    }
+
+    /// Review on #523 (MED): Node ESM stack frames spell paths as `file:///Users/…` — the `///`
+    /// put the prefix behind a path character, so nothing matched. The scheme is a legitimate
+    /// path start.
+    #[test]
+    fn a_file_url_stack_frame_is_redacted_behind_its_scheme() {
+        let t = table(&[("/Users/op", "<home>"), ("/tmp", "<tmp>")]);
+        assert_eq!(
+            redact_prefixes(
+                "    at run (file:///Users/op/proj/dist/x.mjs:12:3)\n    at file:///tmp/y.mjs:1:1 \
+                 and file:///home/alice/z.mjs",
+                &t
+            ),
+            "    at run (file://<home>/proj/dist/x.mjs:12:3)\n    at file://<tmp>/y.mjs:1:1 \
+             and file://<home>/z.mjs"
         );
     }
 

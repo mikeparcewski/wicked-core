@@ -58,8 +58,10 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-/// Every seat's ballot exits `Not logged in` — the whole roster is dead for the run.
+/// Every seat's ballot exits `Not logged in` — the whole roster is dead for the run. Counts the
+/// ballots it was asked so a test can prove a council was (re-)convened.
 struct AllSignedOut;
+static BALLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 impl Dispatcher for AllSignedOut {
     fn dispatch(&self, c: &AgenticCli, _: &CouncilTask) -> Option<Vote> {
         Some(Vote {
@@ -78,10 +80,35 @@ impl Dispatcher for AllSignedOut {
         _task: &CouncilTask,
         _ctx: &BallotContext,
     ) -> DispatchOutcome {
+        BALLOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         DispatchOutcome::Failed(
             SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1")
                 .with_output("Not logged in · Please run /login", ""),
         )
+    }
+}
+
+/// A runner that reports the unit it started and then BLOCKS until the test releases it — so a
+/// unit can be reassigned while it is in flight (`ReassignUnit` requires an Executing cursor).
+struct GatedRunner {
+    started: std::sync::Mutex<std::sync::mpsc::Sender<u32>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl StepRunner for GatedRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let _ = self.started.lock().unwrap().send(i.unit.ord);
+        let _ = self.release.lock().unwrap().recv();
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "ok".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: vec![],
+            tools: Vec::new(),
+            governed: false,
+        }
     }
 }
 
@@ -219,12 +246,32 @@ fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() 
             ord,
             reviewing_ord,
             gate_kind,
+            prompt,
             ..
         } => {
             assert_eq!((*ord, *reviewing_ord), (1, Some(1)));
             assert_eq!(gate_kind, "escalation");
+            // DES §7 (11): under run-level `human_confirm: none` the prompt discloses why the run
+            // paused anyway (the core#464 note).
+            assert!(
+                prompt.contains("engine gate: a denied unit pauses for a decision"),
+                "the human_confirm:none note rides the prompt: {prompt}"
+            );
         }
         other => unreachable!("{other:?}"),
+    }
+    // DES §7 (13): the dead-seat gate's summary carries no home prefix (core#466).
+    if let CoreEvent::GateEscalated {
+        verdict_summary, ..
+    } = &evs[escalated]
+    {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        assert!(
+            home.is_empty() || !verdict_summary.contains(&home),
+            "no home prefix in the summary: {verdict_summary}"
+        );
     }
     assert!(
         !evs.iter()
@@ -331,4 +378,77 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
     let store = wicked_apps_core::open_store_ro(Some(&db)).expect("read-only store");
     let units = session_units(&store, sid).unwrap();
     assert_eq!(units[0].assigned_cli.as_deref(), Some("codex"));
+}
+
+/// DES §7 (12) / BC-16: `POST /runs/:id/reassign {cli: null}` on a parked-then-approved run
+/// re-convenes the council over a CLEARED bench — the ballots run again (the count rises; with the
+/// run's bench still in force `:426` would have refused before any ballot) — and, every seat still
+/// dead, the run parks again at the `dead_seat` gate with the bumped attempt; never `sessionFailed`.
+#[test]
+fn a_cli_null_reassign_re_councils_over_a_cleared_bench_and_parks_again() {
+    let sid = "deadseat-reassign";
+    let db = db_path("reassign");
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<u32>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let core = Core::spawn_with_engine(
+        db,
+        Arc::new(AllSignedOut),
+        Arc::new(GatedRunner {
+            started: std::sync::Mutex::new(started_tx),
+            release: std::sync::Mutex::new(release_rx),
+        }),
+    );
+    let ev = core.subscribe();
+    core.launch_run(spec(sid)).expect("launch");
+    let evs = collect_until(
+        &ev,
+        Duration::from_secs(15),
+        |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid),
+    );
+    no_session_failed(&evs, sid);
+    let ballots_before = BALLOTS.load(std::sync::atomic::Ordering::SeqCst);
+
+    // Approve → the cursor dispatches on the provisional seat and blocks in the gated runner.
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve");
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(10)).ok(),
+        Some(1),
+        "the cursor unit dispatched (on the provisional seat) and is in flight"
+    );
+
+    // The operator's explicit "try again": re-council over a CLEARED bench.
+    core.reassign_unit(sid, 1, None)
+        .expect("reassign {cli:null}");
+    let post = collect_until(
+        &ev,
+        Duration::from_secs(15),
+        |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid),
+    );
+    no_session_failed(&post, sid);
+    assert!(
+        BALLOTS.load(std::sync::atomic::Ordering::SeqCst) > ballots_before,
+        "the council was re-convened: the ballots ran again (the bench was cleared, not reused)"
+    );
+    let reassigned = post
+        .iter()
+        .position(|e| matches!(e, CoreEvent::UnitReassigned { session, ord: 1, new_cli: None, .. } if session == sid))
+        .unwrap_or_else(|| panic!("unitReassigned{{newCli: null}}: {post:?}"));
+    let gate = post
+        .iter()
+        .position(|e| matches!(e, CoreEvent::GateEscalated { session, condition, .. } if session == sid && condition == "dead_seat"))
+        .unwrap_or_else(|| panic!("a second dead_seat gate: {post:?}"));
+    assert!(reassigned < gate, "{post:?}");
+    if let CoreEvent::GateEscalated { attempt, .. } = &post[gate] {
+        assert!(*attempt >= 1, "the reassign bumped the attempt: {attempt}");
+    }
+    // Clean up: release the superseded worker and reject the parked run.
+    drop(release_tx);
+    let _ = core.confirm_gate(sid, HumanDecision::Reject);
 }

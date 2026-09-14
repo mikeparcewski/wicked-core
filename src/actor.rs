@@ -14425,3 +14425,81 @@ mod tool_cmd_tests {
         let _ = std::fs::remove_file(&pidfile);
     }
 }
+
+/// DES-L3 §7 (9): a run that went terminal while its council ran is NEVER resurrected by the
+/// dead-seat arm — `park_at_dead_seat_gate` answers `Ok(false)` (the caller keeps the fail
+/// contract, which itself guards terminal statuses) and emits nothing.
+#[cfg(test)]
+mod dead_seat_park_tests {
+    use super::*;
+    use crate::domain::{AgentSession, HumanConfirm, UnitStatus, WorkUnit};
+    use std::sync::mpsc::channel;
+
+    fn seed_cancelled(store: &mut dyn GraphStore, run_id: &str) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["codex".into(), "claude".into()],
+            status: SessionStatus::Cancelled,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(store, session.to_node()).unwrap();
+        let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_run_is_not_resurrected_by_the_dead_seat_arm() {
+        let run_id = format!("dead-seat-cancelled-{}", std::process::id());
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        seed_cancelled(&mut store, &run_id);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let refusal = NoEligibleSeat {
+            run_id: run_id.clone(),
+            benched: "2 of 2 seats benched".into(),
+            benched_seats: vec![crate::domain::BenchedSeat {
+                cli: "codex".into(),
+                reason: "not_logged_in".into(),
+                source: "ballot".into(),
+            }],
+        };
+        let parked = park_at_dead_seat_gate(&mut store, &mut subs, &tx, &run_id, &refusal).unwrap();
+        assert!(!parked, "a terminal run is left alone");
+        assert!(
+            std::iter::from_fn(|| erx.try_recv().ok()).next().is_none(),
+            "nothing emitted for a cancelled run"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert!(
+            session.benched_seats.is_empty(),
+            "no bench written on a terminal run"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[0].status, UnitStatus::Pending);
+        assert!(units[0].denial.is_none() && units[0].assigned_cli.is_none());
+    }
+}
