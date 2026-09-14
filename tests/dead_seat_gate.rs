@@ -297,7 +297,13 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
     no_session_failed(&evs, sid);
 
     let status = core
-        .confirm_gate(sid, HumanDecision::Approve { amend: None })
+        .confirm_gate(
+            sid,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
         .expect("approve");
     assert_ne!(status, SessionStatus::Failed);
     let post = collect_until(&ev, Duration::from_secs(15), |e| {
