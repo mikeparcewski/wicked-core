@@ -601,9 +601,31 @@ fn checkpoint_wals(
     }
 }
 
+/// `dataUsed.files` names each path ONCE, in first-seen order: an ACP seat repeats a call's
+/// `locations` across its frames (and a unit reads the same file many times), and the wire used to
+/// carry every repeat (review of #524, finding 2).
+fn distinct_files(files: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    files
+        .iter()
+        .filter(|f| seen.insert(f.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod wal_checkpoint_tests {
     use super::*;
+
+    #[test]
+    fn data_used_files_are_emitted_once_per_path_in_first_seen_order() {
+        let files = ["b.rs", "a.rs", "b.rs", "a.rs", "c.rs"].map(String::from);
+        assert_eq!(
+            distinct_files(&files),
+            ["b.rs", "a.rs", "c.rs"].map(String::from)
+        );
+        assert!(distinct_files(&[]).is_empty());
+    }
 
     /// Perf #5: the idle-tick helper must empty all three actor-owned WALs via the actor's own
     /// connections and leave every store readable. (The `recv_timeout` wiring above is exercised
@@ -4309,7 +4331,7 @@ fn apply_step_result(
             CoreEvent::DataUsed {
                 session: run_id.clone(),
                 ord,
-                files: output.files.clone(),
+                files: distinct_files(&output.files),
             },
         );
     }
