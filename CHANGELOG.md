@@ -1351,6 +1351,17 @@ Two release tracks share this file, newest entry first regardless of track:
   steer on the read-only cursor, the shape #465 reported, kept as the default by ruling (BC-04: the
   studio sends `creator` whenever the cursor is not a creator). The `scope` token renders on the
   wire for all three arms (`cursor` | `creator` | `request_changes`).
+- **Campaigns gain `denial_gate: hold | auto_reject` — an unattended campaign no longer parks forever
+  at the engine's escalation gate (DES-L1 PR-1D; core #484).** `CampaignDef` gains the additive
+  `denial_gate` (absent ⇒ `hold`, today). Under `auto_reject`, when a node's run pauses,
+  `on_node_awaiting` reads the run's DURABLE open gate row (`interaction_requests.gate_kind`) — never
+  the prompt's wording — and answers an `escalation` gate (a denied unit) with Reject through the same
+  `actor::confirm_gate` arm an operator's Reject takes (D-2: cancel): `campaignNodeAwaitingHuman` is
+  disclosed first, the run cancels, the node reconciles to `Cancelled` and its dependents follow the
+  `OnSuccess` edge rule. Def-, run-level and deliver gates HOLD under both policies — a gate the def or
+  the launch asked for is never answered for the operator. Real-engine test: `auto_reject` cancels
+  the escalation-gated node and holds the `human_confirm: all` node; `hold` parks both. core-ts
+  `launchCampaign` doc lists the field (snake_case wire).
 
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
