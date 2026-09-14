@@ -180,10 +180,14 @@ fn an_unregistered_state_home_entry_refuses_the_launch_at_intake_with_a_typed_co
     )
     .expect("register workflow");
 
-    // ── Refused at INTAKE: the live daemon's debris shape, plus a stray file. ──
+    // ── Refused at INTAKE: the live daemon's debris shape, a stray file, and a near-miss of a
+    // registered NAME (`chats-x` beside the registered `chats` — a name claim is exact, never a
+    // prefix). ──
     let debris = state_home.join("skills.fixture-debris-20260909");
     std::fs::create_dir_all(&debris).unwrap();
     std::fs::write(state_home.join("stray.txt"), "").unwrap();
+    let near_miss = state_home.join("chats-x");
+    std::fs::create_dir_all(&near_miss).unwrap();
     let err = core
         .launch_run(spec("intake-refused", "one-agent-unit"))
         .expect_err("an unregistered state-home entry refuses the launch synchronously");
@@ -197,6 +201,7 @@ fn an_unregistered_state_home_entry_refuses_the_launch_at_intake_with_a_typed_co
             .map(|u| (u.name.as_str(), u.level))
             .collect::<Vec<_>>(),
         vec![
+            ("chats-x", "state-home"),
             ("skills.fixture-debris-20260909", "state-home"),
             ("stray.txt", "state-home")
         ],
@@ -218,6 +223,7 @@ fn an_unregistered_state_home_entry_refuses_the_launch_at_intake_with_a_typed_co
     let text = err.to_string();
     for needle in [
         "configuration error",
+        "`chats-x`",
         "`skills.fixture-debris-20260909`",
         "`stray.txt`",
         "the run was not started",
@@ -259,11 +265,13 @@ fn an_unregistered_state_home_entry_refuses_the_launch_at_intake_with_a_typed_co
         "no worker ran — the launch never reached a unit"
     );
 
-    // ── Admitted: the same state home with the entries gone and the three env-placed names
-    // present (registered, so fenced — never a refusal). ──
+    // ── Admitted: the same state home with the entries gone and the registered names present —
+    // the two env-placed ones, the crew-placed `interactive` root, and the `chats` transcripts
+    // dir (registered, so fenced — never a refusal). ──
     std::fs::remove_dir_all(&debris).unwrap();
+    std::fs::remove_dir_all(&near_miss).unwrap();
     std::fs::remove_file(state_home.join("stray.txt")).unwrap();
-    for registered in ["workflows", "steering-inbox", "interactive"] {
+    for registered in ["workflows", "steering-inbox", "interactive", "chats"] {
         std::fs::create_dir_all(state_home.join(registered)).unwrap();
     }
     core.launch_run(spec("intake-admitted", "one-agent-unit"))

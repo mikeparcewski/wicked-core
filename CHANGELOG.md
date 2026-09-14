@@ -211,6 +211,20 @@ Two release tracks share this file, newest entry first regardless of track:
   clean-only, as before).
 
 ### Changed
+- **State-home registry: `chats` registered; `interactive` is a crew-placed root (the ONE fence
+  rule change of this RC — FIX-IT-ALL L10-5, core half).** wicked-crew persists chat transcripts
+  at `<state home>/chats/<id>.jsonl` (crew BC-33) and moves the interactive bridge's default docs
+  root and recorder browser under `<state home>/interactive/` (crew BC-49, D-L7-1 MOVE); both
+  would be refused by the intake fence as unregistered entries the moment crew creates them.
+  `tests/fixtures/state-home-subtrees.json` gains the `chats` entry (`kind: dir`, `owner: crew`,
+  `worker_read: none`), and the `interactive` entry drops its `env` field and names both crew
+  placements in `source` — `WICKED_INTERACTIVE_ROOT` may now name any path (the crew boot-refuse
+  row is crew's to delete, in the same crew release as its joins). The fence RULE SET changes once:
+  one new deny (`chats`); `env` is crew's boot-preflight classification, not a deny rule. Core's
+  survey is directory-driven, so the row is inert until crew's release creates the directory — the
+  crew copy of the fixture re-converges byte for byte when crew lands its halves. Tests:
+  `state_home_intake.rs` admits `chats/` and refuses `chats-x` (a name claim is exact, never a
+  prefix); the unit list names `chats`.
 - **A denied unit pauses at the escalation gate; it no longer fails the run (core#464, core#463
   item 3).** Three governed `bug` runs in one day (wicked-garden `e20a3ffb`, RC1 Phase 3 r3
   `dd5b8f54`, garden L4 `b5c2739d`) ended `unitDenied` → `sessionFailed` at their second unit:
