@@ -183,6 +183,7 @@ fn session_started_for<'a>(events: &'a [CoreEvent], session: &str) -> Vec<Sessio
 
 fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two.".into(),
         clis,
@@ -250,6 +251,7 @@ fn session_started_cli_count_matches_spec() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two.".into(),
         clis: vec![cli("a"), cli("b"), cli("c")],
@@ -284,6 +286,7 @@ fn session_started_entity_mode_is_serialized() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
         clis: vec![cli("a")],
@@ -311,6 +314,7 @@ fn session_started_entity_mode_is_serialized() {
     let ev2 = core2.subscribe();
     core2
         .launch_run(LaunchSpec {
+            base_ref: None,
             project_id: None,
             problem: "Do step one.".into(),
             clis: vec![cli("a")],
@@ -340,6 +344,7 @@ fn session_started_workflow_id_is_none_for_free_text() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one. Do step two.".into(),
         clis: vec![cli("a")],
@@ -400,6 +405,7 @@ fn unit_planned_role_and_gate_from_phase_def() {
 
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Build the feature then review it.".into(),
         clis: vec![cli("a"), cli("b")],
@@ -478,6 +484,7 @@ fn unit_planned_skill_ref_and_has_validator_pin() {
 
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do the work.".into(),
         clis: vec![cli("a")],
@@ -551,6 +558,7 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
 
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Run the test suite.".into(),
         clis: vec![cli("a")],
@@ -602,6 +610,7 @@ fn unit_planned_free_text_defaults() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
         clis: vec![cli("a")],
@@ -652,6 +661,7 @@ fn unit_distributed_council_routing_carries_agreement_fields() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
         clis: vec![cli("a"), cli("b")],
@@ -723,6 +733,7 @@ fn unit_distributed_evaluator_distinct_routing() {
 
     // A problem whose sentence keywords classify as Build + Review stages.
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Build the auth feature. Then review it for security issues.".into(),
         clis: vec![cli("a"), cli("b")],
@@ -785,6 +796,7 @@ fn unit_distributed_degraded_routing_carries_reason() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
         clis: vec![cli("a"), cli("b")],
@@ -908,6 +920,7 @@ fn workflow_selected_fires_for_structured_run_only() {
 
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Build then review it.".into(),
         clis: vec![cli("a")],
@@ -1087,6 +1100,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
     );
     let ev = core.subscribe();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do the work.".into(),
         clis: vec![cli("a")],
@@ -1188,6 +1202,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
     let ev2 = core2.subscribe();
     core2
         .launch_run(LaunchSpec {
+            base_ref: None,
             project_id: None,
             problem: "Do the work.".into(),
             clis: vec![cli("a")],

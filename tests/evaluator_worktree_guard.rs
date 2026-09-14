@@ -319,6 +319,7 @@ fn core_for(name: &str, verify: VerifyBehaviour) -> (Core, Arc<Mutex<Vec<String>
 
 fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Fix the bug in src/app.ts".into(),
         // Two seats, so evaluator ≠ creator has a distinct seat to route the evaluator onto.

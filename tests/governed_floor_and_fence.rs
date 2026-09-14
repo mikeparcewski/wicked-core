@@ -259,6 +259,7 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
     let ro_id = "r-w6-floor-ro";
     let launch = |id: &str, problem: &str| {
         core.launch_run(LaunchSpec {
+            base_ref: None,
             project_id: None,
             problem: problem.into(),
             clis: vec![cli("a"), cli("b")],

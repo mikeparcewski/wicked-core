@@ -48,6 +48,15 @@ export interface LaunchOptions {
   /** The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run. */
   repoRef?: string
   /**
+   * An EXPLICIT base for the run worktree (crew#550 `revisesPr`; wicked-core-ts ≥ 0.7.27): the
+   * name of a branch on `origin` — an open pull request's head — the run starts from instead of
+   * the remote default branch. Resolved after the engine's own `git fetch origin` as
+   * `origin/<baseRef>`; a ref that does not resolve FAILS the launch (`sessionFailed` naming it),
+   * never a silent fall-back to the default branch. The run still lives on `wicked/<run>`. Omit
+   * for today's resolution (the remote default tip, else the clone's `HEAD`).
+   */
+  baseRef?: string
+  /**
    * A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
    * is data-driven from the def's phases; omit for the free-text planner.
    */

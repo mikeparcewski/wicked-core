@@ -150,6 +150,7 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
     core.register_workflow(&def_json).unwrap();
 
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Do the thing.".into(),
         clis: vec![cli("stub")],
@@ -228,6 +229,7 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
 
     core.register_workflow(&def_json).unwrap();
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Run the tool.".into(),
         clis: vec![cli("stub")],

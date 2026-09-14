@@ -614,6 +614,13 @@ pub struct LaunchOptions {
     pub auto_deliver: Option<bool>,
     /// The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run.
     pub repo_ref: Option<String>,
+    /// An EXPLICIT base for the run worktree (crew#550 `revisesPr`; wicked-core-ts ≥ 0.7.27): the
+    /// name of a branch on `origin` — an open pull request's head — the run starts from instead of
+    /// the remote default branch. Resolved after the engine's own `git fetch origin` as
+    /// `origin/<baseRef>`; a ref that does not resolve FAILS the launch (`sessionFailed` naming it),
+    /// never a silent fall-back to the default branch. The run still lives on `wicked/<run>`. Omit
+    /// for today's resolution (the remote default tip, else the clone's `HEAD`).
+    pub base_ref: Option<String>,
     /// A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
     /// is data-driven from the def's phases; omit for the free-text planner.
     pub workflow: Option<String>,
@@ -665,6 +672,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         human_confirm: HumanConfirm::parse(o.human_confirm.as_deref()).map_err(err)?,
         auto_deliver: o.auto_deliver.unwrap_or(false),
         repo_ref: o.repo_ref,
+        base_ref: o.base_ref,
         workflow: o.workflow,
         project_id: o.project_id,
         extra_write_roots: o.extra_write_roots.unwrap_or_default(),

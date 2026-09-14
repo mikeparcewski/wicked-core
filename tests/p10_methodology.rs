@@ -123,6 +123,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
     )
     .expect("register the 2-phase def");
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Build the auth feature. Then review it for security".into(),
         clis: vec![cli("a"), cli("b")],

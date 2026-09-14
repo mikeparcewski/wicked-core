@@ -132,6 +132,7 @@ fn drain_settled(events: &std::sync::mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent
 
 fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
     LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Extract the rules.".into(),
         clis: vec![cli("stub")],

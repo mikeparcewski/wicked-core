@@ -10562,6 +10562,7 @@ mod project_graph_end_to_end_tests {
             .unwrap();
 
         let spec = |id: &str, pg: Option<crate::ProjectGraphBinding>| crate::LaunchSpec {
+            base_ref: None,
             project_id: None,
             problem: "Do the one task".into(),
             clis: vec![cli("a")],

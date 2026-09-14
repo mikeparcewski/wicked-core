@@ -753,6 +753,14 @@ impl PhaseDef {
         self.depends_on.push(dep.to_string());
         self
     }
+    /// Author this phase's own INSTRUCTIONS (FINDING-011's fold — `plan_from_def` appends them to
+    /// the unit description after a single-line separator). One line: the PTY runner submits a
+    /// newline as an early turn end, and the planner's fold test pins that no `\n` reaches the
+    /// prompt.
+    fn instructions(mut self, text: &str) -> Self {
+        self.instructions = Some(text.to_string());
+        self
+    }
     #[cfg_attr(not(test), allow(dead_code))]
     fn skill(mut self, skill_ref: &str, allowed: &[&str]) -> Self {
         self.skill_ref = Some(skill_ref.to_string());
@@ -1220,6 +1228,13 @@ pub fn feature_def() -> WorkflowDef {
 
 /// `bug` — triage(value) → reproduce(value) → fix(execution) → verify. Reproduce-first: `fix`
 /// depends on `reproduce`; a bug is not fixed until the repro goes red→green.
+/// The `bug` def's `fix` phase instructions (DES-L9, BC-60) — ONE line, folded onto the creator's
+/// prompt after ` ||| `. Crew's `BUILTIN_WORKFLOWS.bug` mirror carries the same literal and pins
+/// it in a unit test, so the two carriers cannot drift silently.
+pub const BUG_FIX_SWEEP_INSTRUCTIONS: &str = "Before finishing, sweep the repository for \
+consumers of any behaviour this fix retires or changes — tests, e2e gates, docs, comments, \
+CHANGELOG conventions — and update them or list each as a follow-up in your final output.";
+
 pub fn bug_def() -> WorkflowDef {
     WorkflowDef {
         base_skill_ref: None,
@@ -1234,6 +1249,11 @@ pub fn bug_def() -> WorkflowDef {
                 .codes()
                 .role(PhaseRole::Creator)
                 .evidence_floor()
+                // (DES-L9, BC-60; core#432 items 1-2, F-3R2-022) A fix that retires or changes a
+                // behaviour must sweep its consumers — the run that retired a redirect left the
+                // tests, e2e gate, docs and comments assuming it. Prompt text, carried as DATA on
+                // the phase (both carriers: this def and crew's mirror — pinned to one literal).
+                .instructions(BUG_FIX_SWEEP_INSTRUCTIONS)
                 .after("reproduce"),
             PhaseDef::new("verify", StageKind::Test)
                 .gate(
@@ -1660,6 +1680,49 @@ mod workflow_def_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// DES-L9 (BC-60, core#432 items 1-2): the `bug` def's `fix` phase carries the retired-behaviour
+    /// sweep as ONE line of `instructions` — the planner folds it onto the creator's prompt after the
+    /// single-line separator, no other phase gains text, and the literal is the one crew's mirror pins.
+    #[test]
+    fn bug_fix_carries_the_retired_behaviour_sweep_as_one_line_of_instructions() {
+        let def = bug_def();
+        let fix = def
+            .phases
+            .iter()
+            .find(|p| p.id == "fix")
+            .expect("bug has a fix phase");
+        assert_eq!(
+            fix.instructions.as_deref(),
+            Some(BUG_FIX_SWEEP_INSTRUCTIONS)
+        );
+        assert!(
+            !BUG_FIX_SWEEP_INSTRUCTIONS.contains('\n'),
+            "one line — the PTY runner submits a newline as an early turn end"
+        );
+        assert!(BUG_FIX_SWEEP_INSTRUCTIONS
+            .starts_with("Before finishing, sweep the repository for consumers of any behaviour"));
+        for p in def.phases.iter().filter(|p| p.id != "fix") {
+            assert!(
+                p.instructions.is_none(),
+                "{} keeps the historical prompt shape",
+                p.id
+            );
+        }
+        let units = crate::plan_from_def(&def, "500 on empty cart", "s");
+        let fix_unit = units
+            .iter()
+            .find(|u| u.description.starts_with("fix"))
+            .unwrap();
+        assert!(
+            fix_unit
+                .description
+                .contains(" ||| Before finishing, sweep the repository"),
+            "{}",
+            fix_unit.description
+        );
+        assert!(!fix_unit.description.contains('\n'));
     }
 
     #[test]

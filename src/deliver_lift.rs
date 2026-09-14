@@ -60,6 +60,17 @@ pub(crate) fn is_deliver_unit(unit: &crate::domain::WorkUnit) -> bool {
     unit.tool_cmd.is_some() && unit.phase_id() == Some(DELIVER_PHASE_ID)
 }
 
+/// The STRAND marker — crew's `DELIVER_LIFT_CONFLICT_MARKER` (`core/deliver.ts`), the exact
+/// substring crew's delivery index keys "failed → completed + `delivery: stranded`, post-hoc
+/// liftable" on. The engine's own [`LiftOutcome::Conflict`] refusal carries it ON PURPOSE, and
+/// the actor's deliver-refusal arm (DES-L9 F1) EXEMPTS any deliver failure carrying it — a strand
+/// keeps its terminal path; every other deliver refusal parks at an `escalation` gate.
+pub(crate) const LIFT_CONFLICT_MARKER: &str = "deliver: LIFT-CONFLICT";
+
+/// `UnitDenial.source` of a deliver unit the actor parked on a refusal (DES-L9 F1 arm). Rides
+/// the existing `unit.denial` shape — `UnitDenialSource` is open-ended on the wire.
+pub(crate) const DENIAL_SOURCE_DELIVER_REFUSAL: &str = "deliver_refusal";
+
 /// What the lift concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiftOutcome {
@@ -683,7 +694,7 @@ pub(crate) fn lift_and_reverify(
         }
         LiftOutcome::Conflict => {
             return Err(format!(
-                "deliver: LIFT-CONFLICT — lifting the run's work onto {base_ref} ({tip}) would \
+                "{LIFT_CONFLICT_MARKER} — lifting the run's work onto {base_ref} ({tip}) would \
                  conflict in: {}. The worktree was left exactly as verified (base {}); nothing was \
                  rebased and nothing was pushed. Resolve on the branch (rebase onto {base_ref}, \
                  regenerate any generated files, re-run the repository's checks) and approve to \

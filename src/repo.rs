@@ -675,7 +675,7 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
 /// `master` of the operator's real clone. A cwd is not a boundary; the worktree is, so its existence
 /// has to be verified rather than inferred from a stat.
 pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf> {
-    create_worktree_based(repo_root, run_id).map(|(wt, _)| wt)
+    create_worktree_based(repo_root, run_id, None).map(|(wt, _)| wt)
 }
 
 /// How a freshly minted run worktree's BASE commit was chosen (core#431, F-3R2-013).
@@ -736,13 +736,42 @@ impl RunBase {
 }
 
 /// Decide the base commit for a new run worktree of `repo_root` — see [`RunBase`].
-fn resolve_run_base(repo_root: &str) -> anyhow::Result<RunBase> {
+///
+/// `explicit` (DES-L9 / crew#550 `revisesPr`, BC-59) names a branch on `origin` the run must start
+/// from — an open pull request's head. It is resolved AFTER the fetch as `origin/<explicit>` and
+/// is never fallen back from: a ref that does not resolve is an `Err` naming it (the launch fails
+/// `WorktreeFailed` → `sessionFailed`), because basing a revision on the default branch instead
+/// would ship a DUPLICATE pull request. `None` ⇒ the remote-default resolution below.
+fn resolve_run_base(repo_root: &str, explicit: Option<&str>) -> anyhow::Result<RunBase> {
     let (ok, head, err) = git(repo_root, &["rev-parse", "HEAD"])?;
     if !ok || head.is_empty() {
         anyhow::bail!("{repo_root}: cannot resolve HEAD: {err}");
     }
+    if let Some(name) = explicit {
+        // A ref NAME, not a revision expression: no whitespace, no `..`, no leading `-` (git would
+        // read it as an option), non-empty. `origin/` is prefixed below, so `HEAD`/`@` cannot
+        // alias anything either.
+        let bad = name.is_empty()
+            || name.starts_with('-')
+            || name.contains("..")
+            || name
+                .chars()
+                .any(|c| c.is_whitespace() || c == ':' || c == '^' || c == '~');
+        if bad {
+            anyhow::bail!(
+                "the launch named {name:?} as the run's base, which is not a branch name — a \
+                 revision base is the head branch of an open pull request (`wicked/<run>`)"
+            );
+        }
+    }
     let (has_origin, _, _) = git(repo_root, &["remote", "get-url", "origin"])?;
     if !has_origin {
+        if let Some(name) = explicit {
+            anyhow::bail!(
+                "the launch named origin/{name} as the run's base but the registered clone has no \
+                 `origin` remote — a revision run needs the remote the pull request lives on"
+            );
+        }
         return Ok(RunBase::from_head(
             &head,
             false,
@@ -754,6 +783,52 @@ fn resolve_run_base(repo_root: &str) -> anyhow::Result<RunBase> {
         Ok(()) => (true, None),
         Err(e) => (false, Some(format!("`git fetch origin` failed ({e})"))),
     };
+    if let Some(name) = explicit {
+        // EXPLICIT BASE — the open PR's head branch. `origin/<name>` must resolve after the fetch;
+        // `behind: 0` / `lifted: false` by definition (nothing was compared against the default
+        // branch — the run base IS the named tip). The deliver lift later takes its Skipped arm
+        // for a branch carrying its own history (`deliver_lift.rs`), and the deliver script pushes
+        // the run's commits onto that branch instead of opening a second PR.
+        let base_ref = format!("origin/{name}");
+        let (ok, tip, err) = git(
+            repo_root,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("{base_ref}^{{commit}}"),
+            ],
+        )?;
+        if !ok || tip.is_empty() {
+            let fetch = match &fetch_note {
+                Some(f) => format!("; {f}"),
+                None => String::new(),
+            };
+            anyhow::bail!(
+                "{base_ref} does not resolve after `git fetch origin`{fetch}{} — fetch that branch \
+                 into the registered clone (a --single-branch clone has no {base_ref}) or re-clone; \
+                 the launch named it as the run's base (revises a pull request)",
+                if err.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", err.trim())
+                }
+            );
+        }
+        let note = format!(
+            "explicit base — the launch named {base_ref} (revises a pull request){}",
+            fetch_note.map(|f| format!("; {f}")).unwrap_or_default()
+        );
+        return Ok(RunBase {
+            base_ref: Some(base_ref),
+            commit: tip,
+            local_head: head,
+            behind: 0,
+            fetched,
+            lifted: false,
+            note: Some(note),
+        });
+    }
     let Some(base_ref) = crate::deliver_lift::resolve_remote_default(root) else {
         let mut note = "no remote default ref (origin/HEAD, origin/main) — the run starts from \
                         the clone's HEAD"
@@ -827,9 +902,15 @@ fn resolve_run_base(repo_root: &str) -> anyhow::Result<RunBase> {
 
 /// [`create_worktree`], also reporting HOW the base was chosen — `Some(RunBase)` for a freshly
 /// minted worktree, `None` when a live worktree was reused (a genuine resume keeps its history).
+///
+/// `base_ref` (DES-L9 / crew#550): an EXPLICIT branch on `origin` to base a FRESH worktree on
+/// (an open pull request's head) — see [`resolve_run_base`]; `None` keeps the remote-default
+/// resolution. A live worktree reused for a resume keeps its history regardless (flagged: a
+/// reaped-and-re-minted tree re-bases from scratch, like every run).
 pub fn create_worktree_based(
     repo_root: &str,
     run_id: &str,
+    base_ref: Option<&str>,
 ) -> anyhow::Result<(PathBuf, Option<RunBase>)> {
     let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
@@ -880,7 +961,7 @@ pub fn create_worktree_based(
     // core#431 (F-3R2-013): the base is the remote default branch's CURRENT tip when the clone
     // is behind it — the worker starts from the code that is actually on `main`, so the deliver
     // lift has nothing to move and cannot conflict on what landed while the run was queued.
-    let base = resolve_run_base(repo_root)?;
+    let base = resolve_run_base(repo_root, base_ref)?;
     eprintln!(
         "wicked-core: run {run_id} worktree based on {} ({}){}{}",
         base.base_ref.as_deref().unwrap_or("HEAD"),
@@ -2165,7 +2246,8 @@ mod tests {
             "premise: the clone is stale"
         );
 
-        let (wt, resolved) = create_worktree_based(clone.to_str().unwrap(), "r-stale").unwrap();
+        let (wt, resolved) =
+            create_worktree_based(clone.to_str().unwrap(), "r-stale", None).unwrap();
         let resolved = resolved.expect("a freshly minted worktree reports its base");
         assert!(resolved.fetched, "{resolved:?}");
         assert_eq!(resolved.base_ref.as_deref(), Some("origin/main"));
@@ -2213,7 +2295,7 @@ mod tests {
         sh(&clone, &["add", "-A"]);
         sh(&clone, &["commit", "-qm", "local unpushed"]);
         let ahead = sh(&clone, &["rev-parse", "HEAD"]);
-        let (wt2, r2) = create_worktree_based(clone.to_str().unwrap(), "r-ahead").unwrap();
+        let (wt2, r2) = create_worktree_based(clone.to_str().unwrap(), "r-ahead", None).unwrap();
         let r2 = r2.unwrap();
         assert!(!r2.lifted && r2.behind == 0, "{r2:?}");
         assert_eq!(r2.commit, ahead);
@@ -2234,13 +2316,184 @@ mod tests {
         std::fs::write(lone.join("a.txt"), "a\n").unwrap();
         sh(&lone, &["add", "-A"]);
         sh(&lone, &["commit", "-qm", "base"]);
-        let (_, r3) = create_worktree_based(lone.to_str().unwrap(), "r-lone").unwrap();
+        let (_, r3) = create_worktree_based(lone.to_str().unwrap(), "r-lone", None).unwrap();
         let r3 = r3.unwrap();
         assert!(r3.base_ref.is_none() && !r3.lifted && !r3.fetched, "{r3:?}");
         assert!(r3
             .note
             .as_deref()
             .is_some_and(|n| n.contains("no `origin` remote")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// DES-L9 / crew#550 (BC-59): an EXPLICIT base names `origin/<branch>` — an open pull request's
+    /// head — and a fresh worktree is minted from THAT tip: `base_ref` is the named ref, `lifted:
+    /// false`, `behind: 0`, the note says so, the tree holds the PR's file, and the run still lives
+    /// on its own `wicked/<run>` branch. A ref that does not resolve is an `Err` NAMING it and
+    /// mints nothing — never a silent fall-back to the default branch (that would push a duplicate
+    /// PR); so is a value that is not a branch name, and a clone with no `origin` at all.
+    #[test]
+    fn an_explicit_base_mints_from_the_named_origin_branch_or_refuses_by_name() {
+        fn sh(cwd: &Path, args: &[&str]) -> String {
+            // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        fn identity(repo: &Path) {
+            sh(repo, &["config", "user.email", "t@example.invalid"]);
+            sh(repo, &["config", "user.name", "t"]);
+            sh(repo, &["config", "commit.gpgsign", "false"]);
+            sh(repo, &["config", "core.autocrlf", "false"]);
+        }
+        let base = std::env::temp_dir().join(format!(
+            "wicked-core-revbase-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        sh(&seed, &["init", "-q", "-b", "main", "."]);
+        identity(&seed);
+        std::fs::write(seed.join("a.txt"), "a\n").unwrap();
+        sh(&seed, &["add", "-A"]);
+        sh(&seed, &["commit", "-qm", "base"]);
+        let origin = base.join("origin.git");
+        sh(
+            &base,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        sh(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        let clone = base.join("clone");
+        sh(
+            &base,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        identity(&clone);
+        let main_tip = sh(&clone, &["rev-parse", "HEAD"]);
+        // A prior run's PR branch lands on origin from elsewhere: one commit on top of main.
+        let other = base.join("other");
+        sh(
+            &base,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        identity(&other);
+        sh(&other, &["checkout", "-q", "-b", "wicked/prior-run"]);
+        std::fs::write(other.join("pr.txt"), "the prior run's fix\n").unwrap();
+        sh(&other, &["add", "-A"]);
+        sh(&other, &["commit", "-qm", "prior run"]);
+        sh(&other, &["push", "-q", "origin", "wicked/prior-run"]);
+        let pr_head = sh(&other, &["rev-parse", "HEAD"]);
+        assert_ne!(pr_head, main_tip);
+
+        // The revision run: based on the PR head, on its own run branch.
+        let (wt, resolved) =
+            create_worktree_based(clone.to_str().unwrap(), "r-rev", Some("wicked/prior-run"))
+                .unwrap();
+        let r = resolved.expect("a freshly minted worktree reports its base");
+        assert_eq!(r.base_ref.as_deref(), Some("origin/wicked/prior-run"));
+        assert_eq!(r.commit, pr_head, "the base IS the PR head");
+        assert!(r.fetched && !r.lifted && r.behind == 0, "{r:?}");
+        assert!(
+            r.note
+                .as_deref()
+                .is_some_and(|n| n.contains("explicit base")
+                    && n.contains("origin/wicked/prior-run")
+                    && n.contains("revises a pull request")),
+            "{:?}",
+            r.note
+        );
+        assert_eq!(sh(&wt, &["rev-parse", "HEAD"]), pr_head);
+        assert_eq!(
+            sh(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "wicked/r-rev",
+            "the run keeps its own branch; only the base changes"
+        );
+        assert!(wt.join("pr.txt").exists(), "the PR's work is in the tree");
+        // The clone's own checkout is untouched.
+        assert_eq!(sh(&clone, &["rev-parse", "HEAD"]), main_tip);
+        match r.to_event("r-rev") {
+            crate::event::CoreEvent::RunBaseResolved {
+                base_ref,
+                base_commit,
+                behind,
+                lifted,
+                run_branch,
+                ..
+            } => {
+                assert_eq!(base_ref.as_deref(), Some("origin/wicked/prior-run"));
+                assert_eq!(base_commit, pr_head);
+                assert_eq!((behind, lifted), (0, false));
+                assert_eq!(run_branch, "wicked/r-rev");
+            }
+            other => panic!("expected runBaseResolved, got {other:?}"),
+        }
+
+        // A ref origin does not have: refused BY NAME, nothing minted, no fall-back to main.
+        let err = create_worktree_based(clone.to_str().unwrap(), "r-gone", Some("wicked/no-such"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("origin/wicked/no-such does not resolve after `git fetch origin`")
+                && err.contains("--single-branch")
+                && err.contains("revises a pull request"),
+            "{err}"
+        );
+        assert!(
+            !worktree_path(clone.to_str().unwrap(), "r-gone").exists(),
+            "a refused base mints no worktree"
+        );
+        // Not a branch name at all: refused before any git call names it.
+        for bad in ["", "-x", "a..b", "a b", "x^", "y~1", "a:b"] {
+            let err = create_worktree_based(clone.to_str().unwrap(), "r-bad", Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a branch name"), "{bad:?}: {err}");
+        }
+
+        // No `origin` at all: an explicit base cannot be honoured — refused, not ignored.
+        let lone = base.join("lone");
+        std::fs::create_dir_all(&lone).unwrap();
+        sh(&lone, &["init", "-q", "-b", "main", "."]);
+        identity(&lone);
+        std::fs::write(lone.join("a.txt"), "a\n").unwrap();
+        sh(&lone, &["add", "-A"]);
+        sh(&lone, &["commit", "-qm", "base"]);
+        let err = create_worktree_based(lone.to_str().unwrap(), "r-lone", Some("wicked/x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no `origin` remote"), "{err}");
+        // …and `None` keeps today's resolution on the same clone.
+        let (_, today) = create_worktree_based(lone.to_str().unwrap(), "r-today", None).unwrap();
+        assert!(today.unwrap().base_ref.is_none());
         let _ = std::fs::remove_dir_all(&base);
     }
 
