@@ -1358,8 +1358,12 @@ Two release tracks share this file, newest entry first regardless of track:
   the prompt's wording — and answers an `escalation` gate (a denied unit) with Reject through the same
   `actor::confirm_gate` arm an operator's Reject takes (D-2: cancel): `campaignNodeAwaitingHuman` is
   disclosed first, the run cancels, the node reconciles to `Cancelled` and its dependents follow the
-  `OnSuccess` edge rule. Def-, run-level and deliver gates HOLD under both policies — a gate the def or
-  the launch asked for is never answered for the operator. Real-engine test: `auto_reject` cancels
+  `OnSuccess` edge rule. "Escalation" is EVERY `escalate_denied_unit` class — a verdict, floor or
+  boundary denial AND the dead-seat gate (a quota-exhausted seat cancels the node under `auto_reject`
+  instead of waiting for a reassign). Def-, run-level and deliver gates HOLD under both policies — a
+  gate the def or the launch asked for is never answered for the operator. Campaign NODES only: a
+  single run (crew's interactive chat/draft/demo/edit subscribers included) still parks as today.
+  Real-engine test: `auto_reject` cancels
   the escalation-gated node and holds the `human_confirm: all` node; `hold` parks both. core-ts
   `launchCampaign` doc lists the field (snake_case wire).
 

@@ -134,8 +134,10 @@ pub enum FailurePolicy {
 /// The static definition of a campaign — validated + persisted verbatim inside the live [`Campaign`]
 /// so a resume can reconstruct nodes/edges/policy/cap without a second store.
 /// (DES-L1 PR-1D, core#484) What an UNATTENDED campaign does when a node's run parks at the
-/// engine's ESCALATION gate (a denied unit — `gateEscalated`, `awaitingHuman{gateKind:
-/// "escalation"}`): `hold` = today, the node waits for a human (`campaignNodeAwaitingHuman`);
+/// engine's ESCALATION gate (`gateEscalated`, `awaitingHuman{gateKind: "escalation"}` — EVERY
+/// `escalate_denied_unit` class: a verdict / floor / boundary denial AND the dead-seat gate, so
+/// under `auto_reject` a quota-exhausted seat cancels the node instead of waiting for a reassign):
+/// `hold` = today, the node waits for a human (`campaignNodeAwaitingHuman`);
 /// `auto_reject` = the campaign answers the gate itself with Reject — the run cancels, the node
 /// reconciles to `Cancelled` and its dependents follow the `OnSuccess` edge rule. Def- and
 /// run-level human gates (`gateKind: "def" | "run_level" | "deliver" | …`) HOLD under both — a
