@@ -15,6 +15,18 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Governed grounding recognises the `wicked-garden` launcher + more shim spellings (#463 §7.3,
+  #474); Evaluator prompts carry the engine-owned VERDICT line (L1↔L4 contract).** The estate fence
+  classified the shim only when it was spawned as a python/sh script; garden's own launcher —
+  `wicked-garden run|python <script>`, directly or via `node <…/wicked-garden.mjs>` / `npx` — fell
+  through to ALLOW with no `--readonly`/store-pin check. `executed_estate_shim` now looks through the
+  launcher's mandatory `run`/`python` verb, and `script_path` collapses `//` and strips leading
+  `./`, and a `mem` backend run by basename after a `cd scripts` is recognised by its module stem —
+  so all three spellings are held to the same read-only + pinned-store rule. Separately, the
+  engine now appends one pinned 159-byte `EVALUATOR_VERDICT_CONVENTION` line to every Evaluator-role
+  work unit's prompt (all `SkillForm`s, both carriers; never to a creator, neutral, tool-command, or
+  engine-internal unit), so a seat whose garden skill text is not loaded still emits the verdict
+  shape the acceptance fold parses.
 - **Every seat with a published generation is handed the launcher (`SkillsDelivery::LauncherOnly`,
   D1 / DES-L4 PR-⑤).** A seat with no skills lever — codex under the inherit-operator-config hatch,
   copilot with no view, or a CLI with no lever at all (agy) — was handed `SkillsDelivery::None`, so

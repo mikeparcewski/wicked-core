@@ -48,6 +48,17 @@ pub const PROMPT_CONVENTION: &str = " ||| CONVENTION (external transformations):
      confidence=<known|needs-research> :: <the transformation logic as you understand it; \
      when unsure, use confidence=needs-research and state what needs human research>";
 
+/// The evaluator VERDICT contract line (L1↔L4 cross-lane contract; des-adjudicated §4.1). Appended
+/// by `execute_wrapped::skill_prompt` to EVERY Evaluator-role work unit's prompt (all three
+/// `SkillForm`s, both carriers) and to no other role, so a seat whose garden skill text is not loaded
+/// (`SkillForm::Unloaded`) still knows the one output shape L1's fold parses. SINGLE-LINE by the same
+/// pty contract as `PROMPT_CONVENTION`. Pinned byte-for-byte at 159 bytes: L1's parser reads the LAST
+/// line whose first token normalises to `VERDICT`, PASS only → pass, everything else → FAIL into the
+/// human gate — the words here must match what that parser is written against.
+pub const EVALUATOR_VERDICT_CONVENTION: &str = " ||| VERDICT (evaluator unit): make the LAST line \
+     of your output exactly VERDICT: PASS or VERDICT: FAIL, findings above it; no verdict line = \
+     FAIL (human gate)";
+
 /// Parse every external-transform marker in `output` (bounded). Lines that carry the
 /// marker but not the full grammar are captured as needs-research placeholders rather
 /// than dropped — a half-written assumption is still a signal a human should see.
@@ -180,5 +191,22 @@ mod tests {
         let flood = "ASSUMPTION[external-transform] library=a transform=b confidence=known :: c\n"
             .repeat(50);
         assert_eq!(parse(&flood).len(), MAX_MARKERS);
+    }
+
+    /// L1↔L4 contract (des-adjudicated §4.1): the VERDICT convention is pinned byte-for-byte at
+    /// 159 bytes, single-line, so L1's fold parser reads the shape the engine actually appends.
+    /// Mutation: any wording drift here fails — the const is the contract, not prose.
+    #[test]
+    fn evaluator_verdict_convention_is_the_pinned_159_byte_line() {
+        assert_eq!(
+            EVALUATOR_VERDICT_CONVENTION,
+            " ||| VERDICT (evaluator unit): make the LAST line of your output exactly VERDICT: PASS \
+             or VERDICT: FAIL, findings above it; no verdict line = FAIL (human gate)"
+        );
+        assert_eq!(EVALUATOR_VERDICT_CONVENTION.len(), 159);
+        assert!(
+            !EVALUATOR_VERDICT_CONVENTION.contains('\n'),
+            "single-line by pty contract"
+        );
     }
 }
