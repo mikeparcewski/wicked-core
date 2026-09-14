@@ -301,13 +301,46 @@ pub struct JudgeRefusal {
     pub reason: String,
 }
 
+/// (DES-L1 PR-1B, core#465) WHERE an approve's amendment lands: on the unit at the cursor (today's
+/// behaviour, the default) or on the first CREATOR phase at/after the cursor — so an intake steer
+/// ("Implement X") reaches the phase that implements, not the triage that only reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AmendScope {
+    /// The unit at the cursor (the phase the gate paused before / re-runs).
+    #[default]
+    Cursor,
+    /// The first `PhaseRole::Creator` unit at or after the cursor; the cursor dispatches unamended.
+    Creator,
+}
+
+impl AmendScope {
+    /// The wire token (`amendScope` on the gate body / `unitReworkAmended.scope`).
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            AmendScope::Cursor => "cursor",
+            AmendScope::Creator => "creator",
+        }
+    }
+}
+
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`
-/// can carry an `amend` that is appended to the next unit's instruction (redirect the work).
+/// can carry an `amend` that is appended to a unit's instruction (redirect the work), and
+/// `RequestChanges` (DES-L1 PR-1B, core#459) sends a NOT-PASS review back to the creator phase with
+/// the reviewer's findings in context instead of retrying the same review or cancelling the run.
 #[derive(Debug, Clone)]
 pub enum HumanDecision {
-    /// Proceed; optionally inject an amendment into the next unit's instruction.
-    Approve { amend: Option<String> },
-    /// Stop the run here (treated as a cancellation).
+    /// Proceed; optionally inject an amendment into a unit's instruction (`amend_scope` says which).
+    Approve {
+        amend: Option<String>,
+        amend_scope: AmendScope,
+    },
+    /// Rewind the run to the most recent creator phase before the gated unit (or the cursor when it
+    /// IS a creator): that unit re-runs at a fresh attempt with the rejected review as prior
+    /// context and a bounded marker on its description; every unit from it on is re-armed.
+    /// `note` is the operator's own steer, appended to the findings. Errors when no creator
+    /// precedes the gated unit (approve = retry, or reject).
+    RequestChanges { note: Option<String> },
+    /// Stop the run here (treated as a cancellation). Unchanged (D-2).
     Reject,
 }
 
@@ -400,6 +433,32 @@ impl StepRunner for StubStepRunner {
             files: Vec::new(),
             tools: Vec::new(),
             governed: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod stub_output_tests {
+    use super::*;
+
+    /// DES-L1 §7 (14): the stub closes an Evaluator AGENT unit with the `VERDICT: PASS` line the
+    /// fold parses, and nothing else — a Creator, a Neutral and an Evaluator TOOL unit keep the
+    /// bare `stub-output for …` line.
+    #[test]
+    fn the_stub_answers_the_verdict_contract_for_evaluator_agent_units_only() {
+        let mut u = crate::domain::WorkUnit::pending("s:verify", "s", 4, "verify the fix");
+        u.role = PhaseRole::Evaluator;
+        assert_eq!(
+            stub_output(&u),
+            "stub-output for verify the fix\nVERDICT: PASS"
+        );
+        assert!(crate::validator::parse_evaluator_verdict(&stub_output(&u)).pass);
+        u.tool_cmd = Some(vec!["true".into()]);
+        assert_eq!(stub_output(&u), "stub-output for verify the fix");
+        for role in [PhaseRole::Creator, PhaseRole::Neutral] {
+            let mut u = crate::domain::WorkUnit::pending("s:fix", "s", 3, "fix it");
+            u.role = role;
+            assert_eq!(stub_output(&u), "stub-output for fix it");
         }
     }
 }

@@ -226,7 +226,13 @@ fn gate_prompt_is_durable_survives_restart_and_resolves_answered() {
 
         // Answer it from the fresh process — the run resumes and completes.
         let status = core
-            .confirm_gate("run-g", HumanDecision::Approve { amend: None })
+            .confirm_gate(
+                "run-g",
+                HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: Default::default(),
+                },
+            )
             .expect("confirm after restart");
         assert_eq!(status, SessionStatus::Executing);
         assert!(wait_status(&core, "run-g", SessionStatus::Completed));

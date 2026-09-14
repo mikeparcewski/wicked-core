@@ -555,7 +555,13 @@ fn seq_restart_child_approves_the_gate_in_a_fresh_process() {
     };
     let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
     let status = core
-        .confirm_gate(RESTART_RUN, HumanDecision::Approve { amend: None })
+        .confirm_gate(
+            RESTART_RUN,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
         .expect("approve the gate after the restart");
     assert_eq!(status, SessionStatus::Executing);
     wait_terminal(&core, RESTART_RUN);

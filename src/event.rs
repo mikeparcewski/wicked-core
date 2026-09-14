@@ -968,10 +968,16 @@ pub enum CoreEvent {
     UnitReworkAmended {
         session: String,
         ord: u32,
-        /// The raw amendment text supplied by the operator.
+        /// The raw amendment text supplied by the operator — for `request_changes`, the rejected
+        /// review's findings followed by the operator's note.
         amendment: String,
         /// The unit's description after the amendment was injected.
         updated_description: String,
+        /// (DES-L1 PR-1B) WHICH arm landed it: `cursor` (an approve's amendment on the cursor unit,
+        /// today's shape), `creator` (`amendScope: creator` — routed to the first creator phase at
+        /// or after the cursor), `request_changes` (the rewound creator; `ord` is that creator).
+        /// Additive.
+        scope: String,
     },
     /// (EVT-013) A worker's `ApplyStepResult` arrived and the output is ready to be gated. Fires
     /// after all terminal/idempotency/attempt guards pass, before the gate runs. `output_bytes` is
@@ -2108,12 +2114,14 @@ impl CoreEvent {
                 ord,
                 amendment,
                 updated_description,
+                scope,
             } => json!({
                 "type": "unitReworkAmended",
                 "session": session,
                 "ord": ord,
                 "amendment": amendment,
                 "updatedDescription": updated_description,
+                "scope": scope,
             }),
             CoreEvent::UnitOutputCaptured {
                 session,

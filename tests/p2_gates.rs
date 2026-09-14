@@ -169,7 +169,13 @@ fn gate_before_specific_unit_pauses_then_approve_resumes() {
 
     // Approve (no amendment) → resume → unit 2 runs → complete.
     let status = core
-        .confirm_gate("r", HumanDecision::Approve { amend: None })
+        .confirm_gate(
+            "r",
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
         .expect("confirm");
     assert_eq!(status, SessionStatus::Executing);
     assert!(
@@ -226,6 +232,7 @@ fn gate_all_pauses_each_unit_and_amend_redirects() {
         "r",
         HumanDecision::Approve {
             amend: Some("prioritise security".into()),
+            amend_scope: Default::default(),
         },
     )
     .expect("approve unit 1 with amend");
@@ -237,8 +244,14 @@ fn gate_all_pauses_each_unit_and_amend_redirects() {
         vec![0],
         "unit 1 ran (amended) before the unit-2 gate"
     );
-    core.confirm_gate("r", HumanDecision::Approve { amend: None })
-        .expect("approve unit 2");
+    core.confirm_gate(
+        "r",
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve unit 2");
     assert!(wait_status(&core, "r", SessionStatus::Completed));
     assert_eq!(ran_ix(&ran), vec![0, 1]);
 
@@ -263,8 +276,14 @@ fn cancel_run_terminates_a_paused_run() {
     assert_eq!(core.cancel_run("r").unwrap(), SessionStatus::Cancelled);
     // Confirming a cancelled (non-paused) run errors rather than silently resuming.
     assert!(
-        core.confirm_gate("r", HumanDecision::Approve { amend: None })
-            .is_err(),
+        core.confirm_gate(
+            "r",
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            }
+        )
+        .is_err(),
         "confirming a cancelled run must error"
     );
 }
@@ -285,8 +304,14 @@ fn t_d4_pre_unit_gate_approval_is_a_first_dispatch_not_rework() {
     assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
 
     // Approve → the cursor unit (ord 2) has NEVER run, so this is its FIRST dispatch: attempt stays 0.
-    core.confirm_gate("r", HumanDecision::Approve { amend: None })
-        .expect("confirm");
+    core.confirm_gate(
+        "r",
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("confirm");
     assert!(wait_status(&core, "r", SessionStatus::Completed));
 
     // Drain and keep only UnitDispatched, in order.

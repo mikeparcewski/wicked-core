@@ -1118,6 +1118,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
         "ura-sess",
         HumanDecision::Approve {
             amend: Some("use structured logging throughout".to_string()),
+            amend_scope: Default::default(),
         },
     )
     .expect("confirm with amendment");
@@ -1210,6 +1211,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
             "ura-empty-sess",
             HumanDecision::Approve {
                 amend: Some(String::new()),
+                amend_scope: Default::default(),
             },
         )
         .expect("confirm with empty amendment");

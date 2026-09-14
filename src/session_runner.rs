@@ -754,6 +754,8 @@ mod tests {
             repo_checks_floor: false,
             default_floor: false,
             repo_checks: None,
+            last_attempt: None,
+            rework_of: None,
             status: UnitStatus::Pending,
         }
     }

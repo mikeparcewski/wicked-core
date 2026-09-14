@@ -919,7 +919,10 @@ fn prompt_decision(prompt: &str) -> HumanDecision {
     let _ = std::io::stdin().lock().read_line(&mut line);
     match line.trim().chars().next() {
         Some('r') | Some('R') => HumanDecision::Reject,
-        _ => HumanDecision::Approve { amend: None },
+        _ => HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
     }
 }
 

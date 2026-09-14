@@ -478,8 +478,14 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
     );
 
     // Approve the human gate → the run completes.
-    core.confirm_gate("run-happy", HumanDecision::Approve { amend: None })
-        .expect("approve the domain-graph gate");
+    core.confirm_gate(
+        "run-happy",
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve the domain-graph gate");
     wait_status(&core, "run-happy", SessionStatus::Completed)
         .expect("approving the final gate completes the governed run");
 }

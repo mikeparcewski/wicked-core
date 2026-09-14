@@ -3953,17 +3953,21 @@ fn redrive_executing_sessions(
         let mut sess = s;
         // Skip any cursor unit that already completed before the crash (a crash between the unit-Done
         // write and the cursor-advance write) so we don't re-dispatch a Done unit → `Stale` wedge.
+        let mut advanced = false;
         while units
             .get(sess.unit_ix)
             .map(|u| u.status == crate::domain::UnitStatus::Done)
             .unwrap_or(false)
         {
             sess.unit_ix += 1;
-            sess.attempt = 0;
+            advanced = true;
         }
-        // Bump the attempt (findings #1 + #2/#3) and persist BEFORE dispatch (dispatch reads `attempt`
-        // from the store) so the re-dispatch mints a fresh idempotency key.
-        sess.attempt = sess.attempt.saturating_add(1);
+        // Mint a fresh idempotency key (findings #1 + #2/#3) and persist BEFORE dispatch (dispatch
+        // reads `attempt` from the store). (DES-L1 PR-1B) Keyed on the cursor unit's OWN history
+        // (`redrive_attempt`): a unit the crash interrupted moves past the key it was dispatched at,
+        // a unit the redrive advanced onto starts from its `last_attempt` — never a used key, and a
+        // never-run unit stays at 0.
+        sess.attempt = redrive_attempt(advanced, sess.attempt, units.get(sess.unit_ix));
         if let Err(e) = put_node(store, sess.to_node()) {
             emit_run_error(subscribers, &run_id, e);
             continue;
@@ -5138,9 +5142,11 @@ fn apply_step_result(
     if let Some(t) = &evidence.verified_tree {
         session.verified_tree = Some(t.clone());
     }
-    // Approved → advance the resume cursor past the unit we just applied.
+    // Approved → advance the resume cursor past the unit we just applied. (DES-L1 PR-1B) The next
+    // unit's attempt is ITS `next_attempt` — 0 on a first pass, `last_attempt + 1` for a unit a
+    // `request_changes` rewind re-armed — so the re-run never reuses a `(run, unit, attempt)` key.
     session.unit_ix = output.unit_ix + 1;
-    session.attempt = 0;
+    session.attempt = units.get(session.unit_ix).map(next_attempt).unwrap_or(0);
     put_node(store, session.to_node())?;
 
     // Advance: dispatch the next unit, pause at its human-confirm gate, or finalize.
@@ -5162,6 +5168,75 @@ fn apply_step_result(
             finalize_run(store, subscribers, runner, self_tx, &run_id)?;
             Ok(StepApplied::Finished)
         }
+    }
+}
+
+/// (DES-L1 PR-1B) The attempt a unit's NEXT dispatch mints — `last_attempt + 1`, or 0 for a unit
+/// that never folded — so a re-run after a `request_changes` rewind never reuses a
+/// `(run, unit, attempt)` key (the `task.dispatched` / phase-id wedge) and a never-run unit keeps
+/// "first dispatch is attempt 0".
+pub(crate) fn next_attempt(u: &crate::domain::WorkUnit) -> u32 {
+    u.last_attempt.map_or(0, |a| a.saturating_add(1))
+}
+
+/// (DES-L1 PR-1B) The attempt the crash redrive dispatches the cursor at. The unit the crash
+/// interrupted already emitted `task.dispatched` at `in_flight` (the persisted `session.attempt`),
+/// so its fresh key is `in_flight + 1` — and never below its own `next_attempt`; a cursor the
+/// redrive ADVANCED onto (past units that finished before the crash) was never dispatched at
+/// `in_flight`, so it mints from its own history alone (0 when never run).
+pub(crate) fn redrive_attempt(
+    advanced: bool,
+    in_flight: u32,
+    cursor: Option<&crate::domain::WorkUnit>,
+) -> u32 {
+    let own = cursor.map(next_attempt).unwrap_or(0);
+    if advanced {
+        own
+    } else {
+        in_flight.saturating_add(1).max(own)
+    }
+}
+
+/// (DES-L1 PR-1B, review H2) Upper bound of the single-line `request_changes` marker a rewound
+/// creator's description carries — the PTY carrier submits the whole prompt as one line under
+/// `PTY_PROMPT_LIMIT`, so the marker REPLACES its predecessor instead of growing per round; the
+/// full findings ride `unitReworkAmended.amendment` and the seat's prior-context block.
+pub(crate) const REWORK_MARKER_MAX: usize = 160;
+const REWORK_MARKER_PREFIX: &str = " (requested changes r";
+
+/// `description` with ` (requested changes r<round>: <head>)` as its LAST segment — a prior
+/// marker (from an earlier round) is replaced, whitespace in `head` is collapsed, and the marker
+/// is cut on a char boundary to fit [`REWORK_MARKER_MAX`] bytes. Newline-free by construction.
+pub(crate) fn apply_rework_marker(description: &str, round: u32, head: &str) -> String {
+    let base = match description.rfind(REWORK_MARKER_PREFIX) {
+        Some(ix) => &description[..ix],
+        None => description,
+    };
+    let lead = format!("{REWORK_MARKER_PREFIX}{round}: ");
+    let head = head.split_whitespace().collect::<Vec<_>>().join(" ");
+    let room = REWORK_MARKER_MAX.saturating_sub(lead.len() + 1);
+    let head = if head.len() <= room {
+        head
+    } else {
+        let mut cut = String::new();
+        for c in head.chars() {
+            if cut.len() + c.len_utf8() + '…'.len_utf8() > room {
+                break;
+            }
+            cut.push(c);
+        }
+        format!("{}…", cut.trim_end())
+    };
+    format!("{base}{lead}{head})")
+}
+
+/// The last `cap` chars of `s` (elision marked) — the rework context block's clip.
+fn tail_chars(s: &str, cap: usize) -> String {
+    let n = s.chars().count();
+    if n <= cap {
+        s.to_string()
+    } else {
+        format!("…{}", s.chars().skip(n - cap).collect::<String>())
     }
 }
 
@@ -5337,12 +5412,24 @@ fn denial_gate_prompt(
         // remains, so a plain retry re-runs the same refusal.
         "dead_seat" => {
             let cli = unit.assigned_cli.as_deref().unwrap_or("?");
-            format!(
-                "Unit {ord} ({cli}) failed on a dead seat: {}. Reassign the unit to a different \
-                 CLI (sign one in first if needed) and approve to retry, or reject to stop the \
-                 run{note}",
-                reason_head(reason)
-            )
+            if unit.last_attempt.is_none() {
+                // (des-adjudicated §4.7, L3 PR-3A's gate) The unit was NEVER seated — the launch
+                // found no eligible seat and provisionally assigned `cli` without dispatching —
+                // so nothing "failed": the lever is a sign-in (approve retries on the provisional
+                // seat), a reassign, or a reject.
+                format!(
+                    "Unit {ord} was never seated: {}. Sign a seat in, then approve to retry on \
+                     '{cli}', reassign to another seat, or reject{note}",
+                    reason_head(reason)
+                )
+            } else {
+                format!(
+                    "Unit {ord} ({cli}) failed on a dead seat: {}. Reassign the unit to a different \
+                     CLI (sign one in first if needed) and approve to retry, or reject to stop the \
+                     run{note}",
+                    reason_head(reason)
+                )
+            }
         }
         // (DES-L1 PR-1A) The generic verdict gate names its THREE arms — retry, request changes
         // (PR-1B: the review goes back to the creator phase with these findings in context), reject
@@ -6235,26 +6322,50 @@ fn dispatch_unit(
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
     // Single-pass: build both the worker's prior-output list and the EVT-007 context items
     // simultaneously via `unzip` — no intermediate Vec and no second store read.
-    let (prior_outputs, context_items): (Vec<PriorUnitOutput>, Vec<crate::event::InjectedContext>) =
-        units
+    let (mut prior_outputs, mut context_items): (
+        Vec<PriorUnitOutput>,
+        Vec<crate::event::InjectedContext>,
+    ) = units
+        .iter()
+        .filter_map(|u| {
+            let label = prior_context_label(unit, u, current_cli)?;
+            let output = crate::domain::get_work_output(store, &u.id)?;
+            let output_bytes = output.len();
+            Some((
+                PriorUnitOutput {
+                    label: label.clone(),
+                    output,
+                },
+                crate::event::InjectedContext {
+                    ord: u.ord,
+                    label,
+                    output_bytes,
+                },
+            ))
+        })
+        .unzip();
+    // (DES-L1 PR-1B) A creator re-run after `request_changes` is handed the REJECTED review it must
+    // address. That transcript is invisible to `get_work_output` (approved outputs only), so it rides
+    // here explicitly, labelled, through the same prior-context blocks (the ACP carrier's "CONTEXT
+    // (prior phases of this run)" today, the wrapped carrier's under L4 ⑥; the pty carrier passes no
+    // prior context — that seat sees the marker head + the operator's note on its description).
+    if let Some(e) = unit.rework_of {
+        if let Some(review) = units
             .iter()
-            .filter_map(|u| {
-                let label = prior_context_label(unit, u, current_cli)?;
-                let output = crate::domain::get_work_output(store, &u.id)?;
-                let output_bytes = output.len();
-                Some((
-                    PriorUnitOutput {
-                        label: label.clone(),
-                        output,
-                    },
-                    crate::event::InjectedContext {
-                        ord: u.ord,
-                        label,
-                        output_bytes,
-                    },
-                ))
-            })
-            .unzip();
+            .find(|u| u.ord == e)
+            .and_then(|r| crate::domain::get_unit_transcript(store, &r.id))
+            .and_then(|t| t.output)
+        {
+            let output = tail_chars(&review, 4096);
+            let label = format!("[review — unit {e} — requested changes]");
+            context_items.push(crate::event::InjectedContext {
+                ord: e,
+                label: label.clone(),
+                output_bytes: output.len(),
+            });
+            prior_outputs.push(PriorUnitOutput { label, output });
+        }
+    }
     // (EVT-007) Emit UnitContextInjected when prior outputs are being injected — a cross-CLI carry-over
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
@@ -7028,13 +7139,21 @@ pub(crate) fn confirm_gate(
     // DES-PROJECT-001 §5.3: the durable prompt resolves on the SAME command that resolves the
     // gate — `answered`, with the decision payload. This is what empties `/projects/:id/prompts`
     // the moment ANY skin answers. (The Reject arm still cancels below; the human DID answer.)
+    // (DES-L1 PR-1B) The payload names the ARM (`action`) beside the legacy `approve` bool.
     {
         let answer = match &decision {
-            crate::workflow::HumanDecision::Approve { amend } => {
-                serde_json::json!({ "approve": true, "amend": amend }).to_string()
-            }
+            crate::workflow::HumanDecision::Approve { amend, amend_scope } => serde_json::json!({
+                "approve": true, "action": "approve", "amend": amend,
+                "amend_scope": amend_scope.as_wire(),
+            })
+            .to_string(),
+            crate::workflow::HumanDecision::RequestChanges { note } => serde_json::json!({
+                "approve": false, "action": "request_changes", "amend": note,
+            })
+            .to_string(),
             crate::workflow::HumanDecision::Reject => {
-                serde_json::json!({ "approve": false, "amend": null }).to_string()
+                serde_json::json!({ "approve": false, "action": "reject", "amend": null })
+                    .to_string()
             }
         };
         crate::interaction::resolve_open_for_session(
@@ -7046,13 +7165,27 @@ pub(crate) fn confirm_gate(
         )?;
     }
 
-    match decision {
+    // (DES-L1 PR-1B) Three arms. Reject = cancel, unchanged (D-2). `RequestChanges` and `Approve`
+    // both pass the layer-3 boundary check below first; `rework` is `Some(note)` for the former.
+    let (amend, amend_scope, rework): (
+        Option<String>,
+        crate::workflow::AmendScope,
+        Option<Option<String>>,
+    ) = match decision {
         crate::workflow::HumanDecision::Reject => {
             let s = cancel_run(store, subscribers, runner, self_tx, run_id)?;
             in_flight.remove(run_id);
-            Ok(s)
+            return Ok(s);
         }
-        crate::workflow::HumanDecision::Approve { amend } => {
+        crate::workflow::HumanDecision::Approve { amend, amend_scope } => {
+            (amend, amend_scope, None)
+        }
+        crate::workflow::HumanDecision::RequestChanges { note } => {
+            (None, crate::workflow::AmendScope::Cursor, Some(note))
+        }
+    };
+    {
+        {
             // Layer-3: governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
             // Runs BEFORE any approval-side mutations so a Deny cancels cleanly (no partial state committed).
             // Without policies loaded (`wicked-core rules ingest`), select() returns empty and decide()
@@ -7096,28 +7229,67 @@ pub(crate) fn confirm_gate(
                     return result;
                 }
             }
-            // Optionally inject an amendment into the unit at the cursor (the gate is steering).
+            // (DES-L1 PR-1B) REQUEST CHANGES: rewind to the creator and re-dispatch it there.
+            if let Some(note) = rework {
+                return rewind_to_creator(
+                    store,
+                    subscribers,
+                    runner,
+                    self_tx,
+                    in_flight,
+                    session,
+                    run_id,
+                    note,
+                    lifecycle_maps,
+                    actor_maps,
+                    process_gen,
+                    is_acp,
+                );
+            }
+            // Optionally inject an amendment (the gate is steering) — into the unit at the cursor,
+            // or (DES-L1 PR-1B, core#465 `amendScope: creator`) into the first CREATOR phase at or
+            // after the cursor, so an intake steer lands on the phase that implements. IDEMPOTENT:
+            // a text the target already carries is not appended twice (the studio pre-fills every
+            // gate from the durable guidance note).
             if let Some(a) = amend {
                 if !a.is_empty() {
                     let mut units = crate::domain::session_units(store, run_id)?;
-                    if let Some(u) = units.get_mut(session.unit_ix) {
-                        u.description = format!("{} (operator amendment: {a})", u.description);
-                        put_node(store, u.to_node())?;
-                        // (EVT-012) UnitReworkAmended — the authoritative amendment paper trail.
-                        // Fires here (after persist, before Resumed) so the amendment text is
-                        // durable before any subscriber sees the run resume. Resumed alone carries
-                        // no amendment text; this event is the canonical record.
-                        emit(
-                            subscribers,
-                            CoreEvent::UnitReworkAmended {
-                                session: run_id.to_string(),
-                                ord: u.ord,
-                                // Move `a` — it is not used after this emit, avoiding an
-                                // unnecessary heap allocation (Gemini code review).
-                                amendment: a,
-                                updated_description: u.description.clone(),
-                            },
+                    let target_ix = match amend_scope {
+                        crate::workflow::AmendScope::Cursor => Some(session.unit_ix),
+                        crate::workflow::AmendScope::Creator => units
+                            .iter()
+                            .enumerate()
+                            .skip(session.unit_ix)
+                            .find(|(_, u)| u.role == crate::workflow::PhaseRole::Creator)
+                            .map(|(ix, _)| ix),
+                    };
+                    let Some(target_ix) = target_ix else {
+                        anyhow::bail!(
+                            "amendScope \"creator\": no creator phase at or after unit {} — \
+                             approve without a scope to amend the cursor unit",
+                            units.get(session.unit_ix).map(|u| u.ord).unwrap_or(0)
                         );
+                    };
+                    if let Some(u) = units.get_mut(target_ix) {
+                        let segment = format!(" (operator amendment: {a})");
+                        if !u.description.contains(&segment) {
+                            u.description.push_str(&segment);
+                            put_node(store, u.to_node())?;
+                            // (EVT-012) UnitReworkAmended — the authoritative amendment paper trail.
+                            // Fires here (after persist, before Resumed) so the amendment text is
+                            // durable before any subscriber sees the run resume. Resumed alone
+                            // carries no amendment text; this event is the canonical record.
+                            emit(
+                                subscribers,
+                                CoreEvent::UnitReworkAmended {
+                                    session: run_id.to_string(),
+                                    ord: u.ord,
+                                    amendment: a,
+                                    updated_description: u.description.clone(),
+                                    scope: amend_scope.as_wire().to_string(),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -7203,6 +7375,130 @@ pub(crate) fn confirm_gate(
                     Err(e)
                 }
             }
+        }
+    }
+}
+
+/// (DES-L1 PR-1B, core#459) REQUEST CHANGES: send a NOT-PASS review back to the creator. The
+/// target is the cursor when it IS a creator, else the most recent creator before the gated unit
+/// (`pipeline::most_recent_prior_creator`); none ⇒ error (approve = retry the review, or reject).
+/// READ FIRST (review L7) — the gated unit's `denial_reason` (the reviewer's findings) and ord —
+/// THEN one write batch: every unit from the target on loses its worktree baseline / mutation and
+/// its denial (a stale baseline would make the re-run evaluator restore the OLD tree, F-036), the
+/// target goes `Distributed` with `rework_of = <review ord>` (mirrors `resume_run_inner`), the units
+/// after it go `Pending`; the cursor moves to the target at `next_attempt(target)` (a fresh
+/// `(run, unit, attempt)` key), `verified_tree` is cleared (the tree will change), the run is
+/// `Executing`. The description carries only the bounded marker (H2); the full findings + note ride
+/// `unitReworkAmended{scope: request_changes}` and, at dispatch, the seat's prior-context block
+/// (`WorkUnit::rework_of`). Then `Resumed{ord: target}` → `dispatch_unit(target)`.
+#[allow(clippy::too_many_arguments)]
+fn rewind_to_creator(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    session: crate::domain::AgentSession,
+    run_id: &str,
+    note: Option<String>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
+    let mut units = crate::domain::session_units(store, run_id)?;
+    let cursor_ix = session.unit_ix;
+    let Some(cursor) = units.get(cursor_ix) else {
+        anyhow::bail!("run {run_id} has no unit at its cursor ({cursor_ix}) to send back");
+    };
+    let target_ix = if cursor.role == crate::workflow::PhaseRole::Creator {
+        cursor_ix
+    } else {
+        let creator_id = crate::pipeline::most_recent_prior_creator(&units, cursor.ord)
+            .map(|c| c.id.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no creator phase precedes unit {} — approve (retry) or reject",
+                    cursor.ord
+                )
+            })?;
+        units
+            .iter()
+            .position(|u| u.id == creator_id)
+            .expect("the selected creator is one of the run's units")
+    };
+    // READ FIRST: the findings and the reviewing ord, before the batch below clears them.
+    let review_ord = cursor.ord;
+    let findings = cursor.denial_reason.clone().unwrap_or_default();
+    let note = note.filter(|n| !n.trim().is_empty());
+    let round = next_attempt(&units[target_ix]);
+    let head = note.clone().unwrap_or_else(|| reason_head(&findings));
+    let amendment = match &note {
+        Some(n) => format!("{findings}\n{n}"),
+        None => findings.clone(),
+    };
+    let target_ord = units[target_ix].ord;
+    // ONE write batch over every unit from the target on.
+    for (ix, u) in units.iter_mut().enumerate().skip(target_ix) {
+        u.worktree_baseline = None;
+        u.worktree_mutation = None;
+        u.denial = None;
+        u.denial_reason = None;
+        if ix == target_ix {
+            u.status = crate::domain::UnitStatus::Distributed;
+            u.rework_of = Some(review_ord);
+            u.description = apply_rework_marker(&u.description, round, &head);
+        } else {
+            u.status = crate::domain::UnitStatus::Pending;
+            u.rework_of = None;
+        }
+        put_node(store, u.to_node())?;
+    }
+    let mut s = session;
+    s.unit_ix = target_ix;
+    s.attempt = round;
+    s.verified_tree = None;
+    s.status = SessionStatus::Executing;
+    put_node(store, s.to_node())?;
+    emit(
+        subscribers,
+        CoreEvent::UnitReworkAmended {
+            session: run_id.to_string(),
+            ord: target_ord,
+            amendment,
+            updated_description: units[target_ix].description.clone(),
+            scope: "request_changes".to_string(),
+        },
+    );
+    emit(
+        subscribers,
+        CoreEvent::Resumed {
+            session: run_id.to_string(),
+            ord: target_ord,
+        },
+    );
+    in_flight.insert(run_id.to_string());
+    match dispatch_unit(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        target_ix,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    ) {
+        Ok(true) => Ok(SessionStatus::Executing),
+        Ok(false) => {
+            in_flight.remove(run_id);
+            finalize_run(store, subscribers, runner, self_tx, run_id)?;
+            Ok(SessionStatus::Completed)
+        }
+        Err(e) => {
+            in_flight.remove(run_id);
+            Err(e)
         }
     }
 }
@@ -8038,6 +8334,16 @@ mod substance_gate_tests {
     /// has no worktree, so "worktree diff is empty" holds by construction and the substance
     /// decision rides entirely on the output's length (and the unit's role/governed flag).
     fn seed(store: &mut dyn GraphStore, run_id: &str, role: PhaseRole) {
+        seed_with(store, run_id, role, |_| {});
+    }
+
+    /// [`seed`] with a hook over the unit before it is persisted (its id/tool shape, floors).
+    fn seed_with(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        role: PhaseRole,
+        tweak: impl FnOnce(&mut WorkUnit),
+    ) {
         let session = AgentSession {
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
@@ -8067,6 +8373,7 @@ mod substance_gate_tests {
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
         u.role = role;
         u.status = UnitStatus::Distributed;
+        tweak(&mut u);
         put_node(store, u.to_node()).unwrap();
         // The orchestration workflow the Ok fold ticks (same shape `pre_distribute` registers) —
         // without it every fold that reaches `apply_and_finish_unit` errors "workflow not found".
@@ -8728,6 +9035,53 @@ mod substance_gate_tests {
         );
     }
 
+    /// L1↔L2 contract (review-L2-505 / DES-L2 §4): the deliver TOOL unit's repo-checks frame reads
+    /// `floor: "verify"` — it re-verifies the tree it ships — while an undeclared creator floor
+    /// still reads `creator`.
+    #[test]
+    fn the_deliver_units_repo_checks_frame_reads_the_verify_floor() {
+        let passed: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": true, "sandbox_level": "none"
+            }))
+            .unwrap();
+        let floor_of = |evs: &[CoreEvent]| {
+            evs.iter().find_map(|ev| match ev {
+                CoreEvent::RepoChecksEvaluated { floor, .. } => Some(floor.clone()),
+                _ => None,
+            })
+        };
+        // The deliver unit: a Tool unit whose phase id is `deliver` (crew's composed phase).
+        let run_id = format!("deliver-floor-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_with(&mut store, &run_id, PhaseRole::Neutral, |u| {
+            u.id = format!("{run_id}:deliver");
+            u.tool_cmd = Some(vec!["true".into()]);
+        });
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let evidence = crate::workflow::UnitEvidence {
+            repo_checks: Some(passed.clone()),
+            ..Default::default()
+        };
+        let _ = fold_with_evidence(&mut store, &mut subs, &run_id, "pushed", evidence);
+        assert_eq!(floor_of(&drain_events(&erx)).as_deref(), Some("verify"));
+        // Control: a creator with no declared verify floor keeps `creator`.
+        let run_id = format!("creator-floor-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let evidence = crate::workflow::UnitEvidence {
+            repo_checks: Some(passed),
+            ..Default::default()
+        };
+        let _ = fold_with_evidence(&mut store, &mut subs, &run_id, "built it", evidence);
+        assert_eq!(floor_of(&drain_events(&erx)).as_deref(), Some("creator"));
+    }
+
     /// The layer reads ONLY Evaluator agent units: a Creator whose prose quotes a `VERDICT: FAIL`
     /// line and an Evaluator TOOL unit (`tool_cmd`, no verdict) both complete with
     /// `evaluatorVerdict: null` — the same predicate as the prompt line (`skill_prompt`).
@@ -8777,6 +9131,352 @@ mod substance_gate_tests {
         );
         assert_eq!(unit.status, UnitStatus::Done);
         assert_eq!(evaluator_verdict_of(&drain_events(&erx)), Some(None));
+    }
+}
+
+/// DES-L1 PR-1B — the gate's decision arms: `request_changes` rewinds to the creator with the
+/// review's findings in context, `amendScope: creator` routes an intake steer to the phase that
+/// implements, attempts mint from each unit's own history. Driven through `confirm_gate` — the
+/// real command handler — over a seeded bug-shaped run (a `NoopRunner` stands in for the seat;
+/// the store and the event stream are what the tests read).
+#[cfg(test)]
+mod request_changes_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitDenial, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{
+        AmendScope, HumanDecision, PhaseRole, StepInput, StepOutput, StepRunner, StepStatus,
+    };
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    const FINDINGS: &str =
+        "the evaluator's verdict is FAIL\nthe regression test is missing\nVERDICT: FAIL";
+
+    /// A bug-shaped run: triage (Neutral) → reproduce (Neutral) → fix (Creator) → verify
+    /// (Evaluator). `at_verify`: the first three folded Done at attempt 0, verify Rejected at
+    /// attempt 0 with the reviewer's findings, cursor 3, `AwaitingHuman`, a verified tree on the
+    /// session. Otherwise: the intake gate — nothing has run, cursor 0, `AwaitingHuman`.
+    fn seed_bug(store: &mut dyn GraphStore, run_id: &str, at_verify: bool) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "fix the bug".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: if at_verify { 3 } else { 0 },
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: at_verify.then(|| "tree-a".to_string()),
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(store, session.to_node()).unwrap();
+        let phases = [
+            ("triage", PhaseRole::Neutral),
+            ("reproduce", PhaseRole::Neutral),
+            ("fix", PhaseRole::Creator),
+            ("verify", PhaseRole::Evaluator),
+        ];
+        for (ix, (phase, role)) in phases.iter().enumerate() {
+            let mut u = WorkUnit::pending(
+                format!("{run_id}:{phase}"),
+                run_id,
+                ix as u32 + 1,
+                format!("{phase} the bug"),
+            );
+            u.role = *role;
+            u.assigned_cli = Some("claude".into());
+            if at_verify {
+                u.last_attempt = Some(0);
+                if ix < 3 {
+                    u.status = UnitStatus::Done;
+                } else {
+                    u.status = UnitStatus::Rejected;
+                    u.denial_reason = Some(FINDINGS.into());
+                    u.denial = Some(UnitDenial::new("evaluator_verdict", FINDINGS));
+                }
+            }
+            put_node(store, u.to_node()).unwrap();
+        }
+    }
+
+    fn gate(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        decision: HumanDecision,
+    ) -> anyhow::Result<SessionStatus> {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate(
+            store,
+            subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            decision,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+    }
+
+    fn drain(erx: &std::sync::mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
+        std::iter::from_fn(|| erx.try_recv().ok()).collect()
+    }
+
+    /// DES §7 (8): `RequestChanges` at the verify gate rewinds to `fix` — cursor 3 → 2, fix
+    /// `Distributed` with `rework_of = 4` and the bounded marker, verify `Pending`, denials
+    /// cleared, the session's verified tree dropped, attempt = `next_attempt(fix)` = 1; the
+    /// events run `unitReworkAmended{ord 3, request_changes, findings + note}` → `resumed{3}` →
+    /// `unitDispatched{3, attempt 1}`.
+    #[test]
+    fn request_changes_rewinds_to_the_creator_and_re_dispatches_it_at_a_fresh_attempt() {
+        let run_id = format!("rc-rewind-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, true);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let status = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("add the regression test first".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!((session.unit_ix, session.attempt), (2, 1));
+        assert_eq!(
+            session.verified_tree, None,
+            "the tree will change — drop the certificate"
+        );
+        assert_eq!(session.status, SessionStatus::Executing);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let (fix, verify) = (&units[2], &units[3]);
+        assert_eq!(fix.status, UnitStatus::Distributed);
+        assert_eq!(fix.rework_of, Some(4));
+        assert!(fix.denial.is_none() && fix.denial_reason.is_none());
+        assert_eq!(
+            fix.description,
+            "fix the bug (requested changes r1: add the regression test first)"
+        );
+        assert_eq!(verify.status, UnitStatus::Pending);
+        assert!(verify.denial.is_none() && verify.denial_reason.is_none());
+        assert_eq!(verify.rework_of, None);
+        assert_eq!(
+            units[0].status,
+            UnitStatus::Done,
+            "units before the creator are untouched"
+        );
+
+        let evs = drain(&erx);
+        let pos = |pred: &dyn Fn(&CoreEvent) -> bool| evs.iter().position(pred);
+        let amended = pos(&|e| {
+            matches!(e, CoreEvent::UnitReworkAmended { ord: 3, scope, amendment, .. }
+                if scope == "request_changes"
+                    && amendment.contains("the regression test is missing")
+                    && amendment.ends_with("add the regression test first"))
+        })
+        .expect("unitReworkAmended on the creator with the findings + note");
+        let resumed = pos(&|e| matches!(e, CoreEvent::Resumed { ord: 3, .. })).expect("resumed{3}");
+        let dispatched = pos(&|e| {
+            matches!(
+                e,
+                CoreEvent::UnitDispatched {
+                    ord: 3,
+                    attempt: 1,
+                    ..
+                }
+            )
+        })
+        .expect("the creator re-dispatches at attempt 1");
+        assert!(amended < resumed && resumed < dispatched, "{evs:?}");
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::SessionFailed { .. } | CoreEvent::RunCancelled { .. }
+            )),
+            "request_changes never fails or cancels the run"
+        );
+    }
+
+    /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused
+    /// with the operator's remedy; nothing moves.
+    #[test]
+    fn request_changes_with_no_preceding_creator_is_refused_naming_the_remedy() {
+        let run_id = format!("rc-intake-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, false);
+        let mut subs = crate::event_log::EventSink::default();
+        let err = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges { note: None },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no creator phase precedes unit 1")
+                && err.contains("approve (retry) or reject"),
+            "{err}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (session.unit_ix, session.status),
+            (0, SessionStatus::AwaitingHuman)
+        );
+    }
+
+    /// DES §7 (13): `Approve{amend_scope: Creator}` at the intake gate lands the steer on `fix`,
+    /// not on the `triage` cursor (`scope: "creator"` on the wire), and the cursor dispatches
+    /// unamended; the SAME amendment offered again is not appended twice and emits nothing.
+    #[test]
+    fn approve_with_creator_scope_amends_the_first_creator_once() {
+        let run_id = format!("rc-scope-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let steer = || HumanDecision::Approve {
+            amend: Some("Implement X".into()),
+            amend_scope: AmendScope::Creator,
+        };
+        gate(&mut store, &mut subs, &run_id, steer()).unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[0].description, "triage the bug",
+            "the cursor dispatches unamended"
+        );
+        assert_eq!(
+            units[2].description,
+            "fix the bug (operator amendment: Implement X)"
+        );
+        let evs = drain(&erx);
+        assert!(evs.iter().any(|e| matches!(e, CoreEvent::UnitReworkAmended { ord: 3, scope, .. } if scope == "creator")));
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, CoreEvent::Resumed { ord: 1, .. })));
+
+        // Offered again at a later gate (the studio pre-fills every gate from the durable note).
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.status = SessionStatus::AwaitingHuman;
+        put_node(&mut store, session.to_node()).unwrap();
+        gate(&mut store, &mut subs, &run_id, steer()).unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[2].description,
+            "fix the bug (operator amendment: Implement X)"
+        );
+        assert!(
+            !drain(&erx)
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
+            "an identical amendment is not re-landed"
+        );
+    }
+
+    /// DES §7 (10), review H2: the marker REPLACES its predecessor — a second round leaves the
+    /// description no longer than the first — is single-line, whitespace-collapsed and bounded.
+    #[test]
+    fn the_rework_marker_is_bounded_single_line_and_replaces_its_predecessor() {
+        let once = apply_rework_marker("fix the bug", 1, "add  the\nregression test");
+        assert_eq!(
+            once,
+            "fix the bug (requested changes r1: add the regression test)"
+        );
+        let twice = apply_rework_marker(&once, 2, "the test still fails");
+        assert_eq!(
+            twice,
+            "fix the bug (requested changes r2: the test still fails)"
+        );
+        let long = apply_rework_marker("fix the bug", 3, &"finding ".repeat(60));
+        assert!(
+            long.len() <= "fix the bug".len() + REWORK_MARKER_MAX,
+            "{}",
+            long.len()
+        );
+        assert!(long.ends_with("…)") && !long.contains('\n'));
+        assert_eq!(long.matches("(requested changes r").count(), 1);
+    }
+
+    /// DES §7 (12): attempts mint from each unit's own history — the crash redrive moves past the
+    /// key the crash interrupted and never below `last_attempt + 1`; a cursor it advanced onto
+    /// starts from its own history (0 when never run).
+    #[test]
+    fn attempts_mint_from_the_units_own_history() {
+        let mut never = WorkUnit::pending("s:a", "s", 1, "a");
+        assert_eq!(next_attempt(&never), 0, "first dispatch is attempt 0");
+        never.last_attempt = Some(0);
+        assert_eq!(next_attempt(&never), 1);
+        let mut reworked = WorkUnit::pending("s:b", "s", 2, "b");
+        reworked.last_attempt = Some(3);
+        assert_eq!(
+            redrive_attempt(false, 1, Some(&reworked)),
+            4,
+            "never below last + 1"
+        );
+        assert_eq!(
+            redrive_attempt(false, 3, Some(&reworked)),
+            4,
+            "past the interrupted key"
+        );
+        assert_eq!(redrive_attempt(false, 0, None), 1);
+        assert_eq!(
+            redrive_attempt(true, 5, Some(&never)),
+            1,
+            "advanced: own history only"
+        );
+        let fresh = WorkUnit::pending("s:c", "s", 3, "c");
+        assert_eq!(redrive_attempt(true, 5, Some(&fresh)), 0);
     }
 }
 
@@ -12459,7 +13159,10 @@ mod phase_boundary_governance_tests {
             &tx,
             &mut in_flight,
             "r",
-            crate::workflow::HumanDecision::Approve { amend: None },
+            crate::workflow::HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
             &None,
             &None,
             uuid::Uuid::nil(),
@@ -12514,7 +13217,10 @@ mod phase_boundary_governance_tests {
             &tx,
             &mut in_flight,
             "r",
-            crate::workflow::HumanDecision::Approve { amend: None },
+            crate::workflow::HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
             &None,
             &None,
             uuid::Uuid::nil(),

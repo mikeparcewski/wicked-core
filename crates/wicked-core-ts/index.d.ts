@@ -218,10 +218,18 @@ export declare class Core {
   resumeRun(runId: string): Promise<string>
   /**
    * Resolve a human-confirm gate on a PAUSED run. `approve=true` proceeds (optionally applying
-   * `amend` to the next unit's instruction); `approve=false` rejects → cancels the run. Resolves
-   * to the resulting status token. Rejects if the run is not paused at a gate.
+   * `amend` to a unit's instruction); `approve=false` rejects → cancels the run. Resolves to the
+   * resulting status token. Rejects if the run is not paused at a gate.
+   *
+   * (DES-L1 PR-1B, additive — absent `action` = today's two-arm mapping.) `action` names the
+   * arm: `approve` | `request_changes` | `reject`. `request_changes` requires `approve=false`
+   * and sends a NOT-PASS review back to the creator phase (`amend` is the operator's note);
+   * `amendScope` (`cursor` | `creator`, approve only) says where an approve's `amend` lands —
+   * the cursor unit (default) or the first creator phase at/after it. A disagreement
+   * (`action=request_changes` with `approve=true`, `action=approve` with `approve=false`, an
+   * unknown token) rejects before the engine is asked.
    */
-  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null): Promise<string>
+  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.
@@ -722,6 +730,9 @@ export declare class Subscription {
  * is the only pass, every other token denies into the escalation gate); null when the layer did not
  * read the unit (creator/neutral/tool) or the evaluator wrote no `VERDICT:` line (then
  * `denial.source === 'evaluator_verdict'` and `denial.reason` is the contract text).
+ * DES-L1 PR-1B (additive): unitReworkAmended carries `scope: 'cursor' | 'creator' | 'request_changes'`
+ * — which gate arm landed the amendment; for `request_changes` the `ord` is the rewound creator and
+ * `amendment` is the rejected review's findings followed by the operator's note.
  * core#467/#469/F-RC2-009 additions (all additive): repoChecksEvaluated carries `outcome: 'passed' |
  * 'failed' | 'timed_out' | 'not_run'` (a timed-out floor denies under source 'repo_checks_timeout',
  * never 'repo_checks'), `floor: 'creator' | 'verify'`, `claim: {phrase, check, verdict} | null` and

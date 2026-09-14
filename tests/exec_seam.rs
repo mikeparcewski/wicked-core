@@ -556,8 +556,14 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
     );
 
     // Approve the conditional gate → the unit must RE-RUN (does not wedge).
-    core.confirm_gate("cg", HumanDecision::Approve { amend: None })
-        .expect("approve the conditional gate");
+    core.confirm_gate(
+        "cg",
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve the conditional gate");
 
     // A NEW task.dispatched for the verify unit at attempt 1 appears — the fresh key proves a genuine
     // re-dispatch reached a worker (the wedge would have left NO new dispatch and no progress).
