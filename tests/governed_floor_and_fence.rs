@@ -487,9 +487,11 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
 
 /// A seat that COMMITS a change on the first agent unit it is handed (whatever its ord) and
 /// answers judge sessions with a PASS; every later unit touches nothing.
+#[cfg(unix)]
 struct CommittingSeat {
     committed: Arc<Mutex<bool>>,
 }
+#[cfg(unix)]
 impl StepRunner for CommittingSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         let mut output = format!("did unit {}", input.unit.ord);
@@ -522,6 +524,7 @@ impl StepRunner for CommittingSeat {
 /// [`make_git_repo`] plus a `.wicked/checks.json` whose `test` FAILS with a cargo-style id line on
 /// EVERY tree (the base shares the failure with any head) — the shape P7 hit: a red suite the
 /// change did not cause.
+#[cfg(unix)]
 fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     let repo = make_git_repo(name);
     std::fs::create_dir_all(repo.join(".wicked")).unwrap();
@@ -536,6 +539,7 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     repo
 }
 
+#[cfg(unix)]
 fn wait_terminal(core: &Core, run_id: &str) -> Option<SessionStatus> {
     let start = Instant::now();
     while start.elapsed() < WAIT_BUDGET {
