@@ -612,6 +612,7 @@ fn deliver_reverify_runs_the_baseline_diff_floor_against_the_run_base_2e() {
     let events = core.subscribe();
     let run_id = "r-l2-2e";
     core.launch_run(LaunchSpec {
+        base_ref: None,
         project_id: None,
         problem: "Fix the bug.".into(),
         clis: vec![cli("a"), cli("b")],
