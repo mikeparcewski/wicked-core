@@ -1316,6 +1316,32 @@ Two release tracks share this file, newest entry first regardless of track:
   twin). The generic verdict-gate prompt names its three arms (retry · request changes · reject).
   The deterministic stub (`StubStepRunner` and the legacy sync path — one `stub_output` emitter)
   closes an Evaluator unit with `VERDICT: PASS` so stub-engine runs do not park.
+- **The gate gains `request_changes` and `amendScope: creator`; attempts mint from each unit's own
+  history; the deliver frame reads the verify floor (DES-L1 PR-1B; core #459, #465; des-adjudicated
+  §4.7; L1↔L2 contract).** At a NOT-PASS review the operator's only answers were retry-the-same-review
+  or cancel. `HumanDecision` gains `RequestChanges { note }`: the run rewinds to the most recent
+  creator before the gated unit (or the cursor when it is one) — every unit from it on loses its
+  worktree baseline / mutation and its denial (a stale baseline would make the re-run evaluator
+  restore the OLD tree), the creator goes `Distributed` with `rework_of = <review ord>`, later units
+  `Pending`, the cursor moves there at a fresh attempt, `verified_tree` is cleared, and the creator
+  re-runs with the REJECTED review in its prior-context block (`[review — unit N — requested
+  changes]`; ACP today, wrapped under L4 ⑥, the pty seat sees the marker + note). The description
+  carries only a ≤ 160 B single-line marker that REPLACES its predecessor (` (requested changes
+  r<n>: <head>)`); the full findings + note ride `unitReworkAmended{scope: "request_changes"}`. No
+  creator before the gate ⇒ an error naming the remedy (approve = retry, or reject). `Approve` gains
+  `amend_scope` (`cursor` = today | `creator` = the first creator phase at/after the cursor, so an
+  intake steer lands on the phase that implements); an amendment the target already carries is not
+  appended twice. `unitReworkAmended` gains `scope: cursor | creator | request_changes` (additive).
+  Additive `WorkUnit.last_attempt` (written at the fold) and `rework_of` (cleared on approve); the
+  advance and the crash redrive mint `next_attempt` / `redrive_attempt` from the unit's own history —
+  a re-run never reuses a `(run, unit, attempt)` key, a never-run unit stays at attempt 0, and the
+  redrive moves past the key the crash interrupted. The dead-seat gate prompt says "never seated"
+  for a unit that never ran (L3's clause). core-ts `confirmGate(runId, approve, amend?, action?,
+  amendScope?)` — absent `action` = today's mapping; a disagreement rejects before the engine is
+  asked. The deliver TOOL unit's `repoChecksEvaluated.floor` reads `verify` (was `creator`).
+  Reject = cancel is unchanged (D-2). Real-engine journey test: FAIL review → gate → request changes
+  → creator re-runs at attempt 1 with the review in context → review re-runs at attempt 1 → PASS →
+  completed.
 
 - **core-ts 0.7.26** — 2026-09-14 — npm release carrying the eleven engine changes since 0.7.25
   (FIX-IT-ALL wave 1: L4 ①–⑦, L5 1.8, L10-5/-8/-9), all on main tip cad267e (plus #491, the 0.7.25
