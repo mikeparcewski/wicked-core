@@ -1525,4 +1525,100 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(regressions, vec!["test new".to_string()]);
     }
+
+    /// DES-L2 2E, the SKIPPED-lift arm: with no remote there is no tip to measure against, so the
+    /// deliver re-verify falls back to the run's own base commit (`LiftContext::base_commit`) —
+    /// a failure the base shares clears, a head-only failure refuses. Without `base_commit` the
+    /// floor has no base and any red check denies, as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_lift_measures_the_reverify_against_the_run_base() {
+        const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
+                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+        let layout = |tag: &str| {
+            let base = scratch(tag);
+            let repo = base.join("repo");
+            std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+            std::fs::create_dir_all(repo.join("tests")).unwrap();
+            run_git(&repo, &["init", "-q", "-b", "main", "."]);
+            identity(&repo);
+            std::fs::write(
+                repo.join(".wicked/checks.json"),
+                serde_json::json!({ "test": ["sh", "-c", CHECK], "timeout_s": 60 }).to_string(),
+            )
+            .unwrap();
+            std::fs::write(repo.join("tests/shared.red"), "").unwrap();
+            std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-qm", "base"]);
+            let base_commit = run_git(&repo, &["rev-parse", "HEAD"]);
+            let wt = base.join("wt");
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    wt.to_str().unwrap(),
+                    "-b",
+                    &format!("wicked/{tag}"),
+                ],
+            );
+            std::fs::write(wt.join("work.txt"), "the run's work\n").unwrap();
+            (repo, wt, base_commit)
+        };
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+
+        // (A) The base's own red test, no remote: cleared against the run base.
+        let (repo, wt, base_commit) = layout("skipped-shared");
+        let ctx = LiftContext {
+            base_commit: Some(base_commit.clone()),
+            ..ctx_for(&repo, &wt, None)
+        };
+        let clearance = match lift_and_reverify(&ctx, "skipped-shared", 5, 0, &emit) {
+            Ok(c) => c,
+            Err(e) if e.contains("no OS write boundary") => {
+                eprintln!("deliver_lift: no sandbox tool here — the re-verify floor cannot run");
+                return;
+            }
+            Err(e) => panic!("a failure the run base shares must not refuse the deliver: {e}"),
+        };
+        assert!(
+            clearance.verified_base.is_none(),
+            "a skipped lift names no verified base"
+        );
+        let report = clearance.checks.expect("the checks ran");
+        assert!(report.passed, "{report:?}");
+        let c = &report.checks[0];
+        assert!(!c.denies(), "{c:?}");
+        assert_eq!(
+            c.base.as_ref().map(|b| b.head.as_str()),
+            Some(base_commit.as_str()),
+            "measured against the run base: {c:?}"
+        );
+
+        // (B) A head-only red with no remote: a regression against the run base — refused.
+        let (repo, wt, base_commit) = layout("skipped-regression");
+        std::fs::write(wt.join("tests/new.red"), "").unwrap();
+        let ctx = LiftContext {
+            base_commit: Some(base_commit),
+            ..ctx_for(&repo, &wt, None)
+        };
+        let err = lift_and_reverify(&ctx, "skipped-regression", 5, 0, &emit)
+            .err()
+            .expect("a head-only failure refuses the deliver");
+        assert!(err.contains(crate::repo_checks::REGRESSION), "{err}");
+
+        // (C) No base recorded at all: today's behaviour — any red check denies.
+        let (repo, wt, _) = layout("skipped-nobase");
+        let ctx = ctx_for(&repo, &wt, None);
+        let err = lift_and_reverify(&ctx, "skipped-nobase", 5, 0, &emit)
+            .err()
+            .expect("with no base the shared failure still denies (fail-closed)");
+        assert!(
+            err.contains("FAILED") && !err.contains(crate::repo_checks::REGRESSION),
+            "{err}"
+        );
+    }
 }
