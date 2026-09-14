@@ -627,6 +627,25 @@ pub enum CoreEvent {
         cmd: Vec<String>,
         workdir: Option<String>,
     },
+    /// (core#500 / F-BM-008) The engine KILLED a Tool executor's child — its process group on
+    /// unix, the leader only on Windows — because the run's launch identity was invalidated
+    /// while the command ran: `CancelRun` (an operator cancel), `ReassignUnit` (a supersede) or
+    /// a daemon shutdown (best-effort; this frame never reaches the wire on that path — the
+    /// actor loop has already broken). Follows `runCancelled` on a cancel and
+    /// `unitReassigned` → `toolExecutorDispatched` on a supersede. `pid` is the killed leader,
+    /// `ran_ms` how long it ran. `reason` is the invalidation signal the CHILD observed
+    /// (`cancelled` = the run tombstone, `superseded` = the launch sequence moved, `shutdown`);
+    /// an operator cancel flips the tombstone and the sequence together and retires the
+    /// tombstone right after `cancel_run`, so the word may read `cancelled` or `superseded` —
+    /// consumers key on ORDER (this frame after `runCancelled`), never on the string.
+    ToolExecutorKilled {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        pid: u32,
+        reason: String,
+        ran_ms: u64,
+    },
     /// (EVT-016) Input governance was successfully armed for a unit — the gate-hook settings file
     /// was written, the ARMED marker was written to the decisions log, and the governed CLI
     /// invocation is about to start. `path` is `"wrapped_cli"` (the `--settings`-injection path)
@@ -1829,6 +1848,22 @@ impl CoreEvent {
                 "ord": ord,
                 "cmd": cmd,
                 "workdir": workdir,
+            }),
+            CoreEvent::ToolExecutorKilled {
+                session,
+                ord,
+                attempt,
+                pid,
+                reason,
+                ran_ms,
+            } => json!({
+                "type": "toolExecutorKilled",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "pid": pid,
+                "reason": reason,
+                "ranMs": ran_ms,
             }),
             CoreEvent::GovernanceContextArmed {
                 session,

@@ -6390,15 +6390,24 @@ fn dispatch_unit(
             },
         );
     }
-    // Allocate launch sequence + ACP epoch only after every fallible actor-side read has
-    // succeeded. Tool commands bypass the ACP runner entirely and therefore must not create
-    // an epoch that no `EpochCleanup` guard could ever release.
-    let (elicitation_epoch, launch_seq) = if unit.tool_cmd.is_some() {
-        (0, 0)
-    } else if let Some(ref m) = elicitation_maps {
+    // Allocate the launch sequence + ACP epoch only after every fallible actor-side read has
+    // succeeded. A Tool command bypasses the ACP runner entirely and therefore mints NO epoch
+    // (no `EpochCleanup` guard could ever release it) — but it DOES take the run's launch
+    // sequence (core#500 / F-BM-008): `CancelRun` and `ReassignUnit` invalidate that identity
+    // (`advance_launch_seq`), and the tool child polls it the way the wrapped and ACP carriers
+    // poll their tokens, so a cancelled run's deliver script dies instead of pushing a PR under a
+    // run that ended hours earlier. `begin_launch(.., false)` is the wrapped carrier's own call:
+    // `has_active_run` stays false, and its tombstone / bus-seq clears are safe here (a tool unit
+    // is never bus-dispatched — the tool arm below returns before the exec-mediation seam).
+    let (elicitation_epoch, launch_seq) = if let Some(ref m) = elicitation_maps {
         let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
-        let seq = maps.begin_launch(run_id, is_acp);
-        let ep = if is_acp { maps.next_epoch(run_id) } else { 0 };
+        let tracks_acp = is_acp && unit.tool_cmd.is_none();
+        let seq = maps.begin_launch(run_id, tracks_acp);
+        let ep = if tracks_acp {
+            maps.next_epoch(run_id)
+        } else {
+            0
+        };
         (ep, seq)
     } else {
         (0, 0)
@@ -6480,7 +6489,31 @@ fn dispatch_unit(
         // registered repo it was linked from — resolved HERE (the actor holds the store), applied
         // off-thread below before the push runs. `None` for every other tool unit.
         let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
+        // core#500 (F-BM-008): the child's STOP predicate — the run's launch identity, read the
+        // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown ALREADY
+        // flip it (`tombstone_run` + `advance_launch_seq` in `CancelRun`, `advance_launch_seq` in
+        // `ReassignUnit`, `set_shutdown_flag`); nothing new is signalled anywhere. The word is the
+        // signal the child OBSERVED, checked tombstone-first so an operator cancel usually reads
+        // `cancelled` — but the tombstone is retired right after `cancel_run`, so a late poll
+        // reads `superseded` (the sequence moved too). Consumers key on ORDER, never the word.
+        let maps_for_child = elicitation_maps.clone();
+        let run_for_child = run_id.to_string();
+        let my_seq = launch_seq;
         std::thread::spawn(move || {
+            let stop = move || -> Option<&'static str> {
+                let m = maps_for_child.as_ref()?;
+                let g = m.lock().unwrap_or_else(|p| p.into_inner());
+                if g.is_run_cancelled(&run_for_child) {
+                    Some("cancelled")
+                } else if my_seq > 0 && g.current_launch_seq(&run_for_child) != my_seq {
+                    Some("superseded")
+                } else if g.shutdown_flag() {
+                    Some("shutdown")
+                } else {
+                    None
+                }
+            };
+            let mut killed: Option<ToolKilled> = None;
             // core#396 (codex round 6): the run-wide EXISTENCE admission runs before the FIRST
             // unit of ANY kind. A tool command spawns no worker, so neither runner would ever
             // judge this run's skill set — the command executed, and could mutate state, before
@@ -6538,9 +6571,15 @@ fn dispatch_unit(
                                     vec![(crate::deliver_lift::VERIFIED_BASE_ENV.to_string(), b)]
                                 })
                                 .unwrap_or_default();
-                            run_tool_cmd(&cmd, workdir.as_deref(), &env)
+                            let (o, st, k) = run_tool_cmd(&cmd, workdir.as_deref(), &env, &stop);
+                            killed = k;
+                            (o, st)
                         }
-                        None => run_tool_cmd(&cmd, workdir.as_deref(), &[]),
+                        None => {
+                            let (o, st, k) = run_tool_cmd(&cmd, workdir.as_deref(), &[], &stop);
+                            killed = k;
+                            (o, st)
+                        }
                     }
                 }
                 Err(e) => {
@@ -6548,14 +6587,30 @@ fn dispatch_unit(
                     (refused.output, refused.status)
                 }
             };
+            // core#500: say what was stopped BEFORE the result posts — one channel, so this frame
+            // lands after whatever the actor emitted when it flipped the identity (`runCancelled`
+            // on a cancel; `unitReassigned` → `toolExecutorDispatched` on a supersede). Nothing
+            // reaches the wire on a shutdown (the actor loop has broken and the receiver is gone).
+            if let Some(k) = &killed {
+                let _ = tx.send(crate::command::Command::EmitEvent(
+                    CoreEvent::ToolExecutorKilled {
+                        session: run_id2.clone(),
+                        ord,
+                        attempt,
+                        pid: k.pid,
+                        reason: k.reason.to_string(),
+                        ran_ms: k.ran_ms,
+                    },
+                ));
+            }
             // Stream the whole output as one delta so the transcript panel shows something.
             let _ = tx.send(crate::command::Command::CliOutputDelta {
                 run_id: run_id2.clone(),
                 ord,
                 attempt,
                 chunk: output_str.clone(),
-                process_gen: None, // PTY tool-cmd path — not bus-dispatched
-                launch_seq: 0,
+                process_gen: None, // tool-cmd path — not bus-dispatched
+                launch_seq: my_seq,
             });
             let _ = tx.send(crate::command::Command::ApplyStepResult {
                 output: crate::workflow::StepOutput {
@@ -6584,8 +6639,10 @@ fn dispatch_unit(
                     judge_auth_refusals: Vec::new(),
                     judge_refusals: Vec::new(),
                 }),
-                process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
-                launch_seq: 0,
+                process_gen: None, // tool-cmd path — not bus-dispatched
+                // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
+                // / attempt guards before any fold branch); carried for the record.
+                launch_seq: my_seq,
                 ack: None,
             });
         });
@@ -6692,16 +6749,83 @@ fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
 /// `(output, StepStatus)`. Exit 0 → `StepStatus::Ok`; anything else → `StepStatus::Failed`.
 /// Called off the actor thread (blocking subprocess). `extra_env` rides on top of the hardened
 /// environment — the deliver lift's `WICKED_DELIVER_VERIFIED_BASE` (core#431), nothing else today.
+/// What stopped a Tool child before it exited on its own (core#500 / F-BM-008): the pid of the
+/// process-group leader the engine killed, the invalidation signal the child observed, and how
+/// long it had run.
+struct ToolKilled {
+    pid: u32,
+    reason: &'static str,
+    ran_ms: u64,
+}
+
+/// How a polled Tool child ended.
+enum ToolExit {
+    /// The child exited on its own; `None` when the OS refused the final `wait`.
+    Exited(Option<std::process::ExitStatus>),
+    /// `stop()` fired: the engine killed the group and reaped it bounded.
+    Killed(&'static str),
+    /// The OS refused the exit poll; the engine killed the group rather than leave it running.
+    WaitFailed(String),
+}
+
+/// Retained-output cap for a Tool child (`execute_wrapped::run_bounded`'s `MAX_OUT`): a runaway
+/// tool cannot OOM the daemon.
+const TOOL_MAX_OUT: u64 = 8 * 1024 * 1024;
+
+/// Drain a child's pipe to EOF, RETAINING at most [`TOOL_MAX_OUT`] bytes: past the cap the
+/// bytes are read and discarded, never left unread — a reader that stopped at the cap would
+/// close its end of the pipe and the child's next write would die with EPIPE, turning a verbose
+/// but healthy tool into a failed one (review on #511; `run_bounded`'s drains keep reading too).
+fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let Some(mut r) = r else {
+        return buf;
+    };
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = (TOOL_MAX_OUT as usize).saturating_sub(buf.len());
+                if room >= n {
+                    buf.extend_from_slice(&chunk[..n]);
+                } else {
+                    buf.extend_from_slice(&chunk[..room]);
+                    if !capped {
+                        buf.extend_from_slice("\n… (output truncated)\n".as_bytes());
+                        capped = true;
+                    }
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// Spawn a Tool command and poll it to completion the way `execute_wrapped::run_bounded` polls a
+/// seat (core#500 / F-BM-008): the child runs in its OWN process group (unix), the loop wakes
+/// every 50 ms, and `stop()` returning `Some(reason)` — the run's launch identity was invalidated
+/// by `CancelRun`, `ReassignUnit` or shutdown — kills the whole group (`kill_child_tree`, SIGKILL,
+/// the same helper the ACP and wrapped carriers and the floor use) and reaps it bounded. Natural
+/// exit is byte-identical to the blocking `Command::output` this replaced: stdout, then stderr on
+/// its own line, `\n[exit N]` on failure; an unspawnable binary is `failed to spawn …`. A killed
+/// child yields `StepStatus::Cancelled`, the output so far plus `\n[killed: <reason>]`, and the
+/// [`ToolKilled`] record the caller turns into `toolExecutorKilled`. Windows has no process
+/// groups: `kill_child_tree` reaches the leader only (as the ACP and wrapped carriers today).
 fn run_tool_cmd(
     cmd: &[String],
     workdir: Option<&str>,
     extra_env: &[(String, String)],
-) -> (String, crate::workflow::StepStatus) {
-    use std::process::Command;
+    stop: &dyn Fn() -> Option<&'static str>,
+) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
+    use crate::workflow::StepStatus;
+    use std::process::{Command, Stdio};
     let Some(bin) = cmd.first() else {
         return (
             "tool phase has empty cmd".to_string(),
-            crate::workflow::StepStatus::Failed,
+            StepStatus::Failed,
+            None,
         );
     };
     // `cmd` is an arbitrary argv straight out of a `WorkflowDef` — workflows are data, so this runs
@@ -6729,29 +6853,94 @@ fn run_tool_cmd(
     if let Some(wd) = workdir {
         proc.current_dir(wd);
     }
-    match proc.output() {
-        Ok(out) => {
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr);
-            }
-            let status = if out.status.success() {
-                crate::workflow::StepStatus::Ok
-            } else {
-                let code = out.status.code().unwrap_or(-1);
-                combined.push_str(&format!("\n[exit {}]", code));
-                crate::workflow::StepStatus::Failed
-            };
-            (combined, status)
+    proc.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own group (pgid == pid) — the twin of `run_bounded`'s spawn: one `killpg` reaches
+        // everything the script backgrounded, and the group is never the daemon's own.
+        proc.process_group(0);
+    }
+    let mut child = match proc.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                format!("failed to spawn {:?}: {e}", bin),
+                StepStatus::Failed,
+                None,
+            )
         }
-        Err(e) => (
-            format!("failed to spawn {:?}: {e}", bin),
-            crate::workflow::StepStatus::Failed,
-        ),
+    };
+    let pid = child.id();
+    let started = std::time::Instant::now();
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let (stdout_b, stderr_b, exit) = std::thread::scope(|scope| {
+        let out_h = scope.spawn(move || drain_capped(so));
+        let err_h = scope.spawn(move || drain_capped(se));
+        let exit = loop {
+            match crate::validator::has_exited_unreaped(&mut child) {
+                Ok(true) => {
+                    // QUIESCE (twin of `run_bounded`): the leader exited but is not yet reaped, so
+                    // its pid — the group id — is still reserved; kill the group FIRST (anything
+                    // the script backgrounded dies with the phase), THEN collect the status.
+                    crate::validator::kill_child_tree(&mut child);
+                    break ToolExit::Exited(child.wait().ok());
+                }
+                Ok(false) => {
+                    if let Some(reason) = stop() {
+                        crate::validator::kill_child_tree(&mut child);
+                        crate::validator::reap_bounded(&mut child);
+                        break ToolExit::Killed(reason);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    crate::validator::kill_child_tree(&mut child);
+                    crate::validator::reap_bounded(&mut child);
+                    break ToolExit::WaitFailed(e.to_string());
+                }
+            }
+        };
+        (
+            out_h.join().unwrap_or_default(),
+            err_h.join().unwrap_or_default(),
+            exit,
+        )
+    });
+    let mut combined = String::from_utf8_lossy(&stdout_b).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_b);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    match exit {
+        ToolExit::Exited(Some(st)) if st.success() => (combined, StepStatus::Ok, None),
+        ToolExit::Exited(st) => {
+            let code = st.and_then(|s| s.code()).unwrap_or(-1);
+            combined.push_str(&format!("\n[exit {}]", code));
+            (combined, StepStatus::Failed, None)
+        }
+        ToolExit::Killed(reason) => {
+            combined.push_str(&format!("\n[killed: {reason}]"));
+            (
+                combined,
+                StepStatus::Cancelled,
+                Some(ToolKilled {
+                    pid,
+                    reason,
+                    ran_ms: started.elapsed().as_millis() as u64,
+                }),
+            )
+        }
+        ToolExit::WaitFailed(e) => {
+            combined.push_str(&format!("\n[wait failed: {e}]"));
+            (combined, StepStatus::Failed, None)
+        }
     }
 }
 
@@ -13927,5 +14116,182 @@ mod turn_timeout_vs_cancel_tests {
         let failed = crate::domain::UnitDenial::new("repo_checks", "exit 1");
         assert_eq!(super::denial_class(Some(&timeout), false), "floor_failed");
         assert_eq!(super::denial_class(Some(&failed), false), "floor_failed");
+    }
+}
+
+/// core#500 / F-BM-008 — `run_tool_cmd` polls its child and kills it when the run's launch
+/// identity is invalidated; natural exits are byte-identical to the blocking call it replaced.
+#[cfg(test)]
+mod tool_cmd_tests {
+    use super::*;
+    use crate::workflow::StepStatus;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
+    fn never() -> Option<&'static str> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> Vec<String> {
+        vec!["sh".into(), "-c".into(), script.into()]
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        // Safe: signal 0 probes existence only.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn wait_dead(pid: i32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !alive(pid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn natural_exit_is_byte_identical_to_the_blocking_output_it_replaced() {
+        // exit 0, stdout + stderr: stderr joins on its own line, no suffix.
+        let (out, st, k) = run_tool_cmd(&sh("printf out; printf err >&2"), None, &[], &never);
+        assert_eq!(out, "out\nerr");
+        assert_eq!(st, StepStatus::Ok);
+        assert!(k.is_none());
+        // exit 3: the `[exit N]` suffix, Failed.
+        let (out, st, k) = run_tool_cmd(&sh("printf x; exit 3"), None, &[], &never);
+        assert_eq!(out, "x\n[exit 3]");
+        assert_eq!(st, StepStatus::Failed);
+        assert!(k.is_none());
+        // silent success: empty output.
+        let (out, st, _) = run_tool_cmd(&sh("exit 0"), None, &[], &never);
+        assert_eq!(out, "");
+        assert_eq!(st, StepStatus::Ok);
+        // `extra_env` and `workdir` still reach the child.
+        let wd = std::env::temp_dir();
+        let (out, st, _) = run_tool_cmd(
+            &sh("printf '%s' \"$WICKED_TOOL_TEST_ENV\"; pwd >&2"),
+            Some(wd.to_str().unwrap()),
+            &[("WICKED_TOOL_TEST_ENV".into(), "reached".into())],
+            &never,
+        );
+        assert_eq!(st, StepStatus::Ok);
+        assert!(out.starts_with("reached\n"), "{out}");
+    }
+
+    /// Review on #511: a tool that writes MORE than the retained cap must still exit on its own
+    /// terms — the drain keeps reading (and discarding) past the cap, so the child never sees
+    /// EPIPE. 9 MiB of stdout → exit 0, `Ok`, the retained text capped and marked.
+    #[cfg(unix)]
+    #[test]
+    fn output_past_the_retained_cap_is_discarded_not_left_unread() {
+        // 9 × 1 MiB lines of 'x' — past the 8 MiB cap.
+        let script = "i=0; while [ $i -lt 9 ]; do head -c 1048576 /dev/zero | tr '\\0' x; echo; \
+                      i=$((i+1)); done; exit 0";
+        let (out, st, k) = run_tool_cmd(&sh(script), None, &[], &never);
+        assert_eq!(
+            st,
+            StepStatus::Ok,
+            "no EPIPE: the child exited 0 — {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(k.is_none());
+        assert!(out.len() <= (TOOL_MAX_OUT as usize) + 64, "{}", out.len());
+        assert!(out.contains("(output truncated)"), "the cap is marked");
+    }
+
+    #[test]
+    fn an_unspawnable_binary_and_an_empty_cmd_fail_as_before() {
+        let (out, st, k) = run_tool_cmd(
+            &["/nonexistent/wicked-tool-binary-xyz".to_string()],
+            None,
+            &[],
+            &never,
+        );
+        assert!(out.starts_with("failed to spawn"), "{out}");
+        assert_eq!(st, StepStatus::Failed);
+        assert!(k.is_none());
+        let (out, st, k) = run_tool_cmd(&[], None, &[], &never);
+        assert_eq!(out, "tool phase has empty cmd");
+        assert_eq!(st, StepStatus::Failed);
+        assert!(k.is_none());
+    }
+
+    /// Design test (4): `stop` fires once the child has PRODUCED output (a marker the script
+    /// writes after its `echo` — observed, not wall-clock, so a slow fork under load cannot kill
+    /// the child before it ran) → `Cancelled`, the `[killed: …]` suffix, the output tail kept,
+    /// and the call returns in a poll tick + a bounded reap — never the 30 s sleep.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_signal_kills_the_child_and_marks_it_cancelled_with_the_observed_reason() {
+        let marker = std::env::temp_dir().join(format!(
+            "wicked-core-toolstop-{}-{}.marker",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!("echo started; : > '{}'; sleep 30", marker.display());
+        let m = marker.clone();
+        let stop = move || m.exists().then_some("cancelled");
+        let started = Instant::now();
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop);
+        let took = started.elapsed();
+        assert_eq!(st, StepStatus::Cancelled);
+        assert!(out.contains("started"), "the output tail is kept: {out}");
+        assert!(out.ends_with("\n[killed: cancelled]"), "{out}");
+        let k = k.expect("a killed child reports what stopped it");
+        assert!(k.pid > 0);
+        assert_eq!(k.reason, "cancelled");
+        assert!(
+            k.ran_ms < 10_000 && took < Duration::from_secs(10),
+            "poll tick + bounded reap, never the 30 s sleep: ran {} ms, took {took:?}",
+            k.ran_ms
+        );
+        assert!(wait_dead(k.pid as i32, Duration::from_secs(2)));
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// The kill reaches the whole PROCESS GROUP: a `sleep` the script backgrounded dies with the
+    /// leader (unix only — Windows kills the leader alone, as the ACP/wrapped carriers do).
+    #[cfg(unix)]
+    #[test]
+    fn the_kill_reaches_everything_the_script_backgrounded() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "wicked-core-toolgroup-{}-{}.pid",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+        // The signal fires once the background pid is on disk — i.e. once both processes exist.
+        let pf = pidfile.clone();
+        let stop = move || {
+            std::fs::read_to_string(&pf)
+                .ok()
+                .filter(|s| s.trim().parse::<i32>().is_ok())
+                .map(|_| "superseded")
+        };
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop);
+        assert_eq!(st, StepStatus::Cancelled);
+        assert!(out.ends_with("\n[killed: superseded]"), "{out}");
+        let k = k.expect("killed");
+        let bg: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            wait_dead(k.pid as i32, Duration::from_secs(2)),
+            "leader {} still alive",
+            k.pid
+        );
+        assert!(
+            wait_dead(bg, Duration::from_secs(2)),
+            "the backgrounded sleep {bg} survived the group kill"
+        );
+        let _ = std::fs::remove_file(&pidfile);
     }
 }
