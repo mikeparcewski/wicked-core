@@ -1760,6 +1760,19 @@ impl WrappedCliStepRunner {
                 .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
                 cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, roots);
             }
+            // Run markers on the worker's OWN environment (R12 — DES-L4 PR-③): the same ordered
+            // pairs `estate_provenance_env` produces for the estate MCP. Stamped for EVERY unit,
+            // governed or not, AFTER `hardened()` (which strips none of them): garden's estate shim
+            // detects governed mode marker-first and forces `--readonly` + a pinned store, and the
+            // `wicked-estate-mcp` it spawns inherits them to stamp `proposal.submit` provenance
+            // (worker → Bash → sh → node → python → mcp). An ungoverned unit then finds the shim
+            // read-only and refusing an unpinned store — correct, not a regression.
+            let provenance = estate_provenance_env(
+                &input.run_id,
+                input.unit.ord,
+                input.unit.assigned_cli.as_deref(),
+            );
+            stamp_run_markers(&mut cmd, &provenance);
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
             // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
             // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
@@ -2266,7 +2279,8 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
         })
 }
 
-/// Provenance the worker's estate MCP stamps onto anything it submits (DES-MEM-FACETED-001 follow-on).
+/// Provenance the worker's estate MCP stamps onto anything it submits (DES-MEM-FACETED-001 follow-on)
+/// — and, since R12 (DES-L4 PR-③), the run MARKERS stamped on the worker `Command` itself.
 ///
 /// The estate-mcp `proposal.submit` tool server-stamps provenance from `WICKED_RUN_ID` /
 /// `WICKED_RUN_UNIT` / `WICKED_RUN_AGENT` read from its OWN process env — it stamps whatever is set and
@@ -2276,7 +2290,9 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
 ///
 /// Returns ORDERED `(name, value)` pairs so each carrier formats them into its own shape — the wrapped
 /// `--mcp-config` `env` OBJECT (`arm_input_governance`) and the ACP `session/new` `env` ARRAY
-/// (`acp_runner`), the two carrier shapes of one repo-scoped store (FINDING-122).
+/// (`acp_runner`), the two carrier shapes of one repo-scoped store (FINDING-122) — and stamps them,
+/// through [`stamp_run_markers`], on BOTH worker `Command`s, so the estate shim the worker's Bash
+/// spawns (and the `wicked-estate-mcp` behind it) inherits the same three names.
 ///
 /// The run id and unit ordinal are always present on a `StepInput`, so both are always set. The agent
 /// key is ALSO always set: it mirrors the engine's default-seat resolution (`exec`'s `cli_key`,
@@ -2300,6 +2316,20 @@ pub(crate) fn estate_provenance_env(
         .unwrap_or("claude");
     env.push(("WICKED_RUN_AGENT".to_string(), agent.to_string()));
     env
+}
+
+/// Stamp the run markers (the [`estate_provenance_env`] pairs) on a worker `Command` — the ONE
+/// mechanism both carriers use (R12, DES-L4 PR-③): the wrapped `exec` and the ACP `build_cmd`.
+///
+/// Called AFTER `hardened()`: `ENGINE_INTERNAL_ENV` strips `WICKED_ESTATE_DB` and the gate/roots
+/// variables, never `WICKED_RUN_*`, so the markers survive to every descendant the worker spawns —
+/// garden's estate shim reads them marker-first (`is_governed()`) to force `--readonly` + a pinned
+/// store, and the `wicked-estate-mcp` it launches stamps `proposal.submit` provenance from them.
+/// An EMPTY slice stamps nothing — a chat is not a run unit and carries no markers.
+pub(crate) fn stamp_run_markers(cmd: &mut Command, provenance: &[(String, String)]) {
+    for (k, v) in provenance {
+        cmd.env(k, v);
+    }
 }
 
 /// Locate a binary on PATH using the same search the shell would do.
@@ -5129,6 +5159,64 @@ mod tests {
         assert_eq!(
             blank_agent.iter().find(|(k, _)| k == "WICKED_RUN_AGENT"),
             Some(&("WICKED_RUN_AGENT".to_string(), "claude".to_string()))
+        );
+    }
+
+    /// R12 (DES-L4 PR-③): `stamp_run_markers` is the ONE mechanism both carriers use to put the
+    /// run markers on the worker `Command`'s own env. All three names are set from the provenance
+    /// pairs; an EMPTY slice (a chat) stamps nothing. Probe via `get_envs` on a non-`hardened`
+    /// Command so the env under test is not cleared out from under it.
+    #[test]
+    fn stamp_run_markers_sets_all_three_and_empty_sets_none() {
+        let provenance = estate_provenance_env("run-9", 4, Some("codex"));
+        // spawn-audit: test-only — this Command is never spawned; its `get_envs` is inspected to
+        // assert `stamp_run_markers` set the markers. It must NOT be `.hardened()` or the env under
+        // test would be cleared out from under it.
+        let mut cmd = Command::new("true");
+        stamp_run_markers(&mut cmd, &provenance);
+        let seen: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_str()?.to_string(),
+                    v?.to_str().map(str::to_string).unwrap_or_default(),
+                ))
+            })
+            .collect();
+        assert_eq!(seen.get("WICKED_RUN_ID").map(String::as_str), Some("run-9"));
+        assert_eq!(seen.get("WICKED_RUN_UNIT").map(String::as_str), Some("4"));
+        assert_eq!(
+            seen.get("WICKED_RUN_AGENT").map(String::as_str),
+            Some("codex")
+        );
+
+        // spawn-audit: test-only — never spawned; `get_envs` proves an empty slice sets no markers.
+        let mut chat = Command::new("true");
+        stamp_run_markers(&mut chat, &[]);
+        assert_eq!(
+            chat.get_envs()
+                .filter(|(k, _)| k.to_string_lossy().starts_with("WICKED_RUN_"))
+                .count(),
+            0,
+            "a chat (empty slice) carries no run markers"
+        );
+    }
+
+    /// R12: the launcher only stamps the markers if `exec` calls the helper. Scope the search to
+    /// PRODUCTION code (before the first `#[cfg(test)]`) so this test's own literal cannot
+    /// self-satisfy the assertion — the same pattern as `the_launcher_wires_the_worker_estate_channel`.
+    /// Mutation: delete the wrapped call site → this fails.
+    #[test]
+    fn the_wrapped_launcher_stamps_the_run_markers() {
+        let src = include_str!("execute_wrapped.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production prefix before any test module");
+        assert!(
+            production.contains("stamp_run_markers(&mut cmd, &provenance)"),
+            "execute_wrapped no longer stamps the run markers on the wrapped worker Command \
+             (R12) — garden's estate shim cannot detect governed mode marker-first"
         );
     }
 

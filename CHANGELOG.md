@@ -15,6 +15,14 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Run markers on every worker's own environment (R12, DES-L4 PR-③).** `WICKED_RUN_ID` /
+  `WICKED_RUN_UNIT` / `WICKED_RUN_AGENT` — the pairs `estate_provenance_env` already produced — were
+  handed ONLY to the estate MCP (the wrapped `--mcp-config` env object, the ACP `session/new` env
+  array); neither worker `Command` carried them, so garden's estate shim, spawned from the worker's
+  Bash, could not detect governed mode marker-first and a shim-submitted proposal had no provenance
+  to inherit. Both carriers now stamp the three markers on the worker `Command` itself through one
+  shared `stamp_run_markers`, after `hardened()` (which strips none of them), for every unit
+  governed or not; a chat passes an empty slice and stays unmarked.
 - **Governance Bash scan sees through one wrapper level (core #475).** `bash_write_targets` (the
   FINDING-045 write fence) and `classify_estate_command` (the estate allowlist) matched only a bare
   program word: `sh -lc 'echo x > src/y'`, `exec tee src/y`, `xargs tee src/y`, `nice`/`timeout`
