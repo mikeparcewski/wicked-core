@@ -14,7 +14,7 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-### Fixed
+<!-- fixall L5 -->
 - **Chat seats are handed the skills a unit gets; the turn budget is named; `chatReply.usage`; the
   chat boundary reads the seat's store pin (DES-L5 wave 1 "chat first", journey P6; core #487 +
   crew #563 core half, core #412 chat half, F-RC1-110/113/116).** `chat_ensure` handed every seat
@@ -44,6 +44,8 @@ Two release tracks share this file, newest entry first regardless of track:
   budget-eviction text with the partial kept; boundary pin with a `--readonly` shim call admitted
   only when bound; `acp_launch_facts` couples all three identities; core-ts `chatReply` key set
   gains `usage`.
+
+### Fixed
 - **The CLI-registered estate MCP hand-off is DELETED on both carriers, units and chats (D-7, DES-L4
   PR-⑦; F-084 = F-RC1-045/086/113 product half, F-RC1-048 C1, core #485/#486).** The wrapped carrier
   wrote a per-unit `--mcp-config` file (`wicked-estate-mcp --db <graph> --readonly`) and allow-listed
