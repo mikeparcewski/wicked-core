@@ -1206,12 +1206,15 @@ mod tests {
         assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), head, "nothing moved");
     }
 
-    /// A worktree with a `test` script that FAILS (`exit 1`), `node_modules/` present so the
-    /// floor installs nothing — the repository's own check, always red.
+    /// A worktree with a `test` script that FAILS exactly when the tree carries `red.txt`,
+    /// `node_modules/` present so the floor installs nothing. Landed on the TIP it passes there;
+    /// the run's own (uncommitted) `red.txt` makes it fail on the head only — since DES-L2 2E the
+    /// deliver re-verify is baseline-diffed against the tip, so only a HEAD-ONLY failure refuses
+    /// (a failure the tip shares is classified and clears; see the 2E tests below).
     fn add_failing_npm_check(repo: &Path) {
         std::fs::write(
             repo.join("package.json"),
-            r#"{"name":"lift-reverify","version":"0.0.0","scripts":{"test":"exit 1"}}"#,
+            r#"{"name":"lift-reverify","version":"0.0.0","scripts":{"test":"[ ! -e red.txt ]"}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(repo.join("node_modules")).unwrap();
@@ -1251,6 +1254,9 @@ mod tests {
         });
         let other = clone.parent().unwrap().join("other-reverify-retry");
         add_failing_npm_check(&other);
+        // The run's own work is what makes the landed check fail (head-only ⇒ a regression, which
+        // refuses; 2E excuses a failure the tip shares).
+        std::fs::write(wt.join("red.txt"), "the run broke it\n").unwrap();
         // The run's verify unit certified the PRE-lift tree.
         let verified = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
         let ctx = ctx_for(&clone, &wt, Some(verified.clone()));
