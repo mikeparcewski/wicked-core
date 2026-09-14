@@ -6173,8 +6173,18 @@ fn dispatch_unit(
                 None
             }
         });
-    if notes_root.is_some() && unit.notes_root != notes_root {
-        unit.notes_root = notes_root;
+    // (DES-L1 PR-1B) Record the attempt this dispatch mints ON the unit — `last_attempt` is the
+    // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
+    // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"
+    // (the dead-seat gate's never-seated clause, des-adjudicated §4.7).
+    let attempt_changed = unit.last_attempt != Some(session.attempt);
+    if attempt_changed {
+        unit.last_attempt = Some(session.attempt);
+    }
+    if (notes_root.is_some() && unit.notes_root != notes_root) || attempt_changed {
+        if notes_root.is_some() {
+            unit.notes_root = notes_root;
+        }
         put_node(store, unit.to_node())?;
     }
     // F-036 WORKTREE GUARD baseline. For a unit whose phase declared `executes_code: false`

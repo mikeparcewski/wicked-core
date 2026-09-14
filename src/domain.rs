@@ -572,10 +572,12 @@ pub struct WorkUnit {
     /// output tails. `None` until the unit's gate folds (or when the floor does not apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_checks: Option<crate::repo_checks::RepoChecksReport>,
-    /// (DES-L1 PR-1B) The attempt at which this unit was LAST folded (approved or denied), written
-    /// beside `phase_ref`; `None` until the unit has run once. A dispatch after a rewind mints
-    /// `last_attempt + 1` (`actor::next_attempt`) so a re-run never reuses a `(run, unit, attempt)`
-    /// key — the phase-id / `task.dispatched` wedge; a never-run unit stays at attempt 0.
+    /// (DES-L1 PR-1B) The attempt at which this unit was LAST DISPATCHED (written by
+    /// `dispatch_unit`; the fold re-affirms it), whatever that attempt's outcome — approved,
+    /// denied, or a worker exit that never reached the fold; `None` until the unit has been
+    /// dispatched once ("never seated"). A dispatch after a rewind mints `last_attempt + 1`
+    /// (`actor::next_attempt`) so a re-run never reuses a `(run, unit, attempt)` key — the
+    /// phase-id / `task.dispatched` wedge; a never-run unit stays at attempt 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt: Option<u32>,
     /// (DES-L1 PR-1B) The ord of the Evaluator unit whose REJECTED review this creator re-run must
