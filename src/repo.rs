@@ -2722,6 +2722,7 @@ mod tests {
             edges: vec![],
             policy: crate::campaign::FailurePolicy::default(),
             max_concurrency: 1,
+            denial_gate: Default::default(),
         };
         crate::campaign::validate(&def).unwrap();
         let campaign = crate::campaign::Campaign::new(def);

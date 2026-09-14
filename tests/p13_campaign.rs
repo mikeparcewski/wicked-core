@@ -286,6 +286,7 @@ fn sc_c2_example_dispatch_order_and_overlap() {
         ],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 4,
+        denial_gate: Default::default(),
     };
     core.launch_campaign(def).expect("launch");
 
@@ -344,6 +345,7 @@ fn sc_c3_respects_max_concurrency_cap() {
         edges: vec![], // all independent
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
+        denial_gate: Default::default(),
     };
     core.launch_campaign(def).expect("launch");
 
@@ -394,6 +396,7 @@ fn sc_c4_fail_fast_cancels_in_flight_and_fails_campaign() {
         edges: vec![],
         policy: FailurePolicy::FailFast,
         max_concurrency: 4,
+        denial_gate: Default::default(),
     };
     core.launch_campaign(def).expect("launch");
 
@@ -436,6 +439,7 @@ fn sc_c5_continue_independent_blocks_only_dependents() {
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 4,
+        denial_gate: Default::default(),
     };
     core.launch_campaign(def).expect("launch");
 
@@ -476,6 +480,7 @@ fn sc_c8_per_node_gate_frees_the_slot_at_concurrency_one() {
         edges: vec![],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 1,
+        denial_gate: Default::default(),
     };
     core.launch_campaign(def).expect("launch");
 
@@ -520,6 +525,7 @@ fn sc_c6_crash_resume_never_reruns_a_completed_node() {
         edges: vec![edge("A", "B")], // B depends on A
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
+        denial_gate: Default::default(),
     };
     core_a.launch_campaign(def).expect("launch");
 
@@ -661,6 +667,7 @@ fn sc_c6_f1a_resume_reconciles_a_node_whose_session_finished_before_crash() {
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
+        denial_gate: Default::default(),
     };
     {
         let mut store = open_store(Some(&db)).expect("open store");
@@ -709,6 +716,7 @@ fn sc_c6_f1b_resume_launches_a_node_whose_session_was_never_written() {
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
+        denial_gate: Default::default(),
     };
 
     // Craft the artifact directly: node X persisted Running with its derived run id, NO session written.
@@ -762,6 +770,7 @@ fn sc_c6_r1_resume_fails_a_node_that_crashed_mid_planning() {
         edges: vec![edge("X", "Y")], // Y OnSuccess-depends on X; W is independent
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 3,
+        denial_gate: Default::default(),
     };
     // Craft: node X persisted `Running`, its session at `Planning` with NO units written — the exact
     // mid-plan crash artifact (a session in `Planning`/`Distributing` never finished a distributed plan).
@@ -826,6 +835,7 @@ fn sc_c6_r2_resume_reconciles_an_awaiting_human_node_whose_run_was_cancelled() {
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 3,
+        denial_gate: Default::default(),
     };
     // Craft: node X persisted `AwaitingHuman`, its session ALREADY `Cancelled` (the Reject terminal
     // write) — but the deferred `CampaignRunFinished` never landed.
@@ -885,6 +895,7 @@ fn sc_c6_r2_resume_leaves_a_genuinely_waiting_node_paused() {
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
+        denial_gate: Default::default(),
     };
     // Craft: node X persisted `AwaitingHuman` with its session ALSO `AwaitingHuman` (a genuine, live
     // human wait — the non-terminal case the R2 re-derivation must leave alone).
@@ -948,6 +959,7 @@ fn sc_c6_r3_resume_reconciles_a_node_whose_session_failed_before_crash() {
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 3,
+        denial_gate: Default::default(),
     };
     {
         let mut store = open_store(Some(&db)).expect("open store");
@@ -1005,6 +1017,7 @@ fn sc_c6_r3_resume_failed_node_honors_fail_fast_policy() {
         edges: vec![],
         policy: FailurePolicy::FailFast,
         max_concurrency: 2,
+        denial_gate: Default::default(),
     };
     {
         let mut store = open_store(Some(&db)).expect("open store");

@@ -133,6 +133,32 @@ pub enum FailurePolicy {
 
 /// The static definition of a campaign — validated + persisted verbatim inside the live [`Campaign`]
 /// so a resume can reconstruct nodes/edges/policy/cap without a second store.
+/// (DES-L1 PR-1D, core#484) What an UNATTENDED campaign does when a node's run parks at the
+/// engine's ESCALATION gate (`gateEscalated`, `awaitingHuman{gateKind: "escalation"}` — EVERY
+/// `escalate_denied_unit` class: a verdict / floor / boundary denial AND the dead-seat gate, so
+/// under `auto_reject` a quota-exhausted seat cancels the node instead of waiting for a reassign):
+/// `hold` = today, the node waits for a human (`campaignNodeAwaitingHuman`);
+/// `auto_reject` = the campaign answers the gate itself with Reject — the run cancels, the node
+/// reconciles to `Cancelled` and its dependents follow the `OnSuccess` edge rule. Def- and
+/// run-level human gates (`gateKind: "def" | "run_level" | "deliver" | …`) HOLD under both — a
+/// gate the def or the launch asked for is never answered for the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialGatePolicy {
+    #[default]
+    Hold,
+    AutoReject,
+}
+
+impl DenialGatePolicy {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            DenialGatePolicy::Hold => "hold",
+            DenialGatePolicy::AutoReject => "auto_reject",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignDef {
     pub id: String,
@@ -145,6 +171,9 @@ pub struct CampaignDef {
     pub policy: FailurePolicy,
     /// The global concurrency cap (>= 1) — a resource guard on parallel worktrees + CLI subprocesses.
     pub max_concurrency: usize,
+    /// (core#484) The escalation-gate policy — see [`DenialGatePolicy`]. Absent ⇒ `hold`.
+    #[serde(default)]
+    pub denial_gate: DenialGatePolicy,
 }
 
 /// Per-node lifecycle status (DES §2). `TERMINAL = {Completed, Failed, Blocked, Cancelled}`.
@@ -953,11 +982,54 @@ pub(crate) fn on_node_awaiting(
         subscribers,
         CoreEvent::CampaignNodeAwaitingHuman {
             campaign: campaign.id.clone(),
-            node: node_id,
+            node: node_id.clone(),
             run_id: run_id.to_string(),
             prompt,
         },
     );
+    // (DES-L1 PR-1D, core#484) `denial_gate: auto_reject` — an UNATTENDED campaign answers the
+    // engine's ESCALATION gate itself, so a denied node never parks the campaign forever. Keyed on
+    // the DURABLE gate row (the run's open `interaction_requests` row — `gate_kind`), never on the
+    // prompt's wording: only `escalation` (a denied unit) is auto-rejected; a def / run-level /
+    // deliver gate the def or the launch asked for HOLDS for a human. The Reject rides the SAME
+    // `actor::confirm_gate` arm the operator's Reject does (D-2: cancel); the node reconciles to
+    // `Cancelled` through the deferred `RunCancelled` → `on_run_finished` exactly as a human reject
+    // would, and dependents follow the `OnSuccess` edge rule (`dep_bad`).
+    if campaign.def.denial_gate == DenialGatePolicy::AutoReject {
+        let escalation = crate::interaction::list_interactions(
+            store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )?
+        .iter()
+        .any(|r| r.gate_kind.as_deref() == Some("escalation"));
+        if escalation {
+            eprintln!(
+                "wicked-core: campaign {} node {node_id}: denial_gate=auto_reject answers the \
+                 escalation gate of run {run_id} with Reject (core#484)",
+                campaign.id
+            );
+            if let Err(e) = crate::actor::confirm_gate(
+                store,
+                subscribers,
+                seams.runner,
+                seams.self_tx,
+                in_flight,
+                run_id,
+                HumanDecision::Reject,
+                &None,
+                &None,
+                seams.process_gen,
+                false,
+            ) {
+                eprintln!(
+                    "wicked-core: campaign {} node {node_id}: auto_reject could not answer the \
+                     gate of run {run_id}: {e} — the node HOLDS for a human",
+                    campaign.id
+                );
+            }
+        }
+    }
     try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
     finalize_if_done(&mut campaign, subscribers);
     persist(store, &mut campaign)?;
@@ -1746,6 +1818,7 @@ mod tests {
             edges: vec![],
             policy: FailurePolicy::ContinueIndependent,
             max_concurrency: 1,
+            denial_gate: Default::default(),
         };
         assert!(validate(&ok).is_ok());
 
@@ -1805,6 +1878,7 @@ mod tests {
             edges: vec![edge("A", "B", EdgeCondition::OnSuccess)],
             policy: FailurePolicy::ContinueIndependent,
             max_concurrency: 2,
+            denial_gate: Default::default(),
         };
         let mut c = Campaign::new(def);
         c.node_status.insert("A".into(), NodeStatus::Completed);
@@ -1820,6 +1894,8 @@ mod tests {
 
         let back = Campaign::from_node(&c.to_node()).expect("from_node");
         assert_eq!(back.id, "camp1");
+        // (DES-L1 PR-1D) The escalation-gate policy round-trips and defaults to `hold`.
+        assert_eq!(back.def.denial_gate, DenialGatePolicy::Hold);
         assert_eq!(back.status_of("A"), NodeStatus::Completed);
         assert_eq!(back.node_run_id.get("A").unwrap(), "camp1:A:a0");
         // pending_decision rehydrated from its persisted amend shape.
@@ -1874,6 +1950,7 @@ mod tests {
             edges: vec![],
             policy: FailurePolicy::default(),
             max_concurrency: 4,
+            denial_gate: Default::default(),
         };
         let mut c = Campaign::new(def);
         c.node_status.insert("A".into(), NodeStatus::Running);
@@ -1885,5 +1962,27 @@ mod tests {
             2,
             "only Running consumes a slot; AwaitingHuman + ReadyToResume do not"
         );
+    }
+
+    /// DES-L1 PR-1D (core#484): `denial_gate` is additive — absent ⇒ `hold` (today), `auto_reject`
+    /// parses, the tokens are snake_case on the wire like `policy`, anything else is refused.
+    #[test]
+    fn denial_gate_defaults_to_hold_and_parses_auto_reject() {
+        let base = serde_json::json!({ "id": "c", "nodes": [], "max_concurrency": 1 });
+        let def: CampaignDef = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(def.denial_gate, DenialGatePolicy::Hold);
+        let mut auto = base;
+        auto["denial_gate"] = serde_json::json!("auto_reject");
+        let def: CampaignDef = serde_json::from_value(auto).unwrap();
+        assert_eq!(def.denial_gate, DenialGatePolicy::AutoReject);
+        assert_eq!(
+            serde_json::to_value(&def).unwrap()["denial_gate"],
+            "auto_reject"
+        );
+        assert_eq!(DenialGatePolicy::Hold.as_wire(), "hold");
+        assert!(serde_json::from_value::<CampaignDef>(serde_json::json!({
+            "id": "c", "nodes": [], "max_concurrency": 1, "denial_gate": "cancel_everything"
+        }))
+        .is_err());
     }
 }

@@ -245,7 +245,11 @@ export declare class Core {
    * Validate + launch a campaign — a DAG of Runs (DES-CAMPAIGN-001). `defJson` is a
    * `CampaignDef` JSON object in the engine wire shape (snake_case): `{ id, name?, nodes:
    * [{ node_id, run_spec: { problem, clis, entity_mode, human_confirm?, repo_ref?,
-   * workflow_id? } }], edges?: [{ from, to, condition? }], policy?, max_concurrency }`.
+   * workflow_id? } }], edges?: [{ from, to, condition? }], policy?, max_concurrency,
+   * denial_gate?: "hold" | "auto_reject" }` — `denial_gate` (DES-L1 PR-1D, core#484) says what
+   * an unattended campaign does when a node parks at the engine's ESCALATION gate: `hold`
+   * (default) waits for a human, `auto_reject` answers it with Reject (the node cancels, its
+   * dependents follow the edge rule); def / run-level gates always hold.
    * Resolves to the campaign id. Fire-and-forget: independent nodes dispatch immediately and
    * progress arrives as the `campaign*` CoreEvents — `subscribe()` first. Rejects a cycle /
    * empty / duplicate-edge / unknown-edge-endpoint def at launch, before anything persists.

@@ -95,7 +95,8 @@ pub use bus::{
 pub use campaign::{
     all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
     validate as validate_campaign, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision,
-    CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
+    CampaignNode, CampaignStatus, DenialGatePolicy, EdgeCondition, FailurePolicy, NodeStatus,
+    RunSpec,
 };
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
 pub use code_graph::{

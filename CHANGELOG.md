@@ -1351,6 +1351,21 @@ Two release tracks share this file, newest entry first regardless of track:
   steer on the read-only cursor, the shape #465 reported, kept as the default by ruling (BC-04: the
   studio sends `creator` whenever the cursor is not a creator). The `scope` token renders on the
   wire for all three arms (`cursor` | `creator` | `request_changes`).
+- **Campaigns gain `denial_gate: hold | auto_reject` — an unattended campaign no longer parks forever
+  at the engine's escalation gate (DES-L1 PR-1D; core #484).** `CampaignDef` gains the additive
+  `denial_gate` (absent ⇒ `hold`, today). Under `auto_reject`, when a node's run pauses,
+  `on_node_awaiting` reads the run's DURABLE open gate row (`interaction_requests.gate_kind`) — never
+  the prompt's wording — and answers an `escalation` gate (a denied unit) with Reject through the same
+  `actor::confirm_gate` arm an operator's Reject takes (D-2: cancel): `campaignNodeAwaitingHuman` is
+  disclosed first, the run cancels, the node reconciles to `Cancelled` and its dependents follow the
+  `OnSuccess` edge rule. "Escalation" is EVERY `escalate_denied_unit` class — a verdict, floor or
+  boundary denial AND the dead-seat gate (a quota-exhausted seat cancels the node under `auto_reject`
+  instead of waiting for a reassign). Def-, run-level and deliver gates HOLD under both policies — a
+  gate the def or the launch asked for is never answered for the operator. Campaign NODES only: a
+  single run (crew's interactive chat/draft/demo/edit subscribers included) still parks as today.
+  Real-engine test: `auto_reject` cancels
+  the escalation-gated node and holds the `human_confirm: all` node; `hold` parks both. core-ts
+  `launchCampaign` doc lists the field (snake_case wire).
 
 <!-- fixall L3 -->
 - **The repo-checks floor heartbeats on the unit's transcript stream (crew #581, F-BM-010).**
