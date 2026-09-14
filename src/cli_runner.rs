@@ -725,7 +725,14 @@ fn with_floor_heartbeat<R>(
         s.spawn(move || {
             let t0 = std::time::Instant::now();
             emit(&format!("{label} — 0 min"));
-            while stop_rx.recv_timeout(every).is_err() {
+            // Tick ONLY on a timeout. `Disconnected` means `stop_tx` was dropped without a send —
+            // `work` panicked and the closure unwound — and the ticker must exit so the scope can
+            // join it and propagate the panic; `is_err()` would spin here forever, emitting false
+            // liveness for a floor that is already dead (review on #512).
+            while matches!(
+                stop_rx.recv_timeout(every),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
                 emit(&format!("{label} — {} min", t0.elapsed().as_secs() / 60));
             }
         });
@@ -3671,6 +3678,31 @@ mod floor_heartbeat_tests {
                 "ticks are spaced by `every`, not a busy loop: {after:?}"
             );
         }
+    }
+
+    /// Review on #512: a floor that PANICS must not leave the ticker spinning with false liveness.
+    /// `stop_tx` is dropped by the unwinding closure without a send → `Disconnected` → the ticker
+    /// exits, the scope joins it, the panic propagates — promptly, with no further heartbeat.
+    #[test]
+    fn a_panicking_floor_stops_the_heartbeat_and_propagates() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let sink = recording_sink(&seen, t0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_floor_heartbeat(&sink, "floor", Duration::from_millis(50), || -> u8 {
+                std::thread::sleep(Duration::from_millis(120));
+                panic!("the floor blew up");
+            })
+        }));
+        assert!(result.is_err(), "the panic propagates through the scope");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "no hang: the ticker exited on Disconnected"
+        );
+        let at_return = seen.lock().unwrap_or_else(|p| p.into_inner()).len();
+        std::thread::sleep(Duration::from_millis(300));
+        let after = seen.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(after, at_return, "no heartbeat after the panic");
     }
 
     /// Work that returns at once emits exactly the start heartbeat, and the call returns
