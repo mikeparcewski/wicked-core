@@ -153,7 +153,28 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
+/// D-11 (core#393): a free-text problem plans ONE unit, so a plan of N units is workflow DATA — an
+/// N-phase chain def whose phases are named `unit-1..unit-N` (the deny policies here target the
+/// orchestration phase name `unit-<ord>`, which the def's phase ids now match verbatim). Registered
+/// on `core`; returns the def id for [`spec_with`].
+fn chain_def(core: &Core, n: usize) -> String {
+    let id = format!("chain-{n}");
+    let phases: Vec<String> = (1..=n)
+        .map(|i| format!(r#"{{"id":"unit-{i}","kind":"build","gate":"auto"}}"#))
+        .collect();
+    core.register_workflow(format!(
+        r#"{{"id":"{id}","phases":[{}]}}"#,
+        phases.join(",")
+    ))
+    .expect("register the chain def");
+    id
+}
+
 fn spec(session_id: &str, problem: &str) -> LaunchSpec {
+    spec_with(session_id, problem, None)
+}
+
+fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> LaunchSpec {
     LaunchSpec {
         project_id: None,
         problem: problem.into(),
@@ -163,7 +184,7 @@ fn spec(session_id: &str, problem: &str) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow,
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
@@ -271,7 +292,12 @@ fn governance_deny_through_the_engine_halts_run_at_the_escalation_gate() {
 
     // Two units; unit 1's output trips the deny → the run must halt BEFORE unit 2 — at the
     // escalation gate (core#464: a denial pauses with a route back, it no longer fails the run).
-    core.launch_run(spec("r", "task one. task two")).unwrap();
+    core.launch_run(spec_with(
+        "r",
+        "task one. task two",
+        Some(chain_def(&core, 2)),
+    ))
+    .unwrap();
     wait_status(
         &core,
         "r",
@@ -330,7 +356,12 @@ fn a_deny_policy_registered_through_the_engine_api_actually_halts_a_run() {
         }),
     );
     core.register_deny_policy("unit-1", "DEPLOY").unwrap();
-    core.launch_run(spec("r", "task one. task two")).unwrap();
+    core.launch_run(spec_with(
+        "r",
+        "task one. task two",
+        Some(chain_def(&core, 2)),
+    ))
+    .unwrap();
     wait_status(&core, "r", SessionStatus::AwaitingHuman, "a deny policy registered via the engine API halts the run at the escalation gate (it targets the real unit phases)");
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
@@ -430,7 +461,8 @@ fn deny_policy_fires_on_a_unit_beyond_the_64th() {
         .map(|i| format!("step {i}"))
         .collect::<Vec<_>>()
         .join(". ");
-    core.launch_run(spec("r", &problem)).unwrap();
+    core.launch_run(spec_with("r", &problem, Some(chain_def(&core, 65))))
+        .unwrap();
     wait_status(
         &core,
         "r",
@@ -474,7 +506,7 @@ fn a_run_exceeding_the_governed_unit_limit_is_rejected_fail_closed() {
         .collect::<Vec<_>>()
         .join(". ");
     let err = core
-        .launch_run(spec("r", &problem))
+        .launch_run(spec_with("r", &problem, Some(chain_def(&core, 300))))
         .expect_err("an over-limit run is rejected at launch");
     assert!(
         err.to_string().contains("governed"),
@@ -493,7 +525,12 @@ fn worker_failure_halts_run_as_failed() {
             ran: ran.clone(),
         }),
     );
-    core.launch_run(spec("r", "task one. task two")).unwrap();
+    core.launch_run(spec_with(
+        "r",
+        "task one. task two",
+        Some(chain_def(&core, 2)),
+    ))
+    .unwrap();
     wait_status(
         &core,
         "r",
@@ -556,7 +593,12 @@ fn cancel_while_a_worker_is_in_flight_terminates_and_is_not_wedged() {
             release: Mutex::new(release_rx),
         }),
     );
-    core.launch_run(spec("r", "task one. task two")).unwrap();
+    core.launch_run(spec_with(
+        "r",
+        "task one. task two",
+        Some(chain_def(&core, 2)),
+    ))
+    .unwrap();
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("unit 0's worker is in flight (blocked)");

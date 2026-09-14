@@ -113,7 +113,15 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         Arc::new(FixedDispatcher),
         Arc::new(OkRunner),
     );
-    // "build" unit + "review" unit (the keyword classifies stage), roster of two seats.
+    // A "build" unit + a "review" unit, roster of two seats. D-11 (core#393): free text plans ONE
+    // unit now, so the two stages come from a 2-phase def (`kind` is the stage — data, not a
+    // keyword guess); the evaluator≠creator rule under test is unchanged.
+    core.register_workflow(
+        r#"{"id":"p10-build-review","phases":[
+          {"id":"build","kind":"build","gate":"auto"},
+          {"id":"review","kind":"review","gate":"auto","depends_on":["build"]}]}"#,
+    )
+    .expect("register the 2-phase def");
     core.launch_run(LaunchSpec {
         project_id: None,
         problem: "Build the auth feature. Then review it for security".into(),
@@ -123,7 +131,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow: Some("p10-build-review".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,

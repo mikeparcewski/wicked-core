@@ -93,6 +93,23 @@ impl StepRunner for OkRunner {
     }
 }
 
+/// The three-unit plan these tests need. D-11 (core#393): a free-text problem now plans ONE unit,
+/// the brief verbatim — the multi-unit shape comes from workflow DATA, so the runs here take a
+/// 3-phase def (registered by [`boot`]) instead of the deleted sentence split.
+const EVLOG_DEF: &str = r#"{"id":"evlog-3","phases":[
+  {"id":"one","kind":"build","gate":"auto"},
+  {"id":"two","kind":"build","gate":"auto","depends_on":["one"]},
+  {"id":"three","kind":"build","gate":"auto","depends_on":["two"]}]}"#;
+
+/// A `Core` on `db` with the 3-phase def registered (re-registration on a reopened store is
+/// judged as authored — idempotent).
+fn boot(db: String) -> Core {
+    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    core.register_workflow(EVLOG_DEF)
+        .expect("register the 3-phase def");
+    core
+}
+
 fn spec(session: &str) -> LaunchSpec {
     LaunchSpec {
         project_id: None,
@@ -103,7 +120,7 @@ fn spec(session: &str) -> LaunchSpec {
         auto_deliver: false,
         repo_ref: None,
         entity_mode: EntityMode::Shared,
-        workflow: None,
+        workflow: Some("evlog-3".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
@@ -156,7 +173,7 @@ fn wait_status(core: &Core, session: &str, want: SessionStatus) {
 fn a_run_with_no_subscriber_still_has_a_readable_event_history_afterwards() {
     let home = scratch("unwatched");
     let db = home.join("estate.db").to_str().unwrap().to_string();
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
 
     // Deliberately NO core.subscribe() before the run.
     core.launch_run(spec("evlog-unwatched")).expect("launch");
@@ -219,7 +236,7 @@ fn a_run_with_no_subscriber_still_has_a_readable_event_history_afterwards() {
 fn concurrent_runs_do_not_contaminate_each_others_history() {
     let home = scratch("isolation");
     let db = home.join("estate.db").to_str().unwrap().to_string();
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
 
     core.launch_run(spec("evlog-org-a")).expect("launch a");
     core.launch_run(spec("evlog-org-b")).expect("launch b");
@@ -252,7 +269,7 @@ fn concurrent_runs_do_not_contaminate_each_others_history() {
 fn the_recorded_history_matches_what_the_live_stream_carried() {
     let home = scratch("agreement");
     let db = home.join("estate.db").to_str().unwrap().to_string();
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
 
     let rx = core.subscribe();
     core.launch_run(spec("evlog-agree")).expect("launch");
@@ -299,11 +316,7 @@ fn history_survives_the_core_that_wrote_it() {
     let db = home.join("estate.db").to_str().unwrap().to_string();
 
     let before = {
-        let core = Core::spawn_with_engine(
-            db.clone(),
-            Arc::new(FirstOptionDispatcher),
-            Arc::new(OkRunner),
-        );
+        let core = boot(db.clone());
         core.launch_run(spec("evlog-restart")).expect("launch");
         wait_terminal(&core, "evlog-restart");
         core.run_events("evlog-restart")
@@ -311,7 +324,7 @@ fn history_survives_the_core_that_wrote_it() {
     };
     assert!(!before.is_empty());
 
-    let core2 = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core2 = boot(db);
     let after = core2.run_events("evlog-restart");
     assert_eq!(
         after.len(),
@@ -332,7 +345,7 @@ fn history_survives_the_core_that_wrote_it() {
 fn streamed_output_chunks_are_kept_out_of_the_durable_history() {
     let home = scratch("nodeltas");
     let db = home.join("estate.db").to_str().unwrap().to_string();
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
 
     core.launch_run(spec("evlog-nodeltas")).expect("launch");
     wait_terminal(&core, "evlog-nodeltas");
@@ -361,7 +374,7 @@ fn streamed_output_chunks_are_kept_out_of_the_durable_history() {
 fn no_event_reaches_a_subscriber_without_also_reaching_the_log() {
     let home = scratch("nogap");
     let db = home.join("estate.db").to_str().unwrap().to_string();
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
 
     let rx = core.subscribe();
     core.launch_run(spec("evlog-nogap")).expect("launch");
@@ -439,11 +452,7 @@ fn seq_stays_monotonic_across_a_real_process_restart() {
 
     // Process one: run up to the gate before unit 2, then go away with the run paused.
     let before = {
-        let core = Core::spawn_with_engine(
-            db.clone(),
-            Arc::new(FirstOptionDispatcher),
-            Arc::new(OkRunner),
-        );
+        let core = boot(db.clone());
         let mut s = spec(RESTART_RUN);
         s.human_confirm = HumanConfirm::Before(2);
         core.launch_run(s).expect("launch");
@@ -475,7 +484,7 @@ fn seq_stays_monotonic_across_a_real_process_restart() {
     );
 
     // Read back through the public API — the path crew's `GET /runs/:id/events` takes.
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
     let after = core.run_events(RESTART_RUN);
     assert!(
         after.len() > before.len(),
@@ -553,7 +562,7 @@ fn seq_restart_child_approves_the_gate_in_a_fresh_process() {
     let Ok(db) = std::env::var(RESTART_CHILD_DB) else {
         return;
     };
-    let core = Core::spawn_with_engine(db, Arc::new(FirstOptionDispatcher), Arc::new(OkRunner));
+    let core = boot(db);
     let status = core
         .confirm_gate(
             RESTART_RUN,

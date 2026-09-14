@@ -87,7 +87,7 @@ fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
         human_confirm: hc,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow: Some("gates-2".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
@@ -106,6 +106,21 @@ fn new_core(name: &str) -> (Core, RanLog) {
         Arc::new(RecordingRunner { ran: ran.clone() }),
     );
     (core, ran)
+}
+
+/// Two agent phases, `auto` def gates — the RUN-LEVEL `human_confirm` under test is what pauses.
+/// D-11 (core#393): a free-text problem plans ONE unit now; the two-unit plan these gate tests need
+/// (pause BEFORE unit 2, "both units ran") is workflow DATA.
+const GATES_DEF: &str = r#"{"id":"gates-2","phases":[
+  {"id":"one","kind":"build","gate":"auto"},
+  {"id":"two","kind":"build","gate":"auto","depends_on":["one"]}]}"#;
+
+/// Register the def on `core` (idempotent) and launch `spec(id, hc)` against it — every `Core` in
+/// this file launches through here, however it was spawned.
+fn launch(core: &Core, id: &str, hc: HumanConfirm) -> anyhow::Result<String> {
+    core.register_workflow(GATES_DEF)
+        .expect("register the 2-phase def");
+    core.launch_run(spec(id, hc))
 }
 
 /// How long a status wait may take before it is called a failure.
@@ -158,8 +173,7 @@ fn ran_ix(ran: &RanLog) -> Vec<usize> {
 fn gate_before_specific_unit_pauses_then_approve_resumes() {
     let (core, ran) = new_core("approve");
     // Pause before unit 2 (ord == 2). Unit 1 runs, then the run pauses.
-    core.launch_run(spec("r", HumanConfirm::Before(2)))
-        .expect("launch");
+    launch(&core, "r", HumanConfirm::Before(2)).expect("launch");
 
     assert!(
         wait_status(&core, "r", SessionStatus::AwaitingHuman),
@@ -193,8 +207,7 @@ fn gate_before_specific_unit_pauses_then_approve_resumes() {
 fn gate_reject_cancels_the_run() {
     let (core, ran) = new_core("reject");
     // Pause before unit 1 (the very first unit).
-    core.launch_run(spec("r", HumanConfirm::Before(1)))
-        .expect("launch");
+    launch(&core, "r", HumanConfirm::Before(1)).expect("launch");
     assert!(
         wait_status(&core, "r", SessionStatus::AwaitingHuman),
         "the run pauses before unit 1"
@@ -222,8 +235,7 @@ fn gate_reject_cancels_the_run() {
 fn gate_all_pauses_each_unit_and_amend_redirects() {
     let (core, ran) = new_core("amend");
     // Pause before EVERY unit.
-    core.launch_run(spec("r", HumanConfirm::All))
-        .expect("launch");
+    launch(&core, "r", HumanConfirm::All).expect("launch");
 
     // Pause before unit 1 → approve WITH an amendment that redirects the work.
     assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
@@ -266,8 +278,7 @@ fn gate_all_pauses_each_unit_and_amend_redirects() {
 #[test]
 fn cancel_run_terminates_a_paused_run() {
     let (core, _ran) = new_core("cancel");
-    core.launch_run(spec("r", HumanConfirm::Before(1)))
-        .expect("launch");
+    launch(&core, "r", HumanConfirm::Before(1)).expect("launch");
     assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
 
     let status = core.cancel_run("r").expect("cancel");
@@ -299,8 +310,7 @@ fn t_d4_pre_unit_gate_approval_is_a_first_dispatch_not_rework() {
     let (core, _ran) = new_core("dispatched");
     let events = core.subscribe();
     // Pause before unit 2 (ord 2): unit 1 (ord 1) dispatches at attempt 0, then the run pauses.
-    core.launch_run(spec("r", wicked_core::HumanConfirm::Before(2)))
-        .expect("launch");
+    launch(&core, "r", wicked_core::HumanConfirm::Before(2)).expect("launch");
     assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
 
     // Approve → the cursor unit (ord 2) has NEVER run, so this is its FIRST dispatch: attempt stays 0.
@@ -340,8 +350,7 @@ fn t_d5_gate_evaluated_carries_depth_and_matches_combine_verdict() {
 
     let (core, _ran) = new_core("gate-eval");
     let events = core.subscribe();
-    core.launch_run(spec("r", wicked_core::HumanConfirm::None))
-        .expect("launch");
+    launch(&core, "r", wicked_core::HumanConfirm::None).expect("launch");
     assert!(wait_status(&core, "r", SessionStatus::Completed));
 
     // Walk the stream: each GateEvaluated must be followed by a GateDecided with allow == combined.
@@ -480,8 +489,7 @@ fn t_d5_gate_evaluated_surfaces_the_evaluator_denial_reason() {
         Arc::new(FixedOutRunner("EVALDENY appears in the output".into())),
     );
     let events = core.subscribe();
-    core.launch_run(spec("r", wicked_core::HumanConfirm::None))
-        .expect("launch");
+    launch(&core, "r", wicked_core::HumanConfirm::None).expect("launch");
     // core#464: the evaluator denial pauses the run at the escalation gate instead of failing it.
     assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
 

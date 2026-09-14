@@ -96,6 +96,13 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
+/// D-11 (core#393): a free-text problem plans ONE unit, so the two-unit runs below take this def —
+/// two agent phases named `unit-1` / `unit-2`, the orchestration phase names the deny policies here
+/// target, so `deny_policy("unit-1", ..)` still lands on the first unit.
+const TWO_UNIT_WORKFLOW: &str = r#"{"id":"two-unit","phases":[
+  {"id":"unit-1","kind":"build","gate":"auto"},
+  {"id":"unit-2","kind":"build","gate":"auto","depends_on":["unit-1"]}]}"#;
+
 /// A `bug`-SHAPED def for the conditional-gate tests: the same four phase ids in the same order, the
 /// same `HumanConfirmIf(VerdictNotPass)` + `verified_evidence` gate on `verify` (registration arms it
 /// with the shipped evidence floor, exactly as `bug/verify` carries), but a `fix` phase that is a
@@ -204,7 +211,10 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
     }
     let core = Core::spawn_with_engine(db, Arc::new(StubDispatcher), Arc::new(OkRunner));
 
-    // Two units; unit 1's description trips the deny → the SYNC run must halt as Failed BEFORE unit 2.
+    // ONE prose unit (D-11, core#393 — free text plans one unit; the legacy SYNC driver takes no
+    // store-registered def) whose description trips the deny → the SYNC run must halt as Failed,
+    // never Completed. "Nothing runs after a denial" is proven on two units by the async twin,
+    // `p2_contract::governance_deny_through_the_engine_halts_run_at_the_escalation_gate`.
     let _ = core.launch(LaunchSpec {
         project_id: None,
         problem: "please DENYME this task. then a second task".into(),
@@ -227,10 +237,10 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
     assert_eq!(v.units[0].status, UnitStatus::Rejected, "unit 1 was denied");
-    assert_ne!(
-        v.units[1].status,
-        UnitStatus::Done,
-        "unit 2 never ran/completed — the SYNC run stopped at the rejection"
+    assert_eq!(v.units.len(), 1, "the prose plan is one unit (D-11)");
+    assert!(
+        v.units.iter().all(|u| u.status != UnitStatus::Done),
+        "nothing completed — the SYNC run stopped at the rejection"
     );
 }
 
@@ -383,6 +393,8 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
             ran: ran.clone(),
         }),
     );
+    core.register_workflow(TWO_UNIT_WORKFLOW)
+        .expect("register the two-unit def");
     core.launch_run(LaunchSpec {
         project_id: None,
         problem: "task one. task two".into(),
@@ -392,7 +404,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow: Some("two-unit".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
@@ -421,7 +433,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
     // the OPERATOR transcript read no longer dead-ends: it returns the partial output beside the
     // structured denial instead of nothing.
     let t = core
-        .unit_transcript("r:u1")
+        .unit_transcript("r:unit-1")
         .expect("a rejected unit keeps its transcript record");
     assert_eq!(
         t.resolution, "rejected",
@@ -440,7 +452,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         t.denial
     );
     assert_eq!(
-        core.work_output("r:u1").as_deref(),
+        core.work_output("r:unit-1").as_deref(),
         Some("EVALDENY appears in the output"),
         "the operator transcript read answers with the partial output, not a dead end"
     );

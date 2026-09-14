@@ -73,7 +73,10 @@ impl StepRunner for ScriptedSeat {
                 input.unit.ord,
                 input.unit.assigned_cli.clone().unwrap_or_default(),
             ));
-            if let (1, Some(wd)) = (input.unit.ord, &input.workdir) {
+            // A run whose id ends in `-ro` is the READER: it touches nothing (D-11 reshaped the
+            // two-unit prose run into two one-unit prose runs; see the floor test).
+            let reader = input.run_id.ends_with("-ro");
+            if let (1, false, Some(wd)) = (input.unit.ord, reader, &input.workdir) {
                 std::fs::create_dir_all(wd.join("src")).unwrap();
                 std::fs::write(wd.join("src/note.txt"), "a note\n").unwrap();
                 git(wd, &["add", "-A"]);
@@ -207,11 +210,12 @@ struct Gate {
     floor_note: Option<String>,
 }
 
-fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
+fn gate_for(events: &[CoreEvent], want_session: &str, want_ord: u32) -> Gate {
     events
         .iter()
         .find_map(|ev| match ev {
             CoreEvent::GateEvaluated {
+                session,
                 ord,
                 has_deterministic_floor,
                 agent_verdict,
@@ -221,7 +225,7 @@ fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
                 ungated_reason,
                 floor_note,
                 ..
-            } if *ord == want_ord => Some(Gate {
+            } if session == want_session && *ord == want_ord => Some(Gate {
                 has_floor: *has_deterministic_floor,
                 agent_verdict: agent_verdict.clone(),
                 judge_cli: judge_cli.clone(),
@@ -235,6 +239,10 @@ fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
         .unwrap_or_else(|| panic!("no gateEvaluated for ord {want_ord}"))
 }
 
+/// D-11 (core#393): a free-text problem plans ONE unit, so the old two-unit prose run became TWO
+/// one-unit PROSE runs on the same repo — `r-w6-floor` (the seat commits) and `r-w6-floor-ro`
+/// (the seat touches nothing). Both units declare nothing and carry the DEFAULT floor
+/// (F-7R2-005) — exactly what this test is about; a def would change the posture under test.
 #[test]
 fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_ungated() {
     let repo = make_git_repo("floor");
@@ -248,42 +256,53 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
         .expect("register");
     let events = core.subscribe();
     let run_id = "r-w6-floor";
-    core.launch_run(LaunchSpec {
-        project_id: None,
-        // Two sentences ⇒ the prose planner's two units: the first writes, the second reads.
-        problem: "Add a note file under src. Confirm the note reads well.".into(),
-        clis: vec![cli("a"), cli("b")],
-        entity_mode: wicked_core::EntityMode::Shared,
-        session_id: run_id.into(),
-        human_confirm: HumanConfirm::None,
-        auto_deliver: false,
-        repo_ref: Some(entry.id.clone()),
-        workflow: None,
-        extra_write_roots: Vec::new(),
-        extra_read_roots: Vec::new(),
-        project_graph: None,
-    })
-    .expect("launch");
+    let ro_id = "r-w6-floor-ro";
+    let launch = |id: &str, problem: &str| {
+        core.launch_run(LaunchSpec {
+            project_id: None,
+            problem: problem.into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: wicked_core::EntityMode::Shared,
+            session_id: id.into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: Some(entry.id.clone()),
+            workflow: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+        })
+        .expect("launch");
+    };
+    launch(run_id, "Add a note file under src.");
     assert!(
         wait_status(&core, run_id, SessionStatus::Completed),
         "a bound prose run with a committing seat and a passing judge completes"
     );
+    launch(ro_id, "Confirm the note reads well.");
+    assert!(
+        wait_status(&core, ro_id, SessionStatus::Completed),
+        "a bound prose run whose seat changes nothing completes ungated"
+    );
     let evs = drain(&events);
     let ran = ran.lock().unwrap().clone();
-    let last_ord = ran.iter().map(|(o, _)| *o).max().expect("units ran");
-    assert!(last_ord >= 2, "two prose units expected, ran {ran:?}");
+    assert!(
+        ran.len() >= 2,
+        "both prose runs ran their unit, ran {ran:?}"
+    );
 
     // (1) The unit that CHANGED the tree: the default floor armed — `repoChecksEvaluated` exists
     // for it (checks ran, or the host could not arm an OS sandbox and the record says so) — and
     // a judge distinct from the creator rendered the verdict. Never `ungated`.
     let checks_for_1 = evs.iter().find_map(|ev| match ev {
         CoreEvent::RepoChecksEvaluated {
+            session,
             ord,
             passed,
             checks,
             sandbox_error,
             ..
-        } if *ord == 1 => Some((*passed, checks.len(), sandbox_error.clone())),
+        } if session == run_id && *ord == 1 => Some((*passed, checks.len(), sandbox_error.clone())),
         _ => None,
     });
     assert!(
@@ -292,7 +311,7 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
          the tree; events: {}",
         evs.len()
     );
-    let g1 = gate_for(&evs, 1);
+    let g1 = gate_for(&evs, run_id, 1);
     assert!(
         !g1.ungated,
         "a unit that changed the tree is never UNGATED: {:?}",
@@ -347,8 +366,8 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
         other => panic!("unexpected repoChecksEvaluated shape for ord 1: {other:?}"),
     }
 
-    // (2) The unit that left the tree alone: honestly UNGATED, with the reason per absent layer.
-    let g2 = gate_for(&evs, last_ord);
+    // (2) The run whose unit left the tree alone: honestly UNGATED, with the reason per absent layer.
+    let g2 = gate_for(&evs, ro_id, 1);
     assert!(
         g2.ungated,
         "an unchanged tree with no judge is UNGATED, never 'pass'"
@@ -369,8 +388,9 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
         g2.floor_note
     );
     assert!(
-        !evs.iter()
-            .any(|ev| matches!(ev, CoreEvent::RepoChecksEvaluated { ord, .. } if *ord == last_ord)),
+        !evs.iter().any(
+            |ev| matches!(ev, CoreEvent::RepoChecksEvaluated { session, .. } if session == ro_id)
+        ),
         "no checks ran for a unit that changed nothing — the narrator must never say they did"
     );
 
@@ -380,10 +400,11 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
         .iter()
         .find_map(|ev| match ev {
             CoreEvent::RunBaseResolved {
+                session,
                 run_branch,
                 base_commit,
                 ..
-            } => Some((run_branch.clone(), base_commit.clone())),
+            } if session == run_id => Some((run_branch.clone(), base_commit.clone())),
             _ => None,
         })
         .expect("runBaseResolved emitted for a fresh worktree");

@@ -101,7 +101,8 @@ async function main() {
   // The run pauses at the gate. Prove the plan/distribute events streamed AND it is awaiting a human.
   const gate = await waitFor((e) => e.type === 'awaitingHuman', 'awaitingHuman')
   assert(has('sessionStarted'), 'should have seen sessionStarted')
-  assert(events.filter((e) => e.type === 'unitPlanned').length === 2, 'should have planned 2 units')
+  // D-11 (core#393): a free-text problem plans ONE unit, the brief verbatim (was one per sentence).
+  assert(events.filter((e) => e.type === 'unitPlanned').length === 1, 'should have planned 1 unit (D-11)')
   assert(has('unitDistributed'), 'should have seen unitDistributed (council assignment)')
   assert(gate.ord === 1, `gate should pause before unit ord 1, got ${gate.ord}`)
   console.log(`[smoke] ✓ streamed plan/distribute; paused at human gate: "${gate.prompt}"`)
@@ -115,8 +116,8 @@ async function main() {
   assert(has('unitExecuting'), 'should have seen unitExecuting')
   const gates = events.filter((e) => e.type === 'gateDecided')
   assert(gates.length >= 1 && gates.every((g) => g.allow === true), 'gates should decide allow=true')
-  assert(events.filter((e) => e.type === 'unitDone').length === 2, 'both units should be done')
-  console.log('[smoke] ✓ run advanced past the gate to SessionCompleted (2 units done)')
+  assert(events.filter((e) => e.type === 'unitDone').length === 1, 'the one unit should be done')
+  console.log('[smoke] ✓ run advanced past the gate to SessionCompleted (1 unit done)')
 
   // Read back the captured stub transcript for unit 1.
   const out = JSON.parse(await core.workOutput(`${sessionId}:u1`))
