@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus,
-    StepInput, StepOutput, StepRunner, StepStatus,
+    AmendScope, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec,
+    SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Confidence, Dispatcher, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -247,8 +247,14 @@ fn a_deliver_refusal_parks_at_an_escalation_gate_and_approve_re_runs_the_phase()
     assert_eq!(gate, Some(("deliver".to_string(), 1)), "events: {evs:?}");
 
     // (2) Approve → the script REFUSES → the arm parks at `escalation` on the deliver unit.
-    core.confirm_gate(sid, HumanDecision::Approve { amend: None })
-        .expect("approve the deliver gate");
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: AmendScope::default(),
+        },
+    )
+    .expect("approve the deliver gate");
     let evs = drain_until(&events, |ev| {
         matches!(ev, CoreEvent::AwaitingHuman { session, .. } if session == sid)
             || is_terminal(ev, sid)
@@ -365,8 +371,14 @@ fn a_deliver_refusal_parks_at_an_escalation_gate_and_approve_re_runs_the_phase()
 
     // (3) Fix the identity, approve → the phase re-runs (attempt 1) and the run completes.
     std::fs::write(&flag, "fixed\n").unwrap();
-    core.confirm_gate(sid, HumanDecision::Approve { amend: None })
-        .expect("approve the escalation gate");
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: AmendScope::default(),
+        },
+    )
+    .expect("approve the escalation gate");
     assert!(
         wait_status(&core, sid, SessionStatus::Completed),
         "the re-run deliver phase completes the run"
