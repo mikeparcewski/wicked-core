@@ -1410,4 +1410,119 @@ mod tests {
         let agent = crate::domain::WorkUnit::pending("s:deliver", "s", 5, "deliver");
         assert!(agent.tool_cmd.is_none() && !is_deliver_unit(&agent));
     }
+
+    /// DES-L2 2E (D-22 / core #489, F-RC1-132 — P7 "verify said PASS, deliver denied the same
+    /// tree"): the deliver re-verify is the SAME baseline-diff floor the verify phase runs,
+    /// measured against the tip the work was lifted onto. A failure the tip shares does not
+    /// refuse the deliver (classified, not denying); a head-only failure is a `regression` and
+    /// refuses with `passed: false` evidence; with a base known the repo's `test_targeted` is
+    /// preferred, exactly as at verify. `.wicked/checks.json` only — `sh` is the runner, every
+    /// `tests/*.red` marker is a failing test (cargo-style id lines).
+    #[cfg(unix)]
+    #[test]
+    fn deliver_reverify_excuses_failures_the_tip_shares_and_refuses_regressions() {
+        const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
+                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+        let config = serde_json::json!({
+            "test": ["sh", "-c", CHECK],
+            "test_targeted": ["sh", "-c", CHECK],
+            "timeout_s": 60
+        })
+        .to_string();
+        let land_red_check = |o: &Path| {
+            std::fs::create_dir_all(o.join(".wicked")).unwrap();
+            std::fs::create_dir_all(o.join("tests")).unwrap();
+            std::fs::write(o.join(".wicked/checks.json"), &config).unwrap();
+            std::fs::write(o.join("tests/shared.red"), "").unwrap();
+            std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+        };
+        let checks_evaluated = |evs: &[CoreEvent], passed_wanted: bool| {
+            evs.iter()
+                .filter(|e| matches!(e, CoreEvent::RepoChecksEvaluated { passed, .. } if *passed == passed_wanted))
+                .count()
+        };
+
+        // (A) The tip's own red test is not this run's fault: the deliver is CLEARED, the
+        // failure classified against the tip, the targeted command preferred.
+        let (clone, wt) = stale_base_layout("reverify-shared");
+        land_on_origin("reverify-shared", &clone, land_red_check);
+        let ctx = ctx_for(&clone, &wt, None);
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let clearance = match lift_and_reverify(&ctx, "reverify-shared", 5, 0, &emit) {
+            Ok(c) => c,
+            Err(e) if e.contains("no OS write boundary") => {
+                eprintln!("deliver_lift: no sandbox tool here — the re-verify floor cannot run");
+                return;
+            }
+            Err(e) => panic!("a failure the tip shares must not refuse the deliver: {e}"),
+        };
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_eq!(clearance.verified_base.as_deref(), Some(tip.as_str()));
+        let report = clearance
+            .checks
+            .expect("the tree was not verified before ⇒ the checks ran");
+        assert!(report.passed, "{report:?}");
+        let c = &report.checks[0];
+        assert_eq!(
+            c.name, "test_targeted",
+            "with a base known the targeted set is preferred"
+        );
+        assert_eq!(c.failure_ids, vec!["test shared".to_string()]);
+        assert!(!c.denies(), "{c:?}");
+        assert!(
+            matches!(
+                c.classification.as_deref(),
+                Some(crate::repo_checks::FLOOR_ENV_MISMATCH)
+                    | Some(crate::repo_checks::PRE_EXISTING_IN_SANDBOX)
+            ),
+            "a failure the tip shares is classified, never a bare failure: {c:?}"
+        );
+        let base = c.base.as_ref().expect("the base run rides the record");
+        assert_eq!(
+            base.head, tip,
+            "measured against the tip the work was lifted onto"
+        );
+        assert_eq!(
+            base.run.as_ref().map(|r| r.failure_ids.clone()),
+            Some(vec!["test shared".to_string()])
+        );
+        assert_eq!(
+            checks_evaluated(&events.borrow(), false),
+            0,
+            "nothing refused"
+        );
+
+        // (B) A red test only the run's tree has is a REGRESSION: refused, with evidence.
+        let (clone, wt) = stale_base_layout("reverify-regression");
+        land_on_origin("reverify-regression", &clone, land_red_check);
+        std::fs::create_dir_all(wt.join("tests")).unwrap();
+        std::fs::write(wt.join("tests/new.red"), "").unwrap();
+        let ctx = ctx_for(&clone, &wt, None);
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let err = lift_and_reverify(&ctx, "reverify-regression", 5, 0, &emit)
+            .err()
+            .expect("a head-only failure refuses the deliver");
+        assert!(
+            err.contains(crate::repo_checks::REGRESSION) && err.contains("Nothing was pushed"),
+            "{err}"
+        );
+        assert_eq!(
+            checks_evaluated(&events.borrow(), false),
+            1,
+            "the refusal carries evidence"
+        );
+        let regressions = events
+            .borrow()
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::RepoChecksEvaluated { checks, .. } => {
+                    checks.first().map(|c| c.regressions.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(regressions, vec!["test new".to_string()]);
+    }
 }
