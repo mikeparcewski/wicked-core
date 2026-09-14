@@ -1367,6 +1367,42 @@ Two release tracks share this file, newest entry first regardless of track:
   the escalation-gated node and holds the `human_confirm: all` node; `hold` parks both. core-ts
   `launchCampaign` doc lists the field (snake_case wire).
 
+<!-- fixall L2 -->
+- **Linux floor: bwrap masks only the secret dirs that EXIST (core #460 / #493 / #415, F-SMOKE-001;
+  DES-L2 §5).** The checks-sandbox argv pushed `--tmpfs <HOME>/<dir>` for every one of the six curated
+  secret dirs with no existence check; bwrap `mkdir`s a missing `--tmpfs` destination and, under
+  `--ro-bind / /`, dies BEFORE exec — `bwrap: Can't mkdir <HOME>/.aws: Read-only file system`, exit 1.
+  Every repo-checks floor and every pinned validator on a Linux daemon whose `HOME` lacked one of the
+  six therefore failed and blamed the work (`install` "failed"; `pinned validator failed: <criterion>`).
+  The loop now takes `filter(is_dir)` — a missing dir has nothing to mask and its parent is read-only
+  inside the jail, so nothing widens. A Linux regression test (`HOME` lacking the dirs → the wrapper
+  runs `/bin/true`) rides the CI ubuntu leg, which now installs bubblewrap so the `#[cfg(unix)]`
+  sandbox tests arm the real jail instead of printing their skip.
+- **A launcher that fails to arm is never the check's failure (core #493, #460).** ONE predicate
+  (`validator::launcher_failure`: an armed wrapper + a first stderr line of `bwrap:` / `sandbox-exec:`
+  on a non-zero exit) at both floor spawn sites: the repo-checks floor records the check as
+  `could_not_run` with `spawnError: "the OS sandbox launcher exited before the check ran: …"`, and the deterministic
+  validator reports `Unrunnable` (rendered `pinned validator COULD NOT BE RUN … the OS sandbox launcher
+  exited before the check ran: …`). Both still deny (fail-closed); the attribution is now honest. The validator's
+  stderr is teed for the classification — it reaches the daemon log exactly as before.
+- **The checks' `TMPDIR` leaves the worktree (core #489, F-RC1-132 / F-RC2-009b; DES-L2 §5 2A).**
+  The floor set `TMPDIR` to `<worktree>/tmp/wicked-checks/tmp`; on a deep worktree (the RC1 rig's
+  was 136 bytes) any test binding a Unix socket under it overflowed `sun_path` (104 bytes on macOS)
+  and failed with `listen EINVAL` on every retry — 35 failures in wicked-bus's suite the code did
+  not have. `TMPDIR`/`TMP`/`TEMP` now point at `<system temp>/wc-<6 random hex>` (mode 0700, drawn
+  per floor, an existing path at the drawn name refused for a fresh draw, reaped with the floor),
+  armed as the boundary's second write root — `run_floor` now prepares the scratch, THEN probes the
+  sandbox with both roots. The env record's `tmpdir` changes accordingly (58 bytes on a macOS
+  per-user temp dir). The worktree scratch keeps every other leaf.
+- **Head and base cargo runs no longer share one `CARGO_TARGET_DIR` (core #480; DES-L2 §5 2B).**
+  `cargo-target/head` vs `cargo-target/base`: cargo's mtime freshness check could hand a head check
+  the base's test binaries through the shared dir (the contamination behind the benchmark's false
+  regression, F-BM-009).
+- **Windows names its gap (core #416).** With no OS write boundary the sandbox probe's reason on
+  Windows now reads `Windows has no OS write boundary the engine can arm — no sandbox-exec/bwrap
+  equivalent; the repository-checks floor never runs on this OS and a code-verifying phase fails
+  closed at its gate; run the daemon on macOS/Linux or verify in CI` instead of the (true, silent)
+  `no OS-sandbox tool on PATH`.
 <!-- fixall L3 -->
 - **The repo-checks floor heartbeats on the unit's transcript stream (crew #581, F-BM-010).**
   After the worker returned, the floor (`typecheck`/`lint`/`test`, up to 3600 s per check) ran on
