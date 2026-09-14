@@ -1770,6 +1770,11 @@ impl WrappedCliStepRunner {
                 input.unit.assigned_cli.as_deref(),
             );
             stamp_run_markers(&mut cmd, &provenance);
+            // D-7 (DES-L4 PR-⑦): garden's estate shim spawns `wicked-estate-mcp --readonly` by
+            // default on EVERY wrapped worker — the read-only default the deleted CLI-registered MCP
+            // used to carry as a process flag now rides garden's own env contract; the fence's
+            // `--readonly` token check stays the audit. Set for every unit, governed or not.
+            cmd.env(crate::gate_hook::ESTATE_READONLY_ENV, "1");
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
             // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
             // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
@@ -2213,71 +2218,8 @@ pub(crate) fn is_node_interpreter(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Locate `wicked-estate-mcp` binary for injecting estate tools into governed workers.
-/// Priority: sibling of wicked-core binary → user-local install → cargo → PATH.
-fn resolve_estate_mcp_exe() -> String {
-    // 1. Sibling of the wicked-core binary (monorepo dev: target/release/).
-    if let Ok(path) = std::env::current_exe() {
-        if !is_node_interpreter(&path) {
-            if let Some(parent) = path.parent() {
-                let sibling = parent.join(if cfg!(windows) {
-                    "wicked-estate-mcp.exe"
-                } else {
-                    "wicked-estate-mcp"
-                });
-                if sibling.exists() {
-                    return sibling.to_string_lossy().into_owned();
-                }
-            }
-        }
-    }
-    // 2. User-local install / cargo / PATH.
-    if let Ok(found) = which_binary("wicked-estate-mcp") {
-        return found;
-    }
-    "wicked-estate-mcp".to_string()
-}
-
-/// The `(command, args)` for the estate MCP server a governed worker should get, over the graph the
-/// engine vouched for (FINDING-122). `None` when there is none: a scratch or the daemon store is
-/// worse than nothing — tools that answer "not found" for a symbol the repo plainly has is how an
-/// agent concludes the code does not exist (estate's R3), and handing over the daemon store is the
-/// FINDING-067 wipe. Shared by BOTH governed paths so the wrapped `settings.json` and the ACP
-/// `session/new` inject the SAME server against the SAME store; each caller formats its own
-/// protocol shape (claude's keyed object vs the ACP array).
-///
-/// WHICH graph this is, is decided upstream by `actor::run_code_graph_db`: the run repo's own, or —
-/// for a run filed into a project whose co-located graph the engine could verify — the PROJECT's.
-///
-/// WRITE SCOPE, partly closed. The handle is writable, and on the project path the file is shared by
-/// every concurrent run in the project. `--readonly` (appended below, DES-GROUNDING-001 §3.0) shuts
-/// the estate MCP *tool surface*, so a worker can no longer mutate the graph THROUGH the MCP — closing
-/// the FINDING-067 delete-sweep via the indexer/write tools. What is NOT yet closed: this `--db` path
-/// is written into the worker-readable inbox mcp-config, so a worker that runs `wicked-estate index
-/// --db <path>` via Bash could still delete-sweep the shared project graph (the binding is verified; a
-/// bash-level indexer write is governed only by the gate-hook, not this path). Fully bounding that —
-/// a read-only DB open, or denying the estate CLI in the boundary — is the follow-up.
-pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(String, Vec<String>)> {
-    code_graph_db
-        .map(str::trim)
-        .filter(|db| !db.is_empty())
-        .map(|db| {
-            (
-                resolve_estate_mcp_exe(),
-                // `--readonly` (DES-GROUNDING-001 §3.0): the estate MCP defaults its memory/knowledge
-                // domains to the OPERATOR's global stores ($WICKED_HOME/{memory,knowledge}.db), so a
-                // worker allow-listed onto the whole server could erase them (FINDING-067 class). The
-                // read-only binary mode advertises and dispatches only read/query tools, hard-rejecting
-                // every write. Enforced in the binary so BOTH carriers (wrapped `--mcp-config` here and
-                // the ACP `session/new` array) are covered identically — the ACP carrier has no
-                // `permissions.allow` analogue, so binary enforcement is the only remedy that reaches it.
-                vec!["--db".to_string(), db.to_string(), "--readonly".to_string()],
-            )
-        })
-}
-
-/// Provenance the worker's estate MCP stamps onto anything it submits (DES-MEM-FACETED-001 follow-on)
-/// — and, since R12 (DES-L4 PR-③), the run MARKERS stamped on the worker `Command` itself.
+/// The run MARKERS stamped on both worker `Command`s (R12, DES-L4 PR-③) — the provenance the estate
+/// MCP behind garden's shim stamps onto anything the worker submits (DES-MEM-FACETED-001 follow-on).
 ///
 /// The estate-mcp `proposal.submit` tool server-stamps provenance from `WICKED_RUN_ID` /
 /// `WICKED_RUN_UNIT` / `WICKED_RUN_AGENT` read from its OWN process env — it stamps whatever is set and
@@ -2285,11 +2227,10 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
 /// proposals belong to, so it sets those on the estate MCP server it launches; without this a promoted
 /// proposal carries empty provenance and is unattributable.
 ///
-/// Returns ORDERED `(name, value)` pairs so each carrier formats them into its own shape — the wrapped
-/// `--mcp-config` `env` OBJECT (`arm_input_governance`) and the ACP `session/new` `env` ARRAY
-/// (`acp_runner`), the two carrier shapes of one repo-scoped store (FINDING-122) — and stamps them,
-/// through [`stamp_run_markers`], on BOTH worker `Command`s, so the estate shim the worker's Bash
-/// spawns (and the `wicked-estate-mcp` behind it) inherits the same three names.
+/// Returns ORDERED `(name, value)` pairs, stamped through [`stamp_run_markers`] on BOTH worker
+/// `Command`s (the wrapped `exec`, the ACP `build_cmd`), so the estate shim the worker's Bash spawns
+/// — and the `wicked-estate-mcp` behind it — inherits the same three names. Since D-7 (DES-L4 PR-⑦)
+/// this is the ONLY provenance channel: no CLI-registered estate MCP receives them any more.
 ///
 /// The run id and unit ordinal are always present on a `StepInput`, so both are always set. The agent
 /// key is ALSO always set: it mirrors the engine's default-seat resolution (`exec`'s `cli_key`,
@@ -2573,7 +2514,9 @@ struct GovLaunch {
 /// `gov.db_path` (the operational store): a worker `wicked-estate index .` against the repo graph
 /// rebuilds its own graph, but against the operational store its delete-sweep removes every
 /// operational node (FINDING-067). Left UNSET when the repo was never indexed — no store beats the
-/// wrong store (the same reasoning as the estate-MCP half, which arms no MCP at all in that case).
+/// wrong store (the shim then refuses an unpinned store, `gate_hook::classify_estate_command`). Since
+/// D-7 (DES-L4 PR-⑦) this env is the ONE graph hand-off on the wrapped carrier — the CLI-registered
+/// estate MCP that also carried the path is gone.
 fn arm_worker_estate_channel(cmd: &mut Command, gov: &GovLaunch) {
     if let Some(db) = gov.code_graph_db.as_deref() {
         cmd.env(crate::gate_hook::ESTATE_DB_ENV, db);
@@ -2760,54 +2703,16 @@ fn arm_input_governance(
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
-    // Include the wicked-estate MCP server so governed workers can GROUND their work in the estate
-    // index (code-graph, and — once wired — memory/knowledge/rules recall), pointed at the run's
-    // REPO-LOCAL (or PROJECT) graph. Using the resolved exe directory to find wicked-estate-mcp avoids
-    // hardcoding a PATH dependency.
-    //
-    // This USED to pass `gov.db_path` — the operational store — "so no separate lookup is needed".
-    // That handed every governed worker a writable handle to the platform's own state, and FINDING-067
-    // is what happened next: a worker told to recon its repo did the obvious thing, ran the estate
-    // indexer against the store it had been given, and the indexer's delete-sweep removed all 833
-    // operational nodes (`agent_session/<id>` and friends live at synthetic locations that are not
-    // files, so "the file is gone" is true of every one of them). The store it wiped held zero source
-    // files, so the worker got nothing out of it either.
-    //
-    // `None` ⇒ NO estate MCP (and no mcp-config file below). Falling back to `gov.db_path` is the bug;
-    // falling back to a scratch db is worse than nothing (tools that answer "not found" for a repo that
-    // plainly has the symbol are how an agent concludes the code does not exist — estate's own R3).
-    //
-    // DES-GROUNDING-001 §3.1: load the server via a SEPARATE `--mcp-config` file, NOT the `--settings`
-    // `mcpServers` key. Proven live: claude only surfaces MCP tools registered through `--mcp-config`;
-    // a server named under `--settings` `mcpServers` never enters the worker's function set (the worker
-    // reported "the MCP tools aren't wired into this session's function set" and fell back to reading
-    // files). `--settings` no longer carries `mcpServers` — it was inert and misleading there. The ACP
-    // path still formats the same parts (from the same `repo_estate_mcp_parts` helper) as its
-    // `session/new` array — one repo-scoped store, two carrier shapes (FINDING-122).
-    let estate_mcp_config =
-        repo_estate_mcp_parts(gov.code_graph_db.as_deref()).map(|(command, args)| {
-            // Server-side provenance for the estate MCP's `proposal.submit` (DES-MEM-FACETED-001
-            // follow-on): the tool reads these from its own process env and stamps promoted proposals
-            // with the run/unit/agent that produced them. The `--mcp-config` carrier takes an `env`
-            // OBJECT ({name: value}); the ACP carrier formats the same pairs as its {name,value} array.
-            let env: serde_json::Map<String, serde_json::Value> = estate_provenance_env(
-                &input.run_id,
-                input.unit.ord,
-                input.unit.assigned_cli.as_deref(),
-            )
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-            serde_json::json!({
-                "mcpServers": {
-                    "wicked-estate": {
-                        "command": command,
-                        "args": args,
-                        "env": env
-                    }
-                }
-            })
-        });
+    // D-7 (DES-L4 PR-⑦): the CLI-registered estate MCP is NO LONGER handed to the worker — no
+    // `--mcp-config` file, no `mcpServers`, no `permissions.allow` for it. Grounding is the estate
+    // SHIM garden's skills run (`wicked-garden run scripts/_estate_client.py --readonly …`), which
+    // reads the graph from `WICKED_ESTATE_DB` (`arm_worker_estate_channel`, the one graph hand-off,
+    // FINDING-067/-069 semantics unchanged: the repo's own graph or nothing, never the operational
+    // store) and spawns `wicked-estate-mcp --readonly` by default because `WICKED_ESTATE_READONLY=1`
+    // rides every worker (`exec`). The gate hook's estate fence audits the `--readonly` token and the
+    // store pin on every shim call (`gate_hook::classify_estate_command`). Deleted with it: the second
+    // transport claude alone had (an org-managed MCP allowlist silently dropped it — F-RC1-045/086),
+    // and the `--db` path written into a worker-readable config file.
     // (codex round 9) an unspellable fenced directory refuses the launch here too — the settings
     // file is never written with a hole the argv flag also lacks.
     let deny = deny_rules(skills_root, operational_home).map_err(std::io::Error::other)?;
@@ -2821,11 +2726,10 @@ fn arm_input_governance(
         // braces on purpose: the flag is the one that survives if this file fails to arm, and the
         // file is the one that survives an operator template that pins its own `--disallowedTools`.
         //
-        // allow `mcp__wicked-estate` (DES-GROUNDING-001 §3.1): a registered MCP tool is still BLOCKED
-        // under `acceptEdits`/headless unless allow-listed — a non-interactive session can't answer the
-        // approval prompt. Whole-server allow is safe because the server runs `--readonly`
-        // (`repo_estate_mcp_parts` / §3.0): there is nothing destructive left to allow.
-        "permissions": { "deny": deny, "allow": ["mcp__wicked-estate"] }
+        // `allow` is EMPTY (D-7, DES-L4 PR-⑦): no MCP server is registered for the worker any more,
+        // so there is nothing to allow-list; grounding calls are ordinary Bash (the shim), judged by
+        // the gate hook like every other tool call.
+        "permissions": { "deny": deny, "allow": [] }
     });
     let dir = decisions_path
         .parent()
@@ -2838,19 +2742,6 @@ fn arm_input_governance(
     let settings_path = dir.join(format!("settings-{phase}.json"));
     let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
     write_private_exclusive(&settings_path, &bytes)?;
-    // Per-unit mcp-config file, ONLY when an estate graph is bound (`None` ⇒ no file, no flag — the
-    // FINDING-067 invariant that a worker never gets the operational store). Same O_EXCL discipline and
-    // same private dir as the settings file. It carries the estate server under its own `mcpServers`
-    // key because `--mcp-config` is the only channel claude surfaces MCP tools from (§3.1).
-    let mcp_config_path = match estate_mcp_config {
-        Some(cfg) => {
-            let path = dir.join(format!("mcp-{phase}.json"));
-            let bytes = serde_json::to_vec(&cfg).map_err(std::io::Error::other)?;
-            write_private_exclusive(&path, &bytes)?;
-            Some(path)
-        }
-        None => None,
-    };
     // Write the ARMED marker BEFORE the CLI runs: its presence lets the actor-side fold distinguish a
     // governed unit that legitimately made no tool-calls (marker only) from one whose evidence was erased
     // or whose hook never fired (marker absent → fail closed). Closes the council evidence-integrity blocker.
@@ -2860,21 +2751,6 @@ fn arm_input_governance(
         Some(crate::gate_hook::CARRIER_WRAPPED_CLI),
     )
     .map_err(|e| std::io::Error::other(e.to_string()))?;
-    // Insert `--mcp-config <path>` FIRST so it parses as a flag (never demoted past the prompt / a `--`
-    // guard). It is variadic and takes a FILE PATH — not comma-joinable — so it cannot ride the
-    // append-or-before-`--` path of `inject_isolation_flags` (a bare positional prompt could be swallowed
-    // as a second config); it goes at argv position 1 exactly like `--settings`. Injected with NO
-    // argv-scan deference guard, like `--settings` below (its one condition is a bound graph — `Some`
-    // below; `None` ⇒ no file, no flag, FINDING-067). A guard scanning the built argv would carry the
-    // model-authored prompt as a bare positional, so a prompt token `--mcp-config` could suppress the
-    // injection and silently un-ground the worker (the untrusted-text-flips-a-boundary hazard
-    // `inject_isolation_flags` avoids by scanning the TEMPLATE, not argv); and `--mcp-config` is variadic,
-    // so an operator template that also pins one merges rather than conflicts — nothing to defer to.
-    // Injected before `--settings` so `--settings` ends up first — keeping the argv layout other callers read.
-    if let Some(path) = mcp_config_path {
-        argv.insert(1, path.to_string_lossy().into_owned());
-        argv.insert(1, "--mcp-config".to_string());
-    }
     // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
     // prompt / a `--` guard).
     argv.insert(1, settings_path.to_string_lossy().into_owned());
@@ -5049,35 +4925,19 @@ mod tests {
             settings_path.starts_with(std::env::temp_dir()),
             "settings live OUTSIDE any worktree (no repo pollution): {settings_path:?}"
         );
-        // This unit binds a graph, so the estate MCP is armed via `--mcp-config <file>` (position 3/4).
-        assert_eq!(argv[3], "--mcp-config");
-        let mcp_config_path = std::path::PathBuf::from(&argv[4]);
-        assert!(mcp_config_path.exists(), "the mcp-config file was written");
+        // D-7 (DES-L4 PR-⑦): NO `--mcp-config` — the graph rides `WICKED_ESTATE_DB` on the worker
+        // Command (`arm_worker_estate_channel`), not a config file; the prompt flag follows `--settings`.
         assert!(
-            mcp_config_path.starts_with(std::env::temp_dir()),
-            "the mcp-config file lives OUTSIDE any worktree: {mcp_config_path:?}"
-        );
-        let mcp_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&mcp_config_path).unwrap()).unwrap();
-        assert_eq!(
-            mcp_json["mcpServers"]["wicked-estate"]["args"][2], "--readonly",
-            "the estate MCP is loaded read-only via --mcp-config"
-        );
-        // The estate MCP carries the run/unit/agent provenance the `proposal.submit` tool stamps
-        // (DES-MEM-FACETED-001 follow-on). run id + unit ord are always present; this unit assigns a
-        // CLI, so the agent key is set too.
-        let env = &mcp_json["mcpServers"]["wicked-estate"]["env"];
-        assert_eq!(
-            env["WICKED_RUN_ID"], input.run_id,
-            "the worker's estate MCP is stamped with the run id"
+            !argv.iter().any(|a| a == "--mcp-config"),
+            "no CLI-registered estate MCP is handed any more: {argv:?}"
         );
         assert_eq!(
-            env["WICKED_RUN_UNIT"], "3",
-            "the worker's estate MCP is stamped with the unit ordinal"
+            argv[3], "-p",
+            "the prompt flag follows the settings pair: {argv:?}"
         );
-        assert_eq!(
-            env["WICKED_RUN_AGENT"], "claude",
-            "the worker's estate MCP is stamped with the assigned CLI"
+        assert!(
+            g.code_graph_db.is_some(),
+            "the bound graph is carried on the launch record for the env channel"
         );
         assert!(
             g.decisions_path.starts_with(std::env::temp_dir()),
@@ -6557,8 +6417,8 @@ mod tests {
             };
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
             arm_input_governance(&input, gov, &mut argv, None, None).unwrap();
-            // Locate each injected config file from the argv (never index a fixed position — arming
-            // now injects both `--settings` and, when a graph is bound, `--mcp-config`).
+            // Locate each injected config file from the argv (never index a fixed position). Since
+            // D-7 (DES-L4 PR-⑦) `--mcp-config` is NEVER injected; `file_after` proves its absence.
             let file_after = |flag: &str| {
                 argv.iter()
                     .position(|a| a == flag)
@@ -6573,7 +6433,7 @@ mod tests {
             };
             let (settings_json, settings_raw) =
                 file_after("--settings").expect("arming inserts `--settings <path>`");
-            // `--mcp-config <path>` is present ONLY when an estate graph is bound.
+            // `--mcp-config <path>` must never be present (D-7).
             let mcp = file_after("--mcp-config");
             let _ = std::fs::remove_dir_all(gov_run_dir_for_test(run_id));
             (settings_json, settings_raw, mcp)
@@ -6586,8 +6446,9 @@ mod tests {
             .into_owned();
         let graph_db = graph_db.as_str();
 
-        // WITH a registered repo: the estate MCP is armed via a SEPARATE `--mcp-config` file (NOT the
-        // `--settings` `mcpServers` key — DES-GROUNDING-001 §3.1), pointed at the REPO-LOCAL graph.
+        // WITH a registered repo: NO estate MCP is handed (D-7, DES-L4 PR-⑦) — the graph rides
+        // `WICKED_ESTATE_DB` on the worker Command (`arm_worker_estate_channel`, asserted by its own
+        // probe test below), never a `--mcp-config` file a worker could read the `--db` path from.
         let (json, raw, mcp) = read_settings(
             &crate::workflow::GovernanceContext {
                 db_path: op_db.to_string(),
@@ -6597,38 +6458,25 @@ mod tests {
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
-        let (mcp_json, mcp_raw) =
-            mcp.expect("the estate MCP is armed via `--mcp-config` when a repo-local graph exists");
-        let args = mcp_json["mcpServers"]["wicked-estate"]["args"]
-            .as_array()
-            .expect("the mcp-config file carries the estate server");
-        assert_eq!(args[0], "--db");
-        assert_eq!(args[1], graph_db, "the MCP opens the repo-local graph");
-        assert_eq!(
-            args[2], "--readonly",
-            "the estate MCP runs read-only so whole-server allow is safe (§3.0)"
+        assert!(
+            mcp.is_none(),
+            "D-7: a bound graph hands NO `--mcp-config` file — the shim is the transport"
         );
-        // The `--settings` object no longer carries `mcpServers` (inert there) and MUST allow the
-        // estate tools so they are callable under `acceptEdits`/headless.
+        // The `--settings` object carries no `mcpServers` and allow-lists NOTHING: there is no
+        // registered server left to allow, and the shim is ordinary Bash the gate hook judges.
         assert!(
             json.get("mcpServers").is_none(),
-            "the settings object must not carry `mcpServers` any more: {json}"
+            "the settings object must not carry `mcpServers`: {json}"
         );
-        let allow = json["permissions"]["allow"]
-            .as_array()
-            .expect("the settings object allow-lists the estate tools");
-        assert!(
-            allow.iter().any(|v| v == "mcp__wicked-estate"),
-            "permissions.allow must include mcp__wicked-estate: {json}"
+        assert_eq!(
+            json["permissions"]["allow"],
+            serde_json::json!([]),
+            "permissions.allow is empty — no `mcp__wicked-estate` (D-7): {json}"
         );
-        // The operational store appears NOWHERE — not in the settings file, not in the mcp-config file.
+        // The operational store appears NOWHERE in the worker's settings.
         assert!(
             !raw.contains(op_db),
             "the operational store must not appear ANYWHERE in the worker's settings: {raw}"
-        );
-        assert!(
-            !mcp_raw.contains(op_db),
-            "the operational store must not appear in the mcp-config file: {mcp_raw}"
         );
 
         // WITHOUT one: NO estate MCP. No mcp-config file at all — not the operational store, not a
@@ -10235,7 +10083,8 @@ mod project_graph_end_to_end_tests {
     }
 
     /// The LAST hop, done for real: arm governance exactly as the wrapped path does and record the
-    /// `--db` the estate MCP server is given in the `--mcp-config` file the engine writes.
+    /// graph the launch binds (`GovLaunch::code_graph_db` — the store `arm_worker_estate_channel`
+    /// hands the worker as `WICKED_ESTATE_DB`; since D-7 there is no `--mcp-config` file to read it from).
     struct ArmingRunner {
         mcp_db: Arc<Mutex<Vec<Option<String>>>>,
     }
@@ -10247,23 +10096,7 @@ mod project_graph_end_to_end_tests {
                 .expect("a governed unit on a file-backed store must carry a governance context");
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
             let settings_db = match arm_input_governance(input, &gov, &mut argv, None, None) {
-                Ok(_) => {
-                    // FIND the mcp-config path rather than indexing a fixed argv slot (Copilot on
-                    // #299). The estate server now lives in the `--mcp-config` file (DES-GROUNDING-001
-                    // §3.1), not the `--settings` `mcpServers` key. If arming ever inserts elsewhere
-                    // this reads the PROMPT as json and the test fails with a parse error that says
-                    // nothing about the real change.
-                    let mcp_config_path = argv
-                        .iter()
-                        .position(|a| a == "--mcp-config")
-                        .and_then(|i| argv.get(i + 1))
-                        .expect("arming must insert `--mcp-config <path>` when a graph is bound");
-                    let mcp_config: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(mcp_config_path).unwrap()).unwrap();
-                    mcp_config["mcpServers"]["wicked-estate"]["args"][1]
-                        .as_str()
-                        .map(str::to_string)
-                }
+                Ok(g) => g.code_graph_db,
                 Err(e) => panic!("arming failed: {e}"),
             };
             self.mcp_db.lock().unwrap().push(settings_db);

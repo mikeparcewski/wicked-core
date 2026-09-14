@@ -11137,7 +11137,8 @@ mod worker_code_graph_tests {
     }
 
     /// The regression. A repo that has never been indexed must yield NO store, so the worker is
-    /// launched with no estate MCP at all.
+    /// launched with no estate store pin at all (`WICKED_ESTATE_DB` unset; since D-7 the shim, not
+    /// a CLI-registered MCP, is what would read it).
     ///
     /// Before the fix this returned `Some(path)`: the resolver ran `create_dir_all` on the graph's
     /// parent and handed back the path regardless, so every graph tool the worker had answered
@@ -11894,8 +11895,8 @@ mod project_graph_binding_tests {
     }
 
     /// …and when the run's own repo has never been indexed either, the answer is still NO ESTATE
-    /// TOOLS. The project binding adds a preference in front of that decision; it does not create a
-    /// new way to end up holding a store nobody vouched for.
+    /// STORE (`WICKED_ESTATE_DB` unset). The project binding adds a preference in front of that
+    /// decision; it does not create a new way to end up holding a store nobody vouched for.
     #[test]
     fn a_refused_binding_on_an_unindexed_repo_still_ships_no_estate_mcp() {
         let dir = scratch("fallback-none");
@@ -11926,7 +11927,8 @@ mod project_graph_binding_tests {
     /// so the label-prefix check is exercised against wicked-estate's actual path spelling rather
     /// than against a fixture that agrees with my reading of it.
     ///
-    /// Prints the exact `(command, args)` `repo_estate_mcp_parts` hands the worker for each case.
+    /// Prints the exact `WICKED_ESTATE_DB` the worker is handed for each case (D-7: the env pin is the
+    /// one graph hand-off; the CLI-registered estate MCP is gone).
     #[test]
     #[ignore = "proof harness — run via proof/prove.sh, which builds the real graphs it needs"]
     fn proof_worker_mcp_db_per_case() {
@@ -11977,22 +11979,20 @@ mod project_graph_binding_tests {
             ("UNBOUND: no project graph on the session", session(None)),
         ];
 
-        println!("\n=== worker estate MCP, per case ===");
+        println!("\n=== worker estate store pin, per case ===");
         for (name, s) in cases {
-            let db = run_code_graph_db(&store, &s, Some(&operational));
-            match crate::execute_wrapped::repo_estate_mcp_parts(db.as_deref()) {
-                Some((_exe, args)) => {
-                    println!("{name}\n    --db {}\n", args[1]);
-                }
-                None => println!("{name}\n    NO estate MCP (no vouched-for graph)\n"),
+            match run_code_graph_db(&store, &s, Some(&operational)) {
+                Some(db) => println!("{name}\n    WICKED_ESTATE_DB={db}\n"),
+                None => println!("{name}\n    NO estate store (no vouched-for graph)\n"),
             }
         }
     }
 
-    /// The bound path is what `repo_estate_mcp_parts` turns into the worker's `--db` argument. This
-    /// is the seam the whole change exists to move, so it is asserted rather than assumed.
+    /// The bound path is what the worker is handed as `WICKED_ESTATE_DB` (`arm_worker_estate_channel`
+    /// / the ACP `build_cmd` — D-7's one graph hand-off). This is the seam the whole change exists to
+    /// move, so it is asserted rather than assumed.
     #[test]
-    fn the_bound_path_becomes_the_workers_estate_mcp_db_argument() {
+    fn the_bound_path_is_the_workers_estate_store_pin() {
         let dir = scratch("mcp-args");
         let db = dir.join("code-graph.db");
         graph_with(&db, &["wicked-core"]);
@@ -12004,16 +12004,22 @@ mod project_graph_binding_tests {
             Some(&op),
             "r13",
         );
-        let (_exe, args) = crate::execute_wrapped::repo_estate_mcp_parts(bound.as_deref())
-            .expect("a vouched-for graph must produce an estate MCP server");
-        assert_eq!(args[0], "--db");
         assert_eq!(
-            args[1],
-            std::fs::canonicalize(&db).unwrap().to_string_lossy()
+            bound.as_deref(),
+            Some(
+                std::fs::canonicalize(&db)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "a vouched-for graph is the exact store the worker is pinned to"
         );
 
-        // And a refused binding produces no server at all — not a server over some other store.
-        assert!(crate::execute_wrapped::repo_estate_mcp_parts(None).is_none());
+        // And a refused binding produces no pin at all — not a pin on some other store.
+        assert_eq!(
+            project_code_graph_db(None, Some("wicked-core"), Some(&op), "r13"),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
