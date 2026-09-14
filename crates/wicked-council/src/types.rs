@@ -1090,15 +1090,24 @@ fn head_and_tail_within_cap(s: &str) -> String {
     out
 }
 
+/// (core#466 / F-RC2-031) What a persisted seat-failure text goes through AFTER classification
+/// and BEFORE the cap: URL credentials and the operator's home / worker-home / temp prefixes are
+/// redacted (`wicked_apps_core::emit::{redact_userinfo, redact_paths}`). Classification runs on
+/// the RAW text first so a signature is never hidden by a token.
+fn scrub(text: &str) -> String {
+    wicked_apps_core::emit::redact_paths(&wicked_apps_core::emit::redact_userinfo(text))
+}
+
 impl SeatFailure {
-    /// A failure with no captured process output — the pre-spawn branches.
+    /// A failure with no captured process output — the pre-spawn branches. `detail` is scrubbed
+    /// (core#466): a spawn error names the program's path.
     pub fn new(kind: SeatFailureKind, detail: impl Into<String>) -> Self {
         SeatFailure {
             kind,
             exit_code: None,
             stderr: String::new(),
             stdout: String::new(),
-            detail: detail.into(),
+            detail: scrub(&detail.into()),
             reason: None,
         }
     }
@@ -1119,8 +1128,8 @@ impl SeatFailure {
     /// stored within the cap — stderr as head+tail, stdout as tail.
     pub fn with_output(mut self, stdout: &str, stderr: &str) -> Self {
         self.reason = SeatFailureReason::classify(stdout, stderr, self.exited_nonzero());
-        self.stdout = tail_within_cap(stdout);
-        self.stderr = head_and_tail_within_cap(stderr);
+        self.stdout = tail_within_cap(&scrub(stdout));
+        self.stderr = head_and_tail_within_cap(&scrub(stderr));
         self
     }
 
@@ -1130,7 +1139,7 @@ impl SeatFailure {
     pub fn with_stderr(mut self, stderr: &str) -> Self {
         self.reason = SeatFailureReason::classify(&self.stdout, stderr, self.exited_nonzero())
             .or(self.reason);
-        self.stderr = head_and_tail_within_cap(stderr);
+        self.stderr = head_and_tail_within_cap(&scrub(stderr));
         self
     }
 
@@ -1140,7 +1149,7 @@ impl SeatFailure {
     pub fn with_stdout(mut self, stdout: &str) -> Self {
         self.reason = SeatFailureReason::classify(stdout, &self.stderr, self.exited_nonzero())
             .or(self.reason);
-        self.stdout = tail_within_cap(stdout);
+        self.stdout = tail_within_cap(&scrub(stdout));
         self
     }
 
@@ -1944,6 +1953,46 @@ mod failure_reason_tests {
     }
 
     /// stdout keeps the TAIL (a CLI states its final error last), cut on a char boundary.
+    /// core#466: a ballot's stderr that lists the operator's home is classified from the RAW text
+    /// (the signature survives) and persisted with the home prefix redacted, within the cap.
+    #[test]
+    fn seat_failure_text_is_classified_raw_then_redacted_then_capped() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .expect("HOME or USERPROFILE");
+        let listing: String = (0..200)
+            .map(|i| format!("{home}/Documents/file-{i}.txt\n"))
+            .collect();
+        let stderr = format!("{listing}Not logged in · Please run /login\n");
+        let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1").with_output("", &stderr);
+        assert_eq!(
+            f.reason,
+            Some(SeatFailureReason::NotLoggedIn),
+            "classified on the raw text"
+        );
+        assert!(
+            !f.stderr.contains(&home),
+            "home prefix redacted: {}",
+            &f.stderr[..80]
+        );
+        assert!(
+            f.stderr.contains("<home>/Documents/file-"),
+            "{}",
+            &f.stderr[..80]
+        );
+        assert!(
+            f.stderr.len() <= STDERR_CAPTURE_LIMIT + 8,
+            "{}",
+            f.stderr.len()
+        );
+        // `detail` too — a spawn error names the program's path.
+        let d = SeatFailure::new(
+            SeatFailureKind::SpawnFailed,
+            format!("{home}/bin/codex: ENOENT"),
+        );
+        assert_eq!(d.detail, "<home>/bin/codex: ENOENT");
+    }
+
     #[test]
     fn stdout_keeps_the_tail_within_the_cap_on_a_char_boundary() {
         let head = "x".repeat(STDERR_CAPTURE_LIMIT * 2);

@@ -483,8 +483,21 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                     .acp
                     .as_ref()
                     .is_some_and(|acp| acp.os_sandbox.is_none());
+                // (core#379) The override omits the WHOLE `[cli.acp]` block: the wholesale-replace
+                // rule (module doc) drops the built-in's ACP config, so the seat runs wrapped and
+                // ungoverned — silently, until now. Warn only; the rule itself is unchanged.
+                let omitted_acp_block = tcli.acp.is_none();
                 let mut cli: AgenticCli = tcli.into();
                 if let Some(slot) = merged.iter_mut().find(|c| c.key == cli.key) {
+                    if omitted_acp_block && slot.acp.is_some() {
+                        eprintln!(
+                            "wicked-council: seat '{}' overrides a built-in that carries [cli.acp] \
+                             but the override omits it — the seat runs WRAPPED and UNGOVERNED \
+                             (restate [cli.acp] with acp_input_governance = true to keep the \
+                             admission; wicked-core#379)",
+                            cli.key
+                        );
+                    }
                     // User record overrides a built-in with the same key.
                     if omitted_trust && !slot.trust_flags.is_empty() {
                         cli.trust_flags = slot.trust_flags.clone();

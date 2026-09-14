@@ -245,6 +245,146 @@ pub fn redact_userinfo(text: &str) -> String {
     out
 }
 
+/// (core#466 / F-RC2-031) Redact the FILESYSTEM PREFIXES that name a person or a machine from
+/// text about to be persisted on the wire — a council seat's stderr/stdout/detail, a dead-seat
+/// gate's summary: the operator's home → `<home>`; the worker home (`WICKED_WORKER_HOME`,
+/// default `<home>/.wicked-worker`) → `<worker home>`; the process temp root
+/// (`std::env::temp_dir()`) and the fixed system temp dirs (`/tmp`, `/private/tmp`, the macOS
+/// `/var/folders` roots) → `<tmp>`; and OTHER users' home directories (`/Users/<name>`,
+/// `/home/<name>`, `<drive>:\Users\<name>`) → `<home>`. Longest prefix first, so the worker home
+/// wins over the home it lives under. A prefix matches only at a PATH START (not inside a word or
+/// after another path token, so `<home>/tmp` is never re-redacted) and only up to a path boundary
+/// (`/tmpfoo` is not `/tmp`); matching is separator- and ASCII-case-insensitive (Windows drive
+/// paths arrive with either separator and any case) while everything after the prefix is kept as
+/// written. A tilde-rooted string is left alone. Not redacted, by decision (DES-L3 §11 (3)): a
+/// `--db` parent outside home and temp — this crate holds no db path and no setter is added
+/// until a journey shows the need. Compose with [`redact_userinfo`] for URL credentials.
+pub fn redact_paths(text: &str) -> String {
+    let mut prefixes: Vec<(String, &'static str)> = Vec::new();
+    if let Ok(worker) = crate::spawn::worker_home_base() {
+        prefixes.push((worker.to_string_lossy().into_owned(), "<worker home>"));
+    }
+    if let Some(home) = home_dir() {
+        prefixes.push((home.to_string_lossy().into_owned(), "<home>"));
+    }
+    prefixes.push((std::env::temp_dir().to_string_lossy().into_owned(), "<tmp>"));
+    for lit in [
+        "/private/var/folders",
+        "/var/folders",
+        "/private/tmp",
+        "/tmp",
+    ] {
+        prefixes.push((lit.to_string(), "<tmp>"));
+    }
+    redact_prefixes(text, &prefixes)
+}
+
+/// [`redact_paths`] over an explicit prefix table (the testable core): replaces each `(prefix,
+/// token)` — longest prefix first — then the other-users' home shapes.
+fn redact_prefixes(text: &str, prefixes: &[(String, &str)]) -> String {
+    let mut table: Vec<(String, &str)> = prefixes
+        .iter()
+        .map(|(p, t)| (normalize_path(p.trim_end_matches(['/', '\\'])), *t))
+        .filter(|(p, _)| !p.is_empty() && p != "/")
+        .collect();
+    table.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+    table.dedup_by(|a, b| a.0 == b.0);
+    let mut out = text.to_string();
+    for (prefix, token) in &table {
+        out = replace_path_prefix(&out, prefix, token);
+    }
+    redact_user_dirs(&out)
+}
+
+/// Byte-length-preserving matching form: `\` → `/`, ASCII lowercased (both 1:1 on bytes, so an
+/// offset found in the normalized copy indexes the original).
+fn normalize_path(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// A byte that continues a path token — the prefix must not be preceded by one (`x/tmp`,
+/// `<home>/tmp`) so an already-redacted or embedded segment is never matched again.
+fn continues_path(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'/' | b'\\' | b'.' | b'_' | b'-' | b'>' | b'~' | b'%' | b'$'
+        )
+}
+
+/// A byte that continues a path COMPONENT — the prefix must end before one (`/tmpfoo` ≠ `/tmp`).
+fn continues_component(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+}
+
+fn replace_path_prefix(text: &str, prefix_norm: &str, token: &str) -> String {
+    let hay = normalize_path(text);
+    let hb = hay.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut last) = (0usize, 0usize);
+    while let Some(pos) = hay[i..].find(prefix_norm) {
+        let start = i + pos;
+        let end = start + prefix_norm.len();
+        let before_ok = start == 0 || !continues_path(hb[start - 1]);
+        let after_ok = end == hb.len() || !continues_component(hb[end]);
+        if before_ok && after_ok && text.is_char_boundary(start) && text.is_char_boundary(end) {
+            out.push_str(&text[last..start]);
+            out.push_str(token);
+            last = end;
+            i = end;
+        } else {
+            i = start + 1;
+            while !hay.is_char_boundary(i) {
+                i += 1;
+            }
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// `/Users/<name>`, `/home/<name>`, `<drive>:/Users/<name>` (either separator, any case) →
+/// `<home>` — another user's directory is as identifying as the operator's own.
+fn redact_user_dirs(text: &str) -> String {
+    let hay = normalize_path(text);
+    let hb = hay.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut last) = (0usize, 0usize);
+    while i < hb.len() {
+        if !hay.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let marker = ["/users/", "/home/"]
+            .into_iter()
+            .find(|m| hay[i..].starts_with(m));
+        if let Some(m) = marker {
+            // A drive letter may precede (`c:/users/`): swallow it with the marker.
+            let mut start = i;
+            if i >= 2 && hb[i - 1] == b':' && hb[i - 2].is_ascii_alphabetic() {
+                start = i - 2;
+            }
+            let before_ok = start == 0 || !continues_path(hb[start - 1]);
+            let name_start = i + m.len();
+            let mut name_end = name_start;
+            while name_end < hb.len() && (continues_component(hb[name_end]) || hb[name_end] >= 0x80)
+            {
+                name_end += 1;
+            }
+            if before_ok && name_end > name_start && text.is_char_boundary(name_end) {
+                out.push_str(&text[last..start]);
+                out.push_str("<home>");
+                last = name_end;
+                i = name_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Resolve the home directory cross-platform without external deps: `HOME` (unix) or `USERPROFILE`
 /// (Windows).
 fn home_dir() -> Option<PathBuf> {
@@ -964,5 +1104,104 @@ mod tests {
         assert_eq!(nodes[0].metadata["spooled_by"], "postgres://***@h/db");
         // The failure report keeps the line VERBATIM — the caller must be able to re-spool it byte-exact.
         assert_eq!(report.failed[0].line, torn);
+    }
+}
+
+/// core#466 / F-RC2-031 — `redact_paths` token shapes (DES-L3 r2 F8).
+#[cfg(test)]
+mod redact_paths_tests {
+    use super::*;
+
+    fn table(rows: &[(&str, &str)]) -> Vec<(String, &'static str)> {
+        rows.iter()
+            .map(|(p, t)| {
+                (
+                    p.to_string(),
+                    match *t {
+                        "<home>" => "<home>",
+                        "<worker home>" => "<worker home>",
+                        _ => "<tmp>",
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn home_worker_home_and_temp_prefixes_become_tokens_longest_first() {
+        let t = table(&[
+            ("/Users/op", "<home>"),
+            ("/Users/op/.wicked-worker", "<worker home>"),
+            ("/tmp", "<tmp>"),
+        ]);
+        let text = "ls /Users/op/.config failed; see /Users/op/.wicked-worker/codex/x, \
+                    /tmp/y and /tmp";
+        assert_eq!(
+            redact_prefixes(text, &t),
+            "ls <home>/.config failed; see <worker home>/codex/x, <tmp>/y and <tmp>"
+        );
+    }
+
+    #[test]
+    fn a_prefix_matches_only_at_a_path_start_and_up_to_a_component_boundary() {
+        let t = table(&[("/tmp", "<tmp>"), ("/Users/op", "<home>")]);
+        // Not a path start (inside a word / after a token), not a whole component.
+        assert_eq!(redact_prefixes("x/tmp/a", &t), "x/tmp/a");
+        assert_eq!(redact_prefixes("/tmpfoo/a", &t), "/tmpfoo/a");
+        assert_eq!(
+            redact_prefixes("/Users/opal/a", &t),
+            "<home>/a",
+            "another user's dir"
+        );
+        // An already-redacted `<home>/tmp` is never re-redacted into `<home><tmp>`.
+        assert_eq!(redact_prefixes("/Users/op/tmp/z", &t), "<home>/tmp/z");
+        // A tilde-rooted string is left alone.
+        assert_eq!(redact_prefixes("~/proj/x", &t), "~/proj/x");
+        // Quoted / parenthesised paths are still paths.
+        assert_eq!(
+            redact_prefixes("cwd=\"/Users/op/p\" (/tmp/q)", &t),
+            "cwd=\"<home>/p\" (<tmp>/q)"
+        );
+    }
+
+    #[test]
+    fn windows_drive_paths_match_either_separator_and_any_case() {
+        let t = table(&[(r"C:\Users\Op", "<home>")]);
+        assert_eq!(
+            redact_prefixes(r"C:\Users\Op\AppData and c:/users/op/x", &t),
+            r"<home>\AppData and <home>/x"
+        );
+        // Another user's Windows home, either separator, drive letter swallowed.
+        assert_eq!(
+            redact_prefixes(r"D:\Users\Zed\q and e:/Users/Ann/r", &t),
+            r"<home>\q and <home>/r"
+        );
+    }
+
+    #[test]
+    fn other_users_home_directories_are_redacted_too() {
+        let t = table(&[("/Users/op", "<home>")]);
+        assert_eq!(
+            redact_prefixes("/home/alice/proj and /Users/bob/x; /Users/op/y", &t),
+            "<home>/proj and <home>/x; <home>/y"
+        );
+    }
+
+    #[test]
+    fn the_live_table_redacts_this_process_home_and_temp_dir() {
+        let home = super::home_dir().expect("HOME or USERPROFILE");
+        let tmp = std::env::temp_dir();
+        let text = format!(
+            "err at {}/.config/x and {}/scratch",
+            home.display(),
+            tmp.display()
+        );
+        let out = redact_paths(&text);
+        assert!(!out.contains(&home.to_string_lossy().into_owned()), "{out}");
+        assert!(
+            out.contains("<home>/.config/x") || out.contains("<worker home>"),
+            "{out}"
+        );
+        assert!(out.contains("<tmp>"), "{out}");
     }
 }
