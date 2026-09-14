@@ -64,6 +64,26 @@ Two release tracks share this file, newest entry first regardless of track:
   with core#464.
 
 ### Added
+- **Each `wicked-core-ts` platform package carries the standalone `wicked-core` hook binary,
+  stripped, thin-LTO, stamped with the engine semver it was built from (core#405, F-009, F-SMOKE-006
+  — FIX-IT-ALL L10-9, register BC-68).** The per-tool-call governance hook binary was published
+  NOWHERE: crew located it in a home-dir install (`<home>/.local/bin`, `<home>/.cargo/bin`, a dev
+  path, PATH) — the stale-copy class the operator hit when a symlink there pointed at an old build —
+  and the installer registry lacked it. `napi-release.yml` now (build job, per target) asserts the
+  root `Cargo.lock` and `crates/wicked-core-ts/Cargo.lock` pin the same `wicked-estate*` versions
+  (two lockfiles, one tree — the binary and the addon must embed the same estate), builds
+  `--bin wicked-core` for the same triple with `--config profile.release.strip=true --config
+  'profile.release.lto="thin"'` (the root crate declares neither; unstripped it measured 19.2 MB
+  against a 14.3 MB platform package) and uploads it beside the `.node` under a per-target name;
+  (publish job) moves each binary into its platform package as `wicked-core[.exe]`, `chmod +x`,
+  appends it to `files[]` and stamps `wickedCoreVersion` = the ROOT crate's semver — the value the
+  addon's gate compares against the binary's `--version` (`our_semver = env!("CARGO_PKG_VERSION")`,
+  the root crate's, not this package's) — so `<pkg>/wicked-core --version == wickedCoreVersion ==
+  GET /diagnostics.engineBinaries.wicked-core` from one tree at the tag. The root crate version is
+  NOT bumped to core-ts's. Crew's locator prefers the bundled binary in a follow-up (crew half;
+  `WICKED_CORE_EXE` still wins). **Merge before the `core-ts-v0.7.26` tag; rehearse the size on a
+  `workflow_dispatch` of a branch first (every leg builds, nothing publishes) — the measured delta
+  fills register L10-e.**
 - **The creator owes the repo-checks floor too; a timeout is not a failure; a base failure is
   not a regression (core#467, core#469, F-RC2-009 — hardening train S4a).** On 2026-09-13 a `fix`
   worker left a tree failing `npm run typecheck` (exit 2) and `npm run lint` (exit 1), wrote

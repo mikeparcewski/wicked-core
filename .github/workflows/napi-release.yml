@@ -145,12 +145,58 @@ jobs:
           fi
           ls -la ./*.node
 
+      # ── The standalone `wicked-core` hook binary rides INSIDE each platform package (core#405,
+      # F-009, F-SMOKE-006 — FIX-IT-ALL L10-9). Two lockfiles, one tree: the addon (this crate's
+      # Cargo.lock) and the binary (the ROOT Cargo.lock) must embed the same wicked-estate, or the
+      # engine and its hook disagree on the store — assert every `wicked-estate*` version agrees
+      # before building either into a package.
+      - name: Assert the root and core-ts lockfiles agree on wicked-estate*
+        shell: bash
+        working-directory: wicked-core
+        run: |
+          set -euo pipefail
+          pins() { awk '/^name = "wicked-estate/ { n=$3 } /^version = / && n != "" { print n, $3; n="" }' "$1" | sort -u; }
+          root="$(pins Cargo.lock)"; ts="$(pins crates/wicked-core-ts/Cargo.lock)"
+          echo "root:"; echo "$root"; echo "core-ts:"; echo "$ts"
+          [ -n "$root" ] || { echo "::error::no wicked-estate* pins found in the root Cargo.lock"; exit 1; }
+          if [ "$root" != "$ts" ]; then
+            echo "::error::the root Cargo.lock and crates/wicked-core-ts/Cargo.lock pin different wicked-estate* versions — the hook binary and the addon would embed two estates. Align them (cargo update -p wicked-estate… in the lagging tree) before tagging."
+            exit 1
+          fi
+
+      # Stripped + thin-LTO release build of the ROOT crate's `wicked-core` bin for the same target
+      # triple (the root crate declares no [profile.release] strip/lto — only core-ts does — so both
+      # are passed on the command line; unstripped it measured 19.2 MB against a 14.3 MB platform
+      # package). The gnu cross leg exports the same linker/cc env as the napi build above. The file
+      # is named PER TARGET so the merged artifact download in `publish` cannot collide.
+      - name: Build the wicked-core hook binary (${{ matrix.target }}, stripped, thin LTO)
+        shell: bash
+        working-directory: wicked-core
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross || '' }}" = "gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+          fi
+          cargo build --release --locked --bin wicked-core --target "${{ matrix.target }}" \
+            --config profile.release.strip=true --config 'profile.release.lto="thin"'
+          ext=""; case "${{ matrix.target }}" in *windows*) ext=".exe";; esac
+          src="target/${{ matrix.target }}/release/wicked-core${ext}"
+          dst="crates/wicked-core-ts/wicked-core-${{ matrix.target }}${ext}"
+          cp "$src" "$dst"
+          ls -la "$dst"
+          echo "wicked-core hook binary (${{ matrix.target }}): $(wc -c < "$dst") bytes — the size delta register L10-e records"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bindings-${{ matrix.target }}
           # path is workspace-root-relative (upload-artifact ignores defaults.run.working-directory);
           # wicked-core is checked out under ./wicked-core (see the checkout-path note above).
-          path: wicked-core/crates/wicked-core-ts/*.node
+          path: |
+            wicked-core/crates/wicked-core-ts/*.node
+            wicked-core/crates/wicked-core-ts/wicked-core-*
           if-no-files-found: error
           retention-days: 7
 
@@ -213,6 +259,41 @@ jobs:
       - name: Move *.node into the platform packages
         shell: bash
         run: npx napi artifacts --dir artifacts --dist npm
+
+      # The hook binary rides beside the .node in its platform package, executable, listed in
+      # `files[]`, and STAMPED: `wickedCoreVersion` = the ROOT crate's semver — the value the addon's
+      # gate compares against the binary's `--version` (`our_semver = env!("CARGO_PKG_VERSION")` in
+      # execute_wrapped.rs, the root crate, NOT this package's version) — so crew can assert
+      # `<pkg>/wicked-core --version == package.json.wickedCoreVersion == /diagnostics.engineBinaries`
+      # from one tree at the tag (core#405; the smoke's S09 check).
+      - name: Place the wicked-core hook binary in each platform package and stamp wickedCoreVersion
+        shell: bash
+        run: |
+          set -euo pipefail
+          root_semver="$(cargo metadata --no-deps --format-version 1 --manifest-path ../../Cargo.toml | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const m=JSON.parse(d);const p=m.packages.find(p=>p.name==="wicked-core");if(!p){process.exit(1)}process.stdout.write(p.version)})')"
+          echo "root crate wicked-core semver: $root_semver"
+          declare -A ABI=(
+            [aarch64-apple-darwin]=darwin-arm64
+            [x86_64-apple-darwin]=darwin-x64
+            [x86_64-unknown-linux-gnu]=linux-x64-gnu
+            [aarch64-unknown-linux-gnu]=linux-arm64-gnu
+            [x86_64-pc-windows-msvc]=win32-x64-msvc
+          )
+          placed=0
+          for target in "${!ABI[@]}"; do
+            abi="${ABI[$target]}"
+            ext=""; case "$target" in *windows*) ext=".exe";; esac
+            src="artifacts/wicked-core-${target}${ext}"
+            dir="npm/${abi}"
+            [ -f "$src" ] || { echo "::error::missing hook binary for ${target} (${src})"; exit 1; }
+            [ -d "$dir" ] || { echo "::error::no platform package dir ${dir} for ${target}"; exit 1; }
+            mv "$src" "${dir}/wicked-core${ext}"
+            chmod +x "${dir}/wicked-core${ext}"
+            (cd "$dir" && npm pkg set "files[]=wicked-core${ext}" "wickedCoreVersion=${root_semver}")
+            echo "  ${dir}/wicked-core${ext}: $(wc -c < "${dir}/wicked-core${ext}") bytes, wickedCoreVersion=${root_semver}"
+            placed=$(( placed + 1 ))
+          done
+          [ "$placed" -eq 5 ] || { echo "::error::placed ${placed} hook binaries, expected 5"; exit 1; }
 
       - name: Sync platform package versions
         shell: bash
