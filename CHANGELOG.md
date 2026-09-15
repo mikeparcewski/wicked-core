@@ -1491,6 +1491,13 @@ Two release tracks share this file, newest entry first regardless of track:
   text is appended unredacted — transcript redaction is the run-wide policy, not this change.
   Behaviour change register: **BC-75** (proposed — user decision owed: a seat-visible tool denial,
   and every failed tool call now in the transcript).
+- **core-ts 0.7.28** — 2026-09-15 — npm release carrying the one engine change since 0.7.27, #529
+  (F-W1-012), on main tip 8632066 (plus #528, the 0.7.27 platform-lockfile re-stamp). **Behaviour
+  change:** the engine now strips the internal handoff scaffold (Work State / Next Move / Relevant
+  Files) from rendered chat replies on every reply-boundary path — including the whole-output /
+  compaction fallback — so the scaffold never reaches a rendered chat reply. The strip is bounded
+  and fence-aware (a fenced code block is left intact); the durable transcript and unit outputs are
+  untouched. Wire shape: additive only; `index.d.ts` unchanged (zero drift).
 - **core-ts 0.7.27** — 2026-09-14 — npm release carrying the fifteen engine changes since 0.7.26
   (FIX-IT-ALL wave 3: L1 #513/#517/#518/#520, L2 #505/#510/#514, L3 #508/#511/#512/#523, L9 #522,
   L5 #525, L4 #524, plus the #526 build hotfix), all on main tip 37633d8 (plus #519, the 0.7.26
