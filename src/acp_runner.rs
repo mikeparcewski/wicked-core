@@ -3231,7 +3231,7 @@ const INTERNAL_SCAFFOLD_HEADINGS: [&str; 3] = ["Work State", "Next Move", "Relev
 
 /// Remove any internal-handoff scaffold block from a rendered chat reply (F-W1-012).
 ///
-/// A seat streams its answer AFTER an internal planning scaffold (`## Work State` / `## Next Move`
+/// A seat streams its answer AROUND an internal planning scaffold (`## Work State` / `## Next Move`
 /// / `## Relevant Files`). The reply-boundary rule ([`answer_after_last_tool_call`]) normally cuts
 /// to the answer after the last `tool_call`, but on a turn with no resolvable boundary — a
 /// `compaction` part, no tool call at all, or a tail shorter than the narration — it falls back to
@@ -3240,40 +3240,90 @@ const INTERNAL_SCAFFOLD_HEADINGS: [&str; 3] = ["Work State", "Next Move", "Relev
 /// ([`TurnResult::chat_answer`]), so a recognized scaffold block can NEVER reach the rendered reply
 /// regardless of how the boundary resolved.
 ///
-/// Loss-averse: strips ONLY a scaffold level-2 heading and the lines beneath it, up to the next
-/// level-2 heading that is NOT scaffold (a `###` subheading stays inside the block and never ends
-/// it) or end of text — so a legitimate `## Important Details` (or any other section) is kept. Text
-/// with no scaffold heading is returned byte-identical.
+/// BOUNDED and loss-averse (one O(n) idempotent pass): removes ONLY the recognized scaffold
+/// sections and the lines that belong to each — the heading, its `###` subsections, list items,
+/// indented continuations, and the blank lines between them. A section ENDS at the first line that
+/// is not part of it: the next `#`/`##` heading (a new scaffold section, or a legitimate one that
+/// is kept), or the first non-blank line that is not a `###` subheader / list item / indented
+/// continuation (a bold-led conclusion, prose). That line and EVERYTHING after it are preserved
+/// verbatim — the strip never runs to end of text past real content. Fence-aware: a ``` code fence
+/// is content, a scaffold heading INSIDE a fence is never stripped, and a fence is never split or
+/// left dangling. A reply with no scaffold heading (outside any fence) is returned byte-identical.
 fn strip_internal_scaffold(text: &str) -> String {
+    /// The ATX heading level of `line` — the run of leading `#` that is followed by a space — else
+    /// `None`. A `###` line is level 3 (a scaffold subheader); a `#`/`##` line is level 1/2.
+    fn heading_level(line: &str) -> Option<usize> {
+        let t = line.trim_start();
+        let hashes = t.bytes().take_while(|&b| b == b'#').count();
+        (hashes >= 1 && t[hashes..].starts_with(' ')).then_some(hashes)
+    }
+
+    /// Is `t` (an already-`trim_start`ed line) a markdown list item — a `-`/`*`/`+` bullet or an
+    /// ordered `N.`/`N)` marker, each followed by a space? A bold run like `**Estate…**` is NOT
+    /// (its `*` is not followed by a space), so a bold-led conclusion ends the block.
+    fn is_list_item(t: &str) -> bool {
+        if let Some(rest) = t.strip_prefix(['-', '*', '+']) {
+            return rest.starts_with(' ');
+        }
+        let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+        digits >= 1 && t[digits..].starts_with(['.', ')']) && t[digits + 1..].starts_with(' ')
+    }
+
     /// A level-2 ATX heading whose title begins with a scaffold name — i.e. a line matching
-    /// `^\s*## (Work State|Next Move|Relevant Files)`. A `###` line never matches (`"### "` is not
-    /// prefixed by `"## "`), so subsections stay inside the block rather than ending it.
+    /// `^\s*## (Work State|Next Move|Relevant Files)`.
     fn is_scaffold_heading(line: &str) -> bool {
-        line.trim_start().strip_prefix("## ").is_some_and(|title| {
-            let title = title.trim_start();
-            INTERNAL_SCAFFOLD_HEADINGS
-                .iter()
-                .any(|h| title.starts_with(h))
-        })
+        heading_level(line) == Some(2)
+            && line.trim_start().strip_prefix("## ").is_some_and(|title| {
+                let title = title.trim_start();
+                INTERNAL_SCAFFOLD_HEADINGS
+                    .iter()
+                    .any(|h| title.starts_with(h))
+            })
     }
 
     let mut kept: Vec<&str> = Vec::new();
     let mut in_scaffold = false;
+    let mut in_fence = false;
     let mut stripped_any = false;
     for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let t = body.trim_start();
+
+        // Fences are content and bound the strip: a fence line ends any scaffold section (never
+        // split or orphan a fence) and toggles fence state; text inside a fence is kept verbatim,
+        // so a scaffold heading INSIDE a fence is never treated as scaffold.
+        if t.starts_with("```") {
+            in_scaffold = false;
+            in_fence = !in_fence;
+            kept.push(line);
+            continue;
+        }
+        if in_fence {
+            kept.push(line);
+            continue;
+        }
+
         if is_scaffold_heading(line) {
             in_scaffold = true;
             stripped_any = true;
-            continue; // drop the scaffold heading itself
+            continue; // drop the scaffold heading and open a scaffold section
         }
+
         if in_scaffold {
-            // A non-scaffold level-2 heading ENDS the block and is kept; a `###` subsection or any
-            // body line stays inside the block and is dropped.
-            if line.trim_start().starts_with("## ") {
-                in_scaffold = false;
-            } else {
-                continue;
+            let belongs = match heading_level(body) {
+                // A non-scaffold level-1/2 heading ends the block; a `###`+ subheader belongs to it.
+                Some(1) | Some(2) => false,
+                Some(_) => true,
+                None => {
+                    t.is_empty()                        // blank line inside the block
+                        || is_list_item(t)              // list body
+                        || line.starts_with([' ', '\t']) // indented continuation
+                }
+            };
+            if belongs {
+                continue; // drop the scaffold-section body line
             }
+            in_scaffold = false; // real content — the section ends here; keep this line onward
         }
         kept.push(line);
     }
@@ -13637,15 +13687,19 @@ acp_input_governance = true
             .count()
     }
 
-    /// F-W1-012: the internal-handoff scaffold NEVER survives into the rendered chat reply, on
-    /// EVERY reply-boundary path — including the whole-output fallback the compaction turn takes.
+    /// F-W1-012: the internal-handoff scaffold NEVER survives into the rendered chat reply (on every
+    /// reply-boundary path, the whole-output fallback included), AND the strip is BOUNDED — a
+    /// legitimate conclusion AFTER the scaffold is preserved verbatim, no fence is orphaned, and a
+    /// reply with no scaffold is byte-identical. This is the opencode-Q2 golden shape: leading
+    /// answer, legit `##` sections, the banned scaffold block (Work State / Next Move / Relevant
+    /// Files with `###` subsections and list bodies), then a bold-led conclusion running to EOF.
     #[test]
-    fn the_internal_scaffold_never_reaches_a_rendered_chat_reply() {
-        // The shape opencode Q2 leaked: a real answer + a legitimate `## Important Details`
-        // section, then the banned handoff scaffold (Work State / Next Move / Relevant Files with
-        // ### subsections) riding through to end of text.
-        let leaked = "\
+    fn the_internal_scaffold_is_stripped_but_the_conclusion_after_it_is_preserved() {
+        let golden = "\
 The skill reaches the worker through the published immutable snapshot; core resolves it per spawn.
+
+## Where the evidence comes from
+A run's own record, the QE ledger, and estate as recon intel.
 
 ## Important Details
 - Repos live under the fresh checkout; crew is a TS monorepo and core is Rust.
@@ -13663,11 +13717,18 @@ The skill reaches the worker through the published immutable snapshot; core reso
 1. Read the verdict audit to see whether evidence collection touches estate.
 
 ## Relevant Files
-- crew: api/evidence.ts, qe/acceptance.ts
-- core: src/workflow.rs, src/pipeline.rs";
+- crew: `api/evidence.ts`, `qe/acceptance.ts`
+- core: `src/workflow.rs`, `src/pipeline.rs`
 
-        // 1) The pure strip removes exactly the three banned sections and their `###` subsections.
-        let cleaned = strip_internal_scaffold(leaked);
+**Estate's role is recon/planning intel, not an acceptance-gate read.** The gate reads the QE ledger.
+
+**Final trace:** three systems of record — run record, QE ledger, estate.
+
+No further next steps — both questions fully answered.";
+
+        let cleaned = strip_internal_scaffold(golden);
+
+        // ── Direction 1: NO LEAK — the criterion holds, and the `###` subsections are gone too.
         assert_eq!(
             scaffold_header_hits(&cleaned),
             0,
@@ -13680,57 +13741,105 @@ The skill reaches the worker through the published immutable snapshot; core reso
             "### Completed",
             "### Active",
             "### Blocked",
+            "Read the verdict audit", // Next Move body
+            "src/pipeline.rs",        // Relevant Files body
         ] {
             assert!(
                 !cleaned.contains(banned),
-                "`{banned}` was stripped from the reply: {cleaned}"
+                "`{banned}` was stripped: {cleaned}"
             );
         }
-        // The real answer and a legitimate heading are KEPT (loss-averse).
-        assert!(
-            cleaned.contains("The skill reaches the worker")
-                && cleaned.contains("## Important Details"),
-            "the answer and legitimate sections survive: {cleaned}"
+
+        // ── Direction 2: NO OVER-STRIP — the answer, the legit `##` sections BEFORE the scaffold,
+        // and the whole bold-led conclusion AFTER it survive verbatim; the strip does not run to EOF.
+        for kept in [
+            "The skill reaches the worker",
+            "## Where the evidence comes from",
+            "## Important Details",
+            "**Estate's role is recon/planning intel", // first conclusion line, right after the block
+            "**Final trace:**",
+            "No further next steps — both questions fully answered.", // last line of the reply
+        ] {
+            assert!(cleaned.contains(kept), "`{kept}` must survive: {cleaned}");
+        }
+        // No fence is orphaned (balanced ``` count; here there are none either way).
+        assert_eq!(
+            cleaned.matches("```").count() % 2,
+            0,
+            "no dangling code fence: {cleaned}"
+        );
+        // Only the scaffold shrank the reply; the conclusion tail is intact to the last byte.
+        assert!(cleaned.len() < golden.len());
+        assert!(cleaned.ends_with("both questions fully answered."));
+
+        // ── Byte-exact: a reply loses ONLY the scaffold bytes (intro + conclusion, verbatim).
+        let bx = "Intro line.\n\n## Work State\n### Completed\n- done\n\n## Relevant Files\n- f.rs\n\nConclusion line.";
+        assert_eq!(
+            strip_internal_scaffold(bx),
+            "Intro line.\n\nConclusion line.",
+            "the scaffold region is removed and nothing else"
         );
 
-        // 2) A reply with no scaffold is returned byte-identical.
+        // ── A reply with no scaffold heading is returned byte-identical.
         let clean = "The run-level flag on the wire is `archived_at`.\n\n## Trace\n- one\n- two";
         assert_eq!(
             strip_internal_scaffold(clean),
             clean,
-            "no scaffold heading ⇒ untouched"
+            "no scaffold ⇒ untouched"
         );
 
-        // 3) chat_answer strips on the ANSWER path (a resolved-but-still-carries-scaffold boundary).
+        // ── Idempotent: stripping the stripped reply is a no-op.
+        assert_eq!(strip_internal_scaffold(&cleaned), cleaned, "idempotent");
+
+        // ── `## Work State` as CONTENT survives: inside a code fence, quoted, and inline prose.
+        let fenced = "Here is the banned handoff format:\n\n```md\n## Work State\n### Completed\n- x\n```\n\nThat fenced block is documentation — keep it.";
+        assert_eq!(
+            strip_internal_scaffold(fenced),
+            fenced,
+            "a scaffold heading INSIDE a code fence is content, not scaffold"
+        );
+        let quoted = "The seat must never emit:\n> ## Work State\n> ### Completed\nUnderstood.";
+        assert_eq!(
+            strip_internal_scaffold(quoted),
+            quoted,
+            "a quoted scaffold heading is content"
+        );
+        let prose = "Never put a ## Work State line mid-sentence, the reviewer said.";
+        assert_eq!(
+            strip_internal_scaffold(prose),
+            prose,
+            "an inline mention is not a heading line"
+        );
+
+        // ── chat_answer strips on BOTH reply-boundary paths — the resolved ANSWER path…
         let via_answer = TurnResult {
-            output: leaked.to_string(),
+            output: golden.to_string(),
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
             tools: Vec::new(),
-            answer: leaked.to_string(),
+            answer: golden.to_string(),
         };
-        assert_eq!(
-            scaffold_header_hits(&via_answer.chat_answer()),
-            0,
-            "answer-path reply is clean"
-        );
-
-        // 4) …and on the WHOLE-OUTPUT FALLBACK path (empty answer ⇒ chat_answer falls back to
-        // `output`) — the compaction turn's exact shape. THIS is the path that leaked.
+        assert_eq!(scaffold_header_hits(&via_answer.chat_answer()), 0);
+        assert!(via_answer
+            .chat_answer()
+            .contains("both questions fully answered."));
+        // …and the WHOLE-OUTPUT FALLBACK path (empty answer ⇒ falls back to `output`) — the
+        // compaction turn's exact shape, the path that leaked.
         let via_output = TurnResult {
             answer: String::new(),
             ..via_answer
         };
-        let fallback_reply = via_output.chat_answer();
+        let fallback = via_output.chat_answer();
         assert_eq!(
-            scaffold_header_hits(&fallback_reply),
+            scaffold_header_hits(&fallback),
             0,
-            "whole-output fallback reply is clean: {fallback_reply}"
+            "whole-output fallback reply is clean: {fallback}"
         );
         assert!(
-            fallback_reply.contains("The skill reaches the worker"),
-            "the fallback still surfaces the real answer: {fallback_reply}"
+            fallback.contains("The skill reaches the worker")
+                && fallback.contains("both questions fully answered."),
+            "the fallback keeps the answer AND the conclusion: {fallback}"
         );
     }
 
@@ -15994,7 +16103,9 @@ elif behavior == "scaffold_leak":
         + h3 + " Active\n- Thread 2 open.\n"
         + h3 + " Blocked\n- (none)\n\n"
         + h2 + " Next Move\n1. Read the verdict audit.\n\n"
-        + h2 + " Relevant Files\n- core: src/workflow.rs\n"
+        + h2 + " Relevant Files\n- core: src/workflow.rs\n\n"
+        # A bold-led conclusion AFTER the scaffold — must be PRESERVED (bounded strip, no over-strip).
+        + "The estate role is recon intel, not an acceptance-gate read. Both questions answered.\n"
     )
     w({"jsonrpc": "2.0", "method": "session/update", "params": {
         "sessionId": "mock-session",
@@ -16720,9 +16831,11 @@ transport = "stdio"
             0,
             "the scaffold must never reach the rendered chat reply: {reply}"
         );
+        // Bounded, end-to-end: the leading answer AND the bold-led conclusion after the scaffold
+        // both survive — the strip removed only the scaffold, not the real content around it.
         assert!(
-            reply.contains("archived_at"),
-            "the real answer still surfaces: {reply}"
+            reply.contains("archived_at") && reply.contains("Both questions answered."),
+            "the answer and the trailing conclusion both survive: {reply}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
