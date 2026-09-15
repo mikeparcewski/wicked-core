@@ -3010,12 +3010,20 @@ impl TurnResult {
     /// directly-constructed result, [`TurnResult::default_failed`]). The narration before the
     /// answer was already streamed as deltas, where the studio narrates it; it never re-enters the
     /// reply. NEVER empty unless the turn produced no text at all.
+    ///
+    /// F-W1-012: whichever reply is chosen, the internal-handoff scaffold is stripped as the
+    /// FINAL step — the ONE seam every reply-boundary path funnels through, including the
+    /// whole-output fallback — so a `## Work State` / `## Next Move` / `## Relevant Files` block can
+    /// never reach the rendered reply even when the boundary could not be resolved (a compaction
+    /// turn). Applied only to the CHAT reply: the `answer`/`output` fields (unit outputs, the
+    /// durable transcript, prior-output injection) keep their full text.
     fn chat_answer(&self) -> String {
-        if self.answer.is_empty() {
-            self.output.clone()
+        let reply = if self.answer.is_empty() {
+            &self.output
         } else {
-            self.answer.clone()
-        }
+            &self.answer
+        };
+        strip_internal_scaffold(reply)
     }
 }
 
@@ -3212,6 +3220,117 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
         }
         rest = after;
     }
+}
+
+/// The internal-handoff scaffold headings a chat seat is told NEVER to put in an Answer
+/// (F-W1-012): `## Work State`, `## Next Move`, `## Relevant Files` — each with its
+/// `### Completed` / `### Active` / `### Blocked` subsections. Matched as a level-2 ATX heading
+/// whose title BEGINS with one of these, so the acceptance criterion
+/// `^## (Work State|Next Move|Relevant Files)` can never survive [`strip_internal_scaffold`].
+const INTERNAL_SCAFFOLD_HEADINGS: [&str; 3] = ["Work State", "Next Move", "Relevant Files"];
+
+/// Remove any internal-handoff scaffold block from a rendered chat reply (F-W1-012).
+///
+/// A seat streams its answer AROUND an internal planning scaffold (`## Work State` / `## Next Move`
+/// / `## Relevant Files`). The reply-boundary rule ([`answer_after_last_tool_call`]) normally cuts
+/// to the answer after the last `tool_call`, but on a turn with no resolvable boundary — a
+/// `compaction` part, no tool call at all, or a tail shorter than the narration — it falls back to
+/// the WHOLE output, and the scaffold rode through into the reply (opencode Q2, "whole output —
+/// narration retained"). This is the ONE uniform final step every reply funnels through
+/// ([`TurnResult::chat_answer`]), so a recognized scaffold block can NEVER reach the rendered reply
+/// regardless of how the boundary resolved.
+///
+/// BOUNDED and loss-averse (one O(n) idempotent pass): removes ONLY the recognized scaffold
+/// sections and the lines that belong to each — the heading, its `###` subsections, list items,
+/// indented continuations, and the blank lines between them. A section ENDS at the first line that
+/// is not part of it: the next `#`/`##` heading (a new scaffold section, or a legitimate one that
+/// is kept), or the first non-blank line that is not a `###` subheader / list item / indented
+/// continuation (a bold-led conclusion, prose). That line and EVERYTHING after it are preserved
+/// verbatim — the strip never runs to end of text past real content. Fence-aware: a ``` code fence
+/// is content, a scaffold heading INSIDE a fence is never stripped, and a fence is never split or
+/// left dangling. A reply with no scaffold heading (outside any fence) is returned byte-identical.
+fn strip_internal_scaffold(text: &str) -> String {
+    /// The ATX heading level of `line` — the run of leading `#` that is followed by a space — else
+    /// `None`. A `###` line is level 3 (a scaffold subheader); a `#`/`##` line is level 1/2.
+    fn heading_level(line: &str) -> Option<usize> {
+        let t = line.trim_start();
+        let hashes = t.bytes().take_while(|&b| b == b'#').count();
+        (hashes >= 1 && t[hashes..].starts_with(' ')).then_some(hashes)
+    }
+
+    /// Is `t` (an already-`trim_start`ed line) a markdown list item — a `-`/`*`/`+` bullet or an
+    /// ordered `N.`/`N)` marker, each followed by a space? A bold run like `**Estate…**` is NOT
+    /// (its `*` is not followed by a space), so a bold-led conclusion ends the block.
+    fn is_list_item(t: &str) -> bool {
+        if let Some(rest) = t.strip_prefix(['-', '*', '+']) {
+            return rest.starts_with(' ');
+        }
+        let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+        digits >= 1 && t[digits..].starts_with(['.', ')']) && t[digits + 1..].starts_with(' ')
+    }
+
+    /// A level-2 ATX heading whose title begins with a scaffold name — i.e. a line matching
+    /// `^\s*## (Work State|Next Move|Relevant Files)`.
+    fn is_scaffold_heading(line: &str) -> bool {
+        heading_level(line) == Some(2)
+            && line.trim_start().strip_prefix("## ").is_some_and(|title| {
+                let title = title.trim_start();
+                INTERNAL_SCAFFOLD_HEADINGS
+                    .iter()
+                    .any(|h| title.starts_with(h))
+            })
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_scaffold = false;
+    let mut in_fence = false;
+    let mut stripped_any = false;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let t = body.trim_start();
+
+        // Fences are content and bound the strip: a fence line ends any scaffold section (never
+        // split or orphan a fence) and toggles fence state; text inside a fence is kept verbatim,
+        // so a scaffold heading INSIDE a fence is never treated as scaffold.
+        if t.starts_with("```") {
+            in_scaffold = false;
+            in_fence = !in_fence;
+            kept.push(line);
+            continue;
+        }
+        if in_fence {
+            kept.push(line);
+            continue;
+        }
+
+        if is_scaffold_heading(line) {
+            in_scaffold = true;
+            stripped_any = true;
+            continue; // drop the scaffold heading and open a scaffold section
+        }
+
+        if in_scaffold {
+            let belongs = match heading_level(body) {
+                // A non-scaffold level-1/2 heading ends the block; a `###`+ subheader belongs to it.
+                Some(1) | Some(2) => false,
+                Some(_) => true,
+                None => {
+                    t.is_empty()                        // blank line inside the block
+                        || is_list_item(t)              // list body
+                        || line.starts_with([' ', '\t']) // indented continuation
+                }
+            };
+            if belongs {
+                continue; // drop the scaffold-section body line
+            }
+            in_scaffold = false; // real content — the section ends here; keep this line onward
+        }
+        kept.push(line);
+    }
+    if !stripped_any {
+        return text.to_string(); // byte-identical when there was nothing to strip
+    }
+    kept.concat().trim().to_string()
 }
 
 /// (core#431, F-3R2-009; F-4R2-004) The WRITE POSTURE of a fenced unit on the ACP carrier — one
@@ -5761,11 +5880,17 @@ impl AcpStepRunner {
                 // much of its own output it shipped, so "the fallback fired" and "the adapter
                 // announced no tool call" are readable in the daemon log instead of being
                 // indistinguishable from an unfixed engine. The P6 re-run reads this line.
+                // F-W1-012: the MODE is the BOUNDARY decision (the `answer` FIELD, before the
+                // scaffold strip) — the whole-output fallback fired iff it kept everything — while
+                // the reported length is the actually-rendered reply, which `chat_answer` may have
+                // shortened by stripping an internal scaffold block.
+                let boundary_whole =
+                    turn.answer.is_empty() || turn.answer.len() == turn.output.len();
                 eprintln!(
                     "[wicked-core] chat '{chat_id}' seat '{cli_key}' reply {} of {} output bytes ({})",
                     answer.len(),
                     turn.output.len(),
-                    if answer.len() == turn.output.len() {
+                    if boundary_whole {
                         "whole output — narration retained"
                     } else {
                         "answer after the last tool call"
@@ -13546,6 +13671,178 @@ acp_input_governance = true
         assert_eq!(TurnResult::default_failed().chat_answer(), "");
     }
 
+    /// The acceptance criterion, expressed as code: how many chat-reply lines match
+    /// `^## (Work State|Next Move|Relevant Files)` (allowing leading indentation, as the grep does).
+    fn scaffold_header_hits(reply: &str) -> usize {
+        reply
+            .lines()
+            .filter(|l| {
+                l.trim_start().strip_prefix("## ").is_some_and(|t| {
+                    let t = t.trim_start();
+                    ["Work State", "Next Move", "Relevant Files"]
+                        .iter()
+                        .any(|h| t.starts_with(h))
+                })
+            })
+            .count()
+    }
+
+    /// F-W1-012: the internal-handoff scaffold NEVER survives into the rendered chat reply (on every
+    /// reply-boundary path, the whole-output fallback included), AND the strip is BOUNDED — a
+    /// legitimate conclusion AFTER the scaffold is preserved verbatim, no fence is orphaned, and a
+    /// reply with no scaffold is byte-identical. This is the opencode-Q2 golden shape: leading
+    /// answer, legit `##` sections, the banned scaffold block (Work State / Next Move / Relevant
+    /// Files with `###` subsections and list bodies), then a bold-led conclusion running to EOF.
+    #[test]
+    fn the_internal_scaffold_is_stripped_but_the_conclusion_after_it_is_preserved() {
+        let golden = "\
+The skill reaches the worker through the published immutable snapshot; core resolves it per spawn.
+
+## Where the evidence comes from
+A run's own record, the QE ledger, and estate as recon intel.
+
+## Important Details
+- Repos live under the fresh checkout; crew is a TS monorepo and core is Rust.
+- Estate queries go through the read-only shim.
+
+## Work State
+### Completed
+- Thread 1 fully traced.
+### Active
+- Thread 2 estate leg still open.
+### Blocked
+- (none)
+
+## Next Move
+1. Read the verdict audit to see whether evidence collection touches estate.
+
+## Relevant Files
+- crew: `api/evidence.ts`, `qe/acceptance.ts`
+- core: `src/workflow.rs`, `src/pipeline.rs`
+
+**Estate's role is recon/planning intel, not an acceptance-gate read.** The gate reads the QE ledger.
+
+**Final trace:** three systems of record — run record, QE ledger, estate.
+
+No further next steps — both questions fully answered.";
+
+        let cleaned = strip_internal_scaffold(golden);
+
+        // ── Direction 1: NO LEAK — the criterion holds, and the `###` subsections are gone too.
+        assert_eq!(
+            scaffold_header_hits(&cleaned),
+            0,
+            "the criterion `^## (Work State|Next Move|Relevant Files)` holds: {cleaned}"
+        );
+        for banned in [
+            "## Work State",
+            "## Next Move",
+            "## Relevant Files",
+            "### Completed",
+            "### Active",
+            "### Blocked",
+            "Read the verdict audit", // Next Move body
+            "src/pipeline.rs",        // Relevant Files body
+        ] {
+            assert!(
+                !cleaned.contains(banned),
+                "`{banned}` was stripped: {cleaned}"
+            );
+        }
+
+        // ── Direction 2: NO OVER-STRIP — the answer, the legit `##` sections BEFORE the scaffold,
+        // and the whole bold-led conclusion AFTER it survive verbatim; the strip does not run to EOF.
+        for kept in [
+            "The skill reaches the worker",
+            "## Where the evidence comes from",
+            "## Important Details",
+            "**Estate's role is recon/planning intel", // first conclusion line, right after the block
+            "**Final trace:**",
+            "No further next steps — both questions fully answered.", // last line of the reply
+        ] {
+            assert!(cleaned.contains(kept), "`{kept}` must survive: {cleaned}");
+        }
+        // No fence is orphaned (balanced ``` count; here there are none either way).
+        assert_eq!(
+            cleaned.matches("```").count() % 2,
+            0,
+            "no dangling code fence: {cleaned}"
+        );
+        // Only the scaffold shrank the reply; the conclusion tail is intact to the last byte.
+        assert!(cleaned.len() < golden.len());
+        assert!(cleaned.ends_with("both questions fully answered."));
+
+        // ── Byte-exact: a reply loses ONLY the scaffold bytes (intro + conclusion, verbatim).
+        let bx = "Intro line.\n\n## Work State\n### Completed\n- done\n\n## Relevant Files\n- f.rs\n\nConclusion line.";
+        assert_eq!(
+            strip_internal_scaffold(bx),
+            "Intro line.\n\nConclusion line.",
+            "the scaffold region is removed and nothing else"
+        );
+
+        // ── A reply with no scaffold heading is returned byte-identical.
+        let clean = "The run-level flag on the wire is `archived_at`.\n\n## Trace\n- one\n- two";
+        assert_eq!(
+            strip_internal_scaffold(clean),
+            clean,
+            "no scaffold ⇒ untouched"
+        );
+
+        // ── Idempotent: stripping the stripped reply is a no-op.
+        assert_eq!(strip_internal_scaffold(&cleaned), cleaned, "idempotent");
+
+        // ── `## Work State` as CONTENT survives: inside a code fence, quoted, and inline prose.
+        let fenced = "Here is the banned handoff format:\n\n```md\n## Work State\n### Completed\n- x\n```\n\nThat fenced block is documentation — keep it.";
+        assert_eq!(
+            strip_internal_scaffold(fenced),
+            fenced,
+            "a scaffold heading INSIDE a code fence is content, not scaffold"
+        );
+        let quoted = "The seat must never emit:\n> ## Work State\n> ### Completed\nUnderstood.";
+        assert_eq!(
+            strip_internal_scaffold(quoted),
+            quoted,
+            "a quoted scaffold heading is content"
+        );
+        let prose = "Never put a ## Work State line mid-sentence, the reviewer said.";
+        assert_eq!(
+            strip_internal_scaffold(prose),
+            prose,
+            "an inline mention is not a heading line"
+        );
+
+        // ── chat_answer strips on BOTH reply-boundary paths — the resolved ANSWER path…
+        let via_answer = TurnResult {
+            output: golden.to_string(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            answer: golden.to_string(),
+        };
+        assert_eq!(scaffold_header_hits(&via_answer.chat_answer()), 0);
+        assert!(via_answer
+            .chat_answer()
+            .contains("both questions fully answered."));
+        // …and the WHOLE-OUTPUT FALLBACK path (empty answer ⇒ falls back to `output`) — the
+        // compaction turn's exact shape, the path that leaked.
+        let via_output = TurnResult {
+            answer: String::new(),
+            ..via_answer
+        };
+        let fallback = via_output.chat_answer();
+        assert_eq!(
+            scaffold_header_hits(&fallback),
+            0,
+            "whole-output fallback reply is clean: {fallback}"
+        );
+        assert!(
+            fallback.contains("The skill reaches the worker")
+                && fallback.contains("both questions fully answered."),
+            "the fallback keeps the answer AND the conclusion: {fallback}"
+        );
+    }
+
     #[test]
     fn result_usage_parses_ecosystem_adapter_shape() {
         // Official claude adapter result: input + cached reads/writes sum into input.
@@ -15780,6 +16077,45 @@ elif behavior == "task_denied":
         "stopReason": "end_turn", "usage": {"inputTokens": 3, "outputTokens": 2}
     }})
 
+elif behavior == "scaffold_leak":
+    # F-W1-012: the opencode Q2 shape — a `compaction` part and NO tool_call, so the reply-boundary
+    # rule cannot resolve an answer boundary and falls back to the WHOLE output. The seat streams a
+    # short narration, a compaction part (an update kind the engine does not recognize), then its
+    # internal handoff scaffold (## Work State / ## Next Move / ## Relevant Files). Without the
+    # uniform strip the scaffold rides the whole-output fallback into the rendered reply.
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "The archived flag on the wire is archived_at.\n\n"}}
+    }})
+    # A compaction part — ignored by handle_update (no boundary is set), like opencode's real one.
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "compaction"}
+    }})
+    # Build the level-2 (h2) and level-3 (h3) ATX heading markers with chr(35), so no double-quote
+    # ever sits next to a hash in this source (that byte pair would close the Rust raw string).
+    h2 = chr(35) * 2
+    h3 = chr(35) * 3
+    scaffold = (
+        h2 + " Work State\n"
+        + h3 + " Completed\n- Thread 1 traced.\n"
+        + h3 + " Active\n- Thread 2 open.\n"
+        + h3 + " Blocked\n- (none)\n\n"
+        + h2 + " Next Move\n1. Read the verdict audit.\n\n"
+        + h2 + " Relevant Files\n- core: src/workflow.rs\n\n"
+        # A bold-led conclusion AFTER the scaffold — must be PRESERVED (bounded strip, no over-strip).
+        + "The estate role is recon intel, not an acceptance-gate read. Both questions answered.\n"
+    )
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": scaffold}}
+    }})
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 4, "outputTokens": 3}
+    }})
+
 elif behavior == "elicit_disconnect":
     # Send elicitation, then close stdout (simulate adapter death mid-suspension).
     w({"jsonrpc": "2.0", "id": "elicit-disc", "method": "elicitation/create", "params": {
@@ -16444,6 +16780,64 @@ transport = "stdio"
             "the turn still completes after the refused call: {:?}",
             turn.output
         );
+    }
+
+    /// F-W1-012 SMOKE STEP: an end-to-end chat turn whose seat emits a `compaction` part and NO
+    /// tool_call — the opencode Q2 shape where the reply-boundary rule falls back to the WHOLE
+    /// output — must NEVER render its internal handoff scaffold in the reply. Drives the REAL ACP
+    /// turn machinery (`exec_turn_acp` over a mock subprocess), asserts the raw output carried the
+    /// scaffold (so this is a true reproduction) while the rendered reply (`chat_answer`) has zero
+    /// `^## (Work State|Next Move|Relevant Files)` hits. Fails before the uniform strip; passes with
+    /// it. The reply-boundary observable stays "whole output" (answer == output field).
+    #[test]
+    #[cfg(unix)]
+    fn a_compaction_turn_never_renders_the_internal_scaffold_in_its_chat_reply() {
+        let dir = std::env::temp_dir().join(format!("wicked-fw1-012-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut proc = start_mock_proc(&dir, "scaffold_leak");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+        let turn = exec_turn_acp(
+            &mut proc,
+            "trace the archived rename",
+            &[],
+            noop,
+            Duration::from_secs(10),
+            Arc::clone(&maps),
+            "run-fw1-012",
+            0,
+            &tx,
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn.status, StepStatus::Ok, "{:?}", turn.output);
+        // This IS the whole-output fallback: no tool_call ⇒ the answer field is the whole output.
+        assert_eq!(
+            turn.answer, turn.output,
+            "the compaction turn takes the whole-output boundary: {:?}",
+            turn.output
+        );
+        // True reproduction: the RAW output carries the scaffold the seat emitted…
+        assert!(
+            scaffold_header_hits(&turn.output) >= 3,
+            "the seat did emit the scaffold in its raw output: {:?}",
+            turn.output
+        );
+        // …but the RENDERED chat reply is stripped clean (the acceptance criterion, 0 hits).
+        let reply = turn.chat_answer();
+        assert_eq!(
+            scaffold_header_hits(&reply),
+            0,
+            "the scaffold must never reach the rendered chat reply: {reply}"
+        );
+        // Bounded, end-to-end: the leading answer AND the bold-led conclusion after the scaffold
+        // both survive — the strip removed only the scaffold, not the real content around it.
+        assert!(
+            reply.contains("archived_at") && reply.contains("Both questions answered."),
+            "the answer and the trailing conclusion both survive: {reply}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE core#293 REGRESSION TEST — two turns on ONE session, driven until the agent's own
