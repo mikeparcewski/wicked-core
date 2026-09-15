@@ -3010,12 +3010,20 @@ impl TurnResult {
     /// directly-constructed result, [`TurnResult::default_failed`]). The narration before the
     /// answer was already streamed as deltas, where the studio narrates it; it never re-enters the
     /// reply. NEVER empty unless the turn produced no text at all.
+    ///
+    /// F-W1-012: whichever reply is chosen, the internal-handoff scaffold is stripped as the
+    /// FINAL step — the ONE seam every reply-boundary path funnels through, including the
+    /// whole-output fallback — so a `## Work State` / `## Next Move` / `## Relevant Files` block can
+    /// never reach the rendered reply even when the boundary could not be resolved (a compaction
+    /// turn). Applied only to the CHAT reply: the `answer`/`output` fields (unit outputs, the
+    /// durable transcript, prior-output injection) keep their full text.
     fn chat_answer(&self) -> String {
-        if self.answer.is_empty() {
-            self.output.clone()
+        let reply = if self.answer.is_empty() {
+            &self.output
         } else {
-            self.answer.clone()
-        }
+            &self.answer
+        };
+        strip_internal_scaffold(reply)
     }
 }
 
@@ -3212,6 +3220,67 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
         }
         rest = after;
     }
+}
+
+/// The internal-handoff scaffold headings a chat seat is told NEVER to put in an Answer
+/// (F-W1-012): `## Work State`, `## Next Move`, `## Relevant Files` — each with its
+/// `### Completed` / `### Active` / `### Blocked` subsections. Matched as a level-2 ATX heading
+/// whose title BEGINS with one of these, so the acceptance criterion
+/// `^## (Work State|Next Move|Relevant Files)` can never survive [`strip_internal_scaffold`].
+const INTERNAL_SCAFFOLD_HEADINGS: [&str; 3] = ["Work State", "Next Move", "Relevant Files"];
+
+/// Remove any internal-handoff scaffold block from a rendered chat reply (F-W1-012).
+///
+/// A seat streams its answer AFTER an internal planning scaffold (`## Work State` / `## Next Move`
+/// / `## Relevant Files`). The reply-boundary rule ([`answer_after_last_tool_call`]) normally cuts
+/// to the answer after the last `tool_call`, but on a turn with no resolvable boundary — a
+/// `compaction` part, no tool call at all, or a tail shorter than the narration — it falls back to
+/// the WHOLE output, and the scaffold rode through into the reply (opencode Q2, "whole output —
+/// narration retained"). This is the ONE uniform final step every reply funnels through
+/// ([`TurnResult::chat_answer`]), so a recognized scaffold block can NEVER reach the rendered reply
+/// regardless of how the boundary resolved.
+///
+/// Loss-averse: strips ONLY a scaffold level-2 heading and the lines beneath it, up to the next
+/// level-2 heading that is NOT scaffold (a `###` subheading stays inside the block and never ends
+/// it) or end of text — so a legitimate `## Important Details` (or any other section) is kept. Text
+/// with no scaffold heading is returned byte-identical.
+fn strip_internal_scaffold(text: &str) -> String {
+    /// A level-2 ATX heading whose title begins with a scaffold name — i.e. a line matching
+    /// `^\s*## (Work State|Next Move|Relevant Files)`. A `###` line never matches (`"### "` is not
+    /// prefixed by `"## "`), so subsections stay inside the block rather than ending it.
+    fn is_scaffold_heading(line: &str) -> bool {
+        line.trim_start().strip_prefix("## ").is_some_and(|title| {
+            let title = title.trim_start();
+            INTERNAL_SCAFFOLD_HEADINGS
+                .iter()
+                .any(|h| title.starts_with(h))
+        })
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_scaffold = false;
+    let mut stripped_any = false;
+    for line in text.split_inclusive('\n') {
+        if is_scaffold_heading(line) {
+            in_scaffold = true;
+            stripped_any = true;
+            continue; // drop the scaffold heading itself
+        }
+        if in_scaffold {
+            // A non-scaffold level-2 heading ENDS the block and is kept; a `###` subsection or any
+            // body line stays inside the block and is dropped.
+            if line.trim_start().starts_with("## ") {
+                in_scaffold = false;
+            } else {
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    if !stripped_any {
+        return text.to_string(); // byte-identical when there was nothing to strip
+    }
+    kept.concat().trim().to_string()
 }
 
 /// (core#431, F-3R2-009; F-4R2-004) The WRITE POSTURE of a fenced unit on the ACP carrier — one
@@ -5761,11 +5830,17 @@ impl AcpStepRunner {
                 // much of its own output it shipped, so "the fallback fired" and "the adapter
                 // announced no tool call" are readable in the daemon log instead of being
                 // indistinguishable from an unfixed engine. The P6 re-run reads this line.
+                // F-W1-012: the MODE is the BOUNDARY decision (the `answer` FIELD, before the
+                // scaffold strip) — the whole-output fallback fired iff it kept everything — while
+                // the reported length is the actually-rendered reply, which `chat_answer` may have
+                // shortened by stripping an internal scaffold block.
+                let boundary_whole =
+                    turn.answer.is_empty() || turn.answer.len() == turn.output.len();
                 eprintln!(
                     "[wicked-core] chat '{chat_id}' seat '{cli_key}' reply {} of {} output bytes ({})",
                     answer.len(),
                     turn.output.len(),
-                    if answer.len() == turn.output.len() {
+                    if boundary_whole {
                         "whole output — narration retained"
                     } else {
                         "answer after the last tool call"
@@ -13546,6 +13621,119 @@ acp_input_governance = true
         assert_eq!(TurnResult::default_failed().chat_answer(), "");
     }
 
+    /// The acceptance criterion, expressed as code: how many chat-reply lines match
+    /// `^## (Work State|Next Move|Relevant Files)` (allowing leading indentation, as the grep does).
+    fn scaffold_header_hits(reply: &str) -> usize {
+        reply
+            .lines()
+            .filter(|l| {
+                l.trim_start().strip_prefix("## ").is_some_and(|t| {
+                    let t = t.trim_start();
+                    ["Work State", "Next Move", "Relevant Files"]
+                        .iter()
+                        .any(|h| t.starts_with(h))
+                })
+            })
+            .count()
+    }
+
+    /// F-W1-012: the internal-handoff scaffold NEVER survives into the rendered chat reply, on
+    /// EVERY reply-boundary path — including the whole-output fallback the compaction turn takes.
+    #[test]
+    fn the_internal_scaffold_never_reaches_a_rendered_chat_reply() {
+        // The shape opencode Q2 leaked: a real answer + a legitimate `## Important Details`
+        // section, then the banned handoff scaffold (Work State / Next Move / Relevant Files with
+        // ### subsections) riding through to end of text.
+        let leaked = "\
+The skill reaches the worker through the published immutable snapshot; core resolves it per spawn.
+
+## Important Details
+- Repos live under the fresh checkout; crew is a TS monorepo and core is Rust.
+- Estate queries go through the read-only shim.
+
+## Work State
+### Completed
+- Thread 1 fully traced.
+### Active
+- Thread 2 estate leg still open.
+### Blocked
+- (none)
+
+## Next Move
+1. Read the verdict audit to see whether evidence collection touches estate.
+
+## Relevant Files
+- crew: api/evidence.ts, qe/acceptance.ts
+- core: src/workflow.rs, src/pipeline.rs";
+
+        // 1) The pure strip removes exactly the three banned sections and their `###` subsections.
+        let cleaned = strip_internal_scaffold(leaked);
+        assert_eq!(
+            scaffold_header_hits(&cleaned),
+            0,
+            "the criterion `^## (Work State|Next Move|Relevant Files)` holds: {cleaned}"
+        );
+        for banned in [
+            "## Work State",
+            "## Next Move",
+            "## Relevant Files",
+            "### Completed",
+            "### Active",
+            "### Blocked",
+        ] {
+            assert!(
+                !cleaned.contains(banned),
+                "`{banned}` was stripped from the reply: {cleaned}"
+            );
+        }
+        // The real answer and a legitimate heading are KEPT (loss-averse).
+        assert!(
+            cleaned.contains("The skill reaches the worker")
+                && cleaned.contains("## Important Details"),
+            "the answer and legitimate sections survive: {cleaned}"
+        );
+
+        // 2) A reply with no scaffold is returned byte-identical.
+        let clean = "The run-level flag on the wire is `archived_at`.\n\n## Trace\n- one\n- two";
+        assert_eq!(
+            strip_internal_scaffold(clean),
+            clean,
+            "no scaffold heading ⇒ untouched"
+        );
+
+        // 3) chat_answer strips on the ANSWER path (a resolved-but-still-carries-scaffold boundary).
+        let via_answer = TurnResult {
+            output: leaked.to_string(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            answer: leaked.to_string(),
+        };
+        assert_eq!(
+            scaffold_header_hits(&via_answer.chat_answer()),
+            0,
+            "answer-path reply is clean"
+        );
+
+        // 4) …and on the WHOLE-OUTPUT FALLBACK path (empty answer ⇒ chat_answer falls back to
+        // `output`) — the compaction turn's exact shape. THIS is the path that leaked.
+        let via_output = TurnResult {
+            answer: String::new(),
+            ..via_answer
+        };
+        let fallback_reply = via_output.chat_answer();
+        assert_eq!(
+            scaffold_header_hits(&fallback_reply),
+            0,
+            "whole-output fallback reply is clean: {fallback_reply}"
+        );
+        assert!(
+            fallback_reply.contains("The skill reaches the worker"),
+            "the fallback still surfaces the real answer: {fallback_reply}"
+        );
+    }
+
     #[test]
     fn result_usage_parses_ecosystem_adapter_shape() {
         // Official claude adapter result: input + cached reads/writes sum into input.
@@ -15780,6 +15968,43 @@ elif behavior == "task_denied":
         "stopReason": "end_turn", "usage": {"inputTokens": 3, "outputTokens": 2}
     }})
 
+elif behavior == "scaffold_leak":
+    # F-W1-012: the opencode Q2 shape — a `compaction` part and NO tool_call, so the reply-boundary
+    # rule cannot resolve an answer boundary and falls back to the WHOLE output. The seat streams a
+    # short narration, a compaction part (an update kind the engine does not recognize), then its
+    # internal handoff scaffold (## Work State / ## Next Move / ## Relevant Files). Without the
+    # uniform strip the scaffold rides the whole-output fallback into the rendered reply.
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "The archived flag on the wire is archived_at.\n\n"}}
+    }})
+    # A compaction part — ignored by handle_update (no boundary is set), like opencode's real one.
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "compaction"}
+    }})
+    # Build the level-2 (h2) and level-3 (h3) ATX heading markers with chr(35), so no double-quote
+    # ever sits next to a hash in this source (that byte pair would close the Rust raw string).
+    h2 = chr(35) * 2
+    h3 = chr(35) * 3
+    scaffold = (
+        h2 + " Work State\n"
+        + h3 + " Completed\n- Thread 1 traced.\n"
+        + h3 + " Active\n- Thread 2 open.\n"
+        + h3 + " Blocked\n- (none)\n\n"
+        + h2 + " Next Move\n1. Read the verdict audit.\n\n"
+        + h2 + " Relevant Files\n- core: src/workflow.rs\n"
+    )
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": scaffold}}
+    }})
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 4, "outputTokens": 3}
+    }})
+
 elif behavior == "elicit_disconnect":
     # Send elicitation, then close stdout (simulate adapter death mid-suspension).
     w({"jsonrpc": "2.0", "id": "elicit-disc", "method": "elicitation/create", "params": {
@@ -16444,6 +16669,62 @@ transport = "stdio"
             "the turn still completes after the refused call: {:?}",
             turn.output
         );
+    }
+
+    /// F-W1-012 SMOKE STEP: an end-to-end chat turn whose seat emits a `compaction` part and NO
+    /// tool_call — the opencode Q2 shape where the reply-boundary rule falls back to the WHOLE
+    /// output — must NEVER render its internal handoff scaffold in the reply. Drives the REAL ACP
+    /// turn machinery (`exec_turn_acp` over a mock subprocess), asserts the raw output carried the
+    /// scaffold (so this is a true reproduction) while the rendered reply (`chat_answer`) has zero
+    /// `^## (Work State|Next Move|Relevant Files)` hits. Fails before the uniform strip; passes with
+    /// it. The reply-boundary observable stays "whole output" (answer == output field).
+    #[test]
+    #[cfg(unix)]
+    fn a_compaction_turn_never_renders_the_internal_scaffold_in_its_chat_reply() {
+        let dir = std::env::temp_dir().join(format!("wicked-fw1-012-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut proc = start_mock_proc(&dir, "scaffold_leak");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+        let turn = exec_turn_acp(
+            &mut proc,
+            "trace the archived rename",
+            &[],
+            noop,
+            Duration::from_secs(10),
+            Arc::clone(&maps),
+            "run-fw1-012",
+            0,
+            &tx,
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn.status, StepStatus::Ok, "{:?}", turn.output);
+        // This IS the whole-output fallback: no tool_call ⇒ the answer field is the whole output.
+        assert_eq!(
+            turn.answer, turn.output,
+            "the compaction turn takes the whole-output boundary: {:?}",
+            turn.output
+        );
+        // True reproduction: the RAW output carries the scaffold the seat emitted…
+        assert!(
+            scaffold_header_hits(&turn.output) >= 3,
+            "the seat did emit the scaffold in its raw output: {:?}",
+            turn.output
+        );
+        // …but the RENDERED chat reply is stripped clean (the acceptance criterion, 0 hits).
+        let reply = turn.chat_answer();
+        assert_eq!(
+            scaffold_header_hits(&reply),
+            0,
+            "the scaffold must never reach the rendered chat reply: {reply}"
+        );
+        assert!(
+            reply.contains("archived_at"),
+            "the real answer still surfaces: {reply}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// THE core#293 REGRESSION TEST — two turns on ONE session, driven until the agent's own
