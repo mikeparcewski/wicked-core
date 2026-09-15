@@ -315,8 +315,12 @@ impl SeatHealth {
 }
 
 /// Built-in sign-in commands for the known seat keys — used when a registry entry does not
-/// override `login_invocation`. Each is the seat's OWN documented interactive flow (device-code
-/// or URL+paste), so it works inside a PTY with no localhost-callback assumptions.
+/// override `login_invocation`. Most are the seat's OWN documented interactive flow (URL+paste or
+/// device-code), so they work inside a PTY with no localhost-callback assumptions. Codex defaults
+/// to its browser OAuth flow (`codex login`); the device-code flow (headless-safe — no browser
+/// needed) stays available for headless contexts by adding `--device-auth` manually. This is only
+/// what the roster / System page SUGGESTS for sign-in — it does NOT change how a seat RUNS (the
+/// headless worker invocation is resolved separately).
 ///
 /// Every command is DERIVED, not a literal: it is prefixed with the seat's RESOLVED configuration
 /// root (`wicked_apps_core::spawn::seat_config_for` — the same resolver the ballot spawn, the ACP
@@ -340,7 +344,7 @@ pub fn default_login_invocation(key: &str) -> Option<String> {
         // The worker home (crew#267 option 3): sign in the ENGINE-owned config dir, not the
         // operator's — inside the REPL, `/login` runs the URL+paste flow.
         "claude" => (SeatCli::Claude, "claude"),
-        "codex" => (SeatCli::Codex, "codex login --device-auth"),
+        "codex" => (SeatCli::Codex, "codex login"),
         "copilot" => (SeatCli::Copilot, "copilot login"),
         "opencode" => (SeatCli::Opencode, "opencode auth login"),
         "pi" => (SeatCli::Pi, "pi"),
@@ -1449,7 +1453,7 @@ mod login_tests {
     fn every_seats_sign_in_command_names_its_own_root_under_the_worker_home() {
         if wicked_apps_core::spawn::inherits_operator_config() {
             for (key, plain) in [
-                ("codex", "codex login --device-auth"),
+                ("codex", "codex login"),
                 ("pi", "pi"),
                 ("copilot", "copilot login"),
                 ("opencode", "opencode auth login"),
@@ -1476,10 +1480,7 @@ mod login_tests {
         let expect = |key: &str| got.iter().find(|(k, _)| *k == key).unwrap().1.clone();
         assert_eq!(
             expect("codex"),
-            Some(format!(
-                "CODEX_HOME={} codex login --device-auth",
-                q(base.join("codex"))
-            ))
+            Some(format!("CODEX_HOME={} codex login", q(base.join("codex"))))
         );
         assert_eq!(
             expect("pi"),
