@@ -1773,6 +1773,13 @@ impl WrappedCliStepRunner {
                 &input.run_id,
                 input.unit.ord,
                 input.unit.assigned_cli.as_deref(),
+                // BC-79: the run's studio project, carried on the governance context (set only for a
+                // governed unit — the only kind that submits proposals). `None` for an ungoverned
+                // unit or a repo-only run ⇒ no `WICKED_RUN_PROJECT` stamped.
+                input
+                    .governance
+                    .as_ref()
+                    .and_then(|g| g.project_id.as_deref()),
             );
             stamp_run_markers(&mut cmd, &provenance);
             // D-7 (DES-L4 PR-⑦): garden's estate shim spawns `wicked-estate-mcp --readonly` by
@@ -2246,10 +2253,18 @@ pub(crate) fn is_node_interpreter(path: &std::path::Path) -> bool {
 /// key is ALSO always set: it mirrors the engine's default-seat resolution (`exec`'s `cli_key`,
 /// `assigned_cli.as_deref().unwrap_or("claude")`), so a default-seat unit (no `assigned_cli`, or a
 /// blank one) names the real worker — `claude` — in its proposal provenance rather than going blank.
+///
+/// `project` (BC-79) is the studio project id the run is filed into
+/// ([`crate::workflow::GovernanceContext::project_id`], from `AgentSession::project_id`). When it is
+/// present and non-blank, `WICKED_RUN_PROJECT` is stamped too, so garden's estate shim reads it into
+/// `facets.project` and the worker's estate proposals are scoped to the run's project instead of the
+/// state-home default. `None`/blank (a repo-only run, or any ungoverned unit) stamps NOTHING — the
+/// three run markers above are unchanged, preserving the pre-BC-79 behaviour exactly.
 pub(crate) fn estate_provenance_env(
     run_id: &str,
     unit_ord: u32,
     assigned_cli: Option<&str>,
+    project: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("WICKED_RUN_ID".to_string(), run_id.to_string()),
@@ -2263,6 +2278,11 @@ pub(crate) fn estate_provenance_env(
         .filter(|c| !c.is_empty())
         .unwrap_or("claude");
     env.push(("WICKED_RUN_AGENT".to_string(), agent.to_string()));
+    // BC-79: the studio project scope, ONLY when the run named one and it is non-blank. Absent ⇒
+    // nothing is stamped, so a repo-only run's worker env is byte-identical to before this change.
+    if let Some(p) = project.map(str::trim).filter(|p| !p.is_empty()) {
+        env.push(("WICKED_RUN_PROJECT".to_string(), p.to_string()));
+    }
     env
 }
 
@@ -4578,6 +4598,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                project_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -4944,6 +4965,7 @@ mod tests {
             ),
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
+            project_id: None,
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -5058,7 +5080,7 @@ mod tests {
     /// so omitting it is the honest signal rather than inventing a default.
     #[test]
     fn estate_provenance_env_sets_run_unit_and_agent_when_present() {
-        let with_agent = estate_provenance_env("run-42", 3, Some("claude"));
+        let with_agent = estate_provenance_env("run-42", 3, Some("claude"), None);
         assert_eq!(
             with_agent,
             vec![
@@ -5070,7 +5092,7 @@ mod tests {
 
         // No assigned CLI ⇒ the DEFAULT SEAT (claude), matching the engine's cli_key resolution
         // (`assigned_cli.as_deref().unwrap_or("claude")`) — provenance names the real worker, not blank.
-        let no_agent = estate_provenance_env("run-42", 7, None);
+        let no_agent = estate_provenance_env("run-42", 7, None, None);
         assert_eq!(
             no_agent,
             vec![
@@ -5081,11 +5103,106 @@ mod tests {
         );
 
         // A blank assigned CLI is also the default seat (never an empty-string agent stamp).
-        let blank_agent = estate_provenance_env("run-42", 1, Some("  "));
+        let blank_agent = estate_provenance_env("run-42", 1, Some("  "), None);
         assert_eq!(
             blank_agent.iter().find(|(k, _)| k == "WICKED_RUN_AGENT"),
             Some(&("WICKED_RUN_AGENT".to_string(), "claude".to_string()))
         );
+    }
+
+    /// BC-79: a run FILED INTO a studio project stamps `WICKED_RUN_PROJECT` = that project id, so
+    /// garden's estate shim scopes the worker's proposals to the run's project instead of the
+    /// state-home default. A run with NO project (a repo-only run, `None`) — or a blank/whitespace
+    /// id — stamps NOTHING, leaving the three pre-BC-79 markers byte-identical. This is the seam the
+    /// garden reader consumes; nothing reads `WICKED_RUN_PROJECT` yet, so the stamp is inert until
+    /// the BC-79 garden PR lands.
+    #[test]
+    fn estate_provenance_env_stamps_project_only_when_present_and_non_blank() {
+        // Present ⇒ WICKED_RUN_PROJECT is appended AFTER the three run markers, value verbatim.
+        let filed = estate_provenance_env("run-42", 3, Some("claude"), Some("proj_abc"));
+        assert_eq!(
+            filed,
+            vec![
+                ("WICKED_RUN_ID".to_string(), "run-42".to_string()),
+                ("WICKED_RUN_UNIT".to_string(), "3".to_string()),
+                ("WICKED_RUN_AGENT".to_string(), "claude".to_string()),
+                ("WICKED_RUN_PROJECT".to_string(), "proj_abc".to_string()),
+            ]
+        );
+
+        // Absent (a repo-only run) ⇒ no WICKED_RUN_PROJECT at all; the markers are unchanged.
+        let unfiled = estate_provenance_env("run-42", 3, Some("claude"), None);
+        assert!(
+            !unfiled.iter().any(|(k, _)| k == "WICKED_RUN_PROJECT"),
+            "a run with no project must stamp no WICKED_RUN_PROJECT (no regression)"
+        );
+
+        // A blank / whitespace-only id is treated as absent (never an empty-string project stamp).
+        let blank = estate_provenance_env("run-42", 3, Some("claude"), Some("   "));
+        assert!(
+            !blank.iter().any(|(k, _)| k == "WICKED_RUN_PROJECT"),
+            "a blank project id must stamp no WICKED_RUN_PROJECT"
+        );
+    }
+
+    /// BC-79, StepInput → env seam. Both carriers derive the project the SAME way — off the unit's
+    /// `governance` context (`input.governance.as_ref().and_then(|g| g.project_id.as_deref())`),
+    /// which the actor sets from `AgentSession::project_id`. This asserts that exact expression: a
+    /// governed unit carrying a project id stamps `WICKED_RUN_PROJECT`; a governed unit with none,
+    /// and an ungoverned unit (`governance: None`), stamp nothing.
+    #[test]
+    fn step_input_governance_project_reaches_the_worker_env() {
+        let gov = |project: Option<&str>| crate::workflow::GovernanceContext {
+            db_path: "/tmp/op.db".to_string(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_id: project.map(str::to_string),
+        };
+        let input = |governance: Option<crate::workflow::GovernanceContext>| {
+            let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
+            u.assigned_cli = Some("claude".to_string());
+            StepInput {
+                run_id: "run-bc79".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: None,
+                governance,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        // The one expression both carriers use to feed `estate_provenance_env`.
+        let stamp = |input: &StepInput| {
+            estate_provenance_env(
+                &input.run_id,
+                input.unit.ord,
+                input.unit.assigned_cli.as_deref(),
+                input
+                    .governance
+                    .as_ref()
+                    .and_then(|g| g.project_id.as_deref()),
+            )
+            .into_iter()
+            .find(|(k, _)| k == "WICKED_RUN_PROJECT")
+            .map(|(_, v)| v)
+        };
+
+        // A governed unit FILED into a project ⇒ the worker env carries WICKED_RUN_PROJECT=<id>.
+        assert_eq!(
+            stamp(&input(Some(gov(Some("proj_x"))))),
+            Some("proj_x".to_string())
+        );
+        // A governed unit with NO project ⇒ nothing stamped.
+        assert_eq!(stamp(&input(Some(gov(None)))), None);
+        // An UNGOVERNED unit (engine-internal call) ⇒ nothing stamped.
+        assert_eq!(stamp(&input(None)), None);
     }
 
     /// R12 (DES-L4 PR-③): `stamp_run_markers` is the ONE mechanism both carriers use to put the
@@ -5094,7 +5211,7 @@ mod tests {
     /// Command so the env under test is not cleared out from under it.
     #[test]
     fn stamp_run_markers_sets_all_three_and_empty_sets_none() {
-        let provenance = estate_provenance_env("run-9", 4, Some("codex"));
+        let provenance = estate_provenance_env("run-9", 4, Some("codex"), None);
         // spawn-audit: test-only — this Command is never spawned; its `get_envs` is inspected to
         // assert `stamp_run_markers` set the markers. It must NOT be `.hardened()` or the env under
         // test would be cleared out from under it.
@@ -6512,6 +6629,7 @@ mod tests {
                 code_graph_db: Some(graph_db.to_string()),
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                project_id: None,
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
@@ -6544,6 +6662,7 @@ mod tests {
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                project_id: None,
             },
             &format!("mcptest-norepo-{}", std::process::id()),
         );
@@ -8842,6 +8961,7 @@ mod tests {
             code_graph_db: None,
             extra_write_roots: Vec::new(),
             extra_read_roots: vec!["/srv/grounding".to_string()],
+            project_id: None,
         };
         let input = StepInput {
             run_id: format!("skillsroot-{}", std::process::id()),

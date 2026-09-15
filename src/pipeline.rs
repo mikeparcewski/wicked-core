@@ -72,6 +72,7 @@ pub fn run_session(
         Vec::new(), // sync path declares no extra write roots (core#259)
         Vec::new(), // …no extra read roots either (core#294)
         None,       // …and no repo (above) ⇒ no project graph to bind
+        None,       // sync path is unfiled ⇒ no studio project id (BC-79)
         workflow,
         &dispatcher,
         emit,
@@ -376,6 +377,11 @@ pub(crate) fn pre_distribute(
     // one repo halfway through is worse than one that never had them. VERIFIED at dispatch, never
     // here — see `actor::project_code_graph_db`.
     project_graph: Option<crate::project::ProjectGraphBinding>,
+    // The launcher's studio project id (BC-79), persisted on the session for the same reason
+    // `project_graph` is: a resume re-enters with no LaunchSpec, and a run whose proposals silently
+    // unscope from the project to the state-home default halfway through is worse than one that
+    // never carried it. `None` ⇒ a repo-only (unfiled) run.
+    project_id: Option<String>,
     workflow: Option<&str>,
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
@@ -509,6 +515,7 @@ pub(crate) fn pre_distribute(
         extra_write_roots,
         extra_read_roots,
         project_graph,
+        project_id,
         archived_at: None,
         archive_note: None,
         verified_tree: None,
@@ -756,6 +763,9 @@ pub(crate) fn plan_and_distribute(
     extra_write_roots: Vec<String>,
     extra_read_roots: Vec<String>,
     project_graph: Option<crate::project::ProjectGraphBinding>,
+    // The launcher's studio project id (BC-79), forwarded to `pre_distribute` to persist on the
+    // session. `None` ⇒ a repo-only (unfiled) run.
+    project_id: Option<String>,
     workflow: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
@@ -784,6 +794,7 @@ pub(crate) fn plan_and_distribute(
         extra_write_roots,
         extra_read_roots,
         project_graph,
+        project_id,
         workflow,
         emit,
         workflow_registry,
@@ -2164,6 +2175,7 @@ mod resolve_tests {
             Vec::new(),
             Vec::new(),
             None,
+            None,
             Some("feature"),
             &mut |_| {},
             Some(&registry),
@@ -2287,6 +2299,7 @@ mod resolve_tests {
             None,
             Vec::new(),
             Vec::new(),
+            None,
             None,
             Some(&id),
             &mut |_| {},
@@ -2586,6 +2599,7 @@ mod resolve_tests {
             None,
             Vec::new(),
             Vec::new(),
+            None,
             None,
             None,
             &dispatcher,

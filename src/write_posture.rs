@@ -378,6 +378,7 @@ mod tests {
                 second.to_string_lossy().into_owned(),
             ],
             extra_read_roots: vec!["/somewhere/readonly".into()],
+            project_id: None,
         };
         let in_process = deliverable_roots_from(&g.extra_write_roots);
         assert_eq!(

@@ -140,6 +140,17 @@ pub struct AgentSession {
     /// i.e. the pre-change per-repo behaviour.
     #[serde(default)]
     pub project_graph: Option<crate::project::ProjectGraphBinding>,
+    /// The studio PROJECT this run is filed into (`LaunchSpec::project_id`, DES-PROJECT-001), when
+    /// the launch named one — the SAME id crew holds at `POST /runs` and files membership under
+    /// (`actor::attach_member`). Distinct from [`Self::project_graph`], which is a *code-graph*
+    /// binding (db path + repo label); this is the project's IDENTITY, the scope a governed
+    /// worker's estate proposals belong to (BC-79). Persisted on the session for the same reason
+    /// `project_graph` is: a resume/redrive re-enters through the actor with no `LaunchSpec` in
+    /// hand, so an id held only in the launcher's memory would silently unscope a half-finished
+    /// run's proposals between two of its own units. `#[serde(default)]` for back-compat: older
+    /// sessions deserialize `None`, i.e. an unfiled (repo-only) run, preserving today's behaviour.
+    #[serde(default)]
+    pub project_id: Option<String>,
     /// When the operator ARCHIVED this run (crew#265) — a write-off, not a delete: the run and
     /// every artifact stay fully readable (same retire-not-delete contract as retired policies,
     /// FINDING-038), but default run listings exclude it. Only a TERMINAL run can be archived.
@@ -1054,6 +1065,7 @@ mod tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
+            project_id: None,
             archived_at: None,
             archive_note: None,
             verified_tree: None,

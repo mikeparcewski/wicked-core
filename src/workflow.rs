@@ -157,6 +157,16 @@ pub struct GovernanceContext {
     /// older peers) means the read boundary stays exactly the evidence-derived assembly.
     #[serde(default)]
     pub extra_read_roots: Vec<String>,
+    /// The studio PROJECT id this governed run is filed into (`AgentSession::project_id`, BC-79),
+    /// when the launch named one. Carried here — beside [`Self::code_graph_db`], which is the
+    /// run's project *code graph* — so the per-unit worker-env build can stamp it as
+    /// `WICKED_RUN_PROJECT` ([`crate::execute_wrapped::estate_provenance_env`]) for garden's estate
+    /// shim to read into `facets.project`, scoping the worker's estate proposals to the run's
+    /// project rather than the state-home default. `None` ⇒ a repo-only run (no project): nothing
+    /// is stamped and the pre-BC-79 self-derive behaviour is preserved. `#[serde(default)]` so a
+    /// `DispatchedTask` from an older peer still deserializes (as `None`).
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill
