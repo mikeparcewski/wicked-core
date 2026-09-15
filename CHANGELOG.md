@@ -1491,6 +1491,17 @@ Two release tracks share this file, newest entry first regardless of track:
   text is appended unredacted — transcript redaction is the run-wide policy, not this change.
   Behaviour change register: **BC-75** (proposed — user decision owed: a seat-visible tool denial,
   and every failed tool call now in the transcript).
+- **core-ts 0.7.29** — 2026-09-15 — npm release carrying the two engine changes since 0.7.28, #533
+  (BC-79) and #532 (codex OAuth default), on main tip ce74cb7 (plus #531, the 0.7.28
+  platform-lockfile re-stamp). **Behaviour changes:** **BC-79** — governed workers now receive
+  `WICKED_RUN_PROJECT` in their environment (stamped only for a governed, proposal-submitting unit
+  that carries a project), so estate proposals emitted during a run scope to the run's project
+  instead of the ambient default; additive and serde-default, and inert until the garden-side reader
+  lands (a repo-only run and an ungoverned unit are byte-identical to before). **Codex seat** — the
+  default sign-in suggestion for the codex seat is now browser OAuth (`codex login`) rather than the
+  device-code flow (`codex login --device-auth`), which stays available manually for headless
+  contexts; suggestion-string only, no change to how a seat runs. Wire shape: additive only;
+  `index.d.ts` unchanged (zero drift).
 - **core-ts 0.7.28** — 2026-09-15 — npm release carrying the one engine change since 0.7.27, #529
   (F-W1-012), on main tip 8632066 (plus #528, the 0.7.27 platform-lockfile re-stamp). **Behaviour
   change:** the engine now strips the internal handoff scaffold (Work State / Next Move / Relevant
