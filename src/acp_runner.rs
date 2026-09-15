@@ -6705,6 +6705,12 @@ impl AcpStepRunner {
                     &input.run_id,
                     input.unit.ord,
                     input.unit.assigned_cli.as_deref(),
+                    // BC-79: the run's studio project (governance context; `None` for a repo-only
+                    // run) — stamped as `WICKED_RUN_PROJECT` for garden's shim to read.
+                    input
+                        .governance
+                        .as_ref()
+                        .and_then(|g| g.project_id.as_deref()),
                 );
                 match start_acp_process_with_write_roots(
                     &acp_config,
@@ -9973,7 +9979,8 @@ sleep 30
                 envfile = envfile.display()
             ),
         );
-        let provenance = crate::execute_wrapped::estate_provenance_env("run-mk", 8, Some("pi"));
+        let provenance =
+            crate::execute_wrapped::estate_provenance_env("run-mk", 8, Some("pi"), None);
         let proc = start_acp_process_with_write_roots(
             &stub_config(&script, None),
             &dir,
@@ -14035,6 +14042,7 @@ No further next steps — both questions fully answered.";
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                project_id: None,
             }),
             prior_outputs: Vec::new(),
             elicitation_epoch: 0,
@@ -15125,6 +15133,7 @@ No further next steps — both questions fully answered.";
             code_graph_db: Some(graph.join("graph.db").to_string_lossy().into_owned()),
             extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
             extra_read_roots: vec![],
+            project_id: None,
         };
         // The ACP fence's roots (in-process) and the hook's roots (env round-trip) are one list.
         let acp_roots = crate::write_posture::deliverable_roots_from(&g.extra_write_roots);
