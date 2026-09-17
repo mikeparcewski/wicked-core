@@ -467,6 +467,7 @@ pub(crate) fn write_root_witness_path(decisions_path: &str, phase: &str) -> std:
 /// FNV-1a fingerprint of the admitted write-root trees: sorted (path, size, mtime-secs) tuples.
 /// Detects any file creation, deletion, or content/metadata change a Bash call could cause.
 /// `DefaultHasher` is deliberately avoided (it is not stable across Rust versions).
+#[cfg(test)]
 pub(crate) fn fingerprint_write_roots(roots: &[std::path::PathBuf]) -> u64 {
     const FNV_OFFSET: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
@@ -511,14 +512,98 @@ fn collect_dir_entries_for_witness(dir: &std::path::Path, out: &mut Vec<(String,
     }
 }
 
-/// Read the stored write-root fingerprint (`None` on first call or if the sidecar was removed).
-fn read_write_root_witness(path: &std::path::Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Sidecar payload for the post-hoc write-root witness (issue #541, items 1-3 of the review):
+/// the watched write roots (write set minus notes root) and the sorted entry list at snapshot time,
+/// so a mismatch can name the changed paths rather than only reporting a hash difference.
+#[derive(Debug, Clone)]
+pub(crate) struct WitnessSnapshot {
+    pub roots: Vec<std::path::PathBuf>,
+    pub entries: Vec<(String, u64, u64)>, // (path, size_bytes, mtime_secs)
 }
 
-/// Persist the write-root fingerprint for the next gate-hook invocation to compare against.
-fn write_write_root_witness(path: &std::path::Path, fingerprint: u64) {
-    let _ = std::fs::write(path, fingerprint.to_string());
+/// Read the stored write-root witness snapshot (`None` on first call or missing sidecar).
+fn read_write_root_witness(path: &std::path::Path) -> Option<WitnessSnapshot> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let roots = v
+        .get("roots")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.as_str().map(std::path::PathBuf::from))
+        .collect();
+    let entries = v
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .filter_map(|e| {
+            let arr = e.as_array()?;
+            let path = arr.first()?.as_str()?.to_string();
+            let size = arr.get(1)?.as_u64()?;
+            let mtime = arr.get(2)?.as_u64()?;
+            Some((path, size, mtime))
+        })
+        .collect();
+    Some(WitnessSnapshot { roots, entries })
+}
+
+/// Persist the write-root witness snapshot for the next gate-hook invocation to compare against.
+fn write_write_root_witness(path: &std::path::Path, snapshot: &WitnessSnapshot) {
+    let roots_json: Vec<serde_json::Value> = snapshot
+        .roots
+        .iter()
+        .map(|r| serde_json::Value::String(r.to_string_lossy().into_owned()))
+        .collect();
+    let entries_json: Vec<serde_json::Value> = snapshot
+        .entries
+        .iter()
+        .map(|(p, s, m)| serde_json::json!([p, s, m]))
+        .collect();
+    let payload = serde_json::json!({ "roots": roots_json, "entries": entries_json });
+    let _ = std::fs::write(path, payload.to_string());
+}
+
+/// Compute the write-root witness roots: the unit's write set minus the notes root.
+///
+/// A ReadOnly evaluator may write to its notes root — that is an EXPECTED write, not a fence
+/// violation. The witness fingerprints everything ELSE in the write set (the tree and any extra
+/// roots) so a mutation there proves an unwanted write escaped the phase-scope fence (item 1).
+fn compute_witness_roots(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathBuf> {
+    let (write_roots, notes_roots) = match boundary {
+        Some(b) => (b.roots.write.clone(), b.deliverable_roots.clone()),
+        None => (
+            allowed_roots_from_env()
+                .map(|r| r.write)
+                .unwrap_or_default(),
+            deliverable_roots_from_env(),
+        ),
+    };
+    let notes_root = notes_roots.first().cloned();
+    write_roots
+        .into_iter()
+        .filter(|r| notes_root.as_ref() != Some(r))
+        .collect()
+}
+
+/// Diff two sorted entry lists and return the paths that changed (created, deleted, or modified).
+fn diff_witness_entries(old: &[(String, u64, u64)], new: &[(String, u64, u64)]) -> Vec<String> {
+    use std::collections::HashMap;
+    let old_map: HashMap<&str, (u64, u64)> =
+        old.iter().map(|(p, s, m)| (p.as_str(), (*s, *m))).collect();
+    let new_map: HashMap<&str, (u64, u64)> =
+        new.iter().map(|(p, s, m)| (p.as_str(), (*s, *m))).collect();
+    let mut changed: Vec<String> = Vec::new();
+    for (path, &val) in &new_map {
+        if old_map.get(path) != Some(&val) {
+            changed.push((*path).to_string());
+        }
+    }
+    for path in old_map.keys() {
+        if !new_map.contains_key(path) {
+            changed.push((*path).to_string());
+        }
+    }
+    changed.sort_unstable();
+    changed
 }
 
 /// [`boundary_denial_with`] judging the install fence from the cwd persisted at `install_state`
@@ -863,6 +948,12 @@ pub(crate) fn bash_write_phase_scope(
     admitted_roots: &[std::path::PathBuf],
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
+    // Full posture without pre-build scope: the phase is a code-executing creator — no fence of
+    // any kind applies. Return early so that interpreter write targets extracted for the boundary
+    // check (item 4) don't accidentally fire the PRE-BUILD fallthrough in the match below.
+    if matches!(posture, WritePosture::Full) && !pre_build_scope {
+        return None;
+    }
     for target in bash_write_targets(command) {
         if crate::write_posture::deliverable_write_admitted(&target, cwd, home, admitted_roots) {
             continue;
@@ -900,8 +991,13 @@ pub(crate) fn bash_write_phase_scope(
     // extracted from the command text. `bash_write_targets` found nothing to judge, so the loop
     // above returned without denying — but `python3 -c '...'`, `node -e '...'`, `perl -e '...'`,
     // `ruby -e '...'`, and similar shapes can write files at paths invisible to this scan.
-    if matches!(posture, WritePosture::ReadOnly) && !pre_build_scope {
+    if matches!(posture, WritePosture::ReadOnly) {
         if let Some(reason) = opaque_interpreter_denial(command) {
+            return Some(reason);
+        }
+    }
+    if matches!(posture, WritePosture::ReadOnly) {
+        if let Some(reason) = explicit_write_program_denial(command) {
             return Some(reason);
         }
     }
@@ -1050,6 +1146,16 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
             Unwrapped::Inline(inner) => {
                 if unwrap_inline {
                     collect_bash_write_targets(inner, false, targets);
+                    // Also scan the code string for raw absolute path literals — captures
+                    // `python3 -c "open('/outside/x','w')"` where the path is inside the
+                    // interpreter's code string rather than a shell redirect (item 4).
+                    for tok in inner.split(|c: char| {
+                        c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';' | ':')
+                    }) {
+                        if tok.starts_with('/') && tok.len() > 1 {
+                            targets.push(tok.to_string());
+                        }
+                    }
                 }
                 continue;
             }
@@ -1083,7 +1189,7 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
             // in-tree false target, stated not modelled.
             "mkdir" => {
                 for w in &words[idx + 1..] {
-                    if !w.starts_with('-') {
+                    if !w.starts_with('-') && !is_fd_dup_operator(w) {
                         targets.push((*w).to_string());
                     }
                 }
@@ -1094,7 +1200,7 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
             // only when they look like paths — which is a tolerable over-deny vs. a missed escape.
             "touch" => {
                 for w in &words[idx + 1..] {
-                    if !w.starts_with('-') {
+                    if !w.starts_with('-') && !is_fd_dup_operator(w) {
                         targets.push((*w).to_string());
                     }
                 }
@@ -1110,6 +1216,17 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                     if args[j] == "-C" && j + 1 < args.len() {
                         c_paths.push(args[j + 1].to_string());
                         j += 2;
+                    } else if let Some(p) = args[j]
+                        .strip_prefix("--git-dir=")
+                        .or_else(|| args[j].strip_prefix("--work-tree="))
+                    {
+                        c_paths.push(p.to_string());
+                        j += 1;
+                    } else if (args[j] == "--git-dir" || args[j] == "--work-tree")
+                        && j + 1 < args.len()
+                    {
+                        c_paths.push(args[j + 1].to_string());
+                        j += 2;
                     } else if args[j].starts_with('-') {
                         j += 1;
                     } else {
@@ -1119,6 +1236,41 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                         }
                         break;
                     }
+                }
+            }
+            // issue #540: `ln <src> <dest>` — the last non-flag argument is the destination.
+            // `ln` can create hard or symbolic links outside the worktree, which counts as a
+            // write target for boundary judgement.
+            "ln" => {
+                if let Some(dest) = words[idx + 1..].iter().rev().find(|w| !w.starts_with('-')) {
+                    targets.push((*dest).to_string());
+                }
+            }
+            // item 4: interpreter programs (`python3 -c`, `node -e`, etc.) are not unwrapped by
+            // `unwrap_program` (only shells are), so the Inline arm above never fires for them.
+            // Scan the code argument (the word following `-c`/`-e`/`-r`/`--`) for raw absolute
+            // path literals so that `python3 -c "open('/outside/x','w')"` registers as a write
+            // to `/outside/x` for boundary judgement.
+            basename if OPAQUE_WRITER_PROGRAMS.contains(&basename) => {
+                let args = &words[idx + 1..];
+                let mut j = 0;
+                while j < args.len() {
+                    // Look for code-introducing flags (-c, -e, -r, --).
+                    if matches!(args[j], "-c" | "-e" | "-r" | "--") {
+                        if let Some(code) = args.get(j + 1) {
+                            let code = strip_one_quote_layer(code);
+                            for tok in code.split(|c: char| {
+                                c.is_whitespace()
+                                    || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';' | ':')
+                            }) {
+                                if tok.starts_with('/') && tok.len() > 1 {
+                                    targets.push(tok.to_string());
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    j += 1;
                 }
             }
             _ => {}
@@ -1140,8 +1292,6 @@ const GIT_READ_VERBS: &[&str] = &[
     "rev-parse",
     "rev-list",
     "for-each-ref",
-    "branch",
-    "tag",
     "describe",
     "shortlog",
     "grep",
@@ -1156,9 +1306,7 @@ const GIT_READ_VERBS: &[&str] = &[
     "name-rev",
     "merge-base",
     "count-objects",
-    "notes",
     "fsck",
-    "hash-object",
 ];
 
 /// Interpreter programs that can write files with unresolvable targets when invoked with inline
@@ -1167,7 +1315,66 @@ const GIT_READ_VERBS: &[&str] = &[
 const OPAQUE_WRITER_PROGRAMS: &[&str] = &[
     "python", "python2", "python3", "node", "nodejs", "deno", "perl", "ruby", "php", "lua",
     "Rscript",
+    // Shells invoked without `-c` (stdin heredoc, `-s`, a script-file argument) are opaque
+    // under ReadOnly — the script content cannot be statically analysed (item 6 of the review).
+    // `sh -c '...'` is already handled by `unwrap_program` returning `Unwrapped::Inline`.
+    "sh", "bash", "zsh", "dash",
 ];
+
+/// Returns `true` when `command` contains a program that can write files with targets that
+/// `bash_write_targets` cannot resolve from the command text — interpreters, shells without
+/// `-c`, git non-read verbs, `ln`, `sed`, `rm`, `truncate`, `patch` (item 4 of the review).
+/// Used by `bash_cd_escape_targets` to judge `cd` destinations even when there is no
+/// statically-resolvable write target.
+fn command_contains_write_capable_program(command: &str) -> bool {
+    let owned = shell_tokens(command);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
+    const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut seg: Vec<&str> = Vec::new();
+    for &t in &toks {
+        if SEPS.contains(&t) {
+            if !seg.is_empty() {
+                segments.push(std::mem::take(&mut seg));
+            }
+        } else if redirect_glob(t).is_none() {
+            seg.push(t);
+        }
+    }
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
+    for words in &segments {
+        match unwrap_program(words) {
+            Unwrapped::Inline(_) => return true, // any -c wrapper is write-capable
+            Unwrapped::Program { idx, .. } => {
+                let Some(prog) = words.get(idx) else { continue };
+                let basename = program_basename(prog);
+                if OPAQUE_WRITER_PROGRAMS.contains(&basename) {
+                    return true;
+                }
+                if basename == "git" {
+                    let args = &words[idx + 1..];
+                    let mut j = 0;
+                    while j < args.len() {
+                        if args[j].starts_with('-') {
+                            j += 1;
+                        } else {
+                            if !GIT_READ_VERBS.contains(&args[j]) {
+                                return true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if matches!(basename, "ln" | "sed" | "rm" | "truncate" | "patch") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 /// Extract the `cd` destinations from a Bash command for the BOUNDARY check (issue #540).
 ///
@@ -1178,7 +1385,7 @@ const OPAQUE_WRITER_PROGRAMS: &[&str] = &[
 /// install fence, not this boundary check. Called from the boundary check only, NOT from the
 /// phase-scope fence, so evaluators may `cd src/` within the worktree without a fence hit.
 fn bash_cd_escape_targets(command: &str) -> Vec<String> {
-    if bash_write_targets(command).is_empty() {
+    if bash_write_targets(command).is_empty() && !command_contains_write_capable_program(command) {
         return Vec::new();
     }
     bash_cd_targets_inner(command, true)
@@ -1293,6 +1500,134 @@ fn opaque_interpreter_denial_inner(command: &str, unwrap_inline: bool) -> Option
                      a script, or stdin via `-`) — under a read-only evaluation phase every such \
                      invocation is refused; {PHASE_SCOPE_BASH_REMEDY}."
                 ));
+            }
+        }
+    }
+    None
+}
+
+/// Under ReadOnly posture, deny explicit write-program invocations by program word — programs
+/// that cannot be safely allowed without analysing their arguments and that are not otherwise
+/// caught by the write-target extractor or the opaque-interpreter check. This is separate from
+/// `opaque_interpreter_denial`: these programs have predictable write semantics but no
+/// resolvable TARGET in the command text under the shapes that matter.
+///
+/// Covers: `sed -i` (in-place edit), `rm` (deletion), `truncate`, `patch`, `ln` (linking),
+/// and git write subcommands (`commit`, `apply`, `checkout`, `stash`, `reset`).
+fn explicit_write_program_denial(command: &str) -> Option<String> {
+    explicit_write_program_denial_inner(command, true)
+}
+
+fn explicit_write_program_denial_inner(command: &str, unwrap_inline: bool) -> Option<String> {
+    let owned = shell_tokens(command);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
+    const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut seg: Vec<&str> = Vec::new();
+    for &t in &toks {
+        if SEPS.contains(&t) {
+            if !seg.is_empty() {
+                segments.push(std::mem::take(&mut seg));
+            }
+        } else if redirect_glob(t).is_none() {
+            seg.push(t);
+        }
+    }
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
+    for words in &segments {
+        match unwrap_program(words) {
+            Unwrapped::Inline(inner) => {
+                if unwrap_inline {
+                    if let Some(r) = explicit_write_program_denial_inner(inner, false) {
+                        return Some(r);
+                    }
+                }
+            }
+            Unwrapped::Program { idx, .. } => {
+                let Some(prog) = words.get(idx) else {
+                    continue;
+                };
+                let basename = program_basename(prog);
+                let args = &words[idx + 1..];
+                match basename {
+                    "sed" => {
+                        // `sed -i` (in-place edit) — deny if any arg is `-i` or starts with `-i`.
+                        let has_inplace = args.iter().any(|a| {
+                            *a == "-i" || (a.starts_with("-i") && a.len() > 2) || *a == "--in-place"
+                        });
+                        if has_inplace {
+                            return Some(format!(
+                                "phase scope: `Bash` invokes `sed -i` (in-place file edit) — \
+                                 under a read-only evaluation phase this write is refused; \
+                                 {PHASE_SCOPE_BASH_REMEDY}."
+                            ));
+                        }
+                    }
+                    "rm" => {
+                        // `rm` always deletes — deny by program word.
+                        if !args
+                            .iter()
+                            .all(|a| matches!(*a, "--help" | "-h" | "--version"))
+                        {
+                            return Some(format!(
+                                "phase scope: `Bash` invokes `rm` (file deletion) — \
+                                 under a read-only evaluation phase this write is refused; \
+                                 {PHASE_SCOPE_BASH_REMEDY}."
+                            ));
+                        }
+                    }
+                    "truncate" => {
+                        return Some(format!(
+                            "phase scope: `Bash` invokes `truncate` (file size modification) — \
+                             under a read-only evaluation phase this write is refused; \
+                             {PHASE_SCOPE_BASH_REMEDY}."
+                        ));
+                    }
+                    "patch" => {
+                        return Some(format!(
+                            "phase scope: `Bash` invokes `patch` (file modification) — \
+                             under a read-only evaluation phase this write is refused; \
+                             {PHASE_SCOPE_BASH_REMEDY}."
+                        ));
+                    }
+                    "ln" => {
+                        // `ln` without `--help`/`--version` creates links.
+                        if !args
+                            .iter()
+                            .all(|a| matches!(*a, "--help" | "-h" | "--version"))
+                        {
+                            return Some(format!(
+                                "phase scope: `Bash` invokes `ln` (link creation) — \
+                                 under a read-only evaluation phase this write is refused; \
+                                 {PHASE_SCOPE_BASH_REMEDY}."
+                            ));
+                        }
+                    }
+                    "git" => {
+                        // Deny specific git write subcommands by name.
+                        const GIT_WRITE_SUBCOMMANDS: &[&str] =
+                            &["commit", "apply", "checkout", "stash", "reset"];
+                        let mut j = 0;
+                        while j < args.len() {
+                            if args[j].starts_with('-') {
+                                j += 1;
+                            } else {
+                                if GIT_WRITE_SUBCOMMANDS.contains(&args[j]) {
+                                    return Some(format!(
+                                        "phase scope: `Bash` invokes `git {}` (a write \
+                                         subcommand) — under a read-only evaluation phase \
+                                         this is refused; {PHASE_SCOPE_BASH_REMEDY}.",
+                                        args[j]
+                                    ));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1831,6 +2166,18 @@ fn is_safe_write_sink(target: &str) -> bool {
     ) || target.starts_with("/dev/fd/")
 }
 
+/// Returns `true` for fd-dup redirect operators (`2>&1`, `>&2`, `1>&2`) that appear in the
+/// argument stream of `touch`/`mkdir` when the shell tokeniser leaves them in the segment.
+/// These are NOT file paths and must be skipped so `touch <notes>/f 2>&1` is not refused.
+fn is_fd_dup_operator(tok: &str) -> bool {
+    let t = tok.trim_start_matches(|c: char| c.is_ascii_digit());
+    let t = t.strip_prefix('&').unwrap_or(t);
+    if let Some(rest) = t.strip_prefix('>') {
+        return rest.starts_with('&');
+    }
+    false
+}
+
 /// If `tok` is a WRITE-redirect operator to a FILE (`>`, `>>`, `>|`, `N>`, `&>`, optionally glued to a
 /// filename), return the glued filename (`""` when the filename is the next token). `None` for a
 /// non-redirect token, a READ redirect (`<`), or an fd DUPLICATION (`2>&1`, `>&2`) — the latter
@@ -2076,26 +2423,27 @@ pub(crate) fn evaluate_tool_call(
         None => deliverable_roots_from_env(),
     };
 
-    // POST-HOC WITNESS (issue #541 criterion 3): for ReadOnly units, compare a fingerprint of the
-    // admitted write roots against the value stored after the LAST allowed Bash call. A mismatch
-    // proves that an allowed Bash call mutated the write roots outside the modelled targets — the
-    // one shape the pre-call phase-scope fence cannot catch. Fatal (write escape): the unit is
-    // denied and the event is recorded under `boundary-deny:`. Witness sidecar is at
-    // `<decisions-dir>/write-root-witness-<phase>`; absent on first call (no prior Bash allowed).
-    // Check only in the subprocess carrier (`boundary.is_none()`) where the sidecar file is
-    // process-stable; the ACP in-process carrier manages its own boundary differently.
+    // POST-HOC WITNESS (issue #541 items 1-3): for ReadOnly units, compare the entry list of the
+    // write roots (write set minus notes root) against the snapshot stored after the LAST allowed
+    // Bash call. A mismatch names the changed paths under a typed `witness-deny:` claim.
+    // Runs on BOTH carriers: the sidecar is keyed by decisions-dir+phase, which both share.
+    let witness_roots = compute_witness_roots(boundary);
     let witness_path_buf = write_root_witness_path(decisions_path, phase);
-    if boundary.is_none()
-        && write_posture == crate::write_posture::WritePosture::ReadOnly
-        && !scope_roots.is_empty()
-    {
+    if write_posture == crate::write_posture::WritePosture::ReadOnly && !witness_roots.is_empty() {
         if let Some(stored) = read_write_root_witness(&witness_path_buf) {
-            let current = fingerprint_write_roots(&scope_roots);
-            if stored != current {
-                let reason = "write-root-mutated: the admitted write roots changed since the \
-                              last allowed Bash call — a previous Bash tool call wrote outside \
-                              its modelled targets (issue #541)";
-                append_boundary_deny(decisions_path, scope, phase, reason, true);
+            let mut current_entries = Vec::new();
+            for root in &witness_roots {
+                collect_dir_entries_for_witness(root, &mut current_entries);
+            }
+            current_entries.sort_unstable();
+            let changed = diff_witness_entries(&stored.entries, &current_entries);
+            if !changed.is_empty() {
+                let reason = format!(
+                    "write-root-mutated: the admitted write roots changed since the last \
+                     allowed Bash call — changed paths: {} (issue #541)",
+                    changed.join(", ")
+                );
+                append_witness_deny(decisions_path, scope, phase, &changed);
                 eprintln!("wicked-governance: DENY ({reason})");
                 return 2;
             }
@@ -2210,20 +2558,34 @@ pub(crate) fn evaluate_tool_call(
             // ALLOWED: the seat's shell runs this call, so its trailing `cd` is where the install
             // fence judges the next one from (review of #456, F1). Only here — every deny above
             // returned 2 before this point, and a refused call never moved the shell.
-            if tool == "Bash" && boundary.is_none() {
-                if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
-                    let cwd =
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                    track_install_fence_cwd(command, &cwd, home.as_deref(), &install_state);
+            if tool == "Bash" {
+                // Install-fence cwd tracking is subprocess-only (boundary.is_none()).
+                if boundary.is_none() {
+                    if let Some(command) =
+                        context.get("command").and_then(serde_json::Value::as_str)
+                    {
+                        let cwd = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                        track_install_fence_cwd(command, &cwd, home.as_deref(), &install_state);
+                    }
                 }
-                // POST-HOC WITNESS: snapshot the write roots AFTER an allowed Bash call so the
-                // next gate-hook invocation can detect mutations (issue #541 criterion 3).
+                // POST-HOC WITNESS: snapshot the witness roots (write set minus notes root) AFTER
+                // an allowed Bash call, on BOTH carriers, so the next invocation can detect
+                // mutations and name the changed paths (items 1-3 of the review).
                 if write_posture == crate::write_posture::WritePosture::ReadOnly
-                    && !scope_roots.is_empty()
+                    && !witness_roots.is_empty()
                 {
-                    let fp = fingerprint_write_roots(&scope_roots);
-                    write_write_root_witness(&witness_path_buf, fp);
+                    let mut entries = Vec::new();
+                    for root in &witness_roots {
+                        collect_dir_entries_for_witness(root, &mut entries);
+                    }
+                    entries.sort_unstable();
+                    let snapshot = WitnessSnapshot {
+                        roots: witness_roots.clone(),
+                        entries,
+                    };
+                    write_write_root_witness(&witness_path_buf, &snapshot);
                 }
             }
             0
@@ -2590,6 +2952,33 @@ pub(crate) const PHASE_SCOPE_RULE_ID: &str = "engine:pre-build-scope";
 /// ([`crate::path_policy`]'s module doc). What the phase actually produced is judged by its own
 /// output gate and required deliverables, not by this containment event.
 const PHASE_SCOPE_DENY_PREFIX: &str = "phase-scope-deny:";
+
+/// Claim-id prefix for a post-hoc write-root witness deny (issue #541, item 3 of the review).
+/// Fatal: the write roots watched by the witness changed between two gate-hook invocations or
+/// after the unit's last allowed Bash call, proving an unmodelled write escaped the fence.
+/// The changed paths are listed in `obligations` so the fold can name them without parsing prose.
+const WITNESS_DENY_PREFIX: &str = "witness-deny:";
+
+fn append_witness_deny(decisions_path: &str, scope: &str, phase: &str, changed_paths: &[String]) {
+    let paths_str = changed_paths.join(", ");
+    let reason = format!(
+        "write-root-mutated: the admitted write roots changed since the \
+         last allowed Bash call — changed paths: {paths_str} (issue #541)"
+    );
+    let claim = ConformanceClaim {
+        claim_id: format!("{WITNESS_DENY_PREFIX}{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec!["engine:write-root-witness".to_string()],
+        decision: Decision::Deny,
+        obligations: changed_paths.to_vec(),
+        evaluated_context_ref: "sha256:witness".to_string(),
+        criteria: format!("write-root witness: {reason}"),
+        evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    let _ = append_decision(Path::new(decisions_path), &claim);
+}
 
 /// Record a PHASE-SCOPE block: a pre-build phase's `Write`/`Edit` to a non-documentation path
 /// (core#296). The caller has already exited 2 — the tool call never runs. This is what makes the
@@ -3163,6 +3552,27 @@ pub fn fold_input_denial(
                 denied_tool: tool_for_claim,
                 phase: Some(phase.to_string()),
             });
+        }
+    }
+    // POST-HOC WITNESS unit-end check (item 2 of the review): re-scan the witness roots after
+    // all tool calls have been evaluated to catch a write that escaped via the last allowed Bash
+    // call (no subsequent gate-hook invocation would have detected it).
+    if denial.is_none() {
+        let witness_path = write_root_witness_path(&path.to_string_lossy(), phase);
+        if let Some(stored) = read_write_root_witness(&witness_path) {
+            let mut current_entries = Vec::new();
+            for root in &stored.roots {
+                collect_dir_entries_for_witness(root, &mut current_entries);
+            }
+            current_entries.sort_unstable();
+            let changed = diff_witness_entries(&stored.entries, &current_entries);
+            if !changed.is_empty() {
+                denial = Some(fail_closed(format!(
+                    "input governance denied {phase}: write-root mutated after the last \
+                     allowed Bash call — changed paths: {} (issue #541 unit-end catch)",
+                    changed.join(", ")
+                )));
+            }
         }
     }
     // A GOVERNED unit whose log is PRESENT but has lost its armed marker was truncated/edited → the
@@ -3740,14 +4150,18 @@ mod tests {
             "{d}"
         );
 
-        // python3 -c: opaque interpreter, denied by program word.
+        // python3 -c: denied — either by extracted write target (when the path is absolute and
+        // extractable) or by opaque-interpreter word (item 4 now extracts absolute paths, so
+        // "would write" fires first; the "interpreter" path is the fallback for non-absolute or
+        // non-extractable targets). Both messages carry PHASE_SCOPE_BASH_REMEDY.
         let d = deny_ro(format!(
             "python3 -c 'open(\"{}\",\"w\")'",
             w(&wt.join("pwned"))
         ))
         .expect("python3 -c is denied for ReadOnly (issue #541)");
         assert!(
-            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            (d.contains("interpreter") || d.contains("would write"))
+                && d.contains(PHASE_SCOPE_BASH_REMEDY),
             "{d}"
         );
 
@@ -3762,36 +4176,40 @@ mod tests {
             "{d}"
         );
 
-        // node -e: opaque interpreter, denied.
+        // node -e: denied — either by extracted write target (item 4 now extracts absolute paths
+        // from interpreter code strings) or by opaque-interpreter word.
         let d = deny_ro(format!(
             r#"node -e "require('fs').writeFileSync('{}','x')""#,
             w(&wt.join("pwned"))
         ))
         .expect("node -e is denied for ReadOnly (issue #541)");
         assert!(
-            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            (d.contains("interpreter") || d.contains("would write"))
+                && d.contains(PHASE_SCOPE_BASH_REMEDY),
             "{d}"
         );
 
-        // perl -e: opaque interpreter, denied.
+        // perl -e: denied — either by extracted write target or by opaque-interpreter word.
         let d = deny_ro(format!(
             "perl -e 'open(F,\">\",\"{}\")' ",
             w(&wt.join("pwned"))
         ))
         .expect("perl -e is denied for ReadOnly (issue #541)");
         assert!(
-            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            (d.contains("interpreter") || d.contains("would write"))
+                && d.contains(PHASE_SCOPE_BASH_REMEDY),
             "{d}"
         );
 
-        // ruby -e: opaque interpreter, denied.
+        // ruby -e: denied — either by extracted write target or by opaque-interpreter word.
         let d = deny_ro(format!(
             "ruby -e 'File.write(\"{}\",\"x\")'",
             w(&wt.join("pwned"))
         ))
         .expect("ruby -e is denied for ReadOnly (issue #541)");
         assert!(
-            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            (d.contains("interpreter") || d.contains("would write"))
+                && d.contains(PHASE_SCOPE_BASH_REMEDY),
             "{d}"
         );
 
@@ -3934,12 +4352,29 @@ mod tests {
         let fp3 = fingerprint_write_roots(&roots);
         assert_eq!(fp1, fp3, "fingerprint restores when file is removed");
 
-        // Round-trip through sidecar.
+        // Round-trip through sidecar with the new WitnessSnapshot format.
         let sidecar = base.join("decisions").join("witness");
         std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
-        assert_eq!(read_write_root_witness(&sidecar), None);
-        write_write_root_witness(&sidecar, fp1);
-        assert_eq!(read_write_root_witness(&sidecar), Some(fp1));
+        assert!(read_write_root_witness(&sidecar).is_none());
+        let snap = WitnessSnapshot {
+            roots: roots.clone(),
+            entries: {
+                let mut e = Vec::new();
+                collect_dir_entries_for_witness(&root, &mut e);
+                e.sort_unstable();
+                e
+            },
+        };
+        write_write_root_witness(&sidecar, &snap);
+        let loaded = read_write_root_witness(&sidecar).expect("sidecar loads");
+        assert_eq!(loaded.roots, roots, "roots round-trip");
+        assert!(
+            !loaded.entries.is_empty()
+                || std::fs::read_dir(&root)
+                    .map(|mut r| r.next().is_none())
+                    .unwrap_or(true),
+            "entries round-trip (empty dir = empty entries OK)"
+        );
 
         // Sidecar path mirrors install-fence-cwd-path pattern.
         let dp = base.join("gov").join("decisions.ndjson");
@@ -3951,6 +4386,387 @@ mod tests {
                 .unwrap_or(false),
             "sidecar filename has the expected prefix: {wp:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// item 8 — fd-dup operator tokens (`2>&1`, `>&2`) in `touch`/`mkdir` argument lists must
+    /// not be treated as write targets; the command must be admitted when the only paths are
+    /// within the notes root (F-FIX-S1-01: this run's own triage unit was refused on
+    /// `mkdir -p <notes>/… 2>&1`).
+    #[test]
+    fn touch_and_mkdir_fd_dup_tokens_are_not_targets_item8() {
+        use crate::write_posture::WritePosture as P;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-item8-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let notes = base.join("notes");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let notes_roots = vec![notes.clone()];
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let deny =
+            |cmd: &str| bash_write_phase_scope(false, P::ReadOnly, cmd, &wt, None, &notes_roots);
+        // touch into notes with a fd-dup suffix: must be ADMITTED (2>&1 is not a path).
+        assert_eq!(
+            deny(&format!("touch {} 2>&1", w(&notes.join("scratch.md")))),
+            None,
+            "touch <notes-file> 2>&1 must be admitted — 2>&1 is not a write target"
+        );
+        // mkdir -p into notes with a fd-dup suffix: must be ADMITTED.
+        assert_eq!(
+            deny(&format!("mkdir -p {} 2>&1", w(&notes.join("subdir")))),
+            None,
+            "mkdir -p <notes-dir> 2>&1 must be admitted — 2>&1 is not a write target"
+        );
+        // touch outside notes still denied (the path IS a real target).
+        assert!(
+            deny(&format!("touch {}", w(&wt.join("illegal")))).is_some(),
+            "touch outside notes must still be denied"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// item 7 — the interpreter fence applies under ReadOnly regardless of `pre_build_scope`.
+    /// A pre-build neutral unit must not be able to run `python3 -c` while `touch` is refused.
+    #[test]
+    fn interpreter_fence_applies_under_pre_build_scope_item7() {
+        use crate::write_posture::WritePosture as P;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-item7-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        // pre_build_scope=true, ReadOnly posture, no admitted roots.
+        let deny = |cmd: &str| bash_write_phase_scope(true, P::ReadOnly, cmd, &wt, None, &[]);
+        assert!(
+            deny("python3 -c 'open(\"x\",\"w\")'").is_some(),
+            "python3 -c must be denied under ReadOnly + pre_build_scope=true"
+        );
+        assert!(
+            deny("node -e 'require(\"fs\").writeFileSync(\"x\",\"y\")'").is_some(),
+            "node -e must be denied under ReadOnly + pre_build_scope=true"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// item 5 — `branch`/`tag`/`notes`/`hash-object` removed from `GIT_READ_VERBS`;
+    /// `--git-dir=`/`--work-tree=` treated like `-C`; `ln` last-arg is a write target.
+    #[test]
+    fn git_read_verbs_pruned_and_git_dir_work_tree_ln_item5() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-item5-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let sibling = base.join("sibling");
+        for d in [&wt, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
+        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        // branch/tag/notes/hash-object are no longer read-only — they are treated as write verbs.
+        assert!(
+            check(&format!("git -C {} branch my-branch", w(&sibling))).is_some(),
+            "git -C <sibling> branch must be denied (branch removed from GIT_READ_VERBS)"
+        );
+        assert!(
+            check(&format!("git -C {} tag v1.0", w(&sibling))).is_some(),
+            "git -C <sibling> tag must be denied (tag removed from GIT_READ_VERBS)"
+        );
+        assert!(
+            check(&format!("git -C {} notes add -m x HEAD", w(&sibling))).is_some(),
+            "git -C <sibling> notes must be denied (notes removed from GIT_READ_VERBS)"
+        );
+        assert!(
+            check(&format!("git -C {} hash-object -w file", w(&sibling))).is_some(),
+            "git -C <sibling> hash-object must be denied (hash-object removed from GIT_READ_VERBS)"
+        );
+
+        // --git-dir= treated as write root for non-read verbs.
+        assert!(
+            check(&format!(
+                "git --git-dir={} commit -m x",
+                w(&sibling.join(".git"))
+            ))
+            .is_some(),
+            "git --git-dir=<sibling> commit must be denied"
+        );
+        assert!(
+            check(&format!("git --work-tree={} commit -m x", w(&sibling))).is_some(),
+            "git --work-tree=<sibling> commit must be denied"
+        );
+
+        // --git-dir= in-boundary: admitted for write verbs.
+        assert!(
+            check(&format!(
+                "git --git-dir={} commit -m x",
+                w(&wt.join(".git"))
+            ))
+            .is_none(),
+            "git --git-dir=<in-wt> commit must be admitted"
+        );
+
+        // ln: last argument is the write target.
+        assert!(
+            check(&format!(
+                "ln -s {} {}",
+                w(&wt.join("src")),
+                w(&sibling.join("link"))
+            ))
+            .is_some(),
+            "ln to sibling must be denied (last arg is the destination)"
+        );
+        assert!(
+            check(&format!("ln -s something {}", w(&wt.join("link")))).is_none(),
+            "ln into the worktree must be admitted"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// item 6 — `sh`/`bash`/`zsh`/`dash` invoked WITHOUT `-c` (script file, stdin, heredoc)
+    /// are opaque under ReadOnly. `bash -c '...'` is already handled by the inline rescan.
+    #[test]
+    fn opaque_shell_invocations_without_c_denied_item6() {
+        use crate::write_posture::WritePosture as P;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-item6-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let deny = |cmd: &str| bash_write_phase_scope(false, P::ReadOnly, cmd, &wt, None, &[]);
+
+        // bash <<'EOF'\ntouch x\nEOF — heredoc stdin invocation (opaque).
+        let d = deny("bash <<'EOF'\ntouch x\nEOF").expect("bash heredoc must be denied");
+        assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
+
+        // sh script.sh — script-file invocation (opaque).
+        let d = deny("sh script.sh").expect("sh script.sh must be denied");
+        assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
+
+        // bash -s < f — stdin (-s) invocation (opaque).
+        let d = deny("bash -s < f").expect("bash -s < f must be denied");
+        assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
+
+        // zsh script.zsh — script invocation (opaque).
+        let d = deny("zsh script.zsh").expect("zsh script.zsh must be denied");
+        assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
+
+        // dash with script — opaque.
+        let d = deny("dash -x run.sh").expect("dash -x run.sh must be denied");
+        assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
+
+        // bash alone (no args) — harmless: admitted.
+        assert_eq!(
+            deny("bash"),
+            None,
+            "bare bash with no args must be admitted"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// item 4 — `bash_cd_escape_targets` fires when the command contains a write-CAPABLE
+    /// program even if `bash_write_targets` finds no resolvable target; interpreter code
+    /// strings are scanned for absolute path literals.
+    #[test]
+    fn cd_escape_with_write_capable_program_and_abs_path_in_code_item4() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-item4-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let sibling = base.join("sibling");
+        for d in [&wt, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
+        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        // cd <sibling> && git commit: write-capable program → cd destination judged.
+        assert!(
+            check(&format!("cd {} && git commit -m x", w(&sibling))).is_some(),
+            "cd <sibling> && git commit must be denied"
+        );
+
+        // cd <sibling> && python3 -c: interpreter → cd destination judged.
+        assert!(
+            check(&format!(
+                "cd {} && python3 -c 'open(\"x\",\"w\")'",
+                w(&sibling)
+            ))
+            .is_some(),
+            "cd <sibling> && python3 -c must be denied"
+        );
+
+        // python3 -c with absolute sibling path literal in the code string.
+        assert!(
+            check(&format!("python3 -c \"open('{}/x','w')\"", w(&sibling))).is_some(),
+            "python3 -c with absolute sibling path in code string must be denied"
+        );
+
+        // In-worktree cd: admitted.
+        assert!(
+            check(&format!("cd {} && git commit -m x", w(&wt.join("src")))).is_none(),
+            "cd inside worktree && git commit must be admitted"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// items 1, 2, 3 — witness watches write roots minus notes root, runs on both carriers,
+    /// names changed paths, and catches a last-call write at fold time.
+    #[test]
+    fn witness_watches_write_roots_minus_notes_names_paths_items1_2_3() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-item123-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let notes = base.join("notes");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+
+        // --- item 1: witness_roots = write_roots minus notes ---
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone(), notes.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![notes.clone()], // notes root
+            estate_store_pinned: false,
+        };
+        let wr = compute_witness_roots(Some(&boundary));
+        assert_eq!(wr, vec![wt.clone()], "witness roots = write minus notes");
+        assert!(!wr.contains(&notes), "notes root excluded from witness");
+
+        // --- item 3: changed paths named in diff ---
+        let sidecar = base.join("decisions").join("witness-test-phase");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        // Snapshot an empty wt.
+        let snap1 = WitnessSnapshot {
+            roots: vec![wt.clone()],
+            entries: vec![],
+        };
+        write_write_root_witness(&sidecar, &snap1);
+        // Create a file in wt.
+        let new_file = wt.join("leaked.rs");
+        std::fs::write(&new_file, "oops").unwrap();
+        // Re-scan and diff.
+        let stored = read_write_root_witness(&sidecar).expect("sidecar present");
+        let mut current = Vec::new();
+        for root in &stored.roots {
+            collect_dir_entries_for_witness(root, &mut current);
+        }
+        current.sort_unstable();
+        let changed = diff_witness_entries(&stored.entries, &current);
+        assert!(!changed.is_empty(), "diff detects created file");
+        assert!(
+            changed.iter().any(|p| p.contains("leaked.rs")),
+            "changed path names the file: {changed:?}"
+        );
+
+        // --- item 2 (fold-time unit-end catch): simulate a last-call write ---
+        // Write a snapshot, then modify the wt (simulating a last-call Bash), then call
+        // fold_input_denial with a governed unit that has no deny log yet.
+        // We use a temp run with a real decisions file so fold can find the witness.
+        let run_id = format!("witness-test-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0);
+        write_armed_marker(&dpath, "unit-witness").unwrap();
+        // Write a sentinel so fold doesn't fail-closed on missing hook-fired.
+        // (We skip the sentinel here to keep the test minimal — the fold closes on missing
+        // sentinel only when there ARE claim lines, which there are none here.)
+        // Store a snapshot with the leaked file still present.
+        let witness_path = write_root_witness_path(&dpath.to_string_lossy(), "unit-witness");
+        // Snapshot current state (wt has leaked.rs).
+        let snap_current = WitnessSnapshot {
+            roots: vec![wt.clone()],
+            entries: current.clone(),
+        };
+        write_write_root_witness(&witness_path, &snap_current);
+        // Now add ANOTHER file to simulate a post-snapshot mutation.
+        let post_file = wt.join("post-mutation.rs");
+        std::fs::write(&post_file, "post").unwrap();
+        // fold_input_denial should detect the post-mutation.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let denial =
+            fold_input_denial(&mut store, &run_id, 0, "unit-witness", true).expect("fold ok");
+        assert!(
+            denial.is_some(),
+            "fold detects last-call write via unit-end witness check"
+        );
+        let reason = &denial.unwrap().reason;
+        assert!(
+            reason.contains("post-mutation.rs") || reason.contains("write-root mutated"),
+            "fold names the changed path: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// additional acceptance — under ReadOnly, `sed -i`, `rm`, `truncate`, `patch`, `ln`,
+    /// and `git commit|apply|checkout|stash|reset` are denied by program word.
+    #[test]
+    fn explicit_write_program_words_denied_under_readonly_additional() {
+        use crate::write_posture::WritePosture as P;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!(
+            "wicked-explicit-write-{}-{tid}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let deny = |cmd: &str| bash_write_phase_scope(false, P::ReadOnly, cmd, &wt, None, &[]);
+
+        let cases = [
+            ("sed -i 's/a/b/' file.rs", "sed -i"),
+            ("rm file.rs", "rm"),
+            ("truncate -s 0 file.rs", "truncate"),
+            ("patch -p1 < fix.patch", "patch"),
+            ("ln -s src dst", "ln"),
+            ("git commit -m 'x'", "git commit"),
+            ("git apply fix.patch", "git apply"),
+            ("git checkout main", "git checkout"),
+            ("git stash", "git stash"),
+            ("git reset --hard HEAD", "git reset"),
+        ];
+        for (cmd, label) in &cases {
+            assert!(
+                deny(cmd).is_some(),
+                "`{label}` must be denied under ReadOnly — got None"
+            );
+        }
+        // Controls: pure reads admitted.
+        assert_eq!(
+            deny("sed 's/a/b/' file.rs"),
+            None,
+            "sed without -i is admitted"
+        );
+        assert_eq!(deny("git status"), None, "git status is admitted");
+        assert_eq!(deny("git log --oneline"), None, "git log is admitted");
 
         let _ = std::fs::remove_dir_all(&base);
     }

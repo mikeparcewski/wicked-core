@@ -20,20 +20,32 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **Gate hook: close ReadOnly write-fence holes for `touch`, inline interpreters, and post-hoc
   witness (#541).** `touch` is now modelled in `collect_bash_write_targets` (targets extracted and
-  judged against admitted roots, matching the `mkdir` pattern). Inline interpreter programs
-  (`python3 -c`, `node -e`, `perl -e`, `ruby -e`, heredoc stdin, etc.) are denied by
+  judged against admitted roots, matching the `mkdir` pattern). Fd-dup tokens (`2>&1`, `>&2`) in
+  `touch`/`mkdir` argument lists are no longer treated as write targets (item 8). Inline interpreter
+  programs (`python3 -c`, `node -e`, `perl -e`, `ruby -e`, heredoc stdin, etc.) are denied by
   `opaque_interpreter_denial` when the unit's write posture is ReadOnly — because their write
-  targets cannot be statically extracted from the code string. A post-hoc fingerprint witness
-  (FNV-1a over sorted write-root directory trees) is stored in a sidecar after each allowed Bash
-  call and checked at the start of each subsequent gate-hook invocation; a changed fingerprint
-  fails the unit with a typed event.
+  targets cannot be statically extracted from the code string — and this fence now applies
+  regardless of `pre_build_scope` (item 7). Shells (`sh`, `bash`, `zsh`, `dash`) invoked without
+  `-c` are now treated as opaque writers under ReadOnly (item 6). Explicit write programs (`sed -i`,
+  `rm`, `truncate`, `patch`, `ln`, `git commit/apply/checkout/stash/reset`) are denied by program
+  word under ReadOnly (`explicit_write_program_denial`, additional acceptance). `bash_cd_escape_targets`
+  now fires when the command contains a write-capable program even if no resolvable write target is
+  found; interpreter `-c` code strings are scanned for absolute path literals (item 4). The post-hoc
+  witness now stores a `WitnessSnapshot` (write roots minus notes root, plus full entry list) so
+  mismatch reports name the changed paths; runs on both carriers; a unit-end catch in
+  `fold_input_denial` detects last-call writes; typed `witness-deny:` claim prefix (items 1-3). A
+  changed fingerprint fails the unit with a typed event.
 
 - **Gate hook: close worktree boundary misses for `git -C <other-path>` and `cd <other-path> &&
   <write>` (#540).** `collect_bash_write_targets` now has a `git` arm: for write subcommands (any
   verb absent from the `GIT_READ_VERBS` allowlist), the path arguments of every `-C` flag are
-  extracted and checked against the unit's write roots. `bash_cd_escape_targets` extracts `cd`
+  extracted and checked against the unit's write roots. `--git-dir=`/`--work-tree=` flags are now
+  also extracted as write roots for non-read git verbs (item 5). `branch`, `tag`, `notes`, and
+  `hash-object` are removed from `GIT_READ_VERBS` (they can write; item 5). A new `ln` arm treats
+  the last non-flag argument as a write target (item 5). `bash_cd_escape_targets` extracts `cd`
   destinations from commands that also contain resolvable write operations and checks them against
-  `AllowedRoots.write`; bare `cd` commands with no following write are left to the install fence.
+  `AllowedRoots.write`; it now also fires when the command contains a write-capable program even
+  without a resolvable target; bare `cd` commands with no following write are left to the install fence.
 
 - **Build fix: collapse the duplicate `"tool_call"` arm in the ACP `sessionUpdate` handler (#524 × #525 unreachable-pattern collision; main red at `-D warnings`).** #525 (L5) added `"tool_call" => { *answer_from = … }` and #524 (L4) added `"tool_call" | "tool_call_update" => { … }`; composed on main the first shadows the second, so `-D unreachable-patterns` failed the lib compile on all three OS legs. The two arms are merged into one — `*answer_from` still advances on `tool_call` only (never on an update frame, exactly as #525 shipped) and #524's failed-tool-call recording and update-frame `locations` collection run unchanged. No behaviour change.
 
