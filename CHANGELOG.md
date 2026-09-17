@@ -18,6 +18,23 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **Validator: skip agent judge when no identity-distinct seat is available; gate default-floor judge on pinned skip; per-seat eligibility reasons (#539).** Two callers — the pinned-validator inline path in `cli_runner` and `gate_phase` — unconditionally called `agent_validate`, which falls back to the single default runner (the deterministic validator's own seat) when no distinct seat exists. For a claude creator this is a self-grade: the same seat that wrote the work judges it as distinct. Both callers now pre-check `distinct_judge_available` (F-7R2-005) before calling the judge; when no distinct seat is found, the judge is skipped, `judge_skipped` is set with the eligibility reason, and the deterministic verdict carries the fold. The `GateEvaluated` wire shape gains `agentVerdict: "skipped"` (replacing `null`) and `judgeDistinct: false` when the judge was skipped, so consumers can distinguish "no judge wanted" from "judge wanted but skipped for eligibility". A fall-through bug is also fixed: when the pinned-validator path sets `judge_skipped` (no distinct seat), the `default_floor_applies` arm was not guarded on `judge_skipped.is_none()` — the default judge would still run on a seat that IS distinct for the looser default exclusion (`excluded=[creator]` only), producing `agentVerdict:pass` AND `judgeSkippedReason` on the wire simultaneously. The default-floor arm is now gated on `judge_skipped.is_none()`. The judge-skip reason now names each seat's per-seat eligibility outcome (`excluded (creator)`, `excluded (validator author)`, `excluded (creator = validator author)`, `unusable (empty invocation)`) instead of a flat "eligible roster" list — an unusable seat (empty `headless_invocation`) no longer appears as eligible. The bus path (evaluator daemon) is unaffected — it enforces evaluator≠creator independently.
 
+- **Gate hook: close ReadOnly write-fence holes for `touch`, inline interpreters, and post-hoc
+  witness (#541).** `touch` is now modelled in `collect_bash_write_targets` (targets extracted and
+  judged against admitted roots, matching the `mkdir` pattern). Inline interpreter programs
+  (`python3 -c`, `node -e`, `perl -e`, `ruby -e`, heredoc stdin, etc.) are denied by
+  `opaque_interpreter_denial` when the unit's write posture is ReadOnly — because their write
+  targets cannot be statically extracted from the code string. A post-hoc fingerprint witness
+  (FNV-1a over sorted write-root directory trees) is stored in a sidecar after each allowed Bash
+  call and checked at the start of each subsequent gate-hook invocation; a changed fingerprint
+  fails the unit with a typed event.
+
+- **Gate hook: close worktree boundary misses for `git -C <other-path>` and `cd <other-path> &&
+  <write>` (#540).** `collect_bash_write_targets` now has a `git` arm: for write subcommands (any
+  verb absent from the `GIT_READ_VERBS` allowlist), the path arguments of every `-C` flag are
+  extracted and checked against the unit's write roots. `bash_cd_escape_targets` extracts `cd`
+  destinations from commands that also contain resolvable write operations and checks them against
+  `AllowedRoots.write`; bare `cd` commands with no following write are left to the install fence.
+
 - **Build fix: collapse the duplicate `"tool_call"` arm in the ACP `sessionUpdate` handler (#524 × #525 unreachable-pattern collision; main red at `-D warnings`).** #525 (L5) added `"tool_call" => { *answer_from = … }` and #524 (L4) added `"tool_call" | "tool_call_update" => { … }`; composed on main the first shadows the second, so `-D unreachable-patterns` failed the lib compile on all three OS legs. The two arms are merged into one — `*answer_from` still advances on `tool_call` only (never on an update frame, exactly as #525 shipped) and #524's failed-tool-call recording and update-frame `locations` collection run unchanged. No behaviour change.
 
 - **Chat seats are handed the skills a unit gets; the turn budget is named; `chatReply.usage`; the
