@@ -1165,16 +1165,7 @@ const GIT_READ_VERBS: &[&str] = &[
 /// code (`-c`/`-e`/`-r`), a script argument, or stdin (`-`). Under ReadOnly posture,
 /// [`opaque_interpreter_denial`] refuses these when they look like code execution.
 const OPAQUE_WRITER_PROGRAMS: &[&str] = &[
-    "python",
-    "python2",
-    "python3",
-    "node",
-    "nodejs",
-    "deno",
-    "perl",
-    "ruby",
-    "php",
-    "lua",
+    "python", "python2", "python3", "node", "nodejs", "deno", "perl", "ruby", "php", "lua",
     "Rscript",
 ];
 
@@ -1224,10 +1215,7 @@ fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
                     continue;
                 };
                 if program_basename(prog) == "cd" {
-                    if let Some(dest) = words[idx + 1..]
-                        .iter()
-                        .find(|w| !w.starts_with('-'))
-                    {
+                    if let Some(dest) = words[idx + 1..].iter().find(|w| !w.starts_with('-')) {
                         targets.push((*dest).to_string());
                     }
                 }
@@ -1293,9 +1281,9 @@ fn opaque_interpreter_denial_inner(command: &str, unwrap_inline: bool) -> Option
                     continue; // bare interpreter with no args — harmless
                 }
                 // Allow invocations whose ONLY args are read-only info flags.
-                let only_info = args.iter().all(|a| {
-                    matches!(*a, "--version" | "-V" | "--help" | "-h" | "-?")
-                });
+                let only_info = args
+                    .iter()
+                    .all(|a| matches!(*a, "--version" | "-V" | "--help" | "-h" | "-?"));
                 if only_info {
                     continue;
                 }
@@ -3722,10 +3710,8 @@ mod tests {
         use crate::write_posture::WritePosture as P;
         // No `(`/`)` in the scratch path: `shell_tokens` splits bare parens as control operators.
         let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
-        let base = std::env::temp_dir().join(format!(
-            "wicked-541-fence-{}-{tid}",
-            std::process::id(),
-        ));
+        let base =
+            std::env::temp_dir().join(format!("wicked-541-fence-{}-{tid}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&base);
         let wt = base.join("wt");
         let notes = base.join("notes");
@@ -3734,21 +3720,25 @@ mod tests {
         let notes_roots = vec![notes.clone()];
         let none: &[std::path::PathBuf] = &[];
         let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
-        let deny_ro = |cmd: String| {
-            bash_write_phase_scope(false, P::ReadOnly, &cmd, &wt, None, &notes_roots)
-        };
-        let deny_ro_noroot = |cmd: String| {
-            bash_write_phase_scope(false, P::ReadOnly, &cmd, &wt, None, none)
-        };
+        let deny_ro =
+            |cmd: String| bash_write_phase_scope(false, P::ReadOnly, &cmd, &wt, None, &notes_roots);
+        let deny_ro_noroot =
+            |cmd: String| bash_write_phase_scope(false, P::ReadOnly, &cmd, &wt, None, none);
         // touch: denied because the file path is outside the notes root (write target extracted).
         let d = deny_ro(format!("touch {}", w(&wt.join("lockfile"))))
             .expect("touch into the tree is refused for ReadOnly (issue #541)");
-        assert!(d.contains("would write") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("would write") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // cat > f: redirect target is extracted, denied.
         let d = deny_ro(format!("cat > {}", w(&wt.join("src").join("out.rs"))))
             .expect("cat > f is denied (redirect target)");
-        assert!(d.contains("would write") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("would write") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // python3 -c: opaque interpreter, denied by program word.
         let d = deny_ro(format!(
@@ -3756,7 +3746,10 @@ mod tests {
             w(&wt.join("pwned"))
         ))
         .expect("python3 -c is denied for ReadOnly (issue #541)");
-        assert!(d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // python3 - <<EOF (stdin heredoc shape): the `-` arg triggers the opaque-writer check.
         let d = deny_ro(format!(
@@ -3764,7 +3757,10 @@ mod tests {
             w(&wt.join("pwned"))
         ))
         .expect("python3 - <<EOF is denied for ReadOnly (issue #541)");
-        assert!(d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // node -e: opaque interpreter, denied.
         let d = deny_ro(format!(
@@ -3772,7 +3768,10 @@ mod tests {
             w(&wt.join("pwned"))
         ))
         .expect("node -e is denied for ReadOnly (issue #541)");
-        assert!(d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // perl -e: opaque interpreter, denied.
         let d = deny_ro(format!(
@@ -3780,7 +3779,10 @@ mod tests {
             w(&wt.join("pwned"))
         ))
         .expect("perl -e is denied for ReadOnly (issue #541)");
-        assert!(d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // ruby -e: opaque interpreter, denied.
         let d = deny_ro(format!(
@@ -3788,7 +3790,10 @@ mod tests {
             w(&wt.join("pwned"))
         ))
         .expect("ruby -e is denied for ReadOnly (issue #541)");
-        assert!(d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY), "{d}");
+        assert!(
+            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            "{d}"
+        );
 
         // Controls: --version flags are safe, not denied.
         assert_eq!(
@@ -3846,10 +3851,8 @@ mod tests {
         use crate::path_policy::AllowedRoots;
         // No `(`/`)` in the scratch path: `shell_tokens` splits bare parens as control operators.
         let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
-        let base = std::env::temp_dir().join(format!(
-            "wicked-540-boundary-{}-{tid}",
-            std::process::id(),
-        ));
+        let base =
+            std::env::temp_dir().join(format!("wicked-540-boundary-{}-{tid}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&base);
         let wt = base.join("run-a").join("wt");
         let sibling = base.join("run-b").join("wt");
@@ -3862,19 +3865,14 @@ mod tests {
             read: vec![],
         };
         let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
-        let check = |cmd: &str| {
-            boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash")
-        };
+        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
         let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
 
         // git -C <sibling> commit: write subcommand → denied (issue #540).
         // Note: paths under system temp are advisory by the core#264 carve-out — the key
         // property is that the call is DENIED (not allowed), not that it is fatal here.
-        let (reason, _fatal) = check(&format!(
-            "git -C {} commit -m 'x'",
-            w(&sibling)
-        ))
-        .expect("git -C <sibling> commit is denied");
+        let (reason, _fatal) = check(&format!("git -C {} commit -m 'x'", w(&sibling)))
+            .expect("git -C <sibling> commit is denied");
         assert!(reason.contains("leaves the unit boundary"), "{reason}");
 
         // git -C <sibling> status: read subcommand → allowed.
@@ -3918,10 +3916,7 @@ mod tests {
     /// and `write_root_witness_path` mirrors `install_fence_cwd_path`.
     #[test]
     fn write_root_witness_fingerprint_detects_mutations() {
-        let base = std::env::temp_dir().join(format!(
-            "wicked-541-witness-{}",
-            std::process::id(),
-        ));
+        let base = std::env::temp_dir().join(format!("wicked-541-witness-{}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("notes");
         std::fs::create_dir_all(&root).unwrap();
