@@ -1395,13 +1395,21 @@ pub(crate) fn apply_and_finish_unit(
             Some(if av.pass { "pass" } else { "reject" }.to_string()),
             Some(av.reasoning.clone()),
         ),
+        // (#539) No distinct judge seat — the judge was intentionally skipped rather than run as a
+        // self-grade. Emit "skipped" (not None) so consumers can distinguish "no judge wanted" from
+        // "judge wanted but skipped for eligibility".
+        None if evidence.judge_skipped.is_some() => (Some("skipped".to_string()), None),
         None => (None, None),
     };
     // (core#431, F-3R2-007) WHO judged: the seat the layer-2 judge ran under and whether it was
     // identity-distinct from the work's author — `None` when no judge ran, so evaluator ≠ creator
     // can be verified from the event stream instead of trusted.
     let judge_cli = agent_verdict.and_then(|av| av.judge_cli.clone());
-    let judge_distinct = agent_verdict.and_then(|av| av.judge_distinct);
+    // (#539) When the judge was skipped for eligibility, force judge_distinct = false so the wire
+    // records "no distinct judge" rather than the ambiguous None.
+    let judge_distinct = agent_verdict
+        .and_then(|av| av.judge_distinct)
+        .or_else(|| evidence.judge_skipped.as_ref().map(|_| false));
     // (M5) HONEST criterion: `Some` ONLY when a pinned validator gated this unit (its criterion); `None`
     // for an ungated phase — the unit description is never relabeled a "criterion". `has_deterministic_floor`
     // makes the ungated case explicit so `deterministic_pass` (vacuously true with no floor) isn't misread.

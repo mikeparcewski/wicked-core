@@ -898,64 +898,90 @@ fn run_unit_and_judge_with_roster(
     // ungatedReason` so the studio says "UNGATED — no eligible judge seat" instead of "pass".
     let mut judge_skipped: Option<String> = None;
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
-        let pinned = input
-            .unit
-            .validator
-            .as_ref()
-            .filter(|v| v.approved)
-            .map(|v| {
-                // BUS PATH: when `WICKED_BUS_DB` is set, publish a gate-evaluation request and wait for
-                // the governed evaluator daemon to respond (no subprocess, no dangerous flags, no TTY).
-                // On timeout or any error the function returns a hard DENY (fail-closed governance —
-                // a timeout must never silently approve a gate by falling back to deterministic-only).
-                if let Ok(bus_path) = std::env::var("WICKED_BUS_DB") {
-                    // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
-                    // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
-                    let work_author = input.unit.assigned_cli.as_deref();
-                    // The daemon does not report which seat judged: `judge_cli` stays `None` on
-                    // this path (core#431) — an honest unknown, never a guessed seat.
-                    return bus_request_agent_verdict(
-                        &v.criterion,
-                        work_for_agent,
-                        &input.run_id,
-                        input.unit_ix,
-                        input.attempt,
-                        &bus_path,
-                        work_author,
-                    );
-                }
-                // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
-                // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
-                // BOTH the deterministic validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) AND the
-                // WORK's own author (the unit's `assigned_cli`, falling back to the deterministic author
-                // when unassigned). Excluding the work author is what stops a self-grade — the judge can
-                // never be dispatched under the very seat that WROTE the work. When no identity-distinct
-                // seat exists, `agent_validate` falls back to the single default runner (documented).
-                let work_author = input
-                    .unit
-                    .assigned_cli
-                    .as_deref()
-                    .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
-                let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
-                let (verdict, refused) = crate::validator::agent_validate_with_refusals(
+        // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
+        // early without a closure (closures cannot mutate `judge_skipped`).
+        let pinned: Option<crate::validator::AgentVerdict> = 'pinned: {
+            let Some(v) = input.unit.validator.as_ref().filter(|v| v.approved) else {
+                break 'pinned None;
+            };
+            // BUS PATH: when `WICKED_BUS_DB` is set, publish a gate-evaluation request and wait for
+            // the governed evaluator daemon to respond (no subprocess, no dangerous flags, no TTY).
+            // On timeout or any error the function returns a hard DENY (fail-closed governance —
+            // a timeout must never silently approve a gate by falling back to deterministic-only).
+            if let Ok(bus_path) = std::env::var("WICKED_BUS_DB") {
+                // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
+                // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
+                let work_author = input.unit.assigned_cli.as_deref();
+                // The daemon does not report which seat judged: `judge_cli` stays `None` on
+                // this path (core#431) — an honest unknown, never a guessed seat.
+                break 'pinned Some(bus_request_agent_verdict(
                     &v.criterion,
                     work_for_agent,
-                    &excluded,
-                    roster,
-                    &**runner,
-                );
-                note_refusals(&refused);
-                match verdict {
-                    // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
-                    Ok(av) => av,
-                    Err(e) => crate::validator::AgentVerdict {
-                        pass: false,
-                        reasoning: format!("agent validator errored (fail-closed): {e}"),
-                        judge_cli: None,
-                        judge_distinct: None,
+                    &input.run_id,
+                    input.unit_ix,
+                    input.attempt,
+                    &bus_path,
+                    work_author,
+                ));
+            }
+            // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
+            // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
+            // BOTH the deterministic validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) AND the
+            // WORK's own author (the unit's `assigned_cli`, falling back to the deterministic author
+            // when unassigned). Excluding the work author is what stops a self-grade.
+            let work_author = input
+                .unit
+                .assigned_cli
+                .as_deref()
+                .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
+            let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
+            // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
+            // Without this check, agent_validate falls back to the single default runner — a
+            // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
+            if !crate::validator::distinct_judge_available(&excluded, roster) {
+                let roster_keys: Vec<&str> = roster.iter().map(|c| c.key.as_str()).collect();
+                let why = format!(
+                    "no eligible judge seat distinct from creator '{work_author}' and validator \
+                     author '{}' (eligible roster: {}; benched: {})",
+                    crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
+                    if roster_keys.is_empty() {
+                        "none".to_string()
+                    } else {
+                        roster_keys.join(", ")
                     },
-                }
-            });
+                    if benched.is_empty() {
+                        "none".to_string()
+                    } else {
+                        benched.join(", ")
+                    }
+                );
+                eprintln!(
+                    "wicked-core: unit {} has a pinned validator but no distinct judge seat — \
+                     judge skipped (evaluator ≠ creator enforced; F-7R2-005/#539)",
+                    input.unit.ord
+                );
+                judge_skipped = Some(why);
+                break 'pinned None;
+            }
+            let (verdict, refused) = crate::validator::agent_validate_with_refusals(
+                &v.criterion,
+                work_for_agent,
+                &excluded,
+                roster,
+                &**runner,
+            );
+            note_refusals(&refused);
+            Some(match verdict {
+                // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
+                Ok(av) => av,
+                Err(e) => crate::validator::AgentVerdict {
+                    pass: false,
+                    reasoning: format!("agent validator errored (fail-closed): {e}"),
+                    judge_cli: None,
+                    judge_distinct: None,
+                },
+            })
+        };
         if pinned.is_some() {
             pinned
         } else if default_floor_applies {
@@ -2681,21 +2707,37 @@ mod tests {
         );
         drop(seen);
 
-        // 2-seat roster [claude, agy]: both identities excluded ⇒ documented fallback (no explicit seat).
+        // 2-seat roster [claude, agy]: both identities excluded ⇒ (#539) judge is SKIPPED, not
+        // dispatched as a self-grade via the single-runner fallback. The runner is called once for
+        // the work unit only; evidence.judge_skipped carries the eligibility reason.
         let rec2 = Arc::new(RecordingRunner::default());
         let runner2: Arc<dyn StepRunner> = rec2.clone();
         let roster2 = vec![
             seat("claude", "claude -p {PROMPT}"),
             seat("agy", "agy run {PROMPT}"),
         ];
-        let _ = run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2, &[], &[]);
+        let (_out2, verdict2, evidence2) =
+            run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2, &[], &[]);
         let seen2 = rec2.seen.lock().unwrap();
         assert_eq!(
-            seen2.last().cloned().flatten(),
-            None,
-            "no distinct seat ⇒ fallback carries no explicit seat (and is NOT agy)"
+            seen2.len(),
+            1,
+            "only the work unit must be dispatched — no fallback judge call (#539)"
+        );
+        assert_eq!(
+            seen2.last().cloned().flatten().as_deref(),
+            Some("agy"),
+            "the single dispatch is the work unit (assigned_cli = agy)"
         );
         drop(seen2);
+        assert!(
+            verdict2.is_none(),
+            "no distinct seat ⇒ no agent verdict (#539 — judge skipped, not self-graded)"
+        );
+        assert!(
+            evidence2.judge_skipped.is_some(),
+            "evidence.judge_skipped must name the reason when the judge is skipped (#539)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

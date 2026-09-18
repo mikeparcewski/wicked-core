@@ -195,6 +195,10 @@ pub const PRE_EXISTING_IN_SANDBOX: &str = "pre_existing_in_sandbox";
 /// Base and head fail IDENTICALLY in the floor's sandbox: the floor's environment, not the
 /// change, is the likely cause — never denies; recorded with the floor's env.
 pub const FLOOR_ENV_MISMATCH: &str = "floor_env_mismatch";
+/// Both base and head fail with NO parseable failure identifiers (unknown runner output format,
+/// e.g. node:test without a TAP-aware parser). Cannot determine if pre-existing or a regression —
+/// fail-closed: always denies (#538).
+pub const UNCLASSIFIED_RED_BASE: &str = "unclassified_red_base";
 
 /// Claim verdicts on the wire (`ClaimCheck::verdict`).
 pub const CLAIM_REJECTED: &str = "claim_rejected";
@@ -548,6 +552,18 @@ impl RepoChecksReport {
                         } else {
                             format!(" (head-only failures: {})", c.regressions.join(", "))
                         }
+                    ),
+                    // (#538) Both sides red with no parseable failure identifiers — unknown runner
+                    // output format; cannot determine pre-existing vs regression. Fail closed.
+                    Some(BaseRun {
+                        run: Some(_), head, ..
+                    }) if c.classification.as_deref() == Some(UNCLASSIFIED_RED_BASE) => format!(
+                        " — the run base {} also fails this check; no failure identifiers could \
+                         be extracted from either run's output (unknown runner output format — \
+                         add a parser or use a runner the floor knows, e.g. node:test in TAP \
+                         mode). Cannot determine if pre-existing or a regression \
+                         (unclassified_red_base — fail-closed)",
+                        &head[..head.len().min(10)]
                     ),
                     Some(BaseRun {
                         run: Some(_), head, ..
@@ -1953,13 +1969,9 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
             let head_ids: BTreeSet<&str> = head.failure_ids.iter().map(String::as_str).collect();
             let base_ids: BTreeSet<&str> = b.failure_ids.iter().map(String::as_str).collect();
             match (head_ids.is_empty(), base_ids.is_empty()) {
-                (true, true) => {
-                    if head.exit_code == b.exit_code {
-                        Some(FLOOR_ENV_MISMATCH)
-                    } else {
-                        Some(REGRESSION)
-                    }
-                }
+                // (#538) Both sides red with zero IDs — the runner's output format is unknown;
+                // cannot determine if pre-existing or a regression. Fail closed.
+                (true, true) => Some(UNCLASSIFIED_RED_BASE),
                 (false, false) => {
                     head.pre_existing = head_ids
                         .intersection(&base_ids)
@@ -2231,6 +2243,14 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
                     return Some(format!("{file}: {sev} {} {rule}", msg.join(" ")));
                 }
             }
+        }
+    }
+    // node:test / TAP: `not ok N - test name` — the only provably failure-only TAP line (#538).
+    // `# Subtest:` appears for both passing and failing subtests and is intentionally excluded.
+    if let Some(rest) = s.strip_prefix("not ok ") {
+        let name = rest.split_once(" - ").map(|x| x.1).unwrap_or(rest).trim();
+        if !name.is_empty() {
+            return Some(format!("not ok {name}"));
         }
     }
     None
@@ -3760,6 +3780,85 @@ mod tests {
         );
         assert_eq!(id("✖ 1 problem (1 error, 0 warnings)", &mut f), None);
         assert_eq!(id("", &mut f), None);
+        // node:test TAP output (#538): `not ok N - name` is a failure; `# Subtest:` is not.
+        assert_eq!(
+            id("not ok 1 - passes the assertion", &mut f).as_deref(),
+            Some("not ok passes the assertion")
+        );
+        assert_eq!(
+            id("not ok 42 - deeply/nested > suite > test name", &mut f).as_deref(),
+            Some("not ok deeply/nested > suite > test name")
+        );
+        assert_eq!(
+            id("not ok 1", &mut f).as_deref(),
+            Some("not ok 1"),
+            "no separator: the whole rest is the id"
+        );
+        assert_eq!(
+            id("# Subtest: some suite", &mut f),
+            None,
+            "# Subtest is not failure-only"
+        );
+        assert_eq!(
+            id("ok 1 - passes", &mut f),
+            None,
+            "ok lines are not failures"
+        );
+        assert_eq!(id("TAP version 14", &mut f), None);
+    }
+
+    /// (#538) Both base and head fail with no parseable failure identifiers → `unclassified_red_base`,
+    /// which must deny (fail-closed) and never be treated as pre-existing.
+    #[test]
+    fn unclassified_red_base_denies_when_both_sides_produce_zero_ids() {
+        let make_check = |exit: i32| CheckRun {
+            name: "test".to_string(),
+            argv: vec![],
+            source: "test".to_string(),
+            exit_code: Some(exit),
+            timed_out: false,
+            spawn_error: None,
+            duration_ms: 0,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            bound_s: 0,
+            bound_note: None,
+            failure_ids: vec![],
+            classification: None,
+            pre_existing: vec![],
+            regressions: vec![],
+            base: None,
+        };
+        let make_base = |exit: i32| BaseRun {
+            head: "abc1234567".to_string(),
+            run: Some(make_check(exit)),
+            cached: false,
+            error: None,
+        };
+
+        // Same exit code on both sides — previously classified FLOOR_ENV_MISMATCH (which passed);
+        // must now be UNCLASSIFIED_RED_BASE and must deny.
+        let mut head = make_check(1);
+        classify(&mut head, make_base(1));
+        assert_eq!(
+            head.classification.as_deref(),
+            Some(UNCLASSIFIED_RED_BASE),
+            "zero ids both sides (same exit code) must be unclassified_red_base, not floor_env_mismatch"
+        );
+        assert!(
+            head.denies(),
+            "unclassified_red_base must deny (fail-closed)"
+        );
+
+        // Different exit codes on both sides — previously classified REGRESSION; still deny.
+        let mut head2 = make_check(2);
+        classify(&mut head2, make_base(1));
+        assert_eq!(
+            head2.classification.as_deref(),
+            Some(UNCLASSIFIED_RED_BASE),
+            "zero ids both sides (different exit codes) must also be unclassified_red_base"
+        );
+        assert!(head2.denies());
     }
 
     /// core#467: the claim scanner is conservative — a claim phrase AND a check-shaped word in
