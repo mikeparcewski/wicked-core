@@ -491,11 +491,61 @@ pub(crate) fn fingerprint_write_roots(roots: &[std::path::PathBuf]) -> u64 {
 }
 
 fn collect_dir_entries_for_witness(dir: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
+    // For git-managed roots (directories that ARE a git worktree root, identified by the
+    // presence of a `.git` entry), use `git ls-files` so .gitignore is respected — target/,
+    // .git/, node_modules/, dist/ never appear and an allowed call's own build side-effects
+    // cannot read as an escape (INDEPENDENT REVIEW item 2). Only check when `.git` is present
+    // so that plain temp directories inside an outer git repo do not accidentally inherit the
+    // outer repo's file list via git's upward root search.
+    if dir.join(".git").exists() {
+        if let Ok(output) = std::process::Command::new("git")
+            .args([
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ])
+            .current_dir(dir)
+            .output()
+        {
+            if output.status.success() {
+                for rel in output.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                    let Ok(rel_str) = std::str::from_utf8(rel) else {
+                        continue;
+                    };
+                    let abs = dir.join(rel_str);
+                    let Ok(meta) = std::fs::metadata(&abs) else {
+                        continue;
+                    };
+                    if meta.is_file() {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        out.push((abs.to_string_lossy().into_owned(), meta.len(), mtime));
+                    }
+                }
+                return;
+            }
+        }
+    }
+    // Fallback for non-git roots (or when git ls-files fails): raw recursive walk
+    // skipping .git directories.
+    collect_dir_entries_raw(dir, out);
+}
+
+fn collect_dir_entries_raw(dir: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
         let path = entry.path();
+        if path.file_name().is_some_and(|n| n == ".git") {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
@@ -507,7 +557,7 @@ fn collect_dir_entries_for_witness(dir: &std::path::Path, out: &mut Vec<(String,
             .unwrap_or(0);
         out.push((path.to_string_lossy().into_owned(), meta.len(), mtime));
         if meta.is_dir() {
-            collect_dir_entries_for_witness(&path, out);
+            collect_dir_entries_raw(&path, out);
         }
     }
 }
@@ -1077,6 +1127,131 @@ fn shell_tokens(command: &str) -> Vec<String> {
     out
 }
 
+/// Returns `true` for a code-string token that is an absolute filesystem path.
+/// Covers Unix (`/`-rooted), Windows (`C:\`, `\\?\`, UNC `\\server\share\`) via
+/// `Path::is_absolute()`, and explicitly excludes `//`-prefixed tokens (URL authority
+/// components left after splitting on `:`, e.g. `//127.0.0.1` from `http://127.0.0.1`).
+/// INDEPENDENT REVIEW items 1 and 3a.
+fn is_abs_path_token(tok: &str) -> bool {
+    !tok.starts_with("//") && std::path::Path::new(tok).is_absolute()
+}
+
+/// Returns `true` when a code string contains at least one write-shaped call, used to
+/// gate whether absolute path literals are treated as write targets at the Creator
+/// boundary. Conservative heuristic: the interpreter fence remains the primary ReadOnly
+/// control; gaps here only under-deny at Creator, never open a ReadOnly hole.
+/// INDEPENDENT REVIEW item 3c.
+fn code_string_has_write_shape(code: &str) -> bool {
+    const WRITE_SHAPES: &[&str] = &[
+        ",'w'",
+        ", 'w'",
+        ",\"w\"",
+        ", \"w\"",
+        ",'a'",
+        ", 'a'",
+        ",\"a\"",
+        ", \"a\"",
+        ",'x'",
+        ", 'x'",
+        ",\"x\"",
+        ", \"x\"",
+        ",'r+'",
+        ", 'r+'",
+        ",\"r+\"",
+        ", \"r+\"",
+        ",'w+'",
+        ", 'w+'",
+        ",\"w+\"",
+        ", \"w+\"",
+        ".write(",
+        ".write_text(",
+        ".write_bytes(",
+        "write_text(",
+        "write_bytes(",
+        "writeFileSync(",
+        "writeFile(",
+        "appendFileSync(",
+        "appendFile(",
+        "IO.write(",
+        "File.write(",
+        "File.open(",
+        "mkdir(",
+        " > ",
+        ">>",
+    ];
+    WRITE_SHAPES.iter().any(|p| code.contains(p))
+}
+
+/// Extracts heredoc body strings from a raw shell command string. Handles `<<MARKER`,
+/// `<<-MARKER` (strip leading tabs), and quoted markers (`<<'MARKER'`, `<<"MARKER"`).
+/// Skips here-strings (`<<<`). Returns each body as a String.
+/// INDEPENDENT REVIEW item 4.
+fn extract_heredoc_bodies(command: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = command[search_from..].find("<<") {
+        let idx = search_from + rel;
+        let after = &command[idx + 2..];
+        // Skip here-strings (<<<).
+        if after.starts_with('<') {
+            search_from = idx + 3;
+            continue;
+        }
+        let strip_tabs = after.starts_with('-');
+        let marker_start = if strip_tabs { &after[1..] } else { after };
+        let marker_start = marker_start.trim_start_matches([' ', '\t']);
+        // Extract the marker, possibly quoted.
+        let (marker, rest_after_marker) = if let Some(rest) = marker_start.strip_prefix('\'') {
+            let end = rest.find('\'').unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        } else if let Some(rest) = marker_start.strip_prefix('"') {
+            let end = rest.find('"').unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        } else {
+            let end = marker_start
+                .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|'))
+                .unwrap_or(marker_start.len());
+            (&marker_start[..end], &marker_start[end..])
+        };
+        let _ = rest_after_marker;
+        if marker.is_empty() {
+            search_from = idx + 2;
+            continue;
+        }
+        // Body starts on the line after the `<<MARKER` declaration.
+        let after_nl = match command[idx..].find('\n') {
+            Some(nl) => idx + nl + 1,
+            None => {
+                search_from = idx + 2;
+                continue;
+            }
+        };
+        // Terminator is the marker alone on a line.
+        let end_pat = format!("\n{marker}");
+        let body_slice = &command[after_nl..];
+        let body = if let Some(body_end) = body_slice.find(&end_pat as &str) {
+            &body_slice[..body_end]
+        } else if body_slice.starts_with(marker) {
+            // Marker is the very first line of the remainder (degenerate empty heredoc).
+            ""
+        } else {
+            search_from = idx + 2;
+            continue;
+        };
+        let collected = if strip_tabs {
+            body.lines()
+                .map(|l| l.trim_start_matches('\t'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            body.to_string()
+        };
+        bodies.push(collected);
+        search_from = idx + 2;
+    }
+    bodies
+}
+
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
 /// Covers the direct escapes: `>`/`>>`/`N>` redirects (spaced or glued), `tee [-a] FILE...`, the
 /// destination of `cp`/`mv`/`install` (last non-flag arg), `dd of=FILE`, `touch FILE...`,
@@ -1101,6 +1276,23 @@ pub(crate) fn bash_write_targets(command: &str) -> Vec<String> {
 /// issued and false for the ONE inner rescan of a shell `-c` string — a `-c` wrapper found INSIDE
 /// that string is the documented two-level pass, not unwrapped again.
 fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut Vec<String>) {
+    // INDEPENDENT REVIEW item 4: scan heredoc bodies before shell_tokens, which treats
+    // newlines as whitespace and loses heredoc structure. Each body is rescanned as its own
+    // command string and, when write-shaped, its absolute path literals are extracted.
+    if unwrap_inline {
+        for body in extract_heredoc_bodies(command) {
+            collect_bash_write_targets(&body, false, targets);
+            if code_string_has_write_shape(&body) {
+                for tok in body.split(|c: char| {
+                    c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';')
+                }) {
+                    if is_abs_path_token(tok) {
+                        targets.push(tok.to_string());
+                    }
+                }
+            }
+        }
+    }
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -1144,18 +1336,12 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
         let idx = match unwrap_program(words) {
             Unwrapped::Program { idx, .. } => idx,
             Unwrapped::Inline(inner) => {
+                // INDEPENDENT REVIEW item 3b: the raw token scan that was here produced FATAL
+                // false denials for read commands (`sh -c 'cat /etc/hosts'` → `/etc/hosts` as
+                // a write target). `unwrap_program` already re-scans the inner command via the
+                // recursive call below, so the raw scan only added spurious read-path targets.
                 if unwrap_inline {
                     collect_bash_write_targets(inner, false, targets);
-                    // Also scan the code string for raw absolute path literals — captures
-                    // `python3 -c "open('/outside/x','w')"` where the path is inside the
-                    // interpreter's code string rather than a shell redirect (item 4).
-                    for tok in inner.split(|c: char| {
-                        c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';' | ':')
-                    }) {
-                        if tok.starts_with('/') && tok.len() > 1 {
-                            targets.push(tok.to_string());
-                        }
-                    }
                 }
                 continue;
             }
@@ -1213,7 +1399,11 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                 let mut c_paths: Vec<String> = Vec::new();
                 let mut j = 0;
                 while j < args.len() {
-                    if args[j] == "-C" && j + 1 < args.len() {
+                    if (args[j] == "-c" || args[j] == "--config") && j + 1 < args.len() {
+                        // INDEPENDENT REVIEW item 6 (site 1): skip -c key=value so the value
+                        // is not mistaken for the git subcommand verb.
+                        j += 2;
+                    } else if args[j] == "-C" && j + 1 < args.len() {
                         c_paths.push(args[j + 1].to_string());
                         j += 2;
                     } else if let Some(p) = args[j]
@@ -1246,11 +1436,55 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                     targets.push((*dest).to_string());
                 }
             }
-            // item 4: interpreter programs (`python3 -c`, `node -e`, etc.) are not unwrapped by
-            // `unwrap_program` (only shells are), so the Inline arm above never fires for them.
-            // Scan the code argument (the word following `-c`/`-e`/`-r`/`--`) for raw absolute
-            // path literals so that `python3 -c "open('/outside/x','w')"` registers as a write
-            // to `/outside/x` for boundary judgement.
+            // INDEPENDENT REVIEW item 5: `sed -i` edits files in-place; `rm` deletes them.
+            // Both are write operations that the boundary must judge, exactly like redirects.
+            "sed" => {
+                let args = &words[idx + 1..];
+                let has_inplace = args.iter().any(|w| {
+                    *w == "-i" || (w.starts_with("-i") && w.len() > 2) || *w == "--in-place"
+                });
+                if has_inplace {
+                    // If -e or -f supplies the script inline, every non-flag arg is a file.
+                    // Otherwise the first non-flag arg is the inline script; rest are files.
+                    let mut has_e_or_f = false;
+                    let mut skip_next = false;
+                    let mut non_flags: Vec<&str> = Vec::new();
+                    for w in args {
+                        if skip_next {
+                            skip_next = false;
+                            continue;
+                        }
+                        if *w == "-e" || *w == "-f" {
+                            has_e_or_f = true;
+                            skip_next = true;
+                            continue;
+                        }
+                        if w.starts_with('-') {
+                            continue;
+                        }
+                        non_flags.push(w);
+                    }
+                    let file_args: &[&str] = if has_e_or_f {
+                        &non_flags[..]
+                    } else {
+                        non_flags.get(1..).unwrap_or(&[])
+                    };
+                    for f in file_args {
+                        targets.push((*f).to_string());
+                    }
+                }
+            }
+            "rm" => {
+                for w in &words[idx + 1..] {
+                    if !w.starts_with('-') && !is_fd_dup_operator(w) {
+                        targets.push((*w).to_string());
+                    }
+                }
+            }
+            // Interpreter programs (`python3 -c`, `node -e`, etc.) are not unwrapped by
+            // `unwrap_program` (only shells are). Scan the code argument for absolute path
+            // literals ONLY when the code string contains a write-shaped call
+            // (INDEPENDENT REVIEW items 1, 3a, 3c).
             basename if OPAQUE_WRITER_PROGRAMS.contains(&basename) => {
                 let args = &words[idx + 1..];
                 let mut j = 0;
@@ -1259,12 +1493,17 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                     if matches!(args[j], "-c" | "-e" | "-r" | "--") {
                         if let Some(code) = args.get(j + 1) {
                             let code = strip_one_quote_layer(code);
-                            for tok in code.split(|c: char| {
-                                c.is_whitespace()
-                                    || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';' | ':')
-                            }) {
-                                if tok.starts_with('/') && tok.len() > 1 {
-                                    targets.push(tok.to_string());
+                            // Gate: only extract paths when the code is write-shaped (item 3c).
+                            // Splitting on `:` shears drive letters and URL authority, producing
+                            // false tokens — omit `:` from the split (items 1, 3a).
+                            if code_string_has_write_shape(code) {
+                                for tok in code.split(|c: char| {
+                                    c.is_whitespace()
+                                        || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';')
+                                }) {
+                                    if is_abs_path_token(tok) {
+                                        targets.push(tok.to_string());
+                                    }
                                 }
                             }
                         }
@@ -1357,7 +1596,18 @@ fn command_contains_write_capable_program(command: &str) -> bool {
                     let args = &words[idx + 1..];
                     let mut j = 0;
                     while j < args.len() {
-                        if args[j].starts_with('-') {
+                        // INDEPENDENT REVIEW item 6 (site 2): skip the value of flags that
+                        // take a separate-token argument so the value is never mistaken for
+                        // the subcommand verb (over-deny) or causes a verb-position miss.
+                        if (args[j] == "-c"
+                            || args[j] == "--config"
+                            || args[j] == "-C"
+                            || args[j] == "--git-dir"
+                            || args[j] == "--work-tree")
+                            && j + 1 < args.len()
+                        {
+                            j += 2;
+                        } else if args[j].starts_with('-') {
                             j += 1;
                         } else {
                             if !GIT_READ_VERBS.contains(&args[j]) {
@@ -1611,7 +1861,18 @@ fn explicit_write_program_denial_inner(command: &str, unwrap_inline: bool) -> Op
                             &["commit", "apply", "checkout", "stash", "reset"];
                         let mut j = 0;
                         while j < args.len() {
-                            if args[j].starts_with('-') {
+                            // INDEPENDENT REVIEW item 6 (site 3): skip values of flags that
+                            // take a separate token so the value is never treated as the verb
+                            // (would cause a bypass: `git -c user.name=x commit` → admitted).
+                            if (args[j] == "-c"
+                                || args[j] == "--config"
+                                || args[j] == "-C"
+                                || args[j] == "--git-dir"
+                                || args[j] == "--work-tree")
+                                && j + 1 < args.len()
+                            {
+                                j += 2;
+                            } else if args[j].starts_with('-') {
                                 j += 1;
                             } else {
                                 if GIT_WRITE_SUBCOMMANDS.contains(&args[j]) {
@@ -4165,14 +4426,17 @@ mod tests {
             "{d}"
         );
 
-        // python3 - <<EOF (stdin heredoc shape): the `-` arg triggers the opaque-writer check.
+        // python3 - <<EOF (stdin heredoc shape): denied — either by extracted write target
+        // (heredoc scanning now extracts the abs path when write-shaped) or by the opaque-
+        // interpreter check when the path is not statically extractable.
         let d = deny_ro(format!(
             "python3 - <<'EOF'\nopen('{}','w')\nEOF",
             w(&wt.join("pwned"))
         ))
         .expect("python3 - <<EOF is denied for ReadOnly (issue #541)");
         assert!(
-            d.contains("interpreter") && d.contains(PHASE_SCOPE_BASH_REMEDY),
+            (d.contains("interpreter") || d.contains("would write"))
+                && d.contains(PHASE_SCOPE_BASH_REMEDY),
             "{d}"
         );
 
@@ -4544,9 +4808,14 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         let deny = |cmd: &str| bash_write_phase_scope(false, P::ReadOnly, cmd, &wt, None, &[]);
 
-        // bash <<'EOF'\ntouch x\nEOF — heredoc stdin invocation (opaque).
+        // bash <<'EOF'\ntouch x\nEOF — heredoc stdin invocation; denied either because
+        // heredoc body scanning extracts a write target ("would write") or by the opaque-
+        // interpreter check when no static target is found.
         let d = deny("bash <<'EOF'\ntouch x\nEOF").expect("bash heredoc must be denied");
-        assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
+        assert!(
+            d.contains("interpreter") || d.contains("opaque") || d.contains("would write"),
+            "{d}"
+        );
 
         // sh script.sh — script-file invocation (opaque).
         let d = deny("sh script.sh").expect("sh script.sh must be denied");
@@ -4571,6 +4840,325 @@ mod tests {
             "bare bash with no args must be admitted"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INDEPENDENT REVIEW item 1 / 3a — `is_abs_path_token` covers Unix, Windows and UNC
+    /// paths via `Path::is_absolute()`, and rejects `//`-prefixed URL authority tokens and
+    /// relative paths. Runs on all platforms without hard-coding path separators.
+    #[test]
+    fn absolute_path_detection_cross_platform_ir_item1_3a() {
+        // Relative paths: never absolute.
+        assert!(!is_abs_path_token("relative/x"), "relative path rejected");
+        assert!(!is_abs_path_token("./local"), "dot-relative rejected");
+        assert!(!is_abs_path_token(""), "empty string rejected");
+        // URL authority leftover after splitting on ':' — must be rejected.
+        assert!(!is_abs_path_token("//127.0.0.1"), "URL authority rejected");
+        assert!(
+            !is_abs_path_token("//server/share"),
+            "UNC-style // rejected"
+        );
+        // On Unix, /tmp/x is absolute.
+        #[cfg(unix)]
+        {
+            assert!(is_abs_path_token("/tmp/x"), "Unix abs accepted");
+            assert!(is_abs_path_token("/etc/hosts"), "Unix abs accepted");
+        }
+        // Platform-native temp dir is always absolute and not //-prefixed.
+        let td = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(is_abs_path_token(&td), "temp_dir() is absolute: {td}");
+        // URL scanner: python3 -c "urlopen('http://127.0.0.1:7701/path')" must produce no
+        // abs-path target from the URL — the token after splitting on non-':' separators
+        // keeps the full URL form, which is_abs_path_token must reject.
+        let url_code = "urlopen('http://127.0.0.1:7701/path')";
+        let has_url_hit = url_code
+            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';'))
+            .any(is_abs_path_token);
+        assert!(
+            !has_url_hit,
+            "URL token must not be flagged as abs path: {url_code}"
+        );
+        // Write-shaped code with a platform-native sibling path must be detected.
+        let sibling = std::env::temp_dir().join("ir-sibling-test");
+        let sibling_s = sibling.to_string_lossy().into_owned();
+        let write_code = format!("open('{sibling_s}','w')");
+        assert!(
+            code_string_has_write_shape(&write_code),
+            "write-shaped code detected: {write_code}"
+        );
+        let mut targets = Vec::new();
+        collect_bash_write_targets(&format!("python3 -c \"{write_code}\""), true, &mut targets);
+        assert!(
+            targets.iter().any(|t| t.contains(&sibling_s)),
+            "platform-native sibling path extracted from write-shaped code: {targets:?}"
+        );
+        // Read-shaped code must NOT produce a target.
+        let read_code = format!("open('{sibling_s}','r')");
+        let mut read_targets = Vec::new();
+        collect_bash_write_targets(
+            &format!("python3 -c \"{read_code}\""),
+            true,
+            &mut read_targets,
+        );
+        assert!(
+            read_targets.is_empty(),
+            "read-shaped code must not produce write targets: {read_targets:?}"
+        );
+    }
+
+    /// INDEPENDENT REVIEW item 3b — the Inline arm no longer raw-scans the shell `-c` string
+    /// for absolute tokens; read commands inside `-c` must not produce write targets.
+    #[test]
+    fn inline_arm_no_raw_scan_ir_item3b() {
+        // sh -c 'cat /etc/hosts' — read-only: must produce no write target.
+        let targets = bash_write_targets("sh -c 'cat /etc/hosts'");
+        assert!(
+            targets.is_empty(),
+            "sh -c 'cat /etc/hosts' must yield no write targets: {targets:?}"
+        );
+        // bash -c 'ls /usr/local' — read-only: must produce no write target.
+        let targets = bash_write_targets("bash -c 'ls /usr/local'");
+        assert!(
+            targets.is_empty(),
+            "bash -c 'ls /usr/local' must yield no write targets: {targets:?}"
+        );
+        // bash -c 'tee /tmp/out' — actual write: must still be captured.
+        let targets = bash_write_targets("bash -c 'tee /tmp/out'");
+        assert!(
+            !targets.is_empty(),
+            "bash -c 'tee /tmp/out' must yield a write target"
+        );
+    }
+
+    /// INDEPENDENT REVIEW item 3c — interpreter literals are only extracted as write targets
+    /// when the code string is write-shaped; read-shaped calls and URLs are admitted.
+    #[test]
+    fn interpreter_literal_write_shape_gate_ir_item3c() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-ir3c-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let sibling = base.join("sibling");
+        for d in [&wt, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
+        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        // Write-shaped: denied.
+        assert!(
+            check(&format!("python3 -c \"open('{}/x','w')\"", w(&sibling))).is_some(),
+            "python3 open write must be denied"
+        );
+        assert!(
+            check(&format!(
+                "node -e \"require('fs').writeFileSync('{}/x','d')\"",
+                w(&sibling)
+            ))
+            .is_some(),
+            "node writeFileSync must be denied"
+        );
+        // Read-shaped: admitted under Creator boundary.
+        assert!(
+            check(&format!("python3 -c \"open('{}/x','r')\"", w(&sibling))).is_none(),
+            "python3 open read must be admitted"
+        );
+        assert!(
+            check(&format!(
+                "node -e \"require('fs').readFileSync('{}/x')\"",
+                w(&sibling)
+            ))
+            .is_none(),
+            "node readFileSync must be admitted"
+        );
+        // URL: admitted (no abs-path token after correct split).
+        assert!(
+            check("python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:7701/path')\"").is_none(),
+            "URL in interpreter code must be admitted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INDEPENDENT REVIEW item 4 — heredoc bodies are scanned; write-shaped heredocs denied,
+    /// read-shaped admitted.
+    #[test]
+    fn heredoc_body_scanned_creator_posture_ir_item4() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-ir4h-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let sibling = base.join("sibling");
+        for d in [&wt, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
+        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let sib_x = format!("{}/x", w(&sibling));
+
+        // Write-shaped heredoc: must be denied.
+        let cmd_w = format!("python3 - <<'EOF'\nopen('{sib_x}','w')\nEOF");
+        assert!(
+            check(&cmd_w).is_some(),
+            "heredoc write body must be denied: {cmd_w}"
+        );
+        // Read-shaped heredoc: must be admitted.
+        let cmd_r = format!("python3 - <<'EOF'\nopen('{sib_x}','r')\nEOF");
+        assert!(
+            check(&cmd_r).is_none(),
+            "heredoc read body must be admitted: {cmd_r}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INDEPENDENT REVIEW item 5 — `sed -i` and `rm` are write targets at the Creator boundary;
+    /// `sed` without `-i` is not.
+    #[test]
+    fn sed_inplace_and_rm_creator_boundary_ir_item5() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-ir5-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let sibling = base.join("sibling");
+        for d in [&wt, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
+        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        // sed -i on sibling file: denied.
+        assert!(
+            check(&format!("sed -i 's/a/b/' {}/file.rs", w(&sibling))).is_some(),
+            "sed -i on sibling must be denied"
+        );
+        // rm on sibling file: denied.
+        assert!(
+            check(&format!("rm {}/file.rs", w(&sibling))).is_some(),
+            "rm on sibling must be denied"
+        );
+        // sed without -i: no write target extracted → admitted.
+        assert!(
+            check(&format!("sed 's/a/b/' {}/file.rs", w(&sibling))).is_none(),
+            "sed without -i must be admitted"
+        );
+        // sed -i on in-wt file: admitted.
+        assert!(
+            check(&format!("sed -i 's/a/b/' {}/src/main.rs", w(&wt))).is_none(),
+            "sed -i on in-wt file must be admitted"
+        );
+        // rm on in-wt file: admitted.
+        assert!(
+            check(&format!("rm {}/tmp.rs", w(&wt))).is_none(),
+            "rm on in-wt file must be admitted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INDEPENDENT REVIEW item 6 — `git -c k=v <write-verb>` bypass is closed at all three
+    /// sites; `git -c k=v <read-verb>` is admitted.
+    #[test]
+    fn git_config_flag_bypass_closed_ir_item6() {
+        use crate::write_posture::WritePosture as P;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-ir6-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let deny = |cmd: &str| bash_write_phase_scope(false, P::ReadOnly, cmd, &wt, None, &[]);
+
+        // Site 3 (explicit_write_program_denial): git -c k=v commit must be denied.
+        assert!(
+            deny("git -c user.name=x commit -m y").is_some(),
+            "git -c k=v commit must be denied (site 3)"
+        );
+        // --config long form: also denied.
+        assert!(
+            deny("git --config user.name=x commit -m y").is_some(),
+            "git --config k=v commit must be denied (site 3)"
+        );
+        // Read verb after -c: must be admitted (site 3 must not over-deny).
+        assert!(
+            deny("git -c user.name=x status").is_none(),
+            "git -c k=v status must be admitted (site 3)"
+        );
+        assert!(
+            deny("git -c user.name=x log --oneline").is_none(),
+            "git -c k=v log must be admitted (site 3)"
+        );
+        // -C value must also be skipped (site 2/3): git -C /path commit denied.
+        assert!(
+            deny("git -C /some/outside/path commit -m y").is_some(),
+            "git -C /path commit must be denied"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INDEPENDENT REVIEW item 2 — witness skips git-ignored paths so build outputs
+    /// (target/, node_modules/) do not appear as escapes.
+    #[test]
+    fn witness_skips_gitignored_paths_ir_item2() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-ir2-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Init a git repo so git ls-files works.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if git(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
+            // Write a tracked file and a .gitignore that excludes target/.
+            std::fs::write(base.join(".gitignore"), "target/\n").unwrap();
+            std::fs::write(base.join("src.rs"), "fn main() {}").unwrap();
+            let _ = git(&["add", "."]);
+            let _ = git(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ]);
+            // Now create target/debug/binary (git-ignored).
+            let target_dir = base.join("target").join("debug");
+            std::fs::create_dir_all(&target_dir).unwrap();
+            std::fs::write(target_dir.join("binary"), "ELF").unwrap();
+
+            // collect_dir_entries_for_witness must NOT include target/ contents.
+            let mut entries = Vec::new();
+            collect_dir_entries_for_witness(&base, &mut entries);
+            let has_target = entries.iter().any(|(p, _, _)| p.contains("target"));
+            assert!(
+                !has_target,
+                "witness must not include git-ignored target/ paths: {entries:?}"
+            );
+            // src.rs must be included.
+            let has_src = entries.iter().any(|(p, _, _)| p.ends_with("src.rs"));
+            assert!(has_src, "witness must include tracked src.rs: {entries:?}");
+        } else {
+            // git not available in test env: skip rather than fail.
+            eprintln!("skipping ir_item2 witness test: git init failed");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

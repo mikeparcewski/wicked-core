@@ -18,6 +18,36 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **Validator: skip agent judge when no identity-distinct seat is available; gate default-floor judge on pinned skip; per-seat eligibility reasons (#539).** Two callers — the pinned-validator inline path in `cli_runner` and `gate_phase` — unconditionally called `agent_validate`, which falls back to the single default runner (the deterministic validator's own seat) when no distinct seat exists. For a claude creator this is a self-grade: the same seat that wrote the work judges it as distinct. Both callers now pre-check `distinct_judge_available` (F-7R2-005) before calling the judge; when no distinct seat is found, the judge is skipped, `judge_skipped` is set with the eligibility reason, and the deterministic verdict carries the fold. The `GateEvaluated` wire shape gains `agentVerdict: "skipped"` (replacing `null`) and `judgeDistinct: false` when the judge was skipped, so consumers can distinguish "no judge wanted" from "judge wanted but skipped for eligibility". A fall-through bug is also fixed: when the pinned-validator path sets `judge_skipped` (no distinct seat), the `default_floor_applies` arm was not guarded on `judge_skipped.is_none()` — the default judge would still run on a seat that IS distinct for the looser default exclusion (`excluded=[creator]` only), producing `agentVerdict:pass` AND `judgeSkippedReason` on the wire simultaneously. The default-floor arm is now gated on `judge_skipped.is_none()`. The judge-skip reason now names each seat's per-seat eligibility outcome (`excluded (creator)`, `excluded (validator author)`, `excluded (creator = validator author)`, `unusable (empty invocation)`) instead of a flat "eligible roster" list — an unusable seat (empty `headless_invocation`) no longer appears as eligible. The bus path (evaluator daemon) is unaffected — it enforces evaluator≠creator independently.
 
+- **Gate hook: six INDEPENDENT REVIEW defects fixed (#542).** (1) **Windows path detection
+  (CI red):** `tok.starts_with('/')` in the code-string scanner is replaced with
+  `is_abs_path_token` — `!tok.starts_with("//") && Path::new(tok).is_absolute()` — covering
+  Windows drive letters (`C:\…`), `\\?\` long paths, and UNC forms on all platforms; `:` is
+  removed from the split delimiter so drive letters survive tokenisation. Fixes the
+  `cd_escape_with_write_capable_program_and_abs_path_in_code_item4` Windows CI failure.
+  (2) **Witness ignore rules:** `collect_dir_entries_for_witness` now uses `git ls-files
+  --cached --others --exclude-standard` for directories that are git worktree roots (`.git`
+  entry present), so `target/`, `.git/`, `node_modules/`, `dist/` are excluded by git's own
+  ignore mechanism; raw walk fallback for non-git roots skips `.git/`. An allowed call's own
+  build side-effects no longer appear as escapes.
+  (3) **Code-string scan over-deny (FATAL):** (a) URL authority tokens (`//host`) are no longer
+  flagged as absolute paths after removing `:` from the split; (b) the raw token scan in the
+  shell `Inline` arm is removed — `unwrap_program` already rescans the inner command, so the
+  raw scan only added read commands as spurious write targets; (c) interpreter literals are
+  extracted as write targets only when `code_string_has_write_shape` detects a write-shaped
+  call (`open(…,'w')`, `writeFileSync`, `.write(`, `mkdir(`, `>`, etc.).
+  (4) **Heredoc bodies scanned:** `extract_heredoc_bodies` pre-scans the raw command string
+  (before `shell_tokens`) for `<<MARKER` / `<<-MARKER` bodies; each body is rescanned via
+  `collect_bash_write_targets` and, when write-shaped, its absolute path literals are
+  extracted. `<<<` here-strings are skipped.
+  (5) **`sed -i` and `rm` modelled:** `collect_bash_write_targets` now has `sed` (in-place
+  only: `-i`, `-i<suffix>`, `--in-place`; file args after the script) and `rm` (every
+  non-flag, non-fd-dup arg) arms so the Creator boundary judges them like redirects.
+  (6) **`git -c k=v` bypass closed:** all three sites that parse git flags now skip the value
+  of `-c`/`--config`/`-C`/`--git-dir`/`--work-tree` when they carry a separate token, so
+  `git -c user.name=x commit -m y` is denied under ReadOnly and `git -c user.name=x status`
+  is admitted (`collect_bash_write_targets` site 1, `command_contains_write_capable_program`
+  site 2, `explicit_write_program_denial_inner` site 3).
+
 - **Gate hook: close ReadOnly write-fence holes for `touch`, inline interpreters, and post-hoc
   witness (#541).** `touch` is now modelled in `collect_bash_write_targets` (targets extracted and
   judged against admitted roots, matching the `mkdir` pattern). Fd-dup tokens (`2>&1`, `>&2`) in
