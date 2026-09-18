@@ -33,8 +33,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use wicked_apps_core::{
-    open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
-    CONFORMANCE_CLAIM,
+    open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, HardenedCommand, NodeKind,
+    ToNode, CONFORMANCE_CLAIM,
 };
 use wicked_governance::{conform, decide, recall_rules, select_any, RuleQuery};
 use wicked_orchestration::{apply_gate, get_phase, Phase};
@@ -499,6 +499,7 @@ fn collect_dir_entries_for_witness(dir: &std::path::Path, out: &mut Vec<(String,
     // outer repo's file list via git's upward root search.
     if dir.join(".git").exists() {
         if let Ok(output) = std::process::Command::new("git")
+            .hardened()
             .args([
                 "ls-files",
                 "--cached",
@@ -5120,7 +5121,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         // Init a git repo so git ls-files works.
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
                 .args(args)
                 .current_dir(&base)
                 .output()
