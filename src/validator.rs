@@ -1337,7 +1337,7 @@ fn normalize_identity(tok: &str) -> String {
 /// binary under different KEYS (e.g. `claude` + `claude-sonnet`, both running `claude`) resolve to ONE
 /// identity, so a same-binary seat is never a valid "distinct" judge. NOT the `binary` registry field
 /// (which the ad-hoc/test seats leave unset) — the invocation is the ground truth of what runs.
-fn seat_identity(c: &AgenticCli) -> String {
+pub(crate) fn seat_identity(c: &AgenticCli) -> String {
     let argv0 = c
         .headless_invocation
         .split_whitespace()
@@ -1349,7 +1349,7 @@ fn seat_identity(c: &AgenticCli) -> String {
 /// The normalized identity to EXCLUDE for an author key: if the key names a roster seat, its invocation
 /// identity; otherwise the normalized key itself. So excluding the deterministic author `claude` also
 /// excludes a `claude-sonnet` seat that invokes `claude` (C2), whether or not `claude` is itself listed.
-fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
+pub(crate) fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
     roster
         .iter()
         .find(|c| c.key == key)
@@ -2194,21 +2194,40 @@ pub fn gate_phase(
     deterministic_only: bool,
     runner: &dyn StepRunner,
 ) -> anyhow::Result<GateVerdict> {
+    let roster = crate::registry_roster();
+    gate_phase_with_roster(validator, work, cwd, deterministic_only, runner, &roster)
+}
+
+/// Inner implementation of [`gate_phase`] that accepts an explicit roster, enabling tests to
+/// inject a controlled seat list without touching process-global state (#539).
+pub(crate) fn gate_phase_with_roster(
+    validator: &DeterministicValidator,
+    work: &str,
+    cwd: &std::path::Path,
+    deterministic_only: bool,
+    runner: &dyn StepRunner,
+    roster: &[AgenticCli],
+) -> anyhow::Result<GateVerdict> {
     let det_pass = run_validator(validator, cwd)?;
     let agent = if deterministic_only {
         None
     } else {
-        let roster = crate::registry_roster();
         // gate_phase re-verifies on the actor and does not carry the work unit's assigned_cli, so it can
         // only exclude the deterministic author here. The real (off-actor) path additionally excludes the
         // work's own author — see `cli_runner::run_unit_and_judge` (C1).
-        Some(agent_validate(
-            &validator.criterion,
-            work,
-            &[DETERMINISTIC_VALIDATOR_SEAT],
-            &roster,
-            runner,
-        )?)
+        // (#539) Only run the agent judge when an identity-distinct seat exists. Without this check,
+        // agent_validate falls back to the single-runner — a self-grade when only claude is registered.
+        if distinct_judge_available(&[DETERMINISTIC_VALIDATOR_SEAT], roster) {
+            Some(agent_validate(
+                &validator.criterion,
+                work,
+                &[DETERMINISTIC_VALIDATOR_SEAT],
+                roster,
+                runner,
+            )?)
+        } else {
+            None
+        }
     };
     Ok(combine_verdict(det_pass, agent.as_ref()))
 }
@@ -3969,6 +3988,70 @@ mod tests {
             Some("claude -p {PROMPT}"),
             "fallback uses the single default runner"
         );
+    }
+
+    /// (#539) `gate_phase_with_roster` must not run the agent judge when no identity-distinct seat
+    /// exists — falling back to the single default runner is a self-grade for a claude creator.
+    /// With an empty roster (or one that excludes all seats), the agent must be skipped and the
+    /// deterministic verdict must carry the fold.
+    #[test]
+    fn gate_phase_skips_agent_when_no_distinct_seat_is_available() {
+        use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Pure-logic guard: an empty roster has no judge that is distinct from the deterministic
+        // author. This is the invariant gate_phase_with_roster relies on to skip the agent call.
+        assert!(
+            !distinct_judge_available(&[DETERMINISTIC_VALIDATOR_SEAT], &[]),
+            "empty roster must have no distinct judge seat (#539)"
+        );
+
+        struct ShouldNotRun(Arc<AtomicBool>);
+        impl StepRunner for ShouldNotRun {
+            fn run_unit(&self, _: &StepInput) -> StepOutput {
+                self.0.store(true, Ordering::SeqCst);
+                StepOutput {
+                    run_id: String::new(),
+                    unit_ix: 0,
+                    attempt: 0,
+                    output: "should not have run".into(),
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+            fn on_run_complete(&self, _: &str) {}
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("wicked-gate-phase-539-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let validator = DeterministicValidator {
+            criterion: "always passes".into(),
+            script: "true".into(),
+            approved: true,
+        };
+
+        let called = Arc::new(AtomicBool::new(false));
+        // The runner must never be dispatched regardless of what the deterministic check returns
+        // (subprocess availability is environment-dependent; agent skipping is not).
+        let _ = gate_phase_with_roster(
+            &validator,
+            "work text",
+            &dir,
+            false,
+            &ShouldNotRun(called.clone()),
+            &[],
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "the agent runner must NOT be called when no distinct seat exists (#539)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
