@@ -939,15 +939,37 @@ fn run_unit_and_judge_with_roster(
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
             if !crate::validator::distinct_judge_available(&excluded, roster) {
-                let roster_keys: Vec<&str> = roster.iter().map(|c| c.key.as_str()).collect();
+                let creator_id = crate::validator::excluded_identity(work_author, roster);
+                let validator_id = crate::validator::excluded_identity(
+                    crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
+                    roster,
+                );
+                let seat_outcomes: Vec<String> = roster
+                    .iter()
+                    .map(|c| {
+                        let id = crate::validator::seat_identity(c);
+                        let outcome = if id == creator_id && id == validator_id {
+                            "excluded (creator = validator author)".to_string()
+                        } else if id == creator_id {
+                            "excluded (creator)".to_string()
+                        } else if id == validator_id {
+                            "excluded (validator author)".to_string()
+                        } else if c.headless_invocation.trim().is_empty() {
+                            "unusable (empty invocation)".to_string()
+                        } else {
+                            format!("excluded (same identity as {})", id)
+                        };
+                        format!("{}: {}", c.key, outcome)
+                    })
+                    .collect();
                 let why = format!(
                     "no eligible judge seat distinct from creator '{work_author}' and validator \
-                     author '{}' (eligible roster: {}; benched: {})",
+                     author '{}' (seats: {}; benched: {})",
                     crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
-                    if roster_keys.is_empty() {
+                    if seat_outcomes.is_empty() {
                         "none".to_string()
                     } else {
-                        roster_keys.join(", ")
+                        seat_outcomes.join(", ")
                     },
                     if benched.is_empty() {
                         "none".to_string()
@@ -984,7 +1006,7 @@ fn run_unit_and_judge_with_roster(
         };
         if pinned.is_some() {
             pinned
-        } else if default_floor_applies {
+        } else if default_floor_applies && judge_skipped.is_none() {
             // (F-7R2-005) The DEFAULT judge: no pinned validator gated this unit, but it changed
             // the tree — so a seat DISTINCT from the creator judges the change against the
             // engine-authored default criterion. Never the single-runner fallback (that would be
@@ -1022,14 +1044,28 @@ fn run_unit_and_judge_with_roster(
                     },
                 })
             } else {
-                let roster_keys: Vec<&str> = roster.iter().map(|c| c.key.as_str()).collect();
+                let creator_id = crate::validator::excluded_identity(work_author, roster);
+                let seat_outcomes: Vec<String> = roster
+                    .iter()
+                    .map(|c| {
+                        let id = crate::validator::seat_identity(c);
+                        let outcome = if id == creator_id {
+                            "excluded (creator)".to_string()
+                        } else if c.headless_invocation.trim().is_empty() {
+                            "unusable (empty invocation)".to_string()
+                        } else {
+                            format!("excluded (same identity as {})", id)
+                        };
+                        format!("{}: {}", c.key, outcome)
+                    })
+                    .collect();
                 let why = format!(
-                    "no eligible judge seat distinct from creator '{work_author}' (eligible \
-                     roster: {}; benched: {})",
-                    if roster_keys.is_empty() {
+                    "no eligible judge seat distinct from creator '{work_author}' (seats: {}; \
+                     benched: {})",
+                    if seat_outcomes.is_empty() {
                         "none".to_string()
                     } else {
-                        roster_keys.join(", ")
+                        seat_outcomes.join(", ")
                     },
                     if benched.is_empty() {
                         "none".to_string()
@@ -2738,6 +2774,198 @@ mod tests {
             evidence2.judge_skipped.is_some(),
             "evidence.judge_skipped must name the reason when the judge is skipped (#539)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (#539) When the pinned-validator path skips the judge (no distinct seat), the DEFAULT floor
+    /// must NOT convene a judge either — even though a seat that is distinct for the default path
+    /// (excluded=[creator only]) exists. The fix gates the default arm on `judge_skipped.is_none()`.
+    ///
+    /// Roster {claude, pi}, creator pi, approved validator:
+    ///   pinned excluded=[claude (det author), pi (creator)] → no distinct seat → judge_skipped set
+    ///   default excluded=[pi] → claude IS distinct, so without the fix the default arm runs on claude
+    ///   → agent_verdict=Some AND judge_skipped=Some (broken invariant)
+    ///   After the fix: default arm is skipped → agent_verdict=None, judge_skipped=Some.
+    #[test]
+    fn pinned_judge_skip_suppresses_default_floor_with_creator_pi() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CountingRunner {
+            judge_calls: Mutex<u32>,
+        }
+        impl StepRunner for CountingRunner {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                if input.unit.session_id == "validator" {
+                    *self.judge_calls.lock().unwrap() += 1;
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nok\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-pinned-suppress-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        // default_floor = true so default_floor_applies fires (tree_changed = Some(true) via
+        // fail-closed when worktree_baseline is None).
+        unit.default_floor = true;
+
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        // WICKED_BUS_DB must be unset so the inline path runs. Remove it for this test.
+        std::env::remove_var("WICKED_BUS_DB");
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let rec = Arc::new(CountingRunner::default());
+        let runner: Arc<dyn StepRunner> = rec.clone();
+        let (_out, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+
+        assert!(
+            verdict.is_none(),
+            "pinned skip must suppress the default floor: wire must never carry \
+             agentVerdict:pass together with judgeSkippedReason (#539)"
+        );
+        assert!(
+            evidence.judge_skipped.is_some(),
+            "judge_skipped must be set by the pinned path even when default_floor_applies"
+        );
+        assert_eq!(
+            *rec.judge_calls.lock().unwrap(),
+            0,
+            "no judge subprocess must be spawned when the pinned path already set judge_skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (#539) The judge-skip reason must name each seat's eligibility outcome and must NOT list
+    /// unusable seats (empty invocation) as eligible.
+    #[test]
+    fn judge_skip_reason_names_per_seat_outcome_and_excludes_unusable_from_eligible() {
+        use crate::workflow::{StepOutput, StepRunner};
+
+        struct NoopRunner;
+        impl StepRunner for NoopRunner {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: String::new(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-skip-reason-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "correct".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        // Roster: claude (excluded as validator author), pi (excluded as creator), empty (unusable).
+        // All three excluded/unusable → no distinct seat → pinned skips.
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        std::env::remove_var("WICKED_BUS_DB");
+
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+            // headless_invocation="" → unusable
+            seat("ghost", ""),
+        ];
+        let (_out, _verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+
+        let reason = evidence
+            .judge_skipped
+            .expect("judge_skipped must be set when no distinct seat exists");
+
+        // The seat 'ghost' has an empty invocation — it must not be labeled as eligible.
+        assert!(
+            !reason.contains("ghost: eligible"),
+            "unusable seat must not be described as eligible; got: {reason}"
+        );
+        // Each seat's outcome must be named.
+        assert!(
+            reason.contains("ghost") && reason.contains("unusable"),
+            "unusable seat 'ghost' must appear with 'unusable' in reason; got: {reason}"
+        );
+        assert!(
+            reason.contains("pi") && reason.contains("excluded"),
+            "excluded creator seat 'pi' must appear with 'excluded' in reason; got: {reason}"
+        );
+        assert!(
+            reason.contains("claude") && reason.contains("excluded"),
+            "excluded validator-author seat 'claude' must appear with 'excluded' in reason; got: {reason}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

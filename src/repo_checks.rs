@@ -2253,6 +2253,31 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
             return Some(format!("not ok {name}"));
         }
     }
+    // node:test SPEC reporter (Node ≥ 23): `✖ test name (Nms)` — the timing suffix `(…ms)` is
+    // the discriminator that makes this failure-only (the `✖ failing tests:` summary line and
+    // eslint `✖ N problems` lines have no numeric-only timing suffix). `trim_start()` above
+    // handles indented `  ✖ …` lines from nested suites (#538).
+    if let Some(rest) = s.strip_prefix("✖ ") {
+        // Require ` (Nms)` or ` (N.Ns)` timing — digits/dots only before the unit, so
+        // "1 error, 0 warnings" (ends with 's') and "failing tests:" never match.
+        if let Some(name_part) = rest.strip_suffix(')') {
+            if let Some(paren) = name_part.rfind(" (") {
+                let timing = &name_part[paren + 2..];
+                let is_timing = timing
+                    .strip_suffix("ms")
+                    .or_else(|| timing.strip_suffix('s'))
+                    .is_some_and(|n| {
+                        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                    });
+                if is_timing {
+                    let name = name_part[..paren].trim();
+                    if !name.is_empty() {
+                        return Some(format!("✖ {name}"));
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
@@ -3780,6 +3805,23 @@ mod tests {
         );
         assert_eq!(id("✖ 1 problem (1 error, 0 warnings)", &mut f), None);
         assert_eq!(id("", &mut f), None);
+        // node:test SPEC reporter (Node ≥ 23) — `✖ name (Nms)` with a timing suffix is a
+        // failure; the `✖ failing tests:` summary and eslint `✖ N problems` lines are not (#538).
+        assert_eq!(
+            id("✖ should pass the assertion (3ms)", &mut f).as_deref(),
+            Some("✖ should pass the assertion"),
+            "SPEC failure line with ms timing"
+        );
+        assert_eq!(
+            id("  ✖ nested > suite > test name (1.234s)", &mut f).as_deref(),
+            Some("✖ nested > suite > test name"),
+            "indented SPEC line (nested suite) with s timing"
+        );
+        assert_eq!(
+            id("✖ failing tests:", &mut f),
+            None,
+            "✖ failing tests: summary has no timing suffix"
+        );
         // node:test TAP output (#538): `not ok N - name` is a failure; `# Subtest:` is not.
         assert_eq!(
             id("not ok 1 - passes the assertion", &mut f).as_deref(),

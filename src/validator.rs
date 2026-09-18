@@ -1337,7 +1337,7 @@ fn normalize_identity(tok: &str) -> String {
 /// binary under different KEYS (e.g. `claude` + `claude-sonnet`, both running `claude`) resolve to ONE
 /// identity, so a same-binary seat is never a valid "distinct" judge. NOT the `binary` registry field
 /// (which the ad-hoc/test seats leave unset) — the invocation is the ground truth of what runs.
-fn seat_identity(c: &AgenticCli) -> String {
+pub(crate) fn seat_identity(c: &AgenticCli) -> String {
     let argv0 = c
         .headless_invocation
         .split_whitespace()
@@ -1349,7 +1349,7 @@ fn seat_identity(c: &AgenticCli) -> String {
 /// The normalized identity to EXCLUDE for an author key: if the key names a roster seat, its invocation
 /// identity; otherwise the normalized key itself. So excluding the deterministic author `claude` also
 /// excludes a `claude-sonnet` seat that invokes `claude` (C2), whether or not `claude` is itself listed.
-fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
+pub(crate) fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
     roster
         .iter()
         .find(|c| c.key == key)
