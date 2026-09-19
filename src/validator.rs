@@ -1855,6 +1855,10 @@ pub struct EvaluatorVerdict {
     /// the contract puts the findings ABOVE the verdict line) — for `gateEscalated.verdictSummary`
     /// and the rework context a `request_changes` hands the creator (PR-1B).
     pub findings: String,
+    /// (core#549) `true` when the evaluator's output exceeded [`EVALUATOR_FINDINGS_CAP`] chars and
+    /// `findings` is a tail-trim. Propagates to `UnitDenial.findings_trimmed` and then to
+    /// `gateEscalated.verdictSummaryTrimmed` so a client can detect the cap without parsing `…`.
+    pub findings_trimmed: bool,
 }
 
 impl EvaluatorVerdict {
@@ -1935,7 +1939,8 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
     }
     let trimmed = raw.trim();
     let count = trimmed.chars().count();
-    let findings = if count <= EVALUATOR_FINDINGS_CAP {
+    let findings_trimmed = count > EVALUATOR_FINDINGS_CAP;
+    let findings = if !findings_trimmed {
         trimmed.to_string()
     } else {
         let tail: String = trimmed
@@ -1949,6 +1954,7 @@ pub(crate) fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
         token: decisive,
         pass,
         findings,
+        findings_trimmed,
     }
 }
 
@@ -2646,6 +2652,9 @@ mod tests {
         assert!(!v.pass);
         assert!(v.findings.starts_with('…') && v.findings.ends_with("VERDICT: FAIL"));
         assert_eq!(v.findings.chars().count(), EVALUATOR_FINDINGS_CAP + 1);
+        assert!(v.findings_trimmed, "long output sets findings_trimmed");
+        let short = parse_evaluator_verdict("short\nVERDICT: FAIL");
+        assert!(!short.findings_trimmed, "short output does not set findings_trimmed");
         let fail = parse_evaluator_verdict("the fix breaks X\nVERDICT: FAIL");
         assert_eq!(
             fail.denial_reason(),

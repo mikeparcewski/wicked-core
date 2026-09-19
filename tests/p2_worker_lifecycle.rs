@@ -111,6 +111,7 @@ mod tests {
             repo_checks: None,
             last_attempt: None,
             rework_of: None,
+            rework_amendment: None,
         }
     }
 

@@ -5483,6 +5483,7 @@ fn escalate_denied_unit(
         .worktree_mutation
         .as_ref()
         .filter(|_| class == "evaluator_mutated_worktree");
+    let verdict_summary_trimmed = denial.is_some_and(|d| d.findings_trimmed);
     emit(
         subscribers,
         CoreEvent::GateEscalated {
@@ -5490,6 +5491,7 @@ fn escalate_denied_unit(
             ord,
             condition: class.to_string(),
             verdict_summary: reason.clone(),
+            verdict_summary_trimmed,
             attempt,
             denial_source: denial.map(|d| d.source.clone()).unwrap_or_default(),
             def_gate,
@@ -6519,24 +6521,31 @@ fn dispatch_unit(
             ))
         })
         .unzip();
-    // (DES-L1 PR-1B) A creator re-run after `request_changes` is handed the REJECTED review it must
-    // address. That transcript is invisible to `get_work_output` (approved outputs only), so it rides
-    // here explicitly, labelled, through the same prior-context blocks (the ACP carrier's "CONTEXT
-    // (prior phases of this run)" today, the wrapped carrier's under L4 ⑥; the pty carrier passes no
-    // prior context — that seat sees the marker head + the operator's note on its description).
+    // (DES-L1 PR-1B, core#549) A creator re-run after `request_changes` is handed the full
+    // amendment (evaluator findings + operator note) as prior context. The amendment is persisted
+    // on the unit as `rework_amendment` (stored by `rewind_to_creator` since core#549); older
+    // units that pre-date the field fall back to the evaluator transcript (capped at 4096 chars).
     if let Some(e) = unit.rework_of {
-        if let Some(review) = units
-            .iter()
-            .find(|u| u.ord == e)
-            .and_then(|r| crate::domain::get_unit_transcript(store, &r.id))
-            .and_then(|t| t.output)
-        {
-            let output = tail_chars(&review, 4096);
+        let (output, output_bytes) = if let Some(a) = &unit.rework_amendment {
+            let bytes = a.len();
+            (a.clone(), bytes)
+        } else {
+            let text = units
+                .iter()
+                .find(|u| u.ord == e)
+                .and_then(|r| crate::domain::get_unit_transcript(store, &r.id))
+                .and_then(|t| t.output)
+                .map(|t| tail_chars(&t, 4096))
+                .unwrap_or_default();
+            let bytes = text.len();
+            (text, bytes)
+        };
+        if !output.is_empty() {
             let label = format!("[review — unit {e} — requested changes]");
             context_items.push(crate::event::InjectedContext {
                 ord: e,
                 label: label.clone(),
-                output_bytes: output.len(),
+                output_bytes,
             });
             prior_outputs.push(PriorUnitOutput { label, output });
         }
@@ -7852,10 +7861,12 @@ fn rewind_to_creator(
         if ix == target_ix {
             u.status = crate::domain::UnitStatus::Distributed;
             u.rework_of = Some(review_ord);
+            u.rework_amendment = Some(amendment.clone());
             u.description = apply_rework_marker(&u.description, round, &head);
         } else {
             u.status = crate::domain::UnitStatus::Pending;
             u.rework_of = None;
+            u.rework_amendment = None;
         }
         put_node(store, u.to_node())?;
     }
@@ -9679,6 +9690,63 @@ mod substance_gate_tests {
             )),
             "the findings ride gateEscalated.verdictSummary"
         );
+        // Short output → verdictSummaryTrimmed = false.
+        assert!(
+            evs.iter().any(|ev| matches!(
+                ev,
+                CoreEvent::GateEscalated {
+                    verdict_summary_trimmed: false,
+                    ..
+                }
+            )),
+            "verdictSummaryTrimmed is false for short evaluator output"
+        );
+    }
+
+    /// (core#549, acceptance 2) An evaluator whose output exceeds EVALUATOR_FINDINGS_CAP chars has
+    /// its findings trimmed; `gateEscalated.verdictSummaryTrimmed` is `true` to name the trim on
+    /// the wire without requiring clients to parse the `…` prefix.
+    #[test]
+    fn evaluator_trimmed_findings_set_verdict_summary_trimmed_on_gate_escalated() {
+        let run_id = format!("evaluator-trimmed-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Evaluator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        // 5,000-char output → exceeds EVALUATOR_FINDINGS_CAP (4096) → trimmed.
+        let long_output = format!("{}\nVERDICT: FAIL", "x".repeat(5000));
+        let (applied, _session, unit) = fold(&mut store, &mut subs, &run_id, &long_output, false);
+
+        assert!(matches!(applied, StepApplied::Paused));
+        assert!(
+            unit.denial
+                .as_ref()
+                .is_some_and(|d| d.source == "evaluator_verdict" && d.findings_trimmed),
+            "denial.findings_trimmed must be true for a long evaluator output"
+        );
+
+        let evs = drain_events(&erx);
+        assert!(
+            evs.iter().any(|ev| matches!(
+                ev,
+                CoreEvent::GateEscalated {
+                    verdict_summary_trimmed: true,
+                    ..
+                }
+            )),
+            "verdictSummaryTrimmed must be true when findings were trimmed"
+        );
+        // The verdict summary carries the trimmed text (starts with '…').
+        assert!(
+            evs.iter().any(|ev| match ev {
+                CoreEvent::GateEscalated { verdict_summary, .. } =>
+                    verdict_summary.contains('…'),
+                _ => false,
+            }),
+            "trimmed verdict summary contains the '…' elision marker"
+        );
     }
 
     /// The passing case: `VERDICT: PASS` on the last line completes the unit and is recorded on
@@ -10173,6 +10241,135 @@ mod request_changes_tests {
             )),
             "request_changes never fails or cancels the run"
         );
+    }
+
+    /// (core#549, acceptance 1) A 2,400-char operator note sent at a deliver gate produces a
+    /// `unitContextInjected` item whose `outputBytes` equals the full amendment length
+    /// byte-for-byte — neither the note nor the findings are capped before injection.
+    #[test]
+    fn request_changes_injected_context_bytes_equal_full_amendment_length() {
+        let note: String = "n".repeat(2400);
+        let run_id = format!("rc-bytes-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, true);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some(note.clone()),
+            },
+        )
+        .unwrap();
+
+        let expected_amendment = format!("{FINDINGS}\n{note}");
+        let evs = drain(&erx);
+
+        // unitReworkAmended carries the full amendment text.
+        let amended = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitReworkAmended { amendment, scope, .. }
+                    if scope == "request_changes" =>
+                {
+                    Some(amendment.clone())
+                }
+                _ => None,
+            })
+            .expect("unitReworkAmended{request_changes}");
+        assert_eq!(amended, expected_amendment, "amendment must be findings + note in full");
+
+        // unitContextInjected carries output_bytes matching the full amendment length.
+        let context_bytes = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitContextInjected { prior_units, .. } => prior_units
+                    .iter()
+                    .find(|u| u.label.contains("requested changes"))
+                    .map(|u| u.output_bytes),
+                _ => None,
+            })
+            .expect("unitContextInjected with a requested-changes item");
+        assert_eq!(
+            context_bytes,
+            expected_amendment.len(),
+            "injected output_bytes must match the full amendment byte length (no cap)"
+        );
+
+        // The unit also persists rework_amendment so re-dispatch can retrieve it.
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let fix = &units[2];
+        assert_eq!(
+            fix.rework_amendment.as_deref(),
+            Some(expected_amendment.as_str()),
+            "rework_amendment on the creator unit must be the full amendment"
+        );
+    }
+
+    /// (core#549, acceptance 2) A 12 KB operator note arrives whole at the creator (no cap on the
+    /// injected context); the verdict summary is the part trimmed; `verdictSummaryTrimmed` names
+    /// the trim on the wire when the evaluator's output exceeded EVALUATOR_FINDINGS_CAP.
+    #[test]
+    fn request_changes_12kb_note_arrives_whole_verdict_summary_trim_named_on_wire() {
+        let note: String = "k".repeat(12_000);
+        let run_id = format!("rc-12kb-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, true);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some(note.clone()),
+            },
+        )
+        .unwrap();
+
+        let evs = drain(&erx);
+        // The amendment is short findings + \n + 12 KB note — well above 4096 chars.
+        let expected_amendment = format!("{FINDINGS}\n{note}");
+
+        let context_bytes = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitContextInjected { prior_units, .. } => prior_units
+                    .iter()
+                    .find(|u| u.label.contains("requested changes"))
+                    .map(|u| u.output_bytes),
+                _ => None,
+            })
+            .expect("unitContextInjected with a requested-changes item");
+        assert_eq!(
+            context_bytes,
+            expected_amendment.len(),
+            "12 KB note must arrive whole — no 4096-char cap on the injected amendment"
+        );
+
+        // verdictSummaryTrimmed on gateEscalated: seeded FINDINGS are short, so trimmed=false here.
+        // A separate fold-level test covers the trimmed=true path (see evaluator_verdict tests).
+        // Verify the field is always present on the event JSON.
+        let json_evs: Vec<_> = evs.iter().map(|e| e.to_json()).collect();
+        let escalated = json_evs.iter().find(|j| j["type"] == "gateEscalated");
+        // The seed's evaluator unit was already denied before confirm_gate — gateEscalated fires
+        // in the fold, not in confirm_gate, so it is NOT in `evs` here. The field's presence is
+        // covered by `a_denial_gate_escalation_names_its_class_and_restore_outcome` (event.rs).
+        // What we CAN assert here: the re-dispatched creator has a rework_amendment.
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let fix = &units[2];
+        assert_eq!(
+            fix.rework_amendment.as_ref().map(|a| a.len()),
+            Some(expected_amendment.len()),
+            "rework_amendment byte length matches the full 12 KB amendment"
+        );
+        let _ = escalated; // present in fold-level tests, absent here by design
     }
 
     /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused

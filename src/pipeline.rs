@@ -1128,7 +1128,11 @@ pub(crate) fn apply_and_finish_unit(
     let evaluator_verdict_denial = evaluator_verdict
         .as_ref()
         .filter(|v| !v.pass)
-        .map(|v| crate::domain::UnitDenial::new("evaluator_verdict", v.denial_reason()));
+        .map(|v| {
+            let mut d = crate::domain::UnitDenial::new("evaluator_verdict", v.denial_reason());
+            d.findings_trimmed = v.findings_trimmed;
+            d
+        });
     // The wire token (`gateEvaluated.evaluatorVerdict`): the decisive line's token for a unit the
     // layer read; `None` for every other unit AND for an Evaluator unit that wrote no verdict line
     // (that case denies with the contract text as its reason — the denial is the twin).
@@ -1185,6 +1189,7 @@ pub(crate) fn apply_and_finish_unit(
             rule_ids: e.policies.clone(),
             denied_tool: None,
             phase: None, // filled in by apply_unit with the unit-phase token
+            findings_trimmed: false,
         })
     });
 

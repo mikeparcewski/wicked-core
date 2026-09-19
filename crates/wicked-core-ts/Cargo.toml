@@ -10,6 +10,10 @@ publish = false
 # wicked-memory-ts pattern). It path-depends on wicked-core (../..), a standalone package that
 # now pulls wicked-estate from crates.io; keeping this crate out of any workspace preserves its
 # own [profile.release] + lockfile. Build from THIS directory: `cargo build -p wicked-core-ts`.
+# The empty [workspace] table below is required when building from a git worktree nested inside
+# the main repo directory (otherwise cargo discovers the parent workspace and fails because the
+# worktree path is not in the parent's `exclude` list). Has no effect in a normal checkout.
+[workspace]
 
 [lib]
 crate-type = ["cdylib"]

@@ -341,6 +341,12 @@ pub struct UnitDenial {
     /// The unit-phase token the deny targeted (e.g. `unit-2`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// (core#549) `true` when the evaluator's output exceeded [`EVALUATOR_FINDINGS_CAP`] chars and
+    /// was trimmed before being stored as the denial reason — the trimmed text rides `verdictSummary`
+    /// and `gateEscalated.verdictSummaryTrimmed` names it on the wire. Absent (false) for every
+    /// other denial source and when no trimming occurred.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub findings_trimmed: bool,
 }
 
 impl UnitDenial {
@@ -354,6 +360,7 @@ impl UnitDenial {
             rule_ids: Vec::new(),
             denied_tool: None,
             phase: None,
+            findings_trimmed: false,
         }
     }
 }
@@ -596,6 +603,11 @@ pub struct WorkUnit {
     /// dispatch. Cleared when the unit is approved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rework_of: Option<u32>,
+    /// (core#549) The full amendment text (evaluator's findings + operator's note) built by
+    /// `rewind_to_creator` and stored so `dispatch_unit` can inject it as prior context without
+    /// re-reading the evaluator transcript. Absent until the unit is rewound; cleared on approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_amendment: Option<String>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -765,6 +777,7 @@ impl WorkUnit {
             repo_checks: None,
             last_attempt: None,
             rework_of: None,
+            rework_amendment: None,
             status: UnitStatus::Pending,
         }
     }
