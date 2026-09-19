@@ -18,6 +18,76 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **Validator: skip agent judge when no identity-distinct seat is available; gate default-floor judge on pinned skip; per-seat eligibility reasons (#539).** Two callers — the pinned-validator inline path in `cli_runner` and `gate_phase` — unconditionally called `agent_validate`, which falls back to the single default runner (the deterministic validator's own seat) when no distinct seat exists. For a claude creator this is a self-grade: the same seat that wrote the work judges it as distinct. Both callers now pre-check `distinct_judge_available` (F-7R2-005) before calling the judge; when no distinct seat is found, the judge is skipped, `judge_skipped` is set with the eligibility reason, and the deterministic verdict carries the fold. The `GateEvaluated` wire shape gains `agentVerdict: "skipped"` (replacing `null`) and `judgeDistinct: false` when the judge was skipped, so consumers can distinguish "no judge wanted" from "judge wanted but skipped for eligibility". A fall-through bug is also fixed: when the pinned-validator path sets `judge_skipped` (no distinct seat), the `default_floor_applies` arm was not guarded on `judge_skipped.is_none()` — the default judge would still run on a seat that IS distinct for the looser default exclusion (`excluded=[creator]` only), producing `agentVerdict:pass` AND `judgeSkippedReason` on the wire simultaneously. The default-floor arm is now gated on `judge_skipped.is_none()`. The judge-skip reason now names each seat's per-seat eligibility outcome (`excluded (creator)`, `excluded (validator author)`, `excluded (creator = validator author)`, `unusable (empty invocation)`) instead of a flat "eligible roster" list — an unusable seat (empty `headless_invocation`) no longer appears as eligible. The bus path (evaluator daemon) is unaffected — it enforces evaluator≠creator independently.
 
+- **Gate hook: INDEPENDENT REVIEW defects fixed; command-string scanners retired (#542, #548).**
+  (1) **Windows path detection (CI red):** production path judgement is `path_policy.rs`
+  `Path::new(tok).is_absolute()` — covers Windows drive letters (`C:\…`), `\\?\` long paths,
+  and UNC forms on all platforms; `:` removed from the split delimiter so drive letters survive
+  tokenisation. `is_abs_path_token` is a `#[cfg(test)]` validator that exercises the same logic
+  in tests only.
+  (2) **Witness ignore rules:** `collect_dir_entries_for_witness` uses `git ls-files
+  --cached --others --exclude-standard` for git roots (excludes `target/`, `node_modules/`,
+  etc.); raw-walk fallback skips `.git/`. Build side-effects of allowed calls no longer appear
+  as escapes.
+  (3) **Code-string scan over-deny (FATAL):** (a) URL authority tokens (`//host`) are no longer
+  flagged after removing `:` from the split; (b) the raw token scan in the shell `Inline` arm
+  is removed — `unwrap_program` already rescans the inner command. **Former items 3c and 4
+  retired:** `code_string_has_write_shape`-gated interpreter-literal scanning and
+  `extract_heredoc_bodies` heredoc-body rescanning are removed — both caused false denials of
+  legitimate in-tree writes (README body with `> ` in plain text, Rust generics containing
+  `>>`, python heredocs referencing `/etc/hosts` in comments, etc.). A Creator-posture unit
+  writing outside its tree through a quoted interpreter string or heredoc body is neither blocked
+  pre-call nor detected by the post-hoc witness — the witness runs only for ReadOnly units and
+  fingerprints only the unit's own write roots; that gap is wicked-core#548 (OS-level read-only
+  mounts).
+  (4) **`sed -i` and `rm` modelled:** `collect_bash_write_targets` has `sed` (in-place only:
+  `-i`, `-i<suffix>`, `--in-place`) and `rm` (every non-flag, non-fd-dup arg) arms.
+  (5) **`git -c k=v` bypass closed:** all three parse sites skip the value of
+  `-c`/`--config`/`-C`/`--git-dir`/`--work-tree` so `git -c user.name=x commit -m y` is
+  denied under ReadOnly and `git -c user.name=x status` is admitted.
+
+- **Gate hook: witness collector kind recorded in sidecar; bare and pipe-fed interpreters denied
+  under ReadOnly (#541 revision).** `WitnessSnapshot` now records `CollectorKind` (`git_ls_files`
+  or `raw_walk`); when the collector changes between a stored snapshot and the current scan (e.g.
+  `.git` becomes unavailable), the gate re-snapshots and admits instead of diffing — no false deny
+  when no file changed. Bare interpreter invocations with no args (`bash`, `python3`) and pipe-fed
+  forms (`echo 'touch x' | bash`, `echo 'x' | python3`, `echo 'touch x' | sh`) are now denied by
+  `opaque_interpreter_denial` under ReadOnly — the vacuous-truth exemption (`[].all(_)`) that
+  would have admitted these is removed.
+
+- **Gate hook: ReadOnly write fence for `touch`, inline interpreters, and post-hoc witness
+  (#541 re-scoped, #548).** `touch` is modelled in `collect_bash_write_targets` (every non-flag
+  argument is a write target, matching the `mkdir` pattern). Fd-dup tokens (`2>&1`, `>&2`) in
+  `touch`/`mkdir` argument lists are no longer treated as write targets. Inline interpreter
+  programs (`python3 -c`, `node -e`, `perl -e`, `ruby -e`, heredoc stdin, etc.) and shells
+  (`sh`, `bash`, `zsh`, `dash`) invoked without `-c` are denied by `opaque_interpreter_denial`
+  **by program word** when the write posture is ReadOnly — no argument parsing or code-string
+  analysis; the pre-call fence is purely structural. Explicit write programs (`sed -i`, `rm`,
+  `truncate`, `patch`, `ln`, `git commit/apply/checkout/stash/reset`) are denied by program word
+  under ReadOnly. `bash_cd_escape_targets` fires when the command contains a write-capable program
+  even without a resolvable target. A Creator-posture unit writing outside its tree through a
+  quoted interpreter string or heredoc is neither blocked pre-call nor detected by the post-hoc
+  witness — the witness runs only for ReadOnly units and fingerprints only the unit's own write
+  roots; that gap is wicked-core#548 (OS-level read-only mounts). The post-hoc witness stores a
+  `WitnessSnapshot` (write roots minus notes root, plus full entry list) so mismatch reports name
+  the changed paths; runs on both carriers; a unit-end catch in `fold_input_denial` detects
+  last-call writes; typed `witness-deny:` claim prefix. A changed fingerprint fails the unit with
+  a typed event.
+
+- **Gate hook: close worktree boundary misses for `git -C <other-path>` and `cd <other-path> &&
+  <write>` (#540).** `collect_bash_write_targets` now has a `git` arm: for write subcommands (any
+  verb absent from the `GIT_READ_VERBS` allowlist), the path arguments of every `-C` flag are
+  extracted and checked against the unit's write roots. `--git-dir=`/`--work-tree=` flags are now
+  also extracted as write roots for non-read git verbs. `branch`, `tag`, `notes`, and `hash-object`
+  are removed from `GIT_READ_VERBS` (they can write). A new `ln` arm treats the last non-flag
+  argument as a write target. `bash_cd_escape_targets` extracts `cd` destinations from commands
+  that contain resolvable write operations and checks them against `AllowedRoots.write`; it also
+  fires when the command contains a write-capable program even without a resolvable target; bare
+  `cd` commands with no following write are left to the install fence. A Creator-posture unit
+  writing outside its tree through a `cd` combined with a quoted interpreter string (no
+  statically resolvable target) is neither blocked pre-call nor detected by the post-hoc witness
+  — the witness runs only for ReadOnly units and fingerprints only the unit's own write roots;
+  that gap is wicked-core#548 (OS-level read-only mounts).
+
 - **Build fix: collapse the duplicate `"tool_call"` arm in the ACP `sessionUpdate` handler (#524 × #525 unreachable-pattern collision; main red at `-D warnings`).** #525 (L5) added `"tool_call" => { *answer_from = … }` and #524 (L4) added `"tool_call" | "tool_call_update" => { … }`; composed on main the first shadows the second, so `-D unreachable-patterns` failed the lib compile on all three OS legs. The two arms are merged into one — `*answer_from` still advances on `tool_call` only (never on an update frame, exactly as #525 shipped) and #524's failed-tool-call recording and update-frame `locations` collection run unchanged. No behaviour change.
 
 - **Chat seats are handed the skills a unit gets; the turn budget is named; `chatReply.usage`; the
