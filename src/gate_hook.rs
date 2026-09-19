@@ -473,7 +473,7 @@ pub(crate) fn fingerprint_write_roots(roots: &[std::path::PathBuf]) -> u64 {
     const FNV_PRIME: u64 = 1099511628211;
     let mut entries: Vec<(String, u64, u64)> = Vec::new();
     for root in roots {
-        collect_dir_entries_for_witness(root, &mut entries);
+        let _ = collect_dir_entries_for_witness(root, &mut entries);
     }
     entries.sort_unstable();
     let mut hash = FNV_OFFSET;
@@ -490,7 +490,10 @@ pub(crate) fn fingerprint_write_roots(roots: &[std::path::PathBuf]) -> u64 {
     hash
 }
 
-fn collect_dir_entries_for_witness(dir: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
+fn collect_dir_entries_for_witness(
+    dir: &std::path::Path,
+    out: &mut Vec<(String, u64, u64)>,
+) -> CollectorKind {
     // For git-managed roots (directories that ARE a git worktree root, identified by the
     // presence of a `.git` entry), use `git ls-files` so .gitignore is respected — target/,
     // .git/, node_modules/, dist/ never appear and an allowed call's own build side-effects
@@ -529,13 +532,14 @@ fn collect_dir_entries_for_witness(dir: &std::path::Path, out: &mut Vec<(String,
                         out.push((abs.to_string_lossy().into_owned(), meta.len(), mtime));
                     }
                 }
-                return;
+                return CollectorKind::GitLsFiles;
             }
         }
     }
     // Fallback for non-git roots (or when git ls-files fails): raw recursive walk
     // skipping .git directories.
     collect_dir_entries_raw(dir, out);
+    CollectorKind::RawWalk
 }
 
 fn collect_dir_entries_raw(dir: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
@@ -563,12 +567,30 @@ fn collect_dir_entries_raw(dir: &std::path::Path, out: &mut Vec<(String, u64, u6
     }
 }
 
+/// Which filesystem enumeration strategy produced a `WitnessSnapshot`.
+///
+/// Stored in the sidecar so that a snapshot taken with `git ls-files` and re-checked when `.git`
+/// is unavailable (forcing a raw walk) can be detected as a collector mismatch and re-snapshotted
+/// rather than diffed — the two strategies enumerate different file sets, so a diff would produce
+/// false positives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectorKind {
+    /// `git ls-files` succeeded for every root.
+    GitLsFiles,
+    /// Raw recursive directory walk (`.git` not found or `git ls-files` failed for any root).
+    RawWalk,
+}
+
 /// Sidecar payload for the post-hoc write-root witness (issue #541, items 1-3 of the review):
-/// the watched write roots (write set minus notes root) and the sorted entry list at snapshot time,
-/// so a mismatch can name the changed paths rather than only reporting a hash difference.
+/// the watched write roots (write set minus notes root), the collector kind, and the sorted entry
+/// list at snapshot time, so a mismatch can name the changed paths rather than only reporting a
+/// hash difference.
 #[derive(Debug, Clone)]
 pub(crate) struct WitnessSnapshot {
     pub roots: Vec<std::path::PathBuf>,
+    /// Which strategy enumerated the entries. When the current collector differs from the stored
+    /// one, re-snapshot instead of diffing to avoid false positives.
+    pub collector: CollectorKind,
     pub entries: Vec<(String, u64, u64)>, // (path, size_bytes, mtime_secs)
 }
 
@@ -582,6 +604,12 @@ fn read_write_root_witness(path: &std::path::Path) -> Option<WitnessSnapshot> {
         .iter()
         .filter_map(|r| r.as_str().map(std::path::PathBuf::from))
         .collect();
+    // Missing "collector" key in old sidecars → RawWalk (conservative: forces re-snapshot,
+    // never a false deny).
+    let collector = match v.get("collector").and_then(|c| c.as_str()) {
+        Some("git_ls_files") => CollectorKind::GitLsFiles,
+        _ => CollectorKind::RawWalk,
+    };
     let entries = v
         .get("entries")?
         .as_array()?
@@ -594,7 +622,11 @@ fn read_write_root_witness(path: &std::path::Path) -> Option<WitnessSnapshot> {
             Some((path, size, mtime))
         })
         .collect();
-    Some(WitnessSnapshot { roots, entries })
+    Some(WitnessSnapshot {
+        roots,
+        collector,
+        entries,
+    })
 }
 
 /// Persist the write-root witness snapshot for the next gate-hook invocation to compare against.
@@ -609,7 +641,15 @@ fn write_write_root_witness(path: &std::path::Path, snapshot: &WitnessSnapshot) 
         .iter()
         .map(|(p, s, m)| serde_json::json!([p, s, m]))
         .collect();
-    let payload = serde_json::json!({ "roots": roots_json, "entries": entries_json });
+    let collector_str = match snapshot.collector {
+        CollectorKind::GitLsFiles => "git_ls_files",
+        CollectorKind::RawWalk => "raw_walk",
+    };
+    let payload = serde_json::json!({
+        "roots": roots_json,
+        "collector": collector_str,
+        "entries": entries_json,
+    });
     let _ = std::fs::write(path, payload.to_string());
 }
 
@@ -1530,7 +1570,9 @@ fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
 ///
 /// `--version`, `-V`, `--help`, `-h`, and `-?` (read-only info flags) are the only allowed args
 /// that suppress the denial — if the invocation consists ONLY of those flags, it is harmless.
-/// A bare interpreter name with no args is also allowed.
+/// A bare interpreter name with no args is denied: `echo 'touch x' | bash` tokenises to a
+/// segment with an empty arg list, and the vacuous-truth of `[].all(_)` would otherwise admit
+/// pipe-fed code execution.
 fn opaque_interpreter_denial(command: &str) -> Option<String> {
     opaque_interpreter_denial_inner(command, true)
 }
@@ -1571,13 +1613,13 @@ fn opaque_interpreter_denial_inner(command: &str, unwrap_inline: bool) -> Option
                     continue;
                 }
                 let args = &words[idx + 1..];
-                if args.is_empty() {
-                    continue; // bare interpreter with no args — harmless
-                }
-                // Allow invocations whose ONLY args are read-only info flags.
-                let only_info = args
-                    .iter()
-                    .all(|a| matches!(*a, "--version" | "-V" | "--help" | "-h" | "-?"));
+                // Allow invocations whose ONLY args are read-only info flags. Requires non-empty
+                // args: a bare interpreter (`bash` alone, `echo x | python3`) has an empty arg
+                // list; `[].all(_)` is vacuously true and would admit pipe-fed code execution.
+                let only_info = !args.is_empty()
+                    && args
+                        .iter()
+                        .all(|a| matches!(*a, "--version" | "-V" | "--help" | "-h" | "-?"));
                 if only_info {
                     continue;
                 }
@@ -2530,20 +2572,36 @@ pub(crate) fn evaluate_tool_call(
     if write_posture == crate::write_posture::WritePosture::ReadOnly && !witness_roots.is_empty() {
         if let Some(stored) = read_write_root_witness(&witness_path_buf) {
             let mut current_entries = Vec::new();
+            let mut current_collector = CollectorKind::GitLsFiles;
             for root in &witness_roots {
-                collect_dir_entries_for_witness(root, &mut current_entries);
+                let kind = collect_dir_entries_for_witness(root, &mut current_entries);
+                if kind == CollectorKind::RawWalk {
+                    current_collector = CollectorKind::RawWalk;
+                }
             }
             current_entries.sort_unstable();
-            let changed = diff_witness_entries(&stored.entries, &current_entries);
-            if !changed.is_empty() {
-                let reason = format!(
-                    "write-root-mutated: the admitted write roots changed since the last \
-                     allowed Bash call — changed paths: {} (issue #541)",
-                    changed.join(", ")
-                );
-                append_witness_deny(decisions_path, scope, phase, &changed);
-                eprintln!("wicked-governance: DENY ({reason})");
-                return 2;
+            // If the collector changed (e.g. .git became unavailable since the snapshot was
+            // taken), the two entry sets are not comparable — re-snapshot and admit rather than
+            // producing a false deny.
+            if stored.collector != current_collector {
+                let new_snapshot = WitnessSnapshot {
+                    roots: witness_roots.clone(),
+                    collector: current_collector,
+                    entries: current_entries,
+                };
+                write_write_root_witness(&witness_path_buf, &new_snapshot);
+            } else {
+                let changed = diff_witness_entries(&stored.entries, &current_entries);
+                if !changed.is_empty() {
+                    let reason = format!(
+                        "write-root-mutated: the admitted write roots changed since the last \
+                         allowed Bash call — changed paths: {} (issue #541)",
+                        changed.join(", ")
+                    );
+                    append_witness_deny(decisions_path, scope, phase, &changed);
+                    eprintln!("wicked-governance: DENY ({reason})");
+                    return 2;
+                }
             }
         }
     }
@@ -2675,12 +2733,17 @@ pub(crate) fn evaluate_tool_call(
                     && !witness_roots.is_empty()
                 {
                     let mut entries = Vec::new();
+                    let mut collector = CollectorKind::GitLsFiles;
                     for root in &witness_roots {
-                        collect_dir_entries_for_witness(root, &mut entries);
+                        let kind = collect_dir_entries_for_witness(root, &mut entries);
+                        if kind == CollectorKind::RawWalk {
+                            collector = CollectorKind::RawWalk;
+                        }
                     }
                     entries.sort_unstable();
                     let snapshot = WitnessSnapshot {
                         roots: witness_roots.clone(),
+                        collector,
                         entries,
                     };
                     write_write_root_witness(&witness_path_buf, &snapshot);
@@ -3659,17 +3722,32 @@ pub fn fold_input_denial(
         let witness_path = write_root_witness_path(&path.to_string_lossy(), phase);
         if let Some(stored) = read_write_root_witness(&witness_path) {
             let mut current_entries = Vec::new();
+            let mut current_collector = CollectorKind::GitLsFiles;
             for root in &stored.roots {
-                collect_dir_entries_for_witness(root, &mut current_entries);
+                let kind = collect_dir_entries_for_witness(root, &mut current_entries);
+                if kind == CollectorKind::RawWalk {
+                    current_collector = CollectorKind::RawWalk;
+                }
             }
             current_entries.sort_unstable();
-            let changed = diff_witness_entries(&stored.entries, &current_entries);
-            if !changed.is_empty() {
-                denial = Some(fail_closed(format!(
-                    "input governance denied {phase}: write-root mutated after the last \
-                     allowed Bash call — changed paths: {} (issue #541 unit-end catch)",
-                    changed.join(", ")
-                )));
+            // Collector mismatch: re-snapshot and do not deny — the entry sets are not
+            // comparable across collector strategies.
+            if stored.collector != current_collector {
+                let new_snapshot = WitnessSnapshot {
+                    roots: stored.roots.clone(),
+                    collector: current_collector,
+                    entries: current_entries,
+                };
+                write_write_root_witness(&witness_path, &new_snapshot);
+            } else {
+                let changed = diff_witness_entries(&stored.entries, &current_entries);
+                if !changed.is_empty() {
+                    denial = Some(fail_closed(format!(
+                        "input governance denied {phase}: write-root mutated after the last \
+                         allowed Bash call — changed paths: {} (issue #541 unit-end catch)",
+                        changed.join(", ")
+                    )));
+                }
             }
         }
     }
@@ -4456,9 +4534,10 @@ mod tests {
         assert!(read_write_root_witness(&sidecar).is_none());
         let snap = WitnessSnapshot {
             roots: roots.clone(),
+            collector: CollectorKind::RawWalk,
             entries: {
                 let mut e = Vec::new();
-                collect_dir_entries_for_witness(&root, &mut e);
+                let _ = collect_dir_entries_for_witness(&root, &mut e);
                 e.sort_unstable();
                 e
             },
@@ -4667,11 +4746,30 @@ mod tests {
         let d = deny("dash -x run.sh").expect("dash -x run.sh must be denied");
         assert!(d.contains("interpreter") || d.contains("opaque"), "{d}");
 
-        // bash alone (no args) — harmless: admitted.
-        assert_eq!(
-            deny("bash"),
-            None,
-            "bare bash with no args must be admitted"
+        // bash alone (no args) — denied: empty arg list is no longer exempt because
+        // `echo 'touch x' | bash` tokenises to a segment with empty args, and the
+        // vacuous-truth of `[].all(_)` would otherwise admit pipe-fed code execution.
+        assert!(
+            deny("bash").is_some(),
+            "bare bash with no args must be denied under ReadOnly"
+        );
+
+        // Pipe-fed interpreter invocations: the right-hand segment has no args (empty arg list),
+        // which must be denied — not vacuously admitted as "only info flags".
+        let d = deny("echo 'x' | python3").expect("echo 'x' | python3 must be denied");
+        assert!(
+            d.contains("interpreter") || d.contains("opaque"),
+            "echo 'x' | python3 denial must name the interpreter: {d}"
+        );
+        let d = deny("echo 'touch x' | bash").expect("echo 'touch x' | bash must be denied");
+        assert!(
+            d.contains("interpreter") || d.contains("opaque"),
+            "echo 'touch x' | bash denial must name the interpreter: {d}"
+        );
+        let d = deny("echo 'touch x' | sh").expect("echo 'touch x' | sh must be denied");
+        assert!(
+            d.contains("interpreter") || d.contains("opaque"),
+            "echo 'touch x' | sh denial must name the interpreter: {d}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -4756,8 +4854,8 @@ mod tests {
 
     /// Regression: 11 realistic own-tree Creator writes are ADMITTED pre-call; the same inputs
     /// are denied for ReadOnly by the program-word rule. Former heredoc-body and interpreter-literal
-    /// scanners caused false denials of these; the post-hoc witness now catches out-of-tree effects
-    /// (wicked-core#548).
+    /// scanners caused false denials of these; the post-hoc witness catches out-of-tree effects
+    /// for ReadOnly units only (wicked-core#548).
     #[test]
     fn own_tree_creator_writes_admitted_readonly_denied_by_program_word() {
         use crate::path_policy::AllowedRoots;
@@ -5049,10 +5147,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Collector mismatch: a snapshot taken with `git ls-files` then re-checked when `.git` is
+    /// unavailable (forcing `RawWalk`) must re-snapshot and admit — no false denial even when no
+    /// file changed.
+    #[test]
+    fn ls_files_snapshot_then_git_unavailable_no_change_does_not_fail() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-coll-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if git(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
+            std::fs::write(base.join("tracked.rs"), "fn main() {}").unwrap();
+            let _ = git(&["add", "."]);
+            let _ = git(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ]);
+
+            // Take a GitLsFiles snapshot.
+            let mut entries = Vec::new();
+            let kind = collect_dir_entries_for_witness(&base, &mut entries);
+            assert_eq!(
+                kind,
+                CollectorKind::GitLsFiles,
+                "first snapshot uses git ls-files"
+            );
+            entries.sort_unstable();
+            let sidecar = base.join("witness-sidecar");
+            let snap = WitnessSnapshot {
+                roots: vec![base.clone()],
+                collector: CollectorKind::GitLsFiles,
+                entries: entries.clone(),
+            };
+            write_write_root_witness(&sidecar, &snap);
+
+            // Rename .git so git ls-files fails → RawWalk.
+            let git_dir = base.join(".git");
+            let git_bak = base.join(".git-bak");
+            std::fs::rename(&git_dir, &git_bak).unwrap();
+
+            // Re-check: collector now RawWalk, no files changed.
+            let stored = read_write_root_witness(&sidecar).expect("sidecar present");
+            let mut current_entries = Vec::new();
+            let mut current_collector = CollectorKind::GitLsFiles;
+            for root in &stored.roots {
+                let k = collect_dir_entries_for_witness(root, &mut current_entries);
+                if k == CollectorKind::RawWalk {
+                    current_collector = CollectorKind::RawWalk;
+                }
+            }
+            current_entries.sort_unstable();
+
+            // Collector mismatch → must re-snapshot, NOT deny.
+            assert_ne!(
+                stored.collector, current_collector,
+                "collector changed: git→raw"
+            );
+            // The re-snapshot path (not a diff) means no denial is produced.
+            if stored.collector != current_collector {
+                let new_snap = WitnessSnapshot {
+                    roots: stored.roots.clone(),
+                    collector: current_collector,
+                    entries: current_entries.clone(),
+                };
+                write_write_root_witness(&sidecar, &new_snap);
+                // Verify the updated sidecar records RawWalk.
+                let reloaded = read_write_root_witness(&sidecar).expect("re-snapshotted sidecar");
+                assert_eq!(
+                    reloaded.collector,
+                    CollectorKind::RawWalk,
+                    "sidecar updated to RawWalk"
+                );
+            } else {
+                panic!("expected collector mismatch but got none — test setup wrong");
+            }
+
+            // Restore .git for cleanup.
+            let _ = std::fs::rename(&git_bak, &git_dir);
+        } else {
+            eprintln!("skipping collector-mismatch test: git init failed");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// item 4 — `bash_cd_escape_targets` fires when the command contains a write-CAPABLE
     /// program even if `bash_write_targets` finds no resolvable target. Interpreter-literal
-    /// code-string scanning is retired; out-of-tree paths inside quoted interpreter args are
-    /// caught by the post-hoc witness instead (#548).
+    /// code-string scanning is retired; a Creator-posture unit writing outside its tree through
+    /// a quoted interpreter string is neither blocked pre-call nor detected by the post-hoc
+    /// witness (which runs only for ReadOnly units) — wicked-core#548.
     #[test]
     fn cd_escape_with_write_capable_program_and_abs_path_in_code_item4() {
         use crate::path_policy::AllowedRoots;
@@ -5089,11 +5282,12 @@ mod tests {
         );
 
         // python3 -c with absolute sibling path only in the code string (no cd, no redirect):
-        // admitted pre-call — the interpreter-literal scanner is retired. The post-hoc witness
-        // catches any actual out-of-tree writes (#548).
+        // admitted pre-call — the interpreter-literal scanner is retired. This is a Creator
+        // boundary (Full posture); the post-hoc witness runs only for ReadOnly units, so neither
+        // pre-call nor post-hoc detection applies here — wicked-core#548.
         assert!(
             check(&format!("python3 -c \"open('{}/x','w')\"", w(&sibling))).is_none(),
-            "python3 -c with sibling path in code string is admitted pre-call (witness catches post-call)"
+            "python3 -c with sibling path in code string is admitted pre-call (Creator posture; witness does not run)"
         );
 
         // In-worktree cd: admitted.
@@ -5144,6 +5338,7 @@ mod tests {
         // Snapshot an empty wt.
         let snap1 = WitnessSnapshot {
             roots: vec![wt.clone()],
+            collector: CollectorKind::RawWalk,
             entries: vec![],
         };
         write_write_root_witness(&sidecar, &snap1);
@@ -5154,7 +5349,7 @@ mod tests {
         let stored = read_write_root_witness(&sidecar).expect("sidecar present");
         let mut current = Vec::new();
         for root in &stored.roots {
-            collect_dir_entries_for_witness(root, &mut current);
+            let _ = collect_dir_entries_for_witness(root, &mut current);
         }
         current.sort_unstable();
         let changed = diff_witness_entries(&stored.entries, &current);
@@ -5180,6 +5375,7 @@ mod tests {
         // Snapshot current state (wt has leaked.rs).
         let snap_current = WitnessSnapshot {
             roots: vec![wt.clone()],
+            collector: CollectorKind::RawWalk,
             entries: current.clone(),
         };
         write_write_root_witness(&witness_path, &snap_current);
