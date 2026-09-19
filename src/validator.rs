@@ -2654,7 +2654,10 @@ mod tests {
         assert_eq!(v.findings.chars().count(), EVALUATOR_FINDINGS_CAP + 1);
         assert!(v.findings_trimmed, "long output sets findings_trimmed");
         let short = parse_evaluator_verdict("short\nVERDICT: FAIL");
-        assert!(!short.findings_trimmed, "short output does not set findings_trimmed");
+        assert!(
+            !short.findings_trimmed,
+            "short output does not set findings_trimmed"
+        );
         let fail = parse_evaluator_verdict("the fix breaks X\nVERDICT: FAIL");
         assert_eq!(
             fail.denial_reason(),

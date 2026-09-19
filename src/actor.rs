@@ -9741,8 +9741,9 @@ mod substance_gate_tests {
         // The verdict summary carries the trimmed text (starts with '…').
         assert!(
             evs.iter().any(|ev| match ev {
-                CoreEvent::GateEscalated { verdict_summary, .. } =>
-                    verdict_summary.contains('…'),
+                CoreEvent::GateEscalated {
+                    verdict_summary, ..
+                } => verdict_summary.contains('…'),
                 _ => false,
             }),
             "trimmed verdict summary contains the '…' elision marker"
@@ -10118,6 +10119,69 @@ mod request_changes_tests {
         }
     }
 
+    /// Seeds a 5-phase run (triage / reproduce / fix / verify / deliver) with the session cursor
+    /// parked at the deliver unit (unit_ix = 4, all earlier units Done, no denial anywhere).
+    /// Used by the acceptance-1 test for core#549: a `request_changes` at the deliver gate must
+    /// inject the operator note even though the deliver unit carries no evaluator denial.
+    fn seed_bug_with_deliver(store: &mut dyn GraphStore, run_id: &str) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "fix the bug".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 4,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(store, session.to_node()).unwrap();
+        let phases = [
+            ("triage", PhaseRole::Neutral),
+            ("reproduce", PhaseRole::Neutral),
+            ("fix", PhaseRole::Creator),
+            ("verify", PhaseRole::Evaluator),
+        ];
+        for (ix, (phase, role)) in phases.iter().enumerate() {
+            let mut u = WorkUnit::pending(
+                format!("{run_id}:{phase}"),
+                run_id,
+                ix as u32 + 1,
+                format!("{phase} the bug"),
+            );
+            u.role = *role;
+            u.assigned_cli = Some("claude".into());
+            u.last_attempt = Some(0);
+            u.status = UnitStatus::Done;
+            put_node(store, u.to_node()).unwrap();
+        }
+        // The deliver tool phase — a tool executor, no evaluator denial anywhere.
+        let mut deliver = WorkUnit::pending(
+            format!("{run_id}:deliver"),
+            run_id,
+            5,
+            "deliver the fix".to_string(),
+        );
+        deliver.tool_cmd = Some(vec!["deliver-script".to_string()]);
+        deliver.status = UnitStatus::Pending;
+        put_node(store, deliver.to_node()).unwrap();
+    }
+
     fn gate(
         store: &mut dyn GraphStore,
         subs: &mut crate::event_log::EventSink,
@@ -10243,15 +10307,25 @@ mod request_changes_tests {
         );
     }
 
-    /// (core#549, acceptance 1) A 2,400-char operator note sent at a deliver gate produces a
-    /// `unitContextInjected` item whose `outputBytes` equals the full amendment length
-    /// byte-for-byte — neither the note nor the findings are capped before injection.
+    /// (core#549, acceptance 1) `request_changes` at a **deliver** gate injects the operator note
+    /// as a `[review — unit N — requested changes]` context item. The cursor is the deliver unit
+    /// (no evaluator denial — `findings` is empty); the amendment is `"\n" + note`. Both the
+    /// event's `amendment` field and the persisted `rework_amendment` equal the full text
+    /// byte-for-byte.
+    ///
+    /// Mutation this test catches: dropping the `rework_amendment` store in `rewind_to_creator`
+    /// (`src/actor.rs`) — the fallback transcript path yields empty output for a deliver unit
+    /// (it runs no evaluator and produces no evaluator transcript), so `output.is_empty()` is
+    /// true and the context item would not be injected at all — the primary defect of core#549.
+    /// Note: the re-applying-`tail_chars(a, 4096)` cap mutation is NOT caught by this test
+    /// (2,400-char amendment < 4096, truncates unchanged); it is caught by the sibling
+    /// `request_changes_12kb_note_arrives_whole…` test (12 KB > 4096).
     #[test]
-    fn request_changes_injected_context_bytes_equal_full_amendment_length() {
+    fn request_changes_at_deliver_gate_injects_full_note_as_context_item() {
         let note: String = "n".repeat(2400);
-        let run_id = format!("rc-bytes-{}", std::process::id());
+        let run_id = format!("rc-deliver-{}", std::process::id());
         let mut store = open_store(Some(":memory:")).unwrap();
-        seed_bug(&mut store, &run_id, true);
+        seed_bug_with_deliver(&mut store, &run_id);
         let mut subs = crate::event_log::EventSink::default();
         let (esub, erx) = channel();
         subs.push(esub);
@@ -10266,24 +10340,26 @@ mod request_changes_tests {
         )
         .unwrap();
 
-        let expected_amendment = format!("{FINDINGS}\n{note}");
+        // findings = "" (deliver unit has no denial_reason) → amendment = "\n" + note.
+        let expected_amendment = format!("\n{note}");
         let evs = drain(&erx);
 
-        // unitReworkAmended carries the full amendment text.
+        // unitReworkAmended carries the full amendment content byte-for-byte.
         let amended = evs
             .iter()
             .find_map(|e| match e {
-                CoreEvent::UnitReworkAmended { amendment, scope, .. }
-                    if scope == "request_changes" =>
-                {
-                    Some(amendment.clone())
-                }
+                CoreEvent::UnitReworkAmended {
+                    amendment, scope, ..
+                } if scope == "request_changes" => Some(amendment.clone()),
                 _ => None,
             })
             .expect("unitReworkAmended{request_changes}");
-        assert_eq!(amended, expected_amendment, "amendment must be findings + note in full");
+        assert_eq!(
+            amended, expected_amendment,
+            "amendment must be exactly '\\n' + note (findings empty at deliver gate)"
+        );
 
-        // unitContextInjected carries output_bytes matching the full amendment length.
+        // The context item exists and its output_bytes matches the amendment length.
         let context_bytes = evs
             .iter()
             .find_map(|e| match e {
@@ -10293,14 +10369,17 @@ mod request_changes_tests {
                     .map(|u| u.output_bytes),
                 _ => None,
             })
-            .expect("unitContextInjected with a requested-changes item");
+            .expect(
+                "unitContextInjected must contain a requested-changes item \
+                 (primary defect: no item at deliver gate)",
+            );
         assert_eq!(
             context_bytes,
             expected_amendment.len(),
-            "injected output_bytes must match the full amendment byte length (no cap)"
+            "output_bytes must match full amendment byte length"
         );
 
-        // The unit also persists rework_amendment so re-dispatch can retrieve it.
+        // rework_amendment on the fix unit holds the full text byte-for-byte.
         let units = crate::domain::session_units(&store, &run_id).unwrap();
         let fix = &units[2];
         assert_eq!(
