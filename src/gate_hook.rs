@@ -1000,8 +1000,7 @@ pub(crate) fn bash_write_phase_scope(
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
     // Full posture without pre-build scope: the phase is a code-executing creator — no fence of
-    // any kind applies. Return early so that interpreter write targets extracted for the boundary
-    // check (item 4) don't accidentally fire the PRE-BUILD fallthrough in the match below.
+    // any kind applies. Return early before the PRE-BUILD fallthrough in the match below.
     if matches!(posture, WritePosture::Full) && !pre_build_scope {
         return None;
     }
@@ -1132,125 +1131,10 @@ fn shell_tokens(command: &str) -> Vec<String> {
 /// Covers Unix (`/`-rooted), Windows (`C:\`, `\\?\`, UNC `\\server\share\`) via
 /// `Path::is_absolute()`, and explicitly excludes `//`-prefixed tokens (URL authority
 /// components left after splitting on `:`, e.g. `//127.0.0.1` from `http://127.0.0.1`).
-/// INDEPENDENT REVIEW items 1 and 3a.
+/// INDEPENDENT REVIEW items 1 and 3a. Used only in tests (validates the rule holds).
+#[cfg(test)]
 fn is_abs_path_token(tok: &str) -> bool {
     !tok.starts_with("//") && std::path::Path::new(tok).is_absolute()
-}
-
-/// Returns `true` when a code string contains at least one write-shaped call, used to
-/// gate whether absolute path literals are treated as write targets at the Creator
-/// boundary. Conservative heuristic: the interpreter fence remains the primary ReadOnly
-/// control; gaps here only under-deny at Creator, never open a ReadOnly hole.
-/// INDEPENDENT REVIEW item 3c.
-fn code_string_has_write_shape(code: &str) -> bool {
-    const WRITE_SHAPES: &[&str] = &[
-        ",'w'",
-        ", 'w'",
-        ",\"w\"",
-        ", \"w\"",
-        ",'a'",
-        ", 'a'",
-        ",\"a\"",
-        ", \"a\"",
-        ",'x'",
-        ", 'x'",
-        ",\"x\"",
-        ", \"x\"",
-        ",'r+'",
-        ", 'r+'",
-        ",\"r+\"",
-        ", \"r+\"",
-        ",'w+'",
-        ", 'w+'",
-        ",\"w+\"",
-        ", \"w+\"",
-        ".write(",
-        ".write_text(",
-        ".write_bytes(",
-        "write_text(",
-        "write_bytes(",
-        "writeFileSync(",
-        "writeFile(",
-        "appendFileSync(",
-        "appendFile(",
-        "IO.write(",
-        "File.write(",
-        "File.open(",
-        "mkdir(",
-        " > ",
-        ">>",
-    ];
-    WRITE_SHAPES.iter().any(|p| code.contains(p))
-}
-
-/// Extracts heredoc body strings from a raw shell command string. Handles `<<MARKER`,
-/// `<<-MARKER` (strip leading tabs), and quoted markers (`<<'MARKER'`, `<<"MARKER"`).
-/// Skips here-strings (`<<<`). Returns each body as a String.
-/// INDEPENDENT REVIEW item 4.
-fn extract_heredoc_bodies(command: &str) -> Vec<String> {
-    let mut bodies = Vec::new();
-    let mut search_from = 0;
-    while let Some(rel) = command[search_from..].find("<<") {
-        let idx = search_from + rel;
-        let after = &command[idx + 2..];
-        // Skip here-strings (<<<).
-        if after.starts_with('<') {
-            search_from = idx + 3;
-            continue;
-        }
-        let strip_tabs = after.starts_with('-');
-        let marker_start = if strip_tabs { &after[1..] } else { after };
-        let marker_start = marker_start.trim_start_matches([' ', '\t']);
-        // Extract the marker, possibly quoted.
-        let (marker, rest_after_marker) = if let Some(rest) = marker_start.strip_prefix('\'') {
-            let end = rest.find('\'').unwrap_or(rest.len());
-            (&rest[..end], &rest[end..])
-        } else if let Some(rest) = marker_start.strip_prefix('"') {
-            let end = rest.find('"').unwrap_or(rest.len());
-            (&rest[..end], &rest[end..])
-        } else {
-            let end = marker_start
-                .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|'))
-                .unwrap_or(marker_start.len());
-            (&marker_start[..end], &marker_start[end..])
-        };
-        let _ = rest_after_marker;
-        if marker.is_empty() {
-            search_from = idx + 2;
-            continue;
-        }
-        // Body starts on the line after the `<<MARKER` declaration.
-        let after_nl = match command[idx..].find('\n') {
-            Some(nl) => idx + nl + 1,
-            None => {
-                search_from = idx + 2;
-                continue;
-            }
-        };
-        // Terminator is the marker alone on a line.
-        let end_pat = format!("\n{marker}");
-        let body_slice = &command[after_nl..];
-        let body = if let Some(body_end) = body_slice.find(&end_pat as &str) {
-            &body_slice[..body_end]
-        } else if body_slice.starts_with(marker) {
-            // Marker is the very first line of the remainder (degenerate empty heredoc).
-            ""
-        } else {
-            search_from = idx + 2;
-            continue;
-        };
-        let collected = if strip_tabs {
-            body.lines()
-                .map(|l| l.trim_start_matches('\t'))
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            body.to_string()
-        };
-        bodies.push(collected);
-        search_from = idx + 2;
-    }
-    bodies
 }
 
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
@@ -1277,23 +1161,6 @@ pub(crate) fn bash_write_targets(command: &str) -> Vec<String> {
 /// issued and false for the ONE inner rescan of a shell `-c` string — a `-c` wrapper found INSIDE
 /// that string is the documented two-level pass, not unwrapped again.
 fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut Vec<String>) {
-    // INDEPENDENT REVIEW item 4: scan heredoc bodies before shell_tokens, which treats
-    // newlines as whitespace and loses heredoc structure. Each body is rescanned as its own
-    // command string and, when write-shaped, its absolute path literals are extracted.
-    if unwrap_inline {
-        for body in extract_heredoc_bodies(command) {
-            collect_bash_write_targets(&body, false, targets);
-            if code_string_has_write_shape(&body) {
-                for tok in body.split(|c: char| {
-                    c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';')
-                }) {
-                    if is_abs_path_token(tok) {
-                        targets.push(tok.to_string());
-                    }
-                }
-            }
-        }
-    }
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -1480,37 +1347,6 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                     if !w.starts_with('-') && !is_fd_dup_operator(w) {
                         targets.push((*w).to_string());
                     }
-                }
-            }
-            // Interpreter programs (`python3 -c`, `node -e`, etc.) are not unwrapped by
-            // `unwrap_program` (only shells are). Scan the code argument for absolute path
-            // literals ONLY when the code string contains a write-shaped call
-            // (INDEPENDENT REVIEW items 1, 3a, 3c).
-            basename if OPAQUE_WRITER_PROGRAMS.contains(&basename) => {
-                let args = &words[idx + 1..];
-                let mut j = 0;
-                while j < args.len() {
-                    // Look for code-introducing flags (-c, -e, -r, --).
-                    if matches!(args[j], "-c" | "-e" | "-r" | "--") {
-                        if let Some(code) = args.get(j + 1) {
-                            let code = strip_one_quote_layer(code);
-                            // Gate: only extract paths when the code is write-shaped (item 3c).
-                            // Splitting on `:` shears drive letters and URL authority, producing
-                            // false tokens — omit `:` from the split (items 1, 3a).
-                            if code_string_has_write_shape(code) {
-                                for tok in code.split(|c: char| {
-                                    c.is_whitespace()
-                                        || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';')
-                                }) {
-                                    if is_abs_path_token(tok) {
-                                        targets.push(tok.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    j += 1;
                 }
             }
             _ => {}
@@ -4412,10 +4248,8 @@ mod tests {
             "{d}"
         );
 
-        // python3 -c: denied — either by extracted write target (when the path is absolute and
-        // extractable) or by opaque-interpreter word (item 4 now extracts absolute paths, so
-        // "would write" fires first; the "interpreter" path is the fallback for non-absolute or
-        // non-extractable targets). Both messages carry PHASE_SCOPE_BASH_REMEDY.
+        // python3 -c: denied by opaque-interpreter word (ReadOnly posture; program-word rule).
+        // Both assertion branches ("would write", "interpreter") carry PHASE_SCOPE_BASH_REMEDY.
         let d = deny_ro(format!(
             "python3 -c 'open(\"{}\",\"w\")'",
             w(&wt.join("pwned"))
@@ -4427,9 +4261,9 @@ mod tests {
             "{d}"
         );
 
-        // python3 - <<EOF (stdin heredoc shape): denied — either by extracted write target
-        // (heredoc scanning now extracts the abs path when write-shaped) or by the opaque-
-        // interpreter check when the path is not statically extractable.
+        // python3 - <<EOF (stdin heredoc shape): denied by opaque-interpreter word.
+        // Heredoc body content is NOT scanned pre-call; the witness catches any out-of-tree
+        // writes after the call (#548).
         let d = deny_ro(format!(
             "python3 - <<'EOF'\nopen('{}','w')\nEOF",
             w(&wt.join("pwned"))
@@ -4441,8 +4275,7 @@ mod tests {
             "{d}"
         );
 
-        // node -e: denied — either by extracted write target (item 4 now extracts absolute paths
-        // from interpreter code strings) or by opaque-interpreter word.
+        // node -e: denied by opaque-interpreter word (ReadOnly posture; program-word rule).
         let d = deny_ro(format!(
             r#"node -e "require('fs').writeFileSync('{}','x')""#,
             w(&wt.join("pwned"))
@@ -4454,7 +4287,7 @@ mod tests {
             "{d}"
         );
 
-        // perl -e: denied — either by extracted write target or by opaque-interpreter word.
+        // perl -e: denied by opaque-interpreter word (ReadOnly posture; program-word rule).
         let d = deny_ro(format!(
             "perl -e 'open(F,\">\",\"{}\")' ",
             w(&wt.join("pwned"))
@@ -4466,7 +4299,7 @@ mod tests {
             "{d}"
         );
 
-        // ruby -e: denied — either by extracted write target or by opaque-interpreter word.
+        // ruby -e: denied by opaque-interpreter word (ReadOnly posture; program-word rule).
         let d = deny_ro(format!(
             "ruby -e 'File.write(\"{}\",\"x\")'",
             w(&wt.join("pwned"))
@@ -4865,6 +4698,22 @@ mod tests {
             assert!(is_abs_path_token("/tmp/x"), "Unix abs accepted");
             assert!(is_abs_path_token("/etc/hosts"), "Unix abs accepted");
         }
+        // On Windows, drive-letter, extended-length, and UNC paths are absolute.
+        #[cfg(windows)]
+        {
+            assert!(
+                is_abs_path_token(r"C:\Users\foo"),
+                "Windows drive-letter abs accepted"
+            );
+            assert!(
+                is_abs_path_token(r"\\?\C:\long\path"),
+                "Windows extended-length abs accepted"
+            );
+            assert!(
+                is_abs_path_token(r"\\srv\share\dir"),
+                "Windows UNC abs accepted"
+            );
+        }
         // Platform-native temp dir is always absolute and not //-prefixed.
         let td = std::env::temp_dir().to_string_lossy().into_owned();
         assert!(is_abs_path_token(&td), "temp_dir() is absolute: {td}");
@@ -4878,32 +4727,6 @@ mod tests {
         assert!(
             !has_url_hit,
             "URL token must not be flagged as abs path: {url_code}"
-        );
-        // Write-shaped code with a platform-native sibling path must be detected.
-        let sibling = std::env::temp_dir().join("ir-sibling-test");
-        let sibling_s = sibling.to_string_lossy().into_owned();
-        let write_code = format!("open('{sibling_s}','w')");
-        assert!(
-            code_string_has_write_shape(&write_code),
-            "write-shaped code detected: {write_code}"
-        );
-        let mut targets = Vec::new();
-        collect_bash_write_targets(&format!("python3 -c \"{write_code}\""), true, &mut targets);
-        assert!(
-            targets.iter().any(|t| t.contains(&sibling_s)),
-            "platform-native sibling path extracted from write-shaped code: {targets:?}"
-        );
-        // Read-shaped code must NOT produce a target.
-        let read_code = format!("open('{sibling_s}','r')");
-        let mut read_targets = Vec::new();
-        collect_bash_write_targets(
-            &format!("python3 -c \"{read_code}\""),
-            true,
-            &mut read_targets,
-        );
-        assert!(
-            read_targets.is_empty(),
-            "read-shaped code must not produce write targets: {read_targets:?}"
         );
     }
 
@@ -4931,95 +4754,158 @@ mod tests {
         );
     }
 
-    /// INDEPENDENT REVIEW item 3c — interpreter literals are only extracted as write targets
-    /// when the code string is write-shaped; read-shaped calls and URLs are admitted.
+    /// Regression: 11 realistic own-tree Creator writes are ADMITTED pre-call; the same inputs
+    /// are denied for ReadOnly by the program-word rule. Former heredoc-body and interpreter-literal
+    /// scanners caused false denials of these; the post-hoc witness now catches out-of-tree effects
+    /// (wicked-core#548).
     #[test]
-    fn interpreter_literal_write_shape_gate_ir_item3c() {
+    fn own_tree_creator_writes_admitted_readonly_denied_by_program_word() {
         use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture as P;
         let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
-        let base = std::env::temp_dir().join(format!("wicked-ir3c-{}-{tid}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("wicked-rg11-{}-{tid}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let wt = base.join("wt");
-        let sibling = base.join("sibling");
-        for d in [&wt, &sibling] {
+        let notes = base.join("notes");
+        for d in [
+            &wt.join("src"),
+            &wt.join("scripts"),
+            &wt.join("tests"),
+            &notes,
+        ] {
             std::fs::create_dir_all(d).unwrap();
         }
         let roots = AllowedRoots {
             write: vec![wt.clone()],
             read: vec![],
         };
-        let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
-        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        let notes_roots = vec![notes.clone()];
         let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
-
-        // Write-shaped: denied.
-        assert!(
-            check(&format!("python3 -c \"open('{}/x','w')\"", w(&sibling))).is_some(),
-            "python3 open write must be denied"
-        );
-        assert!(
-            check(&format!(
-                "node -e \"require('fs').writeFileSync('{}/x','d')\"",
-                w(&sibling)
-            ))
-            .is_some(),
-            "node writeFileSync must be denied"
-        );
-        // Read-shaped: admitted under Creator boundary.
-        assert!(
-            check(&format!("python3 -c \"open('{}/x','r')\"", w(&sibling))).is_none(),
-            "python3 open read must be admitted"
-        );
-        assert!(
-            check(&format!(
-                "node -e \"require('fs').readFileSync('{}/x')\"",
-                w(&sibling)
-            ))
-            .is_none(),
-            "node readFileSync must be admitted"
-        );
-        // URL: admitted (no abs-path token after correct split).
-        assert!(
-            check("python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:7701/path')\"").is_none(),
-            "URL in interpreter code must be admitted"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// INDEPENDENT REVIEW item 4 — heredoc bodies are scanned; write-shaped heredocs denied,
-    /// read-shaped admitted.
-    #[test]
-    fn heredoc_body_scanned_creator_posture_ir_item4() {
-        use crate::path_policy::AllowedRoots;
-        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
-        let base = std::env::temp_dir().join(format!("wicked-ir4h-{}-{tid}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let wt = base.join("wt");
-        let sibling = base.join("sibling");
-        for d in [&wt, &sibling] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        let roots = AllowedRoots {
-            write: vec![wt.clone()],
-            read: vec![],
-        };
         let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
-        let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
-        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
-        let sib_x = format!("{}/x", w(&sibling));
+        // Creator boundary: admitted when target is within write roots.
+        let creator_admits =
+            |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
+        // ReadOnly: denied by program-word or redirect-target rule.
+        let ro_denies =
+            |cmd: String| bash_write_phase_scope(false, P::ReadOnly, &cmd, &wt, None, &notes_roots);
 
-        // Write-shaped heredoc: must be denied.
-        let cmd_w = format!("python3 - <<'EOF'\nopen('{sib_x}','w')\nEOF");
-        assert!(
-            check(&cmd_w).is_some(),
-            "heredoc write body must be denied: {cmd_w}"
+        // --- Category 1: cat > {wt}/* heredocs with text that used to trigger false denies ---
+        // Case 1: README body contains "> " and "/usr/local/bin." — false deny before removal.
+        let c1 = format!(
+            "cat > {} <<'EOF'\nNode > 18 requires /usr/local/bin in your PATH.\nEOF",
+            w(&wt.join("README.md"))
         );
-        // Read-shaped heredoc: must be admitted.
-        let cmd_r = format!("python3 - <<'EOF'\nopen('{sib_x}','r')\nEOF");
         assert!(
-            check(&cmd_r).is_none(),
-            "heredoc read body must be admitted: {cmd_r}"
+            creator_admits(&c1).is_none(),
+            "case 1 must be admitted: {c1}"
         );
+        assert!(ro_denies(c1).is_some(), "case 1 ReadOnly must be denied");
+
+        // Case 2: Rust source body with ">>" (Vec<String>>) and "/etc/hosts".
+        let c2 = format!(
+            "cat > {} <<'EOF'\n/// Parses /etc/hosts entries\npub fn parse() -> Option<Vec<String>> {{ None }}\nEOF",
+            w(&wt.join("src").join("lib.rs"))
+        );
+        assert!(
+            creator_admits(&c2).is_none(),
+            "case 2 must be admitted: {c2}"
+        );
+        assert!(ro_denies(c2).is_some(), "case 2 ReadOnly must be denied");
+
+        // Case 3: test file body with Vec<String>> and /etc/hosts comment.
+        let c3 = format!(
+            "cat > {} <<'EOF'\n#[test]\nfn it() {{\n    let _v: Option<Vec<String>> = None;\n    // host = /etc/hosts\n}}\nEOF",
+            w(&wt.join("tests").join("parse_test.rs"))
+        );
+        assert!(
+            creator_admits(&c3).is_none(),
+            "case 3 must be admitted: {c3}"
+        );
+        assert!(ro_denies(c3).is_some(), "case 3 ReadOnly must be denied");
+
+        // --- Category 2: deploy.sh ---
+        // Case 4: cat > deploy.sh.
+        let c4 = format!(
+            "cat > {} <<'EOF'\n#!/bin/bash\ncargo build --release\nEOF",
+            w(&wt.join("scripts").join("deploy.sh"))
+        );
+        assert!(
+            creator_admits(&c4).is_none(),
+            "case 4 must be admitted: {c4}"
+        );
+        assert!(ro_denies(c4).is_some(), "case 4 ReadOnly must be denied");
+
+        // Case 5: tee to in-tree deploy.sh.
+        let c5 = format!("tee {}", w(&wt.join("deploy.sh")));
+        assert!(
+            creator_admits(&c5).is_none(),
+            "case 5 must be admitted: {c5}"
+        );
+        assert!(ro_denies(c5).is_some(), "case 5 ReadOnly must be denied");
+
+        // --- Category 3: python heredocs ---
+        // Case 6: heredoc body has "> " (plain text, no write).
+        let c6 = "python3 - <<'EOF'\nprint('Node > 18 required')\nEOF".to_string();
+        assert!(
+            creator_admits(&c6).is_none(),
+            "case 6 must be admitted: {c6}"
+        );
+        assert!(ro_denies(c6).is_some(), "case 6 ReadOnly must be denied");
+
+        // Case 7: heredoc body has /etc/hosts in a comment — no write.
+        let c7 = "python3 - <<'EOF'\n# /etc/hosts format: IP hostname alias\nprint('ok')\nEOF"
+            .to_string();
+        assert!(
+            creator_admits(&c7).is_none(),
+            "case 7 must be admitted: {c7}"
+        );
+        assert!(ro_denies(c7).is_some(), "case 7 ReadOnly must be denied");
+
+        // Case 8: python heredoc writing to own tree (pre-call admitted; witness catches post-call).
+        let c8 = format!(
+            "python3 - <<'EOF'\nwith open('{}', 'w') as f:\n    f.write('ok')\nEOF",
+            w(&wt.join("out.txt"))
+        );
+        assert!(
+            creator_admits(&c8).is_none(),
+            "case 8 must be admitted: {c8}"
+        );
+        assert!(ro_denies(c8).is_some(), "case 8 ReadOnly must be denied");
+
+        // --- Category 4: cat > f <<EOF variations ---
+        // Case 9: config.toml body has "Node > 18 required" text.
+        let c9 = format!(
+            "cat > {} <<'EOF'\n# Node > 18 required\n[deps]\nEOF",
+            w(&wt.join("config.toml"))
+        );
+        assert!(
+            creator_admits(&c9).is_none(),
+            "case 9 must be admitted: {c9}"
+        );
+        assert!(ro_denies(c9).is_some(), "case 9 ReadOnly must be denied");
+
+        // Case 10: main.rs body contains ">>" in a Rust expression.
+        let c10 = format!(
+            "cat > {} <<EOF\nfn main() {{ println!(\">> starting\") }}\nEOF",
+            w(&wt.join("src").join("main.rs"))
+        );
+        assert!(
+            creator_admits(&c10).is_none(),
+            "case 10 must be admitted: {c10}"
+        );
+        assert!(ro_denies(c10).is_some(), "case 10 ReadOnly must be denied");
+
+        // Case 11: types.rs body has abs-path-like text in a comment.
+        let c11 = format!(
+            "cat > {} <<'EOF'\ntype Hosts = Vec<String>; // like /etc/hosts\nEOF",
+            w(&wt.join("src").join("types.rs"))
+        );
+        assert!(
+            creator_admits(&c11).is_none(),
+            "case 11 must be admitted: {c11}"
+        );
+        assert!(ro_denies(c11).is_some(), "case 11 ReadOnly must be denied");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5164,8 +5050,9 @@ mod tests {
     }
 
     /// item 4 — `bash_cd_escape_targets` fires when the command contains a write-CAPABLE
-    /// program even if `bash_write_targets` finds no resolvable target; interpreter code
-    /// strings are scanned for absolute path literals.
+    /// program even if `bash_write_targets` finds no resolvable target. Interpreter-literal
+    /// code-string scanning is retired; out-of-tree paths inside quoted interpreter args are
+    /// caught by the post-hoc witness instead (#548).
     #[test]
     fn cd_escape_with_write_capable_program_and_abs_path_in_code_item4() {
         use crate::path_policy::AllowedRoots;
@@ -5201,10 +5088,12 @@ mod tests {
             "cd <sibling> && python3 -c must be denied"
         );
 
-        // python3 -c with absolute sibling path literal in the code string.
+        // python3 -c with absolute sibling path only in the code string (no cd, no redirect):
+        // admitted pre-call — the interpreter-literal scanner is retired. The post-hoc witness
+        // catches any actual out-of-tree writes (#548).
         assert!(
-            check(&format!("python3 -c \"open('{}/x','w')\"", w(&sibling))).is_some(),
-            "python3 -c with absolute sibling path in code string must be denied"
+            check(&format!("python3 -c \"open('{}/x','w')\"", w(&sibling))).is_none(),
+            "python3 -c with sibling path in code string is admitted pre-call (witness catches post-call)"
         );
 
         // In-worktree cd: admitted.
