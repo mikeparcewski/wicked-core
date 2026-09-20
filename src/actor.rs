@@ -6067,13 +6067,35 @@ fn advance_or_pause(
                     ),
                 )
             }
-            PauseReason::RunLevel => (
-                None,
-                format!(
-                    "Approve unit {} before it runs: {}",
-                    unit.ord, unit.description
-                ),
-            ),
+            PauseReason::RunLevel => {
+                // (AC-4 / core#537) Name single-voter ballots and any benched seats so the
+                // operator understands why the plan needed their approval.
+                let configured_count = session.clis.len();
+                let benched = &session.benched_seats;
+                let bench_note = if !benched.is_empty() {
+                    let live = configured_count.saturating_sub(benched.len());
+                    let seat_summary = benched
+                        .iter()
+                        .map(|b| format!("{} {} (benched)", b.cli, b.reason))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        " — planned by {} of {} seats — {}",
+                        live, configured_count, seat_summary
+                    )
+                } else if configured_count == 1 {
+                    " — planned by 1 of 1 seats".to_string()
+                } else {
+                    String::new()
+                };
+                (
+                    None,
+                    format!(
+                        "Approve unit {} before it runs: {}{}",
+                        unit.ord, unit.description, bench_note
+                    ),
+                )
+            }
             PauseReason::DeliverGate { reviewing_ord } => {
                 // Name what leaves the machine, and under whose account: the operator's
                 // playbook step "pin `gh auth switch` immediately before approving the deliver
@@ -12323,6 +12345,115 @@ mod def_gate_disclosure_tests {
             3,
             "the substance gate, the deliverable floor and the dead-seat worker exit (core#461) \
              each open the escalation gate"
+        );
+    }
+
+    // AC-4 / core#537 — RunLevel pause names single-voter ballots and benched seats.
+
+    fn seed_run_level_with_bench(
+        store: &mut dyn GraphStore,
+        bench: Vec<crate::domain::BenchedSeat>,
+    ) {
+        let session = AgentSession {
+            id: "rl".into(),
+            workflow_id: "wf-rl".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["pi".into(), "claude".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::All,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: bench,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
+        put_node(store, u1.to_node()).unwrap();
+    }
+
+    fn run_level_prompt(store: &mut dyn GraphStore) -> String {
+        let mut subs = crate::event_log::EventSink::default();
+        let (evtx, evrx) = channel::<CoreEvent>();
+        subs.push(evtx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            "rl",
+            0,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(progress, Progress::Paused),
+            "precondition: HumanConfirm::All pauses at unit 0"
+        );
+        evrx.try_iter()
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman { prompt, .. } => Some(prompt),
+                _ => None,
+            })
+            .expect("RunLevel pause emits AwaitingHuman")
+    }
+
+    #[test]
+    fn run_level_gate_names_benched_seat_in_prompt() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run_level_with_bench(
+            &mut store,
+            vec![crate::domain::BenchedSeat {
+                cli: "pi".into(),
+                reason: "timed_out (2/2 ballots, no vote returned)".into(),
+                source: "ballot".into(),
+            }],
+        );
+        let prompt = run_level_prompt(&mut store);
+        assert!(
+            prompt.contains("pi"),
+            "benched seat must be named in the prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("benched"),
+            "prompt must say the seat is benched: {prompt}"
+        );
+        assert!(
+            prompt.contains("1 of 2"),
+            "prompt must report live vs. configured seat count: {prompt}"
+        );
+    }
+
+    #[test]
+    fn run_level_gate_prompt_is_clean_when_no_seats_are_benched() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run_level_with_bench(&mut store, vec![]);
+        let prompt = run_level_prompt(&mut store);
+        assert!(
+            prompt.starts_with("Approve unit 1"),
+            "no bench means no clutter: {prompt}"
+        );
+        assert!(
+            !prompt.contains("benched"),
+            "no bench must not mention bench: {prompt}"
         );
     }
 

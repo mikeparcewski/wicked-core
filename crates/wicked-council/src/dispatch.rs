@@ -159,6 +159,83 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(40);
 /// Default budget for a local runner, which pays a cold model load before it reasons at all.
 const DEFAULT_LOCAL_RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Load-factor cap for the ballot budget (#537). Higher than the floor's 3.0 because a ballot's
+/// base is much shorter (40 s vs 20 min), and the AC-1 acceptance row requires ratio 5 → 5× budget.
+/// Uses `max(load1, load5)` so the 5-min average can reveal load spikes the 1-min average smoothed.
+pub const BALLOT_LOAD_FACTOR_CAP: f64 = 5.0;
+
+/// FFI-only shim: `getloadavg` is always linked on unix without a crate dependency, matching the
+/// pattern already used for `killpg`/`getpgid` in this file.
+#[cfg(unix)]
+mod ballot_load_ffi {
+    extern "C" {
+        pub fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+    }
+}
+
+/// The host's 1-min and 5-min load averages and logical CPU count.
+///
+/// Both averages are read in one `getloadavg` call so they are internally consistent. Returns
+/// `(None, None, cpus)` on platforms without `getloadavg` (Windows).
+pub(crate) fn host_load_ballot() -> (Option<f64>, Option<f64>, usize) {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    #[cfg(unix)]
+    let (load1, load5) = {
+        let mut avg = [0f64; 3];
+        // SAFETY: `avg` is a valid, writable buffer of 3 doubles and `nelem` says so.
+        let n = unsafe { ballot_load_ffi::getloadavg(avg.as_mut_ptr(), 3) };
+        ((n >= 1).then_some(avg[0]), (n >= 2).then_some(avg[1]))
+    };
+    #[cfg(not(unix))]
+    let (load1, load5) = (None::<f64>, None::<f64>);
+    (load1, load5, cpus)
+}
+
+/// The ballot-budget multiplier: `clamp(max(load1, load5) / cpus, 1, BALLOT_LOAD_FACTOR_CAP)`.
+///
+/// Using the MAX of the 1-min and 5-min averages is intentional: S6/S8 runs (2026-09-20) had
+/// 1-min load ~10.9 on 14 cpus (ratio 0.78 → factor 1.00, budget unchanged) while the 5-min
+/// was 15.6 (ratio 1.11 → 44.6 s budget). Pi answered in 40.8 s — within the 5-min-driven
+/// budget but not the 1-min one. Neither average alone is sufficient; the max is (#537).
+pub(crate) fn ballot_load_factor(load1: Option<f64>, load5: Option<f64>, cpus: usize) -> f64 {
+    let peak = match (load1, load5) {
+        (Some(l1), Some(l5)) => Some(l1.max(l5)),
+        (Some(l), None) | (None, Some(l)) => Some(l),
+        (None, None) => None,
+    };
+    match peak {
+        Some(l) if cpus > 0 && l.is_finite() => {
+            (l / cpus as f64).clamp(1.0, BALLOT_LOAD_FACTOR_CAP)
+        }
+        _ => 1.0,
+    }
+}
+
+/// The derivation note that rides the timeout error message: `"40s × 2.40, 1-min load 33.6 / 14
+/// cpus"`. Returns `None` when the factor is 1.0 (idle host, no scaling, no noise in the log).
+pub(crate) fn ballot_timeout_note(
+    base: Duration,
+    factor: f64,
+    load1: Option<f64>,
+    load5: Option<f64>,
+    cpus: usize,
+) -> Option<String> {
+    if factor <= 1.0 + f64::EPSILON {
+        return None;
+    }
+    let (label, peak) = match (load1, load5) {
+        (Some(l1), Some(l5)) if l5 > l1 => ("5-min", l5),
+        (Some(l1), _) => ("1-min", l1),
+        (_, Some(l5)) => ("5-min", l5),
+        _ => return None,
+    };
+    Some(format!(
+        "{base:?} \u{00d7} {factor:.2}, {label} load {peak:.1} / {cpus} cpus"
+    ))
+}
+
 impl Default for RealDispatcher {
     fn default() -> Self {
         RealDispatcher {
@@ -421,7 +498,12 @@ impl RealDispatcher {
     /// empty recommendation, which synthesis then drops from the tally) is alive, not ready:
     /// re-admitting on it is the `--version` mistake wearing an exit code, so it counts
     /// against health like any other failure.
-    fn record_seat_outcome(&self, cli: &AgenticCli, outcome: &DispatchOutcome) {
+    ///
+    /// `load_induced`: the dispatch budget was scaled at factor ≥ 2 and a `TimedOut` outcome at
+    /// this scale is treated as a host-load event — not counted against a healthy seat's streak.
+    /// A seat already on probation still fails its probation (one probationary ballot is the
+    /// agreed contract; load does not waive it).
+    fn record_seat_outcome(&self, cli: &AgenticCli, outcome: &DispatchOutcome, load_induced: bool) {
         // The shared predicate — the same one the worker's ranking signal uses, so health and
         // ranking can never disagree about what a hollow return was.
         let usable = outcome.is_usable_vote();
@@ -430,6 +512,27 @@ impl RealDispatcher {
         if usable {
             *health = SeatHealth::default();
             return;
+        }
+        // A timed-out dispatch at load factor ≥ 2 is a host-load event, not a seat failure.
+        // Skip the streak increment for a healthy seat so background-load pressure alone cannot
+        // bench a seat that is otherwise answering (field evidence: S6/S8 2026-09-20, #537).
+        // Probation is NOT exempted: the probationary ballot is the agreed readiness test, and
+        // waiving it under load would leave the seat permanently un-re-admitted.
+        // The outcome MUST be TimedOut: NonZeroExit and other failure kinds represent real seat
+        // problems that must still count toward the streak regardless of host load.
+        let is_timed_out = matches!(
+            outcome,
+            DispatchOutcome::Failed(f) if f.kind == SeatFailureKind::TimedOut
+        );
+        if load_induced && is_timed_out {
+            if let SeatHealth::Healthy { .. } = *health {
+                eprintln!(
+                    "wicked-council: seat `{}` timed out under load (factor ≥ 2); \
+                     not counting toward bench streak (#537)",
+                    cli.key
+                );
+                return;
+            }
         }
         match *health {
             SeatHealth::Healthy {
@@ -557,7 +660,16 @@ impl RealDispatcher {
             }
         };
 
-        let timeout = self.timeout_for(cli);
+        // Scale the dispatch budget with host load (#537): a host under pressure gets more time
+        // so a slow answer is not misread as a dead seat. One formula for both the agentic/chat
+        // and local-runner budgets — no per-seat special cases.
+        let base_timeout = self.timeout_for(cli);
+        let (load1, load5, cpus) = host_load_ballot();
+        let factor = ballot_load_factor(load1, load5, cpus);
+        let timeout = Duration::from_secs_f64(base_timeout.as_secs_f64() * factor);
+        // A timeout at ratio ≥ 2 is a host-load event; don't count it toward the bench streak.
+        let load_induced = factor >= 2.0;
+        let timeout_note = ballot_timeout_note(base_timeout, factor, load1, load5, cpus);
         // Hold a permit for the subprocess only. Seats are dispatched concurrently at two levels
         // — every unit convenes its own council, and every council now dispatches its own seats —
         // and those multiply. Without a ceiling, a 3-unit run on a 3-seat roster puts 9 agentic
@@ -570,7 +682,7 @@ impl RealDispatcher {
             let _permit = seat_permits().acquire();
             let queued = queue_started.elapsed();
             let run_started = Instant::now();
-            let result = run_in_isolation(cli, prompt, &workdir, timeout);
+            let result = run_in_isolation(cli, prompt, &workdir, timeout, timeout_note.as_deref());
             (result, queued, run_started.elapsed())
         };
 
@@ -602,7 +714,7 @@ impl RealDispatcher {
         // fails the probation. The guard is disarmed AFTER the record — and its reopen only
         // touches a seat still in `Probation`, so this order can never undo what was just
         // recorded.
-        self.record_seat_outcome(cli, &outcome);
+        self.record_seat_outcome(cli, &outcome, load_induced);
         probation_guard.armed = false;
         TimedOutcome {
             outcome,
@@ -674,11 +786,15 @@ struct IsolatedRun {
 /// whitespace tokenizer that respects double-quotes), substitute `{PROMPT}` per the input
 /// mode, and append `trust_flags`. Avoiding a shell sidesteps the quoting foot-guns
 /// apostrophes in topics would otherwise cause.
+///
+/// `timeout_note` rides the `TimedOut` error when provided, naming the load derivation:
+/// `"40s × 2.40, 1-min load 33.6 / 14 cpus"` (#537).
 fn run_in_isolation(
     cli: &AgenticCli,
     prompt: &str,
     workdir: &PathBuf,
     timeout: Duration,
+    timeout_note: Option<&str>,
 ) -> Result<IsolatedRun, SeatFailure> {
     let mut argv = tokenize(&cli.headless_invocation);
     if argv.is_empty() {
@@ -851,11 +967,13 @@ fn run_in_isolation(
                     // Reap. `wait` does not read the pipes, so unlike `wait_with_output` it
                     // returns as soon as the direct child is collected.
                     let _ = child.wait();
-                    return Err(SeatFailure::new(
-                        SeatFailureKind::TimedOut,
-                        format!("exceeded {timeout:?} dispatch budget"),
-                    )
-                    .with_stderr(&partial));
+                    let msg = match timeout_note {
+                        Some(note) => format!("exceeded {timeout:?} dispatch budget ({note})"),
+                        None => format!("exceeded {timeout:?} dispatch budget"),
+                    };
+                    return Err(
+                        SeatFailure::new(SeatFailureKind::TimedOut, msg).with_stderr(&partial)
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -2508,5 +2626,140 @@ mod failure_diagnostics_tests {
             2,
             "a threshold of zero would bench every seat before it has failed at all"
         );
+    }
+
+    // AC-1 — ballot_load_factor unit tests (#537)
+
+    #[test]
+    fn ballot_load_factor_is_one_when_load_is_below_ncpu() {
+        // ratio = 4/14 = 0.29 → clamped to 1.0
+        assert_eq!(ballot_load_factor(Some(4.0), Some(4.0), 14), 1.0);
+    }
+
+    #[test]
+    fn ballot_load_factor_caps_at_five() {
+        // ratio = 100/14 = 7.14 → clamped to 5.0 (BALLOT_LOAD_FACTOR_CAP)
+        let f = ballot_load_factor(Some(100.0), Some(100.0), 14);
+        assert_eq!(f, BALLOT_LOAD_FACTOR_CAP);
+    }
+
+    #[test]
+    fn ballot_load_factor_s8_shape_seats_pis_answer() {
+        // S8 run 0a00ccaa: load1=10.94, load5=15.6, ncpu=14
+        // max(10.94, 15.6)=15.6; 15.6/14=1.114; clamp(1.114,1,5)=1.114
+        // budget = 40s × 1.114 = 44.6s → seats pi's 40.8s answer
+        let f = ballot_load_factor(Some(10.94), Some(15.6), 14);
+        let budget = Duration::from_secs(40).as_secs_f64() * f;
+        assert!(
+            budget > 40.8,
+            "S8 shape must seat pi's 40.8s answer; got {budget:.1}s budget (factor {f:.3})"
+        );
+        assert!(
+            budget < 46.0,
+            "budget must not balloon past 5× for S8 shape; got {budget:.1}s"
+        );
+    }
+
+    #[test]
+    fn ballot_load_factor_uses_max_of_load1_and_load5() {
+        // load5 > load1 → max drives the factor
+        let f5 = ballot_load_factor(Some(10.0), Some(28.0), 14); // max=28, ratio=2.0
+        let f1 = ballot_load_factor(Some(28.0), Some(10.0), 14); // max=28, ratio=2.0
+        assert_eq!(f5, f1, "max(load1, load5) must be symmetric");
+        assert!(
+            (f5 - 2.0).abs() < 1e-9,
+            "ratio 2.0 must not be clamped: {f5}"
+        );
+    }
+
+    #[test]
+    fn ballot_load_factor_falls_back_to_one_with_no_load_data() {
+        assert_eq!(ballot_load_factor(None, None, 14), 1.0);
+    }
+
+    #[test]
+    fn ballot_timeout_note_is_none_at_ratio_one() {
+        // On an idle host the note must be absent — no noise in the error message.
+        let note = ballot_timeout_note(Duration::from_secs(40), 1.0, Some(4.0), Some(4.0), 14);
+        assert!(
+            note.is_none(),
+            "no note expected at factor 1.0, got {note:?}"
+        );
+    }
+
+    #[test]
+    fn ballot_timeout_note_names_the_controlling_load_average() {
+        // S8 shape: load5 > load1 → note says "5-min"
+        let note = ballot_timeout_note(Duration::from_secs(40), 1.114, Some(10.94), Some(15.6), 14)
+            .expect("factor > 1 must produce a note");
+        assert!(
+            note.contains("5-min"),
+            "S8 note must name 5-min load: {note}"
+        );
+        assert!(note.contains("14 cpus"), "note must name cpu count: {note}");
+        assert!(note.contains("40s"), "note must name base budget: {note}");
+    }
+
+    // AC-2 — load-induced timeout must not advance the bench streak (#537)
+
+    #[test]
+    fn a_timeout_under_load_does_not_bench_a_healthy_seat() {
+        let d = RealDispatcher::default();
+        let cli = shell_seat("pi-sim", "sleep 1");
+        // Seed the seat as Healthy with zero failures.
+        d.seats.lock().unwrap().insert(
+            cli.key.clone(),
+            SeatHealth::Healthy {
+                consecutive_failures: 0,
+            },
+        );
+        // Record a timed-out outcome with load_induced=true.
+        d.record_seat_outcome(
+            &cli,
+            &DispatchOutcome::Failed(SeatFailure::new(
+                SeatFailureKind::TimedOut,
+                "exceeded 40s dispatch budget (40s × 2.40, 1-min load 33.6 / 14 cpus)".to_string(),
+            )),
+            true,
+        );
+        // The seat must remain Healthy with zero consecutive failures.
+        let seats = d.seats.lock().unwrap();
+        match seats.get(&cli.key) {
+            Some(SeatHealth::Healthy {
+                consecutive_failures: 0,
+            }) => {}
+            other => {
+                panic!("load-induced timeout must not advance bench streak; health = {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_genuine_timeout_at_ratio_below_two_still_advances_the_bench_streak() {
+        let d = RealDispatcher::default();
+        let cli = shell_seat("slow", "sleep 1");
+        d.seats.lock().unwrap().insert(
+            cli.key.clone(),
+            SeatHealth::Healthy {
+                consecutive_failures: 0,
+            },
+        );
+        // load_induced=false → normal bench accounting
+        d.record_seat_outcome(
+            &cli,
+            &DispatchOutcome::Failed(SeatFailure::new(
+                SeatFailureKind::TimedOut,
+                "exceeded 40s dispatch budget".to_string(),
+            )),
+            false,
+        );
+        let seats = d.seats.lock().unwrap();
+        match seats.get(&cli.key) {
+            Some(SeatHealth::Healthy {
+                consecutive_failures: n,
+            }) if *n > 0 => {}
+            Some(SeatHealth::Benched { .. }) => {}
+            other => panic!("genuine timeout must advance streak or bench; health = {other:?}"),
+        }
     }
 }

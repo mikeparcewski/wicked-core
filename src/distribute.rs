@@ -640,18 +640,39 @@ pub(crate) fn distribute_units_against_benched(
     }
     let same_seat =
         enforce_evaluator_distinct(units, &mut dists, &still_eligible, clis, &candidates);
+    // (AC-3 / core#537) When a ballot-benched seat made evaluator≠creator unsatisfiable, fail
+    // CLOSED: the operator must relaunch once the seat recovers. A silent creator_seat fallback
+    // lets a compromised or broken seat evaluate its own work — the fence exists to prevent that.
+    // Launcher-bench (source != "ballot") is handled by the existing park_at_dead_seat_gate path.
+    // A bench-free roster that is simply too small is unchanged (condition below is false).
+    if !same_seat.is_empty() && benched.iter().any(|b| b.source == "ballot") {
+        let blocked: Vec<u32> = units
+            .iter()
+            .filter(|u| u.tool_cmd.is_none() && same_seat.contains(&u.ord))
+            .map(|u| u.ord)
+            .collect();
+        return Err(crate::NoEligibleSeat {
+            run_id: session_id.to_string(),
+            benched: format!(
+                "evaluator\u{2260}creator unsatisfiable for unit(s) {:?}: all distinct seats are \
+                 ballot-benched; {}",
+                blocked,
+                crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default()
+            ),
+            benched_seats: benched.clone(),
+        }
+        .into());
+    }
     // (F-7R2-006 rule 3) `degradedReason` on EVERY unit whenever eligible < configured — and
-    // (F-7R3-001) the same-seat disclosure when the BENCH left a review/test unit no seat
-    // distinct from its creator: it stays where the council put it, said on the wire, never a
-    // routing error. (A bench-free roster that is simply too small keeps its pre-existing stderr
-    // warning and the gate's own UNGATED disclosure — nothing changes on its wire.)
+    // (F-7R3-001) the same-seat disclosure when the bench left a review/test unit no seat distinct
+    // from its creator. A bench-free roster that is simply too small keeps its pre-existing stderr
+    // warning and the gate's own UNGATED disclosure.
     let summary = crate::domain::benched_summary(&benched, configured.len());
     for (u, d) in units.iter().zip(dists.iter_mut()) {
         d.benched = benched.clone();
-        // (core#461) The evaluator≠creator fallback is a FIELD, not prose alone: a consumer keys on
-        // `distinctnessFallback == "creator_seat"` whatever emptied the pool — a bench (disclosed
-        // in `degraded_reason` below) or a roster that never had a second seat (which keeps its
-        // `null` `degraded_reason`, review F2 on #452).
+        // (core#461) The evaluator≠creator fallback is a FIELD, not prose alone: a consumer keys
+        // on `distinctnessFallback == "creator_seat"` when the roster never had a second seat
+        // (bench-free too-small roster, review F2 on #452). Ballot-bench case is fail-closed above.
         d.distinctness_fallback = (u.tool_cmd.is_none() && same_seat.contains(&u.ord))
             .then(|| DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string());
         let mut parts: Vec<String> = Vec::new();
@@ -3473,12 +3494,47 @@ mod tests {
         assert_eq!(dists[0].benched[0].source, "ballot");
     }
 
-    /// (d) When the bench leaves NO seat distinct from the creator, the review unit stays on the
-    /// creator seat — never a routing error, never a silent stall — and `degradedReason` says so
-    /// beside the bench summary (the gate will disclose UNGATED on its own).
+    /// (d / AC-3 / core#537) When a ballot-bench empties the evaluator pool, distribution FAILS
+    /// CLOSED: no silent creator_seat fallback. The operator relaunches once the seat recovers.
+    /// A bench-free too-small roster (no "ballot" source) is unchanged — that path stays open.
     #[test]
-    fn when_the_bench_empties_the_evaluator_pool_the_review_stays_on_its_creator_and_says_so() {
+    fn when_a_ballot_bench_empties_the_evaluator_pool_distribution_fails_closed() {
         let dispatcher = dead_seat("copilot", quota_refusal, false);
+        let roster = [seat("claude"), seat("copilot")];
+        let err = distribute_units_against_benched(
+            &build_and_review(),
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect_err("ballot-bench must fail closed — no silent creator_seat fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evaluator\u{2260}creator unsatisfiable"),
+            "error must name the constraint: {msg}"
+        );
+        assert!(
+            msg.contains("ballot-benched"),
+            "error must name ballot as the cause: {msg}"
+        );
+        // Verify it is the typed NoEligibleSeat error (parks at dead_seat gate, not sessionFailed).
+        assert!(
+            err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
+            "must be NoEligibleSeat for dead_seat gate routing: {err:?}"
+        );
+    }
+
+    /// (AC-3) When BOTH seats are healthy, routing is unchanged — fail-closed only fires on bench.
+    #[test]
+    fn when_both_seats_are_healthy_evaluator_distinct_routes_normally() {
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(SpyDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
         let roster = [seat("claude"), seat("copilot")];
         let dists = distribute_units_against_benched(
             &build_and_review(),
@@ -3491,50 +3547,12 @@ mod tests {
             None,
             &[],
         )
-        .expect("never a routing error: the creator seat is still eligible");
-        assert_eq!(dists[0].assigned_cli, "claude");
-        assert_eq!(
-            dists[1].assigned_cli, "claude",
-            "falls back to the creator seat: {:?}",
+        .expect("both healthy — routing must succeed");
+        assert_eq!(dists[0].assigned_cli, "claude", "build stays on claude");
+        assert_ne!(
+            dists[1].assigned_cli, dists[0].assigned_cli,
+            "review must be on a distinct seat: {:?}",
             dists[1].routing
-        );
-        assert!(
-            matches!(dists[1].routing, RoutingInfo::Council { .. }),
-            "{:?}",
-            dists[1].routing
-        );
-        let why = dists[1].degraded_reason.as_deref().unwrap();
-        assert!(
-            why.contains("1 of 2 seats benched: copilot (quota_exhausted (6/6 ballots) — ballot)"),
-            "{why}"
-        );
-        assert!(
-            why.contains("evaluator≠creator not enforceable for unit 2")
-                && why.contains("stays on creator seat 'claude'"),
-            "{why}"
-        );
-        assert!(
-            !dists[0]
-                .degraded_reason
-                .as_deref()
-                .unwrap()
-                .contains("evaluator≠creator"),
-            "the build unit carries only the bench summary: {:?}",
-            dists[0].degraded_reason
-        );
-        // (core#461) The same fallback as a FIELD, on the review unit only — and the fallback
-        // seat is the still-eligible creator, never the benched one.
-        assert_eq!(
-            dists[1].distinctness_fallback.as_deref(),
-            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
-        );
-        assert_eq!(dists[0].distinctness_fallback, None);
-        assert!(
-            dists[1]
-                .benched
-                .iter()
-                .all(|b| b.cli != dists[1].assigned_cli),
-            "the fallback never seats a benched seat"
         );
     }
 
