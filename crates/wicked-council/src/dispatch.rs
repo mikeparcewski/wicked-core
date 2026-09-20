@@ -560,12 +560,13 @@ impl RealDispatcher {
         );
         if load_induced && is_timed_out {
             if let SeatHealth::Healthy {
-                load_exemptions, ..
+                consecutive_failures,
+                load_exemptions,
             } = *health
             {
                 if load_exemptions < self.bench.threshold {
                     *health = SeatHealth::Healthy {
-                        consecutive_failures: 0,
+                        consecutive_failures,
                         load_exemptions: load_exemptions + 1,
                     };
                     eprintln!(
@@ -2986,6 +2987,71 @@ mod failure_diagnostics_tests {
                 "a non-zero exit must advance the bench streak even at high load; health = {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn interleaved_non_zero_exit_and_load_timeout_still_benches_seat() {
+        // Regression for the write-zero bug: the load-exemption branch previously wrote
+        // `consecutive_failures: 0`, zeroing any real-failure streak. A seat that alternates
+        // NonZeroExit / load-TimedOut / NonZeroExit at threshold=2 never benched because each
+        // branch zeroed the other's counter. After the fix the exemption carries
+        // `consecutive_failures` unchanged so the third dispatch reaches streak=2 and benches.
+        let key = "interleaved-bench";
+        let failing = shell_seq_seat(key, &["exit 1"]);
+        let hanging = if cfg!(windows) {
+            seat(key, "cmd", "cmd /C \"ping -n 60 127.0.0.1\"")
+        } else {
+            shell_seat(key, "sleep 60")
+        };
+        // factor = 28 / 14 = 2.0 → load_induced = true for the hanging dispatch.
+        let d = RealDispatcher {
+            timeout: Duration::from_millis(100),
+            local_runner_timeout: Duration::from_millis(100),
+            load_source: Arc::new(FixedLoadSource {
+                load1: Some(28.0),
+                load5: Some(28.0),
+                cpus: 14,
+            }),
+            ..RealDispatcher::default()
+        };
+        // Dispatch 1: NonZeroExit — not load-induced → consecutive_failures becomes 1.
+        d.dispatch_prompt(&failing, &task(), "ignored");
+        {
+            let seats = d.seats.lock().unwrap();
+            match seats.get(key) {
+                Some(SeatHealth::Healthy {
+                    consecutive_failures: 1,
+                    load_exemptions: 0,
+                }) => {}
+                other => {
+                    panic!("after dispatch 1 (NonZeroExit) expected {{cf 1, le 0}}; got {other:?}")
+                }
+            }
+        }
+        // Dispatch 2: load-induced TimedOut → should carry consecutive_failures=1, set le=1.
+        d.dispatch_prompt(&hanging, &task(), "ignored");
+        {
+            let seats = d.seats.lock().unwrap();
+            match seats.get(key) {
+                Some(SeatHealth::Healthy {
+                    consecutive_failures: 1,
+                    load_exemptions: 1,
+                }) => {}
+                other => {
+                    panic!(
+                        "after dispatch 2 (load-TimedOut) expected {{cf 1, le 1}}; got {other:?}"
+                    )
+                }
+            }
+        }
+        // Dispatch 3: NonZeroExit → streak = 1+1 = 2 ≥ threshold → seat must bench.
+        d.dispatch_prompt(&failing, &task(), "ignored");
+        let seats = d.seats.lock().unwrap();
+        assert!(
+            matches!(seats.get(key), Some(SeatHealth::Benched { .. })),
+            "seat must be benched after NonZeroExit / load-TimedOut / NonZeroExit at threshold=2; health = {:?}",
+            seats.get(key)
+        );
     }
 
     #[test]
