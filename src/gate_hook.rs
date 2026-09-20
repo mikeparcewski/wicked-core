@@ -3712,6 +3712,7 @@ pub fn fold_input_denial(
                 rule_ids: claim.policy_ids.clone(),
                 denied_tool: tool_for_claim,
                 phase: Some(phase.to_string()),
+                findings_trimmed: false,
             });
         }
     }

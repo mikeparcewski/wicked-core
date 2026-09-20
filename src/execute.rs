@@ -214,6 +214,7 @@ pub(crate) fn apply_unit(
             rule_ids: claim.policy_ids.clone(),
             denied_tool: None,
             phase: Some(phase_name.clone()),
+            findings_trimmed: false,
         })
     } else {
         // A dual-validator / evaluator / input-hook deny (deny-dominates over a governance ALLOW).
@@ -547,6 +548,7 @@ mod tests {
             rule_ids: vec!["engine:pre-build-scope".to_string()],
             denied_tool: Some("Edit".to_string()),
             phase: Some("unit-3".to_string()),
+            findings_trimmed: false,
         };
         let outcome = apply_unit(
             &mut store,

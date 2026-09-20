@@ -98,6 +98,12 @@ const HAND_AUTHORED = `${BEGIN}
  * gains the class 'dead_seat' (denialSource 'dead_seat'): a worker exited on a dead-seat refusal
  * (signed out / quota / not installed) and no eligible seat remains — the attended run pauses at
  * the escalation gate instead of failing.
+ * core#549 (additive): gateEscalated gains \`verdictSummaryTrimmed\` (boolean) — true when the
+ * evaluator's output exceeded EVALUATOR_FINDINGS_CAP chars and \`verdictSummary\` is a tail-trim
+ * (the full text was too long; the trimmed portion is marked with a leading '…'). WorkUnit
+ * gains \`rework_amendment\` (string | absent) — the full findings+note text stored at request_changes
+ * so the creator's re-dispatch receives the amendment whole, never capped; unitContextInjected's
+ * \`outputBytes\` per item reflects the full amendment byte length.
  */
 export interface CoreEventJson {
   type: string

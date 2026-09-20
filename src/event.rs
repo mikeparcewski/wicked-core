@@ -609,6 +609,10 @@ pub enum CoreEvent {
         ord: u32,
         condition: String,
         verdict_summary: String,
+        /// (core#549) `true` when the evaluator's findings were trimmed to fit
+        /// [`crate::validator::EVALUATOR_FINDINGS_CAP`] — the tail rides `verdict_summary`
+        /// as `"…{last N chars}"` and this flag names it on the wire.
+        verdict_summary_trimmed: bool,
         attempt: u32,
         denial_source: String,
         def_gate: bool,
@@ -1816,6 +1820,7 @@ impl CoreEvent {
                 ord,
                 condition,
                 verdict_summary,
+                verdict_summary_trimmed,
                 attempt,
                 denial_source,
                 def_gate,
@@ -1829,6 +1834,7 @@ impl CoreEvent {
                 "ord": ord,
                 "condition": condition,
                 "verdictSummary": verdict_summary,
+                "verdictSummaryTrimmed": verdict_summary_trimmed,
                 "attempt": attempt,
                 "denialSource": denial_source,
                 "defGate": def_gate,
@@ -2553,6 +2559,7 @@ mod tests {
             ord: 2,
             condition: "evaluator_mutated_worktree".into(),
             verdict_summary: "the reproduce phase changed the tree".into(),
+            verdict_summary_trimmed: false,
             attempt: 0,
             denial_source: "worktree_guard".into(),
             def_gate: false,
@@ -2575,11 +2582,13 @@ mod tests {
         assert_eq!(j["discarded"][0]["status"], "A");
         assert_eq!(j["discarded"][0]["path"], "evidence/repro.md");
         assert_eq!(j["suggestionRef"], "refs/wicked/suggestions/run-1/2/0");
+        assert_eq!(j["verdictSummaryTrimmed"], false);
         let j = CoreEvent::GateEscalated {
             session: "run-1".into(),
             ord: 2,
             condition: "boundary_deny".into(),
             verdict_summary: "input governance denied a tool-call in unit-2".into(),
+            verdict_summary_trimmed: false,
             attempt: 1,
             denial_source: "input_governance".into(),
             def_gate: false,
