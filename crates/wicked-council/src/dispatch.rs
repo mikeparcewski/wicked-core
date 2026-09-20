@@ -135,6 +135,9 @@ pub struct RealDispatcher {
     /// what the failure events name, and what an operator overrides in `clis.toml`. Two keys
     /// resolving to one binary is a registry configuration, not a health question.
     seats: Arc<Mutex<HashMap<String, SeatHealth>>>,
+    /// Source of the host-load sample for dispatch-budget scaling (#557). Defaults to
+    /// [`RealLoadSource`]; tests inject a [`FixedLoadSource`] to pin the factor.
+    load_source: Arc<dyn LoadSource>,
 }
 
 /// Env var overriding the agentic/chat CLI budget, in whole seconds.
@@ -236,6 +239,25 @@ pub(crate) fn ballot_timeout_note(
     ))
 }
 
+/// Injectable source of the host-load sample used when scaling dispatch budgets.
+///
+/// The default implementation reads the real host load via [`host_load_ballot`]. Tests inject
+/// a `FixedLoadSource` to pin the factor deterministically — the seam is in production code so
+/// the same path runs in tests and in production (no `#[cfg(test)]` flag needed to exercise it).
+pub(crate) trait LoadSource: std::fmt::Debug + Send + Sync {
+    fn host_load(&self) -> (Option<f64>, Option<f64>, usize);
+}
+
+/// The real load source: delegates to [`host_load_ballot`].
+#[derive(Debug)]
+struct RealLoadSource;
+
+impl LoadSource for RealLoadSource {
+    fn host_load(&self) -> (Option<f64>, Option<f64>, usize) {
+        host_load_ballot()
+    }
+}
+
 impl Default for RealDispatcher {
     fn default() -> Self {
         RealDispatcher {
@@ -243,6 +265,7 @@ impl Default for RealDispatcher {
             local_runner_timeout: DEFAULT_LOCAL_RUNNER_TIMEOUT,
             bench: BenchConfig::default(),
             seats: Arc::new(Mutex::new(HashMap::new())),
+            load_source: Arc::new(RealLoadSource),
         }
     }
 }
@@ -280,6 +303,7 @@ impl RealDispatcher {
             ),
             bench: BenchConfig::from_env(),
             seats: Arc::new(Mutex::new(HashMap::new())),
+            load_source: Arc::new(RealLoadSource),
         }
     }
 
@@ -396,10 +420,14 @@ fn count_or(raw: Option<String>, fallback: u32) -> u32 {
 /// than a vote.
 #[derive(Debug, Clone, Copy)]
 enum SeatHealth {
-    /// Dispatching normally; tracks the current failure streak.
+    /// Dispatching normally; tracks the current failure streak and load-induced exemptions.
     Healthy {
         /// Failures in a row so far. Any parsed vote resets it to zero.
         consecutive_failures: u32,
+        /// Consecutive load-induced timeouts that have been exempted from the bench streak
+        /// (#559). Capped at `bench.threshold`; a successful vote resets it to zero. A
+        /// non-load-induced failure also resets it (the consecutive-exemption streak breaks).
+        load_exemptions: u32,
     },
     /// Sitting out until the instant. `backoff` is the span that was applied, kept so a failed
     /// probation knows what to double.
@@ -413,6 +441,7 @@ impl Default for SeatHealth {
     fn default() -> Self {
         SeatHealth::Healthy {
             consecutive_failures: 0,
+            load_exemptions: 0,
         }
     }
 }
@@ -520,16 +549,44 @@ impl RealDispatcher {
         // waiving it under load would leave the seat permanently un-re-admitted.
         // The outcome MUST be TimedOut: NonZeroExit and other failure kinds represent real seat
         // problems that must still count toward the streak regardless of host load.
+        //
+        // Exemptions are CAPPED at bench.threshold (#559). A host that stays at load ≥ 2× ncpu
+        // while a seat keeps hanging charges its full budget to every ballot indefinitely —
+        // exactly the pathology named in dispatch.rs dispatch_prompt_timed. After the cap the
+        // seat benches; the probationary ballot is still the readiness contract on the way back.
         let is_timed_out = matches!(
             outcome,
             DispatchOutcome::Failed(f) if f.kind == SeatFailureKind::TimedOut
         );
         if load_induced && is_timed_out {
-            if let SeatHealth::Healthy { .. } = *health {
+            if let SeatHealth::Healthy {
+                consecutive_failures,
+                load_exemptions,
+            } = *health
+            {
+                if load_exemptions < self.bench.threshold {
+                    *health = SeatHealth::Healthy {
+                        consecutive_failures,
+                        load_exemptions: load_exemptions + 1,
+                    };
+                    eprintln!(
+                        "wicked-council: seat `{}` timed out under load (factor ≥ 2); \
+                         not counting toward bench streak ({}/{} exemptions, #537/#559)",
+                        cli.key,
+                        load_exemptions + 1,
+                        self.bench.threshold
+                    );
+                    return;
+                }
+                // Cap exhausted: bench the seat rather than donating unbounded budget.
+                *health = SeatHealth::Benched {
+                    until: Instant::now() + self.bench.base,
+                    backoff: self.bench.base,
+                };
                 eprintln!(
-                    "wicked-council: seat `{}` timed out under load (factor ≥ 2); \
-                     not counting toward bench streak (#537)",
-                    cli.key
+                    "wicked-council: seat `{}` benched after {} consecutive load-induced \
+                     exemptions; re-admission is one probationary ballot (#559)",
+                    cli.key, self.bench.threshold
                 );
                 return;
             }
@@ -537,6 +594,7 @@ impl RealDispatcher {
         match *health {
             SeatHealth::Healthy {
                 consecutive_failures,
+                ..
             } => {
                 let streak = consecutive_failures + 1;
                 if streak >= self.bench.threshold {
@@ -555,6 +613,7 @@ impl RealDispatcher {
                 } else {
                     *health = SeatHealth::Healthy {
                         consecutive_failures: streak,
+                        load_exemptions: 0,
                     };
                 }
             }
@@ -664,7 +723,7 @@ impl RealDispatcher {
         // so a slow answer is not misread as a dead seat. One formula for both the agentic/chat
         // and local-runner budgets — no per-seat special cases.
         let base_timeout = self.timeout_for(cli);
-        let (load1, load5, cpus) = host_load_ballot();
+        let (load1, load5, cpus) = self.load_source.host_load();
         let factor = ballot_load_factor(load1, load5, cpus);
         let timeout = Duration::from_secs_f64(base_timeout.as_secs_f64() * factor);
         // A timeout at ratio ≥ 2 is a host-load event; don't count it toward the bench streak.
@@ -1952,15 +2011,30 @@ mod failure_diagnostics_tests {
         } else {
             shell_seat("slow", "sleep 30")
         };
-        let f = failure_of(&cli, Duration::from_millis(250));
+        // Pin factor to 1.0 (no load scaling): the timeout message names the raw base budget
+        // and appends no note. `detail.contains("250ms")` is then a deliberate assertion about
+        // the base, not a coincidence that the note embeds `{base:?}` at high load (#557).
+        let d = RealDispatcher {
+            timeout: Duration::from_millis(250),
+            local_runner_timeout: Duration::from_millis(250),
+            load_source: Arc::new(FixedLoadSource {
+                load1: None,
+                load5: None,
+                cpus: 1,
+            }),
+            ..RealDispatcher::default()
+        };
+        let outcome = d.dispatch_prompt(&cli, &task(), "ignored");
+        let f = match outcome {
+            DispatchOutcome::Failed(f) => f,
+            DispatchOutcome::Voted(_) => panic!("a sleeping seat must not vote"),
+        };
         assert_eq!(f.kind, SeatFailureKind::TimedOut);
         assert!(
             f.detail.contains("budget"),
             "the timeout must say it was a budget, not an error: {f:?}"
         );
-        // A sub-second budget must render as itself. `as_secs()` truncated this to
-        // "exceeded 0s dispatch budget", which reads as a bug in the budget rather than a
-        // slow seat — the exact confusion this finding is about.
+        // Factor is pinned to 1 — no note is appended, the scaled timeout IS the 250ms base.
         assert!(
             f.detail.contains("250ms"),
             "a sub-second budget must not be truncated to 0s: {f:?}"
@@ -2711,6 +2785,7 @@ mod failure_diagnostics_tests {
             cli.key.clone(),
             SeatHealth::Healthy {
                 consecutive_failures: 0,
+                load_exemptions: 0,
             },
         );
         // Record a timed-out outcome with load_induced=true.
@@ -2727,6 +2802,7 @@ mod failure_diagnostics_tests {
         match seats.get(&cli.key) {
             Some(SeatHealth::Healthy {
                 consecutive_failures: 0,
+                ..
             }) => {}
             other => {
                 panic!("load-induced timeout must not advance bench streak; health = {other:?}")
@@ -2742,6 +2818,7 @@ mod failure_diagnostics_tests {
             cli.key.clone(),
             SeatHealth::Healthy {
                 consecutive_failures: 0,
+                load_exemptions: 0,
             },
         );
         // load_induced=false → normal bench accounting
@@ -2757,9 +2834,257 @@ mod failure_diagnostics_tests {
         match seats.get(&cli.key) {
             Some(SeatHealth::Healthy {
                 consecutive_failures: n,
+                ..
             }) if *n > 0 => {}
             Some(SeatHealth::Benched { .. }) => {}
             other => panic!("genuine timeout must advance streak or bench; health = {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Pinned-factor load-source for #557/#559 tests
+    // ---------------------------------------------------------------------------
+
+    /// A [`LoadSource`] that returns fixed values, so tests never read ambient host load.
+    ///
+    /// Pass `load1: None, load5: None` and any `cpus` for factor=1.0 (no scaling).
+    /// Pass `load1: Some(cpus as f64 * 2.0)` for factor=2.0 (load_induced=true).
+    #[derive(Debug)]
+    struct FixedLoadSource {
+        load1: Option<f64>,
+        load5: Option<f64>,
+        cpus: usize,
+    }
+
+    impl LoadSource for FixedLoadSource {
+        fn host_load(&self) -> (Option<f64>, Option<f64>, usize) {
+            (self.load1, self.load5, self.cpus)
+        }
+    }
+
+    // AC-3 — bounded load exemptions via dispatch_prompt (#559)
+
+    #[test]
+    fn a_load_exempted_seat_benches_after_the_cap_is_exhausted() {
+        // After `bench.threshold` consecutive load-induced exemptions the seat must bench on the
+        // next timeout, not accumulate exemptions forever (#559).
+        let cli = if cfg!(windows) {
+            seat("load-cap", "cmd", "cmd /C \"ping -n 60 127.0.0.1\"")
+        } else {
+            shell_seat("load-cap", "sleep 60")
+        };
+        // factor = 28 / 14 = 2.0 → load_induced = true.
+        let d = RealDispatcher {
+            timeout: Duration::from_millis(100),
+            local_runner_timeout: Duration::from_millis(100),
+            load_source: Arc::new(FixedLoadSource {
+                load1: Some(28.0),
+                load5: Some(28.0),
+                cpus: 14,
+            }),
+            ..RealDispatcher::default()
+        };
+        let threshold = DEFAULT_SEAT_BENCH_THRESHOLD;
+        // First `threshold` dispatches are exempted — load_exemptions climbs 0 → threshold.
+        for i in 1..=threshold {
+            d.dispatch_prompt(&cli, &task(), "ignored");
+            let seats = d.seats.lock().unwrap();
+            match seats.get(&cli.key) {
+                Some(SeatHealth::Healthy { load_exemptions, .. }) => {
+                    assert_eq!(
+                        *load_exemptions, i,
+                        "exemption counter must be {i}/{threshold} after dispatch {i}"
+                    );
+                }
+                other => panic!(
+                    "seat must still be healthy after {i}/{threshold} exemptions; health = {other:?}"
+                ),
+            }
+        }
+        // (threshold + 1)th dispatch: cap exhausted → seat must bench.
+        d.dispatch_prompt(&cli, &task(), "ignored");
+        let seats = d.seats.lock().unwrap();
+        assert!(
+            matches!(seats.get(&cli.key), Some(SeatHealth::Benched { .. })),
+            "seat must be benched after exhausting {} load-induced exemptions; health = {:?}",
+            threshold,
+            seats.get(&cli.key)
+        );
+    }
+
+    #[test]
+    fn a_successful_vote_between_load_timeouts_resets_the_exemption_counter() {
+        // A seat that answers between load-induced timeouts has its exemption streak cleared
+        // and is not penalised for what happened before the vote (#557/#559).
+        let key = "load-reset-seat";
+        let slow = if cfg!(windows) {
+            seat(key, "cmd", "cmd /C \"ping -n 60 127.0.0.1\"")
+        } else {
+            shell_seat(key, "sleep 60")
+        };
+        let fast = shell_seat(key, "echo RECOMMENDATION: 1 ok");
+        let d = RealDispatcher {
+            timeout: Duration::from_millis(100),
+            local_runner_timeout: Duration::from_millis(100),
+            load_source: Arc::new(FixedLoadSource {
+                load1: Some(28.0),
+                load5: Some(28.0),
+                cpus: 14,
+            }),
+            ..RealDispatcher::default()
+        };
+        // One load-induced timeout raises the exemption counter.
+        d.dispatch_prompt(&slow, &task(), "ignored");
+        {
+            let seats = d.seats.lock().unwrap();
+            match seats.get(key) {
+                Some(SeatHealth::Healthy {
+                    load_exemptions, ..
+                }) if *load_exemptions > 0 => {}
+                other => panic!(
+                    "exemption counter must be > 0 after a load-induced timeout; health = {other:?}"
+                ),
+            }
+        }
+        // A successful vote clears the exemption counter and the failure streak to zero.
+        d.dispatch_prompt(&fast, &task(), "ignored");
+        let seats = d.seats.lock().unwrap();
+        match seats.get(key) {
+            Some(SeatHealth::Healthy {
+                consecutive_failures: 0,
+                load_exemptions: 0,
+            }) => {}
+            other => panic!(
+                "a successful vote must reset all health counters to zero; health = {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_non_zero_exit_at_high_load_still_advances_the_bench_streak() {
+        // NonZeroExit is a real seat problem and must count toward the streak even when the
+        // dispatch budget was scaled at factor ≥ 2 — only TimedOut is load-exempt (#537/#559).
+        let cli = shell_seq_seat("nonzero-under-load", &["exit 1"]);
+        let d = RealDispatcher {
+            timeout: Duration::from_secs(10),
+            local_runner_timeout: Duration::from_secs(10),
+            load_source: Arc::new(FixedLoadSource {
+                load1: Some(28.0),
+                load5: Some(28.0),
+                cpus: 14,
+            }),
+            ..RealDispatcher::default()
+        };
+        d.dispatch_prompt(&cli, &task(), "ignored");
+        let seats = d.seats.lock().unwrap();
+        match seats.get(&cli.key) {
+            Some(SeatHealth::Healthy {
+                consecutive_failures: n,
+                ..
+            }) if *n > 0 => {}
+            Some(SeatHealth::Benched { .. }) => {}
+            other => panic!(
+                "a non-zero exit must advance the bench streak even at high load; health = {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn interleaved_non_zero_exit_and_load_timeout_still_benches_seat() {
+        // Regression for the write-zero bug: the load-exemption branch previously wrote
+        // `consecutive_failures: 0`, zeroing any real-failure streak. A seat that alternates
+        // NonZeroExit / load-TimedOut / NonZeroExit at threshold=2 never benched because each
+        // branch zeroed the other's counter. After the fix the exemption carries
+        // `consecutive_failures` unchanged so the third dispatch reaches streak=2 and benches.
+        let key = "interleaved-bench";
+        let failing = shell_seq_seat(key, &["exit 1"]);
+        let hanging = if cfg!(windows) {
+            seat(key, "cmd", "cmd /C \"ping -n 60 127.0.0.1\"")
+        } else {
+            shell_seat(key, "sleep 60")
+        };
+        // factor = 28 / 14 = 2.0 → load_induced = true for the hanging dispatch.
+        let d = RealDispatcher {
+            timeout: Duration::from_millis(100),
+            local_runner_timeout: Duration::from_millis(100),
+            load_source: Arc::new(FixedLoadSource {
+                load1: Some(28.0),
+                load5: Some(28.0),
+                cpus: 14,
+            }),
+            ..RealDispatcher::default()
+        };
+        // Dispatch 1: NonZeroExit — not load-induced → consecutive_failures becomes 1.
+        d.dispatch_prompt(&failing, &task(), "ignored");
+        {
+            let seats = d.seats.lock().unwrap();
+            match seats.get(key) {
+                Some(SeatHealth::Healthy {
+                    consecutive_failures: 1,
+                    load_exemptions: 0,
+                }) => {}
+                other => {
+                    panic!("after dispatch 1 (NonZeroExit) expected {{cf 1, le 0}}; got {other:?}")
+                }
+            }
+        }
+        // Dispatch 2: load-induced TimedOut → should carry consecutive_failures=1, set le=1.
+        d.dispatch_prompt(&hanging, &task(), "ignored");
+        {
+            let seats = d.seats.lock().unwrap();
+            match seats.get(key) {
+                Some(SeatHealth::Healthy {
+                    consecutive_failures: 1,
+                    load_exemptions: 1,
+                }) => {}
+                other => {
+                    panic!(
+                        "after dispatch 2 (load-TimedOut) expected {{cf 1, le 1}}; got {other:?}"
+                    )
+                }
+            }
+        }
+        // Dispatch 3: NonZeroExit → streak = 1+1 = 2 ≥ threshold → seat must bench.
+        d.dispatch_prompt(&failing, &task(), "ignored");
+        let seats = d.seats.lock().unwrap();
+        assert!(
+            matches!(seats.get(key), Some(SeatHealth::Benched { .. })),
+            "seat must be benched after NonZeroExit / load-TimedOut / NonZeroExit at threshold=2; health = {:?}",
+            seats.get(key)
+        );
+    }
+
+    #[test]
+    fn a_timeout_at_factor_one_advances_the_bench_streak() {
+        // At factor < 2 (load_induced=false), a timed-out seat is treated as a real failure —
+        // exemptions do not apply and the streak still leads to bench (#557/#559).
+        let cli = if cfg!(windows) {
+            seat("factor-one-slow", "cmd", "cmd /C \"ping -n 60 127.0.0.1\"")
+        } else {
+            shell_seat("factor-one-slow", "sleep 60")
+        };
+        // load1=None, load5=None → factor=1.0 → load_induced=false.
+        let d = RealDispatcher {
+            timeout: Duration::from_millis(100),
+            local_runner_timeout: Duration::from_millis(100),
+            load_source: Arc::new(FixedLoadSource {
+                load1: None,
+                load5: None,
+                cpus: 1,
+            }),
+            ..RealDispatcher::default()
+        };
+        d.dispatch_prompt(&cli, &task(), "ignored");
+        let seats = d.seats.lock().unwrap();
+        match seats.get(&cli.key) {
+            Some(SeatHealth::Healthy {
+                consecutive_failures: n,
+                ..
+            }) if *n > 0 => {}
+            Some(SeatHealth::Benched { .. }) => {}
+            other => panic!(
+                "a timeout at factor 1 must advance the bench streak as before; health = {other:?}"
+            ),
         }
     }
 }
