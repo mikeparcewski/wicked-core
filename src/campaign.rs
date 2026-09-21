@@ -658,6 +658,9 @@ pub(crate) struct Seams<'a> {
     /// Actor's `process_gen` UUID — passed to `launch_run_inner`/`confirm_gate` so
     /// exec-bus consumers (DES-002) can match campaign-owned tasks to this actor instance.
     pub process_gen: uuid::Uuid,
+    /// Shared lifecycle maps — passed to `cancel_run` so tool child groups are killed
+    /// synchronously BEFORE `RunCancelled` is emitted (core#500 / AC2).
+    pub lifecycle_maps: &'a Option<Arc<std::sync::Mutex<crate::acp_runner::ElicitationMaps>>>,
 }
 
 /// Record + fan out one event (mirrors the actor's single-emit-point helper). Both helpers now bottom
@@ -1217,7 +1220,14 @@ pub(crate) fn cancel(
     }
     persist(store, &mut campaign)?;
     for rid in &live {
-        let _ = crate::actor::cancel_run(store, subscribers, seams.runner, seams.self_tx, rid);
+        let _ = crate::actor::cancel_run(
+            store,
+            subscribers,
+            seams.runner,
+            seams.self_tx,
+            rid,
+            seams.lifecycle_maps,
+        );
         in_flight.remove(rid);
     }
     emit(
@@ -1506,7 +1516,14 @@ fn fail_fast(
     }
     persist(store, campaign)?;
     for rid in &live {
-        let _ = crate::actor::cancel_run(store, subscribers, seams.runner, seams.self_tx, rid);
+        let _ = crate::actor::cancel_run(
+            store,
+            subscribers,
+            seams.runner,
+            seams.self_tx,
+            rid,
+            seams.lifecycle_maps,
+        );
         in_flight.remove(rid);
     }
     Ok(())

@@ -832,6 +832,7 @@ fn apply_minimal_env(cmd: &mut Command) {
 #[cfg(unix)]
 mod sig {
     pub const SIGKILL: i32 = 9;
+    pub const SIGTERM: i32 = 15;
     extern "C" {
         pub fn killpg(pgrp: i32, sig: i32) -> i32;
     }
@@ -850,6 +851,44 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
         unsafe { sig::killpg(pgid, sig::SIGKILL) };
     }
     let _ = child.kill();
+}
+
+/// Kill a process group gracefully from the ACTOR THREAD (no `Child` handle — only the pgid from the
+/// tool-child registry). Sends SIGTERM, waits up to ~500 ms, then SIGKILL if still alive. Returns `true`
+/// if the group was live when first signalled, `false` if it was already dead (ESRCH). The background
+/// thread that owns the `Child` handle remains responsible for `wait()` / reaping; double-signalling an
+/// already-dead group is harmless. Called by `cancel_run` and `ReassignUnit` BEFORE emitting
+/// `RunCancelled` / `UnitReassigned` so the wire never asserts cancellation while tool children live
+/// (AC2 / core#500).
+#[cfg(unix)]
+pub(crate) fn kill_pgroup_graceful(pgid: u32) -> bool {
+    let pgid = pgid as i32;
+    // SIGTERM first — a well-behaved child flushes and exits; ESRCH means already gone.
+    let term_rc = unsafe { sig::killpg(pgid, sig::SIGTERM) };
+    if term_rc != 0 {
+        return false;
+    }
+    // Poll up to 500 ms in 20 ms ticks for the group to die after SIGTERM.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if unsafe { sig::killpg(pgid, 0) } != 0 {
+            return true; // died on SIGTERM
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Force-kill anything that survived SIGTERM.
+    unsafe { sig::killpg(pgid, sig::SIGKILL) };
+    // Confirm the SIGKILL landed — the kernel dequeues it asynchronously. Poll up to 200 ms so
+    // callers can trust "returned true" means "group is dead, not just signalled".
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    while std::time::Instant::now() < deadline {
+        if unsafe { sig::killpg(pgid, 0) } != 0 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Group survived SIGKILL within the budget — do not count it as reaped.
+    false
 }
 
 /// Reap a just-killed child WITHOUT blocking forever (C5): poll `try_wait` up to a short cap instead of a

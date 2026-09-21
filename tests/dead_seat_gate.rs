@@ -317,11 +317,11 @@ fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() 
     let post = collect_until(
         &ev,
         Duration::from_secs(5),
-        |e| matches!(e, CoreEvent::RunCancelled { session } if session == sid),
+        |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == sid),
     );
     assert!(
         post.iter()
-            .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == sid)),
+            .any(|e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == sid)),
         "{post:?}"
     );
     no_session_failed(&post, sid);
@@ -357,7 +357,7 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
     let post = collect_until(&ev, Duration::from_secs(15), |e| {
         matches!(e, CoreEvent::SessionCompleted { session } if session == sid)
             || matches!(e, CoreEvent::SessionFailed { session, .. } if session == sid)
-            || matches!(e, CoreEvent::RunCancelled { session } if session == sid)
+            || matches!(e, CoreEvent::RunCancelled { session, .. } if session == sid)
     });
     no_session_failed(&post, sid);
     let resumed = post

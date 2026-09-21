@@ -198,11 +198,11 @@ fn auto_reject_cancels_the_escalation_gated_node_and_holds_the_run_level_gate() 
         .expect("campaignNodeAwaitingHuman{esc}");
     let cancelled = evs
         .iter()
-        .position(|e| matches!(e, CoreEvent::RunCancelled { session } if session == esc_run))
+        .position(|e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == esc_run))
         .expect("runCancelled for the esc run");
     assert!(awaiting < cancelled, "disclosed before answered: {evs:?}");
     assert!(!evs.iter().any(
-        |e| matches!(e, CoreEvent::RunCancelled { session } if session == "camp-auto:gate:a0")
+        |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "camp-auto:gate:a0")
     ));
     assert!(
         !evs.iter()

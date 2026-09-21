@@ -119,7 +119,7 @@ fn wait_for_gate(
             }) if s == session => return Ok((ord, reviewing_ord, prompt)),
             Ok(CoreEvent::SessionCompleted { session: s })
             | Ok(CoreEvent::SessionFailed { session: s, .. })
-            | Ok(CoreEvent::RunCancelled { session: s })
+            | Ok(CoreEvent::RunCancelled { session: s, .. })
                 if s == session =>
             {
                 return Err(format!("run {session} went terminal without ever pausing"))

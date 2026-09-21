@@ -892,7 +892,7 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                         }
                     }
                     CoreEvent::SessionCompleted { session }
-                    | CoreEvent::RunCancelled { session }
+                    | CoreEvent::RunCancelled { session, .. }
                     | CoreEvent::SessionFailed { session, .. }
                         if is_mine(session) =>
                     {

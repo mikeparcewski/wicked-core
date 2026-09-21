@@ -2023,7 +2023,14 @@ pub(crate) fn run(
                 // Discard any coalesced live-output tail: the operator is discarding the run, and
                 // the throttle entry must not outlive it.
                 let _ = output_throttle.drain_run(&run_id);
-                let res = cancel_run(&mut store, &mut subscribers, &runner, &self_tx, &run_id);
+                let res = cancel_run(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &run_id,
+                    &lifecycle_maps,
+                );
                 // Retire launch state now that the sequence has been advanced.
                 if let Some(ref m) = lifecycle_maps {
                     let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
@@ -2442,7 +2449,14 @@ pub(crate) fn run(
             }
             // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
             Command::LaunchCampaign { def, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
+                let seams = campaign_seams(
+                    &dispatcher,
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                );
                 let res = crate::campaign::launch(
                     &mut store,
                     &mut subscribers,
@@ -2453,7 +2467,14 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::ResumeCampaign { id, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
+                let seams = campaign_seams(
+                    &dispatcher,
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                );
                 let res = crate::campaign::resume(
                     &mut store,
                     &mut subscribers,
@@ -2464,7 +2485,14 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelCampaign { id, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
+                let seams = campaign_seams(
+                    &dispatcher,
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                );
                 let res = crate::campaign::cancel(
                     &mut store,
                     &mut subscribers,
@@ -2484,7 +2512,14 @@ pub(crate) fn run(
                 decision,
                 reply,
             } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
+                let seams = campaign_seams(
+                    &dispatcher,
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                );
                 let res = crate::campaign::confirm_gate(
                     &mut store,
                     &mut subscribers,
@@ -2507,7 +2542,14 @@ pub(crate) fn run(
             Command::CampaignRunFinished { run_id, outcome } => {
                 // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
                 // points). No-op if the run isn't campaign-owned.
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
+                let seams = campaign_seams(
+                    &dispatcher,
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                );
                 if let Err(e) = crate::campaign::on_run_finished(
                     &mut store,
                     &mut subscribers,
@@ -2521,7 +2563,14 @@ pub(crate) fn run(
             }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
+                let seams = campaign_seams(
+                    &dispatcher,
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                );
                 if let Err(e) = crate::campaign::on_node_awaiting(
                     &mut store,
                     &mut subscribers,
@@ -2763,6 +2812,28 @@ pub(crate) fn run(
                 // `PersistentStepRunner::close_cli_session` just removes from its sessions map
                 // (non-blocking — the terminal was already killed by `finish_terminal` above).
                 runner.close_cli_session(&run_id, &previous_cli);
+                // ── kill any live tool child group BEFORE emitting UnitReassigned ───────────
+                // core#500 / AC2: the replacement must not be dispatched while the old attempt's
+                // child is still alive. Graceful kill (SIGTERM → bounded wait → SIGKILL); the
+                // background thread reaps after it observes stop() (sequence advanced above).
+                let previous_attempt_reaped: bool = {
+                    let pgroups = lifecycle_maps
+                        .as_ref()
+                        .map(|m| {
+                            m.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .take_tool_child_pgroups(&run_id)
+                        })
+                        .unwrap_or_default();
+                    let mut killed = false;
+                    #[cfg(unix)]
+                    for pgid in pgroups {
+                        if crate::validator::kill_pgroup_graceful(pgid) {
+                            killed = true;
+                        }
+                    }
+                    killed
+                };
                 // ── bump attempt ────────────────────────────────────────────────────────────
                 let new_attempt = session.attempt.saturating_add(1);
                 {
@@ -2797,6 +2868,7 @@ pub(crate) fn run(
                                 attempt: new_attempt,
                                 previous_cli: previous_cli.clone(),
                                 new_cli: Some(cli.clone()),
+                                previous_attempt_reaped,
                             },
                         );
                         // Re-dispatch the cursor unit.
@@ -2857,6 +2929,7 @@ pub(crate) fn run(
                                 attempt: new_attempt,
                                 previous_cli: previous_cli.clone(),
                                 new_cli: None,
+                                previous_attempt_reaped,
                             },
                         );
                         let _ = reply.send(Ok(()));
@@ -3363,6 +3436,7 @@ fn campaign_seams<'a>(
     self_tx: &'a Sender<Command>,
     registry: &'a crate::workflow::WorkflowRegistry,
     process_gen: uuid::Uuid,
+    lifecycle_maps: &'a Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
 ) -> crate::campaign::Seams<'a> {
     crate::campaign::Seams {
         dispatcher,
@@ -3370,6 +3444,7 @@ fn campaign_seams<'a>(
         self_tx,
         registry,
         process_gen,
+        lifecycle_maps,
     }
 }
 
@@ -4256,6 +4331,19 @@ fn apply_step_result(
         session.status,
         SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
     ) {
+        // core#500: a killed attempt posts Cancelled after RunCancelled — emit a typed event so
+        // consumers can observe the discard rather than seeing a silent no-op.
+        if matches!(output.status, crate::workflow::StepStatus::Cancelled) {
+            emit(
+                subscribers,
+                CoreEvent::ToolResultDiscarded {
+                    session: run_id.clone(),
+                    unit_ix: output.unit_ix,
+                    attempt: output.attempt,
+                    reason: "cancelled".to_string(),
+                },
+            );
+        }
         return Ok(StepApplied::Stale);
     }
     // Idempotency guard: only the unit the cursor is currently on, and only once.
@@ -4269,6 +4357,16 @@ fn apply_step_result(
     // attempt currently in flight for `unit_ix`; anything older is a redelivery — drop it, regardless of
     // unit status. (Equal attempt is the expected current result → apply; a higher attempt cannot exist.)
     if output.attempt < session.attempt {
+        // core#500: a superseded attempt posted its result late — emit a typed discard event.
+        emit(
+            subscribers,
+            CoreEvent::ToolResultDiscarded {
+                session: run_id.clone(),
+                unit_ix: output.unit_ix,
+                attempt: output.attempt,
+                reason: "superseded".to_string(),
+            },
+        );
         return Ok(StepApplied::Stale);
     }
     let mut output = output;
@@ -4427,6 +4525,10 @@ fn apply_step_result(
             subscribers,
             CoreEvent::RunCancelled {
                 session: run_id.clone(),
+                // No tool child to kill here — this is the elicitation-timeout cancel path,
+                // which fires inside apply_step_result after the run's tool phase has long
+                // since completed.
+                tool_children_killed: 0,
             },
         );
         notify_campaign(self_tx, &run_id, crate::campaign::NodeOutcome::Cancelled);
@@ -6697,7 +6799,11 @@ fn dispatch_unit(
         // `cancelled` — but the tombstone is retired right after `cancel_run`, so a late poll
         // reads `superseded` (the sequence moved too). Consumers key on ORDER, never the word.
         let maps_for_child = elicitation_maps.clone();
+        // Separate arc for the registration callbacks so `stop` can move `maps_for_child`
+        // independently (core#500 / AC2).
+        let maps_for_reg = elicitation_maps.clone();
         let run_for_child = run_id.to_string();
+        let run_for_reg = run_id.to_string();
         let my_seq = launch_seq;
         std::thread::spawn(move || {
             let stop = move || -> Option<&'static str> {
@@ -6711,6 +6817,28 @@ fn dispatch_unit(
                     Some("shutdown")
                 } else {
                     None
+                }
+            };
+            // core#500 / AC2: register/deregister the child pgid so the actor thread can kill it
+            // synchronously before emitting RunCancelled / UnitReassigned.
+            let maps_reg = maps_for_reg.clone();
+            let run_reg = run_for_reg.clone();
+            let on_spawn = |pgid: u32| {
+                if let Some(ref m) = maps_reg {
+                    m.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .register_tool_child(&run_reg, pgid);
+                }
+            };
+            let maps_dereg = maps_for_reg.clone();
+            let run_dereg = run_for_reg.clone();
+            // pgid is forwarded from on_spawn via run_tool_cmd so the compare-and-remove in
+            // deregister_tool_child uses the exact pgid this attempt registered (core#500).
+            let on_done = |pgid: u32| {
+                if let Some(ref m) = maps_dereg {
+                    m.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .deregister_tool_child(&run_dereg, pgid);
                 }
             };
             let mut killed: Option<ToolKilled> = None;
@@ -6771,12 +6899,26 @@ fn dispatch_unit(
                                     vec![(crate::deliver_lift::VERIFIED_BASE_ENV.to_string(), b)]
                                 })
                                 .unwrap_or_default();
-                            let (o, st, k) = run_tool_cmd(&cmd, workdir.as_deref(), &env, &stop);
+                            let (o, st, k) = run_tool_cmd(
+                                &cmd,
+                                workdir.as_deref(),
+                                &env,
+                                &stop,
+                                &on_spawn,
+                                &on_done,
+                            );
                             killed = k;
                             (o, st)
                         }
                         None => {
-                            let (o, st, k) = run_tool_cmd(&cmd, workdir.as_deref(), &[], &stop);
+                            let (o, st, k) = run_tool_cmd(
+                                &cmd,
+                                workdir.as_deref(),
+                                &[],
+                                &stop,
+                                &on_spawn,
+                                &on_done,
+                            );
                             killed = k;
                             (o, st)
                         }
@@ -7013,11 +7155,17 @@ fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
 /// child yields `StepStatus::Cancelled`, the output so far plus `\n[killed: <reason>]`, and the
 /// [`ToolKilled`] record the caller turns into `toolExecutorKilled`. Windows has no process
 /// groups: `kill_child_tree` reaches the leader only (as the ACP and wrapped carriers today).
+// on_spawn: called immediately after spawn with the child pid (== pgid on unix); the caller
+// registers it in lifecycle maps so the actor can kill the group synchronously (core#500).
+// on_done: called when the poll loop exits with the pgid that was spawned; the caller
+// passes it back to deregister_tool_child for a compare-and-remove (core#500).
 fn run_tool_cmd(
     cmd: &[String],
     workdir: Option<&str>,
     extra_env: &[(String, String)],
     stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
 ) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
     use crate::workflow::StepStatus;
     use std::process::{Command, Stdio};
@@ -7074,6 +7222,9 @@ fn run_tool_cmd(
         }
     };
     let pid = child.id();
+    // Register the child's pgid (== pid on unix) so the actor thread can kill it synchronously
+    // during cancel / supersede BEFORE emitting RunCancelled / UnitReassigned (core#500 / AC2).
+    on_spawn(pid);
     let started = std::time::Instant::now();
     let so = child.stdout.take();
     let se = child.stderr.take();
@@ -7086,6 +7237,16 @@ fn run_tool_cmd(
                     // QUIESCE (twin of `run_bounded`): the leader exited but is not yet reaped, so
                     // its pid — the group id — is still reserved; kill the group FIRST (anything
                     // the script backgrounded dies with the phase), THEN collect the status.
+                    //
+                    // core#500 / Gap 1: if the actor already killed us (cancel / supersede), take
+                    // the Killed path instead of Exited — the wire needs ToolExecutorKilled and the
+                    // result must be StepStatus::Cancelled, not Failed, so the Stale guard can fire
+                    // ToolResultDiscarded with the correct `reason`.
+                    if let Some(reason) = stop() {
+                        crate::validator::kill_child_tree(&mut child);
+                        crate::validator::reap_bounded(&mut child);
+                        break ToolExit::Killed(reason);
+                    }
                     crate::validator::kill_child_tree(&mut child);
                     break ToolExit::Exited(child.wait().ok());
                 }
@@ -7110,6 +7271,9 @@ fn run_tool_cmd(
             exit,
         )
     });
+    // Deregister before returning so the actor thread's registry stays current.
+    // Pass pid (== pgid on unix) so deregister_tool_child can compare-and-remove (core#500).
+    on_done(pid);
     let mut combined = String::from_utf8_lossy(&stdout_b).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_b);
     if !stderr.is_empty() {
@@ -7609,7 +7773,7 @@ pub(crate) fn confirm_gate(
         Option<Option<String>>,
     ) = match decision {
         crate::workflow::HumanDecision::Reject => {
-            let s = cancel_run(store, subscribers, runner, self_tx, run_id)?;
+            let s = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps)?;
             in_flight.remove(run_id);
             return Ok(s);
         }
@@ -7658,7 +7822,8 @@ pub(crate) fn confirm_gate(
                     // (the human must re-launch) — deny-dominates means Approve cannot override
                     // a policy veto (ADR-0003). Remove from in_flight only after cancel_run so
                     // a write failure leaves the map consistent (run stays in_flight = retryable).
-                    let result = cancel_run(store, subscribers, runner, self_tx, run_id);
+                    let result =
+                        cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps);
                     if result.is_ok() {
                         in_flight.remove(run_id);
                     }
@@ -8020,6 +8185,7 @@ pub(crate) fn cancel_run(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
 ) -> anyhow::Result<SessionStatus> {
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
@@ -8030,6 +8196,29 @@ pub(crate) fn cancel_run(
         SessionStatus::Failed => return Ok(SessionStatus::Failed),
         _ => {}
     }
+    // core#500 / AC2: kill any live tool child group BEFORE the Cancelled status is written to the
+    // store — a reader polling the store between the write and the kill would see a cancelled run
+    // with a live child, violating AC2. SIGTERM → bounded wait → SIGKILL; the background thread
+    // owns the Child handle and will reap after it observes stop(). Double-signalling an
+    // already-dead group is harmless (ESRCH). Returns true only when death is confirmed.
+    let tool_children_killed: u32 = {
+        let pgroups = lifecycle_maps
+            .as_ref()
+            .map(|m| {
+                m.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take_tool_child_pgroups(run_id)
+            })
+            .unwrap_or_default();
+        let mut killed = 0u32;
+        #[cfg(unix)]
+        for pgid in pgroups {
+            if crate::validator::kill_pgroup_graceful(pgid) {
+                killed += 1;
+            }
+        }
+        killed
+    };
     session.status = SessionStatus::Cancelled;
     session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
@@ -8085,6 +8274,7 @@ pub(crate) fn cancel_run(
         subscribers,
         CoreEvent::RunCancelled {
             session: run_id.to_string(),
+            tool_children_killed,
         },
     );
     notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Cancelled);
@@ -14892,9 +15082,9 @@ mod turn_timeout_vs_cancel_tests {
             "the turn-timeout must be wire-distinguishable from an operator cancel"
         );
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == &run_id)),
+            events.iter().any(
+                |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == &run_id)
+            ),
             "the terminal frame stays RunCancelled — additive distinction, no wire break"
         );
     }
@@ -14936,9 +15126,11 @@ mod turn_timeout_vs_cancel_tests {
             SessionStatus::Executing,
             "the reassigned run keeps executing; the old turn's death cannot cancel it"
         );
+        // core#500: a superseded attempt's stale drop now emits ToolResultDiscarded; it must NOT
+        // emit RunCancelled or UnitOutputCaptured.
         assert!(
-            events.is_empty(),
-            "a stale drop emits nothing — no RunCancelled, no UnitOutputCaptured; got {events:?}"
+            events.iter().all(|e| matches!(e, CoreEvent::ToolResultDiscarded { .. })),
+            "a stale drop may only emit ToolResultDiscarded — no RunCancelled, no UnitOutputCaptured; got {events:?}"
         );
 
         // core#358: a superseded WRAPPED fallback now returns Cancelled (not TimedOut). It also
@@ -14947,7 +15139,9 @@ mod turn_timeout_vs_cancel_tests {
         assert!(matches!(applied, StepApplied::Stale));
         assert_eq!(session.status, SessionStatus::Executing);
         assert!(
-            events.is_empty(),
+            events
+                .iter()
+                .all(|e| matches!(e, CoreEvent::ToolResultDiscarded { .. })),
             "a late reassign-cancelled output is stale too; got {events:?}"
         );
 
@@ -15122,6 +15316,9 @@ mod tool_cmd_tests {
         None
     }
 
+    fn noop_spawn(_: u32) {}
+    fn noop_done(_: u32) {}
+
     #[cfg(unix)]
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
@@ -15149,17 +15346,31 @@ mod tool_cmd_tests {
     #[test]
     fn natural_exit_is_byte_identical_to_the_blocking_output_it_replaced() {
         // exit 0, stdout + stderr: stderr joins on its own line, no suffix.
-        let (out, st, k) = run_tool_cmd(&sh("printf out; printf err >&2"), None, &[], &never);
+        let (out, st, k) = run_tool_cmd(
+            &sh("printf out; printf err >&2"),
+            None,
+            &[],
+            &never,
+            &noop_spawn,
+            &noop_done,
+        );
         assert_eq!(out, "out\nerr");
         assert_eq!(st, StepStatus::Ok);
         assert!(k.is_none());
         // exit 3: the `[exit N]` suffix, Failed.
-        let (out, st, k) = run_tool_cmd(&sh("printf x; exit 3"), None, &[], &never);
+        let (out, st, k) = run_tool_cmd(
+            &sh("printf x; exit 3"),
+            None,
+            &[],
+            &never,
+            &noop_spawn,
+            &noop_done,
+        );
         assert_eq!(out, "x\n[exit 3]");
         assert_eq!(st, StepStatus::Failed);
         assert!(k.is_none());
         // silent success: empty output.
-        let (out, st, _) = run_tool_cmd(&sh("exit 0"), None, &[], &never);
+        let (out, st, _) = run_tool_cmd(&sh("exit 0"), None, &[], &never, &noop_spawn, &noop_done);
         assert_eq!(out, "");
         assert_eq!(st, StepStatus::Ok);
         // `extra_env` and `workdir` still reach the child.
@@ -15169,6 +15380,8 @@ mod tool_cmd_tests {
             Some(wd.to_str().unwrap()),
             &[("WICKED_TOOL_TEST_ENV".into(), "reached".into())],
             &never,
+            &noop_spawn,
+            &noop_done,
         );
         assert_eq!(st, StepStatus::Ok);
         assert!(out.starts_with("reached\n"), "{out}");
@@ -15183,7 +15396,7 @@ mod tool_cmd_tests {
         // 9 × 1 MiB lines of 'x' — past the 8 MiB cap.
         let script = "i=0; while [ $i -lt 9 ]; do head -c 1048576 /dev/zero | tr '\\0' x; echo; \
                       i=$((i+1)); done; exit 0";
-        let (out, st, k) = run_tool_cmd(&sh(script), None, &[], &never);
+        let (out, st, k) = run_tool_cmd(&sh(script), None, &[], &never, &noop_spawn, &noop_done);
         assert_eq!(
             st,
             StepStatus::Ok,
@@ -15202,11 +15415,13 @@ mod tool_cmd_tests {
             None,
             &[],
             &never,
+            &noop_spawn,
+            &noop_done,
         );
         assert!(out.starts_with("failed to spawn"), "{out}");
         assert_eq!(st, StepStatus::Failed);
         assert!(k.is_none());
-        let (out, st, k) = run_tool_cmd(&[], None, &[], &never);
+        let (out, st, k) = run_tool_cmd(&[], None, &[], &never, &noop_spawn, &noop_done);
         assert_eq!(out, "tool phase has empty cmd");
         assert_eq!(st, StepStatus::Failed);
         assert!(k.is_none());
@@ -15228,7 +15443,7 @@ mod tool_cmd_tests {
         let m = marker.clone();
         let stop = move || m.exists().then_some("cancelled");
         let started = Instant::now();
-        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop);
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop, &noop_spawn, &noop_done);
         let took = started.elapsed();
         assert_eq!(st, StepStatus::Cancelled);
         assert!(out.contains("started"), "the output tail is kept: {out}");
@@ -15264,7 +15479,7 @@ mod tool_cmd_tests {
                 .filter(|s| s.trim().parse::<i32>().is_ok())
                 .map(|_| "superseded")
         };
-        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop);
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop, &noop_spawn, &noop_done);
         assert_eq!(st, StepStatus::Cancelled);
         assert!(out.ends_with("\n[killed: superseded]"), "{out}");
         let k = k.expect("killed");

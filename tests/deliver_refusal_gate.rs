@@ -182,7 +182,7 @@ fn drain_until(
 fn is_terminal(ev: &CoreEvent, sid: &str) -> bool {
     matches!(ev, CoreEvent::SessionCompleted { session } if session == sid)
         || matches!(ev, CoreEvent::SessionFailed { session, .. } if session == sid)
-        || matches!(ev, CoreEvent::RunCancelled { session } if session == sid)
+        || matches!(ev, CoreEvent::RunCancelled { session, .. } if session == sid)
 }
 
 /// DES-L9 §4 — the script's identity refusal (D-18), verbatim.

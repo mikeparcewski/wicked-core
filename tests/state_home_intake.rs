@@ -106,7 +106,7 @@ fn drain_until_terminal(
                     || matches!(&ev,
                     CoreEvent::SessionFailed { session: s, .. } if s == session)
                     || matches!(&ev,
-                    CoreEvent::RunCancelled { session: s } if s == session)
+                    CoreEvent::RunCancelled { session: s, .. } if s == session)
                     || matches!(&ev,
                     CoreEvent::AwaitingHuman { session: s, .. } if s == session);
                 collected.push(ev);
