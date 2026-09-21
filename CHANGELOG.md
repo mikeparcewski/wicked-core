@@ -14,6 +14,30 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.30** — 2026-09-21 — npm release carrying the five engine changes since 0.7.29, on
+  main tip `8663d4b`. **Council ballot budget now scales with host load (#537).** The per-ballot
+  dispatch budget was a fixed 40 s; it is now `base × clamp(max(load1, load5) / ncpu, 1, 5)`, and
+  the `TimedOut` message names the derivation. Field shape this fixes: a seat answering in
+  40.07–40.81 s against a 40 s budget was benched as dead three times in one night, which then
+  routed the evaluator onto the creator's seat. Note it keys on `max(load1, load5)`, not `load1`
+  alone — the 5-min average predicted the bench where the 1-min average did not.
+  **The load exemption is bounded and testable (#557, #559).** A timed-out seat at factor ≥ 2 is
+  exempt from the bench streak, but only `SeatFailureKind::TimedOut` — a `NonZeroExit` still benches
+  on the first failure — and only up to `bench.threshold` consecutive exemptions, after which the
+  seat benches anyway. Without that cap, a seat that *hung* on a persistently loaded host would
+  never bench and would charge the enlarged budget to every ballot. `RealDispatcher` gains
+  `load_source: Arc<dyn LoadSource>` so tests pin the factor; this is the production path, not a
+  `#[cfg(test)]` seam. **Operator notes survive a deliver-gate `request_changes` (#549).** The
+  re-dispatch injected no `[review — unit N — requested changes]` context item at a deliver gate,
+  because the fallback read the evaluator transcript and a tool-executor unit has none — the creator
+  never saw the note. The amendment is now stored on the unit at rewind time and injected uncapped;
+  the engine trims its own verdict summary instead, and `gateEscalated` carries
+  `verdictSummaryTrimmed`. **Write fence re-scoped (#541, #540)** to program-word denial and an
+  absolute-path boundary with a ReadOnly post-hoc witness; the command-string scanners are retired.
+  **Floor and judge fail closed (#538, #539):** an unclassifiable red base no longer passes, the
+  judge is skipped on the creator seat with per-seat reasons, and node:test failure ids are parsed.
+  Wire shape: additive only.
+
 - **Council load-induced exemption is now bounded and testable: host-load source is injectable; persistent load no longer exempts a hanging seat forever (#557, #559).** Two defects fixed in `dispatch.rs`. (1) **Injectable load source (#557):** `RealDispatcher` gains a `load_source: Arc<dyn LoadSource>` field (defaulting to `RealLoadSource`, which calls `host_load_ballot()`). `dispatch_prompt_timed` now reads load through `self.load_source.host_load()` instead of calling `host_load_ballot()` directly. Tests pin the factor by constructing `RealDispatcher { load_source: Arc::new(FixedLoadSource { load1, load5, cpus }), ..RealDispatcher::default() }`; `FixedLoadSource` is a `#[cfg(test)]` implementation of the same trait. No env-var backdoor; the seam is in production code and exercisable without a compiler flag. (2) **Bounded exemptions (#559):** the load-induced early return in `record_seat_outcome` was unconditional for any `Healthy` seat — a host persistently at load ≥ 2× ncpu with a hanging seat charged its full (scaled) budget to every ballot indefinitely. The exemption counter `load_exemptions: u32` is now stored on `SeatHealth::Healthy`; each load-induced timeout increments it and returns early only while `load_exemptions < bench.threshold` (default 2). When the cap is reached the seat is benched directly (same path as a normal consecutive-failure bench). A load-induced exemption carries `consecutive_failures` unchanged (does not reset it to zero), so real-failure streaks are preserved across load events and the seat still benches when the combined streak reaches the threshold. A successful vote resets the counter to zero. Non-load-induced failures reset it to zero and still advance `consecutive_failures` normally. `SeatHealth::Healthy { load_exemptions }` preserves `#[derive(Copy)]` — `u32` is `Copy`. The `bench.threshold` knob (env `WICKED_COUNCIL_SEAT_BENCH_THRESHOLD`, default 2) governs both the normal bench streak and the load-exemption cap so the two policies scale together.
 
 - **Council ballot budget scales with host load; a slow seat is not a dead seat; evaluator≠creator survives a benched voter (#537).** Three defects fixed. (1) **Budget scaling:** `dispatch_prompt_timed` now computes `factor = clamp(max(load1, load5) / ncpu, 1, 5)` via inline `getloadavg` FFI (no libc dep) and scales the base 40 s ballot timeout to `base × factor`. On S8 (run 0a00ccaa: load1=10.94, load5=15.6, ncpu=14) this yields a 44.6 s budget that seats pi's 40.8 s answer; on S6 (run f39247be) the same shape yields 44.5 s and seats pi's 40.07–40.81 s answers. The `TimedOut` error message now appends `(base × factor, N-min load M / K cpus)` when the factor exceeds 1. (2) **Load-induced bench protection:** a seat whose timeout fires at factor ≥ 2 does not count toward the consecutive-failure bench streak — `record_seat_outcome` returns early for `Healthy` seats under load. Probation is unchanged: the probationary ballot is the readiness contract and load cannot waive it. Genuine timeouts at ratio < 2 still bench normally. (3) **Fail-closed evaluator≠creator:** when a ballot-benched seat empties the evaluator pool, `distribute_units_against_benched` now returns `NoEligibleSeat` (parks at the `dead_seat` gate) instead of silently falling back to the creator seat — a compromised seat must not self-grade its own work. Launcher-bench (source ≠ "ballot") and bench-free small rosters are unchanged. The `PauseReason::RunLevel` gate prompt now names benched seats and the live-vs-configured count so operators understand why human approval was needed.
