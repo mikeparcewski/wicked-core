@@ -640,12 +640,13 @@ pub(crate) fn distribute_units_against_benched(
     }
     let same_seat =
         enforce_evaluator_distinct(units, &mut dists, &still_eligible, clis, &candidates);
-    // (AC-3 / core#537) When a ballot-benched seat made evaluator≠creator unsatisfiable, fail
-    // CLOSED: the operator must relaunch once the seat recovers. A silent creator_seat fallback
-    // lets a compromised or broken seat evaluate its own work — the fence exists to prevent that.
-    // Launcher-bench (source != "ballot") is handled by the existing park_at_dead_seat_gate path.
-    // A bench-free roster that is simply too small is unchanged (condition below is false).
-    if !same_seat.is_empty() && benched.iter().any(|b| b.source == "ballot") {
+    // (AC-3 / core#537, core#560) When a benched seat — from ANY source (launcher health probe,
+    // ballot ledger, or worker transcript) — made evaluator≠creator unsatisfiable, fail CLOSED:
+    // the operator must relaunch once the seat recovers. A silent creator_seat fallback lets a
+    // compromised or broken seat evaluate its own work — the fence exists to prevent that.
+    // A bench-free roster that is simply too small is unchanged: when benched is empty, the
+    // condition is false and the pre-existing creator_seat fallback applies.
+    if !same_seat.is_empty() && !benched.is_empty() {
         let blocked: Vec<u32> = units
             .iter()
             .filter(|u| u.tool_cmd.is_none() && same_seat.contains(&u.ord))
@@ -654,8 +655,8 @@ pub(crate) fn distribute_units_against_benched(
         return Err(crate::NoEligibleSeat {
             run_id: session_id.to_string(),
             benched: format!(
-                "evaluator\u{2260}creator unsatisfiable for unit(s) {:?}: all distinct seats are \
-                 ballot-benched; {}",
+                "evaluator\u{2260}creator unsatisfiable for unit(s) {:?}: distinct seat(s) \
+                 benched; {}",
                 blocked,
                 crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default()
             ),
@@ -3494,9 +3495,9 @@ mod tests {
         assert_eq!(dists[0].benched[0].source, "ballot");
     }
 
-    /// (d / AC-3 / core#537) When a ballot-bench empties the evaluator pool, distribution FAILS
-    /// CLOSED: no silent creator_seat fallback. The operator relaunches once the seat recovers.
-    /// A bench-free too-small roster (no "ballot" source) is unchanged — that path stays open.
+    /// (d / AC-3 / core#537, core#560) When a ballot-bench empties the evaluator pool,
+    /// distribution FAILS CLOSED: no silent creator_seat fallback. The operator relaunches once
+    /// the seat recovers. A bench-free too-small roster is unchanged — that path stays open.
     #[test]
     fn when_a_ballot_bench_empties_the_evaluator_pool_distribution_fails_closed() {
         let dispatcher = dead_seat("copilot", quota_refusal, false);
@@ -3519,13 +3520,102 @@ mod tests {
             "error must name the constraint: {msg}"
         );
         assert!(
-            msg.contains("ballot-benched"),
-            "error must name ballot as the cause: {msg}"
+            msg.contains("distinct seat(s) benched"),
+            "error must name benched seats as the cause: {msg}"
+        );
+        assert!(
+            msg.contains("— ballot"),
+            "error must name ballot as the source: {msg}"
         );
         // Verify it is the typed NoEligibleSeat error (parks at dead_seat gate, not sessionFailed).
         assert!(
             err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
             "must be NoEligibleSeat for dead_seat gate routing: {err:?}"
+        );
+    }
+
+    /// (core#560) When a LAUNCHER-bench empties the evaluator pool (the distinct seat was found
+    /// unusable by the health probe before ballots ran), distribution fails closed. The error names
+    /// the launcher as the source.
+    #[test]
+    fn when_a_launcher_bench_makes_evaluator_creator_unsatisfiable_distribution_fails_closed() {
+        let (dispatcher, _) = spy();
+        let mut pi = seat("pi");
+        pi.health = Some(wicked_council::types::SeatHealth::unusable(
+            "unusable (launcher health probe)",
+        ));
+        let roster = [seat("claude"), pi];
+        let err = distribute_units_against_benched(
+            &build_and_review(),
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect_err("launcher-bench must fail closed — no silent creator_seat fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evaluator\u{2260}creator unsatisfiable"),
+            "error must name the constraint: {msg}"
+        );
+        assert!(
+            msg.contains("distinct seat(s) benched"),
+            "error must name benched seats as the cause: {msg}"
+        );
+        assert!(
+            msg.contains("— launcher"),
+            "error must name launcher as the source: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
+            "must be NoEligibleSeat: {err:?}"
+        );
+    }
+
+    /// (core#560) When a WORKER-bench empties the evaluator pool (a prior dispatch's worker
+    /// returned an auth refusal, benching the distinct seat before this re-plan), distribution
+    /// fails closed. The error names the worker as the source.
+    #[test]
+    fn when_a_worker_bench_makes_evaluator_creator_unsatisfiable_distribution_fails_closed() {
+        let (dispatcher, _) = spy();
+        let roster = [seat("claude"), seat("pi")];
+        let worker_bench = crate::domain::BenchedSeat {
+            cli: "pi".to_string(),
+            reason: "auth_refusal (worker transcript)".to_string(),
+            source: "worker".to_string(),
+        };
+        let err = distribute_units_against_benched(
+            &build_and_review(),
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[worker_bench],
+        )
+        .expect_err("worker-bench must fail closed — no silent creator_seat fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evaluator\u{2260}creator unsatisfiable"),
+            "error must name the constraint: {msg}"
+        );
+        assert!(
+            msg.contains("distinct seat(s) benched"),
+            "error must name benched seats as the cause: {msg}"
+        );
+        assert!(
+            msg.contains("— worker"),
+            "error must name worker as the source: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
+            "must be NoEligibleSeat: {err:?}"
         );
     }
 
