@@ -22,8 +22,9 @@ Two release tracks share this file, newest entry first regardless of track:
   routed the evaluator onto the creator's seat. Note it keys on `max(load1, load5)`, not `load1`
   alone — the 5-min average predicted the bench where the 1-min average did not.
   **The load exemption is bounded and testable (#557, #559).** A timed-out seat at factor ≥ 2 is
-  exempt from the bench streak, but only `SeatFailureKind::TimedOut` — a `NonZeroExit` still benches
-  on the first failure — and only up to `bench.threshold` consecutive exemptions, after which the
+  exempt from the bench streak, but only `SeatFailureKind::TimedOut` — a `NonZeroExit` is never
+  exempted, advancing the streak from its first failure and benching at `bench.threshold` exactly as
+  before — and only up to `bench.threshold` consecutive exemptions, after which the
   seat benches anyway. Without that cap, a seat that *hung* on a persistently loaded host would
   never bench and would charge the enlarged budget to every ballot. `RealDispatcher` gains
   `load_source: Arc<dyn LoadSource>` so tests pin the factor; this is the production path, not a
