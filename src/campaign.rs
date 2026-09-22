@@ -914,6 +914,42 @@ pub(crate) fn on_run_finished(
     Ok(())
 }
 
+/// Reconcile a node whose Reject could not terminate its run, on the in-memory campaign the caller
+/// already holds (core#574).
+///
+/// Same body as [`on_run_finished`]'s tail, minus the store re-read: the caller is mid-`confirm_gate`
+/// and owns the `Campaign`, so re-reading it would discard its own pending edits. It exists because
+/// on both failing Reject arms the deferred `CampaignRunFinished` reconcile will NEVER arrive —
+/// `cancel_run` does not re-notify an already-terminal run, and an unreachable run posts no outcome
+/// at all. Without this the node sits `AwaitingHuman` forever: `on_node_awaiting` drops the run's
+/// later gates (it only gates a `Running` node), so the run never finishes and `finalize_if_done`
+/// early-returns on `any_waiting` for good.
+fn reconcile_after_failed_reject(
+    campaign: &mut Campaign,
+    node_id: &str,
+    outcome: NodeOutcome,
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+) -> anyhow::Result<()> {
+    reconcile_terminal(
+        campaign,
+        node_id,
+        outcome,
+        store,
+        subscribers,
+        in_flight,
+        seams,
+    )?;
+    promote_ready(campaign, subscribers);
+    persist(store, campaign)?;
+    try_fill(campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(campaign, subscribers);
+    persist(store, campaign)?;
+    Ok(())
+}
+
 /// Transition a node to its terminal status from a per-Run outcome, emit its event, and apply the
 /// failure policy on a non-`Completed` outcome. Operates on the in-memory campaign (the caller drives
 /// the follow-on `promote_ready`/`try_fill`/`finalize`) so BOTH the live reconcile ([`on_run_finished`])
@@ -1091,17 +1127,35 @@ pub(crate) fn confirm_gate(
             // Reject terminates the Run immediately (no slot needed); the ensuing RunCancelled
             // reconciles the node via `on_run_finished` (deferred).
             //
-            // core#574: the `Result` is PROPAGATED, not discarded. `actor::confirm_gate` refuses
-            // unless `session.status == AwaitingHuman`, and the node's status can disagree with
-            // the session's — nothing reconciles `node_status` when the run leaves `AwaitingHuman`
-            // by a non-campaign route (e.g. the run-level `Core::confirm_gate` answered it
-            // directly). The outer guard above then passes while the inner one bails, and with
-            // `let _ =` the operator was told `Ok(<campaign status>)` while the run kept executing
-            // and its child stayed alive. A denial that silently does nothing is worse than one
-            // that errors: the campaign state is left untouched (the node stays `AwaitingHuman`,
-            // re-rejectable) and the caller gets the reason. This matches the two sibling call
-            // sites — the Approve/resume path uses `?`, and `auto_reject` logs and HOLDS.
-            crate::actor::confirm_gate(
+            // core#574 — THE DENIAL TAKES EFFECT, OR IT SAYS WHY AND LEAVES NO STUCK NODE.
+            //
+            // `actor::confirm_gate` refuses unless `session.status == AwaitingHuman`, and the
+            // campaign's `node_status` can disagree with the session's status: nothing reconciles
+            // the node when the run leaves `AwaitingHuman` by a non-campaign route (the run-level
+            // `Core::confirm_gate` answering the gate directly resumes the session to `Executing`
+            // and leaves the node `AwaitingHuman`). The outer guard above then passes while the
+            // inner one bails. Neither of the two obvious responses is acceptable:
+            //
+            //   * discarding the `Result` (`let _ =`) reports `Ok(<campaign status>)` while the run
+            //     keeps executing and its child stays alive — the defect #574 was filed for;
+            //   * propagating it with `?` reports the failure but performs NO reconciliation, so
+            //     the node stays `AwaitingHuman` with nothing able to move it. The run's LATER
+            //     gates are then dropped by `on_node_awaiting` (it only gates a `Running` node), so
+            //     the run can park forever, never reach `on_run_finished`, and the campaign never
+            //     finalizes. That is a wedge, not a fix.
+            //
+            // So: try the gate path FIRST — it records the human's answer on the durable prompt row
+            // (`resolve_open_for_session(.., Answered, {"action":"reject"})`), which a bare cancel
+            // would overwrite with `Cancelled` and lose. Its status guard bails BEFORE any mutation,
+            // so a refusal leaves nothing half-applied and the fallback is safe. On refusal, do what
+            // the operator actually asked for and what that arm does anyway: `cancel_run` the run
+            // directly. It carries no gate precondition, kills the tool child group (core#500), and
+            // its `notify_campaign` drives the same deferred `on_run_finished` reconcile.
+            //
+            // The two arms where the run cannot be cancelled reconcile the node THEMSELVES before
+            // erroring, because in both the deferred reconcile will never arrive — the same
+            // "never a stuck node" rule the resume/launch failure arm applies in `dispatch`.
+            if let Err(gate_err) = crate::actor::confirm_gate(
                 store,
                 subscribers,
                 seams.runner,
@@ -1113,13 +1167,76 @@ pub(crate) fn confirm_gate(
                 &None,
                 seams.process_gen,
                 false,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "campaign {} node {node_id}: reject could not cancel run {run_id}: {e}",
-                    campaign.id
-                )
-            })?;
+            ) {
+                let cancelled = crate::actor::cancel_run(
+                    store,
+                    subscribers,
+                    seams.runner,
+                    seams.self_tx,
+                    &run_id,
+                    seams.lifecycle_maps,
+                );
+                // Drop the run from `in_flight` on EVERY arm, as `campaign::cancel` does: whatever
+                // happened, this run is not advancing under campaign control any more.
+                in_flight.remove(&run_id);
+                match cancelled {
+                    // The denial took effect. `cancel_run` emitted `RunCancelled` and queued
+                    // `CampaignRunFinished`, so the node reconciles on the next actor turn exactly
+                    // as it does on the gate path.
+                    Ok(SessionStatus::Cancelled) => {
+                        eprintln!(
+                            "wicked-core: campaign {} node {node_id}: run {run_id} was not parked \
+                             at a gate ({gate_err}) — cancelled it directly so the reject takes \
+                             effect (core#574)",
+                            campaign.id
+                        );
+                    }
+                    // Already terminal. `cancel_run` returns early WITHOUT re-notifying the
+                    // campaign, so nothing else will move this node: reconcile it to the run's own
+                    // outcome here, then say plainly that the denial was too late.
+                    Ok(already) => {
+                        let outcome = match already {
+                            SessionStatus::Completed => NodeOutcome::Completed,
+                            SessionStatus::Failed => NodeOutcome::Failed,
+                            _ => NodeOutcome::Cancelled,
+                        };
+                        reconcile_after_failed_reject(
+                            &mut campaign,
+                            node_id,
+                            outcome,
+                            store,
+                            subscribers,
+                            in_flight,
+                            seams,
+                        )?;
+                        anyhow::bail!(
+                            "campaign {} node {node_id}: run {run_id} was already {already:?} — \
+                             the reject could not take effect; the node is reconciled to the run's \
+                             own outcome ({gate_err})",
+                            campaign.id
+                        );
+                    }
+                    // The run is unreachable (no session row / store failure): it can never post a
+                    // terminal outcome, so fail the node like a launch failure rather than leaving
+                    // it awaiting a human forever.
+                    Err(cancel_err) => {
+                        reconcile_after_failed_reject(
+                            &mut campaign,
+                            node_id,
+                            NodeOutcome::Failed,
+                            store,
+                            subscribers,
+                            in_flight,
+                            seams,
+                        )?;
+                        anyhow::bail!(
+                            "campaign {} node {node_id}: reject could not cancel run {run_id}: \
+                             {cancel_err} (gate path: {gate_err}) — the node is reconciled Failed",
+                            campaign.id
+                        );
+                    }
+                }
+            }
         }
         // ── HumanGateOnFailure policy gate ──────────────────────────────────────
         CampaignGateDecision::Retry => {
@@ -2267,32 +2384,115 @@ mod tests {
         );
     }
 
-    // ── core#574: a reject whose inner cancel bails must ERROR, not report success ─────────────
+    // ── core#574: a Reject either TAKES EFFECT, or it says why and leaves no stuck node ─────────
 
-    /// core#574 — `CampaignGateDecision::Reject` discarded the `Result` of `actor::confirm_gate`
-    /// with `let _ =`. When the inner call bails the operator was told `Ok(<campaign status>)`
-    /// while the run kept executing.
-    ///
-    /// HOW THE STATE IS REACHED (it is not contrived): the campaign's `node_status` and the
-    /// session's `status` are two records, and nothing reconciles the node when the run leaves
-    /// `AwaitingHuman` by a non-campaign route. Answering the run-level gate directly
-    /// (`Core::confirm_gate(run_id, Approve)`) resumes the session to `Executing` and leaves the
-    /// node at `AwaitingHuman` — exactly the pair seeded here, and exactly what was observed
-    /// against a live engine in the issue. The outer node guard then passes and the inner session
-    /// guard bails.
-    ///
-    /// REACHABILITY NOTE (deliberately NOT asserted): no tool child is registered here and none
-    /// could be. `run_tool_cmd` calls `on_done(pid)` unconditionally when a unit ends, so
-    /// "at a gate" and "a tool child is registered" are mutually exclusive through the public API;
-    /// an assertion on `toolChildrenKilled` would be vacuous. What this pins is the CONTRACT: the
-    /// denial either takes effect or says why.
-    #[test]
-    fn campaign_reject_surfaces_the_inner_cancel_failure_instead_of_reporting_success() {
-        use crate::domain::{put_node, AgentSession, SessionStatus, WorkUnit};
+    struct RejectHarness {
+        store: wicked_apps_core::SqliteStore,
+        ev_rx: std::sync::mpsc::Receiver<CoreEvent>,
+        cmd_rx: std::sync::mpsc::Receiver<Command>,
+        run_id: String,
+    }
+
+    /// Seed a campaign whose single node is `AwaitingHuman` while its SESSION is in `session`
+    /// (`None` = no session row at all). That pair is the whole subject of core#574: the campaign's
+    /// `node_status` and the session's status are two records, and nothing reconciles the node when
+    /// the run leaves `AwaitingHuman` by a non-campaign route — answering the run-level gate
+    /// directly (`Core::confirm_gate(run_id, Approve)`) resumes the session to `Executing` and
+    /// leaves the node `AwaitingHuman`, which is exactly what the issue observed against a live
+    /// engine. The terminal variants are the same drift one actor turn later: the run finished and
+    /// its `CampaignRunFinished` is still queued behind the operator's `ConfirmCampaignGate` on the
+    /// single-writer actor thread.
+    fn seed_reject_case(cid: &str, session: Option<SessionStatus>) -> RejectHarness {
+        use crate::domain::{put_node, AgentSession, WorkUnit};
+        use wicked_apps_core::{open_store, ToNode};
+
+        let node_id = "n1";
+        let run_id = format!("{cid}:{node_id}:a0");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        if let Some(status) = session {
+            let session = AgentSession {
+                id: run_id.clone(),
+                workflow_id: format!("wf-{cid}"),
+                problem: "p".into(),
+                entity_mode: EntityMode::Shared,
+                collection_scope: None,
+                clis: vec![],
+                status,
+                human_confirm: HumanConfirm::All,
+                auto_deliver: false,
+                unit_ix: 0,
+                attempt: 0,
+                workdir: None,
+                repo_ref: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_graph: None,
+                project_id: None,
+                archived_at: None,
+                archive_note: None,
+                verified_tree: None,
+                run_branch: None,
+                base_commit: None,
+                finished_at: None,
+                benched_seats: Vec::new(),
+            };
+            put_node(&mut store, session.to_node()).unwrap();
+            put_node(
+                &mut store,
+                WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "the unit").to_node(),
+            )
+            .unwrap();
+        }
+        let def = CampaignDef {
+            id: cid.into(),
+            name: cid.into(),
+            nodes: vec![node(node_id)],
+            edges: vec![],
+            policy: FailurePolicy::FailFast,
+            max_concurrency: 1,
+            denial_gate: Default::default(),
+        };
+        let mut campaign = Campaign {
+            id: cid.into(),
+            def_id: cid.into(),
+            status: CampaignStatus::Running,
+            def,
+            node_status: status_map(&[(node_id, NodeStatus::AwaitingHuman)]),
+            node_run_id: [(node_id.to_string(), run_id.clone())]
+                .into_iter()
+                .collect(),
+            node_attempt: [(node_id.to_string(), 0u32)].into_iter().collect(),
+            pending_decision: BTreeMap::new(),
+            pending_decision_amend: BTreeMap::new(),
+            pending_failure_gates: Vec::new(),
+            fail_fast_tripped: false,
+        };
+        persist(&mut store, &mut campaign).unwrap();
+        let (_ev_tx, ev_rx) = std::sync::mpsc::channel::<CoreEvent>();
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+        RejectHarness {
+            store,
+            ev_rx,
+            cmd_rx,
+            run_id,
+        }
+    }
+
+    /// Drive `confirm_gate(Reject)` against a seeded case, returning the result plus what reached
+    /// the wire and the actor's own command channel.
+    fn reject(
+        h: &mut RejectHarness,
+        cid: &str,
+    ) -> (
+        anyhow::Result<CampaignStatus>,
+        Vec<CoreEvent>,
+        Vec<String>,
+        NodeStatus,
+        Option<SessionStatus>,
+    ) {
         use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
         use std::sync::mpsc::channel;
         use std::sync::Arc;
-        use wicked_apps_core::{open_store, ToNode};
 
         struct NoopRunner;
         impl StepRunner for NoopRunner {
@@ -2321,73 +2521,10 @@ mod tests {
             }
         }
 
-        let cid = "reject-swallow";
-        let node_id = "n1";
-        let run_id = format!("{cid}:{node_id}:a0");
-        let mut store = open_store(Some(":memory:")).unwrap();
-
-        // The session is EXECUTING — the run-level gate was answered outside the campaign — while
-        // the campaign still records the node as AwaitingHuman.
-        let session = AgentSession {
-            id: run_id.clone(),
-            workflow_id: "wf-reject-swallow".into(),
-            problem: "p".into(),
-            entity_mode: EntityMode::Shared,
-            collection_scope: None,
-            clis: vec![],
-            status: SessionStatus::Executing,
-            human_confirm: HumanConfirm::All,
-            auto_deliver: false,
-            unit_ix: 0,
-            attempt: 0,
-            workdir: None,
-            repo_ref: None,
-            extra_write_roots: Vec::new(),
-            extra_read_roots: Vec::new(),
-            project_graph: None,
-            project_id: None,
-            archived_at: None,
-            archive_note: None,
-            verified_tree: None,
-            run_branch: None,
-            base_commit: None,
-            finished_at: None,
-            benched_seats: Vec::new(),
-        };
-        put_node(&mut store, session.to_node()).unwrap();
-        put_node(
-            &mut store,
-            WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "the in-flight unit").to_node(),
-        )
-        .unwrap();
-
-        let def = CampaignDef {
-            id: cid.into(),
-            name: "reject swallow".into(),
-            nodes: vec![node(node_id)],
-            edges: vec![],
-            policy: FailurePolicy::FailFast,
-            max_concurrency: 1,
-            denial_gate: Default::default(),
-        };
-        let mut campaign = Campaign {
-            id: cid.into(),
-            def_id: cid.into(),
-            status: CampaignStatus::Running,
-            def,
-            node_status: status_map(&[(node_id, NodeStatus::AwaitingHuman)]),
-            node_run_id: [(node_id.to_string(), run_id.clone())]
-                .into_iter()
-                .collect(),
-            node_attempt: [(node_id.to_string(), 0u32)].into_iter().collect(),
-            pending_decision: BTreeMap::new(),
-            pending_decision_amend: BTreeMap::new(),
-            pending_failure_gates: Vec::new(),
-            fail_fast_tripped: false,
-        };
-        persist(&mut store, &mut campaign).unwrap();
-
-        let (tx, _rx) = channel::<Command>();
+        let (tx, cmd_rx) = channel::<Command>();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        h.cmd_rx = cmd_rx;
+        h.ev_rx = ev_rx;
         let dispatcher: Arc<dyn wicked_council::types::Dispatcher + Send + Sync> =
             Arc::new(NoopDispatcher);
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
@@ -2401,62 +2538,142 @@ mod tests {
             process_gen: uuid::Uuid::new_v4(),
             lifecycle_maps: &lifecycle_maps,
         };
-        let (ev_tx, ev_rx) = channel::<CoreEvent>();
         let mut subscribers = crate::event_log::EventSink::default();
         subscribers.push(ev_tx);
         let mut in_flight: HashSet<String> = HashSet::new();
+        in_flight.insert(h.run_id.clone());
 
         let res = confirm_gate(
-            &mut store,
+            &mut h.store,
             &mut subscribers,
             &mut in_flight,
             &seams,
             cid,
-            node_id,
+            "n1",
             CampaignGateDecision::Reject,
         );
-
-        let err = match res {
-            Ok(status) => panic!(
-                "the reject reported success ({status:?}) while the run is still {:?} and was \
-                 never cancelled — `actor::confirm_gate`'s Err was discarded by `let _ =` \
-                 (core#574)",
-                crate::domain::get_session(&store, &run_id)
-                    .unwrap()
-                    .unwrap()
-                    .status
-            ),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(
-            err.contains(&run_id) && err.contains("not awaiting confirmation"),
-            "the error must name the run and the reason the cancel refused; got: {err}"
-        );
-
-        // The run is untouched — the denial did not half-apply.
-        let after = crate::domain::get_session(&store, &run_id)
+        let events: Vec<CoreEvent> = h.ev_rx.try_iter().collect();
+        let cmds: Vec<String> = h
+            .cmd_rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::CampaignRunFinished { run_id, outcome } => {
+                    Some(format!("{run_id}:{outcome:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        let node_status = get_campaign(&h.store, cid)
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .status_of("n1");
+        let sess = get_session(&h.store, &h.run_id).unwrap().map(|s| s.status);
+        (res, events, cmds, node_status, sess)
+    }
+
+    /// core#574 (the defect, and the review of the first fix): when the session has drifted out of
+    /// `AwaitingHuman`, the operator's Reject must actually TERMINATE THE RUN.
+    ///
+    /// The first fix propagated `actor::confirm_gate`'s refusal with `?`. That reported the failure
+    /// honestly but reconciled nothing, so the node sat `AwaitingHuman` while the run kept
+    /// executing — and `on_node_awaiting` drops that run's later gates (it only gates a `Running`
+    /// node), so the run could park forever and the campaign never finalize. Swallowing and wedging
+    /// are both wrong; the denial has to land. `cancel_run` carries no gate precondition, so the
+    /// fallback cancels the run directly.
+    #[test]
+    fn campaign_reject_cancels_a_run_that_drifted_out_of_awaiting_human() {
+        let cid = "reject-drift";
+        let mut h = seed_reject_case(cid, Some(SessionStatus::Executing));
+        let (res, events, cmds, node_status, sess) = reject(&mut h, cid);
+
+        res.expect("the reject must succeed — the run is live and cancellable");
         assert_eq!(
-            after.status,
-            SessionStatus::Executing,
-            "a refused reject must not move the session"
+            sess,
+            Some(SessionStatus::Cancelled),
+            "THE DENIAL MUST TAKE EFFECT: the run is still {sess:?}. Reporting the gate path's \
+             refusal (with `?`) or swallowing it (with `let _ =`) both leave the run executing."
         );
-        // …and so is the campaign: the node stays AwaitingHuman, so the operator can re-reject
-        // once the state is reconciled.
-        let reloaded = get_campaign(&store, cid).unwrap().unwrap();
-        assert_eq!(
-            reloaded.status_of(node_id),
-            NodeStatus::AwaitingHuman,
-            "a refused reject must leave the node re-rejectable"
-        );
-        let events: Vec<CoreEvent> = ev_rx.try_iter().collect();
         assert!(
-            !events.iter().any(|e| matches!(
+            events.iter().any(|e| matches!(
                 e,
-                CoreEvent::RunCancelled { session, .. } if session.as_str() == run_id
+                CoreEvent::RunCancelled { session, .. } if session.as_str() == h.run_id
             )),
-            "no RunCancelled may be claimed for a reject that did not happen: {events:?}"
+            "runCancelled must reach the wire: {events:?}"
+        );
+        // The node reconcile is DEFERRED by design (`cancel_run` → `notify_campaign`), exactly as
+        // on the ordinary gate path. What must be true here is that the reconcile is GUARANTEED —
+        // i.e. the command is queued — not that it has already been applied.
+        assert!(
+            cmds.contains(&format!("{}:Cancelled", h.run_id)),
+            "CampaignRunFinished must be queued so the node cannot stay AwaitingHuman; got {cmds:?}"
+        );
+        assert_eq!(
+            node_status,
+            NodeStatus::AwaitingHuman,
+            "reconcile is deferred"
+        );
+    }
+
+    /// core#574 — the run was ALREADY terminal, so the denial cannot take effect. It must then say
+    /// so AND leave the node reconciled: `cancel_run` returns early on a terminal run and
+    /// deliberately does not re-notify the campaign, so nothing else would ever move this node.
+    ///
+    /// Reachable on the single-writer actor thread: the run finished and queued
+    /// `CampaignRunFinished`, and the operator's `ConfirmCampaignGate` is processed first.
+    #[test]
+    fn campaign_reject_on_an_already_terminal_run_reconciles_the_node_and_says_so() {
+        let cid = "reject-terminal";
+        let mut h = seed_reject_case(cid, Some(SessionStatus::Completed));
+        let (res, _events, _cmds, node_status, sess) = reject(&mut h, cid);
+
+        let err = format!(
+            "{:#}",
+            res.expect_err("a denial that cannot land must not report Ok")
+        );
+        // The wedge first: this is the load-bearing assertion.
+        assert_eq!(
+            node_status,
+            NodeStatus::Completed,
+            "THE NODE MUST NOT BE LEFT AWAITING A HUMAN: nothing else will ever move it — \
+             `cancel_run` does not re-notify a terminal run — so the campaign could never \
+             finalize. Reported error was: {err}"
+        );
+        assert!(
+            err.contains(&h.run_id) && err.contains("already"),
+            "the error must name the run and that it was already terminal; got: {err}"
+        );
+        assert_eq!(
+            sess,
+            Some(SessionStatus::Completed),
+            "a completed run is not rewritten by a late denial"
+        );
+    }
+
+    /// core#574 — the run is unreachable (no session row), so it can never post a terminal outcome.
+    /// Fail the node like a launch failure rather than leaving it awaiting a human forever.
+    ///
+    /// SCOPE: this pair is constructed directly in the store. I did not establish that the engine
+    /// produces it; it is the defensive arm of the `match`, and it is here so the arm has a witness
+    /// rather than being asserted by comment alone.
+    #[test]
+    fn campaign_reject_with_an_unreachable_run_fails_the_node_instead_of_wedging() {
+        let cid = "reject-missing";
+        let mut h = seed_reject_case(cid, None);
+        let (res, _events, _cmds, node_status, _sess) = reject(&mut h, cid);
+
+        let err = format!(
+            "{:#}",
+            res.expect_err("an unreachable run must not report Ok")
+        );
+        assert!(
+            err.contains(&h.run_id),
+            "the error must name the run it could not cancel; got: {err}"
+        );
+        assert_eq!(
+            node_status,
+            NodeStatus::Failed,
+            "an unreachable run can never post an outcome, so the node must be failed here or it \
+             sits AwaitingHuman forever"
         );
     }
 }
