@@ -6848,21 +6848,20 @@ fn dispatch_unit(
             let run_reg = run_for_reg.clone();
             let on_spawn = |pgid: u32| {
                 if let Some(ref m) = maps_reg {
-                    let displaced = m
+                    let already_live = m
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .register_tool_child(&run_reg, pgid);
-                    // core#577: `register_tool_child` holds ONE pgid per run and the engine's
-                    // cardinality says a second live registration cannot happen. If it did, the
-                    // displaced group is no longer reachable from the registry (its own worker
-                    // thread still kills it, so this is lost REACH, not a lost process) — say so
-                    // rather than overwriting in silence.
-                    if let Some(prev) = displaced {
+                    // core#577: two tool children live at once for one run means a `ReassignUnit`
+                    // landed between this attempt's spawn and its registration. The registry keeps
+                    // both — a cancel kills both, which is what core#500 promises — but one is the
+                    // ordinary state, so say that it happened instead of overwriting in silence.
+                    if !already_live.is_empty() {
                         eprintln!(
-                            "wicked-core: run {run_reg}: tool child pgid {prev} was DISPLACED in \
-                             the registry by pgid {pgid} — the one-live-tool-child-per-run \
-                             invariant did not hold; {prev} can no longer be killed by the actor \
-                             (core#577)"
+                            "wicked-core: run {run_reg}: tool child pgid {pgid} registered while \
+                             pgid(s) {already_live:?} are still live for this run — a reassign \
+                             race between spawn and registration; all of them are tracked and a \
+                             cancel kills all of them (core#577)"
                         );
                     }
                 }

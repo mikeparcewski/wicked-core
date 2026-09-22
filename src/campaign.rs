@@ -2172,10 +2172,12 @@ mod tests {
 
         // The registered tool-child group — what `cancel_run` reads through `lifecycle_maps`.
         let maps = Arc::new(Mutex::new(crate::acp_runner::ElicitationMaps::new()));
-        assert_eq!(
-            maps.lock().unwrap().register_tool_child(&run_id, pgid),
-            None,
-            "the first registration for a run displaces nothing (core#577)"
+        assert!(
+            maps.lock()
+                .unwrap()
+                .register_tool_child(&run_id, pgid)
+                .is_empty(),
+            "the first registration for a run has no co-resident attempt (core#577)"
         );
         let lifecycle_maps = Some(maps.clone());
 
