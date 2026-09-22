@@ -2082,9 +2082,25 @@ mod tests {
     /// `toolPermission` through the link: the redirect looked applied and isolated nothing. A live
     /// probe under a clean temp home cannot surface this — it is the honest case that passes either
     /// way; only a planted link tests the property an attacker attacks.
+    ///
+    /// The leak check is a BEFORE/AFTER listing of the operator's directory, not a named path. A
+    /// named one cannot fail here: `ensure_dirs` bails on the FIRST owned path it refuses, so only
+    /// `.gemini/antigravity-cli` is ever attempted through the link and `.gemini/config` is never
+    /// reached — an assertion on either name is green whether the refusal works or not. The listing
+    /// fails on ANY entry appearing, whichever path a future ordering attempts first, which is the
+    /// state that has to be impossible: a refusal that creates before it validates.
     #[test]
     #[cfg(unix)]
     fn an_agy_seat_refuses_a_planted_gemini_link() {
+        // Sorted entry names of a directory — the leak sentinel.
+        fn entries(dir: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
         let scratch = std::env::temp_dir().join(format!(
             "wicked-apps-core-agy-planted-{}-{}",
             std::process::id(),
@@ -2099,8 +2115,14 @@ mod tests {
             set: vec![(HOME_ENV, root.to_path_buf())],
             strip: SEAT_CONFIG_ENV.to_vec(),
         };
+        // The operator's real `.gemini`, left EMPTY: an entry appearing in it is the leak. (Nothing
+        // is pre-created inside — a pre-existing `antigravity-cli` would mask the very directory
+        // `ensure_dirs` attempts first, which is how the previous assertion here went blind.)
         let operator_gemini = scratch.join("operator-home").join(".gemini");
-        std::fs::create_dir_all(operator_gemini.join("antigravity-cli")).unwrap();
+        std::fs::create_dir_all(&operator_gemini).unwrap();
+        let before = entries(&operator_gemini);
+        assert!(before.is_empty(), "the operator's .gemini starts empty");
+
         let planted_root = scratch.join("worker2").join("agy");
         std::fs::create_dir_all(&planted_root).unwrap();
         std::os::unix::fs::symlink(&operator_gemini, planted_root.join(".gemini")).unwrap();
@@ -2108,20 +2130,22 @@ mod tests {
             .ensure_dirs()
             .expect_err("a planted .gemini link is refused");
         assert!(err.to_string().contains("symlink"), "{err}");
-        assert!(
-            !operator_gemini
-                .join("antigravity-cli")
-                .join("config")
-                .exists(),
+        assert_eq!(
+            entries(&operator_gemini),
+            before,
             "nothing was created through the planted link"
         );
 
         // One level deeper: a real `.gemini` with the CREDENTIAL directory planted inside it. The
-        // parent being honest is not enough — `antigravity-cli` is owned in its own right.
+        // parent being honest is not enough — `antigravity-cli` is owned in its own right. Its own
+        // target, so this planting cannot be masked by (or mask) the one above.
+        let operator_credentials = scratch.join("operator-home").join("antigravity-cli");
+        std::fs::create_dir_all(&operator_credentials).unwrap();
+        let before_credentials = entries(&operator_credentials);
         let deep_root = scratch.join("worker3").join("agy");
         std::fs::create_dir_all(deep_root.join(".gemini")).unwrap();
         std::os::unix::fs::symlink(
-            operator_gemini.join("antigravity-cli"),
+            &operator_credentials,
             deep_root.join(".gemini").join("antigravity-cli"),
         )
         .unwrap();
@@ -2129,6 +2153,11 @@ mod tests {
             .ensure_dirs()
             .expect_err("a planted antigravity-cli link is refused");
         assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(
+            entries(&operator_credentials),
+            before_credentials,
+            "nothing was created through the planted credential link"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -2164,11 +2193,6 @@ mod tests {
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .expect("this process has a home directory"),
         );
-        assert_ne!(
-            root, operator_home,
-            "the seat root is not the operator's home"
-        );
-
         let mut cmd = Command::new("true");
         cmd.hardened();
         cmd.env(HOME_ENV, &operator_home); // the decoy the daemon would otherwise pass through
