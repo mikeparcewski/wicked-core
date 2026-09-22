@@ -1774,7 +1774,7 @@ fn remove_entry_no_follow(p: &std::path::Path) -> anyhow::Result<()> {
 /// Bounded budget for the spawn-time version-pin probe (`AcpConfig::verified_version`,
 /// DES-INPUT-GOV-006 §3.4). Generous, not tuned: a `--version` probe is a trivial command and
 /// this only bounds an ALREADY-degraded path (a pathological binary hanging here downgrades this
-/// spawn to disclosed-ungoverned, per [`resolved_binary_version_matches`] — it does not block the
+/// spawn to disclosed-ungoverned, per [`probe_resolved_binary_version`] — it does not block the
 /// spawn itself).
 const VERSION_PIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -8843,7 +8843,7 @@ sleep 30
 
     /// A stub bridge that answers `--version` distinctly from the ACP handshake (branching on
     /// `$1`), so a single script doubles as both the spawned ACP binary and the thing the
-    /// spawn-time version-pin probe (`resolved_binary_version_matches`) runs `--version` against —
+    /// spawn-time version-pin probe (`probe_resolved_binary_version`) runs `--version` against —
     /// exactly how `AcpConfig::verified_version` checks the SAME resolved binary that gets spawned.
     #[cfg(unix)]
     fn stub_bridge_with_version(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
@@ -8872,7 +8872,7 @@ sleep 30
 
     #[test]
     #[cfg(unix)]
-    fn resolved_binary_version_matches_the_exact_pinned_string_only() {
+    fn the_version_pin_probe_matches_the_exact_pinned_string_only() {
         let dir = std::env::temp_dir().join(format!(
             "wicked-version-pin-probe-{}-{:?}",
             std::process::id(),
@@ -9112,8 +9112,9 @@ sleep 30
             !proc.governance_verified,
             "a resolved binary reporting a different version must not be trusted as admitted"
         );
-        // core#581: and the process CARRIES what drifted, so the caller can disclose it once per
-        // spawn instead of the operator having to read the pin and probe the binary by hand.
+        // core#581: and the process CARRIES what drifted, so the disclosure site can name both
+        // builds on every turn that runs on this bridge, instead of the operator having to read
+        // the pin and probe the binary by hand.
         let drift = proc
             .version_pin_drift
             .clone()
