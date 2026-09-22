@@ -937,11 +937,12 @@ struct AcpProcess {
     /// pin did NOT match the resolved binary — the disclosure detail behind
     /// `governance_verified == false`. Computed ONCE at spawn.
     ///
-    /// Read by the UNIT path only: the session-open arm emits one `GovernanceUnenforced` naming
-    /// both builds when it opens a session, and the per-turn governed check emits the same detail
-    /// on a REUSED session (exactly one of the two fires for any given turn). Before core#581 the
-    /// drift was announced only on a governed turn — so an ungoverned unit said nothing at all —
-    /// and the message named neither the pinned nor the installed version.
+    /// Read from ONE place in the unit path: the disclosure that sits after the read-only reroute,
+    /// on every turn that actually starts on this bridge. It is deliberately NOT read in the
+    /// session-open arm — a unit rerouted to the wrapped carrier never starts an ACP turn, so
+    /// announcing it there would be a false audit event about a unit the wrapped runner governs.
+    /// Before core#581 the drift was announced only on a GOVERNED turn — so an ungoverned unit
+    /// said nothing — and the message named neither the pinned nor the installed version.
     ///
     /// NOT read by the CHAT path (`chat_open` / `chat_ensure_one`), which spawns through the same
     /// function but emits no `GovernanceUnenforced`: the event is unit-shaped (`ord`, `attempt`),
@@ -1788,22 +1789,11 @@ const VERSION_PIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// forcing function was proven against one specific pinned build (opencode's Homebrew tap
 /// auto-updates with no lockfile), not a range, so an unreadable or different version must
 /// downgrade this spawn's governance claim rather than assume it still holds.
-/// Which of the two `GovernanceUnenforced` emitters owns the version-pin disclosure for THIS turn
-/// (core#581, reconciled in the #587 review).
-///
-/// The session-open arm emits when it OPENS a session and there is a drift to name — that is
-/// `did_insert && has_drift`, and `reused == !did_insert`. The per-turn governed check emits
-/// otherwise. Keyed on one predicate so the two can never both fire for one
-/// `(session, ord, attempt, cli)` — which is what they did before this was reconciled — and can
-/// never both stay silent on a governed, unverified turn.
-fn spawn_owns_drift_disclosure(reused: bool, has_drift: bool) -> bool {
-    !reused && has_drift
-}
-
 /// The spawn-time `verified_version` probe, and WHAT the binary reported (core#581).
 ///
-/// `matched` is the admission decision; `observed` is the first line of `--version` output, kept so
-/// the disclosure can name both sides of a drift. "pinned 1.17.18, resolved binary reports 1.18.31"
+/// `matched` is the admission decision and compares the FIRST line; `observed` is the first
+/// NON-EMPTY line, kept so the disclosure can name both sides of a drift. The two differ on
+/// purpose — see the comment on the probe body. "pinned 1.17.18, resolved binary reports 1.18.31"
 /// is actionable; "did not match its pinned verified_version" leaves an operator to find the
 /// constant and run `--version` by hand, which is how a drifted seat sat unnoticed.
 #[derive(Debug, Clone)]
@@ -1819,8 +1809,12 @@ struct VersionPinDrift {
     /// The binary as CONFIGURED (e.g. bare `opencode`).
     binary: String,
     /// Where `which` finds it on this host, when it finds it — the PATH answer an operator needs
-    /// to tell one install from another. `None` when it is not on `PATH` (an absolute configured
-    /// path, or a binary the spawn will fail to resolve).
+    /// to tell one install from another.
+    ///
+    /// `None` means the probe found no file. That is NOT the same as "not on PATH": `Path::join`
+    /// with an absolute argument replaces the whole path, so `which` returns an ABSOLUTE configured
+    /// binary as itself whenever that file exists, and `None` only when it does not. The two cases
+    /// read differently to an operator, so `disclosure` words them differently.
     resolved_path: Option<String>,
     expected: String,
     /// `None` when the probe could not run at all (spawn failure, timeout, non-zero exit).
@@ -1828,10 +1822,10 @@ struct VersionPinDrift {
 }
 
 impl VersionPinDrift {
-    /// The operator-facing reason. Names BOTH versions and the binary that was resolved, because
-    /// the whole point of the disclosure is that a reader can act on it without going to look up
-    /// the pin. Says what to do, and does NOT suggest simply moving the pin: the pin's value is
-    /// what it was proven against, so re-proving comes first.
+    /// The operator-facing reason. Names both builds, the binary as configured AND where it
+    /// resolves, because the whole point of the disclosure is that a reader can act on it without
+    /// going to look up the pin. Says what to do, and does NOT suggest simply moving the pin: the
+    /// pin's value is what it was proven against, so re-proving comes first.
     fn disclosure(&self, cli_key: &str) -> String {
         let observed = match &self.observed {
             // The pin compares the FIRST line, so a binary can print the right version somewhere
@@ -1844,9 +1838,14 @@ impl VersionPinDrift {
             Some(v) => format!("reports `{v}`"),
             None => "did not answer `--version`".to_string(),
         };
-        let binary = match &self.resolved_path {
-            Some(path) => format!("`{}` (resolves to {path})", self.binary),
-            None => format!("`{}` (not found on PATH)", self.binary),
+        let configured_is_absolute = std::path::Path::new(&self.binary).is_absolute();
+        let binary = match (&self.resolved_path, configured_is_absolute) {
+            // An absolute configured path resolves to itself; repeating it adds nothing.
+            (Some(path), true) if path == &self.binary => format!("`{path}`"),
+            (Some(path), _) => format!("`{}` (resolves to {path})", self.binary),
+            // "not found on PATH" would be wrong for a path that was never looked up on PATH.
+            (None, true) => format!("`{}` (no such file)", self.binary),
+            (None, false) => format!("`{}` (not found on PATH)", self.binary),
         };
         format!(
             "seat '{cli_key}' is admitted to ACP input governance against the exact build \
@@ -6946,9 +6945,6 @@ impl AcpStepRunner {
                         // A1: captured before `proc` moves into the Arc so the once-per-spawn
                         // `SandboxUnenforced` disclosure can be emitted in the `did_insert` arm.
                         let sandbox_downgrade = proc.sandbox_downgrade.clone();
-                        // core#581: same capture, same reason — the once-per-spawn version-pin
-                        // disclosure below needs it after `proc` moves into the Arc.
-                        let version_pin_drift = proc.version_pin_drift.clone();
                         let arc = Arc::new(Mutex::new(proc));
                         let session_handles = {
                             let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -7014,28 +7010,6 @@ impl AcpStepRunner {
                                     cli: cli_key.clone(),
                                     level: level.clone(),
                                     reason: reason.clone(),
-                                });
-                            }
-                            // core#581: this seat is admitted to ACP input governance but the
-                            // binary that actually spawned is not the build the admission was
-                            // proven against, so this session is unadmitted. Disclose it once per
-                            // spawn, like the sandbox sibling above — and regardless of whether
-                            // this first unit is governed: the per-turn `GovernanceUnenforced`
-                            // below fires only for a gated unit, so an UNGOVERNED unit on a
-                            // drifted seat used to say nothing at all. The reason names both
-                            // builds so the drift is actionable without going to read the pin.
-                            //
-                            // This arm runs only on a fresh spawn, so the per-turn check below
-                            // suppresses itself when it fires here (`disclosed_at_spawn`) and
-                            // carries the same detail itself on a reused session. A CHAT session
-                            // reaches neither: see `AcpProcess::version_pin_drift`.
-                            if let Some(drift) = &version_pin_drift {
-                                self.emit_event(CoreEvent::GovernanceUnenforced {
-                                    session: run_id.clone(),
-                                    ord: input.unit.ord,
-                                    attempt: input.attempt,
-                                    cli: cli_key.clone(),
-                                    reason: drift.disclosure(&cli_key),
                                 });
                             }
                         }
@@ -7187,37 +7161,33 @@ impl AcpStepRunner {
             });
             return fallback_with_warning(reason, input, emit, &self.fallback);
         }
-        // core#581: ONE disclosure per turn, and the SAME detail on every turn.
+        // core#581: the version-pin disclosure, emitted from ONE place and only for a unit that
+        // actually starts a turn on the drifted bridge.
         //
-        // The spawn arm above emits the version-pin disclosure when it opens a session (it covers
-        // the ungoverned units this arm does not). That arm runs only on a fresh spawn, so:
+        // It sits HERE, after the read-only reroute above, on purpose. The reroute sends an
+        // `executes_code:false` unit to the wrapped carrier when the pin missed, so that unit never
+        // starts an ACP turn — announcing that it "runs unchecked" would be a false audit event
+        // about a unit the wrapped runner governs with an argv read-only lever and the worktree
+        // guard. The comment on `acp_admitted` above already records that hazard for the gate
+        // match; the same reasoning binds this disclosure.
         //
-        //   * fresh spawn + a drift to report -> the spawn arm already said it for THIS turn;
-        //     saying it again here would be two audit events for one condition on one
-        //     (session, ord, attempt, cli);
-        //   * a REUSED session -> the spawn arm did not run, and this is the only place left to
-        //     say it. It must carry the same detail, not the generic text that named neither
-        //     build — turn 2+ is where an operator actually looks, because by then there is
-        //     output to be suspicious about.
-        //
-        // The generic text remains for the case that has no drift to name: a pin that missed on a
-        // seat which does not claim input governance (`version_pin_drift` is `None` there, so the
-        // spawn arm stayed silent and this disclosure must not).
-        let disclosed_at_spawn =
-            spawn_owns_drift_disclosure(reused, proc.version_pin_drift.is_some());
-        if gate_ctx.is_some() && !proc.governance_verified && !disclosed_at_spawn {
-            let reason = match &proc.version_pin_drift {
-                Some(drift) => format!(
+        // The condition is the DRIFT, not `gate_ctx`: an ungoverned unit on a seat whose admission
+        // no longer holds is exactly the case that used to say nothing at all. A governed unit adds
+        // the per-unit consequence. `version_pin_drift` is `Some` only when the pin missed on a
+        // seat claiming input governance, which is also the only way `governance_verified` can be
+        // false on a gated turn — so no separate `!governance_verified` test is needed here, and
+        // there is no drift-free branch to write: `gate_ctx` is `Some` only when `acp_admitted`
+        // (see the `match (&input.governance, acp_admitted)` above), so a seat without input
+        // governance never reaches a gated turn at all.
+        if let Some(drift) = &proc.version_pin_drift {
+            let reason = if gate_ctx.is_some() {
+                format!(
                     "{} This unit is governed, so it is treated as unadmitted (answered by \
                      allow_result, unchecked) for as long as the drift stands.",
                     drift.disclosure(&cli_key)
-                ),
-                None => format!(
-                    "unit is governed and '{cli_key}' is admitted to input governance, but the \
-                     resolved ACP binary did not match its pinned verified_version at spawn \
-                     time; this session is treated as unadmitted (answered by allow_result, \
-                     unchecked) until a fresh admission re-proves the currently-installed build"
-                ),
+                )
+            } else {
+                drift.disclosure(&cli_key)
             };
             self.emit_event(CoreEvent::GovernanceUnenforced {
                 session: run_id.clone(),
@@ -8926,55 +8896,13 @@ sleep 30
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// core#587 review, Finding 1 — EXACTLY ONE of the two `GovernanceUnenforced` emitters owns a
-    /// given turn.
-    ///
-    /// The defect: the session-open arm (inside `if did_insert`) and the per-turn governed check
-    /// both fired on turn 1 of a drifted seat — two audit events for one condition on one
-    /// `(session, ord, attempt, cli)` — while on turn 2+ only the per-turn one fired, carrying the
-    /// generic text that named neither build. That is the very thing core#581 set out to fix, left
-    /// unfixed on every turn after the first.
-    ///
-    /// SCOPE: this pins the PREDICATE, not the emission sites. The sites cannot be driven from a
-    /// test — `TomlAcpConfig` refuses to let an overlay set `verified_version`, so no
-    /// test-constructible seat carries a pin through the runner path (established when I deleted
-    /// an earlier attempt rather than widen that contract). The spawn side's condition is read
-    /// from the code as `did_insert && drift.is_some()`, and `reused == !did_insert` comes from
-    /// its own binding, `(result, !did_insert)`.
-    #[test]
-    fn exactly_one_emitter_owns_the_version_pin_disclosure_for_a_turn() {
-        for reused in [false, true] {
-            for has_drift in [false, true] {
-                let spawn_emits = !reused && has_drift; // the `did_insert` arm's condition
-                let per_turn_emits = !spawn_owns_drift_disclosure(reused, has_drift); // governed + unverified
-                assert!(
-                    spawn_emits != per_turn_emits,
-                    "reused={reused} has_drift={has_drift}: exactly one emitter must own the \
-                     turn — both firing is the duplicate audit event, neither firing is a \
-                     governed turn that discloses nothing"
-                );
-            }
-        }
-        // And the case the defect was actually about: a REUSED session with a drift must be owned
-        // by the per-turn emitter, which is what makes it carry the both-builds detail instead of
-        // the generic text.
-        assert!(
-            !spawn_owns_drift_disclosure(true, true),
-            "turn 2+ on a drifted seat is the per-turn emitter's to disclose"
-        );
-        assert!(
-            spawn_owns_drift_disclosure(false, true),
-            "turn 1 on a drifted seat is the session-open arm's"
-        );
-    }
-
     /// core#581 — A DRIFTED PIN MUST BE ABLE TO SAY WHAT DRIFTED.
     ///
     /// Before this the engine kept only a bool: the resolved binary "did not match its pinned
     /// verified_version". An operator reading that had to go find the constant and run `--version`
     /// themselves — which is how the live drift (pinned `1.17.18`, installed `1.18.31`) sat
     /// unnoticed while the seat's ACP governance failed closed. The probe now keeps WHAT it saw,
-    /// and the disclosure names both sides plus the binary it actually resolved.
+    /// and the disclosure names both builds, the binary as configured, and where it resolves.
     ///
     /// The versions here are the live ones on purpose: this is the shape that went unseen.
     #[test]
@@ -9060,7 +8988,7 @@ sleep 30
             reason.contains("Re-prove"),
             "and must say what to do about it, not just that it happened: {reason}"
         );
-        // Not on PATH: say so rather than silently omitting where it came from.
+        // A BARE configured name that is not on PATH: say so.
         let unresolved = VersionPinDrift {
             resolved_path: None,
             ..drift.clone()
@@ -9068,7 +8996,34 @@ sleep 30
         .disclosure("opencode");
         assert!(
             unresolved.contains("not found on PATH"),
-            "an unresolvable binary must say so: {unresolved}"
+            "an unresolvable bare name must say so: {unresolved}"
+        );
+        // An ABSOLUTE configured binary was never looked up on PATH, so "not found on PATH" would
+        // be the wrong sentence; and when it does resolve it resolves to itself, so repeating the
+        // path adds nothing (core#587 review, Defect 4).
+        let abs_missing = VersionPinDrift {
+            binary: "/opt/custom/bin/opencode".into(),
+            resolved_path: None,
+            ..drift.clone()
+        }
+        .disclosure("opencode");
+        assert!(
+            abs_missing.contains("no such file") && !abs_missing.contains("PATH"),
+            "an absolute path that does not exist is not a PATH problem: {abs_missing}"
+        );
+        let abs_present = VersionPinDrift {
+            binary: "/opt/custom/bin/opencode".into(),
+            resolved_path: Some("/opt/custom/bin/opencode".into()),
+            ..drift.clone()
+        }
+        .disclosure("opencode");
+        assert!(
+            !abs_present.contains("resolves to"),
+            "an absolute path resolves to itself; do not print it twice: {abs_present}"
+        );
+        assert!(
+            abs_present.contains("/opt/custom/bin/opencode"),
+            "but it must still be named: {abs_present}"
         );
         // A binary that never answered says so rather than naming a version it never read.
         let silent = VersionPinDrift {
