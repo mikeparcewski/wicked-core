@@ -675,8 +675,29 @@ impl ElicitationMaps {
     /// Register the live tool child's pgid for `run_id`. Called by the tool background thread
     /// immediately after `proc.spawn()` — before the poll loop — so the actor thread can find
     /// and kill the group during cancel / supersede.
-    pub fn register_tool_child(&mut self, run_id: &str, pgid: u32) {
-        self.tool_child_pgroups.insert(run_id.to_string(), pgid);
+    ///
+    /// ONE PGID PER RUN, and that is an INVARIANT, not a simplification (core#577). A run
+    /// executes one unit at a time (the actor is the single writer and dispatches the next unit
+    /// only when the previous one's result posts back), `LaunchRun` refuses a second launch of a
+    /// live run id (`RunBusy`, via the `in_flight` guard), and `ReassignUnit` drains the registry
+    /// with `take_tool_child_pgroups` and kills the group BEFORE dispatching the replacement. So
+    /// the steady state has at most one live tool child per run.
+    ///
+    /// It is asserted rather than assumed: this returns `Some(previous)` when a registration
+    /// DISPLACED one — an event the invariant says cannot happen, which the caller logs. The one
+    /// way it can occur is a `ReassignUnit` landing in the window between `proc.spawn()` and this
+    /// call, so the `take_` found nothing and the replacement's registration overwrites the
+    /// late-registering old attempt. That is survivable rather than a leak — the displaced
+    /// attempt's own worker thread observes `stop()` and kills its own group — but the registry
+    /// has lost the pgid, so it must not be silent about it.
+    ///
+    /// Deliberately NOT a panic: a displaced pgid is a recoverable loss of reach, and turning it
+    /// into a worker-thread panic (holding this mutex) would be a worse outcome than the condition
+    /// it reports.
+    #[must_use = "a displaced pgid is the invariant breaking — log it, do not drop it"]
+    pub fn register_tool_child(&mut self, run_id: &str, pgid: u32) -> Option<u32> {
+        let displaced = self.tool_child_pgroups.insert(run_id.to_string(), pgid);
+        displaced.filter(|prev| *prev != pgid)
     }
 
     /// Deregister the tool child for `run_id` only if the stored pgid still matches `pgid`.
@@ -693,6 +714,11 @@ impl ElicitationMaps {
     /// Remove and return all live tool child pgids for `run_id`. Called by the actor thread
     /// BEFORE emitting `RunCancelled` or dispatching a replacement unit for `ReassignUnit`.
     /// Returns an empty vec when no tool child is registered (gate reject, non-tool run, etc.).
+    ///
+    /// The `Vec` is 0-or-1 BY CONSTRUCTION, not by coincidence (core#577): the storage holds one
+    /// pgid per run and [`Self::register_tool_child`] documents why that is the invariant. It is a
+    /// `Vec` so the callers' `for pgid in pgroups { … }` shape survives if that ever changes;
+    /// do not read it as evidence that multiple groups are tracked today.
     pub fn take_tool_child_pgroups(&mut self, run_id: &str) -> Vec<u32> {
         self.tool_child_pgroups.remove(run_id).into_iter().collect()
     }
@@ -18842,5 +18868,51 @@ transport = "stdio"
                 );
             }
         }
+    }
+
+    // ── core#577: the tool-child registry holds ONE pgid per run — assert it, do not overwrite ──
+
+    /// core#577 — `register_tool_child` overwrote unconditionally while `deregister_tool_child`
+    /// carefully compare-and-removes. The overwrite is now REPORTED: the displaced pgid comes back
+    /// so the caller can log it, because a displaced group can no longer be killed by the actor.
+    ///
+    /// The cardinality itself is unchanged (one pgid per run) — the engine's own structure makes a
+    /// second live registration unreachable in the steady state (`LaunchRun` refuses a live run id
+    /// via `in_flight`/`RunBusy`, a run advances one unit at a time, and `ReassignUnit` drains the
+    /// registry before dispatching the replacement), so a wider data structure would be storage for
+    /// a state the engine does not produce. What was missing was the assertion, not the capacity.
+    #[test]
+    fn registering_a_second_tool_child_for_one_run_reports_the_displaced_pgid() {
+        let mut maps = super::ElicitationMaps::new();
+
+        // The ordinary path: first registration displaces nothing.
+        assert_eq!(maps.register_tool_child("run-a", 111), None);
+        // Idempotent re-registration of the SAME pgid is not a displacement.
+        assert_eq!(maps.register_tool_child("run-a", 111), None);
+        // Another run is a different key — never a displacement.
+        assert_eq!(maps.register_tool_child("run-b", 222), None);
+
+        // The invariant breaking: a second, DIFFERENT live pgid for one run. Pre-core#577 this
+        // returned `()` and 111 was silently unreachable from here on.
+        assert_eq!(
+            maps.register_tool_child("run-a", 333),
+            Some(111),
+            "a displaced pgid must be handed back so the caller can log it"
+        );
+        // The newest registration is what the actor kills…
+        assert_eq!(maps.take_tool_child_pgroups("run-a"), vec![333]);
+        // …and the 0-or-1 shape of that Vec is the storage's, not an accident of this case.
+        assert!(maps.take_tool_child_pgroups("run-a").is_empty());
+        assert_eq!(maps.take_tool_child_pgroups("run-b"), vec![222]);
+
+        // Unchanged: deregistration still compare-and-removes, so a late on_done from a displaced
+        // attempt cannot evict the replacement's registration (core#500).
+        assert_eq!(maps.register_tool_child("run-c", 444), None);
+        maps.deregister_tool_child("run-c", 999); // a stale attempt's pgid
+        assert_eq!(
+            maps.take_tool_child_pgroups("run-c"),
+            vec![444],
+            "a stale deregistration must not evict the live entry"
+        );
     }
 }

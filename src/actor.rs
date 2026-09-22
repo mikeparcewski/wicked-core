@@ -6848,9 +6848,23 @@ fn dispatch_unit(
             let run_reg = run_for_reg.clone();
             let on_spawn = |pgid: u32| {
                 if let Some(ref m) = maps_reg {
-                    m.lock()
+                    let displaced = m
+                        .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .register_tool_child(&run_reg, pgid);
+                    // core#577: `register_tool_child` holds ONE pgid per run and the engine's
+                    // cardinality says a second live registration cannot happen. If it did, the
+                    // displaced group is no longer reachable from the registry (its own worker
+                    // thread still kills it, so this is lost REACH, not a lost process) — say so
+                    // rather than overwriting in silence.
+                    if let Some(prev) = displaced {
+                        eprintln!(
+                            "wicked-core: run {run_reg}: tool child pgid {prev} was DISPLACED in \
+                             the registry by pgid {pgid} — the one-live-tool-child-per-run \
+                             invariant did not hold; {prev} can no longer be killed by the actor \
+                             (core#577)"
+                        );
+                    }
                 }
             };
             let maps_dereg = maps_for_reg.clone();
@@ -15682,6 +15696,69 @@ mod tool_cmd_tests {
         assert!(
             wait_dead(bg, Duration::from_secs(2)),
             "the backgrounded sleep {bg} survived the group kill"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+    }
+
+    /// core#575 asked whether a process the script BACKGROUNDED into the tool child's group
+    /// survives the leader's NATURAL exit — the registry entry is dropped when the leader exits
+    /// (`on_done(pid)` runs unconditionally), so anything still in the group would be unreachable
+    /// afterwards. It does not survive, and this pins why: the `Ok(true)` (leader exited, not yet
+    /// reaped) arm kills the whole GROUP before collecting the status, while the leader's pid — and
+    /// therefore the group id — is still reserved by the un-reaped zombie.
+    ///
+    /// SCOPE, stated plainly: this is GREEN against the code as it stands; it guards a property,
+    /// not a fix. It is worth having because that `kill_child_tree` on a child that has ALREADY
+    /// exited reads like a redundant line — deleting it is the regression this catches, and the
+    /// existing `the_kill_reaches_everything_the_script_backgrounded` cannot, because there the
+    /// leader is still alive (it `wait`s) and the kill comes from the stop path instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_natural_leader_exit_still_takes_everything_it_backgrounded_with_it() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "wicked-core-575-{}-{}.pid",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // The leader backgrounds a long sleep into its OWN group, records its pid, and EXITS —
+        // no `wait`. `stop()` never fires: this is the natural-exit path, not a cancel.
+        //
+        // The background process gets its own stdio ON PURPOSE. Inheriting the leader's stdout
+        // pipe would make the drain block until it exits, so a missing group kill would show up as
+        // a 300 s hang rather than a verdict — and the test would then still pass, late, once the
+        // sleep ended on its own. With the redirect, `run_tool_cmd` returns at the leader's exit
+        // either way and the assertion below is the only thing that decides.
+        let script = format!(
+            "sleep 300 >/dev/null 2>&1 & echo $! > '{}'; exit 1",
+            pidfile.display()
+        );
+        let deregistered = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let d = deregistered.clone();
+        let on_done = move |p: u32| {
+            d.store(p, std::sync::atomic::Ordering::SeqCst);
+        };
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &never, &noop_spawn, &on_done);
+        assert_eq!(st, StepStatus::Failed, "{out}");
+        assert_eq!(
+            out, "\n[exit 1]",
+            "the leader's own exit is what is reported"
+        );
+        assert!(k.is_none(), "a natural exit is not a kill");
+        let bg: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the script recorded the backgrounded pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            wait_dead(bg, Duration::from_secs(2)),
+            "the backgrounded process {bg} outlived the tool phase: the registry has already \
+             deregistered this pgid, so nothing can reach it any more (core#575)"
+        );
+        // And the deregistration really did happen with the pgid that was spawned.
+        assert_ne!(
+            deregistered.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "on_done must run on the natural-exit path"
         );
         let _ = std::fs::remove_file(&pidfile);
     }
