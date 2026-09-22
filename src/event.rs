@@ -146,10 +146,16 @@ pub enum CoreEvent {
         seat_constraint: Option<String>,
         /// (core#461) The evaluator≠creator DISCLOSURE as a field: `Some("creator_seat")` when a
         /// review/test unit STAYS on a seat that built what it checks because no eligible seat
-        /// distinct from the builders admits it — a single-eligible-seat roster, or a bench that
-        /// emptied the pool (`degraded_reason` then says which); `None` (wire `null`) otherwise.
-        /// The fallback seat is always a still-eligible one. Additive; emitted unconditionally,
-        /// the `degraded_reason` rule.
+        /// distinct from the builders admits it; `None` (wire `null`) otherwise.
+        ///
+        /// The roster is always BENCH-FREE when this is set (core#560/#567): a bench that leaves a
+        /// review/test unit no distinct seat REFUSES the plan instead, so that case never reaches
+        /// the wire. Three shapes set it — a one-seat roster; a roster whose every seat was
+        /// assigned a Build/Recon unit; and one whose only non-builder seats the unit's skills
+        /// refuse. `degraded_reason` does NOT name this: the field is the disclosure, and the seat
+        /// the unit stays on is therefore always a still-eligible one (see
+        /// [`crate::distribute::Distribution::distinctness_fallback`]). Additive; emitted
+        /// unconditionally, the `degraded_reason` rule.
         distinctness_fallback: Option<String>,
     },
     /// The council was convened to pick a CLI for a unit (distribution vote started).
