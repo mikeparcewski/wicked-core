@@ -154,10 +154,18 @@ pub struct Distribution {
     /// reaches this field. Three bench-free shapes reach it — a one-seat roster; a roster of two or
     /// more seats where EVERY seat was assigned a Build/Recon unit; and a roster that does have a
     /// non-builder seat which this unit's skills refuse (`seat_candidates`). `degraded_reason` does
-    /// NOT name this — it is disclosed by this field alone. `None` when the unit is separated, is
-    /// not an evaluator, or is a tool unit. Rides `unitDistributed.distinctnessFallback`. The
-    /// fallback seat is always a still-eligible one: the bench pass reseats every unit off a
-    /// benched seat BEFORE this is judged, so a benched or dead seat is never the fallback.
+    /// NOT name this — it is disclosed by this field alone.
+    ///
+    /// The seat the unit stays on is therefore always a still-ELIGIBLE one, and by construction
+    /// rather than by any reseating: `launcher_benched` is folded into `benched` before anything
+    /// else runs, so an empty bench means no seat was benched by a ballot, a worker OR the
+    /// launcher's health probe — which is exactly what `eligible_seats` filters on. (Before
+    /// core#560 this field could be set WITH a bench, and the guarantee rested on the bench pass
+    /// having reseated the unit first; that path is now refused, so the reseat pass can no longer
+    /// be what makes this true.)
+    ///
+    /// `None` when the unit is separated, is not an evaluator, or is a tool unit. Rides
+    /// `unitDistributed.distinctnessFallback`.
     pub distinctness_fallback: Option<String>,
 }
 
