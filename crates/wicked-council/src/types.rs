@@ -1530,7 +1530,10 @@ mod login_tests {
             base.join("pi"),
             base.join("copilot"),
             base.join("opencode").join("data").join("opencode"),
-            base.join("agy"),
+            // agy's CREDENTIAL directory, not merely its root: `agy` writes the
+            // `antigravity-oauth-token` here, and asserting only `base.join("agy")` would pass
+            // while the directory the sign-in actually fills went unowned and unchecked.
+            base.join("agy").join(".gemini").join("antigravity-cli"),
         ] {
             assert!(d.is_dir(), "{} is prepared before sign-in", d.display());
         }
