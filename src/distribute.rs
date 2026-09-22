@@ -382,9 +382,11 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
 ///    nothing alone (core#461 — the ledger sees EVERY round of every council, not the latest). A
 ///    unit the council handed to a benched seat is reassigned to the first still-eligible seat its
 ///    skills admit (routing `degraded`, naming both seats and the cause), and the evaluator≠creator
-///    reassignment picks only among still-eligible seats — when none distinct from the builders
-///    remains, a review/test unit stays on its creator seat, `distinctness_fallback` is
-///    `creator_seat` (core#461), and `degraded_reason` says so whenever the bench emptied the pool.
+///    reassignment picks only among still-eligible seats. When a BENCH leaves a review/test unit no
+///    seat distinct from its creator the plan is REFUSED (`NoEligibleSeat`, core#560) — for every
+///    bench source, not just ballot. Only a bench-free roster that never had a second seat keeps a
+///    review/test unit on its creator seat, and that case is disclosed by the
+///    `distinctness_fallback: "creator_seat"` field (core#461), not by `degraded_reason`.
 /// 3. `degraded_reason` names the bench on EVERY unit whenever eligible < configured, and the
 ///    whole bench rides each `Distribution` for the actor to persist.
 #[allow(clippy::too_many_arguments)]
@@ -664,16 +666,22 @@ pub(crate) fn distribute_units_against_benched(
         }
         .into());
     }
-    // (F-7R2-006 rule 3) `degradedReason` on EVERY unit whenever eligible < configured — and
-    // (F-7R3-001) the same-seat disclosure when the bench left a review/test unit no seat distinct
-    // from its creator. A bench-free roster that is simply too small keeps its pre-existing stderr
-    // warning and the gate's own UNGATED disclosure.
+    // (F-7R2-006 rule 3) `degradedReason` on EVERY unit whenever eligible < configured.
+    //
+    // There is NO same-seat `degradedReason` disclosure here any more (core#567). F-7R3-001 used to
+    // disclose-and-continue when a bench left a review/test unit no seat distinct from its creator;
+    // core#560 replaced that policy with the refusal above, so the state the disclosure described
+    // is refused before this loop and the disclosure was dead code. A bench-free roster that is
+    // simply too small never reached it either — that case keeps its pre-existing stderr warning,
+    // the `distinctnessFallback` field below, and the gate's own UNGATED disclosure.
     let summary = crate::domain::benched_summary(&benched, configured.len());
     for (u, d) in units.iter().zip(dists.iter_mut()) {
         d.benched = benched.clone();
         // (core#461) The evaluator≠creator fallback is a FIELD, not prose alone: a consumer keys
         // on `distinctnessFallback == "creator_seat"` when the roster never had a second seat
-        // (bench-free too-small roster, review F2 on #452). Ballot-bench case is fail-closed above.
+        // (bench-free too-small roster, review F2 on #452). That is the ONLY way this is set:
+        // every bench-induced distinctness failure — launcher, ballot or worker (core#560) — is
+        // fail-closed above, so `benched` is necessarily empty whenever `same_seat` is not.
         d.distinctness_fallback = (u.tool_cmd.is_none() && same_seat.contains(&u.ord))
             .then(|| DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string());
         let mut parts: Vec<String> = Vec::new();
@@ -687,14 +695,6 @@ pub(crate) fn distribute_units_against_benched(
         }
         if let Some(s) = &summary {
             parts.push(s.clone());
-        }
-        if !benched.is_empty() && same_seat.contains(&u.ord) {
-            parts.push(format!(
-                "evaluator≠creator not enforceable for unit {}: it stays on creator seat '{}' — \
-                 no eligible seat distinct from the builders remains (the gate will say UNGATED \
-                 unless the repo checks floor gates it)",
-                u.ord, d.assigned_cli
-            ));
         }
         d.degraded_reason = (!parts.is_empty()).then(|| parts.join("; "));
     }
