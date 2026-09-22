@@ -933,6 +933,15 @@ struct AcpProcess {
     /// session is cached and reused across turns — and read by the caller to emit exactly one
     /// `SandboxUnenforced` disclosure per spawn. `None` when the floor armed OR the flag was OFF.
     sandbox_downgrade: Option<(String, String)>,
+    /// (core#581) `Some(..)` when this seat claims ACP input governance and its `verified_version`
+    /// pin did NOT match the resolved binary — the disclosure detail behind
+    /// `governance_verified == false`. Computed ONCE at spawn and read by the caller to emit
+    /// exactly one `GovernanceUnenforced` per spawn, the same shape `sandbox_downgrade` uses for
+    /// `SandboxUnenforced`. Before this the drift was only ever announced on a GOVERNED turn, so a
+    /// seat that had quietly stopped being governed said nothing at all on an ungoverned unit or a
+    /// chat, and even the governed message named neither the pinned nor the installed version.
+    /// `None` when the pin matched, the seat carries no pin, or the seat claims no governance.
+    version_pin_drift: Option<VersionPinDrift>,
     /// (core#396) The skills snapshot this session was OPENED with — the plugin the bridge loaded
     /// at `session/new` — bound to the process for its lifetime. Every later turn of the cached
     /// session prompts, admits, read-widens and reports against THIS generation, never against a
@@ -1771,26 +1780,86 @@ const VERSION_PIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// forcing function was proven against one specific pinned build (opencode's Homebrew tap
 /// auto-updates with no lockfile), not a range, so an unreadable or different version must
 /// downgrade this spawn's governance claim rather than assume it still holds.
-fn resolved_binary_version_matches(binary: &str, expected: &str) -> bool {
+/// The spawn-time `verified_version` probe, and WHAT the binary reported (core#581).
+///
+/// `matched` is the admission decision; `observed` is the first line of `--version` output, kept so
+/// the disclosure can name both sides of a drift. "pinned 1.17.18, resolved binary reports 1.18.31"
+/// is actionable; "did not match its pinned verified_version" leaves an operator to find the
+/// constant and run `--version` by hand, which is how a drifted seat sat unnoticed.
+#[derive(Debug, Clone)]
+struct VersionPinProbe {
+    matched: bool,
+    observed: Option<String>,
+}
+
+/// A `verified_version` pin that did NOT match, on a seat that claims input governance — the
+/// disclosure detail behind `governance_verified == false` (core#581).
+#[derive(Debug, Clone)]
+struct VersionPinDrift {
+    binary: String,
+    expected: String,
+    /// `None` when the probe could not run at all (spawn failure, timeout, non-zero exit).
+    observed: Option<String>,
+}
+
+impl VersionPinDrift {
+    /// The operator-facing reason. Names BOTH versions and the binary that was resolved, because
+    /// the whole point of the disclosure is that a reader can act on it without going to look up
+    /// the pin. Says what to do, and does NOT suggest simply moving the pin: the pin's value is
+    /// what it was proven against, so re-proving comes first.
+    fn disclosure(&self, cli_key: &str) -> String {
+        let observed = match &self.observed {
+            Some(v) => format!("reports `{v}`"),
+            None => "did not answer `--version`".to_string(),
+        };
+        format!(
+            "seat '{cli_key}' is admitted to ACP input governance against the exact build \
+             `{expected}`, but the resolved binary {binary} {observed} — the admission was never \
+             proven against the installed build, so this session is NOT admitted and every \
+             governed turn on it runs unchecked. Re-prove the installed build and move the pin, or \
+             pin the install so it cannot drift (the distribution auto-updates with no lockfile).",
+            expected = self.expected,
+            binary = self.binary,
+        )
+    }
+}
+
+fn probe_resolved_binary_version(binary: &str, expected: &str) -> VersionPinProbe {
     // The version pin must probe the SAME binary the spawn path will actually launch. On Windows,
     // npm shims install as `<name>.cmd` and a bare-name spawn returns NotFound (the exact case the
     // spawn below retries with an explicit `.cmd`). Without the same retry here, `run_bounded`
-    // fails to resolve the shim → this returns false → governance is downgraded to
+    // fails to resolve the shim -> this returns false -> governance is downgraded to
     // disclosed-ungoverned even though the bridge spawns fine. That is fail-SAFE (it discloses
     // rather than falsely claiming governance) but it defeats admission for every npm-shim ACP
     // adapter on Windows (#377 review). Mirror the spawn's retry so the check matches the spawn.
     let probe = |b: &str| {
         wicked_council::probe::run_bounded(b, &["--version".to_string()], VERSION_PIN_PROBE_TIMEOUT)
     };
-    let matches = |combined: &str| combined.lines().next().map(str::trim) == Some(expected);
+    let first_line = |combined: &str| combined.lines().next().map(str::trim).map(str::to_string);
+    let outcome = |combined: &str| {
+        let observed = first_line(combined);
+        VersionPinProbe {
+            matched: observed.as_deref() == Some(expected),
+            observed,
+        }
+    };
     match probe(binary) {
-        Ok((true, combined)) => matches(&combined),
+        Ok((true, combined)) => outcome(&combined),
         Err(wicked_council::probe::ProbeError::Spawn)
             if cfg!(windows) && std::path::Path::new(binary).extension().is_none() =>
         {
-            matches!(probe(&format!("{binary}.cmd")), Ok((true, c)) if matches(&c))
+            match probe(&format!("{binary}.cmd")) {
+                Ok((true, c)) => outcome(&c),
+                _ => VersionPinProbe {
+                    matched: false,
+                    observed: None,
+                },
+            }
         }
-        _ => false,
+        _ => VersionPinProbe {
+            matched: false,
+            observed: None,
+        },
     }
 }
 
@@ -2195,9 +2264,20 @@ fn start_acp_process_with_write_roots(
     // check belongs here, at the one point the spawn decision is made, not scattered across
     // later per-turn governance lookups that cannot see which binary actually started this
     // process.
-    let governance_verified = match &config.verified_version {
-        None => true,
-        Some(expected) => resolved_binary_version_matches(&config.binary, expected),
+    let (governance_verified, version_pin_drift) = match &config.verified_version {
+        None => (true, None),
+        Some(expected) => {
+            let probe = probe_resolved_binary_version(&config.binary, expected);
+            // The DISCLOSURE is gated on the seat actually claiming input governance: a version
+            // pin on a seat that never claimed admission gates nothing, so announcing it would be
+            // noise. `governance_verified` itself is unchanged — it stays a fact about the process.
+            let drift = (!probe.matched && config.acp_input_governance).then(|| VersionPinDrift {
+                binary: config.binary.clone(),
+                expected: expected.clone(),
+                observed: probe.observed.clone(),
+            });
+            (probe.matched, drift)
+        }
     };
     // The graph's key dir is recognised against THIS daemon's repo-graph root — derived from the
     // same state home the fence is built from (core#406) — and joins the WRITE roots for a UNIT
@@ -2600,6 +2680,7 @@ fn start_acp_process_with_write_roots(
         elicitation_advertised: form_enabled,
         governance_verified,
         sandbox_downgrade,
+        version_pin_drift,
         // Bound by the unit runner right after the spawn (it holds the admitted snapshot; this
         // chokepoint only knows the delivery it put in the handshake).
         skills: None,
@@ -6814,6 +6895,9 @@ impl AcpStepRunner {
                         // A1: captured before `proc` moves into the Arc so the once-per-spawn
                         // `SandboxUnenforced` disclosure can be emitted in the `did_insert` arm.
                         let sandbox_downgrade = proc.sandbox_downgrade.clone();
+                        // core#581: same capture, same reason — the once-per-spawn version-pin
+                        // disclosure below needs it after `proc` moves into the Arc.
+                        let version_pin_drift = proc.version_pin_drift.clone();
                         let arc = Arc::new(Mutex::new(proc));
                         let session_handles = {
                             let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -6879,6 +6963,24 @@ impl AcpStepRunner {
                                     cli: cli_key.clone(),
                                     level: level.clone(),
                                     reason: reason.clone(),
+                                });
+                            }
+                            // core#581: this seat is admitted to ACP input governance but the
+                            // binary that actually spawned is not the build the admission was
+                            // proven against, so this session is unadmitted. Disclose it exactly
+                            // once per spawn, like the sandbox sibling above — and CRUCIALLY
+                            // regardless of whether this first unit is governed: the per-turn
+                            // `GovernanceUnenforced` below fires only for a gated unit, so an
+                            // ungoverned unit or a chat on a drifted seat used to say nothing at
+                            // all. The reason names both versions so the drift is actionable
+                            // without going to read the pin.
+                            if let Some(drift) = &version_pin_drift {
+                                self.emit_event(CoreEvent::GovernanceUnenforced {
+                                    session: run_id.clone(),
+                                    ord: input.unit.ord,
+                                    attempt: input.attempt,
+                                    cli: cli_key.clone(),
+                                    reason: drift.disclosure(&cli_key),
                                 });
                             }
                         }
@@ -8730,14 +8832,86 @@ sleep 30
         let script = stub_bridge_with_version(&dir, "1.17.18");
         let bin = script.to_string_lossy().to_string();
 
-        assert!(resolved_binary_version_matches(&bin, "1.17.18"));
+        assert!(probe_resolved_binary_version(&bin, "1.17.18").matched);
         assert!(
-            !resolved_binary_version_matches(&bin, "1.18.21"),
+            !probe_resolved_binary_version(&bin, "1.18.21").matched,
             "a different reported version must not match a stale pin"
         );
         assert!(
-            !resolved_binary_version_matches("wicked-no-such-binary-xyzzy", "1.17.18"),
+            !probe_resolved_binary_version("wicked-no-such-binary-xyzzy", "1.17.18").matched,
             "a probe that cannot even spawn must not be treated as a match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#581 — A DRIFTED PIN MUST BE ABLE TO SAY WHAT DRIFTED.
+    ///
+    /// Before this the engine kept only a bool: the resolved binary "did not match its pinned
+    /// verified_version". An operator reading that had to go find the constant and run `--version`
+    /// themselves — which is how the live drift (pinned `1.17.18`, installed `1.18.31`) sat
+    /// unnoticed while the seat's ACP governance failed closed. The probe now keeps WHAT it saw,
+    /// and the disclosure names both sides plus the binary it actually resolved.
+    ///
+    /// The versions here are the live ones on purpose: this is the shape that went unseen.
+    #[test]
+    #[cfg(unix)]
+    fn a_drifted_version_pin_reports_what_the_resolved_binary_actually_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-version-pin-observed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = stub_bridge_with_version(&dir, "1.18.31");
+        let bin = script.to_string_lossy().to_string();
+
+        // What the engine SAW, not merely that it disagreed.
+        let probe = probe_resolved_binary_version(&bin, "1.17.18");
+        assert!(!probe.matched, "1.18.31 is not the pinned 1.17.18");
+        assert_eq!(
+            probe.observed.as_deref(),
+            Some("1.18.31"),
+            "the probe must keep the version it read, or the disclosure has nothing to name"
+        );
+        // A matching pin still matches, and still reports what it read.
+        let ok = probe_resolved_binary_version(&bin, "1.18.31");
+        assert!(ok.matched);
+        assert_eq!(ok.observed.as_deref(), Some("1.18.31"));
+        // A binary that cannot even be probed is a mismatch with nothing observed — it must not
+        // be reported as if it had answered.
+        let none = probe_resolved_binary_version("wicked-no-such-binary-xyzzy", "1.17.18");
+        assert!(!none.matched);
+        assert_eq!(none.observed, None);
+
+        // The operator-facing text names both sides and the binary that was actually resolved.
+        let drift = VersionPinDrift {
+            binary: bin.clone(),
+            expected: "1.17.18".into(),
+            observed: Some("1.18.31".into()),
+        };
+        let reason = drift.disclosure("opencode");
+        for needle in ["opencode", "1.17.18", "1.18.31", bin.as_str()] {
+            assert!(
+                reason.contains(needle),
+                "the disclosure must name {needle}: {reason}"
+            );
+        }
+        assert!(
+            reason.contains("Re-prove"),
+            "and must say what to do about it, not just that it happened: {reason}"
+        );
+        // A binary that never answered says so rather than naming a version it never read.
+        let silent = VersionPinDrift {
+            binary: bin.clone(),
+            expected: "1.17.18".into(),
+            observed: None,
+        }
+        .disclosure("opencode");
+        assert!(
+            silent.contains("did not answer"),
+            "an unprobeable binary must not be described as reporting something: {silent}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8772,29 +8946,64 @@ sleep 30
             verified_version: None,
         };
 
-        // No pin at all: always verified.
+        // No pin at all: always verified, and nothing to disclose.
         let proc = start_acp_process(&base_config, &dir, None, None).unwrap();
         assert!(proc.governance_verified);
+        assert!(
+            proc.version_pin_drift.is_none(),
+            "no pin, no drift (core#581)"
+        );
         drop(proc);
 
-        // Matching pin: verified.
+        // Matching pin: verified, and nothing to disclose.
         let matching = AcpConfig {
             verified_version: Some("1.17.18".into()),
             ..base_config.clone()
         };
         let proc = start_acp_process(&matching, &dir, None, None).unwrap();
         assert!(proc.governance_verified);
+        assert!(
+            proc.version_pin_drift.is_none(),
+            "a matching pin must not disclose a drift (core#581)"
+        );
         drop(proc);
 
         // Mismatched pin: the spawn still succeeds, but governance is downgraded for this process.
         let mismatched = AcpConfig {
             verified_version: Some("1.18.21".into()),
-            ..base_config
+            ..base_config.clone()
         };
         let proc = start_acp_process(&mismatched, &dir, None, None).unwrap();
         assert!(
             !proc.governance_verified,
             "a resolved binary reporting a different version must not be trusted as admitted"
+        );
+        // core#581: and the process CARRIES what drifted, so the caller can disclose it once per
+        // spawn instead of the operator having to read the pin and probe the binary by hand.
+        let drift = proc
+            .version_pin_drift
+            .clone()
+            .expect("a governed seat whose pin missed must carry the drift");
+        assert_eq!(drift.expected, "1.18.21");
+        assert_eq!(
+            drift.observed.as_deref(),
+            Some("1.17.18"),
+            "the disclosure names what the binary actually reported"
+        );
+        drop(proc);
+
+        // A seat that claims NO input governance has nothing admitted for a pin to gate, so a
+        // mismatch there is not an operator-facing drift — no noise.
+        let ungoverned = AcpConfig {
+            verified_version: Some("1.18.21".into()),
+            acp_input_governance: false,
+            ..base_config
+        };
+        let proc = start_acp_process(&ungoverned, &dir, None, None).unwrap();
+        assert!(!proc.governance_verified);
+        assert!(
+            proc.version_pin_drift.is_none(),
+            "an ungoverned seat's pin gates no admission, so it discloses nothing (core#581)"
         );
         drop(proc);
 
