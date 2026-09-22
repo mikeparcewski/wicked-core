@@ -1285,9 +1285,9 @@ fn rejecting_the_denial_gate_cancels_the_run_and_keeps_the_dirty_worktree() {
         SessionStatus::Cancelled
     );
     let evs = drain(&events);
-    assert!(evs
-        .iter()
-        .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == "r-reject-dirty")));
+    assert!(evs.iter().any(
+        |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r-reject-dirty")
+    ));
     assert!(
         evs.iter().any(|e| matches!(
             e,
@@ -1338,9 +1338,9 @@ fn rejecting_the_denial_gate_on_a_clean_recon_tree_cancels_without_failing() {
         SessionStatus::Cancelled
     );
     let evs = drain(&events);
-    assert!(evs
-        .iter()
-        .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == "r-reject-clean")));
+    assert!(evs.iter().any(
+        |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r-reject-clean")
+    ));
     assert!(!session_failed(&before) && !session_failed(&evs));
     let _ = std::fs::remove_dir_all(&repo);
 }

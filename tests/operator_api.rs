@@ -381,6 +381,7 @@ mod tests {
             attempt,
             previous_cli,
             new_cli,
+            ..
         } = ev
         {
             assert_eq!(session, "run-reassign");

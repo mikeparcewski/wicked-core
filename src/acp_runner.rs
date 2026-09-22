@@ -194,9 +194,9 @@ pub struct ElicitationMaps {
     /// `next_epoch`; used by `has_active_run` and `current_epoch`.
     /// Zero is not stored (only epochs ≥ 1 represent active runs).
     run_epoch: HashMap<String, u64>,
-    /// Dispatch-mode-agnostic tombstone set. Populated by `tombstone_run` (CancelRun
-    /// universal path) and `tombstone_bus_run` (shared_run_terminal bus guard).
-    /// `is_run_cancelled` checks this so `try_next_epoch_bus` can reject stale bus tasks
+    /// Dispatch-mode-agnostic tombstone set. Populated by `tombstone_run` (called inside
+    /// `cancel_run`, which all cancel paths go through) and `tombstone_bus_run` (shared_run_terminal
+    /// bus guard). `is_run_cancelled` checks this so `try_next_epoch_bus` can reject stale bus tasks
     /// for both locally-cancelled and bus-cancelled runs.
     all_cancelled_runs: HashSet<String>,
     /// Elicitation ids for which `ElicitationCreated` has been announced to subscribers.
@@ -206,6 +206,12 @@ pub struct ElicitationMaps {
     /// Elicitation ids whose paired `ElicitationResolved` event must be suppressed.
     /// Set when the `ElicitationCreated` was suppressed; cleared by `take_suppressed_resolution`.
     suppressed_resolutions: HashSet<String>,
+    /// Live tool child process-group ids keyed by run_id (core#500 / AC2): the actor thread reads
+    /// this to synchronously kill the group BEFORE emitting `RunCancelled` / `UnitReassigned`, so
+    /// the wire never asserts cancellation while the child is still alive. At most one entry per
+    /// run at any time (tool units are serialised). The background thread registers on spawn and
+    /// deregisters when the poll loop returns.
+    tool_child_pgroups: HashMap<String, u32>,
 }
 
 impl ElicitationMaps {
@@ -224,6 +230,7 @@ impl ElicitationMaps {
             all_cancelled_runs: HashSet::new(),
             creation_announced: HashSet::new(),
             suppressed_resolutions: HashSet::new(),
+            tool_child_pgroups: HashMap::new(),
         }
     }
 
@@ -641,7 +648,9 @@ impl ElicitationMaps {
 
     /// Universal tombstone — inserts `run_id` into `all_cancelled_runs` so
     /// `is_run_cancelled` returns true for both local and bus dispatch paths.
-    /// Called by `CancelRun` after `advance_launch_seq`.
+    /// Called by `cancel_run` before the group-kill block; all cancel callers
+    /// (`CancelRun`, `campaign::cancel`, `campaign::fail_fast`, human Reject,
+    /// governance Deny) inherit it through `cancel_run`.
     pub fn tombstone_run(&mut self, run_id: &str) {
         self.all_cancelled_runs.insert(run_id.to_string());
     }
@@ -656,11 +665,31 @@ impl ElicitationMaps {
         *self.run_launch_seq.get(run_id).unwrap_or(&0)
     }
 
-    /// Clear tombstone state for `run_id` after it has gone terminal (all bus tasks stale).
-    /// Called after `advance_launch_seq` so any in-flight bus tasks are invalidated
-    /// before the tombstone is removed.
-    pub fn retire_launch_state(&mut self, run_id: &str) {
-        self.all_cancelled_runs.remove(run_id);
+    // ── Tool child process-group registry (core#500 / AC2) ─────────────────────────────────────
+
+    /// Register the live tool child's pgid for `run_id`. Called by the tool background thread
+    /// immediately after `proc.spawn()` — before the poll loop — so the actor thread can find
+    /// and kill the group during cancel / supersede.
+    pub fn register_tool_child(&mut self, run_id: &str, pgid: u32) {
+        self.tool_child_pgroups.insert(run_id.to_string(), pgid);
+    }
+
+    /// Deregister the tool child for `run_id` only if the stored pgid still matches `pgid`.
+    /// Called by the background thread when the poll loop exits. The compare-and-remove prevents
+    /// a superseded attempt's late on_done from evicting the REPLACEMENT attempt's registration
+    /// (core#500: the registry was keyed by run_id only, so a deregister always removed the
+    /// current entry regardless of which attempt wrote it).
+    pub fn deregister_tool_child(&mut self, run_id: &str, pgid: u32) {
+        if self.tool_child_pgroups.get(run_id) == Some(&pgid) {
+            self.tool_child_pgroups.remove(run_id);
+        }
+    }
+
+    /// Remove and return all live tool child pgids for `run_id`. Called by the actor thread
+    /// BEFORE emitting `RunCancelled` or dispatching a replacement unit for `ReassignUnit`.
+    /// Returns an empty vec when no tool child is registered (gate reject, non-tool run, etc.).
+    pub fn take_tool_child_pgroups(&mut self, run_id: &str) -> Vec<u32> {
+        self.tool_child_pgroups.remove(run_id).into_iter().collect()
     }
 
     /// Mark the paired `ElicitationResolved` for `elicitation_id` as suppressed.

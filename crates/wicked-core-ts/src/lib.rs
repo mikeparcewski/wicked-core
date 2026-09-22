@@ -2557,9 +2557,12 @@ mod tests {
             &["type", "session", "ord"],
         );
         check(
-            CoreEvent::RunCancelled { session: s() },
+            CoreEvent::RunCancelled {
+                session: s(),
+                tool_children_killed: 0,
+            },
             "runCancelled",
-            &["type", "session"],
+            &["type", "session", "toolChildrenKilled"],
         );
         check(
             CoreEvent::SessionFailed {
@@ -2626,9 +2629,28 @@ mod tests {
                 attempt: 1,
                 previous_cli: s(),
                 new_cli: Some(s()),
+                previous_attempt_reaped: false,
             },
             "unitReassigned",
-            &["type", "session", "ord", "attempt", "previousCli", "newCli"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "previousCli",
+                "newCli",
+                "previousAttemptReaped",
+            ],
+        );
+        check(
+            CoreEvent::ToolResultDiscarded {
+                session: s(),
+                unit_ix: 0,
+                attempt: 0,
+                reason: "cancelled".to_string(),
+            },
+            "toolResultDiscarded",
+            &["type", "session", "unitIx", "attempt", "reason"],
         );
         check(
             CoreEvent::Error {

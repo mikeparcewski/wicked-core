@@ -485,7 +485,12 @@ pub enum CoreEvent {
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
     /// A run was cancelled (by the operator, or by a rejected gate).
-    RunCancelled { session: String },
+    /// `tool_children_killed` is the count of tool child process groups that were synchronously
+    /// killed BEFORE this event was emitted (core#500 / AC2); 0 when no tool unit was live.
+    RunCancelled {
+        session: String,
+        tool_children_killed: u32,
+    },
     /// A run halted as `Failed` at the unit with this `ord` — a governance deny or a worker failure
     /// (the run-level deny contract: never complete past a rejection).
     SessionFailed { session: String, ord: u32 },
@@ -639,9 +644,9 @@ pub enum CoreEvent {
     /// `unitReassigned` → `toolExecutorDispatched` on a supersede. `pid` is the killed leader,
     /// `ran_ms` how long it ran. `reason` is the invalidation signal the CHILD observed
     /// (`cancelled` = the run tombstone, `superseded` = the launch sequence moved, `shutdown`);
-    /// an operator cancel flips the tombstone and the sequence together and retires the
-    /// tombstone right after `cancel_run`, so the word may read `cancelled` or `superseded` —
-    /// consumers key on ORDER (this frame after `runCancelled`), never on the string.
+    /// an operator cancel flips the tombstone and the sequence inside `cancel_run` and the
+    /// tombstone is NOT retired afterwards, so the word reads `cancelled` on a cancel path.
+    /// Consumers key on ORDER (this frame after `runCancelled`), never on the string.
     ToolExecutorKilled {
         session: String,
         ord: u32,
@@ -1043,6 +1048,22 @@ pub enum CoreEvent {
         previous_cli: String,
         /// `None` means the council was re-convened and its choice is the new assignment.
         new_cli: Option<String>,
+        /// `true` when the previous attempt's tool child process group was synchronously killed
+        /// BEFORE this event was emitted (core#500 / AC2); `false` for non-tool units or when
+        /// no child was registered (e.g. the previous attempt had not yet spawned its child).
+        previous_attempt_reaped: bool,
+    },
+    /// (core#500) A late `ApplyStepResult` from a killed or superseded tool attempt was silently
+    /// discarded with no state change. Fires in two cases: (1) the run is already terminal when the
+    /// result arrives — the killed attempt posted back AFTER `RunCancelled`; (2) the session's
+    /// attempt count advanced past `attempt` — a superseded attempt from `ReassignUnit` returned
+    /// late. `reason` is `"cancelled"` (terminal run) or `"superseded"` (attempt guard).
+    /// `unit_ix` is the 0-based cursor index (matches `session.unit_ix`).
+    ToolResultDiscarded {
+        session: String,
+        unit_ix: usize,
+        attempt: u32,
+        reason: String,
     },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {
@@ -1530,8 +1551,11 @@ impl CoreEvent {
             CoreEvent::Resumed { session, ord } => {
                 json!({ "type": "resumed", "session": session, "ord": ord })
             }
-            CoreEvent::RunCancelled { session } => {
-                json!({ "type": "runCancelled", "session": session })
+            CoreEvent::RunCancelled {
+                session,
+                tool_children_killed,
+            } => {
+                json!({ "type": "runCancelled", "session": session, "toolChildrenKilled": tool_children_killed })
             }
             CoreEvent::SessionFailed { session, ord } => {
                 json!({ "type": "sessionFailed", "session": session, "ord": ord })
@@ -1568,6 +1592,7 @@ impl CoreEvent {
                 attempt,
                 previous_cli,
                 new_cli,
+                previous_attempt_reaped,
             } => json!({
                 "type": "unitReassigned",
                 "session": session,
@@ -1575,6 +1600,19 @@ impl CoreEvent {
                 "attempt": attempt,
                 "previousCli": previous_cli,
                 "newCli": new_cli,
+                "previousAttemptReaped": previous_attempt_reaped,
+            }),
+            CoreEvent::ToolResultDiscarded {
+                session,
+                unit_ix,
+                attempt,
+                reason,
+            } => json!({
+                "type": "toolResultDiscarded",
+                "session": session,
+                "unitIx": unit_ix,
+                "attempt": attempt,
+                "reason": reason,
             }),
             CoreEvent::Error { session, message } => {
                 json!({ "type": "error", "session": session, "message": message })
