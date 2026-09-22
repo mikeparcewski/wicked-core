@@ -10,9 +10,14 @@
 //! | claude   | claude-agent-acp (@agentclientprotocol, Agent SDK)   | stdio     |
 //! | codex    | codex-acp (@agentclientprotocol, Rust)               | stdio     |
 //! | pi       | pi-acp (community adapter)                           | stdio     |
-//! | agy      | agy-acp (wicked-crew packages/agent-acp-bridges)     | stdio     |
+//! | agy      | agy-acp (ambiguous bin name — see below)             | stdio     |
 //! | copilot  | copilot --acp (native)                               | stdio     |
 //! | opencode | opencode acp (native)                                | stdio     |
+//!
+//! `agy-acp` is resolved by name off PATH and TWO programs ship that bin: wicked-crew's own
+//! bridge (`packages/agent-acp-bridges`) and a community `agy-acp` on npm (0.5.2,
+//! Apache-2.0, ACP v1 — published, not wicked-maintained). Neither is proven against the agy
+//! seat and PATH order decides which one a spawn gets; see `wicked-council`'s registry note.
 //!
 //! When an ACP binary is unavailable or fails during the handshake, `AcpStepRunner`
 //! emits a warning and prepends it to `StepOutput.output` so it is visible in both
