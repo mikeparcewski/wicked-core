@@ -1021,7 +1021,7 @@ pub(crate) fn on_node_awaiting(
                 in_flight,
                 run_id,
                 HumanDecision::Reject,
-                &None,
+                seams.lifecycle_maps,
                 &None,
                 seams.process_gen,
                 false,
@@ -1098,7 +1098,7 @@ pub(crate) fn confirm_gate(
                 in_flight,
                 &run_id,
                 HumanDecision::Reject,
-                &None,
+                seams.lifecycle_maps,
                 &None,
                 seams.process_gen,
                 false,
@@ -1323,7 +1323,7 @@ pub(crate) fn resume(
                         in_flight,
                         spec.to_launch_spec(run_id.clone()),
                         seams.registry,
-                        &None,
+                        seams.lifecycle_maps,
                         &None,
                         seams.process_gen,
                         false,
@@ -1364,7 +1364,7 @@ pub(crate) fn resume(
                     seams.self_tx,
                     in_flight,
                     run_id,
-                    &None,
+                    seams.lifecycle_maps,
                     &None,
                     seams.process_gen,
                     false,
@@ -2002,5 +2002,237 @@ mod tests {
             "id": "c", "nodes": [], "max_concurrency": 1, "denial_gate": "cancel_everything"
         }))
         .is_err());
+    }
+
+    // ── core#500: the REJECT path must hand `cancel_run` the lifecycle maps ────────────────────
+
+    /// WIRING-CONTRACT test (core#500), deliberately white-box — read the scope note before
+    /// treating this as kill coverage.
+    ///
+    /// WHAT THIS PINS: that `campaign::confirm_gate`'s `CampaignGateDecision::Reject` arm passes
+    /// `seams.lifecycle_maps` — not `&None` — into `actor::confirm_gate` → `cancel_run`. With
+    /// `&None`, `cancel_run` takes the `None` branch: no `tombstone_run`, no `advance_launch_seq`,
+    /// an empty `pgroups_to_kill`, and `kill_pgroup_graceful` is never called. This test fails
+    /// (count 0, process group still alive) against that shape and passes against the wired one.
+    ///
+    /// WHAT THIS IS NOT: end-to-end kill coverage for the reject path. There is no integration
+    /// test of that, and this is not a substitute for one — do not delete it as "redundant".
+    ///
+    /// WHY THE REGISTRY IS SEEDED DIRECTLY: the engine can never hold a live tool child at a
+    /// human gate, so a run cannot be driven into this state from the public API.
+    /// `actor::confirm_gate` refuses unless `session.status == AwaitingHuman`, and `run_tool_cmd`
+    /// calls `on_done(pid)` UNCONDITIONALLY after the wait — on success, failure and kill alike —
+    /// so a tool unit that has ended has already deregistered its pgid. Gates fire either before a
+    /// unit dispatches or after one ends, which makes "at a gate" and "a tool child is registered"
+    /// mutually exclusive states. Seeding `register_tool_child` is therefore the only way to
+    /// observe what the reject path does with a registered group; it stands in for the child, and
+    /// the process group killed here is real.
+    #[cfg(unix)]
+    #[test]
+    fn campaign_reject_hands_cancel_run_the_lifecycle_maps_so_a_registered_group_is_killed() {
+        use crate::domain::{put_node, AgentSession, SessionStatus, WorkUnit};
+        use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+        use std::os::unix::process::CommandExt;
+        use std::sync::mpsc::channel;
+        use std::sync::{Arc, Mutex};
+        use wicked_apps_core::HardenedCommand;
+        use wicked_apps_core::{open_store, ToNode};
+
+        struct NoopRunner;
+        impl StepRunner for NoopRunner {
+            fn run_unit(&self, i: &StepInput) -> StepOutput {
+                StepOutput {
+                    run_id: i.run_id.clone(),
+                    unit_ix: i.unit_ix,
+                    attempt: i.attempt,
+                    output: "unused".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        struct NoopDispatcher;
+        impl wicked_council::types::Dispatcher for NoopDispatcher {
+            fn dispatch(
+                &self,
+                _c: &AgenticCli,
+                _t: &wicked_council::CouncilTask,
+            ) -> Option<wicked_council::types::Vote> {
+                None
+            }
+        }
+
+        fn alive(pid: i32) -> bool {
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        let cid = "reject-wiring";
+        let node_id = "n1";
+        let run_id = format!("{cid}:{node_id}:a0");
+        let mut store = open_store(Some(":memory:")).unwrap();
+
+        // A REAL process group that outlives the test unless something kills it: `process_group(0)`
+        // makes the child its own group leader, so its pid IS its pgid — the same shape
+        // `register_tool_child` receives from a live tool unit.
+        // spawn-audit: hardened — a stand-in for a tool child; it must inherit no engine state.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.hardened();
+        let mut child = cmd
+            .arg("-c")
+            .arg("sleep 300")
+            .process_group(0)
+            .spawn()
+            .expect("spawn the stand-in tool child");
+        let pgid = child.id();
+        let pid = pgid as i32;
+        assert!(alive(pid), "the stand-in group must be alive before reject");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the stand-in group must still be RUNNING before reject"
+        );
+
+        // The run is parked at a human gate — the ONLY state the Reject arm accepts.
+        let session = AgentSession {
+            id: run_id.clone(),
+            workflow_id: "wf-reject".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::All,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        put_node(
+            &mut store,
+            WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "the gated unit").to_node(),
+        )
+        .unwrap();
+
+        let def = CampaignDef {
+            id: cid.into(),
+            name: "reject wiring".into(),
+            nodes: vec![node(node_id)],
+            edges: vec![],
+            policy: FailurePolicy::FailFast,
+            max_concurrency: 1,
+            denial_gate: Default::default(),
+        };
+        let mut campaign = Campaign {
+            id: cid.into(),
+            def_id: cid.into(),
+            status: CampaignStatus::Running,
+            def,
+            node_status: status_map(&[(node_id, NodeStatus::AwaitingHuman)]),
+            node_run_id: [(node_id.to_string(), run_id.clone())]
+                .into_iter()
+                .collect(),
+            node_attempt: [(node_id.to_string(), 0u32)].into_iter().collect(),
+            pending_decision: BTreeMap::new(),
+            pending_decision_amend: BTreeMap::new(),
+            pending_failure_gates: Vec::new(),
+            fail_fast_tripped: false,
+        };
+        persist(&mut store, &mut campaign).unwrap();
+
+        // The registered tool-child group — what `cancel_run` reads through `lifecycle_maps`.
+        let maps = Arc::new(Mutex::new(crate::acp_runner::ElicitationMaps::new()));
+        maps.lock().unwrap().register_tool_child(&run_id, pgid);
+        let lifecycle_maps = Some(maps.clone());
+
+        let (tx, _rx) = channel::<Command>();
+        let dispatcher: Arc<dyn wicked_council::types::Dispatcher + Send + Sync> =
+            Arc::new(NoopDispatcher);
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let seams = Seams {
+            dispatcher: &dispatcher,
+            runner: &runner,
+            self_tx: &tx,
+            registry: &registry,
+            process_gen: uuid::Uuid::new_v4(),
+            lifecycle_maps: &lifecycle_maps,
+        };
+
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        let mut subscribers = crate::event_log::EventSink::default();
+        subscribers.push(ev_tx);
+        let mut in_flight: HashSet<String> = HashSet::new();
+
+        confirm_gate(
+            &mut store,
+            &mut subscribers,
+            &mut in_flight,
+            &seams,
+            cid,
+            node_id,
+            CampaignGateDecision::Reject,
+        )
+        .expect("the reject is accepted on an AwaitingHuman node");
+
+        let events: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        let killed = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::RunCancelled {
+                    session,
+                    tool_children_killed,
+                    ..
+                } if session.as_str() == run_id => Some(*tool_children_killed),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("reject must emit RunCancelled for {run_id}; got {events:?}")
+            });
+        assert!(
+            killed >= 1,
+            "toolChildrenKilled must be >= 1: the reject path must pass seams.lifecycle_maps into \
+             cancel_run so the registered group is killed. 0 means the call site passes &None and \
+             cancel_run took the None branch (core#500 on the reject path); got {events:?}"
+        );
+
+        // The kill is REAL, not just a counter. Reap it: a signalled-but-unwaited child stays a
+        // ZOMBIE, and `kill(pid, 0)` SUCCEEDS on a zombie — so `alive()` alone cannot tell
+        // "killed" from "still running" here. `try_wait` returning `Some` is the honest witness.
+        let mut exited = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(st) = child.try_wait().unwrap() {
+                exited = Some(st);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            exited.is_some(),
+            "the registered process group {pid} is still RUNNING after the reject — cancel_run \
+             never reached it"
+        );
+        // The same call must invalidate the launch identity, the other half the `None` branch skips.
+        assert!(
+            maps.lock().unwrap().is_run_cancelled(&run_id),
+            "reject must tombstone the run so the tool thread's stop() observes `cancelled`"
+        );
+
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 }

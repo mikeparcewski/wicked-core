@@ -15190,6 +15190,13 @@ mod turn_timeout_vs_cancel_tests {
         );
         // core#500: a superseded attempt's stale drop now emits ToolResultDiscarded; it must NOT
         // emit RunCancelled or UnitOutputCaptured.
+        // `Iterator::all` is vacuously true on an empty slice, so the `all` below would still pass
+        // if ToolResultDiscarded emission broke entirely. Pin the non-emptiness first.
+        assert!(
+            !events.is_empty(),
+            "the stale drop must EMIT ToolResultDiscarded — an empty event list would satisfy the \
+             `all` check vacuously and hide a total emission regression"
+        );
         assert!(
             events.iter().all(|e| matches!(e, CoreEvent::ToolResultDiscarded { .. })),
             "a stale drop may only emit ToolResultDiscarded — no RunCancelled, no UnitOutputCaptured; got {events:?}"
@@ -15200,6 +15207,11 @@ mod turn_timeout_vs_cancel_tests {
         let (applied, session, events) = fold(&mut store, &run_id, StepStatus::Cancelled, 0);
         assert!(matches!(applied, StepApplied::Stale));
         assert_eq!(session.status, SessionStatus::Executing);
+        assert!(
+            !events.is_empty(),
+            "the stale drop must EMIT ToolResultDiscarded — an empty event list would satisfy the \
+             `all` check vacuously and hide a total emission regression"
+        );
         assert!(
             events
                 .iter()

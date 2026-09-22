@@ -863,6 +863,12 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
 /// (AC2 / core#500).
 #[cfg(unix)]
 pub(crate) fn kill_pgroup_graceful(pgid: u32) -> bool {
+    // Bounds guard FIRST. `killpg(0, sig)` signals the CALLER's own process group — the daemon
+    // would SIGTERM then SIGKILL itself — and pgid 1 is init. Neither is ever a tool child, so a
+    // 0/1 pgid means the registry handed us a bogus value; refuse rather than signal.
+    if pgid <= 1 {
+        return false;
+    }
     let pgid = pgid as i32;
     // SIGTERM first — a well-behaved child flushes and exits; ESRCH means already gone.
     let term_rc = unsafe { sig::killpg(pgid, sig::SIGTERM) };
