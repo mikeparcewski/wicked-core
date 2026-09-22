@@ -2014,15 +2014,12 @@ pub(crate) fn run(
             Command::CancelRun { run_id, reply } => {
                 // ACP teardown: cancel epoch, signal kill handles (no-op for PTY).
                 shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
-                // Universal tombstone + sequence advance (invalidates any in-flight bus tasks).
-                if let Some(ref m) = lifecycle_maps {
-                    let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
-                    maps.tombstone_run(&run_id);
-                    maps.advance_launch_seq(&run_id);
-                }
                 // Discard any coalesced live-output tail: the operator is discarding the run, and
                 // the throttle entry must not outlive it.
                 let _ = output_throttle.drain_run(&run_id);
+                // tombstone + sequence advance now happen inside cancel_run so all callers
+                // (campaign::cancel, campaign::fail_fast, human Reject, governance Deny) inherit
+                // the invalidation uniformly without a separate pre-call here.
                 let res = cancel_run(
                     &mut store,
                     &mut subscribers,
@@ -2031,11 +2028,6 @@ pub(crate) fn run(
                     &run_id,
                     &lifecycle_maps,
                 );
-                // Retire launch state now that the sequence has been advanced.
-                if let Some(ref m) = lifecycle_maps {
-                    let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
-                    maps.retire_launch_state(&run_id);
-                }
                 in_flight.remove(&run_id);
                 let _ = reply.send(res);
             }
@@ -2817,22 +2809,37 @@ pub(crate) fn run(
                 // child is still alive. Graceful kill (SIGTERM → bounded wait → SIGKILL); the
                 // background thread reaps after it observes stop() (sequence advanced above).
                 let previous_attempt_reaped: bool = {
-                    let pgroups = lifecycle_maps
-                        .as_ref()
-                        .map(|m| {
-                            m.lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .take_tool_child_pgroups(&run_id)
-                        })
-                        .unwrap_or_default();
-                    let mut killed = false;
                     #[cfg(unix)]
-                    for pgid in pgroups {
-                        if crate::validator::kill_pgroup_graceful(pgid) {
-                            killed = true;
+                    {
+                        let pgroups = lifecycle_maps
+                            .as_ref()
+                            .map(|m| {
+                                m.lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .take_tool_child_pgroups(&run_id)
+                            })
+                            .unwrap_or_default();
+                        let mut killed = false;
+                        for pgid in pgroups {
+                            if crate::validator::kill_pgroup_graceful(pgid) {
+                                killed = true;
+                            }
                         }
+                        killed
                     }
-                    killed
+                    #[cfg(not(unix))]
+                    {
+                        // Drain the registry so the actor's map stays current; no kill on non-unix.
+                        let _ = lifecycle_maps
+                            .as_ref()
+                            .map(|m| {
+                                m.lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .take_tool_child_pgroups(&run_id)
+                            })
+                            .unwrap_or_default();
+                        false
+                    }
                 };
                 // ── bump attempt ────────────────────────────────────────────────────────────
                 let new_attempt = session.attempt.saturating_add(1);
@@ -4326,14 +4333,24 @@ fn apply_step_result(
     let mut session = crate::domain::get_session(store, &run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
 
+    // Load units early so both discard guards can gate on tool_cmd.is_some(); fail-open (.ok())
+    // so a DB error here still lets the terminal guard return Ok(Stale) rather than Err.
+    let units_opt = crate::domain::session_units(store, &run_id).ok();
+
     // Terminal guard: never apply onto an already-terminal run (e.g. a worker orphaned by Cancel).
     if matches!(
         session.status,
         SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
     ) {
-        // core#500: a killed attempt posts Cancelled after RunCancelled — emit a typed event so
-        // consumers can observe the discard rather than seeing a silent no-op.
-        if matches!(output.status, crate::workflow::StepStatus::Cancelled) {
+        // core#500: a killed TOOL attempt posts Cancelled after RunCancelled — emit a typed event
+        // so consumers can observe the discard. Non-tool units (no tool_cmd) never have a child
+        // to kill so `ToolResultDiscarded` must not fire for them.
+        if matches!(output.status, crate::workflow::StepStatus::Cancelled)
+            && units_opt
+                .as_ref()
+                .and_then(|us| us.get(output.unit_ix))
+                .is_some_and(|u| u.tool_cmd.is_some())
+        {
             emit(
                 subscribers,
                 CoreEvent::ToolResultDiscarded {
@@ -4357,16 +4374,23 @@ fn apply_step_result(
     // attempt currently in flight for `unit_ix`; anything older is a redelivery — drop it, regardless of
     // unit status. (Equal attempt is the expected current result → apply; a higher attempt cannot exist.)
     if output.attempt < session.attempt {
-        // core#500: a superseded attempt posted its result late — emit a typed discard event.
-        emit(
-            subscribers,
-            CoreEvent::ToolResultDiscarded {
-                session: run_id.clone(),
-                unit_ix: output.unit_ix,
-                attempt: output.attempt,
-                reason: "superseded".to_string(),
-            },
-        );
+        // core#500: a superseded TOOL attempt posted its result late — emit a typed discard event.
+        // Gate on tool_cmd.is_some() for the same reason as the terminal guard above.
+        if units_opt
+            .as_ref()
+            .and_then(|us| us.get(output.unit_ix))
+            .is_some_and(|u| u.tool_cmd.is_some())
+        {
+            emit(
+                subscribers,
+                CoreEvent::ToolResultDiscarded {
+                    session: run_id.clone(),
+                    unit_ix: output.unit_ix,
+                    attempt: output.attempt,
+                    reason: "superseded".to_string(),
+                },
+            );
+        }
         return Ok(StepApplied::Stale);
     }
     let mut output = output;
@@ -6792,12 +6816,11 @@ fn dispatch_unit(
         // off-thread below before the push runs. `None` for every other tool unit.
         let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
         // core#500 (F-BM-008): the child's STOP predicate — the run's launch identity, read the
-        // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown ALREADY
-        // flip it (`tombstone_run` + `advance_launch_seq` in `CancelRun`, `advance_launch_seq` in
-        // `ReassignUnit`, `set_shutdown_flag`); nothing new is signalled anywhere. The word is the
-        // signal the child OBSERVED, checked tombstone-first so an operator cancel usually reads
-        // `cancelled` — but the tombstone is retired right after `cancel_run`, so a late poll
-        // reads `superseded` (the sequence moved too). Consumers key on ORDER, never the word.
+        // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown flip it:
+        // `tombstone_run` + `advance_launch_seq` inside `cancel_run` (covers all cancel callers),
+        // `advance_launch_seq` in `ReassignUnit`, `set_shutdown_flag`. The tombstone is NOT retired
+        // after cancel; it persists until `begin_launch` on relaunch. The word the child observes
+        // is therefore always `cancelled` on an operator cancel. Consumers key on ORDER, never the word.
         let maps_for_child = elicitation_maps.clone();
         // Separate arc for the registration callbacks so `stop` can move `maps_for_child`
         // independently (core#500 / AC2).
@@ -7210,6 +7233,19 @@ fn run_tool_cmd(
         // Own group (pgid == pid) — the twin of `run_bounded`'s spawn: one `killpg` reaches
         // everything the script backgrounded, and the group is never the daemon's own.
         proc.process_group(0);
+    }
+    // Pre-spawn stop check: a cancel in the window between tool dispatch and spawn must not
+    // produce a fresh child. `pid: 0` signals the child was never born (no pgid to kill).
+    if let Some(reason) = stop() {
+        return (
+            format!("[killed: {reason}]"),
+            StepStatus::Cancelled,
+            Some(ToolKilled {
+                pid: 0,
+                reason,
+                ran_ms: 0,
+            }),
+        );
     }
     let mut child = match proc.spawn() {
         Ok(c) => c,
@@ -8196,28 +8232,52 @@ pub(crate) fn cancel_run(
         SessionStatus::Failed => return Ok(SessionStatus::Failed),
         _ => {}
     }
+    // Invalidate the launch identity so ALL callers (CancelRun, campaign::cancel,
+    // campaign::fail_fast, human Reject, governance Deny) inherit the invalidation uniformly.
+    // Placed here — after the terminal early-returns — so a double-cancel does not re-advance
+    // the sequence and spuriously supersede a subsequent relaunch.
+    if let Some(ref m) = lifecycle_maps {
+        let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
+        maps.tombstone_run(run_id);
+        maps.advance_launch_seq(run_id);
+    }
     // core#500 / AC2: kill any live tool child group BEFORE the Cancelled status is written to the
     // store — a reader polling the store between the write and the kill would see a cancelled run
     // with a live child, violating AC2. SIGTERM → bounded wait → SIGKILL; the background thread
     // owns the Child handle and will reap after it observes stop(). Double-signalling an
     // already-dead group is harmless (ESRCH). Returns true only when death is confirmed.
     let tool_children_killed: u32 = {
-        let pgroups = lifecycle_maps
-            .as_ref()
-            .map(|m| {
-                m.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take_tool_child_pgroups(run_id)
-            })
-            .unwrap_or_default();
-        let mut killed = 0u32;
         #[cfg(unix)]
-        for pgid in pgroups {
-            if crate::validator::kill_pgroup_graceful(pgid) {
-                killed += 1;
+        {
+            let pgroups = lifecycle_maps
+                .as_ref()
+                .map(|m| {
+                    m.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take_tool_child_pgroups(run_id)
+                })
+                .unwrap_or_default();
+            let mut killed = 0u32;
+            for pgid in pgroups {
+                if crate::validator::kill_pgroup_graceful(pgid) {
+                    killed += 1;
+                }
             }
+            killed
         }
-        killed
+        #[cfg(not(unix))]
+        {
+            // Drain the registry so the actor's map stays current; no kill on non-unix.
+            let _ = lifecycle_maps
+                .as_ref()
+                .map(|m| {
+                    m.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take_tool_child_pgroups(run_id)
+                })
+                .unwrap_or_default();
+            0u32
+        }
     };
     session.status = SessionStatus::Cancelled;
     session.finished_at = Some(crate::interaction::now_millis());
@@ -15011,6 +15071,8 @@ mod turn_timeout_vs_cancel_tests {
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
         u.assigned_cli = Some("claude".to_string());
         u.status = UnitStatus::Distributed;
+        // tool_cmd required so ToolResultDiscarded fires on stale drops (gated on is_some()).
+        u.tool_cmd = Some(vec!["true".to_string()]);
         put_node(store, u.to_node()).unwrap();
     }
 
@@ -15150,6 +15212,62 @@ mod turn_timeout_vs_cancel_tests {
         let (applied, session, _events) = fold(&mut store, &run_id, StepStatus::Cancelled, 1);
         assert!(matches!(applied, StepApplied::Finished));
         assert_eq!(session.status, SessionStatus::Cancelled);
+    }
+
+    /// (4 — negative gate, fix #6): a superseded NON-TOOL unit (tool_cmd = None) must emit
+    /// NO ToolResultDiscarded on a stale drop. The event is tool-typed by name and contract;
+    /// firing it for agent units would mislead consumers that no tool child ran.
+    #[test]
+    fn superseded_non_tool_unit_emits_no_tool_result_discarded() {
+        let run_id = format!("nontool-stale-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+
+        // Seed a session at attempt 1 with a unit that has NO tool_cmd.
+        let session = AgentSession {
+            id: run_id.clone(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 1,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
+        u.assigned_cli = Some("claude".to_string());
+        u.status = UnitStatus::Distributed;
+        // tool_cmd intentionally None — this is an agent unit, not a tool-executor unit.
+        put_node(&mut store, u.to_node()).unwrap();
+
+        // Fold with the OLD attempt (0 < session.attempt 1): superseded path.
+        let (applied, _, events) = fold(&mut store, &run_id, StepStatus::Cancelled, 0);
+        assert!(
+            matches!(applied, StepApplied::Stale),
+            "superseded attempt is Stale"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::ToolResultDiscarded { .. })),
+            "a non-tool unit (tool_cmd = None) must NEVER emit ToolResultDiscarded on supersede: {events:?}"
+        );
     }
 
     /// F-7R2-013 (wave 6): a COMPLETED run inside its retention window KEEPS its worktree — the
@@ -15498,6 +15616,51 @@ mod tool_cmd_tests {
             "the backgrounded sleep {bg} survived the group kill"
         );
         let _ = std::fs::remove_file(&pidfile);
+    }
+
+    /// Fix #4 — pre-spawn window: when `stop()` is already `Some` before `proc.spawn()`, the
+    /// function returns `(Cancelled, ToolKilled{pid:0})` WITHOUT spawning a child. The script
+    /// would create a sentinel file if it ever ran; the sentinel must remain absent.
+    #[cfg(unix)]
+    #[test]
+    fn stop_already_set_before_spawn_returns_cancelled_without_creating_a_child() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "wicked-core-prespawn-{}-{}.sentinel",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Script creates sentinel immediately — proves any spawn would be observable.
+        let script = format!("touch '{}'", sentinel.display());
+        let spawn_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sc = spawn_count.clone();
+        let on_spawn = move |_: u32| {
+            sc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let (out, st, k) = run_tool_cmd(
+            &sh(&script),
+            None,
+            &[],
+            &|| Some("cancelled"), // already cancelled before spawn
+            &on_spawn,
+            &noop_done,
+        );
+        assert_eq!(st, StepStatus::Cancelled, "pre-spawn kill yields Cancelled");
+        assert!(
+            out.contains("[killed: cancelled]"),
+            "output carries the kill annotation: {out}"
+        );
+        let k = k.expect("ToolKilled is present for a pre-spawn cancel");
+        assert_eq!(k.pid, 0, "pid 0 signals the child was never spawned");
+        assert_eq!(k.reason, "cancelled");
+        assert_eq!(
+            spawn_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "on_spawn must not be called — the child was never spawned"
+        );
+        assert!(
+            !sentinel.exists(),
+            "sentinel exists — the child ran despite the pre-spawn stop check"
+        );
     }
 }
 

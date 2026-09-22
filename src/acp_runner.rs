@@ -194,9 +194,9 @@ pub struct ElicitationMaps {
     /// `next_epoch`; used by `has_active_run` and `current_epoch`.
     /// Zero is not stored (only epochs ≥ 1 represent active runs).
     run_epoch: HashMap<String, u64>,
-    /// Dispatch-mode-agnostic tombstone set. Populated by `tombstone_run` (CancelRun
-    /// universal path) and `tombstone_bus_run` (shared_run_terminal bus guard).
-    /// `is_run_cancelled` checks this so `try_next_epoch_bus` can reject stale bus tasks
+    /// Dispatch-mode-agnostic tombstone set. Populated by `tombstone_run` (called inside
+    /// `cancel_run`, which all cancel paths go through) and `tombstone_bus_run` (shared_run_terminal
+    /// bus guard). `is_run_cancelled` checks this so `try_next_epoch_bus` can reject stale bus tasks
     /// for both locally-cancelled and bus-cancelled runs.
     all_cancelled_runs: HashSet<String>,
     /// Elicitation ids for which `ElicitationCreated` has been announced to subscribers.
@@ -648,7 +648,9 @@ impl ElicitationMaps {
 
     /// Universal tombstone — inserts `run_id` into `all_cancelled_runs` so
     /// `is_run_cancelled` returns true for both local and bus dispatch paths.
-    /// Called by `CancelRun` after `advance_launch_seq`.
+    /// Called by `cancel_run` before the group-kill block; all cancel callers
+    /// (`CancelRun`, `campaign::cancel`, `campaign::fail_fast`, human Reject,
+    /// governance Deny) inherit it through `cancel_run`.
     pub fn tombstone_run(&mut self, run_id: &str) {
         self.all_cancelled_runs.insert(run_id.to_string());
     }
@@ -661,13 +663,6 @@ impl ElicitationMaps {
     /// Return the current launch sequence for `run_id`, or 0 if none.
     pub fn current_launch_seq(&self, run_id: &str) -> u64 {
         *self.run_launch_seq.get(run_id).unwrap_or(&0)
-    }
-
-    /// Clear tombstone state for `run_id` after it has gone terminal (all bus tasks stale).
-    /// Called after `advance_launch_seq` so any in-flight bus tasks are invalidated
-    /// before the tombstone is removed.
-    pub fn retire_launch_state(&mut self, run_id: &str) {
-        self.all_cancelled_runs.remove(run_id);
     }
 
     // ── Tool child process-group registry (core#500 / AC2) ─────────────────────────────────────

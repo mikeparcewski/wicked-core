@@ -2632,7 +2632,15 @@ mod tests {
                 previous_attempt_reaped: false,
             },
             "unitReassigned",
-            &["type", "session", "ord", "attempt", "previousCli", "newCli", "previousAttemptReaped"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "previousCli",
+                "newCli",
+                "previousAttemptReaped",
+            ],
         );
         check(
             CoreEvent::ToolResultDiscarded {

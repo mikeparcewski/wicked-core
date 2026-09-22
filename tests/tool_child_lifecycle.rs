@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, SessionStatus, StepInput,
-    StepOutput, StepRunner, StepStatus,
+    CampaignDef, CampaignNode, CampaignStatus, Core, CoreEvent, EntityMode, FailurePolicy,
+    HumanConfirm, HumanDecision, LaunchSpec, RunSpec, SessionStatus, StepInput, StepOutput,
+    StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -297,9 +298,10 @@ fn cancel_run_kills_the_live_tool_child_and_its_group_and_the_frame_follows_run_
                 *pid as i32, leader_pid,
                 "the killed leader is the spawned child"
             );
-            assert!(
-                matches!(reason.as_str(), "cancelled" | "superseded"),
-                "the signal the child observed (never `shutdown` here): {reason}"
+            assert_eq!(
+                reason.as_str(),
+                "cancelled",
+                "fix #5: tombstone persists after cancel so the child always observes 'cancelled', never 'superseded'"
             );
             assert!(*ran_ms > 0);
         }
@@ -460,9 +462,11 @@ fn cancel_kills_entire_process_group_including_grandchild() {
     let leader = dir.join("leader.pid");
     let bg = dir.join("bg.pid");
     let sentinel = dir.join("sentinel.flag");
+    // sleep 1 so the grandchild creates the sentinel well within the post-cancel wait window
+    // if the group kill fails — making the sentinel assertion genuinely falsifiable.
     let script = format!(
         "echo $$ > '{ldr}'; \
-         (sleep 30 && touch '{sen}') & \
+         (sleep 1 && touch '{sen}') & \
          echo $! > '{bg}'; \
          sleep 300",
         ldr = leader.display(),
@@ -529,8 +533,10 @@ fn cancel_kills_entire_process_group_including_grandchild() {
         wait_dead(bg_pid, Duration::from_secs(5)),
         "grandchild {bg_pid} still alive — group kill missed it"
     );
-    // The grandchild was supposed to touch sentinel.flag after 30s; it was killed first.
-    std::thread::sleep(Duration::from_millis(300));
+    // The grandchild sleeps 1 s then touches the sentinel. We wait 3 s — enough for the
+    // sentinel to appear if the grandchild survived the cancel. If the group kill works, the
+    // grandchild is already dead and the sentinel never appears.
+    std::thread::sleep(Duration::from_secs(3));
     assert!(
         !sentinel.exists(),
         "sentinel exists — the grandchild ran its action despite the cancel"
@@ -764,5 +770,107 @@ fn superseded_attempt_late_result_emits_tool_result_discarded() {
     );
 
     let _ = core.cancel_run(sid);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── (7) Campaign cancel kills the live tool child through cancel_campaign ──────────────────────
+
+/// Design test (7) — fix #3 coverage: `campaign::cancel` calls `cancel_run`, which now has the
+/// tombstone + advance_launch_seq inside it. This test proves the full cancel path from
+/// `cancel_campaign` reaches the tool child's process group: both the leader and the background
+/// process are dead after `cancel_campaign`, and `runCancelled.toolChildrenKilled >= 1`.
+#[test]
+fn campaign_cancel_kills_the_live_tool_child_through_cancel_campaign() {
+    let cid = "toolkill-campaign-cancel";
+    let node_id = "node1";
+    let dir = fixture_dir("campaign-cancel");
+    let leader = dir.join("leader.pid");
+    let bg = dir.join("bg.pid");
+    let script = format!(
+        "echo $$ > '{ldr}'; sleep 300 & echo $! > '{bg}'; sleep 300",
+        ldr = leader.display(),
+        bg = bg.display(),
+    );
+
+    let core = Core::spawn_with_engine(
+        db_path(&dir),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev = core.subscribe();
+    core.register_workflow(tool_def("campaign-tool", &script))
+        .unwrap();
+
+    // The run_id under a campaign is "{cid}:{node_id}:a{attempt}" — a0 for the first dispatch.
+    let run_sid = format!("{cid}:{node_id}:a0");
+
+    let def = CampaignDef {
+        id: cid.into(),
+        name: "toolkill-campaign".into(),
+        nodes: vec![CampaignNode {
+            node_id: node_id.into(),
+            run_spec: RunSpec {
+                problem: "kill test".into(),
+                clis: vec![cli("stub")],
+                entity_mode: EntityMode::Shared,
+                human_confirm: HumanConfirm::None,
+                repo_ref: None,
+                workflow_id: Some("campaign-tool".into()),
+            },
+        }],
+        edges: vec![],
+        policy: FailurePolicy::FailFast,
+        max_concurrency: 1,
+        denial_gate: Default::default(),
+    };
+    core.launch_campaign(def).expect("launch campaign");
+
+    // Wait for the tool thread to be dispatched and both pids written.
+    let pre = collect_until(
+        &ev,
+        Duration::from_secs(10),
+        |e| matches!(e, CoreEvent::ToolExecutorDispatched { session, .. } if session.as_str() == run_sid),
+    );
+    assert!(
+        pre.iter().any(
+            |e| matches!(e, CoreEvent::ToolExecutorDispatched { session, .. } if session.as_str() == run_sid)
+        ),
+        "tool dispatched: {pre:?}"
+    );
+    let leader_pid = read_pid(&leader);
+    let bg_pid = read_pid(&bg);
+    assert!(alive(leader_pid), "leader alive before campaign cancel");
+    assert!(alive(bg_pid), "grandchild alive before campaign cancel");
+
+    let status = core.cancel_campaign(cid).expect("cancel_campaign");
+    assert_eq!(status, CampaignStatus::Cancelled);
+
+    let post = collect_until(
+        &ev,
+        Duration::from_secs(5),
+        |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session.as_str() == run_sid),
+    );
+    if let Some(CoreEvent::RunCancelled {
+        tool_children_killed,
+        ..
+    }) = post.iter().find(
+        |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session.as_str() == run_sid),
+    ) {
+        assert!(
+            *tool_children_killed >= 1,
+            "toolChildrenKilled must be >= 1: campaign cancel must reach the tool child group: {post:?}"
+        );
+    } else {
+        panic!("no runCancelled on the wire after campaign cancel: {post:?}");
+    }
+
+    assert!(
+        wait_dead(leader_pid, Duration::from_secs(5)),
+        "leader {leader_pid} still alive after campaign cancel"
+    );
+    assert!(
+        wait_dead(bg_pid, Duration::from_secs(5)),
+        "background {bg_pid} still alive — group kill missed it"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

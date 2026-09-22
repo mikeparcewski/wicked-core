@@ -644,9 +644,9 @@ pub enum CoreEvent {
     /// `unitReassigned` → `toolExecutorDispatched` on a supersede. `pid` is the killed leader,
     /// `ran_ms` how long it ran. `reason` is the invalidation signal the CHILD observed
     /// (`cancelled` = the run tombstone, `superseded` = the launch sequence moved, `shutdown`);
-    /// an operator cancel flips the tombstone and the sequence together and retires the
-    /// tombstone right after `cancel_run`, so the word may read `cancelled` or `superseded` —
-    /// consumers key on ORDER (this frame after `runCancelled`), never on the string.
+    /// an operator cancel flips the tombstone and the sequence inside `cancel_run` and the
+    /// tombstone is NOT retired afterwards, so the word reads `cancelled` on a cancel path.
+    /// Consumers key on ORDER (this frame after `runCancelled`), never on the string.
     ToolExecutorKilled {
         session: String,
         ord: u32,

@@ -855,7 +855,8 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
 
 /// Kill a process group gracefully from the ACTOR THREAD (no `Child` handle — only the pgid from the
 /// tool-child registry). Sends SIGTERM, waits up to ~500 ms, then SIGKILL if still alive. Returns `true`
-/// if the group was live when first signalled, `false` if it was already dead (ESRCH). The background
+/// if the group was confirmed dead (via SIGTERM or SIGKILL within the poll budget), `false` if it was
+/// already dead (ESRCH) or if the group survived SIGKILL within the confirmation budget. The background
 /// thread that owns the `Child` handle remains responsible for `wait()` / reaping; double-signalling an
 /// already-dead group is harmless. Called by `cancel_run` and `ReassignUnit` BEFORE emitting
 /// `RunCancelled` / `UnitReassigned` so the wire never asserts cancellation while tool children live
