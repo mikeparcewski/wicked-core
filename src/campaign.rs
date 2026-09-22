@@ -1090,7 +1090,18 @@ pub(crate) fn confirm_gate(
                 .ok_or_else(|| anyhow::anyhow!("node {node_id} has no live run"))?;
             // Reject terminates the Run immediately (no slot needed); the ensuing RunCancelled
             // reconciles the node via `on_run_finished` (deferred).
-            let _ = crate::actor::confirm_gate(
+            //
+            // core#574: the `Result` is PROPAGATED, not discarded. `actor::confirm_gate` refuses
+            // unless `session.status == AwaitingHuman`, and the node's status can disagree with
+            // the session's — nothing reconciles `node_status` when the run leaves `AwaitingHuman`
+            // by a non-campaign route (e.g. the run-level `Core::confirm_gate` answered it
+            // directly). The outer guard above then passes while the inner one bails, and with
+            // `let _ =` the operator was told `Ok(<campaign status>)` while the run kept executing
+            // and its child stayed alive. A denial that silently does nothing is worse than one
+            // that errors: the campaign state is left untouched (the node stays `AwaitingHuman`,
+            // re-rejectable) and the caller gets the reason. This matches the two sibling call
+            // sites — the Approve/resume path uses `?`, and `auto_reject` logs and HOLDS.
+            crate::actor::confirm_gate(
                 store,
                 subscribers,
                 seams.runner,
@@ -1102,7 +1113,13 @@ pub(crate) fn confirm_gate(
                 &None,
                 seams.process_gen,
                 false,
-            );
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "campaign {} node {node_id}: reject could not cancel run {run_id}: {e}",
+                    campaign.id
+                )
+            })?;
         }
         // ── HumanGateOnFailure policy gate ──────────────────────────────────────
         CampaignGateDecision::Retry => {
@@ -2247,6 +2264,199 @@ mod tests {
         assert!(
             maps.lock().unwrap().is_run_cancelled(&run_id),
             "reject must tombstone the run so the tool thread's stop() observes `cancelled`"
+        );
+    }
+
+    // ── core#574: a reject whose inner cancel bails must ERROR, not report success ─────────────
+
+    /// core#574 — `CampaignGateDecision::Reject` discarded the `Result` of `actor::confirm_gate`
+    /// with `let _ =`. When the inner call bails the operator was told `Ok(<campaign status>)`
+    /// while the run kept executing.
+    ///
+    /// HOW THE STATE IS REACHED (it is not contrived): the campaign's `node_status` and the
+    /// session's `status` are two records, and nothing reconciles the node when the run leaves
+    /// `AwaitingHuman` by a non-campaign route. Answering the run-level gate directly
+    /// (`Core::confirm_gate(run_id, Approve)`) resumes the session to `Executing` and leaves the
+    /// node at `AwaitingHuman` — exactly the pair seeded here, and exactly what was observed
+    /// against a live engine in the issue. The outer node guard then passes and the inner session
+    /// guard bails.
+    ///
+    /// REACHABILITY NOTE (deliberately NOT asserted): no tool child is registered here and none
+    /// could be. `run_tool_cmd` calls `on_done(pid)` unconditionally when a unit ends, so
+    /// "at a gate" and "a tool child is registered" are mutually exclusive through the public API;
+    /// an assertion on `toolChildrenKilled` would be vacuous. What this pins is the CONTRACT: the
+    /// denial either takes effect or says why.
+    #[test]
+    fn campaign_reject_surfaces_the_inner_cancel_failure_instead_of_reporting_success() {
+        use crate::domain::{put_node, AgentSession, SessionStatus, WorkUnit};
+        use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+        use std::sync::mpsc::channel;
+        use std::sync::Arc;
+        use wicked_apps_core::{open_store, ToNode};
+
+        struct NoopRunner;
+        impl StepRunner for NoopRunner {
+            fn run_unit(&self, i: &StepInput) -> StepOutput {
+                StepOutput {
+                    run_id: i.run_id.clone(),
+                    unit_ix: i.unit_ix,
+                    attempt: i.attempt,
+                    output: "unused".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        struct NoopDispatcher;
+        impl wicked_council::types::Dispatcher for NoopDispatcher {
+            fn dispatch(
+                &self,
+                _c: &AgenticCli,
+                _t: &wicked_council::CouncilTask,
+            ) -> Option<wicked_council::types::Vote> {
+                None
+            }
+        }
+
+        let cid = "reject-swallow";
+        let node_id = "n1";
+        let run_id = format!("{cid}:{node_id}:a0");
+        let mut store = open_store(Some(":memory:")).unwrap();
+
+        // The session is EXECUTING — the run-level gate was answered outside the campaign — while
+        // the campaign still records the node as AwaitingHuman.
+        let session = AgentSession {
+            id: run_id.clone(),
+            workflow_id: "wf-reject-swallow".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::All,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        put_node(
+            &mut store,
+            WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "the in-flight unit").to_node(),
+        )
+        .unwrap();
+
+        let def = CampaignDef {
+            id: cid.into(),
+            name: "reject swallow".into(),
+            nodes: vec![node(node_id)],
+            edges: vec![],
+            policy: FailurePolicy::FailFast,
+            max_concurrency: 1,
+            denial_gate: Default::default(),
+        };
+        let mut campaign = Campaign {
+            id: cid.into(),
+            def_id: cid.into(),
+            status: CampaignStatus::Running,
+            def,
+            node_status: status_map(&[(node_id, NodeStatus::AwaitingHuman)]),
+            node_run_id: [(node_id.to_string(), run_id.clone())]
+                .into_iter()
+                .collect(),
+            node_attempt: [(node_id.to_string(), 0u32)].into_iter().collect(),
+            pending_decision: BTreeMap::new(),
+            pending_decision_amend: BTreeMap::new(),
+            pending_failure_gates: Vec::new(),
+            fail_fast_tripped: false,
+        };
+        persist(&mut store, &mut campaign).unwrap();
+
+        let (tx, _rx) = channel::<Command>();
+        let dispatcher: Arc<dyn wicked_council::types::Dispatcher + Send + Sync> =
+            Arc::new(NoopDispatcher);
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let lifecycle_maps = None;
+        let seams = Seams {
+            dispatcher: &dispatcher,
+            runner: &runner,
+            self_tx: &tx,
+            registry: &registry,
+            process_gen: uuid::Uuid::new_v4(),
+            lifecycle_maps: &lifecycle_maps,
+        };
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        let mut subscribers = crate::event_log::EventSink::default();
+        subscribers.push(ev_tx);
+        let mut in_flight: HashSet<String> = HashSet::new();
+
+        let res = confirm_gate(
+            &mut store,
+            &mut subscribers,
+            &mut in_flight,
+            &seams,
+            cid,
+            node_id,
+            CampaignGateDecision::Reject,
+        );
+
+        let err = match res {
+            Ok(status) => panic!(
+                "the reject reported success ({status:?}) while the run is still {:?} and was \
+                 never cancelled — `actor::confirm_gate`'s Err was discarded by `let _ =` \
+                 (core#574)",
+                crate::domain::get_session(&store, &run_id)
+                    .unwrap()
+                    .unwrap()
+                    .status
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains(&run_id) && err.contains("not awaiting confirmation"),
+            "the error must name the run and the reason the cancel refused; got: {err}"
+        );
+
+        // The run is untouched — the denial did not half-apply.
+        let after = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            SessionStatus::Executing,
+            "a refused reject must not move the session"
+        );
+        // …and so is the campaign: the node stays AwaitingHuman, so the operator can re-reject
+        // once the state is reconciled.
+        let reloaded = get_campaign(&store, cid).unwrap().unwrap();
+        assert_eq!(
+            reloaded.status_of(node_id),
+            NodeStatus::AwaitingHuman,
+            "a refused reject must leave the node re-rejectable"
+        );
+        let events: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                CoreEvent::RunCancelled { session, .. } if session.as_str() == run_id
+            )),
+            "no RunCancelled may be claimed for a reject that did not happen: {events:?}"
         );
     }
 }
