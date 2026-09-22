@@ -146,9 +146,14 @@ export interface UnitDistributedEventJson extends CoreEventJson {
   /**
    * (core#461) The evaluator ≠ creator DISCLOSURE as a field: \`'creator_seat'\` when a review/test
    * unit STAYS on a seat that built what it checks because no eligible seat distinct from the
-   * builders admits it — a single-eligible-seat roster, or a bench that emptied the pool
-   * (\`degradedReason\` then says which). \`null\` otherwise. The fallback seat is always a
-   * still-eligible one: a benched or dead seat is never the fallback. Additive.
+   * builders admits it. \`null\` otherwise.
+   *
+   * The roster is always BENCH-FREE when this is set (core#560/#567): a bench that leaves a
+   * review/test unit no distinct seat REFUSES the plan instead, so that case never reaches the
+   * wire. Three shapes set it — a one-seat roster; a roster whose every seat was assigned a
+   * Build/Recon unit; and one whose only non-builder seats the unit's skills refuse.
+   * \`degradedReason\` does NOT name this: the field is the disclosure. The seat the unit stays on
+   * is therefore always a still-eligible one. Additive.
    */
   distinctnessFallback: 'creator_seat' | null
 }

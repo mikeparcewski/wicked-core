@@ -147,11 +147,25 @@ pub struct Distribution {
     pub benched: Vec<BenchedSeat>,
     /// (core#461) The evaluator≠creator DISCLOSURE, first-class: `Some("creator_seat")` when this
     /// is a review/test unit that STAYS on a seat that built what it checks because no eligible
-    /// seat distinct from the builders admits it — a single-eligible-seat roster, or a bench that
-    /// emptied the pool (`degraded_reason` then says which). `None` when the unit is separated, is
-    /// not an evaluator, or is a tool unit. Rides `unitDistributed.distinctnessFallback`. The
-    /// fallback seat is always a still-eligible one: the bench pass reseats every unit off a
-    /// benched seat BEFORE this is judged, so a benched or dead seat is never the fallback.
+    /// seat distinct from the builders admits it.
+    ///
+    /// The roster is necessarily BENCH-FREE when this is set (core#560/#567): a bench that leaves
+    /// a review/test unit no distinct seat refuses the plan instead (`NoEligibleSeat`), so it never
+    /// reaches this field. Three bench-free shapes reach it — a one-seat roster; a roster of two or
+    /// more seats where EVERY seat was assigned a Build/Recon unit; and a roster that does have a
+    /// non-builder seat which this unit's skills refuse (`seat_candidates`). `degraded_reason` does
+    /// NOT name this — it is disclosed by this field alone.
+    ///
+    /// The seat the unit stays on is therefore always a still-ELIGIBLE one, and by construction
+    /// rather than by any reseating: `launcher_benched` is folded into `benched` before anything
+    /// else runs, so an empty bench means no seat was benched by a ballot, a worker OR the
+    /// launcher's health probe — which is exactly what `eligible_seats` filters on. (Before
+    /// core#560 this field could be set WITH a bench, and the guarantee rested on the bench pass
+    /// having reseated the unit first; that path is now refused, so the reseat pass can no longer
+    /// be what makes this true.)
+    ///
+    /// `None` when the unit is separated, is not an evaluator, or is a tool unit. Rides
+    /// `unitDistributed.distinctnessFallback`.
     pub distinctness_fallback: Option<String>,
 }
 
@@ -382,9 +396,14 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
 ///    nothing alone (core#461 — the ledger sees EVERY round of every council, not the latest). A
 ///    unit the council handed to a benched seat is reassigned to the first still-eligible seat its
 ///    skills admit (routing `degraded`, naming both seats and the cause), and the evaluator≠creator
-///    reassignment picks only among still-eligible seats — when none distinct from the builders
-///    remains, a review/test unit stays on its creator seat, `distinctness_fallback` is
-///    `creator_seat` (core#461), and `degraded_reason` says so whenever the bench emptied the pool.
+///    reassignment picks only among still-eligible seats. When a BENCH leaves a review/test unit no
+///    seat distinct from its creator the plan is REFUSED (`NoEligibleSeat`, core#560) — for every
+///    bench source, not just ballot. A BENCH-FREE roster with no seat distinct from the builders
+///    instead keeps the review/test unit on its creator seat: a one-seat roster, a roster whose
+///    every seat was assigned a Build/Recon unit, or one whose only non-builder seats this unit's
+///    skills refuse. That case is disclosed by the `distinctness_fallback: "creator_seat"` field
+///    (core#461), not by `degraded_reason`; only the all-seats-built shape ALSO warns on stderr
+///    (a one-seat roster never does — it had nothing to separate).
 /// 3. `degraded_reason` names the bench on EVERY unit whenever eligible < configured, and the
 ///    whole bench rides each `Distribution` for the actor to persist.
 #[allow(clippy::too_many_arguments)]
@@ -664,16 +683,30 @@ pub(crate) fn distribute_units_against_benched(
         }
         .into());
     }
-    // (F-7R2-006 rule 3) `degradedReason` on EVERY unit whenever eligible < configured — and
-    // (F-7R3-001) the same-seat disclosure when the bench left a review/test unit no seat distinct
-    // from its creator. A bench-free roster that is simply too small keeps its pre-existing stderr
-    // warning and the gate's own UNGATED disclosure.
+    // (F-7R2-006 rule 3) `degradedReason` on EVERY unit whenever eligible < configured.
+    //
+    // There is NO same-seat `degradedReason` disclosure here any more (core#567). F-7R3-001 used to
+    // disclose-and-continue when a bench left a review/test unit no seat distinct from its creator;
+    // core#560 replaced that policy with the refusal above, so the state the disclosure described
+    // is refused before this loop and the disclosure was dead code — it required `!benched
+    // .is_empty()`, which the refusal makes impossible here. A BENCH-FREE roster with no distinct
+    // seat never satisfied that condition either, so nothing it does is changed: it keeps the
+    // `distinctnessFallback` field below and the gate's own UNGATED disclosure, plus — when the
+    // roster has two or more seats and every one of them built — the stderr warning
+    // `enforce_evaluator_distinct` prints. A ONE-seat roster is silent by design (it has nothing to
+    // separate), so "bench-free" is not the same as "warned about".
     let summary = crate::domain::benched_summary(&benched, configured.len());
     for (u, d) in units.iter().zip(dists.iter_mut()) {
         d.benched = benched.clone();
         // (core#461) The evaluator≠creator fallback is a FIELD, not prose alone: a consumer keys
-        // on `distinctnessFallback == "creator_seat"` when the roster never had a second seat
-        // (bench-free too-small roster, review F2 on #452). Ballot-bench case is fail-closed above.
+        // on `distinctnessFallback == "creator_seat"` for a review/test unit left on a seat that
+        // built what it checks. What IS guaranteed here is only that the roster is BENCH-FREE:
+        // every bench-induced distinctness failure — launcher, ballot or worker (core#560) — is
+        // fail-closed above, so `benched` is necessarily empty whenever `same_seat` is not. It is
+        // NOT guaranteed that the roster was too small. `enforce_evaluator_distinct` also yields
+        // `same_seat` on a multi-seat roster whose every seat was assigned a Build/Recon unit, and
+        // on one whose only non-builder seats this unit's skills refuse — both bench-free, both
+        // landing here (review F2 on #452 covers the one-seat shape only).
         d.distinctness_fallback = (u.tool_cmd.is_none() && same_seat.contains(&u.ord))
             .then(|| DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string());
         let mut parts: Vec<String> = Vec::new();
@@ -687,14 +720,6 @@ pub(crate) fn distribute_units_against_benched(
         }
         if let Some(s) = &summary {
             parts.push(s.clone());
-        }
-        if !benched.is_empty() && same_seat.contains(&u.ord) {
-            parts.push(format!(
-                "evaluator≠creator not enforceable for unit {}: it stays on creator seat '{}' — \
-                 no eligible seat distinct from the builders remains (the gate will say UNGATED \
-                 unless the repo checks floor gates it)",
-                u.ord, d.assigned_cli
-            ));
         }
         d.degraded_reason = (!parts.is_empty()).then(|| parts.join("; "));
     }
@@ -788,8 +813,10 @@ fn seat_is_claude(clis: &[AgenticCli], key: &str) -> bool {
 /// — a seat the unit's skills ADMIT (core#401): a Claude-only review unit is never moved onto a seat
 /// the ladder would refuse it on; with no such alternative it stays where the council put it.
 /// Returns the ords of the review/test units that STAY on a builder seat because no eligible seat
-/// distinct from the builders admits them (F-7R3-001) — the caller discloses it on the wire when
-/// the bench is what emptied the pool.
+/// distinct from the builders admits them (F-7R3-001). The caller REFUSES the plan when a bench is
+/// what emptied the pool (`NoEligibleSeat`, core#560): the run parks at the dead-seat gate instead
+/// of executing, so there is no per-unit disclosure to make. On a BENCH-FREE roster it keeps the
+/// unit where it is and sets `distinctness_fallback: "creator_seat"` instead.
 fn enforce_evaluator_distinct(
     units: &[WorkUnit],
     dists: &mut [Distribution],
