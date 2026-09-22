@@ -8,9 +8,12 @@
 //! The registry record is the de-drift source of truth — flags are encoded here, never
 //! re-derived per call. The built-in roster uses the CLIs that actually exist in this
 //! environment (**claude, agy, codex, copilot, opencode, pi**) so a real probe can detect
-//! them. agy stays listed but council-disabled: it has no working headless/ACP path, so
-//! seating it only buys dispatch timeouts (liveness ≠ readiness — `agy --version` answering
-//! proves nothing about completing a ballot).
+//! them. agy stays listed but council-disabled because no timed ballot inside the dispatch
+//! budget is on record — NOT because it lacks a headless path: `agy --help` (v1.2.8)
+//! documents `--print` / `-p` as "Run a single prompt non-interactively and print the
+//! response", which is exactly the invocation its record below encodes. Liveness ≠
+//! readiness: `agy --version` answering proves nothing about completing a ballot, and the
+//! ballot path never touches ACP for any seat (see the agy record and wicked-core#572).
 
 use std::path::{Path, PathBuf};
 
@@ -126,7 +129,7 @@ impl From<TomlCli> for AgenticCli {
 
 /// The built-in, hand-verified registry. These are the agentic CLIs available in this
 /// environment (**claude, agy, codex, copilot, opencode, pi**; agy listed but
-/// council-disabled — no working headless/ACP path). The full roster is data, not logic;
+/// council-disabled — no timed ballot on record). The full roster is data, not logic;
 /// it grows by appending records here or via the user TOML.
 pub fn builtin() -> Vec<AgenticCli> {
     vec![
@@ -174,12 +177,29 @@ pub fn builtin() -> Vec<AgenticCli> {
             trust_flags: vec![],
             alt_binaries: vec![],
             confidence: Confidence::Verified,
-            // Disabled 2026-09: agy never establishes an ACP session, so every seating
-            // costs a full dispatch-budget timeout and re-deliberation pressure.
-            // Re-enable once an agy bridge completes a real ballot round-trip.
+            // Disabled 2026-09. The original justification recorded here named a mechanism
+            // this crate does not have: *"agy never establishes an ACP session, so every
+            // seating costs a full dispatch-budget timeout."* A council ballot never attempts
+            // an ACP session FOR ANY SEAT — `dispatch.rs`'s `run_in_isolation` tokenizes
+            // `cli.headless_invocation` and spawns that argv directly, and `dispatch.rs`
+            // carries no ACP reference outside one test fixture (`acp: None`). Whatever was
+            // observed in 2026-09, ACP was not the ballot-path cause; `agy-acp` was not even
+            // installed on the host that observed it (`which agy-acp` → not found), so
+            // nothing had a bridge to spawn. What remains true is narrower and is why the
+            // seat stays benched: no ballot completing inside the dispatch budget is on
+            // record for agy. Re-enable on a timed round-trip, not on a bridge
+            // (wicked-core#572; and note #572 separately observes that this one flag also
+            // gates governed-work seating and evaluator reassignment, which is a design
+            // question, not a fact this comment can settle).
             enabled_for_council: false,
-            // wicked-crew's own bridge (packages/agent-acp-bridges) — no ecosystem
-            // adapter exists for Antigravity yet.
+            // Resolved by NAME off PATH — and two different programs now ship this bin name:
+            // wicked-crew's own bridge (`packages/agent-acp-bridges`, bin `agy-acp`) and a
+            // community `agy-acp` published on npm (0.5.2, Apache-2.0, "ACP v1 + experimental
+            // draft ACP v2", github.com/shindgew/agy-acp). The older note that "no ecosystem
+            // adapter exists for Antigravity yet" is no longer true. Neither program has been
+            // proven against this seat, the npm one is not wicked-maintained, and neither is
+            // installed here (`which agy-acp` → not found) — so which one a spawn would get
+            // is an unresolved PATH-order question, not a settled choice.
             acp: Some(AcpConfig {
                 binary: "agy-acp".into(),
                 start_args: vec![],
@@ -266,6 +286,13 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // RequestPermissionProfile / ActivePermissionProfile) is vendored in codex-acp's
                 // own repo but never called from its compiled dist/index.js (zero references) —
                 // the protocol capability exists, this adapter just doesn't bridge to it yet.
+                // Currency re-check 2026-09-22 against codex-acp@1.12.0 (then `latest`, two
+                // minors past the version this verdict was written on): the decisive markers
+                // are unchanged in its compiled `dist/index.js` — `PermissionProfile`,
+                // `RequestPermissionProfile` and `ActivePermissionProfile` still have ZERO
+                // references, while `approvalsReviewer` and `auto_review` are still present.
+                // The verdict holds; only the reviewer-preset question was re-checked, not
+                // the whole surface.
                 // Genuinely blocked-on-upstream, not unresearched: forward path is either an
                 // upstream codex-acp release wiring up what it already vendors, or a wicked-owned
                 // bridge speaking the codex app-server protocol directly. No re-proof evidence
@@ -301,14 +328,49 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
-                // OQ-PI-ACP-001 resolved NOT admitted: a live capture against the pinned
-                // pi-acp@0.0.32 (gitHead 2f6e3c5, see .product/evidence/oq-pi-acp-001/)
-                // shows a core `write` tool call go from pending -> in_progress -> completed
-                // with zero session/request_permission round-trips, and the shipped
-                // adapter source confirms the same path serves read/edit/bash — its
-                // requestPermission is invoked only for pi's extension select/confirm UI,
-                // never for tool execution. Stays disclosed-ungoverned until a fixed
-                // adapter version proves otherwise.
+                // OQ-PI-ACP-001 resolved NOT admitted — but read the reason carefully, because
+                // the wording this comment used to carry ("its requestPermission is invoked
+                // only for pi's extension select/confirm UI, never for tool execution") was
+                // literally true and drew the OPPOSITE conclusion from its own premise, and
+                // that conclusion has been keeping the pi seat refused for scoped work
+                // (wicked-core#571).
+                //
+                // What the capture showed, and still shows: against the pinned pi-acp@0.0.32
+                // (gitHead 2f6e3c5, see .product/evidence/oq-pi-acp-001/) a core `write` goes
+                // pending -> in_progress -> completed with zero session/request_permission
+                // round-trips, and the same path serves read/edit/bash. That is because the
+                // tool path emits a fire-and-forget ACP `tool_call` NOTIFICATION, never a
+                // request.
+                //
+                // What it does NOT establish is that the adapter cannot ask. pi's extension
+                // select/confirm UI *is* a tool-execution gate when an extension raises it
+                // from pi's blocking `tool_call` hook, and every link of that chain ships in
+                // the builds pinned here:
+                //   1. pi-agent-core `dist/agent-loop.js` — `prepareToolCall` AWAITS
+                //      `config.beforeToolCall`; a `block` result returns `kind: "immediate"`
+                //      and `executePreparedToolCall` is never reached.
+                //   2. pi-coding-agent `dist/core/agent-session.js` — wires that hook to the
+                //      extension runner's `tool_call` event and fails CLOSED on a handler
+                //      error ("Extension failed, blocking execution").
+                //   3. pi under `--mode rpc` — `ctx.ui.select` / `ctx.ui.confirm` build a
+                //      promise that emits `extension_ui_request` and resolves only on the
+                //      client's answer (`dist/modes/rpc/rpc-mode.js`, `createDialogPromise`);
+                //      `confirm` defaults to `false` if it times out, i.e. fails closed.
+                //   4. pi-acp bridges exactly that into a real ACP round-trip:
+                //      `extension_ui_request` -> `handleExtensionSelect`/`handleExtensionConfirm`
+                //      -> `requestExtensionPermission` -> `this.conn.requestPermission(...)`,
+                //      with the answer written back via `sendExtensionUiResponse` (read in the
+                //      SHIPPED `pi-acp@0.0.32` `dist/index.js`, not upstream sources).
+                //   ...and pi-acp deliberately leaves extensions enabled when it spawns pi:
+                //   `pi --mode rpc --no-themes`, `env: process.env`, no disable flag.
+                //
+                // So `acp_input_governance: false` below is correct as a statement about the
+                // CURRENT CONFIGURATION — no gate extension is loaded, so nothing raises an
+                // ask — and wrong as a statement about the adapter's capability. It stays
+                // false until OQ-PI-ACP-001 is re-run WITH a gate extension loaded: the four
+                // links above are each source-verified, but the COMPOSED path has never been
+                // executed end-to-end, and an unexecuted composition is reasoning, not
+                // evidence.
                 acp_input_governance: false,
                 os_sandbox: false,
                 acp_governance_env: None,
@@ -342,8 +404,10 @@ pub fn builtin() -> Vec<AgenticCli> {
                 auth_method: None,
                 // OQ-COPILOT-ACP-001 resolved NOT admitted (see .product/evidence/
                 // oq-copilot-acp-001/ and .product/DES-INPUT-GOV-004-copilot-acp-admission.md).
-                // Unlike pi (no permission plumbing) and codex (plumbing exists but is
-                // short-circuited by an internal reviewer), copilot's default invocation — this
+                // Unlike pi (plumbing exists, but nothing raises an ask unless a gate
+                // extension is loaded — see the pi seat above, wicked-core#571) and codex
+                // (plumbing exists but is short-circuited by an internal reviewer),
+                // copilot's default invocation — this
                 // exact one, no extra flags — genuinely blocks on session/request_permission for
                 // every edit and every bash-class call observed, including a destructive `rm -rf`
                 // and a network `curl`, and a selected reject was proven to actually prevent the
@@ -594,12 +658,14 @@ mod tests {
         assert!(keys.contains(&"claude"), "claude must be a built-in seat");
         assert!(keys.contains(&"agy"), "agy must be a built-in seat");
         assert!(keys.contains(&"pi"), "pi must be a built-in seat");
-        // agy stays listed (roster completeness) but council-disabled: it has no working
-        // headless/ACP path, so seating it only buys dispatch timeouts.
+        // agy stays listed (roster completeness) but council-disabled because no ballot
+        // completing inside the dispatch budget is on record — not for want of a headless
+        // path (`agy -p` is documented) and not for want of a bridge (the ballot path never
+        // opens an ACP session for any seat). See the seat record's note.
         let agy = clis.iter().find(|c| c.key == "agy").unwrap();
         assert!(
             !agy.enabled_for_council,
-            "agy must stay council-disabled until its bridge completes a real ballot"
+            "agy must stay council-disabled until a timed ballot round-trip is on record"
         );
         // Built-ins ship Verified confidence.
         assert!(clis.iter().all(|c| c.confidence == Confidence::Verified));

@@ -1,8 +1,13 @@
 # wicked-core
 
 In-process composition runtime AND the execution engine behind wicked-crew.
-Thin pointer stub — the real references are `README.md`, `DESIGN.md`,
-`ORCHESTRATOR.md`, and the design docs in `.product/`.
+Thin pointer stub — the real references are `README.md`, `DESIGN.md` and
+`ORCHESTRATOR.md`. The `.product/` design docs (DES-*, REQ-*, ADRs, evidence
+directories) are cited all over the source but are **gitignored** (`.gitignore`
+line 19) and tracked in no commit — a fresh clone has none of them. Treat every
+`.product/…` path in a comment as a pointer to a local-only artifact that may or
+may not exist on the machine you are reading from, never as something you can
+open to check a claim.
 
 ## Layout (the part that bites)
 
