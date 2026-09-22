@@ -6833,11 +6833,11 @@ fn dispatch_unit(
                 let m = maps_for_child.as_ref()?;
                 let g = m.lock().unwrap_or_else(|p| p.into_inner());
                 if g.is_run_cancelled(&run_for_child) {
-                    Some("cancelled")
+                    Some(STOP_CANCELLED)
                 } else if my_seq > 0 && g.current_launch_seq(&run_for_child) != my_seq {
-                    Some("superseded")
+                    Some(STOP_SUPERSEDED)
                 } else if g.shutdown_flag() {
-                    Some("shutdown")
+                    Some(STOP_SHUTDOWN)
                 } else {
                     None
                 }
@@ -7168,11 +7168,59 @@ fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
     buf
 }
 
+/// The three words the tool child's `stop()` predicate reports — the run's launch identity was
+/// invalidated by a cancel, by a supersede, or by shutdown (core#500). They travel to the wire
+/// verbatim (`[killed: <reason>]`, `ToolKilled.reason`, `toolResultDiscarded.reason`), and
+/// [`actor_kill_grace`] keys the kill policy on them, so they are named once here rather than
+/// spelled at both ends.
+pub(crate) const STOP_CANCELLED: &str = "cancelled";
+pub(crate) const STOP_SUPERSEDED: &str = "superseded";
+pub(crate) const STOP_SHUTDOWN: &str = "shutdown";
+
+/// How long the tool worker waits for the ACTOR's graceful kill before forcing (core#576).
+///
+/// Derivation: `kill_pgroup_graceful` spends up to 500 ms polling after SIGTERM plus up to 200 ms
+/// confirming the SIGKILL, and the actor needs a moment to get from flipping the stop predicate to
+/// the `killpg`. 1 s covers that with slack. It is a BOUND, not a delay: the wait ends the instant
+/// the leader exits, which for a SIGTERM-honouring child is a few ms. It is also the worst case for
+/// a cancel whose pgid was never registered (no `lifecycle_maps`), where nothing else will kill the
+/// group and the worker forces after the full second.
+#[cfg(unix)]
+const ACTOR_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The grace [`run_tool_cmd`] allows before force-killing a stopped child — `Some` only when
+/// ANOTHER thread is already driving a graceful kill of this group (core#576).
+///
+/// `cancel_run` (`CancelRun`, campaign cancel/fail-fast, human Reject, governance Deny) and
+/// `ReassignUnit` both call `kill_pgroup_graceful` on the registered pgid: SIGTERM, then up to
+/// 500 ms, then SIGKILL. `Command::Shutdown` does NOT — it only sets the flag — so on `shutdown`
+/// this worker is the only killer and must force immediately. Non-unix has no group kill on the
+/// actor side at all, so nothing there is ever graceful.
+fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
+    #[cfg(unix)]
+    {
+        match reason {
+            STOP_CANCELLED | STOP_SUPERSEDED => Some(ACTOR_KILL_GRACE),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = reason;
+        None
+    }
+}
+
 /// Spawn a Tool command and poll it to completion the way `execute_wrapped::run_bounded` polls a
 /// seat (core#500 / F-BM-008): the child runs in its OWN process group (unix), the loop wakes
 /// every 50 ms, and `stop()` returning `Some(reason)` — the run's launch identity was invalidated
-/// by `CancelRun`, `ReassignUnit` or shutdown — kills the whole group (`kill_child_tree`, SIGKILL,
-/// the same helper the ACP and wrapped carriers and the floor use) and reaps it bounded. Natural
+/// by `CancelRun`, `ReassignUnit` or shutdown — ends the phase and reaps the child bounded. HOW it
+/// ends depends on who else is killing (core#576, [`actor_kill_grace`]): on `cancelled` /
+/// `superseded` the actor thread is already driving `kill_pgroup_graceful` (SIGTERM → 500 ms →
+/// SIGKILL), so this loop waits up to [`ACTOR_KILL_GRACE`] for the leader to exit rather than
+/// SIGKILLing it out from under that window; on `shutdown` (and on non-unix) nothing else kills
+/// the group, so `kill_child_tree` fires immediately. In every case the group is force-killed and
+/// the child reaped before the call returns. Natural
 /// exit is byte-identical to the blocking `Command::output` this replaced: stdout, then stderr on
 /// its own line, `\n[exit N]` on failure; an unspawnable binary is `failed to spawn …`. A killed
 /// child yields `StepStatus::Cancelled`, the output so far plus `\n[killed: <reason>]`, and the
@@ -7288,8 +7336,16 @@ fn run_tool_cmd(
                 }
                 Ok(false) => {
                     if let Some(reason) = stop() {
-                        crate::validator::kill_child_tree(&mut child);
-                        crate::validator::reap_bounded(&mut child);
+                        // core#576: the child is STILL RUNNING here — possibly inside its own
+                        // SIGTERM handler. SIGKILLing it now (what this arm used to do) defeated
+                        // the 500 ms graceful window `kill_pgroup_graceful` opens on the actor
+                        // thread, which then observed the group gone and attributed a graceful
+                        // death that never happened. For the reasons the actor escalates for we
+                        // now wait for its SIGTERM to land; for `shutdown` — where nothing else
+                        // kills the group — `actor_kill_grace` returns `None` and the kill is
+                        // immediate, as before. Either way the group is force-killed and the
+                        // child reaped before this returns.
+                        crate::validator::kill_after_stop(&mut child, actor_kill_grace(reason));
                         break ToolExit::Killed(reason);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -15672,6 +15728,173 @@ mod tool_cmd_tests {
         assert!(
             !sentinel.exists(),
             "sentinel exists — the child ran despite the pre-spawn stop check"
+        );
+    }
+
+    // ── core#576: the actor's SIGTERM window must survive the worker's own poll loop ───────────
+
+    /// core#576 — on a `cancelled` / `superseded` stop the worker must NOT SIGKILL the child it is
+    /// still polling: the actor thread is concurrently running `kill_pgroup_graceful` (SIGTERM →
+    /// 500 ms → SIGKILL) and an immediate `killpg(pgid, SIGKILL)` here killed the child mid-handler.
+    ///
+    /// THE WITNESS is the child's own SIGTERM trap: it prints a marker on stdout (which
+    /// `run_tool_cmd` returns) and exits. SIGKILL cannot be trapped, so the marker appears only if
+    /// the child was alive when the SIGTERM arrived — i.e. only if the worker left the graceful
+    /// window open. Nothing about the witness is a duration, so host load cannot flip the verdict.
+    ///
+    /// THE RACE IS PINNED, not slept on. The stop predicate records the `Instant` at which the
+    /// WORKER first observed it (the closure runs on the worker's poll thread), and the stand-in
+    /// actor sends its SIGTERM 150 ms after that instant. Against the pre-fix arm the worker's
+    /// SIGKILL is issued in the same breath as that observation, so the SIGTERM always arrives too
+    /// late and the trap never runs — the test cannot pass by being slow or lucky.
+    ///
+    /// The test stands in for the actor ONLY in sending the SIGTERM; `kill_pgroup_graceful` itself
+    /// is covered by the campaign wiring test in `campaign.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_leaves_the_actors_sigterm_window_open_instead_of_sigkilling_first() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let tmp = std::env::temp_dir();
+        let tag = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let ready = tmp.join(format!("wicked-core-576-ready-{tag}"));
+        // Trap TERM → print the witness on stdout, then exit. `ready` is written only AFTER the
+        // trap is installed, so the stop predicate cannot fire before the child can handle it.
+        let script = format!(
+            "trap 'printf TERM-HANDLED; exit 7' TERM; : > \"{r}\"; \
+             while : ; do sleep 0.05; done",
+            r = ready.display()
+        );
+
+        // `stop()` flips once the trap is armed, and records WHEN THE WORKER SAW IT.
+        let observed: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let obs = observed.clone();
+        let rdy = ready.clone();
+        let stop = move || -> Option<&'static str> {
+            if !rdy.exists() {
+                return None;
+            }
+            let mut g = obs.lock().unwrap_or_else(|p| p.into_inner());
+            if g.is_none() {
+                *g = Some(Instant::now());
+            }
+            Some("cancelled")
+        };
+
+        // The stand-in ACTOR: learn the pgid from on_spawn, then SIGTERM the group 150 ms after the
+        // worker observed the stop — the window the worker used to slam shut.
+        let pgid = Arc::new(AtomicU32::new(0));
+        let pg = pgid.clone();
+        let on_spawn = move |p: u32| {
+            pg.store(p, Ordering::SeqCst);
+        };
+        let pg_actor = pgid.clone();
+        let obs_actor = observed.clone();
+        let actor = std::thread::spawn(move || {
+            // Generous: this bound exists only so a wedged test cannot hang the suite. Under the
+            // endpoint-scanner load this host sees, a spawn can stall for tens of seconds and a
+            // tight bound would report a harness timeout instead of the real verdict.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let seen = *obs_actor.lock().unwrap_or_else(|p| p.into_inner());
+                let p = pg_actor.load(Ordering::SeqCst);
+                if let (Some(at), true) = (seen, p > 1) {
+                    let wait = Duration::from_millis(150).saturating_sub(at.elapsed());
+                    if !wait.is_zero() {
+                        std::thread::sleep(wait);
+                    }
+                    // Safe: the group is the tool child's own (`process_group(0)` at spawn).
+                    unsafe { libc::killpg(p as i32, libc::SIGTERM) };
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop, &on_spawn, &noop_done);
+        assert!(
+            actor.join().expect("actor thread"),
+            "the stand-in actor never got a pgid to signal"
+        );
+
+        assert_eq!(st, StepStatus::Cancelled, "{out}");
+        let k = k.expect("a killed child reports what stopped it");
+        assert_eq!(k.reason, "cancelled");
+        assert!(
+            out.contains("TERM-HANDLED"),
+            "the child's SIGTERM trap never ran: the worker SIGKILLed it inside the actor's \
+             graceful window (core#576). out={out:?}"
+        );
+        // …and the graceful path still leaves nothing alive.
+        assert!(
+            wait_dead(k.pid as i32, Duration::from_secs(2)),
+            "leader {} still alive after the stop",
+            k.pid
+        );
+        let _ = std::fs::remove_file(&ready);
+    }
+
+    /// core#576, the BACKSTOP — read the scope note: this one is green against main too.
+    ///
+    /// The grace is a BOUND, not a promise that someone else will do the killing. The fix #576
+    /// literally suggests ("do not call `kill_child_tree`; enter `reap_bounded`") LEAKS whenever no
+    /// actor kill arrives: a cancel whose pgid was never registered (`lifecycle_maps: None`), or a
+    /// group with members that survive the leader. This pins the property that makes the grace safe
+    /// — after the grace the worker forces, and it never returns while its own child is alive.
+    ///
+    /// The child ignores SIGTERM and nothing signals it, so only the worker's own
+    /// `killpg(SIGKILL)` can end it. Green before this change (which killed immediately) and green
+    /// after; RED against the suggested reap-only shape, which is the regression it guards.
+    /// Deliberately asserts no durations: on this host an endpoint scanner can stall a spawn for
+    /// tens of seconds, so every wall-clock bound here is a coin flip.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_nobody_else_kills_is_still_forced_not_left_running() {
+        let marker = std::env::temp_dir().join(format!(
+            "wicked-core-576-backstop-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        // Ignores TERM: only a SIGKILL can end it.
+        let script = format!(
+            "trap '' TERM; : > \"{m}\"; while : ; do sleep 0.05; done",
+            m = marker.display()
+        );
+        let m = marker.clone();
+        let stop = move || m.exists().then_some("cancelled");
+        let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop, &noop_spawn, &noop_done);
+        assert_eq!(st, StepStatus::Cancelled, "{out}");
+        let k = k.expect("a killed child reports what stopped it");
+        assert_eq!(k.reason, "cancelled");
+        assert!(
+            wait_dead(k.pid as i32, Duration::from_secs(2)),
+            "the grace must be a bound, not a leak: leader {} survived a cancel nobody else killed",
+            k.pid
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// `actor_kill_grace` is the policy in one place: graceful only for the reasons the actor
+    /// escalates for.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_reasons_the_actor_escalates_for_get_a_grace() {
+        assert_eq!(
+            super::actor_kill_grace(super::STOP_CANCELLED),
+            Some(super::ACTOR_KILL_GRACE)
+        );
+        assert_eq!(
+            super::actor_kill_grace(super::STOP_SUPERSEDED),
+            Some(super::ACTOR_KILL_GRACE)
+        );
+        assert_eq!(
+            super::actor_kill_grace(super::STOP_SHUTDOWN),
+            None,
+            "Command::Shutdown never kills a tool child, so the worker must not wait for it"
         );
     }
 }
