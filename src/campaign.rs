@@ -2089,8 +2089,24 @@ mod tests {
         let pgid = child.id();
         let pid = pgid as i32;
         assert!(alive(pid), "the stand-in group must be alive before reject");
+
+        // REAP CONCURRENTLY — this mirrors production and the test is wrong without it. In the
+        // engine the background tool thread owns the `Child` and `wait()`s it, so a killed group
+        // disappears promptly. With no reaper the killed child lingers as a ZOMBIE, `killpg(pgid,
+        // 0)` keeps SUCCEEDING (a zombie is still a process group member), and
+        // `kill_pgroup_graceful` — which returns true only on CONFIRMED death — reports false, so
+        // `toolChildrenKilled` is 0 even though the wiring is correct. That is a property of the
+        // harness, not of the code under test; it showed up as a Linux CI failure while macOS
+        // happened to pass.
+        let (dead_tx, dead_rx) = channel::<()>();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = dead_tx.send(());
+        });
         assert!(
-            child.try_wait().unwrap().is_none(),
+            dead_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
             "the stand-in group must still be RUNNING before reject"
         );
 
@@ -2210,29 +2226,21 @@ mod tests {
              cancel_run took the None branch (core#500 on the reject path); got {events:?}"
         );
 
-        // The kill is REAL, not just a counter. Reap it: a signalled-but-unwaited child stays a
-        // ZOMBIE, and `kill(pid, 0)` SUCCEEDS on a zombie — so `alive()` alone cannot tell
-        // "killed" from "still running" here. `try_wait` returning `Some` is the honest witness.
-        let mut exited = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Some(st) = child.try_wait().unwrap() {
-                exited = Some(st);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        // The kill is REAL, not just a counter: the reaper only reports once `wait()` returns, and
+        // `kill(pid, 0)` cannot distinguish a zombie from a live process, so the reaper is the
+        // honest witness that the group actually died.
         assert!(
-            exited.is_some(),
+            dead_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
             "the registered process group {pid} is still RUNNING after the reject — cancel_run \
              never reached it"
         );
+        reaper.join().expect("reaper thread");
         // The same call must invalidate the launch identity, the other half the `None` branch skips.
         assert!(
             maps.lock().unwrap().is_run_cancelled(&run_id),
             "reject must tombstone the run so the tool thread's stop() observes `cancelled`"
         );
-
-        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
     }
 }
