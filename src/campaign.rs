@@ -1152,9 +1152,20 @@ pub(crate) fn confirm_gate(
             // directly. It carries no gate precondition, kills the tool child group (core#500), and
             // its `notify_campaign` drives the same deferred `on_run_finished` reconcile.
             //
-            // The two arms where the run cannot be cancelled reconcile the node THEMSELVES before
-            // erroring, because in both the deferred reconcile will never arrive — the same
-            // "never a stuck node" rule the resume/launch failure arm applies in `dispatch`.
+            // WHICH PATH IS DECIDED ON THE SESSION'S PRIOR STATUS, NOT ON `cancel_run`'s RETURN
+            // (core#574 round 3). `cancel_run` answers `Ok(SessionStatus::Cancelled)` for BOTH
+            // "I just cancelled a live run" AND "it was already `Cancelled`" — the terminal
+            // early-return at `src/actor.rs:8297-8303` reports the status and, by design, does
+            // "NOT re-emit a terminal event (or re-notify a campaign)". Those two cases need
+            // OPPOSITE handling and the return value cannot tell them apart, so an
+            // already-`Cancelled` run took the live-cancel arm: no reconcile, and an `Ok` that
+            // claimed a denial which never happened. Reading the status first removes the
+            // ambiguity at its source instead of trying to undo it afterwards.
+            //
+            // Every terminal prior status — and a missing session row — reconciles the node HERE
+            // and then errors, because none of them will produce a fresh terminal event for this
+            // reject to ride on. That is the same "never a stuck node" rule the resume/launch
+            // failure arm applies in `dispatch`.
             if let Err(gate_err) = crate::actor::confirm_gate(
                 store,
                 subscribers,
@@ -1168,74 +1179,100 @@ pub(crate) fn confirm_gate(
                 seams.process_gen,
                 false,
             ) {
-                let cancelled = crate::actor::cancel_run(
+                // Drop the run from `in_flight` on EVERY path below, as `campaign::cancel` does:
+                // whatever happened, this run is not advancing under campaign control any more.
+                in_flight.remove(&run_id);
+                // Exhaustive over `SessionStatus` ON PURPOSE (no `_` arm): a new variant must come
+                // here and be classified as terminal or not, rather than defaulting into a branch.
+                // `None` = no session row at all: the run can never post an outcome.
+                let prior = get_session(store, &run_id)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "campaign {} node {node_id}: reject could not read run {run_id}: {e}",
+                            campaign.id
+                        )
+                    })?
+                    .map(|s| s.status);
+                let terminal_outcome = match prior {
+                    None => Some(NodeOutcome::Failed),
+                    Some(SessionStatus::Completed) => Some(NodeOutcome::Completed),
+                    Some(SessionStatus::Failed) => Some(NodeOutcome::Failed),
+                    Some(SessionStatus::Cancelled) => Some(NodeOutcome::Cancelled),
+                    Some(
+                        SessionStatus::Planning
+                        | SessionStatus::Distributing
+                        | SessionStatus::Executing
+                        | SessionStatus::AwaitingHuman,
+                    ) => None,
+                };
+                if let Some(outcome) = terminal_outcome {
+                    // Nothing further will move this node: reconcile it to the run's own outcome
+                    // (or fail it, when there is no run to have an outcome) and say plainly that
+                    // the denial could not take effect.
+                    reconcile_after_failed_reject(
+                        &mut campaign,
+                        node_id,
+                        outcome,
+                        store,
+                        subscribers,
+                        in_flight,
+                        seams,
+                    )?;
+                    match prior {
+                        Some(st) => anyhow::bail!(
+                            "campaign {} node {node_id}: run {run_id} was already {st:?} — the \
+                             reject could not take effect; the node is reconciled to {:?} \
+                             ({gate_err})",
+                            campaign.id,
+                            outcome.as_node_status()
+                        ),
+                        None => anyhow::bail!(
+                            "campaign {} node {node_id}: run {run_id} has no session row — it can \
+                             never post an outcome; the node is reconciled Failed ({gate_err})",
+                            campaign.id
+                        ),
+                    }
+                }
+                // The run is LIVE, so the denial can land. `cancel_run` carries no gate
+                // precondition, kills the tool child group (core#500), and its `notify_campaign`
+                // queues the same deferred `on_run_finished` node reconcile the gate path relies
+                // on. Its return status is not re-examined: the actor is the single writer, so
+                // nothing could have moved this run between the read above and this call.
+                crate::actor::cancel_run(
                     store,
                     subscribers,
                     seams.runner,
                     seams.self_tx,
                     &run_id,
                     seams.lifecycle_maps,
+                )
+                .map_err(|cancel_err| {
+                    anyhow::anyhow!(
+                        "campaign {} node {node_id}: reject could not cancel run {run_id}: \
+                         {cancel_err} (gate path: {gate_err})",
+                        campaign.id
+                    )
+                })
+                .or_else(|e| {
+                    // The cancel itself failed on a live run (a store write). Reconcile the node
+                    // rather than leaving it awaiting a human, then surface the cause.
+                    reconcile_after_failed_reject(
+                        &mut campaign,
+                        node_id,
+                        NodeOutcome::Failed,
+                        store,
+                        subscribers,
+                        in_flight,
+                        seams,
+                    )?;
+                    Err(e.context("the node is reconciled Failed"))
+                })?;
+                eprintln!(
+                    "wicked-core: campaign {} node {node_id}: run {run_id} was not parked at a \
+                     gate ({gate_err}) — cancelled it directly so the reject takes effect \
+                     (core#574)",
+                    campaign.id
                 );
-                // Drop the run from `in_flight` on EVERY arm, as `campaign::cancel` does: whatever
-                // happened, this run is not advancing under campaign control any more.
-                in_flight.remove(&run_id);
-                match cancelled {
-                    // The denial took effect. `cancel_run` emitted `RunCancelled` and queued
-                    // `CampaignRunFinished`, so the node reconciles on the next actor turn exactly
-                    // as it does on the gate path.
-                    Ok(SessionStatus::Cancelled) => {
-                        eprintln!(
-                            "wicked-core: campaign {} node {node_id}: run {run_id} was not parked \
-                             at a gate ({gate_err}) — cancelled it directly so the reject takes \
-                             effect (core#574)",
-                            campaign.id
-                        );
-                    }
-                    // Already terminal. `cancel_run` returns early WITHOUT re-notifying the
-                    // campaign, so nothing else will move this node: reconcile it to the run's own
-                    // outcome here, then say plainly that the denial was too late.
-                    Ok(already) => {
-                        let outcome = match already {
-                            SessionStatus::Completed => NodeOutcome::Completed,
-                            SessionStatus::Failed => NodeOutcome::Failed,
-                            _ => NodeOutcome::Cancelled,
-                        };
-                        reconcile_after_failed_reject(
-                            &mut campaign,
-                            node_id,
-                            outcome,
-                            store,
-                            subscribers,
-                            in_flight,
-                            seams,
-                        )?;
-                        anyhow::bail!(
-                            "campaign {} node {node_id}: run {run_id} was already {already:?} — \
-                             the reject could not take effect; the node is reconciled to the run's \
-                             own outcome ({gate_err})",
-                            campaign.id
-                        );
-                    }
-                    // The run is unreachable (no session row / store failure): it can never post a
-                    // terminal outcome, so fail the node like a launch failure rather than leaving
-                    // it awaiting a human forever.
-                    Err(cancel_err) => {
-                        reconcile_after_failed_reject(
-                            &mut campaign,
-                            node_id,
-                            NodeOutcome::Failed,
-                            store,
-                            subscribers,
-                            in_flight,
-                            seams,
-                        )?;
-                        anyhow::bail!(
-                            "campaign {} node {node_id}: reject could not cancel run {run_id}: \
-                             {cancel_err} (gate path: {gate_err}) — the node is reconciled Failed",
-                            campaign.id
-                        );
-                    }
-                }
             }
         }
         // ── HumanGateOnFailure policy gate ──────────────────────────────────────
@@ -2615,38 +2652,54 @@ mod tests {
     }
 
     /// core#574 — the run was ALREADY terminal, so the denial cannot take effect. It must then say
-    /// so AND leave the node reconciled: `cancel_run` returns early on a terminal run and
-    /// deliberately does not re-notify the campaign, so nothing else would ever move this node.
+    /// so AND leave the node reconciled: `cancel_run` returns early on a terminal run
+    /// (`src/actor.rs:8297-8303` — "do NOT re-emit a terminal event (or re-notify a campaign)"), so
+    /// the reject path cannot assume anything else will move this node.
     ///
-    /// Reachable on the single-writer actor thread: the run finished and queued
+    /// PARAMETERISED OVER ALL THREE TERMINAL STATUSES. `Completed` and `Failed` are not
+    /// representative: `cancel_run` reports an already-`Cancelled` run with the SAME
+    /// `Ok(SessionStatus::Cancelled)` it returns after actually cancelling a live one, so a single
+    /// `Completed` case passes while `Cancelled` takes the live-cancel arm, reconciles nothing, and
+    /// reports success the reject never achieved.
+    ///
+    /// Reachable on the single-writer actor thread: the run reached its terminal status and queued
     /// `CampaignRunFinished`, and the operator's `ConfirmCampaignGate` is processed first.
     #[test]
     fn campaign_reject_on_an_already_terminal_run_reconciles_the_node_and_says_so() {
-        let cid = "reject-terminal";
-        let mut h = seed_reject_case(cid, Some(SessionStatus::Completed));
-        let (res, _events, _cmds, node_status, sess) = reject(&mut h, cid);
+        for (session_status, expected_node) in [
+            (SessionStatus::Completed, NodeStatus::Completed),
+            (SessionStatus::Failed, NodeStatus::Failed),
+            (SessionStatus::Cancelled, NodeStatus::Cancelled),
+        ] {
+            let cid = &format!("reject-terminal-{session_status:?}");
+            let mut h = seed_reject_case(cid, Some(session_status));
+            let (res, _events, _cmds, node_status, sess) = reject(&mut h, cid);
 
-        let err = format!(
-            "{:#}",
-            res.expect_err("a denial that cannot land must not report Ok")
-        );
-        // The wedge first: this is the load-bearing assertion.
-        assert_eq!(
-            node_status,
-            NodeStatus::Completed,
-            "THE NODE MUST NOT BE LEFT AWAITING A HUMAN: nothing else will ever move it — \
-             `cancel_run` does not re-notify a terminal run — so the campaign could never \
-             finalize. Reported error was: {err}"
-        );
-        assert!(
-            err.contains(&h.run_id) && err.contains("already"),
-            "the error must name the run and that it was already terminal; got: {err}"
-        );
-        assert_eq!(
-            sess,
-            Some(SessionStatus::Completed),
-            "a completed run is not rewritten by a late denial"
-        );
+            let err = format!(
+                "{:#}",
+                res.expect_err(&format!(
+                    "a denial that cannot land must not report Ok (run was already \
+                     {session_status:?}); node is {node_status:?}"
+                ))
+            );
+            // The wedge first: this is the load-bearing assertion.
+            assert_eq!(
+                node_status, expected_node,
+                "THE NODE MUST NOT BE LEFT AWAITING A HUMAN when the run was already \
+                 {session_status:?}: `cancel_run` returns early on a terminal run and does not \
+                 re-notify the campaign, so this path cannot rely on a deferred reconcile that \
+                 may never come. Reported error was: {err}"
+            );
+            assert!(
+                err.contains(&h.run_id) && err.contains("already"),
+                "the error must name the run and that it was already terminal; got: {err}"
+            );
+            assert_eq!(
+                sess,
+                Some(session_status),
+                "a terminal run is not rewritten by a late denial"
+            );
+        }
     }
 
     /// core#574 — the run is unreachable (no session row), so it can never post a terminal outcome.
