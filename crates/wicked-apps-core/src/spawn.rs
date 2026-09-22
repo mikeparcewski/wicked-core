@@ -421,10 +421,33 @@ pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 pub const OPENCODE_CONFIG_FILE_ENV: &str = "OPENCODE_CONFIG";
 /// See [`OPENCODE_CONFIG_FILE_ENV`].
 pub const OPENCODE_AUTH_CONTENT_ENV: &str = "OPENCODE_AUTH_CONTENT";
-/// agy (Antigravity) has no configuration-home variable, so it is isolated by stripping alone — but
-/// it does have quiet flags (brief §5: a CLI without a config-home override at least runs quiet):
-/// these hide its logo and account banner so neither reaches a transcript. Set on every isolated
-/// agy seat by [`SeatConfig::apply`]. Its configuration lives under the operator's `~/.gemini/…`.
+/// The process home directory — agy's ONLY configuration-home lever, and the one variable a seat
+/// decision sets that is not a CLI's own. agy (Antigravity) publishes no `AGY_HOME` / `GEMINI_HOME`
+/// / `ANTIGRAVITY_HOME`: it resolves `~/.gemini/antigravity-cli/` (its `antigravity-oauth-token`
+/// and its `settings.json`) and `~/.gemini/config/` from paths hard-coded under the home directory,
+/// so moving the home is the whole isolation. Set for an agy seat ONLY — like the XDG bases for
+/// opencode — and, being generic, NEVER stripped from anyone ([`SEAT_CONFIG_ENV`] does not list
+/// it): stripping it from a claude seat would unset the home of every tool that seat runs.
+///
+/// Two consequences, both intended. (1) An agy seat inherits NO credential: it starts
+/// unauthenticated instead of silently falling back to the operator's consumer OAuth session, which
+/// is what makes a seat's auth mode ASSERTABLE — credentials are supplied deliberately per seat (an
+/// API key, a Vertex configuration) rather than inherited. (2) It inherits no operator
+/// `settings.json`, so the global `"toolPermission": "always-proceed"` auto-approve does not ride
+/// in — with that set there is no permission boundary at all. Do NOT "helpfully" re-inherit the
+/// operator's home to make a seat sign in: sign the SEAT root in
+/// (`wicked-council::types::default_login_invocation` derives the command from this decision).
+///
+/// Stated residual: this is the POSIX spelling. On Windows the home is `USERPROFILE`, which a seat
+/// decision does not move (it is the account's profile root, not a configuration home), so an agy
+/// seat there still resolves `~/.gemini` under the operator's profile — the same shape of
+/// documented limitation as copilot's per-USER keychain entry.
+pub const HOME_ENV: &str = "HOME";
+
+/// agy (Antigravity) publishes no configuration-home variable of its own, so its seat root is
+/// pulled through [`HOME_ENV`] — but it does have quiet flags (brief §5: a CLI without a
+/// config-home override at least runs quiet): these hide its logo and account banner so neither
+/// reaches a transcript. Set on every isolated agy seat by [`SeatConfig::apply`].
 pub const AGY_HIDE_LOGO_ENV: &str = "AGY_CLI_HIDE_LOGO";
 /// See [`AGY_HIDE_LOGO_ENV`].
 pub const AGY_HIDE_ACCOUNT_INFO_ENV: &str = "AGY_CLI_HIDE_ACCOUNT_INFO";
@@ -959,7 +982,7 @@ pub const SEAT_CONFIG_ENV: &[&str] = &[
 /// Which agent CLI a seat runs — judged on the CLI binary's file STEM (the seat record's `binary`
 /// on ACP, the template's first token when wrapped, the program a ballot execs), case-insensitive
 /// on Windows only, exactly as [`binary_is_claude`] judges claude. `Other` is a CLI this engine
-/// knows no configuration-home variable for (agy, a custom seat): it gets nothing set and every
+/// knows no configuration home for (a custom seat): it gets nothing set and every
 /// [`SEAT_CONFIG_ENV`] variable stripped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SeatCli {
@@ -968,7 +991,9 @@ pub enum SeatCli {
     Pi,
     Copilot,
     Opencode,
-    /// Antigravity: no configuration-home variable (isolated by stripping alone), quiet flags set.
+    /// Antigravity: no configuration-home variable of its own, so its root is pulled through
+    /// [`HOME_ENV`] — `~/.gemini/…` then resolves inside the seat root, not the operator's home.
+    /// Quiet flags set on top.
     Agy,
     Other,
 }
@@ -1009,7 +1034,7 @@ impl SeatCli {
     }
 
     /// The seat root's directory name under the worker home base (`<base>/<name>`) — the built-in
-    /// seat's registry key. `None` for a CLI with no known configuration-home variable.
+    /// seat's registry key. `None` for a CLI with no known configuration home.
     pub fn root_name(self) -> Option<&'static str> {
         match self {
             SeatCli::Claude => Some("claude"),
@@ -1017,7 +1042,8 @@ impl SeatCli {
             SeatCli::Pi => Some("pi"),
             SeatCli::Copilot => Some("copilot"),
             SeatCli::Opencode => Some("opencode"),
-            SeatCli::Agy | SeatCli::Other => None,
+            SeatCli::Agy => Some("agy"),
+            SeatCli::Other => None,
         }
     }
 }
@@ -1035,10 +1061,10 @@ pub enum SeatConfig {
         cli: SeatCli,
         /// The seat's root, `<worker home base>/<root_name>` — validated like the claude dir
         /// (absolute, normally spelled, no planted link at any component). `None` for a CLI with
-        /// no known configuration-home variable.
+        /// no known configuration home at all.
         root: Option<std::path::PathBuf>,
-        /// The variables SET, in order: the CLI's own configuration-home variable(s), pointing
-        /// into `root`. Empty for a rootless CLI.
+        /// The variables SET, in order: the CLI's own configuration-home variable(s) — or, for a
+        /// CLI that publishes none, [`HOME_ENV`] — pointing into `root`. Empty for a rootless CLI.
         set: Vec<(&'static str, std::path::PathBuf)>,
         /// The [`SEAT_CONFIG_ENV`] variables this seat does NOT read — STRIPPED, so no foreign
         /// CLI's configuration path is ambient in the process.
@@ -1067,7 +1093,8 @@ impl SeatConfig {
                 cmd.env(key, value);
             }
             if *cli == SeatCli::Agy {
-                // No config home to isolate; at least no banner in the transcript (brief §5).
+                // The config home rides in `set` as [`HOME_ENV`]; these only keep the logo and
+                // account banner out of the transcript (brief §5).
                 cmd.env(AGY_HIDE_LOGO_ENV, "1");
                 cmd.env(AGY_HIDE_ACCOUNT_INFO_ENV, "1");
             }
@@ -1115,9 +1142,24 @@ impl SeatConfig {
     }
 
     /// Every directory the CLI will actually READ under this decision: the root, each `set`
-    /// target — and, for opencode, the APP directory under each XDG base (`<base>/opencode`),
-    /// which is what the CLI resolves its config, `auth.json` and state from. Checking only the
-    /// XDG parents left a pre-planted `<root>/data/opencode` link undetected (Copilot, #426).
+    /// target — and the APP directories the CLI itself creates beneath them, which is where the
+    /// credentials land. For opencode, `<base>/opencode` under each XDG base (its config,
+    /// `auth.json` and state); checking only the XDG parents left a pre-planted
+    /// `<root>/data/opencode` link undetected (Copilot, #426). For agy, the `.gemini` tree under
+    /// its home: the SAME defect, one CLI later — a `set` of `[(HOME, root)]` owns `<base>/agy`
+    /// and nothing else, so `.gemini` is not a component of any owned path,
+    /// [`refuse_symlinked_home`] never runs over it, and a link planted at `<base>/agy/.gemini`
+    /// aimed at the operator's own is followed: the seat reads their `antigravity-oauth-token` and
+    /// their always-proceed `toolPermission` while the redirect reads as applied.
+    ///
+    /// The agy list is what agy 1.2.8 was OBSERVED to create under a redirected home, all of it at
+    /// 0755 and all of it before the CLI is authenticated: `.gemini`; `.gemini/antigravity-cli`
+    /// (the `antigravity-oauth-token`, the `settings.json` carrying `toolPermission`); and
+    /// `.gemini/config` (`mcp_config.json` — the seat's MCP tool surface, so a link there is a
+    /// tool-surface substitution, not just a settings leak). Each is named in its OWN right rather
+    /// than relying on the deepest: `refuse_symlinked_home` walks every component, but privacy is
+    /// enforced on the LEAF of each owned path, so an unnamed `.gemini` that already exists at
+    /// agy's 0755 would keep it and hold an OAuth token world-readable.
     pub fn owned_dirs(&self) -> Vec<std::path::PathBuf> {
         let SeatConfig::Isolated { cli, root, set, .. } = self else {
             return Vec::new();
@@ -1127,6 +1169,12 @@ impl SeatConfig {
             dirs.push(dir.clone());
             if *cli == SeatCli::Opencode {
                 dirs.push(dir.join("opencode"));
+            }
+            if *cli == SeatCli::Agy {
+                let gemini = dir.join(".gemini");
+                dirs.push(gemini.join("antigravity-cli"));
+                dirs.push(gemini.join("config"));
+                dirs.push(gemini);
             }
         }
         dirs
@@ -1172,8 +1220,10 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
 /// — claude `<base>/claude` (`CLAUDE_CONFIG_DIR`, the dir FINDING-061 introduced), codex
 /// `<base>/codex` (`CODEX_HOME`), pi `<base>/pi` (`PI_CODING_AGENT_DIR`), copilot
 /// `<base>/copilot` (`COPILOT_HOME`), opencode `<base>/opencode/{config,data,state}`
-/// (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`) — and every OTHER seat variable
-/// stripped. An unknown CLI is isolated by stripping alone. `Err` is the resolver failing (no home
+/// (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`), agy `<base>/agy` ([`HOME_ENV`] — it
+/// publishes no configuration-home variable, so its hard-coded `~/.gemini/…` paths are moved by
+/// moving the home) — and every OTHER seat variable stripped. An unknown CLI is isolated by
+/// stripping alone. `Err` is the resolver failing (no home
 /// directory, a relative or `..` override, a planted link); callers fail CLOSED, as for claude.
 pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
     if inherits_operator_config() {
@@ -1199,7 +1249,15 @@ pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
             (XDG_DATA_HOME_ENV, root.join("data")),
             (XDG_STATE_HOME_ENV, root.join("state")),
         ],
-        SeatCli::Agy | SeatCli::Other => unreachable!("rootless CLIs returned above"),
+        // agy publishes no configuration-home variable, so its root is pulled through the process
+        // home: `~/.gemini/antigravity-cli/{antigravity-oauth-token,settings.json}` then resolves
+        // INSIDE the seat root. That is the isolation, not a side effect of it — the seat inherits
+        // neither the operator's OAuth token nor their `"toolPermission": "always-proceed"`, so it
+        // starts unauthenticated and with no global auto-approve, and a seat's auth mode is
+        // assertable instead of whatever the operator happened to be signed into. See [`HOME_ENV`]
+        // before re-inheriting the operator's home to "fix" a sign-in.
+        SeatCli::Agy => vec![(HOME_ENV, root.clone())],
+        SeatCli::Other => unreachable!("rootless CLIs returned above"),
     };
     // Every seat variable this seat does not SET is stripped — for opencode that includes its own
     // inline document (`OPENCODE_CONFIG_CONTENT`), extra config file and inline credentials: the
@@ -1664,8 +1722,8 @@ mod tests {
         assert_eq!(Other.root_name(), None);
         assert_eq!(
             Agy.root_name(),
-            None,
-            "no configuration-home variable is known for agy"
+            Some("agy"),
+            "agy has no configuration-home VARIABLE of its own, but it does have a root"
         );
         assert_eq!(Opencode.root_name(), Some("opencode"));
     }
@@ -1737,24 +1795,22 @@ mod tests {
                 (XDG_STATE_HOME_ENV, base.join("opencode").join("state")),
             ],
         );
-        // An unknown CLI — and agy, which has no configuration-home variable — is isolated by
-        // stripping alone: nothing of its own to set.
-        for rootless in [Other, Agy] {
-            match seat_config_for(rootless).unwrap() {
-                SeatConfig::Isolated {
-                    cli,
-                    root: None,
-                    set,
-                    strip,
-                } => {
-                    assert_eq!(cli, rootless);
-                    assert!(set.is_empty());
-                    assert_eq!(strip, SEAT_CONFIG_ENV.to_vec());
-                }
-                other => {
-                    panic!("{rootless:?}: expected a rootless isolated decision, got {other:?}")
-                }
+        // agy publishes no configuration-home variable, so its root is pulled through the process
+        // home — set for agy ONLY, and (being generic, like the XDG bases) never stripped.
+        expect(Agy, vec![(HOME_ENV, base.join("agy"))]);
+        // An unknown CLI is isolated by stripping alone: nothing of its own to set.
+        match seat_config_for(Other).unwrap() {
+            SeatConfig::Isolated {
+                cli,
+                root: None,
+                set,
+                strip,
+            } => {
+                assert_eq!(cli, Other);
+                assert!(set.is_empty());
+                assert_eq!(strip, SEAT_CONFIG_ENV.to_vec());
             }
+            other => panic!("Other: expected a rootless isolated decision, got {other:?}"),
         }
         // The claude-only view agrees with the generalisation.
         assert_eq!(
@@ -1816,14 +1872,15 @@ mod tests {
             Some(Some("operator-xdg".to_string())),
             "a generic XDG base is left alone on a non-opencode seat"
         );
-        // agy: nothing of its own to set, every seat variable stripped — and the two quiet flags
-        // (no logo, no account banner in the transcript) set; a pi seat gets neither flag.
+        // agy: its own home set, every seat variable stripped — and the two quiet flags (no logo,
+        // no account banner in the transcript) set; a pi seat gets neither flag.
+        let agy_root = PathBuf::from(abs("worker/agy"));
         let mut agy = Command::new("true");
         agy.hardened();
         SeatConfig::Isolated {
             cli: SeatCli::Agy,
-            root: None,
-            set: Vec::new(),
+            root: Some(agy_root.clone()),
+            set: vec![(HOME_ENV, agy_root.clone())],
             strip: SEAT_CONFIG_ENV.to_vec(),
         }
         .apply(&mut agy);
@@ -1832,6 +1889,11 @@ mod tests {
                 .find(|(k, _)| k.to_string_lossy() == key)
                 .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
         };
+        assert_eq!(
+            flag(&agy, HOME_ENV),
+            Some(Some(agy_root.to_string_lossy().into_owned())),
+            "an agy seat's home is its own root"
+        );
         assert_eq!(flag(&agy, AGY_HIDE_LOGO_ENV), Some(Some("1".to_string())));
         assert_eq!(
             flag(&agy, AGY_HIDE_ACCOUNT_INFO_ENV),
@@ -1954,6 +2016,245 @@ mod tests {
         let err = ensure_private_dir(std::path::Path::new("relative/dir")).expect_err("relative");
         assert!(err.to_string().contains("relative"), "{err}");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Moving an agy seat's home is only as good as the directories the engine OWNS under it.
+    /// agy 1.2.8, probed live under a redirected home, creates `.gemini`, `.gemini/antigravity-cli`
+    /// (its `antigravity-oauth-token` and the `settings.json` carrying `toolPermission`) and
+    /// `.gemini/config` (`mcp_config.json`, the seat's MCP tool surface) — all three at **0755**,
+    /// all three BEFORE it is authenticated. Owning `<base>/agy` alone left every one of them
+    /// unchecked: `.gemini` is not a COMPONENT of any owned path, so a link planted there is never
+    /// refused and the seat reads the operator's token straight through it — the exact fallback the
+    /// redirect exists to make impossible. Same defect and same fix as opencode's `<xdg>/opencode`
+    /// app dirs (Copilot, #426): own the directory the CLI creates, not just its parent. The
+    /// refusal itself is [`an_agy_seat_refuses_a_planted_gemini_link`]; this is the creation side.
+    #[test]
+    #[cfg(unix)]
+    fn an_agy_seat_owns_every_directory_agy_creates_under_its_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = std::env::temp_dir().join(format!(
+            "wicked-apps-core-agy-dirs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agy_at = |root: &std::path::Path| SeatConfig::Isolated {
+            cli: SeatCli::Agy,
+            root: Some(root.to_path_buf()),
+            set: vec![(HOME_ENV, root.to_path_buf())],
+            strip: SEAT_CONFIG_ENV.to_vec(),
+        };
+
+        // Every directory agy will write credentials into is created by the ENGINE, private —
+        // including a `.gemini` that pre-exists at agy's own 0755, which is made 0700, not left.
+        let root = scratch.join("worker").join("agy");
+        std::fs::create_dir_all(root.join(".gemini")).unwrap();
+        std::fs::set_permissions(root.join(".gemini"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let decision = agy_at(&root);
+        decision.ensure_dirs().expect("creates the tree");
+        decision.ensure_dirs().expect("idempotent");
+        for dir in [
+            root.clone(),
+            root.join(".gemini"),
+            root.join(".gemini").join("antigravity-cli"),
+            root.join(".gemini").join("config"),
+        ] {
+            let meta = std::fs::metadata(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            assert!(meta.is_dir(), "{} is created", dir.display());
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "{} is private (agy would create it 0755)",
+                dir.display()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// THE boundary the agy redirect rests on: a link planted where the seat's `.gemini` belongs,
+    /// aimed at the operator's real one, must be REFUSED — never followed, never created through.
+    /// Owning only `<base>/agy` did not refuse it (`.gemini` is not a component of an owned path),
+    /// so the seat read the operator's `antigravity-oauth-token` and their always-proceed
+    /// `toolPermission` through the link: the redirect looked applied and isolated nothing. A live
+    /// probe under a clean temp home cannot surface this — it is the honest case that passes either
+    /// way; only a planted link tests the property an attacker attacks.
+    ///
+    /// The leak check is a BEFORE/AFTER listing of the operator's directory, not a named path. A
+    /// named one cannot fail here: `ensure_dirs` bails on the FIRST owned path it refuses, so only
+    /// `.gemini/antigravity-cli` is ever attempted through the link and `.gemini/config` is never
+    /// reached — an assertion on either name is green whether the refusal works or not. The listing
+    /// fails on ANY entry appearing, whichever path a future ordering attempts first, which is the
+    /// state that has to be impossible: a refusal that creates before it validates.
+    #[test]
+    #[cfg(unix)]
+    fn an_agy_seat_refuses_a_planted_gemini_link() {
+        // Sorted entry names of a directory — the leak sentinel.
+        fn entries(dir: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+        let scratch = std::env::temp_dir().join(format!(
+            "wicked-apps-core-agy-planted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let agy_at = |root: &std::path::Path| SeatConfig::Isolated {
+            cli: SeatCli::Agy,
+            root: Some(root.to_path_buf()),
+            set: vec![(HOME_ENV, root.to_path_buf())],
+            strip: SEAT_CONFIG_ENV.to_vec(),
+        };
+        // The operator's real `.gemini`, left EMPTY: an entry appearing in it is the leak. (Nothing
+        // is pre-created inside — a pre-existing `antigravity-cli` would mask the very directory
+        // `ensure_dirs` attempts first, which is how the previous assertion here went blind.)
+        let operator_gemini = scratch.join("operator-home").join(".gemini");
+        std::fs::create_dir_all(&operator_gemini).unwrap();
+        let before = entries(&operator_gemini);
+        assert!(before.is_empty(), "the operator's .gemini starts empty");
+
+        let planted_root = scratch.join("worker2").join("agy");
+        std::fs::create_dir_all(&planted_root).unwrap();
+        std::os::unix::fs::symlink(&operator_gemini, planted_root.join(".gemini")).unwrap();
+        let err = agy_at(&planted_root)
+            .ensure_dirs()
+            .expect_err("a planted .gemini link is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(
+            entries(&operator_gemini),
+            before,
+            "nothing was created through the planted link"
+        );
+
+        // One level deeper: a real `.gemini` with the CREDENTIAL directory planted inside it. The
+        // parent being honest is not enough — `antigravity-cli` is owned in its own right. Its own
+        // target, so this planting cannot be masked by (or mask) the one above.
+        let operator_credentials = scratch.join("operator-home").join("antigravity-cli");
+        std::fs::create_dir_all(&operator_credentials).unwrap();
+        let before_credentials = entries(&operator_credentials);
+        let deep_root = scratch.join("worker3").join("agy");
+        std::fs::create_dir_all(deep_root.join(".gemini")).unwrap();
+        std::os::unix::fs::symlink(
+            &operator_credentials,
+            deep_root.join(".gemini").join("antigravity-cli"),
+        )
+        .unwrap();
+        let err = agy_at(&deep_root)
+            .ensure_dirs()
+            .expect_err("a planted antigravity-cli link is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(
+            entries(&operator_credentials),
+            before_credentials,
+            "nothing was created through the planted credential link"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// An agy seat runs under ITS OWN home, never the operator's. agy reads `~/.gemini/…`
+    /// (`antigravity-cli/antigravity-oauth-token`, `antigravity-cli/settings.json`) from hard-coded
+    /// paths under the process home, so [`HOME_ENV`] is the only lever there is — and the seat
+    /// decision has to pull it. The assertion is the MECHANISM, over a command carrying the
+    /// operator's home as a decoy: the applied decision must REPLACE it with the seat root, so no
+    /// `~/.gemini` read can reach the operator's OAuth token or their `"toolPermission":
+    /// "always-proceed"`.
+    ///
+    /// PLATFORM: that last claim is TRUE ON UNIX ONLY, so it is asserted there only. On Windows `~`
+    /// resolves from `USERPROFILE`, which a seat decision does not move ([`HOME_ENV`], stated
+    /// residual) — asserting "never inherits the operator's home" there would pass purely because
+    /// the test injected its own `HOME` decoy, proving nothing about the variable the CLI reads.
+    /// The gap is pinned instead, on EVERY platform: the decision names `HOME` and nothing else.
+    #[test]
+    fn an_agy_seat_runs_under_its_own_home_not_the_operators() {
+        if inherits_operator_config() {
+            return; // the operator's explicit hatch: nothing is isolated, by design.
+        }
+        let base = worker_home_base().expect("this process has a home directory");
+        let decision = seat_config_for(SeatCli::Agy).expect("resolves");
+        let root = decision
+            .root()
+            .expect("agy has a seat root of its own")
+            .to_path_buf();
+        assert_eq!(root, base.join("agy"), "the root is <worker home base>/agy");
+
+        let operator_home = std::path::PathBuf::from(
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .expect("this process has a home directory"),
+        );
+        let mut cmd = Command::new("true");
+        cmd.hardened();
+        cmd.env(HOME_ENV, &operator_home); // the decoy the daemon would otherwise pass through
+        decision.apply(&mut cmd);
+        let value = |key: &str| -> Option<Option<String>> {
+            cmd.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            value(HOME_ENV),
+            Some(Some(root.to_string_lossy().into_owned())),
+            "an agy seat's HOME is its own root"
+        );
+        // The KNOWN GAP, pinned as a fact rather than left as prose: the decision moves `HOME` and
+        // nothing else, so on Windows — where `~` comes from `USERPROFILE` — an agy seat still
+        // resolves `~/.gemini` under the operator's profile. This is NOT a property worth having;
+        // it is the residual documented on `HOME_ENV`. Closing it means setting `USERPROFILE` too,
+        // at which point this assertion fails and sends you to that doc.
+        let SeatConfig::Isolated { set, .. } = &decision else {
+            panic!("isolated above");
+        };
+        assert_eq!(
+            set.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![HOME_ENV],
+            "agy's decision moves HOME only; USERPROFILE is untouched (Windows residual)"
+        );
+        #[cfg(unix)]
+        {
+            // Unix only: here `HOME` IS the variable `~/.gemini` resolves from, so overriding it
+            // is the whole boundary — the seat cannot reach the operator's OAuth token or their
+            // always-proceed `toolPermission`. On Windows this would assert nothing real.
+            assert_ne!(
+                value(HOME_ENV),
+                Some(Some(operator_home.to_string_lossy().into_owned())),
+                "an agy seat never inherits the operator's home"
+            );
+        }
+        // The quiet flags the seat already had are not traded away for the root.
+        for flag in [AGY_HIDE_LOGO_ENV, AGY_HIDE_ACCOUNT_INFO_ENV] {
+            assert_eq!(value(flag), Some(Some("1".to_string())), "{flag}");
+        }
+        // HOME is generic, so it is SET for agy only and never stripped from anyone — exactly the
+        // rule the XDG bases follow for opencode.
+        assert!(
+            !SEAT_CONFIG_ENV.contains(&HOME_ENV),
+            "HOME is never a stripped seat variable"
+        );
+        let mut pi = Command::new("true");
+        pi.hardened();
+        pi.env(HOME_ENV, &operator_home);
+        seat_config_for(SeatCli::Pi)
+            .expect("resolves")
+            .apply(&mut pi);
+        assert_eq!(
+            pi.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == HOME_ENV)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned()),
+            Some(operator_home.to_string_lossy().into_owned()),
+            "a non-agy seat's home is left exactly as inherited"
+        );
     }
 
     /// F-7R2-012 (wave 6): every seat decision — isolated or the inherit hatch — strips the

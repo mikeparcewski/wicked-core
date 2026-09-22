@@ -348,10 +348,12 @@ pub fn default_login_invocation(key: &str) -> Option<String> {
         "copilot" => (SeatCli::Copilot, "copilot login"),
         "opencode" => (SeatCli::Opencode, "opencode auth login"),
         "pi" => (SeatCli::Pi, "pi"),
-        // No configuration-home variable is known for agy: it signs in where it runs (the
-        // operator's `~/.gemini/…` configuration) — a documented residual of core#410; its seats
-        // at least run quiet (`AGY_CLI_HIDE_LOGO` / `AGY_CLI_HIDE_ACCOUNT_INFO`).
-        "agy" => return Some("agy".to_string()),
+        // agy publishes no configuration-home variable, so its seat root is pulled through the
+        // process home (`HOME`, `wicked_apps_core::spawn::HOME_ENV`) and `~/.gemini/…` resolves
+        // inside it. The derived command therefore signs in the SEAT's home, not the operator's —
+        // the same F-010 mismatch a plain `agy` here would re-introduce, now that an agy seat no
+        // longer reads the operator's `~/.gemini/antigravity-cli/antigravity-oauth-token`.
+        "agy" => (SeatCli::Agy, "agy"),
         _ => return None,
     };
     match seat_config_for(cli) {
@@ -1425,8 +1427,8 @@ mod login_tests {
         let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
         std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
         let login = default_login_invocation("claude");
-        // core#410: read under the SAME unresolvable override — the other seats resolve through
-        // the same base and must fail closed the same way; agy has no root and is unaffected.
+        // core#410: read under the SAME unresolvable override — every other seat resolves through
+        // the same base and must fail closed the same way, agy (whose root is its `HOME`) included.
         let codex = default_login_invocation("codex");
         let agy = default_login_invocation("agy");
         match &prior {
@@ -1441,7 +1443,10 @@ mod login_tests {
             codex, None,
             "codex signs in ITS seat root, which is unresolvable here too"
         );
-        assert_eq!(agy.as_deref(), Some("agy"));
+        assert_eq!(
+            agy, None,
+            "agy signs in ITS seat root (its HOME), which is unresolvable here too"
+        );
     }
 
     /// core#410 (F-010): every seat's sign-in command names the SEAT ROOT the spawns run under —
@@ -1457,6 +1462,7 @@ mod login_tests {
                 ("pi", "pi"),
                 ("copilot", "copilot login"),
                 ("opencode", "opencode auth login"),
+                ("agy", "agy"),
             ] {
                 assert_eq!(default_login_invocation(key).as_deref(), Some(plain));
             }
@@ -1468,10 +1474,11 @@ mod login_tests {
         let base = std::env::temp_dir().join(format!("wc-login-roots-{}", std::process::id()));
         let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
         std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
-        let got: Vec<(&str, Option<String>)> = ["codex", "pi", "copilot", "opencode", "claude"]
-            .into_iter()
-            .map(|k| (k, default_login_invocation(k)))
-            .collect();
+        let got: Vec<(&str, Option<String>)> =
+            ["codex", "pi", "copilot", "opencode", "claude", "agy"]
+                .into_iter()
+                .map(|k| (k, default_login_invocation(k)))
+                .collect();
         match &prior {
             Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
             None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
@@ -1510,6 +1517,12 @@ mod login_tests {
             )),
             "the claude spelling is unchanged by the generalisation"
         );
+        // agy publishes no configuration-home variable of its own: its root is its HOME, so the
+        // sign-in writes `~/.gemini/antigravity-cli/antigravity-oauth-token` INSIDE the seat root.
+        assert_eq!(
+            expect("agy"),
+            Some(format!("HOME={} agy", q(base.join("agy"))))
+        );
         // Copilot, #426: the directories the sign-in command will write credentials into are
         // prepared (private) by the roster read itself — opencode's app dirs included.
         for d in [
@@ -1517,6 +1530,10 @@ mod login_tests {
             base.join("pi"),
             base.join("copilot"),
             base.join("opencode").join("data").join("opencode"),
+            // agy's CREDENTIAL directory, not merely its root: `agy` writes the
+            // `antigravity-oauth-token` here, and asserting only `base.join("agy")` would pass
+            // while the directory the sign-in actually fills went unowned and unchecked.
+            base.join("agy").join(".gemini").join("antigravity-cli"),
         ] {
             assert!(d.is_dir(), "{} is prepared before sign-in", d.display());
         }
