@@ -853,6 +853,42 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+/// Collect a child that the run's STOP predicate has condemned, without defeating the SIGTERM
+/// window the ACTOR thread is driving (core#576).
+///
+/// `grace` is `Some(d)` for the stop reasons the actor escalates for — `cancel_run` and
+/// `ReassignUnit` both call [`kill_pgroup_graceful`] (SIGTERM → ~500 ms → SIGKILL) on the pgid this
+/// child registered. Killing here in the same instant is what made that window unobservable: the
+/// worker polls every 50 ms and its `kill_child_tree` is an immediate `killpg(pgid, SIGKILL)`, so a
+/// child that flushes buffers or stops its own subprocesses on SIGTERM was killed mid-cleanup. With
+/// a grace the worker POLLS for the leader to exit instead, letting the actor's SIGTERM land first.
+///
+/// `grace` is `None` when nothing else will kill this group — `Command::Shutdown` only sets the
+/// flag and never kills a tool child, and non-unix has no group kill at all — so the worker stays
+/// the only killer and forces immediately, exactly as before.
+///
+/// EITHER WAY the group is force-killed and the child reaped before returning. The leader exiting
+/// on SIGTERM does not mean the GROUP is empty (a script may have backgrounded work into it), and
+/// the worker must never return while its own child's group is alive — that is the same
+/// `kill_child_tree` the `Ok(true)` (natural-exit) arm applies, and it is why the wait polls
+/// `has_exited_unreaped`: a reaped pid frees the group id for reuse, and the `killpg` below would
+/// then land on a stranger.
+pub(crate) fn kill_after_stop(child: &mut std::process::Child, grace: Option<Duration>) {
+    if let Some(grace) = grace {
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            // `Ok(true)` = the leader exited (the actor's SIGTERM was honoured, or its SIGKILL
+            // landed); `Err` = the OS refused to tell us — stop waiting either way.
+            match has_exited_unreaped(child) {
+                Ok(false) => std::thread::sleep(Duration::from_millis(20)),
+                _ => break,
+            }
+        }
+    }
+    kill_child_tree(child);
+    reap_bounded(child);
+}
+
 /// Kill a process group gracefully from the ACTOR THREAD (no `Child` handle — only the pgid from the
 /// tool-child registry). Sends SIGTERM, waits up to ~500 ms, then SIGKILL if still alive. Returns `true`
 /// if the group was confirmed dead (via SIGTERM or SIGKILL within the poll budget), `false` if it was
@@ -861,6 +897,12 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
 /// already-dead group is harmless. Called by `cancel_run` and `ReassignUnit` BEFORE emitting
 /// `RunCancelled` / `UnitReassigned` so the wire never asserts cancellation while tool children live
 /// (AC2 / core#500).
+///
+/// The return value reports DEATH, never its CAUSE (core#576): this function holds no `Child` handle
+/// and cannot see a status, only whether `killpg(pgid, 0)` still succeeds. Since core#576 the worker
+/// thread no longer races it with an immediate SIGKILL for cancel/supersede (see
+/// [`kill_after_stop`]), so the SIGTERM window is now real — but "returned true inside the SIGTERM
+/// poll" still does not prove the group honoured the signal.
 #[cfg(unix)]
 pub(crate) fn kill_pgroup_graceful(pgid: u32) -> bool {
     // Bounds guard FIRST. `killpg(0, sig)` signals the CALLER's own process group — the daemon
@@ -879,7 +921,11 @@ pub(crate) fn kill_pgroup_graceful(pgid: u32) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
         if unsafe { sig::killpg(pgid, 0) } != 0 {
-            return true; // died on SIGTERM
+            // CONFIRMED DEAD, cause unknown (core#576): all this observes is that the group is
+            // gone within the SIGTERM window. It may have honoured the SIGTERM, it may have been
+            // exiting anyway, or another thread may have killed it. Do not report a cause here —
+            // the return value means "dead", not "died gracefully".
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
