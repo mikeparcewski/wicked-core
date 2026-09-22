@@ -212,11 +212,13 @@ pub struct ElicitationMaps {
     /// Set when the `ElicitationCreated` was suppressed; cleared by `take_suppressed_resolution`.
     suppressed_resolutions: HashSet<String>,
     /// Live tool child process-group ids keyed by run_id (core#500 / AC2): the actor thread reads
-    /// this to synchronously kill the group BEFORE emitting `RunCancelled` / `UnitReassigned`, so
-    /// the wire never asserts cancellation while the child is still alive. At most one entry per
-    /// run at any time (tool units are serialised). The background thread registers on spawn and
-    /// deregisters when the poll loop returns.
-    tool_child_pgroups: HashMap<String, u32>,
+    /// this to synchronously kill the groups BEFORE emitting `RunCancelled` / `UnitReassigned`, so
+    /// the wire never asserts cancellation while a child is still alive. Usually 0 or 1 pgids per
+    /// run (tool units are serialised), but a `ReassignUnit` that lands between an attempt's
+    /// `proc.spawn()` and its registration leaves two attempts briefly live at once, and BOTH have
+    /// to stay reachable (core#577). The background thread registers on spawn and deregisters its
+    /// own pgid when the poll loop returns.
+    tool_child_pgroups: HashMap<String, Vec<u32>>,
 }
 
 impl ElicitationMaps {
@@ -675,26 +677,69 @@ impl ElicitationMaps {
     /// Register the live tool child's pgid for `run_id`. Called by the tool background thread
     /// immediately after `proc.spawn()` — before the poll loop — so the actor thread can find
     /// and kill the group during cancel / supersede.
-    pub fn register_tool_child(&mut self, run_id: &str, pgid: u32) {
-        self.tool_child_pgroups.insert(run_id.to_string(), pgid);
+    ///
+    /// EVERY live pgid is kept, not only the newest (core#577). One live tool child per run is the
+    /// ordinary state — a run advances one unit at a time (the actor is the single writer and
+    /// dispatches the next unit only when the previous one's result posts back), `LaunchRun`
+    /// refuses a second launch of a live run id (`RunBusy`, via the `in_flight` guard), and
+    /// `ReassignUnit` drains the registry with [`Self::take_tool_child_pgroups`] and kills the
+    /// group BEFORE dispatching the replacement — but it is not an invariant, and this registry
+    /// used to overwrite on the premise that it was.
+    ///
+    /// The window that breaks it: `ReassignUnit` advances the launch sequence and drains the
+    /// registry while an attempt sits between `proc.spawn()` (`actor.rs`, `run_tool_cmd`) and this
+    /// call. The drain finds nothing, the replacement is dispatched, and two tool children are
+    /// live at once. NOTHING orders their two registrations — the superseded attempt's worker
+    /// thread only has to be off-CPU across the replacement's dispatch and spawn — so the second
+    /// registration is as likely to be the SUPERSEDED attempt's as the replacement's.
+    ///
+    /// That direction is what made an overwrite a defect rather than an untidiness: it evicted the
+    /// REPLACEMENT — the live one — and then the superseded attempt's own
+    /// [`Self::deregister_tool_child`] matched its own pgid and emptied the run's entry, so a later
+    /// cancel took `[]`, reported `toolChildrenKilled: 0`, and left a live tool child running that
+    /// nothing could reach. That is precisely the escape core#500 exists to close, so the storage
+    /// now holds what IS live rather than what is expected to be.
+    ///
+    /// The return value is the pgids already registered for this run — empty in the ordinary case,
+    /// non-empty only in that race. It is a state worth logging, not a failure: both children are
+    /// tracked and a cancel kills both.
+    #[must_use = "co-resident tool children mean a reassign race — log it, do not drop it"]
+    pub fn register_tool_child(&mut self, run_id: &str, pgid: u32) -> Vec<u32> {
+        let live = self
+            .tool_child_pgroups
+            .entry(run_id.to_string())
+            .or_default();
+        let already: Vec<u32> = live.iter().copied().filter(|p| *p != pgid).collect();
+        if !live.contains(&pgid) {
+            live.push(pgid);
+        }
+        already
     }
 
-    /// Deregister the tool child for `run_id` only if the stored pgid still matches `pgid`.
-    /// Called by the background thread when the poll loop exits. The compare-and-remove prevents
-    /// a superseded attempt's late on_done from evicting the REPLACEMENT attempt's registration
-    /// (core#500: the registry was keyed by run_id only, so a deregister always removed the
-    /// current entry regardless of which attempt wrote it).
+    /// Deregister the tool child `pgid` for `run_id`, leaving any other live pgid of that run in
+    /// place. Called by the background thread when its poll loop exits. Removing only its OWN pgid
+    /// is what keeps a superseded attempt's late `on_done` from evicting a concurrently live
+    /// replacement (core#500: the registry was keyed by run_id only, so a deregister removed the
+    /// current entry regardless of which attempt wrote it; core#577: with per-attempt entries the
+    /// compare is against a set rather than against a single slot).
     pub fn deregister_tool_child(&mut self, run_id: &str, pgid: u32) {
-        if self.tool_child_pgroups.get(run_id) == Some(&pgid) {
-            self.tool_child_pgroups.remove(run_id);
+        if let Some(live) = self.tool_child_pgroups.get_mut(run_id) {
+            live.retain(|p| *p != pgid);
+            if live.is_empty() {
+                self.tool_child_pgroups.remove(run_id);
+            }
         }
     }
 
     /// Remove and return all live tool child pgids for `run_id`. Called by the actor thread
     /// BEFORE emitting `RunCancelled` or dispatching a replacement unit for `ReassignUnit`.
     /// Returns an empty vec when no tool child is registered (gate reject, non-tool run, etc.).
+    ///
+    /// Usually 0 or 1 pgids; 2 while a superseded attempt and its replacement are both live (see
+    /// [`Self::register_tool_child`] for the window that produces that). The callers' `for pgid in
+    /// pgroups { … }` kills every one of them, which is the point of returning them all (core#577).
     pub fn take_tool_child_pgroups(&mut self, run_id: &str) -> Vec<u32> {
-        self.tool_child_pgroups.remove(run_id).into_iter().collect()
+        self.tool_child_pgroups.remove(run_id).unwrap_or_default()
     }
 
     /// Mark the paired `ElicitationResolved` for `elicitation_id` as suppressed.
@@ -18842,5 +18887,100 @@ transport = "stdio"
                 );
             }
         }
+    }
+
+    // ── core#577: the tool-child registry tracks every LIVE pgid, not just the newest ───────────
+
+    /// core#577, THE DEFECT — a superseded attempt that registers late must not be able to strand
+    /// its own live replacement.
+    ///
+    /// The window: `ReassignUnit` advances the launch sequence, drains the registry, and dispatches
+    /// a replacement while the superseded attempt sits between `proc.spawn()` and its `on_spawn`
+    /// registration, so the drain finds nothing and two tool children are live. Nothing orders the
+    /// two registrations, so the SUPERSEDED attempt can register second — and while
+    /// `register_tool_child` overwrote, that evicted the replacement, after which the superseded
+    /// attempt's own `on_done` deregistered its own pgid and left the entry EMPTY. A cancel then
+    /// took `[]`, reported `toolChildrenKilled: 0`, and the live tool child ran on unreachable —
+    /// the exact escape core#500 closes (a cancelled run's deliver script committing and pushing
+    /// under the daemon's token).
+    ///
+    /// This walks that sequence and asserts on REACHABILITY, deliberately ignoring what
+    /// `register_tool_child` returns: a report is not a fix, so this test must fail against a
+    /// registry that reports the race perfectly and still loses the pgid.
+    #[test]
+    fn a_late_superseded_attempt_cannot_strand_the_live_replacement() {
+        let mut maps = super::ElicitationMaps::new();
+
+        // 1. The superseded attempt (pgid 100) has spawned but not yet registered, so
+        //    `ReassignUnit`'s drain finds nothing…
+        assert!(maps.take_tool_child_pgroups("run-r").is_empty());
+        // 2. …and the REPLACEMENT (pgid 200) is dispatched, spawns, and registers first.
+        let _ = maps.register_tool_child("run-r", 200);
+        // 3. The superseded attempt finally reaches its registration. Pre-core#577 this overwrote
+        //    the entry with 100 and 200 was gone from the registry.
+        let _ = maps.register_tool_child("run-r", 100);
+        // 4. It observes `stop()`, kills its own group, and `on_done(100)` deregisters ITSELF.
+        //    Pre-core#577 the entry was `100`, so this compare-and-remove emptied the run.
+        maps.deregister_tool_child("run-r", 100);
+        // 5. A cancel now. The replacement is still live, so it must still be killable.
+        assert_eq!(
+            maps.take_tool_child_pgroups("run-r"),
+            vec![200],
+            "the live replacement was stranded: a cancel would take [] and leave it running"
+        );
+
+        // The other order (the replacement registers second) has to survive too, and its late
+        // `on_done` must remove only its own pgid.
+        let _ = maps.register_tool_child("run-s", 100);
+        let _ = maps.register_tool_child("run-s", 200);
+        assert_eq!(
+            maps.take_tool_child_pgroups("run-s"),
+            vec![100, 200],
+            "while both are live a cancel must reach both"
+        );
+        let _ = maps.register_tool_child("run-t", 100);
+        let _ = maps.register_tool_child("run-t", 200);
+        maps.deregister_tool_child("run-t", 100);
+        assert_eq!(
+            maps.take_tool_child_pgroups("run-t"),
+            vec![200],
+            "a superseded attempt's own deregistration must not evict the replacement"
+        );
+    }
+
+    /// core#577, THE REPORT — co-residency is rare enough to be worth a log line, so
+    /// `register_tool_child` hands back the pgids already live for that run.
+    #[test]
+    fn registering_beside_a_live_tool_child_reports_the_co_resident_pgid() {
+        let mut maps = super::ElicitationMaps::new();
+
+        // The ordinary path: one attempt, nothing co-resident.
+        assert!(maps.register_tool_child("run-a", 111).is_empty());
+        // Idempotent re-registration of the SAME pgid is one child, not two.
+        assert!(maps.register_tool_child("run-a", 111).is_empty());
+        assert_eq!(
+            maps.take_tool_child_pgroups("run-a"),
+            vec![111],
+            "an idempotent re-registration must not double the entry"
+        );
+        // Another run is a different key — never co-resident.
+        assert!(maps.register_tool_child("run-a", 111).is_empty());
+        assert!(maps.register_tool_child("run-b", 222).is_empty());
+        assert_eq!(maps.take_tool_child_pgroups("run-a"), vec![111]);
+        assert_eq!(maps.take_tool_child_pgroups("run-b"), vec![222]);
+        assert!(maps.take_tool_child_pgroups("run-b").is_empty());
+
+        // The race: a second, DIFFERENT live pgid for one run comes back so the caller can log it.
+        assert!(maps.register_tool_child("run-c", 333).is_empty());
+        assert_eq!(
+            maps.register_tool_child("run-c", 444),
+            vec![333],
+            "a co-resident live pgid must be handed back so the caller can log the race"
+        );
+
+        // A deregistration for a pgid this run never held changes nothing (core#500's
+        // compare-and-remove, now against the set).
+        maps.deregister_tool_child("run-c", 999);
+        assert_eq!(maps.take_tool_child_pgroups("run-c"), vec![333, 444]);
     }
 }
