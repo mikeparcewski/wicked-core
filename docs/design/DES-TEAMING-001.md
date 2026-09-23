@@ -5,6 +5,7 @@
 - **Rev 3 (2026-09-23):** operator ruling on Q1, written into §6.3/§6.7. An unresolved HIGH goes to a council. YES continues the run autonomously. NO **or no verdict** pauses for a human (fail-closed). The rev 2 Option A/B block is replaced by the ruling.
 - **Rev 4 (2026-09-23):** S2 builder corrections, verified on `d5d9708`. The ACP spawn path does not resolve seat-instance keys yet, so that prerequisite is now build step 0 (§4.1, §9, §10). §4.7 is re-ordered: S2's final batch carries no declines; S3 parses `ADVICE` and then runs the HOLD/WITHDRAW round. §7 notes that fixtures compare JSON values, not key order.
 - **Rev 5 (2026-09-23):** review on #604 at `0493046`. (1) The ruling is **extended, pending operator confirmation** (§6.7): every **unaccepted** HIGH (declined-and-held, unanswered, or never delivered) is unresolved and takes the council path, so `combine_verdict(true, None)` can no longer approve one. (2) `findingId` now includes a stable location anchor, so two identical hazardous lines in one file are two findings; a secondary `lineKey` keeps moved-line correlation (§4.6).
+- **Rev 6 (2026-09-23):** review on #604 at `609d0dd`. (1) The S3 hold-round acceptance now says **unaccepted** (declined, unanswered, not delivered), matching §6.3. (2) The `team_dispute` pause is a **pause intent** returned on `UnitOutcome`; the actor's `apply_step_result` performs `pause_for_human` (§6.7), since `apply_and_finish_unit` has no session or actor handles. (3) There are **six** new events, not seven; every reference agrees.
 - **Date:** 2026-09-23
 - **Scope:** wicked-core (S2 monitor subscription, S3 monitor→worker injection, S6 gate adjudication — engine half), wicked-crew (S6 read route + api-types), wicked-studio (S6 surfaces)
 - **Related:** #590 (the operator-approved proposal), #599 (S1, merged as `d5d9708`: the `AskUserQuestion` elicitation channel), #595 (seat-instance keys, `claude#2`), S4 (complexity policy, `feat/590-s4-review-scale`), S5 (deterministic `RoutingInfo::Teamed` + the decision-council entry point) — S4 and S5 are built elsewhere; this document names only the interface it consumes from them (§8).
@@ -249,7 +250,7 @@ A finding is **unresolved** when:
 
 - **Route:** `GET /api/v1/runs/:id/team` → `{ runId, units: [{ ord, attempt, ledger: TeamLedger }] }`, read from the run's unit records (`adapter.sessionsDetail()`, which is durable across restarts). A run with no ledgers returns `units: []`, not 404. It is registered beside `GET /runs/:id/gate` (`routes.ts:3206`). There is **no new decision route**: the human still decides through `POST /runs/:id/gate` (`routes.ts:2942-2943`).
 - **`/ws`:** nothing to add. The relay already forwards every frame (`server.ts:1235`).
-- **crew-api-types:** the seven event types of §7 as `type` aliases in the style of `WorkerToolCallDeniedEvent` (`packages/crew-api-types/index.d.ts:1883`), plus `TeamLedger` and the route's response type. The Rust `to_json` arm is the source of truth. The api-types spelling must match it byte for byte.
+- **crew-api-types:** the six event types of §7 as `type` aliases in the style of `WorkerToolCallDeniedEvent` (`packages/crew-api-types/index.d.ts:1883`), plus `TeamLedger` and the route's response type. The Rust `to_json` arm is the source of truth. The api-types spelling must match it byte for byte.
 - **Evidence bundle:** `GET /runs/:id/evidence` includes each unit's `team_ledger` (it rides the unit record already).
 
 ### 6.5 studio
@@ -271,11 +272,14 @@ A finding is **unresolved** when:
 **Ruling (operator, 2026-09-23).** Every unresolved HIGH (§6.3) goes to a council. Council **YES** → the run continues autonomously. Council **NO** → human pause. **Fail-closed:** if the council cannot produce a verdict (no quorum, benched seats, error, timeout, over the cap), that is treated as NO and the run pauses for a human. **It never auto-continues without a YES.** The verdict is recorded at the gate as evidence.
 
 **Mechanism.**
-- **Where:** in `apply_and_finish_unit` (`src/pipeline.rs:827`), after `outcome` is computed and after `teamLedger` + `GateEvaluated` are emitted, and **before** `GateDecided`/`UnitDone` are emitted (`src/pipeline.rs:1540-1576`).
+- **Where, in two halves — the fold decides, the actor pauses.** `apply_and_finish_unit` (`src/pipeline.rs:827-841`) receives only the store, the fold inputs and an `emit` callback; it has no `AgentSession`, no subscribers and no `self_tx`, and `pause_for_human` (`src/actor.rs:6071`) needs all three. So:
+  1. **Fold (`src/pipeline.rs`):** after `outcome` is computed and after `teamLedger` + `GateEvaluated` are emitted, and **before** `GateDecided`/`UnitDone` would be emitted (`:1540-1576`), evaluate the condition below. When it holds, **do not** emit `GateDecided`/`UnitDone`, and return the outcome with a new additive field `UnitOutcome.team_pause: Option<TeamPause>` (`src/execute.rs:36`; `#[serde(default, skip_serializing_if = "Option::is_none")]`), where `TeamPause { prompt: String, finding_ids: Vec<String> }`. `outcome.approved` stays `true`: the gate approved; the run is only not allowed to continue unattended.
+  2. **Actor (`apply_step_result`, `src/actor.rs:4318`):** at the call site `src/actor.rs:5358-5376`, after the existing denied branch (`if !outcome.approved`, `:5400-5427`, which returns `StepApplied::Paused` through `escalate_denied_unit`) and **before** `advance_or_pause` (`:5444`), add: `if let Some(tp) = outcome.team_pause { pause_for_human(store, subscribers, self_tx, &mut session, unit.ord, None, "team_dispute", tp.prompt)?; return Ok(StepApplied::Paused); }`. `pause_for_human` writes the `AwaitingHuman` session state and the open `interaction_request` in one batch and emits `awaitingHuman` (`:6071-6110`), so the pause is durable before the actor returns; the cursor stays on this unit.
+  3. **Resume:** a human approve through `POST /runs/:id/gate` reaches `confirm_gate`. For a `team_dispute` gate the unit is already approved and folded, so `confirm_gate` emits `resumed`, then `gateDecided{allow:true}` + `unitDone` for that ord, and advances the cursor exactly as the approved path would have (`advance_or_pause`). Reject cancels. Approve+amend reruns the creator with the amendment.
 - **Condition:** `outcome.approved == true` **and** the ledger holds ≥1 unresolved HIGH whose `dispute.verdict != "yes"`.
   - If the fold denied, the unit is denied as today (`unitDenied`) and there is no pause. The rework amendment carries the findings (§6.2).
   - If every unresolved HIGH has `dispute.verdict == "yes"`, the unit continues as today. This holds even when the judge was skipped: under the ruling, a council YES is the only way an unresolved HIGH continues autonomously.
-- **Action:** withhold `GateDecided`/`UnitDone`, and have the actor call `pause_for_human(…, gate_kind: "team_dispute", prompt)` (`src/actor.rs:6070-6110`).
+- **Action (as above):** the fold withholds `GateDecided`/`UnitDone` and returns `team_pause`; the actor calls `pause_for_human(…, gate_kind: "team_dispute", prompt)`.
   - The pause fires on **every** run, including runs launched with no human confirmation.
   - The prompt lists each unresolved HIGH: `findingId`, `path:finalLine`, claim, the worker's reason, the monitor's reason, and the council verdict (agreement and dissent, or the no-verdict reason).
   - The human answers through the existing `POST /runs/:id/gate` (`routes.ts:2942`): approve → `resumed` then `gateDecided{allow:true}` + `unitDone`; reject → cancel; approve+amend → the creator reruns with the amendment.
@@ -349,13 +353,13 @@ Every variant is mapped by hand in `CoreEvent::to_json` (`src/event.rs:1269-1275
                          // "yes" (continue) | "no" (pause) | "no_verdict" (pause, fail-closed)
                          "reason":null,                      // no_verdict only: "no_quorum" | "seats_benched" | "error" | "timeout" | "cap"
                          "agreementPct":67,"dissent":1,"seats":["codex","pi"]}}],   // null ×3 for no_verdict
- "teamPause":true,               // the fold withheld unitDone and paused with gateKind "team_dispute"
+ "teamPause":true,               // the fold set UnitOutcome.team_pause; the actor then paused with gateKind "team_dispute"
  "rejected":{"malformed":0,"belowBar":2,"unconfirmed":1,"duplicate":0}}
 ```
 
 **Key order.** wicked-core's `serde_json` has no `preserve_order` feature (`Cargo.toml:59`, `serde_json = "1"`), so object keys serialize in sorted order, not the order shown above. Fixture tests in core, core-ts and crew-api-types must compare parsed JSON **values**, never serialized strings or key order.
 
-**Durable log.** All seven go to the per-run event log like any event. `unitCheckpoint` is the only frequent one, it exists only for teamed units, and it is small (≤ ~600 B).
+**Durable log.** All six go to the per-run event log like any event. `unitCheckpoint` is the only frequent one, it exists only for teamed units, and it is small (≤ ~600 B).
 
 ## 8. Interfaces consumed (not designed here)
 
@@ -378,7 +382,7 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 | `monitor_ensure` / `monitor_turn` | core | `src/acp_runner.rs`, beside `chat_turn` (`:6187`) |
 | `StepRunner::team_finish` (default `None`) | core | `src/workflow.rs:365` trait |
 | Final pass call, ledger render into WORK, monitor seats excluded from the judge (all three paths) | core | `src/cli_runner.rs:761`, `:885-895`; bus `:97-112`, `:351-394`, `:911-925`; inline `:937`, `:988`, `:1020`, `:1029` |
-| `team_dispute` pause after an approving fold with an unresolved HIGH lacking a council YES | core | `src/pipeline.rs:827`, `:1540-1576`; `pause_for_human` `src/actor.rs:6070` |
+| `team_dispute` pause: `UnitOutcome.team_pause` set by the fold, performed by the actor | core | fold `src/pipeline.rs:827`, `:1540-1576`; `UnitOutcome` `src/execute.rs:36`; actor `src/actor.rs:5358-5376`, `:5400-5444`; `pause_for_human` `:6071` |
 | `UnitEvidence.team`, `WorkUnit.team_ledger`, `teamLedger` emission | core | `src/workflow.rs:265`, `src/domain.rs`, `src/pipeline.rs:1540` |
 | Ledger into evaluator prior context and rework amendment | core | `src/actor.rs:6650-6700` |
 | Seven `to_json` arms + core-ts `.d.ts` regen | core | `src/event.rs`, `crates/wicked-core-ts` |
@@ -388,7 +392,7 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 ## 10. Build order
 
 0. **Prerequisite (in progress, separate PR): #591 ACP gap.** `registry_record` does a two-step lookup (the exact instance key, then its cli key via `seat_cli_key`). `start_acp_process_with_write_roots` resolves the **seat-key** configuration home, not `seat_config_for(seat_cli)` (`src/acp_runner.rs:7755-7761`, `:2221`). The instance-key fence holds on the ACP path. S2's monitor attach (§4.1) needs it. S3 and S6 do not.
-1. **Wire contract first (core, S2-owned).** The seven `CoreEvent` variants + `to_json` arms + the `TeamLedger` type, with no emitters. Merge. From here, crew and studio can build against fixtures, and S3 can build against the types.
+1. **Wire contract first (core, S2-owned).** The six `CoreEvent` variants + `to_json` arms + the `TeamLedger` type, with no emitters. Merge. From here, crew and studio can build against fixtures, and S3 can build against the types.
 2. **In parallel, three builders:**
    - **S2 (core):** `unitCheckpoint` emission, `team.rs` supervisor, monitor sessions, batching, snapshot/diff, confirmation, dedup, `monitorFinding`, final pass steps 1–3, `team_finish`.
    - **S3 (core):** `steering_supported`, mailbox, delivery at the checkpoint arm, response matching, `adviceDelivered`, advice text, `ADVICE` parsing → `workerAdviceResponse` and the hold round (final pass steps 4–5). It is tested against a mock bridge that advertises and answers `_session/steering`.
@@ -426,7 +430,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 8. The same bridge answering `{"outcome":"promptRequired"}` yields `outcome:"turn_ended"`, the finding is `delivery:"not_delivered"` in the ledger, and **no** further `session/prompt` is sent.
 9. A bridge that does not advertise steering receives **no** `_session/steering` frame.
 10. A MEDIUM finding is never sent through steering. A finding whose evidence text is gone from the fresh snapshot is not sent and ends `superseded`.
-11. Final output lines `ADVICE f-…: DECLINE — campaign.rs:325 documents the exclusion` and `ADVICE f-…: ACCEPT — added AbortController` produce one `workerAdviceResponse` each, with the matching disposition and reason. A delivered id with no line ends `unanswered`. **Hold round:** only monitors that authored a declined finding get a hold-round turn. It lists exactly those ids with the worker's reasons. A missing reply for an id records `monitorReply: {kind:"hold", reason:"no reply (counted as hold)"}`. The S2 final review batch prompt contains no decline text.
+11. Final output lines `ADVICE f-…: DECLINE — campaign.rs:325 documents the exclusion` and `ADVICE f-…: ACCEPT — added AbortController` produce one `workerAdviceResponse` each, with the matching disposition and reason. A delivered id with no line ends `unanswered`. **Hold round:** only monitors that authored an **unaccepted** finding get a hold-round turn: a finding that is `declined`, `unanswered` with `delivery:"injected"`, or `unanswered` with `delivery:"not_delivered"`. It lists exactly those ids, each with its state (the worker's decline reason, "no answer", or "not delivered — <outcome>"). A monitor whose findings are all `accepted`, `withdrawn` or `superseded` gets no turn. A missing reply for an id records `monitorReply: {kind:"hold", reason:"no reply (counted as hold)"}`. The S2 final review batch prompt contains no decline text.
 12. Advice queued for attempt 1 is not delivered to attempt 2.
 
 **S6**
@@ -448,7 +452,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
     (g) Approving the `team_dispute` gate through `POST /runs/:id/gate` emits `resumed`, then `gateDecided{allow:true}` and `unitDone`, for that ord.
     (h) **Unanswered (extension, §6.7):** the same fixture with the HIGH `delivery:"injected"`, no `ADVICE` line, and the monitor holding (or silent): council NO and every no-verdict reason pause exactly as (b)–(d); council YES continues as (a). With `judge_skipped` set, there is never a `unitDone` without a council YES.
     (i) **Not delivered (extension, §6.7):** the same fixture on a bridge that does not advertise steering (`delivery:"not_delivered"`), and again with a steer answered `promptRequired`: identical outcomes to (h). The council input's worker position reads `"not delivered — …"`.
-17. `GET /api/v1/runs/:id/team` returns the ledgers for a teamed run and `units: []` for a run without monitors. The api-types fixture round-trips the Rust `to_json` output for all seven events.
+17. `GET /api/v1/runs/:id/team` returns the ledgers for a teamed run and `units: []` for a run without monitors. The api-types fixture round-trips the Rust `to_json` output for all six events.
 18. Studio: the gate panel shows each finding's severity, `path:line`, the worker's disposition and reason, and the council verdict. Approve/reject still go through `POST /runs/:id/gate`.
 
 **E2E (rig, after all three).** Re-run the #590 B18 shape: a retire-flow unit that writes a cancellation-free coverage fetch. Pass requires a HIGH `monitorFinding` at that handler's `file:line` **before** the unit's turn ends, an `adviceDelivered{injected}`, a `workerAdviceResponse`, and a `teamLedger` the gate panel renders. Launch alone is not a pass: the run must reach a terminal state.
