@@ -394,19 +394,26 @@ pub fn finding_id(path: &str, evidence: &str) -> String {
     format!("f-{hex}")
 }
 
-/// Whether line `line` (1-based) of `file` IS `evidence`, whitespace-normalized. An empty
-/// evidence confirms nothing.
+/// Whether line `line` (1-based) of `file` IS `evidence` — the exact text (DES §4.6 step 3,
+/// "file:line or it did not happen": the monitor prompt asks for the exact line and
+/// `monitorFinding.evidence` is documented as equal to it). Whitespace normalization serves the
+/// finding id only ([`finding_id`]), so a re-spaced quote is `unconfirmed`, never emitted as
+/// evidence that is not in the tree (codex review of #609). An empty evidence, a line 0 and a
+/// missing file confirm nothing.
 pub fn confirm(file: Option<&str>, line: u32, evidence: &str) -> bool {
-    let want = normalize_evidence(evidence);
-    if want.is_empty() {
+    if evidence.is_empty() {
         return false;
     }
-    file.and_then(|f| f.lines().nth(line as usize - 1))
-        .is_some_and(|l| normalize_evidence(l) == want)
+    let Some(i) = line.checked_sub(1) else {
+        return false;
+    };
+    file.and_then(|f| f.lines().nth(i as usize))
+        .is_some_and(|l| l == evidence)
 }
 
-/// Where `evidence` sits in `file` now: `line` itself when it still matches, else the matching
-/// line nearest to it, else `None` (the text is gone — the finding is superseded).
+/// Where `evidence` sits in `file` now: `line` itself when it still matches exactly, else the
+/// nearest line with the same NORMALIZED text (DES §4.6 `lineKey`: moved-line correlation, the
+/// same key the finding id is on), else `None` (the text is gone — the finding is superseded).
 pub fn locate(file: Option<&str>, line: u32, evidence: &str) -> Option<u32> {
     if confirm(file, line, evidence) {
         return Some(line);
@@ -1108,9 +1115,17 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost, emit: &Emit) -> BatchDone
     })
 }
 
+/// Attempts whose checkpoints may be held before their `Attach` lands, and checkpoints per such
+/// attempt (see [`TeamCore::hold_early`]). Past either bound the OLDEST is dropped, and the daemon
+/// log says so.
+pub const EARLY_CHECKPOINT_KEYS: usize = 32;
+pub const EARLY_CHECKPOINTS_PER_KEY: usize = 64;
+
 /// The supervisor's state: every attached attempt.
 pub struct TeamCore {
     units: HashMap<UnitKey, Arc<Mutex<UnitTeam>>>,
+    /// Checkpoints that arrived before their attempt's `Attach` (oldest attempt first).
+    early: Vec<(UnitKey, Vec<CoreEvent>)>,
     host: Arc<dyn MonitorHost>,
     emit: Emit,
     pub limits: TeamLimits,
@@ -1120,17 +1135,62 @@ impl TeamCore {
     pub fn new(host: Arc<dyn MonitorHost>, emit: Emit, limits: TeamLimits) -> Self {
         Self {
             units: HashMap::new(),
+            early: Vec::new(),
             host,
             emit,
             limits,
         }
     }
 
-    /// `TeamCmd::Attach`: start tracking an attempt (idempotent per key).
+    /// `TeamCmd::Attach`: start tracking an attempt (idempotent per key), then replay, in order,
+    /// any checkpoint of it that arrived first.
     pub fn attach(&mut self, ctx: AttachCtx) {
+        let key = ctx.key();
         self.units
-            .entry(ctx.key())
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(UnitTeam::new(ctx))));
+        if let Some(pos) = self.early.iter().position(|(k, _)| *k == key) {
+            let (_, held) = self.early.remove(pos);
+            for ev in held {
+                self.on_event(&ev);
+            }
+        }
+    }
+
+    /// A checkpoint for an attempt this core is not tracking (yet). `Attach` travels the direct
+    /// command channel from the worker thread while checkpoints come through the engine's
+    /// fan-out and a forwarder thread (DES §4.2), so a fast first tool call can overtake its own
+    /// attach; dropping it would silence the monitor for a unit whose only tree change it was.
+    /// It is held until the attach lands, bounded on both axes.
+    fn hold_early(&mut self, key: UnitKey, ev: CoreEvent) {
+        let pos = match self.early.iter().position(|(k, _)| *k == key) {
+            Some(p) => p,
+            None => {
+                if self.early.len() >= EARLY_CHECKPOINT_KEYS {
+                    let (k, held) = self.early.remove(0);
+                    eprintln!(
+                        "[wicked-core] team: {} checkpoint(s) of {}:{}:{} arrived before its \
+                         attach and were dropped ({EARLY_CHECKPOINT_KEYS} attempts already held)",
+                        held.len(),
+                        k.0,
+                        k.1,
+                        k.2
+                    );
+                }
+                self.early.push((key, Vec::new()));
+                self.early.len() - 1
+            }
+        };
+        let (k, held) = &mut self.early[pos];
+        if held.len() >= EARLY_CHECKPOINTS_PER_KEY {
+            held.remove(0);
+            eprintln!(
+                "[wicked-core] team: the oldest checkpoint of {}:{}:{} was dropped \
+                 ({EARLY_CHECKPOINTS_PER_KEY} already held before its attach)",
+                k.0, k.1, k.2
+            );
+        }
+        held.push(ev);
     }
 
     /// Consume one engine event. Only `unitCheckpoint` is read (DES §4.2): deltas, hook replays
@@ -1148,7 +1208,9 @@ impl TeamCore {
         else {
             return;
         };
-        let Some(unit) = self.units.get(&(session.clone(), *ord, *attempt)) else {
+        let key = (session.clone(), *ord, *attempt);
+        let Some(unit) = self.units.get(&key) else {
+            self.hold_early(key, ev.clone());
             return;
         };
         let mut u = unit.lock().unwrap_or_else(|p| p.into_inner());
@@ -1216,6 +1278,7 @@ impl TeamCore {
     /// that was never attached (a wrapped carrier) starts from `ctx`.
     pub fn take(&mut self, ctx: AttachCtx) -> Arc<Mutex<UnitTeam>> {
         let key = ctx.key();
+        self.early.retain(|(k, _)| *k != key);
         self.units
             .remove(&key)
             .unwrap_or_else(|| Arc::new(Mutex::new(UnitTeam::new(ctx))))
@@ -1224,6 +1287,7 @@ impl TeamCore {
     /// Stop tracking every attempt of `run_id`.
     pub fn drop_run(&mut self, run_id: &str) {
         self.units.retain(|(r, _, _), _| r != run_id);
+        self.early.retain(|(k, _)| k.0 != run_id);
     }
 
     pub fn host(&self) -> Arc<dyn MonitorHost> {

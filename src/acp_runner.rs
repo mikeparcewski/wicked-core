@@ -21092,7 +21092,13 @@ while True:
         let dir = scratch("readonly");
         let wt = dir.join("wt");
         std::fs::create_dir_all(wt.join("src")).unwrap();
-        let git = |args: &[&str]| crate::worktree_guard::git(&wt, args, &[]).unwrap();
+        // Every git spawn here inherits the process PATH, which the PATH-pinning tests in this
+        // binary mutate under `ENV_LOCK`; take the read side around each spawn (never across
+        // `start`, which takes it itself) so a parallel pin cannot make `git` unfindable.
+        let git = |args: &[&str]| {
+            let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+            crate::worktree_guard::git(&wt, args, &[]).unwrap()
+        };
         git(&["init", "-q"]);
         std::fs::write(wt.join("src/a.rs"), "fn a() {}\n").unwrap();
         git(&["add", "-A"]);
@@ -21112,7 +21118,11 @@ while True:
             workdir: wt.clone(),
             git_dir: wt.join(".git"),
         };
-        let before = repo.snapshot().unwrap();
+        let snapshot = || {
+            let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+            repo.snapshot().unwrap()
+        };
+        let before = snapshot();
         let target = wt.join("src/a.rs");
         let ledger = dir.join("answer.txt");
         let scratch_root = dir.join("monitor-scratch");
@@ -21139,7 +21149,7 @@ while True:
         let _ = turn(&mut monitor, &tx, None);
         let monitor_answer = std::fs::read_to_string(&ledger).unwrap_or_default();
         let monitor_text = std::fs::read_to_string(&target).unwrap();
-        let monitor_tree = repo.snapshot().unwrap();
+        let monitor_tree = snapshot();
         drop(monitor);
 
         let mut unarmed = start(&config, &scratch_root);

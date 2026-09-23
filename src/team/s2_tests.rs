@@ -292,8 +292,11 @@ fn a_burst_on_an_unchanged_tree_makes_no_turn_and_reads_start_nothing() {
 // ── A finding without a file:line in the settled tree is not emitted ─────────────────────
 
 /// DES §12-3: a FINDING whose `evidence` is not line `line` of `path` in the snapshot tree is
-/// dropped (`rejected.unconfirmed`); the one that matches is emitted with that tree id. A
-/// finding on a path that does not exist, and a malformed line, are dropped too.
+/// dropped (`rejected.unconfirmed`); the one that matches EXACTLY is emitted with that tree id
+/// and the line's own text as its evidence. A re-spaced quote of the right line (`let   x =
+/// 2;` for `    let x = 2;`) is `unconfirmed` too — the prompt asks for the exact text and the
+/// event contract says evidence equals the line (codex review of #609). A finding on a path
+/// that does not exist, and a malformed line, are dropped as well.
 #[test]
 fn only_a_finding_confirmed_at_its_file_line_in_the_snapshot_tree_is_emitted() {
     let fx = Fixture::new("confirm");
@@ -303,8 +306,9 @@ fn only_a_finding_confirmed_at_its_file_line_in_the_snapshot_tree_is_emitted() {
         [
             r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"let x = 1;","claim":"stale","suggestion":null}"#,
             r#"FINDING {"severity":"high","path":"src/gone.rs","line":1,"evidence":"x","claim":"no such file"}"#,
-            r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"let   x = 2;","claim":"x is never read","suggestion":"drop it"}"#,
+            r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"let   x = 2;","claim":"re-spaced quote","suggestion":null}"#,
             r#"FINDING {"severity":"high","path":"../etc/passwd","line":1,"evidence":"root","claim":"escape"}"#,
+            r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"    let x = 2;","claim":"x is never read","suggestion":"drop it"}"#,
             "DONE",
         ]
         .join("\n"),
@@ -328,7 +332,7 @@ fn only_a_finding_confirmed_at_its_file_line_in_the_snapshot_tree_is_emitted() {
             severity: "high".into(),
             path: "src/lib.rs".into(),
             line: 3,
-            evidence: "let   x = 2;".into(),
+            evidence: "    let x = 2;".into(),
             claim: "x is never read".into(),
             suggestion: Some("drop it".into()),
             tree,
@@ -343,9 +347,162 @@ fn only_a_finding_confirmed_at_its_file_line_in_the_snapshot_tree_is_emitted() {
         Rejected {
             malformed: 1,
             below_bar: 0,
-            unconfirmed: 2,
+            unconfirmed: 3,
             duplicate: 0
         }
+    );
+}
+
+/// codex review of #609 (MEDIUM): `confirm` is exact — the quoted evidence must BE the line's
+/// text; dropped indentation or changed spacing does not confirm. Whitespace normalization
+/// serves only the finding id, so the exact and the re-spaced quote still share one id.
+#[test]
+fn confirm_is_exact_line_text_and_normalization_serves_only_the_finding_id() {
+    let file = Some("fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    assert!(
+        confirm(file, 3, "    let x = 2;"),
+        "the exact line confirms"
+    );
+    assert!(
+        !confirm(file, 3, "let x = 2;"),
+        "dropped indentation does not"
+    );
+    assert!(
+        !confirm(file, 3, "let   x = 2;"),
+        "changed spacing does not"
+    );
+    assert!(
+        !confirm(file, 3, "    let x = 2; "),
+        "a trailing space does not"
+    );
+    assert!(
+        !confirm(file, 2, "    let x = 2;"),
+        "the wrong line does not"
+    );
+    assert!(!confirm(file, 3, ""), "empty evidence confirms nothing");
+    assert!(!confirm(file, 0, "fn a() {}"), "line 0 confirms nothing");
+    assert!(
+        !confirm(None, 3, "    let x = 2;"),
+        "a missing file confirms nothing"
+    );
+    assert_eq!(
+        finding_id("src/lib.rs", "    let x = 2;"),
+        finding_id("src/lib.rs", "let   x = 2;"),
+        "the id is keyed on the normalized text"
+    );
+}
+
+// ── A checkpoint that overtakes its attach ───────────────────────────────────────────────
+
+/// codex review of #609 (HIGH): `Attach` travels the direct command channel from the worker
+/// thread while checkpoints come through the engine fan-out and a forwarder thread, so a fast
+/// first tool call can reach the supervisor BEFORE its own attach. Such a checkpoint is held
+/// and replayed when the attach lands: the batch still starts, and the finding names that
+/// checkpoint's seq. Nothing is due while nothing is attached.
+#[test]
+fn a_checkpoint_that_overtakes_its_attach_is_held_and_the_batch_still_starts() {
+    let fx = Fixture::new("early");
+    let host = Arc::new(FakeHost::default());
+    host.replies.lock().unwrap().insert(
+        "m1".into(),
+        r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"    let x = 2;","claim":"x is never read"}
+DONE"#
+            .into(),
+    );
+    let (emit, seen) = recorder();
+    let mut core = TeamCore::new(host.clone(), emit.clone(), TeamLimits::default());
+    fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    core.on_event(&checkpoint(1, "edit"));
+    assert_eq!(
+        pump(&mut core, &host, &emit, Instant::now()),
+        0,
+        "nothing is attached: nothing is due"
+    );
+    core.attach(fx.ctx(1, &["claude#2"]));
+    assert_eq!(
+        pump(&mut core, &host, &emit, Instant::now()),
+        1,
+        "the held checkpoint starts the batch once the attach lands"
+    );
+    assert_eq!(host.turns.load(Ordering::Relaxed), 1);
+    let found = findings(&seen);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        matches!(
+            &found[0],
+            CoreEvent::MonitorFinding {
+                checkpoint_seq: 1,
+                ..
+            }
+        ),
+        "{found:?}"
+    );
+}
+
+/// The hold is bounded on both axes, and the NEWEST survive: past
+/// `EARLY_CHECKPOINTS_PER_KEY` the oldest checkpoint of an attempt is dropped (the batch still
+/// starts, on the newest seq); past `EARLY_CHECKPOINT_KEYS` attempts the oldest attempt's hold
+/// is dropped (its attach then starts nothing until a new checkpoint arrives).
+#[test]
+fn the_early_checkpoint_hold_is_bounded_and_keeps_the_newest() {
+    let fx = Fixture::new("early-bound");
+    let host = Arc::new(FakeHost::default());
+    host.replies.lock().unwrap().insert(
+        "m1".into(),
+        r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"    let x = 2;","claim":"x is never read"}
+DONE"#
+            .into(),
+    );
+    let (emit, seen) = recorder();
+    let mut core = TeamCore::new(host.clone(), emit.clone(), TeamLimits::default());
+    fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    let per_key = EARLY_CHECKPOINTS_PER_KEY as u64;
+    for seq in 1..=per_key + 1 {
+        core.on_event(&checkpoint(seq, "edit"));
+    }
+    core.attach(fx.ctx(1, &["claude#2"]));
+    assert_eq!(pump(&mut core, &host, &emit, Instant::now()), 1);
+    let found = findings(&seen);
+    assert_eq!(found.len(), 1, "{found:?}");
+    match &found[0] {
+        CoreEvent::MonitorFinding { checkpoint_seq, .. } => {
+            assert_eq!(
+                *checkpoint_seq,
+                per_key + 1,
+                "the newest checkpoint is the one kept"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    // Too many attempts held: the oldest attempt's hold goes first.
+    let mut core = TeamCore::new(host.clone(), emit.clone(), TeamLimits::default());
+    for i in 0..=EARLY_CHECKPOINT_KEYS as u32 {
+        core.on_event(&CoreEvent::UnitCheckpoint {
+            session: "run-1".into(),
+            ord: 3,
+            attempt: i + 1,
+            seq: 1,
+            tool_call_id: "toolu_1".into(),
+            kind: "edit".into(),
+            title: "call 1".into(),
+            status: "completed".into(),
+            paths: vec![],
+        });
+    }
+    // attempt 1 was the oldest and is gone; attempt 2 is still held.
+    core.attach(fx.ctx(1, &["claude#2"]));
+    assert_eq!(
+        pump(&mut core, &host, &emit, Instant::now()),
+        0,
+        "the dropped hold starts nothing"
+    );
+    let mut ctx2 = fx.ctx(1, &["claude#2"]);
+    ctx2.attempt = 2;
+    core.attach(ctx2);
+    assert_eq!(
+        pump(&mut core, &host, &emit, Instant::now()),
+        1,
+        "a held hold still starts its batch"
     );
 }
 
@@ -519,7 +676,7 @@ fn the_final_pass_reviews_the_settled_tree_and_reconfirms_every_finding() {
         "m1".into(),
         [
             r#"FINDING {"severity":"high","path":"src/lib.rs","line":1,"evidence":"fn a() {}","claim":"a is dead"}"#,
-            r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"let x = 5;","claim":"magic"}"#,
+            r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"    let x = 5;","claim":"magic"}"#,
             "DONE",
         ]
         .join("\n"),
