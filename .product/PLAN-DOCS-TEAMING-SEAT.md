@@ -78,6 +78,26 @@ wicked-core's own root docs are clean: `README.md`/`DESIGN.md`/`ORCHESTRATOR.md`
 | A8 | `/Users/michael.parcewski/Projects/wicked/CLAUDE.md:27` | *"See `wicked-core/README.md` + `.product/DES-EXEC-001`."* | `.product/DES-EXEC-001` cannot be opened from any clone. |
 | A9 | `wicked-core` `CLAUDE.md:5-10` | Already correct and should be the model for A7: *"The `.product/` design docs … are cited all over the source but are **gitignored** … and tracked in no commit — a fresh clone has none of them."* | **No change needed** — unless this PR's placement decision (§5) is accepted, in which case this paragraph must be amended to say some `.product/` files are now tracked. |
 
+### 2.3 Other claims that are wrong about **shipped** behaviour
+
+Independent of #590/#591. Each row marks whether it was **re-derived here** or is **reported, pending verification** — verify before editing.
+
+| # | File:line | Claim vs reality | Verified |
+|---|---|---|---|
+| A10 | `wicked-crew` `packages/crew/defaults/workers.json` | The shipped default roster is **one seat**: a single `{"id":"claude","command":"claude","args":["--print"],"council_capable":true}`. The site advertises an 8-entry roster (`site/src/pages/index.astro:73-86`) and *"a full six-seat roster"* (`site/src/content/control-plane.md:127`). | ✅ re-derived |
+| A11 | `wicked-core` `crates/wicked-council/src/lib.rs:7-8` | *"with the real CLIs available in this environment (`claude`, `agy`, `pi`)"* — the registry holds six (claude, agy, codex, copilot, opencode, pi; `registry.rs:130-133`). | ✅ re-derived |
+| A12 | `wicked-core` `crates/wicked-council/src/lib.rs:22-24` and `crates/wicked-council/src/bus.rs:7` | Both name the events `wicked.council.requested` / `wicked.council.voted`. The shipped constants are **`wicked.crew.council.*`** — `EVENTS.md:22-25` (`wicked.crew.council.{requested,voted,deliberated}`, `wicked.crew.council_seat.failed`). Event-grammar drift in a doc comment. | ✅ re-derived |
+| A13 | `wicked-garden` `hooks/scripts/post_tool.py:829` | `import consensus_gate` — but **`scripts/crew/consensus_gate.py` does not exist on `origin/main`** (0 tracked paths). It is wrapped in a fail-open `try/except`, so garden's consensus/reviewer gate is **dead code**. Consequently `WICKED_GARDEN_BUS_EVENTS.md:58-61` documents four `wicked.garden.consensus.*` events with no live producer, and `scenarios/crew/consensus-chain-id-uniqueness.md` cannot run. | ✅ re-derived (file absence + import site) |
+| A14 | `wicked-crew` `site/src/content/control-plane.md:126-138` and `docs/articles/…:126-138` | The article states its own convergence math is **obsolete** and ships anyway: *"the convergence math is under revision because implementation showed it wasn't doing the work the design assumed."* | ⚠️ reported |
+| A15 | `wicked-crew` `site/src/pages/index.astro:20` vs `:74-76` | *"Never depict one-shot `-p` dispatch"* against *"Each is dispatched as a headless CLI subprocess: the prompt is substituted into argv (`{PROMPT}`) and the result is read from stdout."* Same file. | ⚠️ reported |
+| A16 | `wicked-crew` `packages/crew-api-types/index.d.ts:550-557`, `:638-648` | `inactive` is *"NO LONGER PRODUCED from crew 0.7.36"*; `council_bench` is `@deprecated` and *"ABSENT from crew 0.7.36"*. Studio's `HealthRailSection.tsx:66-74` and `ReassignControl.tsx:26-29` still carry copy written around a roster that has no council-eligibility field. | ⚠️ reported |
+| A17 | `wicked-core` `ORCHESTRATOR.md:262`, `:315`; `HANDOFF.md:66-67` | `:262` *"Today `distribute` picks one `assigned_cli` per unit… For multi-CLI: change `assigned_cli` to `Vec<String>`"* is present-tense design that never happened (the wire still carries `cli: string`). `:315` / `HANDOFF.md:66-67` list **P5 as NEXT** when P5 shipped. | ⚠️ reported |
+| A18 | `wicked-garden` `skills/qe/refs/accept.md:51-60` | The reviewer-isolation CLI table lists *"Gemini CLI / Codex, Cursor, Kiro"*. Gemini CLI is sunsetted per the ecosystem roster; antigravity/opencode/pi/copilot are absent. | ⚠️ reported |
+| A19 | `wicked-garden` `skills/workflow/SKILL.md:110` | Names *"Fallback fork skills (facilitator, researcher, implementer, reviewer)"* as live; `CHANGELOG.md:101` records `crew-implementer`/`crew-reviewer`/`crew-researcher` **retired into `governed-worker`**. | ⚠️ reported |
+| A20 | `wicked-crew` `README.md:118`; `wicked-core` `src/validator.rs:19` | Both say *"a **human/council** approves it"* / *"the human / council step"* on the validator-approval path, and neither resolves which. **AMBIGUOUS — do not guess**; resolve against the code when C9 is edited. | ⚠️ reported |
+
+**Checked and rejected:** the report that `packages/crew/src/api/server.ts:859` (*"Convening a 6-seat council…"*) contradicts `packages/crew/src/interactive/council-outcome.ts:9` (*"Convening a 5-seat council…"*). Reading both: `server.ts:857-861` is a comment describing a **stub runner narrating a fake lifecycle** (*"Nothing ran. Nothing was written. Two gate approvals were announced anyway."*), and `council-outcome.ts:5-11` records a **fresh-rig observation** where four of five seats were signed out. Neither asserts a roster size. Not a contradiction; no action.
+
 ---
 
 ## 3. Tier B — `wicked-crew` `revisesPr` (crew#662)
@@ -144,15 +164,28 @@ Installed copies: `wicked-studio/node_modules/wicked-crew-api-types` is pinned a
 
 ### 4.0 The distinction that governs this section
 
-Three different things share the word **council**. Only the first is touched by #590.
+**Four** different things share the word **council**. Only the first is touched by #590.
 
 | Sense | Where | Touched by #590? |
 |---|---|---|
 | **The per-phase council** — N seats ballot per workflow phase, 75% agreement, seats bench, produces routing + a verdict | wicked-core `crates/wicked-council/`, `src/distribute.rs`; wicked-crew | **YES** |
 | **wicked-garden's `jam-council`** — a multi-model brainstorming / second-opinion panel a user invokes on request | wicked-garden `skills/jam-council/SKILL.md` and 13 sibling skill files | **NO — product feature, stays** |
 | **wicked-garden's daemon council** — a synchronous "POST a question, get votes + synthesis" API backing the skill above | wicked-garden `daemon/council.py` (*"Council orchestrator for the wicked-garden daemon … the caller POSTs a question, gets back votes + synthesis"*, `council.py:1-8`), plus its `council_sessions` table | **NO — garden's own, stays** |
+| **wicked-garden's consensus/reviewer gate** — `agreement_ratio`, `consensus_threshold`, `strong_dissent_blocks` | wicked-garden `hooks/scripts/post_tool.py`, `WICKED_GARDEN_BUS_EVENTS.md:58-61` | **NO — and it is dead code; see A13** |
 
-**Verified exclusion list — 14 wicked-garden `skills/` files mention "council" and none is the per-phase council** (none references 75% agreement, ballots, benching or `RoutingInfo`): `skills/archetype/refs/{build,decide,review}.md`, `skills/classify/SKILL.md`, `skills/core/SKILL.md`, `skills/jam-brainstorm-facilitator/SKILL.md`, `skills/jam-council/SKILL.md`, `skills/jam/SKILL.md`, `skills/jam/refs/council-verdict.md`, `skills/qe/SKILL.md`, `skills/swarm/SKILL.md`, `skills/swarm/refs/{independent-verification,ship-discipline}.md`, `skills/workflow/SKILL.md`. Garden has 74 files mentioning "council" in total; **none of them is in scope for #590.** Editing them would rewrite a product feature for a change that does not touch it.
+**14 wicked-garden `skills/` files mention "council"** (garden has 74 in total): `skills/archetype/refs/{build,decide,review}.md`, `skills/classify/SKILL.md`, `skills/core/SKILL.md`, `skills/jam-brainstorm-facilitator/SKILL.md`, `skills/jam-council/SKILL.md`, `skills/jam/SKILL.md`, `skills/jam/refs/council-verdict.md`, `skills/qe/SKILL.md`, `skills/swarm/SKILL.md`, `skills/swarm/refs/{independent-verification,ship-discipline}.md`, `skills/workflow/SKILL.md`.
+
+**11 of the 14 are clean jam-council and are excluded.** None references 75% agreement, ballots, benching or `RoutingInfo`. Editing them would rewrite a product feature for a change that does not touch it.
+
+**But three are NOT clean, and a blanket exclusion would be wrong:**
+
+| File:line | Text | Sense |
+|---|---|---|
+| `skills/workflow/SKILL.md:97` | *"CONDITIONAL auto-resolution (AC-4.4): spec gap conditions → fixed inline. Intent-changing conditions → escalate to user or **council**."* — a bare noun inside a crew CONDITIONAL-gate paragraph, in a file whose own frontmatter reads *"Reference for how the **wicked-crew workflow engine** operates — phase catalog, gate enforcement, rigor tiers"* | **AMBIGUOUS, leans per-phase.** Re-read against the code before excluding. ✅ re-derived |
+| `skills/archetype/refs/build.md:31` | *"Approve happens through PR review, **council**, or the `review` archetype"* — bare noun; jam-council only by sibling-file inference | AMBIGUOUS ⚠️ reported |
+| `skills/archetype/refs/decide.md:36` | *"the user (or a **council**) picks"* — bare noun, but the same file names `wicked-garden-jam-council` at `:79` | Leans jam-council ⚠️ reported |
+
+Garden also carries per-phase surfaces that contain **no "council" word at all** and that a word-grep misses — notably `skills/governed-worker/SKILL.md` (the floor skill handed to every governed unit) and the *"the run's deliver phase opens the PR"* boilerplate repeated across the `qe*` skills. Enumerate these against the #590 diff; do not assume garden is uniformly out of scope. ⚠️ reported
 
 ### 4.1 wicked-crew — Tier C (#590)
 
@@ -180,7 +213,12 @@ Three different things share the word **council**. Only the first is touched by 
 | D6 | `README.md:199` | *"a verified claim about claude-seated governed units, not a blanket property of every run"* | "claude-seated" becomes ambiguous once `claude#1`/`claude#2` exist. |
 | D7 | `packages/crew/defaults/workers.json` | The shipped default roster — one entry per CLI | Gains instance shape / pool size (DES-SEAT-001 S4). |
 | D8 | `packages/crew-api-types/index.d.ts` | `assignedCli` and the `distinctnessFallback` wire disclosure | New `same_cli_instance` value (DES-SEAT-001 S3) + instance id (OQ-SEAT-1). **Published contract — version and changelog it.** |
-| D9 | `packages/crew/src/api/{seat-health,seat-signin,seat-standing,roster-standing}.ts` doc comments | Seat identity as a CLI key | Instance keying; and S5's per-instance login (wicked-crew#615). |
+| D9 | `packages/crew/src/api/seat-signin.ts:20-37` | **The per-seat config-home table as crew reads it** — and it says *"no configuration-home variable is known for agy, so it runs where the operator does"*, which core#578 changed (agy now gets `HOME = root`, `spawn.rs:445`). Stale today as well as changed by #591. | Instance keying; and S5's per-instance login (wicked-crew#615). ⚠️ reported |
+| D10 | `packages/crew/src/api/seat-standing.ts:131, 138-140, 174, 184-186` | Rendered operator strings: *"not enabled for council"*, *"signed out — **a council would bench this seat on its first ballot**"* | Both #590 and #591. ⚠️ reported |
+| D11 | `packages/crew/src/core/engine-roster.ts:147-162` | `NO_ELIGIBLE_SEAT_REMEDY` and the 409 *"no eligible seat for `<run>`: `<benched>` — sign a seat in, or add one"* (mirrored at `wicked-core` `src/actor.rs:104`) | Under pooling, "add one" becomes "add an instance". ⚠️ reported |
+| D12 | `packages/crew/src/interactive/{draft,chat,demo,edit}-events.ts` + `interactive/council-outcome.ts:44-58` | The **"Convening a N-seat council…"** strings users actually read in document threads, and the suffix *"(1 of 5 seats answered — 4 benched)"* | Four call sites, one helper — change the helper. ⚠️ reported |
+| D13 | `packages/crew/skills/wicked-crew/SKILL.md:19-26, 107-108` | **A shipped agent skill installed into users' CLIs**: *"## The one hard rule — evaluator ≠ creator (do not break this)"* | Survives #590 (DES-TEAM-001 §2.5) — listed so it is **not** swept into the rewrite. Note `packages/crew/src/cli/mcp.ts:142-143` exposes the `gate` tool with **no** such warning; worth closing on its own merits. ⚠️ reported |
+| D14 | `packages/crew/src/core/deliver-text.ts:439-471` | Text composed into **every delivered PR body** — `'## Evaluator gate'`, `'_This workflow has no evaluator phase._'`, per-phase seat + verdict lines | Highest blast radius of any string here: it lands in public PRs. ⚠️ reported |
 
 ### 4.3 wicked-studio
 
@@ -189,7 +227,7 @@ Three different things share the word **council**. Only the first is touched by 
 | S1 | `site/src/pages/index.astro:378-381` | *"Put one question to several models in the same thread and see **how many seats answered** — '3 of 5 seats', or '3 polled' when the count is unknown"* | **D** (#591) — "5 seats" becomes instances, not vendors. Studio has exactly **one** `.astro` file and it is in scope (positive control: 1 of 1 matched `wicked`). |
 | S2 | `site/src/pages/index.astro:68, 313, 895` | *"Group chat with your whole roster: fan one question out, watch each seat answer side by side"*; *"roster fan-out … three seats answered"* | **D** (#591). Note this is the **chat roster**, not the per-phase council — #590 does not touch it. |
 | S3 | `e2e/test_feature_live.py:24-27, 849` | The load-preflight gate | **A** — see A5. |
-| S4 | Studio's seat/council UI components (82 files mention `council`, 143 mention `seat` on `origin/main`) | Not individually catalogued here | **C/D**, but driven by the wire contract (D8) rather than by prose. Enumerate against the api-types diff when D8 lands, not before. |
+| S4 | **Studio's live UI copy is the largest single surface in the estate** — 82 files mention `council`, 143 mention `seat`, and the repo has **zero** `jam-council` references, so *every* council token in studio is the per-phase one. Highest-value, all ⚠️ reported: `src/components/ChatPanel.tsx:1190` — the BUILD composer subhead *"Describe your goal. **The council elects a CLI**, decomposes the plan, and executes it — you approve each gate."* (the most prominent council claim in the app); `src/components/narrator.ts:201-218` — *"Council convened — polling N agents"*, *"Ballot N: X% — below the ${neededPct ?? 75}% bar, runoff"*, *"Seat X did not vote"*, and `:55` *"evaluator ≠ creator not held — review stays on the creator seat"*; `src/components/councilQuorum.ts:22-44`; `src/components/HealthRailSection.tsx:78-82` — *"signed out — **councils may bench this seat**"*; `src/components/IntakePlan.tsx:125-132` — *"seats are chosen by the council at dispatch"*; `src/components/SystemSettings.tsx:318-343, 546-553` — the **Workers** screen, the only user-facing worker-config-home copy, which renders a raw `CODEX_HOME=… codex login` line verbatim (**directly in #591's path**); plus `RoutingProvenance.tsx`, `AssumptionsPanel.tsx`, `RunDegradedNote.tsx`, `ReassignControl.tsx`, `gateVerdictModel.ts`, `GateVerdict.tsx`, `store/runtime.ts`, `README.md:25-27`. | **C/D.** Sequence behind the wire contract (D8), but the copy is prose, not generated — it will not follow the types automatically. **Preserve** `src/components/GroupChat.tsx:55` (*"NOT a run — no council, no gates, no units"*): it is the line that keeps chat fan-out distinct from the council. |
 
 ### 4.4 wicked-core (this repo)
 
@@ -198,8 +236,50 @@ Three different things share the word **council**. Only the first is touched by 
 | N1 | `ORCHESTRATOR.md` (12 `council` mentions), `HANDOFF.md` (6), `DESIGN.md` (3), `REASSESS-P0-P1.md` (3), `README.md` (1) | Per-phase council as the routing mechanism | **C** (#590) — re-read each when S5 lands; several are historical revision logs that should be left as history, not rewritten. |
 | N2 | `crates/wicked-apps-core/src/spawn.rs:386-389` | Names the pi variable correctly as `PI_CODING_AGENT_DIR` | **No change.** Recorded because #591's own table spells it `PI_AGENT_DIR`; the *issue* is wrong, not the code. Fix the issue text. |
 | N3 | `crates/wicked-apps-core/src/spawn.rs:292-295` | *"the ACP spawn, the ballot spawn, the wrapped worker and the sign-in command all name, and run under, the same directory"* | **D** (#591) — this invariant is exactly what instance keying must preserve across **both** config-home resolvers (DES-SEAT-001 §3.2b). Update with S2. |
+| N4 | `crates/wicked-council/src/worker.rs:67-73` | **The canonical 75%** — `pub const APPROVAL_THRESHOLD: f32 = 0.75;` with `MAX_BALLOTS = 3` and *"degrades to plurality"*. **Every "75%" on every site traces here.** | **C** — if the number changes or becomes mode-dependent, this is the root. ⚠️ reported |
+| N5 | `crates/wicked-council/src/dispatch.rs:56-63`, `:100-102` | The ballot prompt **as rendered to the voter**: *"The council needs at least {pct}% of its live seats to converge on one option (a seat the dispatcher has benched abstains and is not counted…)"*; *"You are one independent evaluator on a routing council."* | **C** — this is the council's user-visible text, not just config. ⚠️ reported |
+| N6 | `crates/wicked-council/src/types.rs:555-600` | `pub const SEATS` — the four deliberation lenses (Capability Fit / Risk & Failure Modes / Efficiency / Output Quality) with full prompt text | **C** — monitors are a different role model; these prompts do not carry over. ⚠️ reported |
+| N7 | `src/distribute.rs:378-408` | The routing-rule doc header — the single load-bearing statement of the whole mechanism (eligibility → ballot ledger → bench → `NoEligibleSeat` refusal → `degraded_reason`) | **C/D.** ⚠️ reported. **Note the file boundary:** `src/distribute.rs` is under active implementation; coordinate, do not edit blind. |
+| N8 | `crates/wicked-core-ts/index.d.ts:107-121` **and** `crates/wicked-core-ts/scripts/finalize-dts.mjs:46, 64, 68` | The published napi contract carrying `routingMethod: 'council' \| 'degraded' \| 'evaluator_distinct' \| 'tool'` | **C** (`Teamed`) + **D** (instance id). **The `.d.ts` is GENERATED — edit both files or the change is reverted on the next build.** ⚠️ reported |
+| N9 | `EVENTS.md:22-25` (crew council events) beside `:192`, `:223` (garden's jam-council events) | **Both council senses in one file**, and its header says **GENERATED — do not hand-edit** | **C** — change the emit seam, not the doc. See also A12. ⚠️ reported |
+| N10 | `crates/wicked-governance/seed/corpus/plane-boundaries.md:37-39` | `PAT-1303`, a **seeded steering rule projected into the estate graph** — *"evaluator≠creator …, deny-dominates dual gates, and 'done' re-derived from evidence"* | Survives #590 unchanged (§4.6 W6). Listed because agents **recall** it: if doctrine ever does change, re-seeding is part of the change, not a follow-up. ⚠️ reported |
+| N11 | `workflows/README.md:59, 73, 76, 87` | The workflow-authoring contract — `role: creator\|evaluator\|neutral`, *"Never narrows seat selection"* | **D** — "seat selection" becomes instance selection. ⚠️ reported |
 
-### 4.5 Sites and the rest
+### 4.5 wicked-ci — the densest operator-facing council surface after crew
+
+**Not in the original survey list, and it should have been.** `wicked-ci` `smoke/README.md` is a live operator document describing the per-phase council in detail. Confirmed by reading it. Tier **C/D**.
+
+| # | File:line | Claim |
+|---|---|---|
+| I1 | `smoke/README.md:121` | *"the published core-ts engine addon (plan → distribute → **councils** → gates → repo-checks floor → deliver script)"* |
+| I2 | `smoke/README.md:129-133` | The seat table: `claude` *"the one live seat"*; `opencode` *"a second live seat so the evaluator can be **identity-distinct from the creator**"*; `codex` *"the engine must learn `not_logged_in` from the ballot, not the probe"*; `copilot` *"the engine must **bench `quota_exhausted`**"*; `pi` *"`not_installed` from the spawn error"*. **This table is the #591 scenario in miniature** — it is the smoke harness that encodes one-seat-per-CLI. |
+| I3 | `smoke/README.md:134` | `acp-agent` *"Council-disabled in the overlay so S04's roster is unchanged"* |
+| I4 | `smoke/README.md:139-141` | *"Every **seat** shim answers four prompt kinds … a **council BALLOT** (`RECOMMENDATION: 1 …`), an agent JUDGE, the FAILURE-TRIAGE judge, and a WORKER turn"* |
+| I5 | `smoke/README.md:143-147` | The EVALUATOR-turn convention sentence and the evaluator-verdict gate (F-RC1-131) |
+| I6 | `smoke/README.md:149-154` | *"pinned through a **council registry overlay** … `$HOME/.config/wicked-council/clis.toml` … `enabled_for_council = false`"* |
+| I7 | `smoke/README.md:32` (S04), `:33` (S06), `:175`, `:93`, `:197` | The mixed-roster bench scenario, *"no council convenes"*, *"the ledger DOES bench a dead seat"*, the overlay edit, the bench-on-abstention record |
+| I8 | `README.md:30, 319-327`; `docs/smoke-consumer-recipes.md:6-8, 160`; `smoke/lib/{shims,expect,env}.mjs`, `smoke/lib/steps/S04-bug-run.mjs:1-22`; `docs-lint/registry.json:46` | Supporting harness + recipe surfaces ⚠️ reported |
+
+**This is the surface most likely to break on #591**: the smoke harness asserts a fixed roster shape, so instance identity changes the fixtures, not just the prose.
+
+### 4.6 Claims with no "council" word — the sites' real exposure
+
+A word-grep for `council` misses these entirely. Both are Tier **C** (#590 changes the trust-model wording) and both are ⚠️ reported, not re-derived.
+
+| # | File:line | Claim |
+|---|---|---|
+| W1 | `wicked-web` `src/components/SameGarden.astro:70` | *"**Evaluator ≠ creator** — no agent grades its own homework. \"Done\" is re-derived from evidence, never asserted."* — **wicked-web is a shared library consumed by every product site**, so this renders on wg/wc/we/ws. One edit, four sites. |
+| W2 | `wicked-web` `src/components/SameGarden.astro:73` | *"invokes skills as governed workers — **deny dominates**, every verdict lands in the record"* |
+| W3 | `wickedagile` `src/components/Shipped.astro:70` | *"invokes skills as governed workers — **evaluator ≠ creator**"* — note the **drift**: the same riser says "deny dominates" in wicked-web and "evaluator ≠ creator" here. |
+| W4 | `wickedagile` `src/components/Shipped.astro:83`, `src/scripts/data.js:49`, `src/scripts/terminal.js:69` | *"evaluator ≠ creator, \"done\" re-derived from evidence, the human in command"* — three copies of one sentence. |
+| W5 | `wicked-estate` `docs/adr/ADR-012-rule-authorship.md:20-23` | *"The wicked platform's core invariant is **evaluator ≠ creator**"* |
+| W6 | `wicked-core` `crates/wicked-governance/seed/corpus/plane-boundaries.md:37-39` | `PAT-1303` is a **seeded steering rule ingested into the estate graph**, so agents *recall* it: *"evaluator≠creator …, deny-dominates dual gates, and \"done\" re-derived from evidence"*. Changing doctrine without re-seeding leaves agents reciting the old rule. |
+
+**All six survive #590 unchanged** — DES-TEAM-001 §2.5 and §5 keep `evaluator ≠ creator` explicitly out of scope. They are listed so a future editor does **not** sweep them in with the council rewrite. The wicked-web/wickedagile drift (W2 vs W3) is worth fixing on its own merits.
+
+**Excluded from these sites — jam-council, do not touch:** `wickedagile` `src/components/Shipped.astro:85`, `src/scripts/data.js:45`, `src/scripts/terminal.js:71` (all three are the `wicked-garden` package entry: *"multi-model councils, graph-aware refactors, repo playbooks, the QE specialist fleet"*); `wicked-web` `SameGarden.astro:79, 84`; root `CLAUDE.md:18` (*"the multi-model council *is* the router"*).
+
+### 4.7 Sites and the rest
 
 | Repo | Council/seat surface | Note |
 |---|---|---|
@@ -227,8 +307,16 @@ The three documents in this PR were therefore added with `git add -f`. They are 
 ## 6. Sequencing
 
 1. **Now, one PR per owning repo:** A1–A4 (program docs + root `CLAUDE.md`), A7–A8 (`.product/` location). Independent of everything else.
-2. **Now, wicked-studio:** A5 (re-scope the load clause of the e2e preflight). A6 is optional.
+2. **Now, wicked-studio:** A5 (re-scope the load clause of the e2e preflight). A6 optional.
 3. **Now, wicked-crew:** retarget crew#662 per §3.2 — correct the premise, keep asks 3 and 4.
-4. **On #591 merge:** D1–D9, N3, S1–S2. `packages/crew-api-types` (D8) leads; studio (S4) follows the published contract.
-5. **On #590 merge:** C1–C9, N1. C4 and C1 must land together (duplicate article).
-6. **Never:** the 14 wicked-garden `skills/` council files and `daemon/council.py` (§4.0).
+4. **Now, on their own merits** (verify each ⚠️ row first): A10–A20. A11/A12 are one small wicked-core doc-comment PR. A13 (garden's dead consensus gate) is the largest — it is a code decision, not a doc edit: delete the path or land the missing module.
+5. **On #591 merge:** D1–D14, N3, N8, N11, S1–S2, I2. **`packages/crew-api-types` (D8) leads** — studio's copy (S4) and the smoke fixtures (I2) both key off it. N8 requires editing the generator **and** the generated `.d.ts`.
+6. **On #590 merge:** C1–C9, N1, N4–N7, N9, I1/I3–I8. C1 and C4 must land together (near-duplicate article). N4 (`APPROVAL_THRESHOLD`) is the root of every "75%" downstream — change it first, then the sites.
+7. **Verify before excluding:** `wicked-garden` `skills/workflow/SKILL.md:97` and `skills/archetype/refs/build.md:31` (§4.0) — ambiguous, leaning per-phase.
+8. **Never touch:** the 11 clean jam-council files in wicked-garden `skills/`, `daemon/council.py`, the jam-council entries on wickedagile/wicked-web (§4.6), and root `CLAUDE.md:18` (§4.0).
+
+## 7. Confidence
+
+Rows marked ✅ were re-derived against `origin/main` in the course of writing this plan. Rows marked ⚠️ come from a dedicated inventory pass and carry a `file:line` but were **not** independently re-read here — verify each before editing it. One reported finding was checked and **rejected** (§2.3, the "6-seat vs 5-seat" contradiction), which is the reason for the distinction.
+
+**Known gaps:** `.product/` is gitignored in wicked-crew, wicked-garden, wicked-studio, wicked-estate and wicked-interactive, so `DES-*` citations throughout those repos' source point at artifacts no clone can open — this catalogue could not read them. The `aee254f1` run-ledger figures underlying both design records were not re-derived (DES-TEAM-001 §6 OQ-TEAM-6). Studio's live-UI classifications come from reading render paths, not from running the app.
