@@ -42,7 +42,8 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-/// Votes with recommendation "1" (numeric → resolves to first CLI → Council routing).
+/// Votes with recommendation "1". No council routes a unit since core#590 S5; kept as the
+/// engine's injected dispatcher seam.
 struct NumericDispatcher;
 impl Dispatcher for NumericDispatcher {
     fn dispatch(&self, c: &AgenticCli, _: &CouncilTask) -> Option<Vote> {
@@ -58,7 +59,7 @@ impl Dispatcher for NumericDispatcher {
     }
 }
 
-/// Abstains (None) — the council never reaches a quorum → Degraded routing.
+/// Abstains (None) — a council handed this dispatcher could never reach a quorum.
 struct NullDispatcher;
 impl Dispatcher for NullDispatcher {
     fn dispatch(&self, _: &AgenticCli, _: &CouncilTask) -> Option<Vote> {
@@ -651,9 +652,11 @@ fn unit_planned_free_text_defaults() {
 
 // ── UnitDistributed tests ────────────────────────────────────────────────────────────────────────
 
-/// Council routing (numeric vote) fills agreement_pct, returned, and dissent.
+/// core#590 S5 — distribution convenes no council: the unit is routed `teamed` to the first seat,
+/// and the council-only fields (`agreementPct`, `returned`, `seated`, `dissent`) are `null`, never
+/// a number nobody measured.
 #[test]
-fn unit_distributed_council_routing_carries_agreement_fields() {
+fn unit_distributed_teamed_routing_carries_no_council_fields() {
     let core = Core::spawn_with_engine(
         db_path("councilroute"),
         Arc::new(NumericDispatcher), // returns "1" → Council routing
@@ -681,40 +684,40 @@ fn unit_distributed_council_routing_carries_agreement_fields() {
 
     let dists: Vec<_> = collected
         .iter()
-        .filter_map(|e| {
-            if let CoreEvent::UnitDistributed {
+        .filter_map(|e| match e {
+            CoreEvent::UnitDistributed {
                 session,
+                cli,
                 routing_method,
                 agreement_pct,
                 returned,
+                seated,
                 dissent,
+                degraded_reason,
                 ..
-            } = e
-            {
-                if session == "council-sess" {
-                    return Some((routing_method.as_str(), *agreement_pct, *returned, *dissent));
-                }
-            }
-            None
+            } if session == "council-sess" => Some((
+                cli.clone(),
+                routing_method.clone(),
+                *agreement_pct,
+                *returned,
+                *seated,
+                *dissent,
+                degraded_reason.clone(),
+            )),
+            _ => None,
         })
         .collect();
-
-    assert!(!dists.is_empty(), "at least one UnitDistributed emitted");
-    for (method, agreement_pct, returned, dissent) in &dists {
-        if *method == "council" {
-            assert!(
-                agreement_pct.is_some(),
-                "council routing carries agreement_pct"
-            );
-            assert!(returned.is_some(), "council routing carries returned");
-            assert!(dissent.is_some(), "council routing carries dissent");
-            return;
-        }
-    }
-    // If all are degraded (can happen in CI with very fast stub), that's OK — just verify the fields.
-    // The important thing is that any council-routed unit carries the fields.
-    println!(
-        "note: all units degraded in this run (no council quorum reached) — routing: {dists:?}"
+    assert_eq!(
+        dists,
+        vec![(
+            "a".to_string(),
+            "teamed".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None
+        )]
     );
 }
 
@@ -768,11 +771,10 @@ fn unit_distributed_evaluator_distinct_routing() {
         })
         .collect();
 
-    assert!(
-        dists
-            .iter()
-            .any(|m| *m == "evaluator_distinct" || *m == "council" || *m == "degraded"),
-        "at least one UnitDistributed emitted with a known routing_method, got: {dists:?}"
+    assert_eq!(
+        dists,
+        ["teamed"],
+        "the prose unit is routed deterministically (core#590 S5): {dists:?}"
     );
 
     // D-11 (core#393): the two-sentence prose is ONE unit now, so there is no review unit here for
@@ -786,20 +788,23 @@ fn unit_distributed_evaluator_distinct_routing() {
     );
 }
 
-/// A dispatcher that never returns a vote degrades to the first seat and carries a degraded_reason.
+/// A launcher-benched seat is never routed to, and the routed unit's `degradedReason` names the
+/// bench (F-7R2-006) — on the `teamed` arm now that no council routes (core#590 S5).
 #[test]
-fn unit_distributed_degraded_routing_carries_reason() {
+fn unit_distributed_names_the_bench_on_the_teamed_arm() {
     let core = Core::spawn_with_engine(
         db_path("degraded"),
-        Arc::new(NullDispatcher), // returns None → no quorum → Degraded
+        Arc::new(NullDispatcher),
         Arc::new(OkRunner),
     );
     let ev = core.subscribe();
+    let mut a = cli("a");
+    a.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
     core.launch_run(LaunchSpec {
         base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
-        clis: vec![cli("a"), cli("b")],
+        clis: vec![a, cli("b")],
         entity_mode: EntityMode::Shared,
         session_id: "degraded-sess".into(),
         human_confirm: HumanConfirm::None,
@@ -813,35 +818,29 @@ fn unit_distributed_degraded_routing_carries_reason() {
     .expect("launch");
 
     let collected = drain_until_terminal(&ev, "degraded-sess");
-
-    let degraded: Vec<_> = collected
+    let dists: Vec<_> = collected
         .iter()
-        .filter_map(|e| {
-            if let CoreEvent::UnitDistributed {
+        .filter_map(|e| match e {
+            CoreEvent::UnitDistributed {
                 session,
+                cli,
                 routing_method,
                 degraded_reason,
                 ..
-            } = e
-            {
-                if session == "degraded-sess" && routing_method == "degraded" {
-                    return Some(degraded_reason.clone());
-                }
+            } if session == "degraded-sess" => {
+                Some((cli.clone(), routing_method.clone(), degraded_reason.clone()))
             }
-            None
+            _ => None,
         })
         .collect();
-
-    assert!(
-        !degraded.is_empty(),
-        "at least one unit should have degraded routing when dispatcher returns None"
+    assert_eq!(
+        dists,
+        vec![(
+            "b".to_string(),
+            "teamed".to_string(),
+            Some("1 of 2 seats benched: a (signed out — launcher)".to_string())
+        )]
     );
-    for reason in &degraded {
-        assert!(
-            reason.is_some(),
-            "degraded routing must carry a degraded_reason"
-        );
-    }
 }
 
 // ── StepFailed tests ─────────────────────────────────────────────────────────────────────────────

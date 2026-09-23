@@ -36,7 +36,7 @@ declare const parsed: CoreEventJson
 if (parsed.type === 'unitDistributed') {
   const d = parsed as UnitDistributedEventJson
   const constraint: string | null = d.seatConstraint
-  const method: 'council' | 'degraded' | 'evaluator_distinct' | 'tool' = d.routingMethod
+  const method: 'council' | 'degraded' | 'evaluator_distinct' | 'tool' | 'teamed' = d.routingMethod
   void constraint
   void method
   // @ts-expect-error — never `undefined`: emitted unconditionally, `null` when unconstrained
@@ -75,6 +75,15 @@ const constrained: UnitDistributedEventJson = {
 }
 // @ts-expect-error — an unknown routing method is not part of the contract
 const unknownMethod: UnitDistributedEventJson = { ...complete, routingMethod: 'ranked' }
+// (core#590 S5) The deterministic pick is a member of the closed set, with no council fields.
+const teamed: UnitDistributedEventJson = {
+  ...complete,
+  routingMethod: 'teamed',
+  agreementPct: null,
+  returned: null,
+  seated: null,
+  dissent: null,
+}
 const fallback: UnitDistributedEventJson = { ...complete, distinctnessFallback: 'creator_seat' }
 // (core#591) …and the instance fallback is the SECOND member of that closed set, not prose.
 const instanceFallback: UnitDistributedEventJson = {
@@ -91,6 +100,7 @@ void seatedIsNumberOrNull
 void constrained
 void unknownMethod
 void distinctnessFallbackIsTokenOrNull
+void teamed
 void fallback
 void instanceFallback
 void unknownFallback

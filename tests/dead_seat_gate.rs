@@ -3,9 +3,11 @@
 //!
 //! "Every seat on my roster was out of quota or signed out and the run died in 2 s with
 //! `sessionFailed` — no gate, nothing to approve after I signed a seat in." These tests go through
-//! the REAL engine (`Core::launch_run` → plan → distribute → the `PlanFailed` arm) with a stub
-//! dispatcher whose every ballot fails `Not logged in`, so both seats are benched by their own
-//! ballots and the typed `NoEligibleSeat` reaches the actor.
+//! the REAL engine (`Core::launch_run` → plan → distribute → the `PlanFailed` arm). Since core#590
+//! S5 distribution convenes no council, so no ballot benches a seat; the typed `NoEligibleSeat`
+//! reaches the actor from the bench that remains: a build→review plan on a roster whose only seat
+//! distinct from the builder was benched by the launcher's health probe, which makes
+//! evaluator ≠ creator unsatisfiable (core#560 — refused, never a creator-seat review).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,10 +16,7 @@ use wicked_core::{
     get_session, session_units, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision,
     LaunchSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus, UnitStatus,
 };
-use wicked_council::types::{
-    BallotContext, Category, Confidence, DispatchOutcome, Dispatcher, InputMode, SeatFailure,
-    SeatFailureKind, Vote,
-};
+use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, SeatHealth, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 /// Pre-main: arm the hermetic emit spool (core#311) so nothing this suite emits reaches the
@@ -58,57 +57,14 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-/// Every seat's ballot exits `Not logged in` — the whole roster is dead for the run. Counts the
-/// ballots it was asked so a test can prove a council was (re-)convened.
-struct AllSignedOut;
+/// No ballot is dispatched to route a unit (core#590 S5); counts any that is, so a test can prove
+/// the dead-seat path convened nothing.
+struct NoBallots;
 static BALLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-impl Dispatcher for AllSignedOut {
-    fn dispatch(&self, c: &AgenticCli, _: &CouncilTask) -> Option<Vote> {
-        Some(Vote {
-            cli: c.key.clone(),
-            recommendation: "1".into(),
-            top_risk: "none".into(),
-            change_my_mind: "no".into(),
-            disqualifier: None,
-            confidence: Confidence::default(),
-            provenance: "test".into(),
-        })
-    }
-    fn dispatch_ballot_detailed(
-        &self,
-        _cli: &AgenticCli,
-        _task: &CouncilTask,
-        _ctx: &BallotContext,
-    ) -> DispatchOutcome {
+impl Dispatcher for NoBallots {
+    fn dispatch(&self, _c: &AgenticCli, _: &CouncilTask) -> Option<Vote> {
         BALLOTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        DispatchOutcome::Failed(
-            SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1")
-                .with_output("Not logged in · Please run /login", ""),
-        )
-    }
-}
-
-/// A runner that reports the unit it started and then BLOCKS until the test releases it — so a
-/// unit can be reassigned while it is in flight (`ReassignUnit` requires an Executing cursor).
-struct GatedRunner {
-    started: std::sync::Mutex<std::sync::mpsc::Sender<u32>>,
-    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-}
-impl StepRunner for GatedRunner {
-    fn run_unit(&self, i: &StepInput) -> StepOutput {
-        let _ = self.started.lock().unwrap().send(i.unit.ord);
-        let _ = self.release.lock().unwrap().recv();
-        StepOutput {
-            run_id: i.run_id.clone(),
-            unit_ix: i.unit_ix,
-            attempt: i.attempt,
-            output: "ok".into(),
-            status: StepStatus::Ok,
-            usage: None,
-            files: vec![],
-            tools: Vec::new(),
-            governed: false,
-        }
+        None
     }
 }
 
@@ -130,22 +86,39 @@ impl StepRunner for OkRunner {
     }
 }
 
+/// The 2-phase build→review def: the review must run on a seat that did not build.
+const BUILD_REVIEW: &str = r#"{"id":"deadseat-build-review","phases":[
+  {"id":"build","kind":"build","gate":"auto"},
+  {"id":"review","kind":"review","gate":"auto","depends_on":["build"]}]}"#;
+
+/// `codex` is usable; `claude` — the only seat distinct from the builder — was found signed out
+/// by the launcher's health probe. The intake admits the run (one seat is usable); distribution
+/// routes the build to `codex` and then cannot seat the review anywhere but its creator.
 fn spec(sid: &str) -> LaunchSpec {
+    let mut claude = cli("claude");
+    claude.health = Some(SeatHealth::unusable("signed out"));
     LaunchSpec {
         base_ref: None,
         project_id: None,
         problem: "Build the thing.".into(),
-        clis: vec![cli("codex"), cli("claude")],
+        clis: vec![cli("codex"), claude],
         entity_mode: EntityMode::Shared,
         session_id: sid.into(),
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: None,
-        workflow: None,
+        workflow: Some("deadseat-build-review".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
     }
+}
+
+fn engine(db: String, runner: Arc<dyn StepRunner>) -> Core {
+    let core = Core::spawn_with_engine(db, Arc::new(NoBallots), runner);
+    core.register_workflow(BUILD_REVIEW)
+        .expect("register the build→review def");
+    core
 }
 
 fn collect_until(
@@ -185,18 +158,19 @@ fn no_session_failed(evs: &[CoreEvent], sid: &str) {
     );
 }
 
-/// Launch → every ballot fails → the typed refusal → `gateEscalated{condition: dead_seat,
-/// attempt: 0, defGate: false, outputCaptured: false}` then `awaitingHuman{gateKind: escalation}`
-/// on the cursor; the store holds `AwaitingHuman`, the bench (both seats), every unit `Pending`
-/// and provisionally seated on the roster's first seat; 0 `sessionFailed`. Reject → `runCancelled`.
+/// Launch → the bench leaves the review no distinct seat → the typed refusal →
+/// `gateEscalated{condition: dead_seat, attempt: 0, defGate: false, outputCaptured: false}` then
+/// `awaitingHuman{gateKind: escalation}` on the cursor; the store holds `AwaitingHuman`, the bench
+/// (the launcher's), every unit `Pending` and provisionally seated on the roster's first seat; 0
+/// ballots; 0 `sessionFailed`. Reject → `runCancelled`.
 #[test]
 fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() {
     let sid = "deadseat-reject";
     let db = db_path("reject");
-    let core = Core::spawn_with_engine(db.clone(), Arc::new(AllSignedOut), Arc::new(OkRunner));
+    let core = engine(db.clone(), Arc::new(OkRunner));
     let ev = core.subscribe();
     core.launch_run(spec(sid))
-        .expect("launch (no launcher bench — the ballots decide)");
+        .expect("launch (one usable seat: the intake admits it)");
 
     let evs = collect_until(
         &ev,
@@ -234,8 +208,10 @@ fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() 
             assert!(!def_gate && !output_captured);
             assert!(
                 verdict_summary.contains(&format!("no eligible seat for {sid}"))
-                    && verdict_summary.contains("2 of 2 seats benched")
-                    && verdict_summary.contains("codex (not_logged_in — ballot)")
+                    && verdict_summary
+                        .contains("evaluator\u{2260}creator unsatisfiable for unit(s) [2]")
+                    && verdict_summary.contains("1 of 2 seats benched")
+                    && verdict_summary.contains("claude (signed out — launcher)")
                     && verdict_summary.contains("provisionally seated on 'codex'"),
                 "{verdict_summary}"
             );
@@ -277,7 +253,12 @@ fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() 
     assert!(
         !evs.iter()
             .any(|e| matches!(e, CoreEvent::UnitDistributed { session, .. } if session == sid)),
-        "no council seated anything: {evs:?}"
+        "nothing was seated: {evs:?}"
+    );
+    assert_eq!(
+        BALLOTS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no ballot is dispatched on the way to the gate"
     );
 
     // The store: parked, bench persisted, units Pending on the provisional seat.
@@ -285,18 +266,16 @@ fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() 
         let store = wicked_apps_core::open_store_ro(Some(&db)).expect("read-only store");
         let session = get_session(&store, sid).unwrap().expect("session");
         assert_eq!(session.status, SessionStatus::AwaitingHuman);
-        let mut benched: Vec<&str> = session
+        let benched: Vec<(&str, &str)> = session
             .benched_seats
             .iter()
-            .map(|b| b.cli.as_str())
+            .map(|b| (b.cli.as_str(), b.source.as_str()))
             .collect();
-        benched.sort();
         assert_eq!(
             benched,
-            vec!["claude", "codex"],
-            "one bench ledger, both seats"
+            vec![("claude", "launcher")],
+            "the launcher's bench, persisted"
         );
-        assert!(session.benched_seats.iter().all(|b| b.source == "ballot"));
         let units = session_units(&store, sid).unwrap();
         assert!(!units.is_empty());
         for u in &units {
@@ -334,7 +313,7 @@ fn an_all_benched_distribution_parks_at_the_dead_seat_gate_and_reject_cancels() 
 fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat() {
     let sid = "deadseat-approve";
     let db = db_path("approve");
-    let core = Core::spawn_with_engine(db.clone(), Arc::new(AllSignedOut), Arc::new(OkRunner));
+    let core = engine(db.clone(), Arc::new(OkRunner));
     let ev = core.subscribe();
     core.launch_run(spec(sid)).expect("launch");
     let evs = collect_until(
@@ -379,77 +358,4 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
     let store = wicked_apps_core::open_store_ro(Some(&db)).expect("read-only store");
     let units = session_units(&store, sid).unwrap();
     assert_eq!(units[0].assigned_cli.as_deref(), Some("codex"));
-}
-
-/// DES §7 (12) / BC-16: `POST /runs/:id/reassign {cli: null}` on a parked-then-approved run
-/// re-convenes the council over a CLEARED bench — the ballots run again (the count rises; with the
-/// run's bench still in force `:426` would have refused before any ballot) — and, every seat still
-/// dead, the run parks again at the `dead_seat` gate with the bumped attempt; never `sessionFailed`.
-#[test]
-fn a_cli_null_reassign_re_councils_over_a_cleared_bench_and_parks_again() {
-    let sid = "deadseat-reassign";
-    let db = db_path("reassign");
-    let (started_tx, started_rx) = std::sync::mpsc::channel::<u32>();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let core = Core::spawn_with_engine(
-        db,
-        Arc::new(AllSignedOut),
-        Arc::new(GatedRunner {
-            started: std::sync::Mutex::new(started_tx),
-            release: std::sync::Mutex::new(release_rx),
-        }),
-    );
-    let ev = core.subscribe();
-    core.launch_run(spec(sid)).expect("launch");
-    let evs = collect_until(
-        &ev,
-        Duration::from_secs(15),
-        |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid),
-    );
-    no_session_failed(&evs, sid);
-    let ballots_before = BALLOTS.load(std::sync::atomic::Ordering::SeqCst);
-
-    // Approve → the cursor dispatches on the provisional seat and blocks in the gated runner.
-    core.confirm_gate(
-        sid,
-        HumanDecision::Approve {
-            amend: None,
-            amend_scope: Default::default(),
-        },
-    )
-    .expect("approve");
-    assert_eq!(
-        started_rx.recv_timeout(Duration::from_secs(10)).ok(),
-        Some(1),
-        "the cursor unit dispatched (on the provisional seat) and is in flight"
-    );
-
-    // The operator's explicit "try again": re-council over a CLEARED bench.
-    core.reassign_unit(sid, 1, None)
-        .expect("reassign {cli:null}");
-    let post = collect_until(
-        &ev,
-        Duration::from_secs(15),
-        |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid),
-    );
-    no_session_failed(&post, sid);
-    assert!(
-        BALLOTS.load(std::sync::atomic::Ordering::SeqCst) > ballots_before,
-        "the council was re-convened: the ballots ran again (the bench was cleared, not reused)"
-    );
-    let reassigned = post
-        .iter()
-        .position(|e| matches!(e, CoreEvent::UnitReassigned { session, ord: 1, new_cli: None, .. } if session == sid))
-        .unwrap_or_else(|| panic!("unitReassigned{{newCli: null}}: {post:?}"));
-    let gate = post
-        .iter()
-        .position(|e| matches!(e, CoreEvent::GateEscalated { session, condition, .. } if session == sid && condition == "dead_seat"))
-        .unwrap_or_else(|| panic!("a second dead_seat gate: {post:?}"));
-    assert!(reassigned < gate, "{post:?}");
-    if let CoreEvent::GateEscalated { attempt, .. } = &post[gate] {
-        assert!(*attempt >= 1, "the reassign bumped the attempt: {attempt}");
-    }
-    // Clean up: release the superseded worker and reject the parked run.
-    drop(release_tx);
-    let _ = core.confirm_gate(sid, HumanDecision::Reject);
 }

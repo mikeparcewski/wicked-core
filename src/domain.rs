@@ -688,7 +688,8 @@ impl StageKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RoutingInfo {
-    /// The council convened and its verdict named the winning seat.
+    /// The council convened and its verdict named the winning seat. No longer PRODUCED (core#590
+    /// S5: distribution convenes no council); kept so a recorded run's routing still loads.
     Council {
         winner: String,
         /// Council agreement ratio, `0..=100`.
@@ -719,14 +720,24 @@ pub enum RoutingInfo {
         /// How many dissenting voices the verdict recorded.
         dissent: u32,
     },
-    /// No usable verdict (no quorum, or the winner named no roster seat) — degraded to the first seat.
+    /// No usable verdict (no quorum, or the winner named no roster seat) — degraded to the first
+    /// seat. No longer PRODUCED (core#590 S5); kept so a recorded run's routing still loads.
     Degraded { reason: String },
-    /// A review/test unit was REASSIGNED off the council's pick to enforce evaluator ≠ creator (the
-    /// critic must differ from the CLI that produced the work it checks). `was` is the council's pick.
+    /// A review/test unit was REASSIGNED off its routed seat to enforce evaluator ≠ creator (the
+    /// critic must differ from the CLI that produced the work it checks). `was` is the routed pick
+    /// (the `Teamed` seat; on a run recorded before core#590 S5, the council's pick).
     EvaluatorDistinct { winner: String, was: String },
     /// No council convened — this unit is a deterministic tool execution. The `assigned_cli` is
     /// the literal command name (first element of `tool_cmd`).
     Tool,
+    /// (core#590 S5) The seat was picked WITHOUT a council — the routing every seated unit gets
+    /// since distribution stopped convening one: the first eligible seat the unit's skills admit,
+    /// in roster order. `winner` is that seat. The evaluator≠creator fence runs after it, so a
+    /// review/test unit the fence moved off a builder seat reads
+    /// [`RoutingInfo::EvaluatorDistinct`] instead (its `was` is this pick). Additive on the wire:
+    /// `{"method":"teamed","winner":"<seat>"}`; `Council` and `Degraded` stay for the routing a
+    /// recorded run already carries.
+    Teamed { winner: String },
 }
 
 impl WorkUnit {
@@ -1237,5 +1248,64 @@ mod tests {
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].ord, 1);
         assert_eq!(units[1].description, "step two");
+    }
+
+    /// core#590 S5 — `Teamed` is ADDITIVE on the wire: it round-trips as
+    /// `{"method":"teamed","winner":…}`, and every routing a recorded run already carries —
+    /// `council` (with and without `seated`), `degraded`, `evaluator_distinct`, `tool` — still
+    /// loads, byte-for-byte the shapes the engine wrote before the change.
+    #[test]
+    fn teamed_routing_is_additive_and_recorded_council_routing_still_loads() {
+        let teamed = RoutingInfo::Teamed {
+            winner: "codex".into(),
+        };
+        let wire = serde_json::json!({"method": "teamed", "winner": "codex"});
+        assert_eq!(serde_json::to_value(&teamed).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<RoutingInfo>(wire).unwrap(), teamed);
+        let recorded = [
+            (
+                serde_json::json!({"method": "council", "winner": "claude", "agreement_pct": 67,
+                    "returned": 2, "seated": 3, "dissent": 1}),
+                RoutingInfo::Council {
+                    winner: "claude".into(),
+                    agreement_pct: 67,
+                    returned: 2,
+                    seated: Some(3),
+                    dissent: 1,
+                },
+            ),
+            (
+                serde_json::json!({"method": "council", "winner": "claude", "agreement_pct": 100,
+                    "returned": 1, "dissent": 0}),
+                RoutingInfo::Council {
+                    winner: "claude".into(),
+                    agreement_pct: 100,
+                    returned: 1,
+                    seated: None,
+                    dissent: 0,
+                },
+            ),
+            (
+                serde_json::json!({"method": "degraded", "reason": "no seat returned a vote"}),
+                RoutingInfo::Degraded {
+                    reason: "no seat returned a vote".into(),
+                },
+            ),
+            (
+                serde_json::json!({"method": "evaluator_distinct", "winner": "pi", "was": "claude"}),
+                RoutingInfo::EvaluatorDistinct {
+                    winner: "pi".into(),
+                    was: "claude".into(),
+                },
+            ),
+            (serde_json::json!({"method": "tool"}), RoutingInfo::Tool),
+        ];
+        for (frame, want) in recorded {
+            assert_eq!(
+                serde_json::from_value::<RoutingInfo>(frame.clone()).unwrap(),
+                want,
+                "{frame}"
+            );
+        }
     }
 }

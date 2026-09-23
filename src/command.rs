@@ -367,11 +367,18 @@ pub(crate) enum Command {
     CampaignNodeAwaiting { run_id: String, prompt: String },
     /// Register (or replace) a workflow def in the actor's registry. Validates before inserting.
     /// `json` is a serialized `WorkflowDef`. Replies `Err` if validation fails.
+    /// (core#590 S5) Convene a council on one disputed decision (`Core::convene_decision`). The
+    /// actor hands the ballots to a worker thread and replies from there.
+    ConveneDecision {
+        req: crate::decision::DecisionRequest,
+        clis: Vec<wicked_council::AgenticCli>,
+        reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
+    },
     RegisterWorkflow {
         json: String,
         reply: std::sync::mpsc::Sender<anyhow::Result<String>>, // returns the workflow id
     },
-    /// Council distribution complete — the distribute worker thread finished `distribute_units_on`
+    /// Distribution complete — the distribute worker thread finished `distribute_units_on`
     /// successfully. The actor arm calls `pipeline::apply_distributions` to write assignments to the
     /// store and dispatch unit 0. Sent by the off-actor distribute thread; processed on actor thread.
     PlanReady {

@@ -6,10 +6,7 @@
 //! Runs on the actor thread (the single writer). Stub execute path (deterministic, no subprocess);
 //! the wrapped-CLI path is a later phase.
 
-use std::sync::Arc;
-
 use wicked_apps_core::ToNode;
-use wicked_council::types::Dispatcher;
 use wicked_council::AgenticCli;
 
 use crate::domain::{put_node, AgentSession, RoutingInfo, SessionStatus, UnitStatus};
@@ -44,11 +41,7 @@ pub fn run_session(
     entity_mode: EntityMode,
     session_id: &str,
     workflow: Option<&str>,
-    dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
-    // See `plan_and_distribute`: the state home a claude ballot is fenced from; `None` on the
-    // sync/test drivers, which have no daemon state home (the default candidate is still fenced).
-    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<SessionResult> {
     // Clear any prior run's per-run governance dir for this session id (the sync driver, like
     // launch_run_inner, must not inherit a stale decisions log — a leftover Deny would spuriously fail
@@ -74,12 +67,10 @@ pub fn run_session(
         None,       // …and no repo (above) ⇒ no project graph to bind
         None,       // sync path is unfiled ⇒ no studio project id (BC-79)
         workflow,
-        &dispatcher,
         emit,
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
         false, // stub not yet created
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
-        operational_home,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -641,7 +632,6 @@ pub(crate) fn apply_distributions(
     for (u, dist) in pre.units.iter_mut().zip(distributions.iter()) {
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.assigned_invocation = dist.assigned_invocation.clone();
-        u.council_task_ref = dist.council_task_ref.clone();
         u.routing = Some(dist.routing.clone());
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
@@ -671,6 +661,8 @@ pub(crate) fn apply_distributions(
                 ("evaluator_distinct".to_string(), None, None, None, None)
             }
             RoutingInfo::Tool => ("tool".to_string(), None, None, None, None),
+            // (core#590 S5) The deterministic pick: no council, so no agreement and no quorum.
+            RoutingInfo::Teamed { .. } => ("teamed".to_string(), None, None, None, None),
         };
         let degraded_reason = dist
             .degraded_reason
@@ -741,7 +733,7 @@ pub(crate) fn apply_distributions(
 }
 
 /// PLAN + DISTRIBUTE (used by the sync operator CLI + tests): the full sequential path — plan,
-/// persist, distribute (blocking council), apply assignments. For the interactive actor engine the
+/// persist, distribute (deterministic, core#590 S5), apply assignments. For the interactive actor engine the
 /// call is split: [`pre_distribute`] on the actor thread + `distribute_units_on` off-thread +
 /// [`apply_distributions`] back on the actor thread via `Command::PlanReady`.
 ///
@@ -767,7 +759,6 @@ pub(crate) fn plan_and_distribute(
     // session. `None` ⇒ a repo-only (unfiled) run.
     project_id: Option<String>,
     workflow: Option<&str>,
-    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
@@ -776,10 +767,6 @@ pub(crate) fn plan_and_distribute(
     // GOV_DB_PATH thread-local internally. Pass in_process_governance().is_some() from the
     // calling thread; the sync/test path correctly gets false when GOV_DB_PATH is not set.
     governed: bool,
-    // The engine's own operational state home (`state_home::operational_home_of_db`), fenced for
-    // every claude council BALLOT on its argv (wicked-crew#524 follow-up). The call site supplies
-    // it for the same reason it supplies `governed`: this function reads no thread-local.
-    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -801,15 +788,7 @@ pub(crate) fn plan_and_distribute(
         session_already_started,
         governed,
     )?;
-    let distributions = distribute::distribute_units_on(
-        &pre.units,
-        clis,
-        session_id,
-        None,
-        dispatcher,
-        None,
-        operational_home,
-    )?;
+    let distributions = distribute::distribute_units_on(&pre.units, clis, session_id)?;
     apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {
         session: pre.session,
@@ -2553,9 +2532,8 @@ mod resolve_tests {
     /// DISTRIBUTION's on the council arm — "N of M seats benched: …" when the launcher's health
     /// probe benched a seat — and the bench is persisted on the session for every later dispatch.
     #[test]
-    fn apply_distributions_carries_degraded_reason_on_the_council_arm_and_persists_the_bench() {
-        use wicked_council::types::{Category, Confidence, InputMode, Vote};
-        use wicked_council::CouncilTask;
+    fn apply_distributions_carries_degraded_reason_on_the_teamed_arm_and_persists_the_bench() {
+        use wicked_council::types::{Category, Confidence, InputMode};
         fn mk_cli(key: &str) -> AgenticCli {
             AgenticCli {
                 key: key.into(),
@@ -2575,27 +2553,11 @@ mod resolve_tests {
                 health: None,
             }
         }
-        /// Every seat votes for option 1 — the first ELIGIBLE candidate.
-        struct FixedDispatcher;
-        impl Dispatcher for FixedDispatcher {
-            fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
-                Some(Vote {
-                    cli: cli.key.clone(),
-                    recommendation: "1 — fit".into(),
-                    top_risk: "none".into(),
-                    change_my_mind: "no".into(),
-                    disqualifier: None,
-                    confidence: Confidence::default(),
-                    provenance: "fixed".into(),
-                })
-            }
-        }
         let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
         let mut signed_out = mk_cli("codex");
         signed_out.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
         let clis = vec![mk_cli("claude"), signed_out, mk_cli("pi")];
         let mut events: Vec<CoreEvent> = Vec::new();
-        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(FixedDispatcher);
         let sid = format!("w6-degraded-{}", std::process::id());
         let planned = plan_and_distribute(
             &mut store,
@@ -2612,12 +2574,10 @@ mod resolve_tests {
             None,
             None,
             None,
-            &dispatcher,
             &mut |ev| events.push(ev),
             None,
             false,
             false,
-            None,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());

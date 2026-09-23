@@ -24,6 +24,7 @@ mod clock;
 mod code_graph;
 mod codex_skills;
 mod command;
+mod decision;
 mod deliver_lift;
 mod diagnostic;
 mod distribute;
@@ -104,6 +105,7 @@ pub use code_graph::{
     index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, RankedSymbol,
 };
 pub use command::InjectTarget;
+pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
     all_sessions, get_session, get_unit_transcript, get_work_output, put_node, put_nodes,
@@ -516,7 +518,7 @@ impl Core {
                 path,
                 rx,
                 self_tx,
-                distribute::real_dispatcher(),
+                decision::real_dispatcher(),
                 runner_actor,
                 pty_actor,
                 None,
@@ -567,7 +569,7 @@ impl Core {
                 path,
                 rx,
                 self_tx,
-                distribute::real_dispatcher(),
+                decision::real_dispatcher(),
                 runner_actor,
                 pty_actor,
                 None,
@@ -1246,6 +1248,30 @@ impl Core {
     ///
     /// Registered defs are visible immediately: the next `launch_run` call with a matching `workflow`
     /// id will plan from this def without a process restart.
+    /// Convene a council on ONE concrete, disputed decision (core#590 S5) — a question, the
+    /// competing positions and the evidence in; the ruling, its agreement and its dissent out.
+    /// The engine's single council entry point: distribution no longer convenes one per unit, so
+    /// this is the only way a council runs. Blocks until the council returns (its ballots run on
+    /// a worker thread, never on the actor, so the engine keeps serving meanwhile) and relays the
+    /// council's lifecycle events scoped to `req.session_id` / `req.ord`.
+    ///
+    /// `clis` is the roster to convene — the caller hands only the seats it may use. An `Err` is a
+    /// request the council refuses (fewer than two positions, no question, no seat, an unwritable
+    /// ballot fence); a council that cannot rule returns `Ok` with `winner: None` and the reason.
+    /// Nothing calls it yet: gate adjudication of disputes (core#590 S6) is its caller.
+    pub fn convene_decision(
+        &self,
+        req: DecisionRequest,
+        clis: Vec<AgenticCli>,
+    ) -> anyhow::Result<DecisionVerdict> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ConveneDecision { req, clis, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     pub fn register_workflow(&self, json: impl Into<String>) -> anyhow::Result<String> {
         let (reply, rx) = channel();
         self.tx
@@ -1437,30 +1463,12 @@ mod tests {
         assert_eq!(ev, CoreEvent::Heartbeat);
     }
 
-    // The whole point of COE: the pipeline composes plan → distribute (council synthesis) → execute
-    // (governance + orchestration) → evidence, and STREAMS the progress as live events. Uses a STUB
-    // dispatcher so the council runs its real synthesis over deterministic votes — NO subprocess, so
-    // the test is reliable (the real-subprocess dispatch is wicked-council's own concern).
+    // The whole point of COE: the pipeline composes plan → distribute (deterministic, core#590 S5)
+    // → execute (governance + orchestration) → evidence, and STREAMS the progress as live events.
     #[test]
     fn pipeline_composes_and_streams_events_deterministically() {
-        use std::sync::Arc;
-        use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
-        use wicked_council::CouncilTask;
+        use wicked_council::types::{Category, Confidence, InputMode};
 
-        struct Stub;
-        impl Dispatcher for Stub {
-            fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
-                Some(Vote {
-                    cli: cli.key.clone(),
-                    recommendation: "fake-a".into(),
-                    top_risk: "none".into(),
-                    change_my_mind: "no".into(),
-                    disqualifier: None,
-                    confidence: Confidence::default(),
-                    provenance: "stub".into(),
-                })
-            }
-        }
         let cli = |key: &str| AgenticCli {
             key: key.into(),
             display_name: key.into(),
@@ -1493,9 +1501,7 @@ mod tests {
             EntityMode::Shared,
             "test-pipeline",
             None, // free-text planner (legacy path)
-            Arc::new(Stub),
             &mut |ev| events.push(ev),
-            None,
         )
         .expect("run_session");
 
@@ -1541,9 +1547,7 @@ mod tests {
             EntityMode::Shared,
             "test-feature",
             Some("feature"),
-            Arc::new(Stub),
             &mut |e| ev2.push(e),
-            None,
         )
         .expect("def-driven run_session");
         let funits = session_units(&store, "test-feature").unwrap();
@@ -1569,6 +1573,92 @@ mod tests {
             "the free-text planner would have made 1 unit from this prose; the def made {}",
             funits.len()
         );
+    }
+
+    /// core#590 S5 — `Core::convene_decision` is the engine's one council entry point: it reaches
+    /// the actor's dispatcher (not a new one), ballots every handed seat, and returns the ruling.
+    /// Driven with a stub dispute; nothing in the engine calls it yet (S6 will).
+    #[test]
+    fn convene_decision_rules_a_stub_dispute_through_the_engine_dispatcher() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+        use wicked_council::CouncilTask;
+        struct Votes2(Arc<AtomicUsize>);
+        impl Dispatcher for Votes2 {
+            fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some(Vote {
+                    cli: cli.key.clone(),
+                    recommendation: "2 — the refutation holds".into(),
+                    top_risk: "none".into(),
+                    change_my_mind: "no".into(),
+                    disqualifier: None,
+                    confidence: Confidence::default(),
+                    provenance: "stub".into(),
+                })
+            }
+        }
+        let seat = |key: &str| AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: "unused {PROMPT}".into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            health: None,
+        };
+        struct NoRun;
+        impl crate::workflow::StepRunner for NoRun {
+            fn run_unit(&self, _i: &crate::workflow::StepInput) -> crate::workflow::StepOutput {
+                unreachable!("no unit runs in a decision council")
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-decision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = Core::spawn_with_engine(
+            dir.join("core.db").to_str().unwrap(),
+            Arc::new(Votes2(calls.clone())),
+            Arc::new(NoRun),
+        );
+        let events = core.subscribe();
+        let verdict = core
+            .convene_decision(
+                DecisionRequest {
+                    session_id: "run-d".into(),
+                    ord: 2,
+                    question: "Is the finding at src/a.rs:10 a defect?".into(),
+                    options: vec!["Monitor: yes".into(), "Worker: no".into()],
+                    evidence: "src/a.rs:10 and the refutation at src/a.rs:4".into(),
+                },
+                vec![seat("a"), seat("b")],
+            )
+            .expect("the council rules");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(verdict.winner, Some(1));
+        assert!(verdict.consensus);
+        assert_eq!(verdict.agreement_pct, 100);
+        assert_eq!((verdict.returned, verdict.seated), (2, 2));
+        assert!(verdict.dissent.is_empty());
+        // The council's events reach subscribers through the actor's emit point, which may run
+        // after the reply lands — so wait for the frame instead of draining what has arrived.
+        let convened = std::iter::from_fn(|| events.recv_timeout(Duration::from_secs(10)).ok())
+            .find(|e| matches!(e, CoreEvent::CouncilConvened { .. }));
+        assert!(
+            matches!(&convened, Some(CoreEvent::CouncilConvened { session, ord: 2, .. }) if session == "run-d"),
+            "{convened:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

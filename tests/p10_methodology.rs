@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, EntityMode, HumanConfirm, LaunchSpec, SessionStatus, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, SessionStatus, StepInput, StepOutput,
+    StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -163,6 +163,119 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         ),
         "the review unit records the evaluator-distinct routing, got: {:?}",
         review.routing
+    );
+}
+
+/// Counts every ballot dispatched — a ballot is a council seat's subprocess turn. Every seat
+/// votes capability profile 1, so a council (were one convened) agrees in one round.
+struct CountingDispatcher {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Dispatcher for CountingDispatcher {
+    fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(Vote {
+            cli: cli.key.clone(),
+            recommendation: "1 — fit".into(),
+            top_risk: "none".into(),
+            change_my_mind: "no".into(),
+            disqualifier: None,
+            confidence: Confidence::default(),
+            provenance: "counting".into(),
+        })
+    }
+}
+
+/// core#590 S5 — distribution convenes NO council: a build→review run on a two-seat roster
+/// dispatches zero ballots and emits no council event; the builder is routed `teamed` to the
+/// first seat and evaluator ≠ creator still moves the review off it. Asserted through the run's
+/// own read model and event stream (the wire shape a consumer sees), with fixed values. On the
+/// pre-S5 engine this run balloted 4 times (2 seats × 2 units) and routed `council`.
+#[test]
+fn a_run_convenes_no_council_and_still_separates_evaluator_from_creator() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let core = Core::spawn_with_engine(
+        db_path("teamed"),
+        Arc::new(CountingDispatcher {
+            calls: calls.clone(),
+        }),
+        Arc::new(OkRunner),
+    );
+    core.register_workflow(
+        r#"{"id":"p10-build-review","phases":[
+          {"id":"build","kind":"build","gate":"auto"},
+          {"id":"review","kind":"review","gate":"auto","depends_on":["build"]}]}"#,
+    )
+    .expect("register the 2-phase def");
+    let events = core.subscribe();
+    core.launch_run(LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "Build the auth feature. Then review it for security".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: EntityMode::Shared,
+        session_id: "teamed".into(),
+        human_confirm: HumanConfirm::None,
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: Some("p10-build-review".into()),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+    })
+    .unwrap();
+    assert!(wait_done(&core, "teamed"), "the run completes");
+    let seen: Vec<CoreEvent> = events.try_iter().collect();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no council ballot is dispatched to route a unit"
+    );
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            CoreEvent::CouncilConvened { .. }
+                | CoreEvent::CouncilVoted { .. }
+                | CoreEvent::CouncilSeatFailed { .. }
+        )),
+        "no council event is emitted"
+    );
+    let v = core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "teamed")
+        .unwrap();
+    assert_eq!(v.units.len(), 2);
+    assert_eq!(v.units[0].assigned_cli.as_deref(), Some("a"));
+    assert_eq!(
+        serde_json::to_value(&v.units[0].routing).unwrap(),
+        serde_json::json!({"method": "teamed", "winner": "a"})
+    );
+    assert_eq!(v.units[1].assigned_cli.as_deref(), Some("b"));
+    assert_eq!(
+        serde_json::to_value(&v.units[1].routing).unwrap(),
+        serde_json::json!({"method": "evaluator_distinct", "winner": "b", "was": "a"})
+    );
+    let distributed: Vec<(u32, String, String)> = seen
+        .iter()
+        .filter_map(|e| match e {
+            CoreEvent::UnitDistributed {
+                ord,
+                cli,
+                routing_method,
+                ..
+            } => Some((*ord, cli.clone(), routing_method.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        distributed,
+        vec![
+            (1, "a".to_string(), "teamed".to_string()),
+            (2, "b".to_string(), "evaluator_distinct".to_string()),
+        ]
     );
 }
 
