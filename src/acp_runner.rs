@@ -1455,9 +1455,7 @@ fn ensure_worker_config_home(
     // symlink_metadata, never a following stat: a prior worker could plant
     // `hooks -> ~/.ssh` or `settings.json -> <victim>` and a following remove/write would
     // act OUTSIDE the home (Copilot, PR#277). A symlink entry is removed AS a link.
-    for entry in WORKER_HOME_SANITIZED {
-        remove_entry_no_follow(&dir.join(entry))?;
-    }
+    sanitize_claude_home(&dir)?;
     // settings.json is re-written every spawn — REPLACED, never unlinked first (codex round 5):
     // `write_atomic` writes the pid/seq temp and `rename`s it over the target, which replaces
     // atomically and does not follow a symlinked target (a planted link is replaced AS a link),
@@ -1696,7 +1694,11 @@ fn private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
 /// directory (`<name>.<pid>.<seq>.tmp`, [`settings_temp_name`]), then `rename` over `path` — a
 /// reader sees the old file or the new one, never a torn one, and a planted link at `path` is
 /// replaced as a link (rename does not follow its target).
-fn write_atomic(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1741,18 +1743,34 @@ fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
 /// Remove a worker-home entry WITHOUT following symlinks: a link is deleted as a link
 /// (`remove_file` — std's `remove_dir_all` also refuses to traverse links, but routing links
 /// away explicitly keeps the property visible and covers link-to-file too). Missing → Ok.
+/// Remove every [`WORKER_HOME_SANITIZED`] entry from a worker Claude config dir, judged on
+/// `symlink_metadata` (a planted link is removed AS a link). Shared by the primary worker home and
+/// every secondary-instance home (core#595 review): `settings.local.json` merges OVER the fence's
+/// `settings.json` and `hooks/` runs code, so a home that skips this can void its own deny rules.
+pub(crate) fn sanitize_claude_home(dir: &std::path::Path) -> anyhow::Result<()> {
+    for entry in WORKER_HOME_SANITIZED {
+        remove_entry_no_follow(&dir.join(entry))?;
+    }
+    Ok(())
+}
+
 fn remove_entry_no_follow(p: &std::path::Path) -> anyhow::Result<()> {
     let meta = match std::fs::symlink_metadata(p) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => anyhow::bail!("cannot stat {} while sanitizing ({e})", p.display()),
     };
-    if meta.file_type().is_dir() {
-        std::fs::remove_dir_all(p)?;
+    let removed = if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(p)
     } else {
-        std::fs::remove_file(p)?;
+        std::fs::remove_file(p)
+    };
+    // A concurrent sanitize of the same home (secondary instances have no process-wide ENSURE
+    // mutex) may have removed it between the stat and here: gone is the goal, not an error.
+    match removed {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an

@@ -145,9 +145,21 @@ pub struct Distribution {
     /// seats plus every seat whose ballot failed authentication — identical on every unit of one
     /// distribution; `apply_distributions` persists it on the session.
     pub benched: Vec<BenchedSeat>,
-    /// (core#461) The evaluator≠creator DISCLOSURE, first-class: `Some("creator_seat")` when this
-    /// is a review/test unit that STAYS on a seat that built what it checks because no eligible
-    /// seat distinct from the builders admits it.
+    /// (core#461, core#591) The evaluator≠creator DISCLOSURE, first-class. Two values:
+    ///
+    /// * `Some("creator_seat")` — this is a review/test unit that STAYS on a seat that built what
+    ///   it checks because no eligible seat distinct from the builders admits it.
+    /// * `Some("same_cli_instance")` (core#591) — this review/test unit IS on a seat distinct from
+    ///   every builder seat, but that seat runs the SAME CLI as a builder (`claude#2` grading
+    ///   `claude#1`). A second instance removes context contamination — the evaluator holds none
+    ///   of the creator's authoring reasoning — but NOT model-level blind spots: same weights,
+    ///   same failure modes. Reading it as a model-distinct evaluator is the silent degradation
+    ///   this field exists to prevent, so it is disclosed rather than assumed away.
+    ///
+    /// `creator_seat` DOMINATES: a unit that stays on a builder seat is disclosed as that, not as
+    /// an instance fallback.
+    ///
+    /// The `creator_seat` paragraphs below describe that value only.
     ///
     /// The roster is necessarily BENCH-FREE when this is set (core#560/#567): a bench that leaves
     /// a review/test unit no distinct seat refuses the plan instead (`NoEligibleSeat`), so it never
@@ -169,15 +181,59 @@ pub struct Distribution {
     pub distinctness_fallback: Option<String>,
 }
 
-/// The one value [`Distribution::distinctness_fallback`] takes today (core#461).
+/// (core#461) [`Distribution::distinctness_fallback`] when the evaluator STAYS on a creator seat.
 pub(crate) const DISTINCTNESS_FALLBACK_CREATOR_SEAT: &str = "creator_seat";
 
+/// (core#591) [`Distribution::distinctness_fallback`] when the evaluator is a DIFFERENT seat
+/// instance that runs the SAME CLI as a creator — instance-distinct, not model-distinct.
+pub(crate) const DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE: &str = "same_cli_instance";
+
+/// The CLI (MODEL) key a roster seat key names (core#591): `claude#2` and `claude` are two seat
+/// INSTANCES of one CLI. Spelled once, over [`wicked_apps_core::spawn::seat_cli_key`] — the same
+/// split the configuration-home resolver keys a seat's root on — so routing and isolation cannot
+/// disagree about which seats share a model.
+fn model_of(key: &str) -> &str {
+    wicked_apps_core::spawn::seat_cli_key(key)
+}
+
 /// The invocation template for `key` from the launch roster (`None` if not found).
+///
+/// `key` is a seat INSTANCE key, which is unique across the roster: `refuse_duplicate_seat_keys`
+/// rejects the plan before any distribution runs, so this `find` is unambiguous by construction
+/// rather than by luck. Before core#591 a duplicate key silently resolved to the FIRST record and
+/// the second instance's own template was unreachable.
 pub(crate) fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
     clis.iter()
         .find(|c| c.key == key)
         .map(|c| c.headless_invocation.clone())
         .filter(|s| !s.trim().is_empty())
+}
+
+/// (core#591) Refuse a launch roster that names one seat key twice, BEFORE anything routes.
+///
+/// A seat key is an INSTANCE identity: it is what `assigned_cli` carries, what
+/// [`invocation_of`] resolves a launch template through, what the evaluator≠creator fence
+/// compares seats by, and what the configuration-home resolver keys a seat's root on. Two records
+/// sharing one key make all four ambiguous at once and NONE of them say so — the template resolves
+/// to whichever record came first, and the fence reads the two records as one seat and leaves a
+/// review unit on its creator. A second instance of one CLI is spelled
+/// `claude{SEAT_INSTANCE_SEP}2`, which is a different key.
+fn refuse_duplicate_seat_keys(configured: &[AgenticCli]) -> anyhow::Result<()> {
+    use wicked_apps_core::spawn::SEAT_INSTANCE_SEP;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in configured {
+        if !seen.insert(c.key.as_str()) {
+            anyhow::bail!(
+                "launch roster names the seat key '{key}' more than once. A key is a seat \
+                 INSTANCE identity (core#591): duplicates make the launch template, the \
+                 evaluator\u{2260}creator fence and the seat's configuration home all resolve to \
+                 whichever record came first. Spell a second instance of one cli as \
+                 '{key}{SEAT_INSTANCE_SEP}2'.",
+                key = c.key
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The distribution of a Tool-executor unit: the engine's own command, handed to no seat — its
@@ -377,6 +433,12 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
 
 /// The routing core, honouring a bench set (F-7R2-006). Rules, in order:
 ///
+/// SEAT IDENTITY, under every rule below (core#591): a roster seat key is an INSTANCE identity —
+/// `claude` and `claude#2` are two seats running one cli — and it must be unique across the
+/// roster, which is refused at entry if it is not (`refuse_duplicate_seat_keys`). Routing,
+/// `assigned_cli` and the wire carry the INSTANCE; a predicate about the MODEL reads the cli key
+/// behind it (`model_of`): `seat_is_claude`, and the `same_cli_instance` disclosure in rule 2.
+///
 /// 0. SEAT REQUIREMENT is per UNIT (F-E2E-011) — a Tool-executor unit (`tool_cmd`) is the engine's
 ///    own command: it convenes no council and is handed to no seat. A plan whose EVERY unit is a
 ///    tool therefore needs no seat at all and is routed `tool` before any eligibility verdict —
@@ -403,7 +465,10 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
 ///    every seat was assigned a Build/Recon unit, or one whose only non-builder seats this unit's
 ///    skills refuse. That case is disclosed by the `distinctness_fallback: "creator_seat"` field
 ///    (core#461), not by `degraded_reason`; only the all-seats-built shape ALSO warns on stderr
-///    (a one-seat roster never does — it had nothing to separate).
+///    (a one-seat roster never does — it had nothing to separate). A review/test unit that DID get
+///    a seat distinct from every builder seat, but one running the same CLI (`claude#2` grading
+///    `claude#1` — two seat INSTANCES of one cli, core#591), is disclosed by the same field as
+///    `"same_cli_instance"`: instance-distinct, not model-distinct.
 /// 3. `degraded_reason` names the bench on EVERY unit whenever eligible < configured, and the
 ///    whole bench rides each `Distribution` for the actor to persist.
 #[allow(clippy::too_many_arguments)]
@@ -418,6 +483,11 @@ pub(crate) fn distribute_units_against_benched(
     operational_home: Option<&std::path::Path>,
     prior_benched: &[BenchedSeat],
 ) -> anyhow::Result<Vec<Distribution>> {
+    // (core#591) BEFORE anything reads the roster: a duplicate seat key makes the launch template,
+    // the evaluator≠creator fence and the seat's configuration home all ambiguous at once, and
+    // none of the three says so. Refused, not disambiguated — a plan whose seat identities are
+    // ambiguous is not a plan. Runs even for an all-tool plan: the roster is wrong either way.
+    refuse_duplicate_seat_keys(configured)?;
     let mut benched: Vec<BenchedSeat> = prior_benched.to_vec();
     for seat in launcher_benched(configured) {
         crate::domain::bench_seat(&mut benched, seat);
@@ -494,6 +564,20 @@ pub(crate) fn distribute_units_against_benched(
                  without its deny fence"
             )
         })?;
+        // core#595: secondary claude ballots (`claude#2`) run under `<base>/claude-2`, which
+        // `ensure_shared_worker_fence` does not cover. Write a matching fence for every
+        // secondary instance before the ballot runs — fail closed on error, as above.
+        for cli in clis.iter().filter(|c| is_claude_ballot(c)) {
+            if wicked_apps_core::spawn::seat_cli_key(&cli.key) != cli.key.as_str() {
+                crate::execute_wrapped::ensure_secondary_instance_fence(&cli.key).map_err(|e| {
+                    anyhow::anyhow!(
+                        "council for {session_id}: the instance fence for `{}` could not be \
+                             written ({e}); refusing to convene without its deny fence",
+                        cli.key
+                    )
+                })?;
+            }
+        }
         fenced = fenced_roster(clis, operational_home).map_err(|e| {
             anyhow::anyhow!(
                 "council for {session_id}: the ballot's state-home fence could not be built ({e}); \
@@ -657,7 +741,7 @@ pub(crate) fn distribute_units_against_benched(
             ),
         };
     }
-    let same_seat =
+    let (same_seat, same_cli_instance) =
         enforce_evaluator_distinct(units, &mut dists, &still_eligible, clis, &candidates);
     // (AC-3 / core#537, core#560) When a benched seat — from ANY source (launcher health probe,
     // ballot ledger, or worker transcript) — made evaluator≠creator unsatisfiable, fail CLOSED:
@@ -707,8 +791,20 @@ pub(crate) fn distribute_units_against_benched(
         // `same_seat` on a multi-seat roster whose every seat was assigned a Build/Recon unit, and
         // on one whose only non-builder seats this unit's skills refuse — both bench-free, both
         // landing here (review F2 on #452 covers the one-seat shape only).
-        d.distinctness_fallback = (u.tool_cmd.is_none() && same_seat.contains(&u.ord))
-            .then(|| DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string());
+        //
+        // (core#591) A SECOND value beside it: an evaluator on a seat distinct from every builder
+        // seat whose CLI is nonetheless a builder's CLI (`claude#2` grading `claude#1`) is
+        // `same_cli_instance` — real separation of context, no separation of model. `creator_seat`
+        // dominates; `enforce_evaluator_distinct` returns the two sets already disjoint.
+        d.distinctness_fallback = if u.tool_cmd.is_some() {
+            None
+        } else if same_seat.contains(&u.ord) {
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string())
+        } else if same_cli_instance.contains(&u.ord) {
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE.to_string())
+        } else {
+            None
+        };
         let mut parts: Vec<String> = Vec::new();
         match &d.routing {
             RoutingInfo::Tool => {
@@ -798,12 +894,19 @@ thread_local! {
 /// operator's `clis.toml` re-points at another carrier — or a roster record keyed `claude` whose
 /// template runs something else — is exactly the seat the ladder would refuse mid-run. A seat the
 /// two carriers would disagree about is therefore refused loudly at plan time, not seated.
+/// (core#591) `key` is a seat INSTANCE key; both identity resolvers are asked about the seat's
+/// CLI ([`model_of`]), because this predicate is about the MODEL — whether the ladder would refuse
+/// a Claude-only unit on this seat. Reading the registry by the instance key would find no record
+/// for `claude#2` and classify a claude instance as `Other`, so a second claude instance could
+/// never take a Claude-only review. The INVOCATION stays the instance's own (`invocation_of(clis,
+/// key)`): what the seat EXECUTES is per-instance, what it IS is per-cli.
 fn seat_is_claude(clis: &[AgenticCli], key: &str) -> bool {
     use crate::skills_snapshot::WorkerCli;
     #[cfg(test)]
     SEAT_JUDGEMENTS.with(|n| n.set(n.get() + 1));
-    let acp = crate::acp_runner::acp_seat_identity(key);
-    let wrapped = crate::execute_wrapped::wrapped_seat_identity(key, invocation_of(clis, key));
+    let cli_key = model_of(key);
+    let acp = crate::acp_runner::acp_seat_identity(cli_key);
+    let wrapped = crate::execute_wrapped::wrapped_seat_identity(cli_key, invocation_of(clis, key));
     matches!(acp, WorkerCli::Claude) && matches!(wrapped, WorkerCli::Claude)
 }
 
@@ -812,18 +915,29 @@ fn seat_is_claude(clis: &[AgenticCli], key: &str) -> bool {
 /// a build/recon CLI to a roster seat NOT used for building (when the roster has the seats to do so)
 /// — a seat the unit's skills ADMIT (core#401): a Claude-only review unit is never moved onto a seat
 /// the ladder would refuse it on; with no such alternative it stays where the council put it.
-/// Returns the ords of the review/test units that STAY on a builder seat because no eligible seat
-/// distinct from the builders admits them (F-7R3-001). The caller REFUSES the plan when a bench is
-/// what emptied the pool (`NoEligibleSeat`, core#560): the run parks at the dead-seat gate instead
-/// of executing, so there is no per-unit disclosure to make. On a BENCH-FREE roster it keeps the
-/// unit where it is and sets `distinctness_fallback: "creator_seat"` instead.
+/// Returns TWO ord sets (core#591):
+///
+/// * `same_seat` — the review/test units that STAY on a builder seat because no eligible seat
+///   distinct from the builders admits them (F-7R3-001). The caller REFUSES the plan when a bench
+///   is what emptied the pool (`NoEligibleSeat`, core#560): the run parks at the dead-seat gate
+///   instead of executing, so there is no per-unit disclosure to make. On a BENCH-FREE roster it
+///   keeps the unit where it is and sets `distinctness_fallback: "creator_seat"` instead.
+/// * `same_cli_instance` — the review/test units that ARE on a seat distinct from every builder
+///   SEAT, but whose seat runs the same CLI as a builder (`claude#2` grading `claude#1`'s work).
+///   The separation is real but partial: no context contamination, the same model-level blind
+///   spots. The caller discloses it as `distinctness_fallback: "same_cli_instance"`. Disjoint from
+///   `same_seat` by construction — a unit still on a builder seat is in `same_seat` only.
+///
+/// Seats are compared by INSTANCE key for the reassignment (two instances of one cli ARE two
+/// seats, and pooling them is the point of core#591) and by CLI key ([`model_of`]) for the
+/// disclosure, because that is the axis the disclosure is about.
 fn enforce_evaluator_distinct(
     units: &[WorkUnit],
     dists: &mut [Distribution],
     roster_keys: &[String],
     clis: &[AgenticCli],
     candidates: &[Candidates],
-) -> Vec<u32> {
+) -> (Vec<u32>, Vec<u32>) {
     use crate::domain::StageKind;
     let mut same_seat: Vec<u32> = Vec::new();
     let builder_clis: std::collections::HashSet<String> = units
@@ -832,8 +946,11 @@ fn enforce_evaluator_distinct(
         .filter(|(u, _)| matches!(u.stage, StageKind::Build | StageKind::Recon))
         .map(|(_, d)| d.assigned_cli.clone())
         .collect();
+    // The MODELS behind those seats — `{claude}` for builders on `claude#1` and `claude#2` alike.
+    let builder_models: std::collections::HashSet<&str> =
+        builder_clis.iter().map(|k| model_of(k)).collect();
     if builder_clis.is_empty() {
-        return same_seat; // nothing built ⇒ nothing to be distinct from
+        return (same_seat, Vec::new()); // nothing built ⇒ nothing to be distinct from
     }
     // Warn when every roster seat is a builder CLI so operators can detect degraded separation.
     // `find` below will return `None` for every Review/Test unit in this configuration, leaving
@@ -881,7 +998,30 @@ fn enforce_evaluator_distinct(
             }
         }
     }
-    same_seat
+    // (core#591) The disclosure pass, over the FINAL seats — it must see where each review/test
+    // unit actually landed, whether the council put it there or the reassignment above did. A unit
+    // on a seat distinct from every builder SEAT whose CLI is nonetheless a builder's CLI is
+    // instance-distinct, not model-distinct, and the operator must be able to see that on the
+    // wire. `same_seat` units are excluded: `creator_seat` is the stronger, dominating disclosure.
+    //
+    // `!builder_clis.contains(&d.assigned_cli)` is not redundant with `!same_seat.contains(&u.ord)`:
+    // the loop above zips `units` with `candidates`, so a unit past the end of a SHORTER
+    // `candidates` is never visited by it and can sit on a builder seat without being in
+    // `same_seat`. Stating the condition here makes the predicate mean what it says — a seat
+    // distinct from every builder SEAT — instead of inheriting that from another loop's bounds.
+    let same_cli_instance: Vec<u32> = units
+        .iter()
+        .zip(dists.iter())
+        .filter(|(u, d)| {
+            u.tool_cmd.is_none()
+                && matches!(u.stage, StageKind::Review | StageKind::Test)
+                && !same_seat.contains(&u.ord)
+                && !builder_clis.contains(&d.assigned_cli)
+                && builder_models.contains(model_of(&d.assigned_cli))
+        })
+        .map(|(u, _)| u.ord)
+        .collect();
+    (same_seat, same_cli_instance)
 }
 
 /// Whether [`enforce_evaluator_distinct`] warns that evaluator≠creator cannot be enforced: a
@@ -1541,6 +1681,106 @@ mod tests {
                 && expected.contains(&format!("Edit({opr}/**)")),
             "{expected:?}"
         );
+        match prev_hatch {
+            Some(v) => std::env::set_var(hatch, v),
+            None => std::env::remove_var(hatch),
+        }
+        std::env::set_var(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            wicked_apps_core::spawn::hermetic_test_worker_home(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#595 HIGH-3: convening a council that seats a SECONDARY claude ballot (`claude#2`)
+    /// must write the deny fence to the INSTANCE home (`<worker>/claude-2/settings.json`).
+    /// `ensure_shared_worker_fence` writes only `<worker>/claude`; before this fix nothing
+    /// wrote to `claude-2`, so the ballot started unfenced.
+    ///
+    /// FAILS on base (c163cf9): `<worker>/claude-2/settings.json` does not exist.
+    #[test]
+    fn convening_a_secondary_claude_ballot_writes_fence_to_the_instance_home() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let hatch = crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV;
+        let prev_hatch = std::env::var_os(hatch);
+        std::env::remove_var(hatch);
+        let base = std::env::temp_dir().join(format!(
+            "wdistribute-secondary-fence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+
+        let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
+        let seen: Arc<std::sync::Mutex<Vec<AgenticCli>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(RecordingDispatcher {
+            seen: Arc::clone(&seen),
+        });
+
+        distribute_units_on(
+            std::slice::from_ref(&unit),
+            &[claude_seat("claude#2")],
+            "s2",
+            None,
+            &dispatcher,
+            None,
+            None,
+        )
+        .expect("distribute a roster with a secondary claude ballot");
+
+        assert!(
+            base.join("claude-2").join("settings.json").exists(),
+            "the fence must be written at the secondary instance home \
+             (<worker>/claude-2/settings.json); it is missing — the ballot ran without a deny fence"
+        );
+        // Assert specific security-critical deny rules are present.
+        // Hardcoded — NOT computed from shared_deny_rules — so a missing rule in that
+        // function fails this test rather than silently passing. (core#595 evaluator CRITICAL)
+        let bytes = std::fs::read(base.join("claude-2").join("settings.json")).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let deny: Vec<String> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        // Directory fences: derive the expected path from HOME directly, never from
+        // shared_deny_rules — the point is to catch a missing rule in that function.
+        // Fence rules spell every path with forward slashes on every OS (the documented Windows
+        // form is `C:/Users/me/.ssh/**`, execute_wrapped.rs tests). A raw USERPROFILE is
+        // `C:\Users\...`, so normalise the separator HERE with a plain replace — never through
+        // `rule_path`, which is the code under test and would make this assertion vacuous again.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default()
+            .replace('\\', "/");
+        for must_contain in [
+            // Credential and key protection: these are the rules that stop reads of SSH keys,
+            // AWS credentials and git credential files by a worker running in the secondary home.
+            format!("Read({home}/.ssh/**)"),
+            format!("Edit({home}/.ssh/**)"),
+            format!("Read({home}/.aws/**)"),
+            format!("Edit({home}/.aws/**)"),
+            format!("Read({home}/.git-credentials)"),
+            format!("Edit({home}/.git-credentials)"),
+            // Operator tool-config fences: council config and wicked daemon state.
+            format!("Read({home}/.config/wicked-council/**)"),
+            format!("Edit({home}/.config/wicked-council/**)"),
+            // Privilege escalation and remote-write Bash verbs — static, never HOME-dependent.
+            "Bash(sudo:*)".to_string(),
+            "Bash(git push:*)".to_string(),
+            "Bash(gh pr create:*)".to_string(),
+        ] {
+            assert!(
+                deny.contains(&must_contain),
+                "secondary fence at claude-2/settings.json is missing security-critical rule \
+                 {must_contain:?}; full deny list: {deny:#?}"
+            );
+        }
+
         match prev_hatch {
             Some(v) => std::env::set_var(hatch, v),
             None => std::env::remove_var(hatch),
@@ -2895,6 +3135,241 @@ mod tests {
             "exceeded 60s dispatch budget",
         )
     }
+    /// A council-routed distribution on `key`, for the routing passes that take `dists` directly.
+    fn council_dist(key: &str, invocation: &str) -> Distribution {
+        Distribution {
+            assigned_cli: key.into(),
+            assigned_invocation: Some(invocation.into()),
+            council_task_ref: None,
+            routing: RoutingInfo::Council {
+                winner: key.into(),
+                agreement_pct: 100,
+                returned: 1,
+                seated: Some(1),
+                dissent: 0,
+            },
+            seat_constraint: None,
+            degraded_reason: None,
+            benched: Vec::new(),
+            distinctness_fallback: None,
+        }
+    }
+
+    /// (core#591 collision 1) Two instances of ONE cli are TWO seats, so the review unit leaves
+    /// the seat that built what it checks.
+    ///
+    /// PREMISE, verified on origin/main before the change: spelled the only way main's roster
+    /// could spell two instances — two records with the SAME `key` — `builder_clis` (a
+    /// `HashSet<String>` of `assigned_cli`) collapsed both to one entry and this returned
+    /// `same_seat == [2]` with the review left on `"claude"`. Under #591 the second instance is a
+    /// different key, so the set holds two entries and the fence has a seat to move the review to.
+    ///
+    /// The expected values are the methodology rule written out (evaluator ≠ creator ⇒ no unit in
+    /// `same_seat`, and the review's seat is not the build's), never read back from the predicate.
+    #[test]
+    fn two_instances_of_one_cli_are_two_seats_not_one() {
+        let units = build_and_review();
+        let mut dists = [
+            council_dist("claude", "claude -p {PROMPT}"),
+            council_dist("claude", "claude -p {PROMPT}"),
+        ];
+        let clis = [seat("claude"), seat("claude#2")];
+        let roster_keys = vec!["claude".to_string(), "claude#2".to_string()];
+        let (same, same_cli) =
+            enforce_evaluator_distinct(&units, &mut dists, &roster_keys, &clis, &[None, None]);
+        assert_eq!(
+            same,
+            Vec::<u32>::new(),
+            "a SECOND instance of claude is a second seat: the review must not stay on the seat \
+             that built it (review landed on {:?})",
+            dists[1].assigned_cli
+        );
+        assert_eq!(dists[0].assigned_cli, "claude", "the build is untouched");
+        assert_eq!(
+            dists[1].assigned_cli, "claude#2",
+            "the review moves to the second instance"
+        );
+        assert_eq!(
+            dists[1].assigned_invocation.as_deref(),
+            Some("run-claude#2 {PROMPT}"),
+            "…and carries THAT instance's own launch template, not the first record's"
+        );
+        // …and the separation it got is disclosed for what it is: same model, different instance.
+        assert_eq!(
+            same_cli,
+            vec![2],
+            "an instance-distinct evaluator on the creator's cli is disclosed"
+        );
+    }
+
+    /// (core#591 collision 2) A roster that names one seat key twice is REFUSED at plan time.
+    ///
+    /// PREMISE, verified on origin/main before the change: `invocation_of` resolves with
+    /// `.find(|c| c.key == key)`, so two records sharing a key silently resolved to the FIRST —
+    /// `invocation_of(&clis, "claude")` returned `Some("claude --instance-a {PROMPT}")` and the
+    /// second record's template was unreachable. Nothing refused the roster. The fix is the
+    /// refusal, not a disambiguation rule: an identifier that names two different seats is not an
+    /// identifier.
+    #[test]
+    fn a_duplicate_seat_key_is_refused_at_plan_time() {
+        let mut a = seat("claude");
+        a.headless_invocation = "claude --instance-a {PROMPT}".into();
+        let mut b = seat("claude");
+        b.headless_invocation = "claude --instance-b {PROMPT}".into();
+
+        let err = refuse_duplicate_seat_keys(&[a.clone(), b.clone()])
+            .expect_err("a duplicate seat key must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("'claude'"), "the refusal names the key: {msg}");
+        assert!(
+            msg.contains("claude#2"),
+            "…and the remedy, so an operator does not have to guess the spelling: {msg}"
+        );
+
+        // The refusal runs on the WHOLE-PLAN path, before any routing — including for an all-tool
+        // plan, whose roster is just as wrong.
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(SpyDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        for units in [build_and_review().to_vec(), vec![tool_unit(1, "index")]] {
+            let err = distribute_units_against_benched(
+                &units,
+                &[a.clone(), b.clone()],
+                "s1",
+                None,
+                &dispatcher,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .expect_err("the plan is refused before anything routes");
+            assert!(err.to_string().contains("more than once"), "{err}");
+        }
+
+        // The distinct spelling is accepted, and each instance resolves its OWN template.
+        let mut two = b.clone();
+        two.key = "claude#2".into();
+        refuse_duplicate_seat_keys(&[a.clone(), two.clone()]).expect("two instances, two keys");
+        assert_eq!(
+            invocation_of(&[a.clone(), two.clone()], "claude").as_deref(),
+            Some("claude --instance-a {PROMPT}")
+        );
+        assert_eq!(
+            invocation_of(&[a, two], "claude#2").as_deref(),
+            Some("claude --instance-b {PROMPT}")
+        );
+    }
+
+    /// (core#591 S3, BOTH directions) The `distinctnessFallback` disclosure separates the two
+    /// kinds of evaluator distinctness that are NOT the same thing:
+    ///
+    /// * a MODEL-distinct evaluator (codex grading claude) discloses NOTHING — it is the
+    ///   methodology working;
+    /// * an INSTANCE-distinct evaluator (`claude#2` grading `claude#1`) discloses
+    ///   `same_cli_instance` — context separated, model not.
+    ///
+    /// The negative half is the one that matters: a disclosure that fires on every reassignment
+    /// carries no information. Both expected values are the governance rule written out, not read
+    /// back from the routing.
+    #[test]
+    fn an_instance_distinct_evaluator_discloses_and_a_model_distinct_one_does_not() {
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(RecordingDispatcher {
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let fallback_of = |roster: &[AgenticCli]| -> (Option<String>, String) {
+            let dists = distribute_units_against_benched(
+                &build_and_review(),
+                roster,
+                "s1",
+                None,
+                &dispatcher,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .expect("routes");
+            assert_eq!(
+                dists[0].distinctness_fallback, None,
+                "the build is no evaluator"
+            );
+            (
+                dists[1].distinctness_fallback.clone(),
+                dists[1].assigned_cli.clone(),
+            )
+        };
+
+        // Instance-distinct: two seats, ONE cli.
+        let (fallback, seat_key) = fallback_of(&[seat("claude"), seat("claude#2")]);
+        assert_ne!(seat_key, "claude", "the review did move off the build seat");
+        assert_eq!(
+            fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE),
+            "an evaluator on another INSTANCE of the creator's cli must be disclosed"
+        );
+
+        // Model-distinct: two seats, TWO clis. Nothing to disclose.
+        let (fallback, seat_key) = fallback_of(&[seat("claude"), seat("codex")]);
+        assert_ne!(seat_key, "claude", "the review did move off the build seat");
+        assert_eq!(
+            fallback, None,
+            "a genuinely model-distinct evaluator discloses nothing — otherwise the disclosure \
+             says nothing about the run it rides"
+        );
+    }
+
+    /// (core#591) `creator_seat` DOMINATES `same_cli_instance`: a review unit that never left the
+    /// seat that built its work is disclosed as that, not as the weaker instance fallback. Without
+    /// the dominance rule a single-instance roster (`claude` alone) would satisfy both conditions
+    /// — its seat IS a builder seat AND its cli IS a builder cli — and the consumer would read the
+    /// stronger failure as the weaker one.
+    #[test]
+    fn creator_seat_dominates_the_instance_disclosure() {
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(RecordingDispatcher {
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &[seat("claude")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("routes");
+        assert_eq!(dists[1].assigned_cli, "claude");
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT),
+            "a unit still on its creator's seat is the STRONGER disclosure"
+        );
+    }
+
+    /// (core#591) `seat_is_claude` is a question about the MODEL, so it reads the cli key behind
+    /// the instance key. A registry lookup by `claude#2` finds no record and would classify a
+    /// claude instance as `Other` — which would silently bar every second claude instance from
+    /// every Claude-only review unit, the exact pooling core#591 exists to allow.
+    #[test]
+    fn a_second_claude_instance_is_still_judged_a_claude_seat() {
+        let first = claude_seat("claude");
+        let mut second = claude_seat("claude#2");
+        second.headless_invocation = "claude -p {PROMPT}".into();
+        let clis = [first, second];
+        assert!(seat_is_claude(&clis, "claude"), "the control");
+        assert!(
+            seat_is_claude(&clis, "claude#2"),
+            "a second INSTANCE of claude is still a claude seat"
+        );
+        // …and the split it relies on is the same one the configuration home is keyed on.
+        assert_eq!(model_of("claude#2"), "claude");
+        assert_eq!(model_of("claude"), "claude");
+        assert_eq!(model_of("codex#7"), "codex");
+    }
+
     /// A build unit (ord 1) and the review unit (ord 2) that must not share its seat.
     fn build_and_review() -> [WorkUnit; 2] {
         let build = WorkUnit::pending("u1", "s1", 1, "Build the thing");

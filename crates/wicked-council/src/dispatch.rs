@@ -954,7 +954,12 @@ fn run_in_isolation(
     // `Inherit` is the operator's explicit hatch, the same one the worker paths honour. Fail
     // CLOSED when a seat's root cannot be resolved or validated: a ballot on the daemon's
     // configuration is the defect, not a fallback.
-    let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier(program)
+    //
+    // core#591: the CLI comes from the PROGRAM (a bridge is not the CLI it carries) and the
+    // INSTANCE from the seat's roster key, so a second instance of one cli — `claude#2` — ballots
+    // under `<worker home>/claude-2` rather than sharing `claude`'s configuration home with the
+    // first. A key with no instance suffix resolves exactly the root it always has.
+    let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier_seat(program, &cli.key)
         .and_then(|c| c.ensure_dirs().map(|()| c))
     {
         Ok(decision) => decision,
