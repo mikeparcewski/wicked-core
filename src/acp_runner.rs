@@ -1969,6 +1969,7 @@ fn start_acp_process(
         &[],
         &crate::skills_snapshot::SkillsDelivery::None,
         seat_cli,
+        "",
         None,
         operational_home,
     )
@@ -2207,6 +2208,11 @@ fn start_acp_process_with_write_roots(
     // STRIPPED — no ambient configuration path of another CLI, and no ensuring (creating,
     // re-sanitizing) claude's home on a foreign seat's account (codex review, PR#413).
     seat_cli: wicked_apps_core::spawn::SeatCli,
+    // The roster SEAT KEY this bridge runs as (core#591): `claude` or an instance `claude#2`.
+    // Decides the configuration ROOT together with `seat_cli`
+    // (`wicked_apps_core::spawn::seat_config_for_seat`) — an instance runs in its own home
+    // (`<base>/claude-2`), never the primary's. `""` names the cli's only instance.
+    seat_key: &str,
     // `Some((run_id, cli_key))` for a UNIT session: names its per-session settings directory
     // (v3.1 §3). `None` for chat sessions.
     session: Option<(&str, &str)>,
@@ -2224,13 +2230,33 @@ fn start_acp_process_with_write_roots(
     // (created, made private and RE-SANITIZED right here, as before); codex / pi / copilot /
     // opencode get their own roots under the same base (created private); every foreign seat
     // variable is stripped. Fail CLOSED on a resolver error, for every CLI.
-    let seat_config = wicked_apps_core::spawn::seat_config_for(seat_cli).map_err(|e| {
-        anyhow::anyhow!(
+    let seat_config =
+        wicked_apps_core::spawn::seat_config_for_seat(seat_cli, seat_key).map_err(|e| {
+            anyhow::anyhow!(
             "ACP worker config isolation failed ({e}); refusing to start an ACP worker under the \
              operator's own CLI configuration (FINDING-061 / core#410)"
         )
-    })?;
+        })?;
     let worker_config_dir: Option<std::path::PathBuf> = match (&seat_config, seat_cli) {
+        // core#591: a SECONDARY claude instance (`claude#2`) runs in its own home
+        // (`<base>/claude-2`), created, re-sanitized and fenced by the one writer the council
+        // ballot uses for that home (`ensure_secondary_instance_fence`, core#595).
+        (
+            wicked_apps_core::spawn::SeatConfig::Isolated { .. },
+            wicked_apps_core::spawn::SeatCli::Claude,
+        ) if wicked_apps_core::spawn::seat_instance_suffix(seat_key).is_some() => {
+            crate::execute_wrapped::ensure_secondary_instance_fence(seat_key).map_err(|e| {
+                anyhow::anyhow!(
+                    "ACP worker config isolation failed for seat '{seat_key}' ({e}); refusing to \
+                     start it without its instance home's fence (core#591)"
+                )
+            })?;
+            let dir = seat_config.claude_dir().map(std::path::Path::to_path_buf);
+            if dir.is_none() {
+                anyhow::bail!("seat '{seat_key}' resolved no claude configuration home (core#591)");
+            }
+            dir
+        }
         (
             wicked_apps_core::spawn::SeatConfig::Isolated { .. },
             wicked_apps_core::spawn::SeatCli::Claude,
@@ -5765,10 +5791,13 @@ fn scoped_seat_runtime_admission(
 /// The boundary a chat's seats are judged against (core#410, review): the scratch root is the ONE
 /// write root (and the cwd), the scoped repository roots are read-only, `HOME` and — for a claude
 /// seat — its worker config dir get the same carve-outs the governed boundary applies. No phase
-/// scopes: a chat has no phases.
+/// scopes: a chat has no phases. The config dir is the seat INSTANCE's (`seat_key`, core#591):
+/// the same `seat_config_for_seat` the spawn ran the process under, so a `claude#2` chat is judged
+/// against `<base>/claude-2` — never the primary's home (codex review of #605).
 fn chat_boundary(
     scope: &ChatScope,
     seat_cli: wicked_apps_core::spawn::SeatCli,
+    seat_key: &str,
 ) -> crate::gate_hook::BoundaryCtx {
     crate::gate_hook::BoundaryCtx {
         roots: crate::path_policy::AllowedRoots {
@@ -5781,7 +5810,7 @@ fn chat_boundary(
         },
         cwd: scope.cwd.clone(),
         home: std::env::var_os("HOME").map(std::path::PathBuf::from),
-        claude_config_dir: wicked_apps_core::spawn::seat_config_for(seat_cli)
+        claude_config_dir: wicked_apps_core::spawn::seat_config_for_seat(seat_cli, seat_key)
             .ok()
             .and_then(|c| c.claude_dir().map(std::path::Path::to_path_buf)),
         pre_build_scope: false,
@@ -6174,6 +6203,7 @@ impl AcpStepRunner {
             &[],
             &delivery,
             seat_cli,
+            cli_key,
             None,
             self.operational_home.as_deref(),
         )
@@ -6204,7 +6234,7 @@ impl AcpStepRunner {
         }
         // The chat's filesystem boundary, judged on every permission request of every turn on
         // this session (core#410, review): write = the scratch root; read = the scoped roots.
-        proc.chat_boundary = Some(chat_boundary(&scope, seat_cli));
+        proc.chat_boundary = Some(chat_boundary(&scope, seat_cli, cli_key));
         let arc = Arc::new(Mutex::new(proc));
         // Insert under BOTH locks, scopes then sessions (the order `chat_open` takes them): the
         // scope this process was warmed in must still be the recorded one (Copilot, #426 — a
@@ -7255,7 +7285,7 @@ impl AcpStepRunner {
             delivery,
             crate::skills_snapshot::SkillsDelivery::CodexSkillsDir { .. }
         ) {
-            let seat_root = match wicked_apps_core::spawn::seat_config_for(seat_cli)
+            let seat_root = match wicked_apps_core::spawn::seat_config_for_seat(seat_cli, &cli_key)
                 .and_then(|c| c.ensure_dirs().map(|()| c))
             {
                 Ok(c) => c.root().map(std::path::Path::to_path_buf),
@@ -7393,6 +7423,7 @@ impl AcpStepRunner {
                     &estate_provenance,
                     &delivery,
                     seat_cli,
+                    &cli_key,
                     Some((run_id.as_str(), cli_key.as_str())),
                     self.operational_home.as_deref(),
                 ) {
@@ -7889,9 +7920,16 @@ impl AcpStepRunner {
                     // the SAME worker home and needs the same sign-in, so it would only burn a
                     // second refusal. The unit fails with the operator's one-time fix in its
                     // output; the actor benches the seat for the run.
-                    let home_hint = worker_config_home()
-                        .map(|d| d.display().to_string())
-                        .unwrap_or_else(|_| "~/.wicked-worker/claude".to_string());
+                    // core#591: the home THIS seat runs in — an instance signs in its own.
+                    let home_hint = wicked_apps_core::spawn::seat_config_for_seat(
+                        wicked_apps_core::spawn::SeatCli::Claude,
+                        &cli_key,
+                    )
+                    .ok()
+                    .and_then(|c| c.claude_dir().map(std::path::Path::to_path_buf))
+                    .map_or_else(worker_config_home, Ok)
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|_| "~/.wicked-worker/claude".to_string());
                     let reason = format!(
                         "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
                          (crew#267). One-time fix: run `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude \
@@ -8058,10 +8096,17 @@ impl StepRunner for AcpStepRunner {
 /// overlay falls back to built-ins instead of stripping every ACP config.
 fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
     let user = wicked_council::registry::default_user_path();
-    wicked_council::registry::load(user.as_deref())
-        .unwrap_or_else(|_| wicked_council::registry::builtin())
-        .into_iter()
-        .find(|c| c.key == cli_key)
+    let clis = wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin());
+    // core#591: a seat INSTANCE (`claude#2`) reads its cli's record unless the operator gave the
+    // instance one of its own — the same two-step lookup the wrapped carrier applies
+    // (`execute_wrapped::resolve_invocation`), so one key never resolves two ways.
+    for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+        if let Some(c) = clis.iter().find(|c| c.key == key) {
+            return Some(c.clone());
+        }
+    }
+    None
 }
 
 /// The seat identity the ACP carrier judges for ONE launch of `cli_key` (core#396), as the
@@ -8291,6 +8336,7 @@ mod tests {
             estate_provenance,
             delivery,
             wicked_apps_core::spawn::SeatCli::Claude,
+            "",
             session,
             None,
         )
@@ -10381,6 +10427,187 @@ sleep 30
         restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&seen_dir);
+    }
+
+    // ── core#591 KNOWN GAP (prereq of DES-TEAMING-001 S2): instance seats on the ACP spawn ──
+
+    /// A seat INSTANCE key (`claude#2`) resolves its cli's registry record on the ACP path — the
+    /// same two-step `[key, seat_cli_key(key)]` lookup the wrapped carrier applies
+    /// (`execute_wrapped.rs:2169`). An exact record under the instance key still wins; an
+    /// unknown cli behind the `#` still resolves nothing. Fixed facts: the `clis.toml` below is
+    /// the only registry input, and every expected binary is spelled in it.
+    #[test]
+    fn a_seat_instance_key_resolves_its_clis_record_on_the_acp_path() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = worker_home_base("instance-registry-home");
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            r#"
+[[cli]]
+key = "claude"
+display_name = "Claude"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/instance-test/claude-bridge"
+transport = "stdio"
+acp_input_governance = true
+
+[[cli]]
+key = "claude#9"
+display_name = "Claude, instance 9, its own record"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/instance-test/claude-9-bridge"
+transport = "stdio"
+"#,
+        )
+        .unwrap();
+        let prior_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let primary = registry_record("claude").map(|c| c.key);
+        let second = registry_record("claude#2").map(|c| c.key);
+        let exact = registry_record("claude#9").map(|c| c.key);
+        let unknown = registry_record("no-such-cli#2").map(|c| c.key);
+        let facts = acp_launch_facts("claude#2");
+        let facts_exact = acp_launch_facts("claude#9");
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            primary.as_deref(),
+            Some("claude"),
+            "the primary is unchanged"
+        );
+        assert_eq!(
+            second.as_deref(),
+            Some("claude"),
+            "claude#2 has no record of its own, so it reads claude's"
+        );
+        assert_eq!(exact.as_deref(), Some("claude#9"), "an exact record wins");
+        assert_eq!(unknown, None, "an unknown cli resolves nothing");
+        let (cfg, seat_cli, _) = facts.expect("claude#2 finds claude's [cli.acp]");
+        assert_eq!(cfg.binary, "/opt/instance-test/claude-bridge");
+        assert!(cfg.acp_input_governance, "admission rides the cli's record");
+        assert_eq!(seat_cli, wicked_apps_core::spawn::SeatCli::Claude);
+        let (cfg9, _, _) = facts_exact.expect("claude#9 has its own [cli.acp]");
+        assert_eq!(cfg9.binary, "/opt/instance-test/claude-9-bridge");
+    }
+
+    /// Through the REAL spawn: a `claude#2` ACP worker runs with `CLAUDE_CONFIG_DIR` =
+    /// `<base>/claude-2` (not the primary's `<base>/claude`), and that home is fenced (a 0600
+    /// `settings.json` carrying the shared deny rules) and sanitized (a planted `hooks/` and
+    /// `settings.local.json` are gone). The primary `claude` spawn is unchanged: `<base>/claude`.
+    /// Expected paths are joined from the test's own base; expected rules are spelled here.
+    #[test]
+    #[cfg(unix)]
+    fn a_secondary_claude_acp_worker_runs_in_its_own_fenced_sanitized_instance_home() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("instance-home");
+        let base = worker_home_base("instance-home-base");
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        let instance = base.join("claude-2");
+        std::fs::create_dir_all(instance.join("hooks")).unwrap();
+        std::fs::write(instance.join("hooks").join("pre.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            instance.join("settings.local.json"),
+            br#"{"permissions":{"allow":["Read(**)"]}}"#,
+        )
+        .unwrap();
+        let ledger = dir.join("seen-config-dir.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"inst"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+        let spawn = |seat_key: &str| {
+            let _ = std::fs::remove_file(&ledger);
+            let proc = super::start_acp_process_with_write_roots(
+                &stub_config(&script, None),
+                &dir,
+                None,
+                None,
+                &[],
+                &[],
+                &[],
+                &crate::skills_snapshot::SkillsDelivery::None,
+                wicked_apps_core::spawn::SeatCli::Claude,
+                seat_key,
+                Some(("run-instance", seat_key)),
+                None,
+            );
+            let seen = std::fs::read_to_string(&ledger)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            drop(proc);
+            seen
+        };
+        let seen_second = spawn("claude#2");
+        let fence = std::fs::read(instance.join("settings.json"));
+        #[cfg(unix)]
+        let fence_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(instance.join("settings.json"))
+                .map(|m| m.permissions().mode() & 0o777)
+                .ok()
+        };
+        let hooks_left = instance.join("hooks").exists();
+        let local_left = instance.join("settings.local.json").exists();
+        let seen_primary = spawn("claude");
+        restore_hermetic_worker_home();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            std::path::PathBuf::from(&seen_second),
+            instance,
+            "claude#2 runs in its OWN instance home, not the primary's"
+        );
+        let settings: Value =
+            serde_json::from_slice(&fence.expect("the instance fence is written")).unwrap();
+        let deny: Vec<&str> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for rule in ["Bash(sudo:*)", "Bash(git push:*)"] {
+            assert!(
+                deny.contains(&rule),
+                "instance fence lacks {rule:?}: {deny:?}"
+            );
+        }
+        assert_eq!(fence_mode, Some(0o600), "the instance fence is private");
+        assert!(
+            !hooks_left,
+            "a planted hooks/ in the instance home is removed"
+        );
+        assert!(!local_left, "a planted settings.local.json is removed");
+        assert_eq!(
+            std::path::PathBuf::from(&seen_primary),
+            base.join("claude"),
+            "the primary claude seat is unchanged"
+        );
     }
 
     /// core#410 (F-010 / F-068), through the REAL spawn: a bridge carrying a codex / pi /
@@ -12830,19 +13057,25 @@ transport = "stdio"
     /// ballot, read from the real environment — a hardcoded decision would pass the behavioural
     /// tests above while silently deleting the operator's opt-out. Since core#410 that read lives
     /// INSIDE the one shared resolver every seat spawn calls
-    /// (`wicked_apps_core::spawn::seat_config_for`, which returns `Inherit` from
+    /// (`wicked_apps_core::spawn::seat_config_for_seat`, which returns `Inherit` from
     /// `inherits_operator_config()` — the same reader `execute_wrapped::inherits_operator_config`
     /// and the skills admission delegate to), so the four cannot disagree; the audit pins the
-    /// spawn's call to that resolver, keyed on the seat it resolved. Needle built by concatenation
-    /// and matched on whitespace-stripped source so neither this test nor rustfmt can satisfy or
-    /// break it.
+    /// spawn's call to that resolver, keyed on the seat INSTANCE it resolved (core#591: the seat
+    /// key, so `claude#2` gets its own home). Needle built by concatenation and matched on
+    /// whitespace-stripped source so neither this test nor rustfmt can satisfy or break it.
+    /// (Until the codex review of #605 the needle was the primary-only `seat_config_for(seat_cli)`
+    /// spelling, which the spawn had already left behind — only the chat boundary's stale call
+    /// still matched it, the very call that review fixed.)
     #[test]
     fn the_acp_spawn_consults_the_same_inherit_escape_hatch_as_the_wrapped_path() {
         let src: String = include_str!("acp_runner.rs")
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let needle = format!("wicked_apps_core::spawn::{}(seat_cli)", "seat_config_for");
+        let needle = format!(
+            "wicked_apps_core::spawn::{}(seat_cli,seat_key)",
+            "seat_config_for_seat"
+        );
         assert!(
             src.contains(&needle),
             "start_acp_process no longer decides config isolation through the shared per-seat \
@@ -13656,6 +13889,67 @@ os_sandbox = true
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#591 (codex review of #605): a scoped chat on a SECONDARY claude instance is spawned in
+    /// `<base>/claude-2` (`seat_config_for_seat`), so its boundary must carve out THAT home — not
+    /// the primary's `<base>/claude`. Otherwise a routine write into its own state tree
+    /// (`projects/…` memory) is judged outside the carve-out by `boundary_denial_tracked` and
+    /// becomes fatal, while a write into the PRIMARY's home is wrongly tolerated. The base is a
+    /// non-existent absolute path outside the OS temp (the core#264 scratch carve-out would make
+    /// the fatal assertions vacuous under `temp_dir()`), and the expected homes are joined here.
+    #[test]
+    #[cfg(unix)]
+    fn a_secondary_instance_chat_boundary_carves_out_its_own_config_home_not_the_primarys() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = std::path::PathBuf::from("/Users/op/wworker-chat-boundary-instance");
+        let _worker = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let own = base.join("claude-2");
+        let primary = base.join("claude");
+        let scope = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-boundary-instance-scratch"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Claude, "claude#2");
+        assert_eq!(
+            boundary.claude_config_dir.as_deref(),
+            Some(own.as_path()),
+            "the carve-out is the INSTANCE's own config home"
+        );
+        let fatal = |p: &std::path::Path| {
+            crate::gate_hook::boundary_denial_tracked(
+                &boundary.roots,
+                &boundary.cwd,
+                boundary.home.as_deref(),
+                boundary.claude_config_dir.as_deref(),
+                &json!({"path": p.to_string_lossy()}),
+                "Write",
+                None,
+                boundary.estate_store_pinned,
+            )
+            .map(|(_, fatal)| fatal)
+        };
+        assert_eq!(
+            fatal(&own.join("projects").join("p").join("memory.json")),
+            Some(false),
+            "a write into its OWN state tree is blocked but ADVISORY (inside the carve-out)"
+        );
+        assert_eq!(
+            fatal(&primary.join("projects").join("p").join("memory.json")),
+            Some(true),
+            "a write into the PRIMARY's home is outside this seat's carve-out: fatal"
+        );
+        assert_eq!(
+            chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Claude, "claude")
+                .claude_config_dir
+                .as_deref(),
+            Some(primary.as_path()),
+            "the primary seat is unchanged"
+        );
+    }
+
     /// Copilot, #426: a chat's read roots are READ-ONLY for every seat — a permission request to
     /// write under a scoped repository is answered with the agent's reject option, a read under it
     /// and a write in the scratch root with allow, and anything outside both is refused.
@@ -13673,7 +13967,7 @@ os_sandbox = true
             code_graph_db: None,
             read_roots: vec![repo.to_string_lossy().into_owned()],
         };
-        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Codex);
+        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Codex, "");
         let request = |tool: &str, path: &std::path::Path| {
             json!({
                 "sessionId": "s1",
@@ -14357,11 +14651,11 @@ acp_input_governance = true
         };
         let seat = wicked_apps_core::spawn::SeatCli::Codex;
         assert!(
-            !chat_boundary(&unbound, seat).estate_store_pinned,
+            !chat_boundary(&unbound, seat, "").estate_store_pinned,
             "no graph and no env pin ⇒ unpinned"
         );
         assert!(
-            chat_boundary(&bound, seat).estate_store_pinned,
+            chat_boundary(&bound, seat, "").estate_store_pinned,
             "the scope's graph IS the pin (it rides the child's WICKED_ESTATE_DB)"
         );
         let shim = json!({
@@ -14375,9 +14669,9 @@ acp_input_governance = true
             ],
         });
         let (_, allowed_bound) =
-            crate::acp_permission::chat_boundary_result(&chat_boundary(&bound, seat), &shim);
+            crate::acp_permission::chat_boundary_result(&chat_boundary(&bound, seat, ""), &shim);
         let (_, allowed_unbound) =
-            crate::acp_permission::chat_boundary_result(&chat_boundary(&unbound, seat), &shim);
+            crate::acp_permission::chat_boundary_result(&chat_boundary(&unbound, seat, ""), &shim);
         assert!(
             allowed_bound,
             "a read-only shim call needs no argv --db on a graph-bound chat"
@@ -19114,6 +19408,7 @@ transport = "stdio"
                 &[],
                 delivery,
                 wicked_apps_core::spawn::SeatCli::Pi,
+                "pi",
                 Some(("r", "pi")),
                 None,
             )
