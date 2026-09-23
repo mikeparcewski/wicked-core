@@ -385,7 +385,7 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 | `team_dispute` pause: `UnitOutcome.team_pause` set by the fold, performed by the actor | core | fold `src/pipeline.rs:827`, `:1540-1576`; `UnitOutcome` `src/execute.rs:36`; actor `src/actor.rs:5358-5376`, `:5400-5444`; `pause_for_human` `:6071` |
 | `UnitEvidence.team`, `WorkUnit.team_ledger`, `teamLedger` emission | core | `src/workflow.rs:265`, `src/domain.rs`, `src/pipeline.rs:1540` |
 | Ledger into evaluator prior context and rework amendment | core | `src/actor.rs:6650-6700` |
-| Seven `to_json` arms + core-ts `.d.ts` regen | core | `src/event.rs`, `crates/wicked-core-ts` |
+| Six `to_json` arms + core-ts `.d.ts` regen | core | `src/event.rs`, `crates/wicked-core-ts` |
 | `GET /runs/:id/team`, api-types events + DTO | crew | `packages/crew/src/api/routes.ts`, `packages/crew-api-types/index.d.ts` |
 | Gate panel, verdict detail, feed lines | studio | `SteeringGate.tsx`, `VerdictDetail.tsx`, `NarratorFeed.tsx`, `api/client.ts` |
 
