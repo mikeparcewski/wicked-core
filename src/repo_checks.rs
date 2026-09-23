@@ -1232,7 +1232,10 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
         }
     }
     // `e2e` LAST: after the test set, only where the stage admits it (see above).
-    let mut out: Vec<RepoCheck> = [install, typecheck, lint, test, cargo_fmt, cargo, e2e]
+    // The formatter runs right after `install` and BEFORE every other check (core#551 review): a
+    // formatting diff is the cheapest, most deterministic denial, and CI runs it first too. A test
+    // that fails earlier would otherwise skip it and hide the "format first" denial.
+    let mut out: Vec<RepoCheck> = [install, cargo_fmt, typecheck, lint, test, cargo, e2e]
         .into_iter()
         .flatten()
         .collect();
@@ -2743,9 +2746,12 @@ mod tests {
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
         std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let checks = detect(&wt).unwrap();
-        assert_eq!(checks[0].argv, s(&["pnpm", "run", "lint"]));
-        assert_eq!(checks[1].name, "cargo-fmt-check");
-        assert_eq!(checks[1].argv, s(&["cargo", "fmt", "--all", "--check"]));
+        assert_eq!(
+            checks[0].name, "cargo-fmt-check",
+            "the formatter precedes every other check"
+        );
+        assert_eq!(checks[0].argv, s(&["cargo", "fmt", "--all", "--check"]));
+        assert_eq!(checks[1].argv, s(&["pnpm", "run", "lint"]));
         assert_eq!(checks[2].name, "cargo-test");
         assert_eq!(checks[2].argv, s(&["cargo", "test"]));
         // No manifests at all ⇒ nothing detected, and a run of it is a vacuous pass that SAYS so.
@@ -4094,6 +4100,34 @@ mod tests {
         assert_eq!(
             names,
             vec!["install".to_string(), "formatter".to_string()],
+            "{names:?}"
+        );
+    }
+
+    /// core#551 (review): on a Node repo with a `test` script AND a configured formatter, the
+    /// formatter runs before the tests — a failing test must not skip the "format first" denial.
+    #[test]
+    fn a_configured_node_formatter_runs_before_the_test_script() {
+        let wt = scratch("fmt-node-order");
+        std::fs::write(
+            wt.join("package.json"),
+            "{\"name\":\"x\",\"version\":\"0.0.0\",\"scripts\":{\"test\":\"vitest run\"}}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            "{\"formatter\": [\"npm\", \"run\", \"format:check\"]}\n",
+        )
+        .unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "install".to_string(),
+                "formatter".to_string(),
+                "test".to_string()
+            ],
             "{names:?}"
         );
     }
