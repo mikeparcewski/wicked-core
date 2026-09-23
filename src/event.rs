@@ -1137,8 +1137,9 @@ pub enum CoreEvent {
     /// The campaign was cancelled by the operator.
     CampaignCancelled { campaign: String },
     // ── ACP elicitation (DES-002) ────────────────────────────────────────────────────────────────
-    /// An MCP server running inside an ACP adapter called `elicitation/create`; wicked-core minted
-    /// an `elicitationId` and is now waiting for the operator to respond. `session` is the `run_id`.
+    /// An ACP adapter sent `elicitation/create` (e.g. `claude-agent-acp` bridging the model's
+    /// `AskUserQuestion` tool, core#594); wicked-core minted an `elicitationId` and is now waiting
+    /// for the operator to respond. `session` is the `run_id`.
     /// `options` and `prop_type` are ALWAYS explicit in the wire JSON (`null`, never absent key) so
     /// crew's `ElicitationCache` has a stable shape to parse (I-1 / I-5).
     ElicitationCreated {
@@ -1152,8 +1153,9 @@ pub enum CoreEvent {
         message: String,
         /// Predefined selection options, if any (≤ 100 entries; entries > 512 bytes dropped; I-5).
         options: Option<Vec<String>>,
-        /// The JSON Schema `type` of the single expected response property, if the schema carried
-        /// one (e.g. `"string"`, `"boolean"`). `None` when no type constraint was specified.
+        /// The JSON Schema `type` of the single answerable property, if the schema carried one:
+        /// `"string"`, or `"array"` for a multi-select (the chosen option is delivered as a
+        /// one-element array). `None` when no type constraint was specified.
         prop_type: Option<String>,
     },
     /// The elicitation identified by `elicitation_id` reached a terminal state. `session` is the

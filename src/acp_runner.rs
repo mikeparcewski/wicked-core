@@ -127,6 +127,10 @@ pub type WriteReg = Arc<Mutex<HashMap<(String, String, u64), SessionHandles>>>;
 
 // ── ElicitationMaps (DES-002) ─────────────────────────────────────────────────
 
+/// The largest elicitation option (bytes) the decider surface carries; longer entries are
+/// dropped at registration and never count as answerable at validation (core#599 review).
+const ELICITATION_OPTION_CAP: usize = 512;
+
 /// A human response delivered via `resolveElicitation` — the value that
 /// unblocks the `'elicit` dual-poll loop inside `exec_turn_acp`.
 #[derive(Debug, Clone)]
@@ -287,7 +291,7 @@ impl ElicitationMaps {
 
         // Filter options: drop entries > 512 bytes or empty string; cap list at 100.
         let options = options.map(|opts| {
-            const OPT_CAP: usize = 512;
+            const OPT_CAP: usize = ELICITATION_OPTION_CAP;
             const LIST_CAP: usize = 100;
             let mut filtered: Vec<String> = opts
                 .into_iter()
@@ -3263,14 +3267,25 @@ impl TurnResult {
 /// declared `depends_on`. Each block is prefixed with its label so the agent can attribute the
 /// contribution, and a contract header precedes them stating that they are the subject of the task.
 /// When the slice is empty the prompt stays a single text block exactly as before — no header.
-/// Validate an `elicitation/create` `requestedSchema` and, if valid, return
-/// `(prop_name, prop_type)`. Returns `None` when the schema has more than one
-/// property or the single property's `type` is not `"string"`.
+/// Validate an `elicitation/create` `requestedSchema` and, if the decider surface can render
+/// it, return its one answerable field; otherwise `Err(reason)` naming why it is cancelled.
 ///
-/// The guard is deliberately restrictive (OQ-R-5): ACP elicitation is intended
-/// for short confirmations, not for general-purpose forms with rich types. A
-/// multi-property or non-string schema is immediately cancelled so the adapter
-/// cannot stall waiting for a response that wicked-core will never provide.
+/// The decider surface (the `ElicitationCreated` event → crew's pending-elicitation cache →
+/// studio's prompt → `resolve_elicitation`) carries ONE message, at most one option list and
+/// ONE string answer. So this accepts exactly one answerable field, and it accepts the shape
+/// `claude-agent-acp`'s `askUserQuestionsToCreateRequest` really sends for one question
+/// (core#594 — pinned by `tests/fixtures/claude_agent_acp_0_73_0_ask_user_question.json`):
+///
+/// - the question field `question_0`: `type: "string"` with options under `oneOf[].const`
+///   (plain `enum` is read too), or multi-select `type: "array"` with options under
+///   `items.anyOf[].const` (or `items.oneOf` / `items.enum`);
+/// - its optional free-text companion `question_0_custom` — any string property named
+///   `<field>_custom` beside `<field>`. It is left unfilled (the adapter reads an absent
+///   custom answer as "use the selection"), because the surface cannot carry a second answer.
+///
+/// Everything else fails closed with a reason: no properties, more than one answerable field
+/// (a multi-question AskUserQuestion), a non-string/array type, a select whose options are not
+/// all strings, or an array with no option list.
 ///
 /// Re-verified against `@agentclientprotocol/sdk` 1.5.0 (core#234 DoD; #212 checked 1.3.0,
 /// where the method was still spelled `unstable_createElicitation` — the surface has since
@@ -3281,18 +3296,119 @@ impl TurnResult {
 /// this function reads) sits at the top level of the `mode: "form"` variant. A `mode: "url"`
 /// request carries `url`/`elicitationId` and NO `requestedSchema` — non-conforming here,
 /// since `start_acp_process` advertises `elicitation: {form: {}}` and nothing else — and if
-/// one arrived the missing `properties` would return `None` and the arm would cancel it.
-fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>)> {
-    let props = schema.get("properties").and_then(Value::as_object)?;
-    if props.len() != 1 {
-        return None; // zero or >1 properties → cancel
+/// one arrived the missing `properties` would fail validation and the arm would cancel it.
+fn validate_elicitation_schema(schema: &Value) -> Result<ElicitationField, String> {
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "the requested schema has no properties".to_string())?;
+    // A `<field>_custom` string beside `<field>` is the adapter's free-text "Other" companion,
+    // not a second question — but only when the adapter's own marker proves it
+    // (`_meta._askUserQuestionCustomAnswer` naming `<field>` with `isCustomAnswer: true`).
+    // An unmarked `_custom` field is a real field (core#599 review).
+    let is_companion = |name: &str, prop: &Value| {
+        let marker = &prop["_meta"]["_askUserQuestionCustomAnswer"];
+        name.strip_suffix("_custom").is_some_and(|base| {
+            props.contains_key(base) && marker["questionId"].as_str() == Some(base)
+        }) && marker["isCustomAnswer"].as_bool() == Some(true)
+            && prop
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|t| t == "string")
+    };
+    let answerable: Vec<(&String, &Value)> = props
+        .iter()
+        .filter(|(name, prop)| !is_companion(name, prop))
+        .collect();
+    let (key, prop) = match answerable.as_slice() {
+        [] => return Err("the requested schema has no answerable field".to_string()),
+        [one] => *one,
+        many => {
+            return Err(format!(
+                "it asks {} questions in one request and the decider surface carries one \
+                 answer per elicitation",
+                many.len()
+            ))
+        }
+    };
+    let prop_type = prop.get("type").and_then(Value::as_str);
+    let (options, multi_select) = match prop_type {
+        None | Some("string") => (select_options(prop, key)?, false),
+        Some("array") => {
+            let items = prop.get("items").unwrap_or(&Value::Null);
+            match select_options(items, key)? {
+                Some(opts) => (Some(opts), true),
+                None => {
+                    return Err(format!(
+                        "multi-select field `{key}` has no option list to choose from"
+                    ))
+                }
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "field `{key}` has type `{other}`, which the decider surface cannot render"
+            ))
+        }
+    };
+    Ok(ElicitationField {
+        key: key.clone(),
+        prop_type: prop_type.map(str::to_string),
+        options,
+        multi_select,
+    })
+}
+
+/// The one answerable field of a validated `elicitation/create` form (core#594).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElicitationField {
+    /// The `requestedSchema.properties` key the answer is delivered under.
+    key: String,
+    /// The field's JSON Schema `type` (`"string"`, `"array"`), if the schema carried one.
+    prop_type: Option<String>,
+    /// The selectable option values (`const`s / `enum` entries), if the field is a select.
+    options: Option<Vec<String>>,
+    /// Multi-select (`type: "array"`): the chosen option is delivered as a one-element array.
+    multi_select: bool,
+}
+
+/// The option values of a select schema node: `oneOf[].const` / `anyOf[].const` (titled enum,
+/// the adapter's shape) or `enum` (plain). `Ok(None)` when the node is free text; `Err` when
+/// an option list is present but not entirely strings (it could not be answered faithfully),
+/// or when no option survives the filter `ElicitationMaps::register` applies (empty or over
+/// [`ELICITATION_OPTION_CAP`] bytes) — such a select would surface `options: Some([])`, which
+/// no answer can satisfy (core#599 review).
+fn select_options(node: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    let malformed = || format!("field `{key}` has an option that is not a string");
+    let listed = ["oneOf", "anyOf"]
+        .iter()
+        .find_map(|titled| node.get(*titled).and_then(Value::as_array))
+        .map(|arr| {
+            arr.iter()
+                .map(|o| o.get("const").and_then(Value::as_str).map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        })
+        .or_else(|| {
+            node.get("enum").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .map(|o| o.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+            })
+        });
+    let Some(listed) = listed else {
+        return Ok(None);
+    };
+    let answerable: Vec<String> = listed
+        .ok_or_else(malformed)?
+        .into_iter()
+        .filter(|o| !o.is_empty() && o.len() <= ELICITATION_OPTION_CAP)
+        .collect();
+    if answerable.is_empty() {
+        return Err(format!(
+            "field `{key}` has no answerable option to choose from"
+        ));
     }
-    let (prop_name, prop_schema) = props.iter().next()?;
-    let prop_type = prop_schema.get("type").and_then(Value::as_str);
-    if prop_type.is_some_and(|t| t != "string") {
-        return None; // non-string type → cancel
-    }
-    Some((prop_name.clone(), prop_type.map(|s| s.to_string())))
+    Ok(Some(answerable))
 }
 
 /// A stream-aware banner gate over one turn's `agent_message_chunk` deltas (core#410, F-068):
@@ -3883,10 +3999,10 @@ fn exec_turn_acp_posture(
                         continue 'exec;
                     }
 
-                    // Guard 2: schema must have exactly one string-typed property.
-                    let (prop_name, prop_type) = match validate_elicitation_schema(schema) {
-                        Some(v) => v,
-                        None => {
+                    // Guard 2: the schema must be one the decider surface can render (core#594).
+                    let field = match validate_elicitation_schema(schema) {
+                        Ok(field) => field,
+                        Err(reason) => {
                             respond_or_note(
                                 &mut proc.stdin,
                                 &write_lock,
@@ -3896,18 +4012,26 @@ fn exec_turn_acp_posture(
                                 &mut output,
                                 MAX_OUT,
                             );
+                            // Fail closed, but say why: the adapter aborts the tool call on a
+                            // cancel, so the reason is disclosed in the turn output.
+                            tracing::warn!(run_id, %reason, "elicitation cancelled");
+                            append_within_cap(
+                                &mut output,
+                                &format!(
+                                    "\n[wicked-core] cancelled an elicitation the worker raised: \
+                                     {reason}."
+                                ),
+                                MAX_OUT,
+                            );
                             continue 'exec;
                         }
                     };
-
-                    // Extract enum options from the property schema if present.
-                    let options = schema["properties"][&prop_name]["enum"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect::<Vec<_>>()
-                        });
+                    let ElicitationField {
+                        key: prop_name,
+                        prop_type,
+                        options,
+                        multi_select,
+                    } = field;
 
                     // Mint a unique elicitation id and register in the maps.
                     let elicitation_id = uuid::Uuid::new_v4().to_string();
@@ -4022,7 +4146,14 @@ fn exec_turn_acp_posture(
                                 let response_payload = match elicit_action.as_str() {
                                     "accept" => match result.response {
                                         Some(resp_val) => {
-                                            json!({"action":"accept","content":{&prop_key: resp_val}})
+                                            // A multi-select field is typed `array`: the one
+                                            // chosen option rides as a one-element array.
+                                            let value = if multi_select {
+                                                json!([resp_val])
+                                            } else {
+                                                resp_val
+                                            };
+                                            json!({"action":"accept","content":{&prop_key: value}})
                                         }
                                         None => {
                                             elicit_action = "cancel".to_string();
@@ -16145,7 +16276,7 @@ No further next steps — both questions fully answered.";
             }
         });
         assert!(
-            validate_elicitation_schema(&schema).is_none(),
+            validate_elicitation_schema(&schema).is_err(),
             "integer property must be rejected (only string is allowed)"
         );
 
@@ -16156,7 +16287,7 @@ No further next steps — both questions fully answered.";
             }
         });
         assert!(
-            validate_elicitation_schema(&schema_bool).is_none(),
+            validate_elicitation_schema(&schema_bool).is_err(),
             "boolean property must be rejected"
         );
     }
@@ -16172,7 +16303,7 @@ No further next steps — both questions fully answered.";
             }
         });
         assert!(
-            validate_elicitation_schema(&schema).is_none(),
+            validate_elicitation_schema(&schema).is_err(),
             "multi-property schema must be rejected"
         );
     }
@@ -16186,14 +16317,12 @@ No further next steps — both questions fully answered.";
                 "name": { "type": "string" }
             }
         });
-        let result = validate_elicitation_schema(&schema);
-        assert!(
-            result.is_some(),
-            "single-string schema must pass validation"
-        );
-        let (prop_name, prop_type) = result.unwrap();
-        assert_eq!(prop_name, "name");
-        assert_eq!(prop_type, Some("string".to_string()));
+        let field = validate_elicitation_schema(&schema)
+            .unwrap_or_else(|reason| panic!("single-string schema must pass validation: {reason}"));
+        assert_eq!(field.key, "name");
+        assert_eq!(field.prop_type, Some("string".to_string()));
+        assert_eq!(field.options, None, "a plain string field is free text");
+        assert!(!field.multi_select);
     }
 
     /// Schema with a single property but no `type` field → passes (type constraint is optional).
@@ -16205,14 +16334,148 @@ No further next steps — both questions fully answered.";
                 "answer": {}
             }
         });
-        let result = validate_elicitation_schema(&schema);
-        assert!(
-            result.is_some(),
-            "single property with no type must pass validation"
+        let field = validate_elicitation_schema(&schema).unwrap_or_else(|reason| {
+            panic!("single property with no type must pass validation: {reason}")
+        });
+        assert_eq!(field.key, "answer");
+        assert!(field.prop_type.is_none());
+    }
+
+    /// The `requestedSchema` of one request in the adapter fixture (core#594).
+    fn adapter_ask_schema(case: &str) -> Value {
+        let fixture: Value = serde_json::from_str(ASK_USER_QUESTION_FIXTURE).unwrap();
+        fixture[case]["requestedSchema"].clone()
+    }
+
+    /// core#594 contract: the adapter's REAL single-select request (`question_0` + its
+    /// `question_0_custom` companion, options under `oneOf`) validates to one select field.
+    #[test]
+    fn adapter_single_select_schema_is_one_select_field() {
+        let field = validate_elicitation_schema(&adapter_ask_schema("single_select"))
+            .unwrap_or_else(|reason| panic!("the adapter's single-select must validate: {reason}"));
+        assert_eq!(
+            field,
+            ElicitationField {
+                key: "question_0".to_string(),
+                prop_type: Some("string".to_string()),
+                options: Some(vec!["Postgres".to_string(), "SQLite".to_string()]),
+                multi_select: false,
+            }
         );
-        let (prop_name, prop_type) = result.unwrap();
-        assert_eq!(prop_name, "answer");
-        assert!(prop_type.is_none());
+    }
+
+    /// core#594 contract: the adapter's REAL multi-select request (`type: "array"`, options under
+    /// `items.anyOf`) validates to one multi-select field.
+    #[test]
+    fn adapter_multi_select_schema_is_one_multi_select_field() {
+        let field = validate_elicitation_schema(&adapter_ask_schema("multi_select"))
+            .unwrap_or_else(|reason| panic!("the adapter's multi-select must validate: {reason}"));
+        assert_eq!(
+            field,
+            ElicitationField {
+                key: "question_0".to_string(),
+                prop_type: Some("array".to_string()),
+                options: Some(vec!["Rust".to_string(), "TypeScript".to_string()]),
+                multi_select: true,
+            }
+        );
+    }
+
+    /// core#594: two questions in one request stay fail-closed, and the reason names the count.
+    #[test]
+    fn adapter_two_question_schema_is_rejected_with_a_reason() {
+        let reason = validate_elicitation_schema(&adapter_ask_schema("two_questions"))
+            .expect_err("two questions cannot ride the one-answer surface");
+        assert!(reason.contains("2 questions"), "{reason}");
+    }
+
+    /// core#599 review: a `<field>_custom` string WITHOUT the adapter's
+    /// `_meta._askUserQuestionCustomAnswer` marker is a real second field, not the "Other"
+    /// companion, so a two-field form fails closed instead of silently dropping one field.
+    #[test]
+    fn unmarked_custom_suffix_field_is_a_real_field_not_a_companion() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "name": {"type": "string"},
+            "name_custom": {"type": "string"}
+        }, "required": ["name", "name_custom"]});
+        let reason = validate_elicitation_schema(&schema)
+            .expect_err("an unmarked `_custom` field must count as a second field");
+        assert!(reason.contains("2 questions"), "{reason}");
+        // A marker naming a DIFFERENT question, or not claiming to be a custom answer, is not
+        // proof either.
+        for meta in [
+            serde_json::json!({"questionId": "other", "isCustomAnswer": true}),
+            serde_json::json!({"questionId": "name", "isCustomAnswer": false}),
+        ] {
+            let schema = serde_json::json!({"type": "object", "properties": {
+                "name": {"type": "string"},
+                "name_custom": {"type": "string", "_meta": {"_askUserQuestionCustomAnswer": meta}}
+            }});
+            assert!(validate_elicitation_schema(&schema).is_err(), "{meta}");
+        }
+    }
+
+    /// core#599 review: options `register` would drop (empty, or over 512 bytes) must not
+    /// count at validation time — a select left with no answerable option fails closed with a
+    /// reason instead of surfacing `options: Some([])`, which no answer can satisfy.
+    #[test]
+    fn select_with_only_unanswerable_options_fails_closed() {
+        let long = "x".repeat(513);
+        for schema in [
+            serde_json::json!({"type": "object", "properties": {
+                "picks": {"type": "array", "items": {"anyOf": [{"const": ""}]}}
+            }}),
+            serde_json::json!({"type": "object", "properties": {
+                "pick": {"type": "string", "oneOf": [{"const": ""}, {"const": long}]}
+            }}),
+            serde_json::json!({"type": "object", "properties": {
+                "pick": {"type": "string", "enum": [""]}
+            }}),
+        ] {
+            let reason = validate_elicitation_schema(&schema)
+                .expect_err("a select with no answerable option must cancel");
+            assert!(
+                reason.contains("no answerable option"),
+                "{schema}: {reason}"
+            );
+        }
+        // Answerable options survive; the unanswerable ones are not offered.
+        let mixed = serde_json::json!({"type": "object", "properties": {
+            "pick": {"type": "string", "oneOf": [{"const": ""}, {"const": "yes"}, {"const": long}]}
+        }});
+        assert_eq!(
+            validate_elicitation_schema(&mixed).unwrap().options,
+            Some(vec!["yes".to_string()])
+        );
+    }
+
+    /// A plain `enum` select still reads its options; a select with a non-string option, or a
+    /// multi-select with no option list, fails closed.
+    #[test]
+    fn select_schemas_read_enum_and_reject_unrenderable_options() {
+        let plain = serde_json::json!({"type": "object", "properties": {
+            "pick": {"type": "string", "enum": ["yes", "no"]}
+        }});
+        assert_eq!(
+            validate_elicitation_schema(&plain).unwrap().options,
+            Some(vec!["yes".to_string(), "no".to_string()])
+        );
+        let non_string = serde_json::json!({"type": "object", "properties": {
+            "pick": {"type": "string", "oneOf": [{"const": 1, "title": "one"}]}
+        }});
+        assert!(validate_elicitation_schema(&non_string).is_err());
+        let bare_array = serde_json::json!({"type": "object", "properties": {
+            "picks": {"type": "array", "items": {"type": "string"}}
+        }});
+        assert!(validate_elicitation_schema(&bare_array).is_err());
+        // A `_custom` field with no base field is a question in its own right, not a companion.
+        let lone_custom = serde_json::json!({"type": "object", "properties": {
+            "note_custom": {"type": "string"}
+        }});
+        assert_eq!(
+            validate_elicitation_schema(&lone_custom).unwrap().key,
+            "note_custom"
+        );
     }
 
     // ── DES-002 T5 exec_turn_acp arm tests (require a real subprocess, unix only) ──
@@ -16228,6 +16491,10 @@ No further next steps — both questions fully answered.";
     ///   disabled-epoch path returns (does not assert an accept), completes
     /// - `"elicit_multi_prop"`: sends a multi-property schema → must receive immediate cancel, completes
     /// - `"elicit_non_string"`: sends an integer-type schema → immediate cancel, completes
+    /// - `"ask_single"` / `"ask_multi"` / `"ask_two"`: replay claude-agent-acp's real
+    ///   AskUserQuestion request from `ask_fixture.json` beside the script (core#594); the first
+    ///   two require the decider's accept (`question_0` as a string / one-element array), the
+    ///   third requires a cancel
     /// - `"elicit_nested"`: sends two elicitations in rapid succession (to test test-20)
     /// - `"elicit_disconnect"`: sends elicitation then closes stdout (test-19)
     /// - `"perm_id_collision"`: drives TWO turns, walking its own request counter into the
@@ -16337,6 +16604,41 @@ elif behavior == "elicit_unadvertised":
         sys.exit(5)
     w({"jsonrpc": "2.0", "id": prompt_id, "result": {
         "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
+    }})
+
+elif behavior in ("ask_single", "ask_multi", "ask_two"):
+    # core#594: replay claude-agent-acp 0.73.0's REAL AskUserQuestion request, read from the
+    # fixture the test copies next to this script (tests/fixtures/
+    # claude_agent_acp_0_73_0_ask_user_question.json — the adapter's own
+    # askUserQuestionsToCreateRequest output). The expected answers are what the adapter's
+    # applyAskElicitationResponse folds into the tool's `answers`: the chosen option label under
+    # `question_0`, as a string for single-select and a string ARRAY for multi-select.
+    import os
+    if not elic_advertised:
+        sys.exit(3)
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "ask_fixture.json")) as fh:
+        fixture = json.load(fh)
+    params = fixture[{"ask_single": "single_select", "ask_multi": "multi_select",
+                      "ask_two": "two_questions"}[behavior]]
+    w({"jsonrpc": "2.0", "id": "ask-1", "method": "elicitation/create", "params": params})
+    answer = r()
+    result = (answer or {}).get("result")
+    if behavior == "ask_two":
+        # Two questions cannot ride the one-answer decider surface: fail closed.
+        if not isinstance(result, dict) or result.get("action") != "cancel":
+            sys.stderr.write("ask_two: expected cancel, got %r\n" % (answer,))
+            sys.exit(5)
+    else:
+        expected = {
+            "ask_single": {"action": "accept", "content": {"question_0": "Postgres"}},
+            "ask_multi": {"action": "accept", "content": {"question_0": ["Rust"]}},
+        }[behavior]
+        if result != expected:
+            sys.stderr.write("%s: expected %r, got %r\n" % (behavior, expected, answer))
+            sys.exit(2)
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 2}
     }})
 
 elif behavior == "elicit_multi_prop":
@@ -17050,6 +17352,157 @@ transport = "stdio"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// claude-agent-acp 0.73.0's REAL `askUserQuestionsToCreateRequest` output (core#594).
+    const ASK_USER_QUESTION_FIXTURE: &str =
+        include_str!("../tests/fixtures/claude_agent_acp_0_73_0_ask_user_question.json");
+
+    /// Drive one turn of the mock bridge replaying an AskUserQuestion fixture. When `answer` is
+    /// `Some`, a decider thread waits for the elicitation to register and accepts it with that
+    /// option; returns the turn and every emitted command.
+    #[cfg(unix)]
+    fn run_ask_user_question_turn(
+        behavior: &str,
+        answer: Option<&'static str>,
+    ) -> (TurnResult, Vec<Command>) {
+        let run_id = format!("run-594-{behavior}");
+        let dir =
+            std::env::temp_dir().join(format!("wicked-594-{behavior}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ask_fixture.json"), ASK_USER_QUESTION_FIXTURE).unwrap();
+
+        let mut proc = start_mock_proc(&dir, behavior);
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, event_rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        let maps_clone = Arc::clone(&maps);
+        let decider_run = run_id.clone();
+        let decider = std::thread::spawn(move || {
+            let Some(choice) = answer else { return };
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                let id = maps_clone.lock().unwrap().pending.keys().next().cloned();
+                if let Some(id) = id {
+                    maps_clone
+                        .lock()
+                        .unwrap()
+                        .deliver(&decider_run, &id, "accept".to_string(), Some(json!(choice)))
+                        .expect("the decider's option must be accepted");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(6),
+            Arc::clone(&maps),
+            &run_id,
+            1,
+            &tx,
+            None,
+        )
+        .unwrap();
+        decider.join().unwrap();
+        assert!(
+            maps.lock().unwrap().pending.is_empty(),
+            "no elicitation may stay registered after the turn ({behavior})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, event_rx.try_iter().collect())
+    }
+
+    /// The `ElicitationCreated` events among `commands` as `(message, options, prop_type)`.
+    #[cfg(unix)]
+    fn created_elicitations(
+        commands: &[Command],
+    ) -> Vec<(String, Option<Vec<String>>, Option<String>)> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(crate::event::CoreEvent::ElicitationCreated {
+                    message,
+                    options,
+                    prop_type,
+                    ..
+                }) => Some((message.clone(), options.clone(), prop_type.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// core#594: a single-select AskUserQuestion — the adapter's real request carries TWO
+    /// properties (`question_0` with `oneOf` options + the `question_0_custom` "Other" box) —
+    /// reaches the decider with its options, and the chosen option goes back to the worker
+    /// under `question_0`. Before the fix it was auto-cancelled (the mock exits 2 on a cancel).
+    #[test]
+    #[cfg(unix)]
+    fn adapter_single_select_ask_user_question_reaches_the_decider() {
+        let (result, commands) = run_ask_user_question_turn("ask_single", Some("Postgres"));
+        assert_eq!(
+            result.status,
+            StepStatus::Ok,
+            "the worker must receive the decider's answer, not a cancel: {}",
+            result.output
+        );
+        assert_eq!(
+            created_elicitations(&commands),
+            vec![(
+                "Which database should the service use?".to_string(),
+                Some(vec!["Postgres".to_string(), "SQLite".to_string()]),
+                Some("string".to_string()),
+            )],
+            "the question must surface with the adapter's oneOf options"
+        );
+    }
+
+    /// core#594: a multi-select AskUserQuestion (`type: "array"`, options under
+    /// `items.anyOf`) reaches the decider, and the chosen option goes back as a one-element
+    /// ARRAY — the shape the adapter's schema declares.
+    #[test]
+    #[cfg(unix)]
+    fn adapter_multi_select_ask_user_question_reaches_the_decider() {
+        let (result, commands) = run_ask_user_question_turn("ask_multi", Some("Rust"));
+        assert_eq!(
+            result.status,
+            StepStatus::Ok,
+            "the worker must receive the decider's answer as an array: {}",
+            result.output
+        );
+        assert_eq!(
+            created_elicitations(&commands),
+            vec![(
+                "Which languages should the scaffold include?".to_string(),
+                Some(vec!["Rust".to_string(), "TypeScript".to_string()]),
+                Some("array".to_string()),
+            )],
+            "the multi-select question must surface with its items.anyOf options"
+        );
+    }
+
+    /// core#594: two questions in one request cannot ride the one-answer decider surface, so
+    /// the request still fails closed — and the cancel now SAYS why in the turn output.
+    #[test]
+    #[cfg(unix)]
+    fn adapter_two_question_ask_user_question_cancels_and_says_why() {
+        let (result, commands) = run_ask_user_question_turn("ask_two", None);
+        assert_eq!(result.status, StepStatus::Ok, "{}", result.output);
+        assert!(
+            created_elicitations(&commands).is_empty(),
+            "a request that is cancelled must not surface to the decider"
+        );
+        assert!(
+            result.output.contains("cancelled an elicitation")
+                && result.output.contains("2 questions"),
+            "the cancel must disclose its reason in the turn output: {:?}",
+            result.output
+        );
     }
 
     /// Test 15: a valid elicitation schema causes `ElicitationCreated` to be emitted.
@@ -17771,21 +18224,21 @@ transport = "stdio"
             "additionalProperties": false
         });
         assert!(
-            validate_elicitation_schema(&schema_a).is_none(),
+            validate_elicitation_schema(&schema_a).is_err(),
             "zero-properties schema must return None → cancel"
         );
 
         // Schema B: absent requestedSchema → JSON Null.
         let schema_b = serde_json::Value::Null;
         assert!(
-            validate_elicitation_schema(&schema_b).is_none(),
+            validate_elicitation_schema(&schema_b).is_err(),
             "absent (Null) requestedSchema must return None → cancel"
         );
 
         // Schema C: requestedSchema present but no 'properties' key at all.
         let schema_c = serde_json::json!({"type": "object"});
         assert!(
-            validate_elicitation_schema(&schema_c).is_none(),
+            validate_elicitation_schema(&schema_c).is_err(),
             "schema without 'properties' key must return None → cancel"
         );
     }
