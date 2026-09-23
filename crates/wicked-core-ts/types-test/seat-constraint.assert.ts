@@ -23,10 +23,12 @@ const tagIsLiteral: Equal<UnitDistributedEventJson['type'], 'unitDistributed'> =
 const degradedReasonIsStringOrNull: Equal<UnitDistributedEventJson['degradedReason'], string | null> =
   true
 const seatedIsNumberOrNull: Equal<UnitDistributedEventJson['seated'], number | null> = true
-// (core#461) The evaluator ≠ creator fallback is a REAL property with a closed token set.
+// (core#461, core#591) The evaluator ≠ creator fallback is a REAL property with a closed token
+// set of TWO values: the unit stayed on a creator seat, or it moved to another INSTANCE of a
+// creator's cli (context-distinct, not model-distinct).
 const distinctnessFallbackIsTokenOrNull: Equal<
   UnitDistributedEventJson['distinctnessFallback'],
-  'creator_seat' | null
+  'creator_seat' | 'same_cli_instance' | null
 > = true
 
 // Reading a parsed event: narrow on the tag, then the field is `string | null`.
@@ -74,6 +76,11 @@ const constrained: UnitDistributedEventJson = {
 // @ts-expect-error — an unknown routing method is not part of the contract
 const unknownMethod: UnitDistributedEventJson = { ...complete, routingMethod: 'ranked' }
 const fallback: UnitDistributedEventJson = { ...complete, distinctnessFallback: 'creator_seat' }
+// (core#591) …and the instance fallback is the SECOND member of that closed set, not prose.
+const instanceFallback: UnitDistributedEventJson = {
+  ...complete,
+  distinctnessFallback: 'same_cli_instance',
+}
 // @ts-expect-error — the fallback token set is closed
 const unknownFallback: UnitDistributedEventJson = { ...complete, distinctnessFallback: 'other_seat' }
 
@@ -85,4 +92,5 @@ void constrained
 void unknownMethod
 void distinctnessFallbackIsTokenOrNull
 void fallback
+void instanceFallback
 void unknownFallback

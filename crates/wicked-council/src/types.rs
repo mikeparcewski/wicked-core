@@ -339,8 +339,15 @@ impl SeatHealth {
 /// read after the environment changed reads the environment, not a cached spelling.
 #[must_use]
 pub fn default_login_invocation(key: &str) -> Option<String> {
-    use wicked_apps_core::spawn::{seat_config_for, SeatCli, SeatConfig};
-    let (cli, login) = match key {
+    use wicked_apps_core::spawn::{seat_cli_key, seat_config_for_seat, SeatCli, SeatConfig};
+    // (core#591) `key` is a seat INSTANCE key. WHICH command signs a seat in is a property of its
+    // CLI (`claude#2` signs in with `claude`), but WHERE it writes is a property of the instance
+    // (`<worker home>/claude-2`) — so the arm is chosen on the cli key and the root is resolved on
+    // the whole key. Choosing both on the whole key would leave every second instance with no
+    // sign-in surface at all; resolving the root on the cli key would send the operator to sign in
+    // a directory no second instance runs under, which is exactly the F-013/F-010 mismatch this
+    // function exists to prevent.
+    let (cli, login) = match seat_cli_key(key) {
         // The worker home (crew#267 option 3): sign in the ENGINE-owned config dir, not the
         // operator's — inside the REPL, `/login` runs the URL+paste flow.
         "claude" => (SeatCli::Claude, "claude"),
@@ -356,7 +363,7 @@ pub fn default_login_invocation(key: &str) -> Option<String> {
         "agy" => (SeatCli::Agy, "agy"),
         _ => return None,
     };
-    match seat_config_for(cli) {
+    match seat_config_for_seat(cli, key) {
         Ok(SeatConfig::Inherit) => Some(login.to_string()),
         Ok(cfg @ SeatConfig::Isolated { .. }) => {
             // The sign-in command writes CREDENTIALS into the seat's directories, before any engine
@@ -1559,6 +1566,78 @@ mod login_tests {
             );
             let _ = std::fs::remove_dir_all(&base2);
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#591) A SECOND instance of a cli has a sign-in command of its own, and it names that
+    /// instance's OWN root — the command is the cli's, the directory is the instance's.
+    ///
+    /// The failure this pins is not "no command": it is a command that signs in the FIRST
+    /// instance's directory while the second instance runs elsewhere — the same F-013/F-010 shape
+    /// (roster says signed in, every ballot says Not logged in) that this derivation exists for.
+    /// Deriving the arm on the whole key instead would be the other failure: no sign-in surface at
+    /// all for every second instance.
+    ///
+    /// This derives a STRING and prepares directories. It signs nothing in and reads no credential.
+    #[test]
+    fn a_second_instance_signs_in_its_own_root() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            // Under the hatch every seat runs on the operator's own configuration, so the command
+            // is the plain one for the cli behind the instance.
+            assert_eq!(
+                default_login_invocation("codex#2").as_deref(),
+                Some("codex login")
+            );
+            return;
+        }
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("wc-login-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let got: Vec<Option<String>> = ["claude", "claude#2", "codex#2", "claude#"]
+            .into_iter()
+            .map(default_login_invocation)
+            .collect();
+        match &prior {
+            Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
+            None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
+        }
+        let q = |p: std::path::PathBuf| shell_double_quote(&p.display().to_string());
+        // The expected strings are written out from the rule (cli's command, instance's root),
+        // never read back from the resolver under test.
+        assert_eq!(
+            got[0],
+            Some(format!(
+                "CLAUDE_CONFIG_DIR={} claude",
+                q(base.join("claude"))
+            )),
+            "instance one is unchanged"
+        );
+        assert_eq!(
+            got[1],
+            Some(format!(
+                "CLAUDE_CONFIG_DIR={} claude",
+                q(base.join("claude-2"))
+            )),
+            "instance two signs in ITS OWN directory with the cli's own command"
+        );
+        assert_ne!(got[0], got[1], "two instances, two sign-in directories");
+        assert_eq!(
+            got[2],
+            Some(format!(
+                "CODEX_HOME={} codex login",
+                q(base.join("codex-2"))
+            )),
+            "the same rule for a cli whose command is not its bare name"
+        );
+        assert_eq!(
+            got[3], None,
+            "an unacceptable instance suffix has NO sign-in surface — fail closed, exactly as an \
+             unresolvable seat root does, never a fallback onto instance one's directory"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

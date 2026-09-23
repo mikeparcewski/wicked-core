@@ -2798,9 +2798,16 @@ fn arm_input_governance(
     })
 }
 
-/// Resolve a CLI key to its headless invocation template. Reads the council registry (built-ins +
+/// Resolve a SEAT key to its headless invocation template. Reads the council registry (built-ins +
 /// the user's `~/.config/wicked-council/clis.toml`); if the key isn't registered, treats the key
 /// itself as the binary (`<key> {PROMPT}`) so an ad-hoc binary still runs.
+///
+/// (core#591) A seat key may name an INSTANCE — `claude#2` — which the registry does not hold a
+/// record for: the registry describes CLIs, and an instance is a second seat running one. The
+/// instance's own template comes off the LAUNCH ROSTER and is handed down as
+/// `assigned_invocation` ([`launch_invocation`]); this resolver is the fallback for when there
+/// isn't one, so it falls back to the CLI's record before the last-resort `<key> {PROMPT}` —
+/// otherwise a `claude#2` seat with no roster template would exec a binary named `claude#2`.
 pub(crate) fn resolve_invocation(cli_key: &str) -> String {
     // Resolve the operator clis.toml through the SAME shared helper as resolve_seat_posture and the
     // vote path (HOME → USERPROFILE). A hand-rolled HOME-only lookup here would, on Windows, apply
@@ -2808,13 +2815,20 @@ pub(crate) fn resolve_invocation(cli_key: &str) -> String {
     // a mismatched launch (Copilot, crew#427).
     let user = wicked_council::registry::default_user_path();
     if let Ok(clis) = wicked_council::registry::load(user.as_deref()) {
-        if let Some(c) = clis.iter().find(|c| c.key == cli_key) {
-            if !c.headless_invocation.trim().is_empty() {
-                return c.headless_invocation.clone();
+        // The exact key first, then the CLI behind it — an operator who registers `claude#2`
+        // outright still wins over the `claude` record.
+        for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+            if let Some(c) = clis.iter().find(|c| c.key == key) {
+                if !c.headless_invocation.trim().is_empty() {
+                    return c.headless_invocation.clone();
+                }
             }
         }
     }
-    format!("{cli_key} {{PROMPT}}")
+    format!(
+        "{} {{PROMPT}}",
+        wicked_apps_core::spawn::seat_cli_key(cli_key)
+    )
 }
 
 /// The declared sandbox/trust posture flags for `cli_key`, from the merged registry (built-ins
@@ -7793,6 +7807,15 @@ mod tests {
         // A key not in the registry becomes `<key> {PROMPT}`.
         let inv = resolve_invocation("definitely-not-a-registered-cli-xyz");
         assert_eq!(inv, "definitely-not-a-registered-cli-xyz {PROMPT}");
+        // (core#591) …and the last-resort binary for an INSTANCE key is the CLI behind it, never
+        // the instance key itself: no host has a binary called `definitely-not-…-xyz#2`, so a
+        // second instance of an ad-hoc seat would fail to spawn instead of running the same
+        // binary. The `#` split is the one in `wicked_apps_core::spawn`, which is also what keys
+        // the seat's configuration home — one spelling for both.
+        assert_eq!(
+            resolve_invocation("definitely-not-a-registered-cli-xyz#2"),
+            "definitely-not-a-registered-cli-xyz {PROMPT}"
+        );
     }
 
     // ── B-runner adapters (DES-STUDIO-COCKPIT-001 §3 / §6b) ──────────────────────────────────────────

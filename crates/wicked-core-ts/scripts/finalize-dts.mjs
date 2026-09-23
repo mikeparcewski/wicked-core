@@ -93,8 +93,9 @@ const HAND_AUTHORED = `${BEGIN}
  * entry carries \`outcome\`, \`boundS\`, \`boundNote\`, \`failureIds\`, \`classification: 'regression' |
  * 'pre_existing_in_sandbox' | 'floor_env_mismatch' | null\` (only a regression denies), \`preExisting\`,
  * \`regressions\` and \`base: {head, cached, run, error} | null\` (the same check run on the run base).
- * core#461 (additive): unitDistributed.distinctnessFallback ('creator_seat' | null — the
- * evaluator ≠ creator fallback as a field, see UnitDistributedEventJson); gateEscalated.condition
+ * core#461/#591 (additive): unitDistributed.distinctnessFallback ('creator_seat' |
+ * 'same_cli_instance' | null — the evaluator ≠ creator fallback as a field, see
+ * UnitDistributedEventJson); gateEscalated.condition
  * gains the class 'dead_seat' (denialSource 'dead_seat'): a worker exited on a dead-seat refusal
  * (signed out / quota / not installed) and no eligible seat remains — the attended run pauses at
  * the escalation gate instead of failing.
@@ -144,18 +145,26 @@ export interface UnitDistributedEventJson extends CoreEventJson {
    */
   seatConstraint: string | null
   /**
-   * (core#461) The evaluator ≠ creator DISCLOSURE as a field: \`'creator_seat'\` when a review/test
-   * unit STAYS on a seat that built what it checks because no eligible seat distinct from the
-   * builders admits it. \`null\` otherwise.
+   * (core#461, core#591) The evaluator ≠ creator DISCLOSURE as a field. \`null\` when there is
+   * nothing to disclose. Two values:
    *
-   * The roster is always BENCH-FREE when this is set (core#560/#567): a bench that leaves a
-   * review/test unit no distinct seat REFUSES the plan instead, so that case never reaches the
-   * wire. Three shapes set it — a one-seat roster; a roster whose every seat was assigned a
-   * Build/Recon unit; and one whose only non-builder seats the unit's skills refuse.
-   * \`degradedReason\` does NOT name this: the field is the disclosure. The seat the unit stays on
-   * is therefore always a still-eligible one. Additive.
+   * - \`'creator_seat'\` — a review/test unit STAYS on a seat that built what it checks because no
+   *   eligible seat distinct from the builders admits it.
+   * - \`'same_cli_instance'\` — the unit IS on a seat distinct from every builder seat, but that
+   *   seat runs the SAME cli as a builder (\`claude#2\` grading \`claude#1\`: two seat INSTANCES of
+   *   one cli). Instance distinctness removes the creator's CONTEXT, not the model's blind spots
+   *   — same weights, same failure modes. Read it as a model-distinct evaluator and you are
+   *   accepting a degraded gate, so it is on the wire. \`'creator_seat'\` dominates when both
+   *   would apply.
+   *
+   * The paragraph below is about \`'creator_seat'\` only. The roster is always BENCH-FREE when it
+   * is set (core#560/#567): a bench that leaves a review/test unit no distinct seat REFUSES the
+   * plan instead, so that case never reaches the wire. Three shapes set it — a one-seat roster; a
+   * roster whose every seat was assigned a Build/Recon unit; and one whose only non-builder seats
+   * the unit's skills refuse. \`degradedReason\` does NOT name either value: the field is the
+   * disclosure. The seat the unit stays on is therefore always a still-eligible one. Additive.
    */
-  distinctnessFallback: 'creator_seat' | null
+  distinctnessFallback: 'creator_seat' | 'same_cli_instance' | null
 }
 
 /**

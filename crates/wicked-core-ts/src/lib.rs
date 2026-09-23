@@ -2366,9 +2366,11 @@ mod tests {
                 // the unit's skill is Claude-only in the handed snapshot. Additive; emitted
                 // unconditionally (null when unconstrained), the `degradedReason` rule.
                 "seatConstraint",
-                // (core#461) The evaluator≠creator fallback as a field (`"creator_seat"` | null):
-                // a review/test unit that stays on a builder seat because no distinct eligible seat
-                // admits it. Additive; emitted unconditionally.
+                // (core#461, core#591) The evaluator≠creator fallback as a field
+                // (`"creator_seat"` | `"same_cli_instance"` | null): a review/test unit that stays
+                // on a builder seat because no distinct eligible seat admits it, or one on a seat
+                // that is a different INSTANCE of a builder's cli. Additive; emitted
+                // unconditionally.
                 "distinctnessFallback",
             ],
         );

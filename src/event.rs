@@ -144,9 +144,19 @@ pub enum CoreEvent {
         /// roster seat was a candidate. Additive: `routing_method` and its fields read exactly as
         /// before; a one-candidate narrowing is the truthful 1-of-1 `council` verdict.
         seat_constraint: Option<String>,
-        /// (core#461) The evaluator≠creator DISCLOSURE as a field: `Some("creator_seat")` when a
-        /// review/test unit STAYS on a seat that built what it checks because no eligible seat
-        /// distinct from the builders admits it; `None` (wire `null`) otherwise.
+        /// (core#461, core#591) The evaluator≠creator DISCLOSURE as a field; `None` (wire `null`)
+        /// when there is nothing to disclose. Two values:
+        ///
+        /// * `Some("creator_seat")` — a review/test unit STAYS on a seat that built what it checks
+        ///   because no eligible seat distinct from the builders admits it.
+        /// * `Some("same_cli_instance")` (core#591) — the unit IS on a seat distinct from every
+        ///   builder seat, but that seat runs the SAME CLI as a builder (`claude#2` grading
+        ///   `claude#1`). Instance distinctness removes the creator's context, not the model's
+        ///   blind spots; a consumer that treats it as a model-distinct evaluator is accepting a
+        ///   degraded gate, so it is on the wire rather than assumed away. `creator_seat`
+        ///   dominates when both would apply.
+        ///
+        /// The paragraph below is about `creator_seat` only.
         ///
         /// The roster is always BENCH-FREE when this is set (core#560/#567): a bench that leaves a
         /// review/test unit no distinct seat REFUSES the plan instead, so that case never reaches
@@ -1332,7 +1342,8 @@ impl CoreEvent {
                     // consumer never has to guess whether absence means "no constraint" or "field
                     // not sent" (core#401).
                     "seatConstraint": seat_constraint,
-                    // (core#461) Same rule: a consumer keys on `"creator_seat"`, never on prose.
+                    // (core#461, core#591) Same rule: a consumer keys on the TOKEN —
+                    // `"creator_seat"` or `"same_cli_instance"` — never on prose.
                     "distinctnessFallback": distinctness_fallback,
                 })
             }
@@ -2392,6 +2403,13 @@ mod tests {
             j["routingMethod"], "council",
             "the routing fields read as before"
         );
+        // (core#591) The SECOND value rides the same field verbatim — a consumer keys on the
+        // token, so it must reach the wire unmapped, not folded into the first one.
+        let j = ev(Some(
+            crate::distribute::DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE,
+        ))
+        .to_json();
+        assert_eq!(j["distinctnessFallback"], "same_cli_instance");
         let j = ev(None).to_json();
         assert!(
             j.as_object().unwrap().contains_key("distinctnessFallback"),

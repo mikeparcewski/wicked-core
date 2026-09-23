@@ -1215,20 +1215,117 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The configuration decision for ONE seat spawn of `cli` (core#410): `Inherit` under the
-/// operator's hatch; else every known CLI gets its own root under the validated worker home base
-/// — claude `<base>/claude` (`CLAUDE_CONFIG_DIR`, the dir FINDING-061 introduced), codex
-/// `<base>/codex` (`CODEX_HOME`), pi `<base>/pi` (`PI_CODING_AGENT_DIR`), copilot
-/// `<base>/copilot` (`COPILOT_HOME`), opencode `<base>/opencode/{config,data,state}`
-/// (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`), agy `<base>/agy` ([`HOME_ENV`] — it
-/// publishes no configuration-home variable, so its hard-coded `~/.gemini/…` paths are moved by
-/// moving the home) — and every OTHER seat variable stripped. An unknown CLI is isolated by
-/// stripping alone. `Err` is the resolver failing (no home
-/// directory, a relative or `..` override, a planted link); callers fail CLOSED, as for claude.
+/// (core#591) The separator between a seat's CLI key and its INSTANCE suffix in a roster key:
+/// `claude#2` is a SECOND instance of the `claude` CLI, `claude` is the first. A key with no
+/// separator names the CLI itself, so every roster written before #591 reads exactly as it did.
+///
+/// The model key is a PREFIX of the instance key rather than a second roster field. That is what
+/// makes the mapping total (every seat key has a CLI key, including an operator's own `myclaude`)
+/// and what makes [`seat_instance_root_name`] injective — two different instance keys can never
+/// resolve to one configuration home, which would silently merge two seats' credential stores.
+pub const SEAT_INSTANCE_SEP: char = '#';
+
+/// The CLI (MODEL) key a seat key names — what a predicate about the MODEL must read (core#591):
+/// `"claude#2"` → `"claude"`, `"claude"` → `"claude"`, `"my-claude"` → `"my-claude"`.
+#[must_use]
+pub fn seat_cli_key(seat_key: &str) -> &str {
+    match seat_key.split_once(SEAT_INSTANCE_SEP) {
+        Some((cli, _)) => cli,
+        None => seat_key,
+    }
+}
+
+/// The INSTANCE suffix of a seat key (core#591), `None` when the key names the CLI's only
+/// instance: `"claude#2"` → `Some("2")`, `"claude"` → `None`, `"claude#"` → `Some("")` (refused
+/// downstream by [`seat_instance_root_name`], never silently treated as the base seat).
+#[must_use]
+pub fn seat_instance_suffix(seat_key: &str) -> Option<&str> {
+    seat_key.split_once(SEAT_INSTANCE_SEP).map(|(_, s)| s)
+}
+
+/// The seat root's DIRECTORY NAME for one instance (core#591): `root_name` itself for the CLI's
+/// only instance, else `<root_name>-<suffix>` — `claude#2` → `claude-2`.
+///
+/// The suffix is `[A-Za-z0-9_]+` and nothing else, and an unacceptable one is REFUSED rather than
+/// sanitized. Two reasons, both load-bearing:
+///
+/// 1. A sanitizing map is not injective — `claude#2` and `claude#/2` would both fold to
+///    `claude-2`, and two roster seats sharing ONE configuration home is the isolation this
+///    resolver exists to provide, silently undone.
+/// 2. The suffix arrives on the launch roster, so it is caller-supplied: `..`, `/`, `\` and an
+///    empty suffix (`claude#`) are all spellable and all re-aim or collapse the root. No seat
+///    root's `root_name` contains `-`, so `<root_name>-<suffix>` can collide with neither another
+///    CLI's root nor a bare `root_name`.
+fn seat_instance_root_name(root_name: &str, suffix: Option<&str>) -> anyhow::Result<String> {
+    let Some(suffix) = suffix else {
+        return Ok(root_name.to_string());
+    };
+    if suffix.is_empty()
+        || !suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        anyhow::bail!(
+            "seat instance suffix {suffix:?} after `{SEAT_INSTANCE_SEP}` is not \
+             [A-Za-z0-9_]+; a seat key spells one instance as `{root_name}{SEAT_INSTANCE_SEP}2` \
+             (anything else is refused rather than sanitized — two seat keys must never resolve \
+             to one configuration home)"
+        );
+    }
+    Ok(format!("{root_name}-{suffix}"))
+}
+
+/// The configuration decision for ONE seat spawn of `cli` (core#410) — the CLI's only instance.
+/// [`seat_config_for_seat`] is the same decision for a named seat, which may be a SECOND instance
+/// of the same CLI (core#591).
 pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
+    seat_config_for_seat(cli, "")
+}
+
+/// The configuration decision for ONE seat spawn of `cli` under roster key `seat_key` (core#410,
+/// core#591): `Inherit` under the operator's hatch; else every known CLI gets its own root under
+/// the validated worker home base — claude `<base>/claude` (`CLAUDE_CONFIG_DIR`, the dir
+/// FINDING-061 introduced), codex `<base>/codex` (`CODEX_HOME`), pi `<base>/pi`
+/// (`PI_CODING_AGENT_DIR`), copilot `<base>/copilot` (`COPILOT_HOME`), opencode
+/// `<base>/opencode/{config,data,state}` (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`),
+/// agy `<base>/agy` ([`HOME_ENV`] — it publishes no configuration-home variable, so its hard-coded
+/// `~/.gemini/…` paths are moved by moving the home) — and every OTHER seat variable stripped. An
+/// unknown CLI is isolated by stripping alone. `Err` is the resolver failing (no home directory, a
+/// relative or `..` override, a planted link, an unacceptable instance suffix); callers fail
+/// CLOSED, as for claude.
+///
+/// (core#591) A seat key carrying an INSTANCE suffix — `claude#2` — moves the whole decision to
+/// `<base>/claude-2`: every variable above is set against THAT root, so two instances of one CLI
+/// read and write two disjoint configuration homes. A key with no suffix (`claude`, and an
+/// operator's own `my-claude`) resolves exactly as before. This is a PATH decision and nothing
+/// else — it moves where a CLI reads its configuration from; it does not create, move, read or
+/// write any credential, and nothing here consults a credential store.
+pub fn seat_config_for_seat(cli: SeatCli, seat_key: &str) -> anyhow::Result<SeatConfig> {
     if inherits_operator_config() {
         return Ok(SeatConfig::Inherit);
     }
+    seat_config_in(worker_home_base, cli, seat_key)
+}
+
+/// [`seat_config_for_seat`] against an explicit worker home base — the pure core, so the root
+/// layout and the planted-link refusal are testable without moving the process's own
+/// [`WORKER_HOME_ENV`] out from under a parallel test. Does NOT consult the operator's hatch: the
+/// caller above does, once.
+///
+/// The base is resolved LAZILY, and that ordering is load-bearing: a CLI with no configuration
+/// home of its own (`SeatCli::Other`) is isolated by stripping alone and must never be refused for
+/// a worker home it does not use. A ballot on a non-claude program under a relative
+/// `WICKED_WORKER_HOME` is refused the moment this resolves eagerly — it was, until
+/// `a_differently_cased_claude_is_not_a_claude_carrier_on_a_case_sensitive_filesystem` and
+/// `a_relative_worker_home_refuses_the_claude_ballot_before_spawning` caught it.
+///
+/// An instance suffix is likewise not validated for a rootless CLI: nothing consumes it there
+/// (the decision is identical for every instance), so there is no ambiguity to refuse.
+fn seat_config_in(
+    base: impl FnOnce() -> anyhow::Result<std::path::PathBuf>,
+    cli: SeatCli,
+    seat_key: &str,
+) -> anyhow::Result<SeatConfig> {
     let Some(name) = cli.root_name() else {
         return Ok(SeatConfig::Isolated {
             cli,
@@ -1237,7 +1334,8 @@ pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
             strip: SEAT_CONFIG_ENV.to_vec(),
         });
     };
-    let root = worker_home_base()?.join(name);
+    let name = seat_instance_root_name(name, seat_instance_suffix(seat_key))?;
+    let root = base()?.join(name);
     refuse_symlinked_home(&root)?;
     let set: Vec<(&'static str, std::path::PathBuf)> = match cli {
         SeatCli::Claude => vec![(CLAUDE_CONFIG_DIR_ENV, root.clone())],
@@ -1285,7 +1383,17 @@ pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
 /// [`seat_config_for`] judged on the binary a spawn is about to run — the wrapped worker's
 /// template binary, the ballot's program, the ACP seat record's `binary` (never the bridge).
 pub fn seat_config_for_carrier(carrier_binary: &str) -> anyhow::Result<SeatConfig> {
-    seat_config_for(SeatCli::from_binary(carrier_binary))
+    seat_config_for_carrier_seat(carrier_binary, "")
+}
+
+/// [`seat_config_for_seat`] judged on the binary a spawn is about to run, for the roster seat
+/// `seat_key` (core#591). The CLI comes from the BINARY (a bridge is not the CLI it carries) and
+/// the instance from the KEY, so `claude#2` running `claude` resolves `<base>/claude-2`.
+pub fn seat_config_for_carrier_seat(
+    carrier_binary: &str,
+    seat_key: &str,
+) -> anyhow::Result<SeatConfig> {
+    seat_config_for_seat(SeatCli::from_binary(carrier_binary), seat_key)
 }
 
 /// TEST-SUPPORT — never call from runtime code. Points [`WORKER_HOME_ENV`] at one per-process
@@ -2817,5 +2925,267 @@ rebase.autosquash\0";
         assert!(ok && refs.contains("refs/heads/main"), "{refs}");
         restore_global(&prior_global);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------
+    // core#591 S2 — the configuration home is keyed on the seat INSTANCE.
+    //
+    // Every assertion below is a PATH/ENV assertion over a temp base. Nothing here creates,
+    // reads, writes or probes a credential store, and nothing launches a CLI.
+    // ---------------------------------------------------------------------
+
+    /// A private temp directory for one test, under the process temp dir.
+    fn instance_fixture_base(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-seat-instance-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("fixture base");
+        // macOS spells the process temp dir through the root-owned `/tmp -> /private/tmp` link,
+        // which `refuse_symlinked_home` follows by design; resolve it so the fixture's OWN
+        // planted link is the only symlink under test.
+        std::fs::canonicalize(&base).expect("fixture base resolves")
+    }
+
+    /// (core#591) TWO instances of ONE cli get DISTINCT configuration homes, and each CLI's own
+    /// configuration-home variable points at ITS OWN root — for every seat that has one.
+    ///
+    /// The expected roots are written out literally (`claude` / `claude-2`, …), not read back from
+    /// the decision under test: the rule is "the instance suffix names a sibling directory", and a
+    /// test that asked the resolver what it resolved would pass however it resolved.
+    #[test]
+    fn two_instances_of_one_cli_get_distinct_config_homes() {
+        use std::path::PathBuf;
+        use SeatCli::*;
+        let base = instance_fixture_base("distinct");
+        let roots = |cli: SeatCli, key: &str| -> (PathBuf, Vec<(&'static str, PathBuf)>) {
+            match seat_config_in(|| Ok(base.clone()), cli, key).expect("resolves") {
+                SeatConfig::Isolated {
+                    root: Some(root),
+                    set,
+                    ..
+                } => (root, set),
+                other => panic!("{cli:?}/{key}: expected an isolated decision, got {other:?}"),
+            }
+        };
+        // Seat, first-instance key, second-instance key, base dir name, and the variables each
+        // sets — spelled out, so the assertion does not re-derive anything from the resolver.
+        let one = base.join("claude");
+        let two = base.join("claude-2");
+        assert_ne!(one, two, "the fixture's own two roots differ");
+        for (cli, dir, vars) in [
+            (Claude, "claude", vec![CLAUDE_CONFIG_DIR_ENV]),
+            (Codex, "codex", vec![CODEX_HOME_ENV]),
+            (Pi, "pi", vec![PI_AGENT_DIR_ENV]),
+            (Copilot, "copilot", vec![COPILOT_HOME_ENV]),
+            (Agy, "agy", vec![HOME_ENV]),
+            (
+                Opencode,
+                "opencode",
+                vec![XDG_CONFIG_HOME_ENV, XDG_DATA_HOME_ENV, XDG_STATE_HOME_ENV],
+            ),
+        ] {
+            let (first_root, first_set) = roots(cli, dir);
+            let (second_root, second_set) = roots(cli, &format!("{dir}#2"));
+            assert_eq!(
+                first_root,
+                base.join(dir),
+                "{cli:?}: instance one keeps <base>/{dir}"
+            );
+            assert_eq!(
+                second_root,
+                base.join(format!("{dir}-2")),
+                "{cli:?}: instance two is <base>/{dir}-2"
+            );
+            assert_ne!(
+                first_root, second_root,
+                "{cli:?}: two instances are two configuration homes"
+            );
+            // …and every variable the seat sets is aimed INSIDE its own instance's root.
+            for (set, root) in [(&first_set, &first_root), (&second_set, &second_root)] {
+                assert_eq!(
+                    set.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                    vars,
+                    "{cli:?}: the variables this seat sets"
+                );
+                for (var, dir) in set {
+                    assert!(
+                        dir.starts_with(root),
+                        "{cli:?}: {var}={} must sit under {}",
+                        dir.display(),
+                        root.display()
+                    );
+                }
+            }
+            // The two instances' variables never point at the same place — the property the
+            // whole seam exists for, asserted on the VALUES, not on the roots they came from.
+            for ((var, a), (_, b)) in first_set.iter().zip(second_set.iter()) {
+                assert_ne!(
+                    a, b,
+                    "{cli:?}: {var} must differ between instance one and instance two"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#591) The instance suffix is REFUSED unless it is `[A-Za-z0-9_]+` — never sanitized.
+    /// A sanitizing map would fold two roster keys onto one configuration home; a traversal
+    /// suffix would re-aim the root out of the worker home entirely. Fail CLOSED, as every other
+    /// failure of this resolver does.
+    ///
+    /// The refused spellings are reachable inputs: the seat key comes from the LAUNCH ROSTER,
+    /// which is caller-supplied JSON (wicked-crew's `clis`), not a compiled-in constant.
+    #[test]
+    fn an_unacceptable_instance_suffix_is_refused_not_sanitized() {
+        let base = instance_fixture_base("suffix");
+        for bad in [
+            "claude#",          // empty suffix
+            "claude#..",        // parent traversal
+            "claude#../../etc", // traversal out of the worker home
+            "claude#a/b",       // a path separator
+            "claude#a\\b",      // the Windows separator
+            "claude#a b",       // whitespace
+            "claude#a-b",       // `-` is the JOINER, so it must not also be legal in a suffix
+            "claude#2#3",       // a second separator
+        ] {
+            let err = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, bad)
+                .expect_err("an unacceptable instance suffix must be refused");
+            assert!(
+                err.to_string().contains("instance suffix"),
+                "{bad}: the refusal must name what was wrong: {err}"
+            );
+        }
+        // …and the acceptable spellings resolve to the sibling roots they name.
+        for (key, want) in [
+            ("claude", "claude"),
+            ("claude#2", "claude-2"),
+            ("claude#b", "claude-b"),
+            ("claude#cheap_2", "claude-cheap_2"),
+            // No separator ⇒ no instance: an operator's own key is the CLI's only instance and
+            // keeps the root it has had since core#410 (moving it would be the #578 hazard).
+            ("my-claude", "claude"),
+        ] {
+            let root = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, key)
+                .expect("resolves")
+                .root()
+                .expect("claude has a root")
+                .to_path_buf();
+            assert_eq!(root, base.join(want), "{key}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#591, guarding #578) `refuse_symlinked_home` still refuses a PLANTED symlink — at an
+    /// INSTANCE root exactly as at a base one. The failing state is CONSTRUCTED: the link is
+    /// planted at `<base>/claude-2` and aimed at a decoy directory, and the decision is then
+    /// resolved. The honest case beside it is the control.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_at_an_instance_root_is_still_refused() {
+        let base = instance_fixture_base("planted");
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(&decoy).expect("decoy");
+
+        // Control FIRST: with nothing planted, both instances resolve.
+        seat_config_in(|| Ok(base.clone()), SeatCli::Claude, "claude")
+            .expect("the honest base root resolves");
+        seat_config_in(|| Ok(base.clone()), SeatCli::Claude, "claude#2")
+            .expect("the honest instance root resolves");
+
+        // Now plant the link the refusal exists for, at the INSTANCE root.
+        let planted = base.join("claude-2");
+        std::os::unix::fs::symlink(&decoy, &planted).expect("plant the link");
+        let err = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, "claude#2")
+            .expect_err("a planted symlink at an instance root must be refused");
+        assert!(
+            err.to_string().contains("claude-2"),
+            "the refusal names the component it refused: {err}"
+        );
+        // The refusal is the SEAT's, not the whole base's: instance one is unaffected.
+        seat_config_in(|| Ok(base.clone()), SeatCli::Claude, "claude")
+            .expect("a link at one instance root does not refuse another");
+
+        // …and an intermediate planted component is refused too — the PR#413 rule, unchanged for
+        // instance roots: the base itself reached through a link.
+        let via_link = base.join("link-to-base");
+        std::os::unix::fs::symlink(&base, &via_link).expect("plant the base link");
+        seat_config_in(|| Ok(via_link.clone()), SeatCli::Claude, "claude#3")
+            .expect_err("an instance root reached through a planted component is refused");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#591) A CLI with no configuration home of its own is decided WITHOUT resolving the
+    /// worker home base — it does not use one, so an unresolvable base must not refuse it.
+    ///
+    /// This is a REGRESSION pin, not a hypothetical: threading the seat key through
+    /// `seat_config_for_carrier` resolved the base eagerly, and every non-claude council ballot
+    /// under a relative `WICKED_WORKER_HOME` began failing `SpawnFailed` ("worker config root
+    /// unresolvable") — caught by `wicked_council::dispatch`'s
+    /// `a_relative_worker_home_refuses_the_claude_ballot_before_spawning` and
+    /// `a_differently_cased_claude_is_not_a_claude_carrier_on_a_case_sensitive_filesystem`.
+    /// Asserted here, at the resolver, so the ordering is pinned where it is decided.
+    #[test]
+    fn a_rootless_cli_is_decided_without_resolving_the_worker_home() {
+        let decision = seat_config_in(
+            || anyhow::bail!("the base must not be resolved for a rootless cli"),
+            SeatCli::Other,
+            "whatever#2",
+        )
+        .expect("a rootless cli is isolated by stripping alone");
+        match decision {
+            SeatConfig::Isolated {
+                cli: SeatCli::Other,
+                root: None,
+                set,
+                strip,
+            } => {
+                assert!(set.is_empty(), "nothing of its own to set");
+                assert_eq!(
+                    strip,
+                    SEAT_CONFIG_ENV.to_vec(),
+                    "every seat variable stripped"
+                );
+            }
+            other => panic!("expected a rootless isolated decision, got {other:?}"),
+        }
+        // …and a cli that DOES have a root still propagates the base failure.
+        seat_config_in(|| anyhow::bail!("unresolvable"), SeatCli::Claude, "claude")
+            .expect_err("a seat with a root fails closed when the base is unresolvable");
+    }
+
+    /// (core#591) The seat-key split is total and the joiner is injective: every seat key has a
+    /// CLI key, and no two acceptable instance keys name one directory.
+    #[test]
+    fn a_seat_key_splits_into_a_cli_key_and_an_instance() {
+        assert_eq!(seat_cli_key("claude"), "claude");
+        assert_eq!(seat_cli_key("claude#2"), "claude");
+        assert_eq!(seat_cli_key("my-claude"), "my-claude");
+        assert_eq!(seat_cli_key(""), "");
+        assert_eq!(seat_instance_suffix("claude"), None);
+        assert_eq!(seat_instance_suffix("claude#2"), Some("2"));
+        assert_eq!(seat_instance_suffix("claude#"), Some(""));
+
+        // Injective on the ACCEPTED set: distinct acceptable keys, distinct directory names.
+        // `root_name()` never contains `-`, so `<root>-<suffix>` cannot spell another root.
+        let mut seen = std::collections::HashSet::new();
+        for cli in [
+            SeatCli::Claude,
+            SeatCli::Codex,
+            SeatCli::Pi,
+            SeatCli::Copilot,
+            SeatCli::Opencode,
+            SeatCli::Agy,
+        ] {
+            let root = cli.root_name().expect("a known seat has a root name");
+            assert!(!root.contains('-'), "{root}: the joiner must not be in it");
+            for suffix in [None, Some("2"), Some("3"), Some("cheap")] {
+                let name = seat_instance_root_name(root, suffix).expect("acceptable");
+                assert!(seen.insert(name.clone()), "{name} was produced twice");
+            }
+        }
     }
 }
