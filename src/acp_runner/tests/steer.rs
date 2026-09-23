@@ -187,13 +187,8 @@ fn worktree(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         format!("export function retire() {{\n  {LIVE_LINE}\n}}\n"),
     )
     .unwrap();
-    let ok = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&wt)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "git init");
+    // Through the engine's own hardened git runner (the spawn-audit chokepoint).
+    crate::worktree_guard::git(&wt, &["init", "-q"], &[]).expect("git init");
     let gd = wt.join(".git");
     (wt, gd)
 }
