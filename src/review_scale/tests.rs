@@ -373,3 +373,41 @@ diff --git a/docs/ops.md b/docs/ops.md
         }
     );
 }
+
+// Review on #600: only `+`/`-` lines were scanned for destructive markers, so a change that only
+// loosens the guard around an existing destructive call (the call itself sits on a context line)
+// read as a plain small change: one standard monitor, no reviewer. Context lines of a behavioural
+// hunk are scanned too; added/removed counts still come from `+`/`-` only.
+#[test]
+fn guard_change_around_context_line_destructive_call_is_destructive() {
+    let hunk = "\
+@@ -1,4 +1,4 @@
+-if confirmed {
++if true {
+     std::fs::remove_dir(path)?;
+ }
+";
+    let want = ReviewPlan {
+        monitors: 2,
+        depth: Depth::Deep,
+        post_hoc_reviewer: true,
+    };
+    // The exact fixture from the review (headerless, so it counts as code).
+    let s = signals_from_diff(hunk);
+    assert_eq!((s.lines_added, s.lines_removed), (1, 1), "{s:?}");
+    assert!(s.destructive, "remove_dir on a context line: {s:?}");
+    assert_eq!(review_plan(&s), want, "{s:?}");
+
+    // The same hunk as a small one-file code change.
+    let d = format!(
+        "diff --git a/src/sweep.rs b/src/sweep.rs\n--- a/src/sweep.rs\n+++ b/src/sweep.rs\n{hunk}"
+    );
+    let s = signals_from_diff(&d);
+    assert_eq!(
+        (s.lines_added, s.lines_removed, s.code_files),
+        (1, 1, 1),
+        "{s:?}"
+    );
+    assert!(s.destructive, "remove_dir on a context line: {s:?}");
+    assert_eq!(review_plan(&s), want, "{s:?}");
+}

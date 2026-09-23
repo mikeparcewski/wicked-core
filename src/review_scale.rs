@@ -67,7 +67,8 @@ pub(crate) struct Thresholds {
     pub config_exts: &'static [&'static str],
     /// Path-token prefixes of critical subsystems.
     pub critical_path_markers: &'static [&'static str],
-    /// Substrings (lowercased) of a changed line in a non-docs file that mark a destructive path.
+    /// Substrings (lowercased) of a hunk line (changed or context) in a non-docs file that mark a
+    /// destructive path.
     pub destructive_line_markers: &'static [&'static str],
     /// Path-token prefixes that make a whole file destructive.
     pub destructive_path_markers: &'static [&'static str],
@@ -200,8 +201,10 @@ enum Kind {
 /// Derive [`ChangeSignals`] from a unified diff (`git diff` output).
 ///
 /// Fails closed: a file is behavioural if EITHER side of its header is (a rename from
-/// `src/memory.rs` to `docs/memory.md` moves code out of a critical subsystem), and a hunk with no
-/// file header counts as code.
+/// `src/memory.rs` to `docs/memory.md` moves code out of a critical subsystem), a hunk with no
+/// file header counts as code, and destructive markers are read from a behavioural hunk's context
+/// lines as well as its `+`/`-` lines (a guard change around an existing destructive call). Only
+/// `+`/`-` lines count toward `lines_added`/`lines_removed`.
 pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
     let t = &THRESHOLDS;
     let mut s = ChangeSignals::default();
@@ -244,14 +247,14 @@ pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
             in_hunk = true;
         } else if !in_hunk {
             s.destructive |= behavioural && line.starts_with("deleted file mode");
-        } else if let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix('-')) {
-            if line.starts_with('+') {
-                s.lines_added += 1;
-            } else {
-                s.lines_removed += 1;
-            }
-            if behavioural {
-                let text = text.to_ascii_lowercase();
+        } else {
+            let (added, removed) = (line.starts_with('+'), line.starts_with('-'));
+            s.lines_added += u32::from(added);
+            s.lines_removed += u32::from(removed);
+            // Context lines are scanned too (review on #600: a change that only loosens the guard
+            // around an existing destructive call leaves the call itself on a context line).
+            if behavioural && (added || removed || line.starts_with(' ')) {
+                let text = line[1..].to_ascii_lowercase();
                 s.destructive |= t.destructive_line_markers.iter().any(|m| text.contains(m));
             }
         }
