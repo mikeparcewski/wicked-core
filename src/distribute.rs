@@ -1737,7 +1737,9 @@ mod tests {
             "the fence must be written at the secondary instance home \
              (<worker>/claude-2/settings.json); it is missing — the ballot ran without a deny fence"
         );
-        // The content must match the shared deny rules (same generator, same file).
+        // Assert specific security-critical deny rules are present.
+        // Hardcoded — NOT computed from shared_deny_rules — so a missing rule in that
+        // function fails this test rather than silently passing. (core#595 evaluator CRITICAL)
         let bytes = std::fs::read(base.join("claude-2").join("settings.json")).unwrap();
         let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let deny: Vec<String> = settings["permissions"]["deny"]
@@ -1746,11 +1748,34 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        assert_eq!(
-            deny,
-            crate::execute_wrapped::shared_deny_rules(None).unwrap(),
-            "the secondary fence must carry the same shared deny rules as the primary"
-        );
+        // Directory fences: derive the expected path from HOME directly, never from
+        // shared_deny_rules — the point is to catch a missing rule in that function.
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        for must_contain in [
+            // Credential and key protection: these are the rules that stop reads of SSH keys,
+            // AWS credentials and git credential files by a worker running in the secondary home.
+            format!("Read({home}/.ssh/**)"),
+            format!("Edit({home}/.ssh/**)"),
+            format!("Read({home}/.aws/**)"),
+            format!("Edit({home}/.aws/**)"),
+            format!("Read({home}/.git-credentials)"),
+            format!("Edit({home}/.git-credentials)"),
+            // Operator tool-config fences: council config and wicked daemon state.
+            format!("Read({home}/.config/wicked-council/**)"),
+            format!("Edit({home}/.config/wicked-council/**)"),
+            // Privilege escalation and remote-write Bash verbs — static, never HOME-dependent.
+            "Bash(sudo:*)".to_string(),
+            "Bash(git push:*)".to_string(),
+            "Bash(gh pr create:*)".to_string(),
+        ] {
+            assert!(
+                deny.contains(&must_contain),
+                "secondary fence at claude-2/settings.json is missing security-critical rule \
+                 {must_contain:?}; full deny list: {deny:#?}"
+            );
+        }
 
         match prev_hatch {
             Some(v) => std::env::set_var(hatch, v),
