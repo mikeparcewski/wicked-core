@@ -5791,10 +5791,13 @@ fn scoped_seat_runtime_admission(
 /// The boundary a chat's seats are judged against (core#410, review): the scratch root is the ONE
 /// write root (and the cwd), the scoped repository roots are read-only, `HOME` and — for a claude
 /// seat — its worker config dir get the same carve-outs the governed boundary applies. No phase
-/// scopes: a chat has no phases.
+/// scopes: a chat has no phases. The config dir is the seat INSTANCE's (`seat_key`, core#591):
+/// the same `seat_config_for_seat` the spawn ran the process under, so a `claude#2` chat is judged
+/// against `<base>/claude-2` — never the primary's home (codex review of #605).
 fn chat_boundary(
     scope: &ChatScope,
     seat_cli: wicked_apps_core::spawn::SeatCli,
+    seat_key: &str,
 ) -> crate::gate_hook::BoundaryCtx {
     crate::gate_hook::BoundaryCtx {
         roots: crate::path_policy::AllowedRoots {
@@ -5807,7 +5810,7 @@ fn chat_boundary(
         },
         cwd: scope.cwd.clone(),
         home: std::env::var_os("HOME").map(std::path::PathBuf::from),
-        claude_config_dir: wicked_apps_core::spawn::seat_config_for(seat_cli)
+        claude_config_dir: wicked_apps_core::spawn::seat_config_for_seat(seat_cli, seat_key)
             .ok()
             .and_then(|c| c.claude_dir().map(std::path::Path::to_path_buf)),
         pre_build_scope: false,
@@ -6231,7 +6234,7 @@ impl AcpStepRunner {
         }
         // The chat's filesystem boundary, judged on every permission request of every turn on
         // this session (core#410, review): write = the scratch root; read = the scoped roots.
-        proc.chat_boundary = Some(chat_boundary(&scope, seat_cli));
+        proc.chat_boundary = Some(chat_boundary(&scope, seat_cli, cli_key));
         let arc = Arc::new(Mutex::new(proc));
         // Insert under BOTH locks, scopes then sessions (the order `chat_open` takes them): the
         // scope this process was warmed in must still be the recorded one (Copilot, #426 — a
@@ -13054,19 +13057,25 @@ transport = "stdio"
     /// ballot, read from the real environment — a hardcoded decision would pass the behavioural
     /// tests above while silently deleting the operator's opt-out. Since core#410 that read lives
     /// INSIDE the one shared resolver every seat spawn calls
-    /// (`wicked_apps_core::spawn::seat_config_for`, which returns `Inherit` from
+    /// (`wicked_apps_core::spawn::seat_config_for_seat`, which returns `Inherit` from
     /// `inherits_operator_config()` — the same reader `execute_wrapped::inherits_operator_config`
     /// and the skills admission delegate to), so the four cannot disagree; the audit pins the
-    /// spawn's call to that resolver, keyed on the seat it resolved. Needle built by concatenation
-    /// and matched on whitespace-stripped source so neither this test nor rustfmt can satisfy or
-    /// break it.
+    /// spawn's call to that resolver, keyed on the seat INSTANCE it resolved (core#591: the seat
+    /// key, so `claude#2` gets its own home). Needle built by concatenation and matched on
+    /// whitespace-stripped source so neither this test nor rustfmt can satisfy or break it.
+    /// (Until the codex review of #605 the needle was the primary-only `seat_config_for(seat_cli)`
+    /// spelling, which the spawn had already left behind — only the chat boundary's stale call
+    /// still matched it, the very call that review fixed.)
     #[test]
     fn the_acp_spawn_consults_the_same_inherit_escape_hatch_as_the_wrapped_path() {
         let src: String = include_str!("acp_runner.rs")
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let needle = format!("wicked_apps_core::spawn::{}(seat_cli)", "seat_config_for");
+        let needle = format!(
+            "wicked_apps_core::spawn::{}(seat_cli,seat_key)",
+            "seat_config_for_seat"
+        );
         assert!(
             src.contains(&needle),
             "start_acp_process no longer decides config isolation through the shared per-seat \
@@ -13880,6 +13889,67 @@ os_sandbox = true
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#591 (codex review of #605): a scoped chat on a SECONDARY claude instance is spawned in
+    /// `<base>/claude-2` (`seat_config_for_seat`), so its boundary must carve out THAT home — not
+    /// the primary's `<base>/claude`. Otherwise a routine write into its own state tree
+    /// (`projects/…` memory) is judged outside the carve-out by `boundary_denial_tracked` and
+    /// becomes fatal, while a write into the PRIMARY's home is wrongly tolerated. The base is a
+    /// non-existent absolute path outside the OS temp (the core#264 scratch carve-out would make
+    /// the fatal assertions vacuous under `temp_dir()`), and the expected homes are joined here.
+    #[test]
+    #[cfg(unix)]
+    fn a_secondary_instance_chat_boundary_carves_out_its_own_config_home_not_the_primarys() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = std::path::PathBuf::from("/Users/op/wworker-chat-boundary-instance");
+        let _worker = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let own = base.join("claude-2");
+        let primary = base.join("claude");
+        let scope = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-boundary-instance-scratch"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Claude, "claude#2");
+        assert_eq!(
+            boundary.claude_config_dir.as_deref(),
+            Some(own.as_path()),
+            "the carve-out is the INSTANCE's own config home"
+        );
+        let fatal = |p: &std::path::Path| {
+            crate::gate_hook::boundary_denial_tracked(
+                &boundary.roots,
+                &boundary.cwd,
+                boundary.home.as_deref(),
+                boundary.claude_config_dir.as_deref(),
+                &json!({"path": p.to_string_lossy()}),
+                "Write",
+                None,
+                boundary.estate_store_pinned,
+            )
+            .map(|(_, fatal)| fatal)
+        };
+        assert_eq!(
+            fatal(&own.join("projects").join("p").join("memory.json")),
+            Some(false),
+            "a write into its OWN state tree is blocked but ADVISORY (inside the carve-out)"
+        );
+        assert_eq!(
+            fatal(&primary.join("projects").join("p").join("memory.json")),
+            Some(true),
+            "a write into the PRIMARY's home is outside this seat's carve-out: fatal"
+        );
+        assert_eq!(
+            chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Claude, "claude")
+                .claude_config_dir
+                .as_deref(),
+            Some(primary.as_path()),
+            "the primary seat is unchanged"
+        );
+    }
+
     /// Copilot, #426: a chat's read roots are READ-ONLY for every seat — a permission request to
     /// write under a scoped repository is answered with the agent's reject option, a read under it
     /// and a write in the scratch root with allow, and anything outside both is refused.
@@ -13897,7 +13967,7 @@ os_sandbox = true
             code_graph_db: None,
             read_roots: vec![repo.to_string_lossy().into_owned()],
         };
-        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Codex);
+        let boundary = chat_boundary(&scope, wicked_apps_core::spawn::SeatCli::Codex, "");
         let request = |tool: &str, path: &std::path::Path| {
             json!({
                 "sessionId": "s1",
@@ -14581,11 +14651,11 @@ acp_input_governance = true
         };
         let seat = wicked_apps_core::spawn::SeatCli::Codex;
         assert!(
-            !chat_boundary(&unbound, seat).estate_store_pinned,
+            !chat_boundary(&unbound, seat, "").estate_store_pinned,
             "no graph and no env pin ⇒ unpinned"
         );
         assert!(
-            chat_boundary(&bound, seat).estate_store_pinned,
+            chat_boundary(&bound, seat, "").estate_store_pinned,
             "the scope's graph IS the pin (it rides the child's WICKED_ESTATE_DB)"
         );
         let shim = json!({
@@ -14599,9 +14669,9 @@ acp_input_governance = true
             ],
         });
         let (_, allowed_bound) =
-            crate::acp_permission::chat_boundary_result(&chat_boundary(&bound, seat), &shim);
+            crate::acp_permission::chat_boundary_result(&chat_boundary(&bound, seat, ""), &shim);
         let (_, allowed_unbound) =
-            crate::acp_permission::chat_boundary_result(&chat_boundary(&unbound, seat), &shim);
+            crate::acp_permission::chat_boundary_result(&chat_boundary(&unbound, seat, ""), &shim);
         assert!(
             allowed_bound,
             "a read-only shim call needs no argv --db on a graph-bound chat"
