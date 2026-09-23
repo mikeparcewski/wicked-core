@@ -3,6 +3,7 @@
 - **Status:** PROPOSED (rev 3). The operator ruled on the HIGH-dispute question on 2026-09-23 (§6.7), so nothing is blocked.
 - **Rev 2 (2026-09-23):** moved from `.product/` (untracked since #562) to `docs/design/`; §6.7 records the HIGH-dispute escalation as a blocking decision with two exact options; §6.2 extends monitor exclusion to the bus-mediated judge (`GateEvalRequest.excluded_seats`). Both come from review on #604.
 - **Rev 3 (2026-09-23):** operator ruling on Q1, written into §6.3/§6.7. An unresolved HIGH goes to a council. YES continues the run autonomously. NO **or no verdict** pauses for a human (fail-closed). The rev 2 Option A/B block is replaced by the ruling.
+- **Rev 4 (2026-09-23):** S2 builder corrections, verified on `d5d9708`. The ACP spawn path does not resolve seat-instance keys yet, so that prerequisite is now build step 0 (§4.1, §9, §10). §4.7 is re-ordered: S2's final batch carries no declines; S3 parses `ADVICE` and then runs the HOLD/WITHDRAW round. §7 notes that fixtures compare JSON values, not key order.
 - **Date:** 2026-09-23
 - **Scope:** wicked-core (S2 monitor subscription, S3 monitor→worker injection, S6 gate adjudication — engine half), wicked-crew (S6 read route + api-types), wicked-studio (S6 surfaces)
 - **Related:** #590 (the operator-approved proposal), #599 (S1, merged as `d5d9708`: the `AskUserQuestion` elicitation channel), #595 (seat-instance keys, `claude#2`), S4 (complexity policy, `feat/590-s4-review-scale`), S5 (deterministic `RoutingInfo::Teamed` + the decision-council entry point) — S4 and S5 are built elsewhere; this document names only the interface it consumes from them (§8).
@@ -53,7 +54,7 @@ A worker unit runs on its carrier. Each time a tool call finishes, the ACP carri
 ### 4.1 Who spawns it, on which seat
 
 - **Process.** The crew daemon hosts wicked-core in-process (napi). wicked-core's `AcpStepRunner` spawns the monitor's ACP bridge child (`claude-agent-acp`) through the same `start_acp_process` path chat seats use. crew spawns nothing new.
-- **Seat.** It is a seat **instance** key from the unit's monitor candidates (§8, from S5), e.g. `claude#2`. Its configuration home follows #595 (`<worker home>/claude-2`, `crates/wicked-apps-core/src/spawn.rs:1295`). The supervisor refuses a candidate that is (a) the creator's instance (`unit.assigned_cli`), or (b) a seat whose `[cli.acp]` is not `acp_input_governance: true`. For (b), the read-only boundary is enforced by answering `session/request_permission`, and an unadmitted adapter never asks (`src/acp_runner.rs:6752-6776`). Today that makes every monitor a claude instance (§13, Q2). A refused or failed start is disclosed as `monitorAttached{status:"failed"}` and never retried within the attempt.
+- **Seat.** It is a seat **instance** key from the unit's monitor candidates (§8, from S5), e.g. `claude#2`. Its configuration home is meant to follow #595 (`<worker home>/claude-2`, `crates/wicked-apps-core/src/spawn.rs:1295`). **The ACP spawn path does not do that yet.** `registry_record` matches the exact key only (`src/acp_runner.rs:7755-7761`), so `claude#2` finds no record. `start_acp_process_with_write_roots` resolves the home with `seat_config_for(seat_cli)` (`:2221`), which is the cli's **primary** home. Monitors on instance keys therefore depend on the prerequisite PR (#591 ACP gap: two-step lookup, seat-key home, fence), build step 0 (§10). The supervisor refuses a candidate that is (a) the creator's instance (`unit.assigned_cli`), or (b) a seat whose `[cli.acp]` is not `acp_input_governance: true`. For (b), the read-only boundary is enforced by answering `session/request_permission`, and an unadmitted adapter never asks (`src/acp_runner.rs:6752-6776`). Today that makes every monitor a claude instance (§13, Q2). A refused or failed start is disclosed as `monitorAttached{status:"failed"}` and never retried within the attempt.
 - **Read-only.** The monitor session is opened with the chat boundary (`chat_boundary`, `src/acp_runner.rs:5920`; judged by `chat_boundary_result`, `src/acp_permission.rs:429`), with `ChatScope { cwd: <private per-monitor scratch>, code_graph_db: <run's graph>, read_roots: [<unit worktree>] }`. It can read the worktree and the graph. It cannot write the worktree. It runs with epoch 0, so any elicitation it raises is cancelled (`src/acp_runner.rs:3895`): monitors never ask a human.
 - **No chat events.** The monitor uses the pool and boundary machinery through a new `monitor_ensure`/`monitor_turn` pair mirroring `chat_ensure`/`chat_turn` (`src/acp_runner.rs:6187`). It emits **no** `ChatDelta`/`ChatReply`/`ChatClosed`. crew folds those into chat state (`server.ts:1203-1225`), and a monitor is not a chat. Pool key `team:<run>:<ord>:<attempt>:<monitorId>`.
 - **Lifetime.** A monitor opens lazily, when its first batch is due, so a unit whose diff never warrants a monitor spawns nothing. It closes when the attempt's final pass returns and on `on_run_complete` (`src/acp_runner.rs:7676`).
@@ -93,7 +94,7 @@ Reply grammar: zero or more lines, then a final line `DONE`. Anything else is ig
 FINDING {"severity":"high|medium|low","path":"src/x.rs","line":41,"evidence":"<the exact text of that line>","claim":"<what is wrong and why>","suggestion":"<optional fix>"}
 ```
 
-At the final pass (§4.7) a monitor may also emit `HOLD <findingId> — <reason>` or `WITHDRAW <findingId> — <reason>` for each finding the worker declined.
+In the hold round (§4.7 step 5, S3-owned), a monitor answers `HOLD <findingId> — <reason>` or `WITHDRAW <findingId> — <reason>` for each finding the worker declined. A review batch never asks for or accepts these.
 
 ### 4.6 Confirmation, severity bar, dedup
 
@@ -110,12 +111,13 @@ Survivors are emitted as `monitorFinding` (§7).
 
 After `runner.run_unit_streaming` returns Ok (`src/cli_runner.rs:761`), the worker thread calls a new trait method `StepRunner::team_finish(&StepInput, &StepOutput) -> Option<TeamLedger>`. Its default returns `None`, so every non-ACP runner and test runner is unchanged. `AcpStepRunner` forwards it to the supervisor as `TeamCmd::Finish` and blocks for at most `FINAL_PASS_BUDGET` (300 s):
 
-1. Abandon any in-flight batch. Snapshot `T_final`. Summon monitors per S4 on the baseline..`T_final` diff if none are attached yet. This is how wrapped units are monitored.
-2. Run one final batch per monitor over `T_{last}`..`T_final`. The prompt also lists every finding the worker declined, with the worker's reason, and asks for `HOLD` or `WITHDRAW` on each.
-3. Re-confirm every finding against `T_final`. If the evidence text is gone from the file, the finding becomes `superseded` (the worker changed it). If the text moved, `finalLine` is updated.
-4. Parse the worker's `ADVICE` lines (§5.3) from `StepOutput.output`.
-5. Run disputes through the council (§6.3).
-6. Return the `TeamLedger`. The worker thread puts it in `UnitEvidence.team` (`src/workflow.rs:265`, additive) and renders it into `work_for_agent` (§6.2).
+1. **(S2)** Abandon any in-flight batch. Snapshot `T_final`. Summon monitors per S4 on the baseline..`T_final` diff if none are attached yet. This is how wrapped units are monitored.
+2. **(S2)** Run one final **review** batch per monitor over `T_{last}`..`T_final`. It carries **no declines**: the worker's dispositions do not exist until step 4.
+3. **(S2)** Re-confirm every finding against `T_final`. If the evidence text is gone from the file, the finding becomes `superseded` (the worker changed it). If the text moved, `finalLine` is updated.
+4. **(S3)** Parse the worker's `ADVICE` lines (§5.3) from `StepOutput.output` → `workerAdviceResponse`.
+5. **(S3)** **Hold round.** For each monitor with ≥1 finding the worker declined, send one more turn on the same warm session. It lists each declined finding with the worker's reason and asks for `HOLD <id> — <reason>` or `WITHDRAW <id> — <reason>`, then `DONE`. No reply for a declined id counts as HOLD (§6.3). Monitors with no declines get no turn.
+6. **(S6)** Send each unresolved HIGH to the council (§6.3).
+7. Return the `TeamLedger`. The worker thread puts it in `UnitEvidence.team` (`src/workflow.rs:265`, additive) and renders it into `work_for_agent` (§6.2).
 
 If the budget expires, the ledger records `finalPass: "timed_out"` with what was gathered so far, and the gate proceeds. A failed unit (`status != Ok`) skips the final pass (`finalPass: "skipped"`), as the guard's first look already does (`src/cli_runner.rs:871`).
 
@@ -337,6 +339,8 @@ Every variant is mapped by hand in `CoreEvent::to_json` (`src/event.rs:1269-1275
  "rejected":{"malformed":0,"belowBar":2,"unconfirmed":1,"duplicate":0}}
 ```
 
+**Key order.** wicked-core's `serde_json` has no `preserve_order` feature (`Cargo.toml:59`, `serde_json = "1"`), so object keys serialize in sorted order, not the order shown above. Fixture tests in core, core-ts and crew-api-types must compare parsed JSON **values**, never serialized strings or key order.
+
 **Durable log.** All seven go to the per-run event log like any event. `unitCheckpoint` is the only frequent one, it exists only for teamed units, and it is small (≤ ~600 B).
 
 ## 8. Interfaces consumed (not designed here)
@@ -354,6 +358,7 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 
 | Piece | Repo | Location |
 |---|---|---|
+| **Step 0 prerequisite:** instance-key ACP lookup + seat-key config home + fence (#591 ACP gap) | core | `src/acp_runner.rs:7755-7761` (`registry_record`), `:2221` (`seat_config_for`) |
 | `TeamSupervisor`, `TeamCmd`, `TeamLedger`, confirmation, dedup, `render_for_gate` | core | new `src/team.rs`; constructed in `Core::spawn_with_acp_sessions` (`src/lib.rs:545`), subscribes via `Core::subscribe` |
 | `unitCheckpoint` emission, `steering_supported`, steer mailbox + delivery, response matching | core | `src/acp_runner.rs` (`:2645`, `:924`, `:3868`, `:4385`, `:4470`, `:7450`) |
 | `monitor_ensure` / `monitor_turn` | core | `src/acp_runner.rs`, beside `chat_turn` (`:6187`) |
@@ -368,11 +373,12 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 
 ## 10. Build order
 
+0. **Prerequisite (in progress, separate PR): #591 ACP gap.** `registry_record` does a two-step lookup (the exact instance key, then its cli key via `seat_cli_key`). `start_acp_process_with_write_roots` resolves the **seat-key** configuration home, not `seat_config_for(seat_cli)` (`src/acp_runner.rs:7755-7761`, `:2221`). The instance-key fence holds on the ACP path. S2's monitor attach (§4.1) needs it. S3 and S6 do not.
 1. **Wire contract first (core, S2-owned).** The seven `CoreEvent` variants + `to_json` arms + the `TeamLedger` type, with no emitters. Merge. From here, crew and studio can build against fixtures, and S3 can build against the types.
 2. **In parallel, three builders:**
-   - **S2 (core):** `unitCheckpoint` emission, `team.rs` supervisor, monitor sessions, batching, snapshot/diff, confirmation, dedup, `monitorFinding`, final pass (steps 1-3), `team_finish`.
-   - **S3 (core):** `steering_supported`, mailbox, delivery at the checkpoint arm, response matching, `adviceDelivered`, advice text, `ADVICE` parsing → `workerAdviceResponse` (final pass step 4). It is tested against a mock bridge that advertises and answers `_session/steering`.
-   - **S6 (core → crew → studio):** ledger persistence, `teamLedger` emission, `render_for_gate` into judge/evaluator/rework, monitor exclusion from the judge, the dispute trigger and the council call (step 5, behind S5's entry point), then the crew route + api-types, then the studio surfaces.
+   - **S2 (core):** `unitCheckpoint` emission, `team.rs` supervisor, monitor sessions, batching, snapshot/diff, confirmation, dedup, `monitorFinding`, final pass steps 1–3, `team_finish`.
+   - **S3 (core):** `steering_supported`, mailbox, delivery at the checkpoint arm, response matching, `adviceDelivered`, advice text, `ADVICE` parsing → `workerAdviceResponse` and the hold round (final pass steps 4–5). It is tested against a mock bridge that advertises and answers `_session/steering`.
+   - **S6 (core → crew → studio):** ledger persistence, `teamLedger` emission, `render_for_gate` into judge/evaluator/rework, monitor exclusion from the judge, the dispute trigger and the council call (final pass step 6, behind S5's entry point), then the crew route + api-types, then the studio surfaces.
 3. **core-ts release → crew → studio** on the normal train (crew bundles studio; bump the studio pin).
 4. **Rig proof (acceptance §12-E2E)** after all three land.
 
@@ -406,7 +412,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 8. The same bridge answering `{"outcome":"promptRequired"}` yields `outcome:"turn_ended"`, the finding is `delivery:"not_delivered"` in the ledger, and **no** further `session/prompt` is sent.
 9. A bridge that does not advertise steering receives **no** `_session/steering` frame.
 10. A MEDIUM finding is never sent through steering. A finding whose evidence text is gone from the fresh snapshot is not sent and ends `superseded`.
-11. Final output lines `ADVICE f-…: DECLINE — campaign.rs:325 documents the exclusion` and `ADVICE f-…: ACCEPT — added AbortController` produce one `workerAdviceResponse` each, with the matching disposition and reason. A delivered id with no line ends `unanswered`.
+11. Final output lines `ADVICE f-…: DECLINE — campaign.rs:325 documents the exclusion` and `ADVICE f-…: ACCEPT — added AbortController` produce one `workerAdviceResponse` each, with the matching disposition and reason. A delivered id with no line ends `unanswered`. **Hold round:** only monitors that authored a declined finding get a hold-round turn. It lists exactly those ids with the worker's reasons. A missing reply for an id records `monitorReply: {kind:"hold", reason:"no reply (counted as hold)"}`. The S2 final review batch prompt contains no decline text.
 12. Advice queued for attempt 1 is not delivered to attempt 2.
 
 **S6**
