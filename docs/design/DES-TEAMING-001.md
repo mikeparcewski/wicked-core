@@ -1,6 +1,7 @@
 # DES-TEAMING-001 — Real-time teaming: monitors on the live unit, advice into the worker, the gate decides
 
-- **Status:** PROPOSED (rev 1)
+- **Status:** PROPOSED (rev 2). **S6 is BLOCKED on an operator decision (§6.7).** S2 and S3 are not blocked.
+- **Rev 2 (2026-09-23):** moved from `.product/` (untracked since #562) to `docs/design/`; §6.7 records the HIGH-dispute escalation as a blocking decision with two exact options; §6.2 extends monitor exclusion to the bus-mediated judge (`GateEvalRequest.excluded_seats`). Both come from review on #604.
 - **Date:** 2026-09-23
 - **Scope:** wicked-core (S2 monitor subscription, S3 monitor→worker injection, S6 gate adjudication — engine half), wicked-crew (S6 read route + api-types), wicked-studio (S6 surfaces)
 - **Related:** #590 (the operator-approved proposal), #599 (S1, merged as `d5d9708`: the `AskUserQuestion` elicitation channel), #595 (seat-instance keys, `claude#2`), S4 (complexity policy, `feat/590-s4-review-scale`), S5 (deterministic `RoutingInfo::Teamed` + the decision-council entry point) — S4 and S5 are built elsewhere; this document names only the interface it consumes from them (§8).
@@ -192,7 +193,15 @@ The ledger is built by the final pass (§4.7), carried in `UnitEvidence.team`, a
 
 One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existing inputs:
 
-1. **The judge.** `work_for_agent` is extended at the same seam `worktree_evidence_for_judge` uses (`src/cli_runner.rs:885-895`), inside the WORK fence the judge already treats as untrusted data (`src/validator.rs:1656-1658`). Every seat that authored a finding in the ledger is **added to `excluded`** for `agent_validate_with_refusals` (`src/cli_runner.rs:988`). A monitor never grades its own finding. This is the evaluator≠creator rule applied one level up.
+1. **The judge.** `work_for_agent` is extended at the same seam `worktree_evidence_for_judge` uses (`src/cli_runner.rs:885-895`), inside the WORK fence the judge already treats as untrusted data (`src/validator.rs:1656-1658`). **A monitor never grades its own finding.** This is the evaluator≠creator rule applied one level up. The judge is chosen on **three** paths today, and the rule must hold on all of them:
+
+   | Path | Where today | What it excludes today | Change |
+   |---|---|---|---|
+   | Bus-mediated, pinned validator (`WICKED_BUS_DB` set) | `src/cli_runner.rs:911-925` → `bus_request_agent_verdict` `:351-394` | Only `work_author`, carried as `GateEvalRequest.work_author` (`:97-112`). The consuming evaluator daemon is outside core and crew (catalog `crates/wicked-governance/seed/event-catalog-annotations.json:79`). The daemon does not report which seat judged (`:915-916`). | `GateEvalRequest` gains `excluded_seats: Vec<String>` (`#[serde(default)]`, so old payloads read as `[]`), filled with `ledger_authors` (below). The daemon **must** select no seat whose instance **or** cli key is in `excluded_seats ∪ {work_author}`. `GateEvalResponse` gains `judge_cli: Option<String>` (`#[serde(default)]`). **Verification, fail-closed:** when `excluded_seats` is non-empty, core treats a response whose `judge_cli` is `None` or is in the excluded set as a DENY with reason `"gate eval bus-path DENY (fail-closed): evaluator did not prove monitor exclusion"`, the same deny posture `bus_deny!` already uses (`:360-370`). With `excluded_seats` empty (no findings), behaviour is byte-identical to today, so an old daemon keeps working for non-teamed units. |
+   | Inline, pinned validator | `src/cli_runner.rs:932-988` | `[DETERMINISTIC_VALIDATOR_SEAT, work_author]` (`:937`) | `excluded` becomes that array **plus** `ledger_authors`, passed to `distinct_judge_available`, to the distinct-seat pre-check at `:938-960`, and to `agent_validate_with_refusals` (`:988`). |
+   | Inline, default judge (F-7R2-005) | `src/cli_runner.rs:1010-1032` | `[work_author]` (`:1020`) | Same: plus `ledger_authors`, for `distinct_judge_available` (`:1021`) and `agent_validate_with_refusals` (`:1029`). |
+
+   `ledger_authors` = every `seat` and every `corroboratedBy` monitor's seat among the ledger's findings (any status), deduplicated. When excluding them leaves no eligible judge, the existing "no eligible judge seat distinct from …" path records `judge_skipped` with the monitors named in the reason (`:960-985`, `:1062-1081`). That is disclosed as UNGATED, not a silent self-grade, and it is exactly the case §6.7 decides about.
 2. **The evaluator unit.** When the actor assembles `prior_outputs` for a unit that reviews ord *n* (`src/actor.rs:6650-6671`), it appends the rendered ledger of *n* as `PriorUnitOutput { label: "[team findings — unit n]" }`.
 3. **The rework.** When the gate or evaluator `request_changes`, the amendment persisted by `rewind_to_creator` (`src/actor.rs:6673-6700`) includes the unresolved findings. They reach the creator's next attempt the way every other review note does.
 
@@ -227,7 +236,36 @@ One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existi
 
 ### 6.6 What S6 deliberately does not do
 
-It adds no auto-deny on an open finding, no auto-escalation to a human gate, and no fold branch on the council verdict. Each would make a monitor or a council the decider (#590 risk 4). Whether an unresolved HIGH should *force* a human gate on an autonomous run is open question Q1 (§13).
+It adds no auto-deny on an open finding and never reads the council verdict as a decision. Each would make a monitor or a council the decider (#590 risk 4). Whether an unresolved HIGH forces a **human pause** (not a deny) is the blocking decision in §6.7.
+
+### 6.7 BLOCKING S6: does an unresolved HIGH dispute force a human pause? (operator decision pending)
+
+**The hole (review on #604, HIGH).** `combine_verdict` approves when the deterministic floor passes and no agent verdict rejects (`src/validator.rs:2263-2270`); `agent == None` counts as no rejection. When no judge runs (`judge_skipped`, `src/cli_runner.rs:960-985`, `:1062-1081`; also when excluding the monitors leaves no eligible seat, §6.2), a unit can auto-approve while its ledger holds a HIGH the worker declined, the monitor held, and a council either upheld or never adjudicated. Run `aee254f1` had `agentVerdict: "skipped"`. S6's builder must not pick an option. The operator's answer drops into one of the two blocks below unchanged.
+
+**Shared definition.** A finding is a **qualifying HIGH dispute** when all of the following hold in the attempt's `TeamLedger`:
+- `severity == "high"`,
+- `delivery == "injected"`,
+- `status == "declined"` (the worker declined it with a reason),
+- `monitorReply.kind == "hold"`, and
+- `dispute.verdict ∈ {"finding_stands", "not_adjudicated", "not_convened", "no_consensus"}`. That is every verdict except `"refusal_stands"`. `no_consensus` and `not_convened` count as not adjudicated.
+
+**Option A: no escalation (rev 1 as written).**
+- The fold never reads the ledger. The ledger is evidence to the judge (when one runs), to the evaluator unit and to the human at any gate the run already has.
+- Consequence, stated plainly: with the judge skipped and the floor passing, a qualifying HIGH dispute **can** auto-approve. The protection is only that `gateEvaluated.ungatedReason` and the ledger disclose it.
+- Code: nothing beyond §6.1–§6.5.
+- Acceptance: #16 (Option A form).
+
+**Option B: a qualifying HIGH dispute forces a conditional human pause.**
+- **Where:** in the actor's fold, **after** `apply_and_finish_unit` computes `outcome.approved` (`src/pipeline.rs:1540-1576`) and **before** the unit is advanced. The decision logic (`combine_verdict`) is unchanged.
+- **Condition:** `outcome.approved == true` **and** the ledger holds ≥1 qualifying HIGH dispute. If the fold denied, nothing changes: the pause never turns a deny into anything.
+- **Action:** `pause_for_human(…, gate_kind: "team_dispute", prompt)` (`src/actor.rs:6070-6110`). This pause fires on **every** run, including runs launched with no human confirmation. The prompt lists each qualifying finding (`findingId`, `path:finalLine`, claim, worker reason, monitor reason, council verdict with agreement and dissent). `GateDecided`/`UnitDone` are **not** emitted until a human answers `POST /runs/:id/gate`: approve advances the unit, reject cancels the run, and approve+amend reruns the creator with the amendment (the existing arms, `routes.ts:2942`). `awaitingHuman.gateKind` gains the token `"team_dispute"`. The api-types `gateKind` stays an open string, and the studio `SteeringGate` renders the ledger for that ord (§6.5).
+- **What this does and does not make authoritative:** monitors and the council still cannot deny or approve. They can only require that a human looks. The human remains the decider.
+- **Acceptance (B-1, the proof it cannot auto-approve with the judge skipped):** Build a teamed unit whose floor passes, whose judge is skipped (`judge_skipped = Some(..)`, `agent_verdict = None`), whose evaluator pass is true, and whose ledger holds one qualifying HIGH dispute. For each `dispute.verdict` in `{finding_stands, not_adjudicated, not_convened, no_consensus}`, the fold must emit `awaitingHuman{gateKind:"team_dispute"}` for that ord, the session status must be `awaiting_human`, and **no** `unitDone` or `gateDecided{allow:true}` may be emitted for that ord.
+- **Acceptance (B-2):** the same unit with `dispute.verdict == "refusal_stands"`, or with the finding `accepted`/`withdrawn`/`superseded`, or with `monitorReply.kind == "withdraw"`, emits `unitDone` with no pause.
+- **Acceptance (B-3):** the same unit with the floor failing emits `unitDenied` and no `team_dispute` pause.
+- **Acceptance (B-4):** approving the `team_dispute` gate through `POST /runs/:id/gate` emits `resumed` then `unitDone` for that ord.
+
+**Out of both options (named so it is not assumed):** a HIGH that was never delivered (non-steering carrier) or left `unanswered` is not a dispute. It reaches the gate as evidence only, under either option.
 
 ## 7. Wire contract — new CoreEvent variants
 
@@ -315,7 +353,8 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 | `unitCheckpoint` emission, `steering_supported`, steer mailbox + delivery, response matching | core | `src/acp_runner.rs` (`:2645`, `:924`, `:3868`, `:4385`, `:4470`, `:7450`) |
 | `monitor_ensure` / `monitor_turn` | core | `src/acp_runner.rs`, beside `chat_turn` (`:6187`) |
 | `StepRunner::team_finish` (default `None`) | core | `src/workflow.rs:365` trait |
-| Final pass call, ledger render into WORK, monitor seats excluded from the judge | core | `src/cli_runner.rs:761`, `:885-895`, `:988` |
+| Final pass call, ledger render into WORK, monitor seats excluded from the judge (all three paths) | core | `src/cli_runner.rs:761`, `:885-895`; bus `:97-112`, `:351-394`, `:911-925`; inline `:937`, `:988`, `:1020`, `:1029` |
+| (Option B only) `team_dispute` pause after an approving fold | core | `src/actor.rs` fold, `pause_for_human` `:6070` |
 | `UnitEvidence.team`, `WorkUnit.team_ledger`, `teamLedger` emission | core | `src/workflow.rs:265`, `src/domain.rs`, `src/pipeline.rs:1540` |
 | Ledger into evaluator prior context and rework amendment | core | `src/actor.rs:6650-6700` |
 | Seven `to_json` arms + core-ts `.d.ts` regen | core | `src/event.rs`, `crates/wicked-core-ts` |
@@ -367,9 +406,14 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 
 **S6**
 13. `teamLedger` is emitted immediately before `gateEvaluated` for the same `(session, ord)`, and the unit record carries `team_ledger` after a daemon restart.
-14. The judge prompt for a teamed unit contains the rendered ledger inside the WORK fence. No seat that authored a finding is selected as the judge.
+14. **Monitor exclusion, all three judge paths.** For a ledger whose findings were authored by `claude#2` (corroborated by `claude#3`), with creator `claude`:
+    (a) **inline pinned:** `agent_validate_with_refusals` is called with an excluded set containing `claude#2` and `claude#3`, and neither is selected (roster fixture with only those plus a distinct seat → the distinct seat judges);
+    (b) **inline default judge:** the same;
+    (c) **bus path:** the published `GateEvalRequest` JSON carries `"excluded_seats":["claude#2","claude#3"]`; a response with `judge_cli: "claude#2"` or `judge_cli: null` folds as a DENY with the fail-closed reason; a response with a distinct `judge_cli` is honoured;
+    (d) with an empty ledger, the bus request carries `"excluded_seats":[]` and a `judge_cli: null` response is honoured exactly as today;
+    (e) excluding the monitors leaves no eligible seat → `judge_skipped` names the monitors. The judge prompt on (a)–(c) contains the rendered ledger inside the WORK fence.
 15. **Dispute trigger:** HIGH + injected + `DECLINE` with a reason + monitor `HOLD` convenes exactly one council, whose input carries the finding, both reasons, the `T_final` hunk at `path:finalLine`, and excludes the creator and author seats. Any one condition removed convenes none.
-16. A council verdict of `finding_stands` does **not** change `combined`. The same unit with and without the verdict folds to the same `GateDecided.allow` given the same judge verdict, floor and evaluator.
+16. A council verdict never changes `combined` (`combine_verdict` inputs are identical with and without it). **Option A form:** the same unit with and without the verdict folds to the same `GateDecided.allow`. **Option B form:** replaced by §6.7 B-1…B-4. Which form ships is the §6.7 decision.
 17. `GET /api/v1/runs/:id/team` returns the ledgers for a teamed run and `units: []` for a run without monitors. The api-types fixture round-trips the Rust `to_json` output for all seven events.
 18. Studio: the gate panel shows each finding's severity, `path:line`, the worker's disposition and reason, and the council verdict. Approve/reject still go through `POST /runs/:id/gate`.
 
@@ -377,7 +421,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 
 ## 13. Open questions
 
-- **Q1. Does an unresolved HIGH force a human gate?** As designed, a declined, held, council-`finding_stands` HIGH on a fully autonomous run reaches only the judge and the evaluator. Both are models, and in `aee254f1` the judge was `skipped`. Forcing a human pause would close that hole, but it makes the monitor+council pair a de-facto decider of *whether a human looks*. This needs an operator ruling. The design ships without the escalation (§6.6).
+- **Q1. BLOCKING S6: does a qualifying HIGH dispute force a human pause?** Moved to §6.7, with Option A and Option B written out and their acceptance tests. S6 does not start its fold work until the operator picks one.
 - **Q2. Monitor independence.** Only claude is ACP-admitted (§2), so every monitor today is `claude#N` reviewing a claude creator. Same model, correlated blind spots. Each instance also needs its own signed-in config home, and #591's per-instance login is out of scope there. Admitting a second adapter to input governance (the codex-acp research is `registry.rs:252-300`) is what makes monitors model-diverse. Until then, independence is instance-level only.
 - **Q3. Pre-emptive steering.** The adapter delivers a steer at priority `now`, which **aborts** the current generation (adapter `acp-agent.js:1196-1206`). The client cannot ask for `later`. Every injected HIGH therefore costs an interrupted cycle and a context jolt mid-task. Whether that helps or hurts work quality is an empirical question for the rig. If it hurts, the remedy is to batch HIGH advice to fewer, later checkpoints, not a second mechanism.
 - Smaller: `unitCheckpoint` also serves studio (live tool activity) and could be emitted for every ACP unit, but volume argues against it. The per-attempt ledger is lost on a daemon restart mid-unit: findings emitted before the crash survive in the event log only.
