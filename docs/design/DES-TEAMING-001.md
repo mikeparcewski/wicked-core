@@ -466,7 +466,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
     (h) **Unanswered (extension — blocked on Q4, §13):** the same fixture with the HIGH `delivery:"injected"`, no `ADVICE` line, and the monitor holding (or silent): council NO and every no-verdict reason pause exactly as (b)–(d); council YES continues as (a). With `judge_skipped` set, there is never a `unitDone` without a council YES.
     (i) **Not delivered (extension — blocked on Q4, §13):** the same fixture on a bridge that does not advertise steering (`delivery:"not_delivered"`), and again with a steer answered `promptRequired`: identical outcomes to (h). The council input's worker position reads `"not delivered — …"`.
 17. `GET /api/v1/runs/:id/team` returns the ledgers for a teamed run and `units: []` for a run without monitors. The api-types fixture round-trips the Rust `to_json` output for all six events.
-18. Studio: the gate panel shows each finding's severity, `path:line`, the worker's disposition and reason, and the council verdict. Approve/reject still go through `POST /runs/:id/gate`.
+18. Studio: the gate panel shows each finding's severity, `path:line`, the worker's disposition and reason, and the council verdict. Approve/reject still go through `POST /api/v1/runs/:id/gate`.
 
 **E2E (rig, after all three).** Re-run the #590 B18 shape: a retire-flow unit that writes a cancellation-free coverage fetch. Pass requires a HIGH `monitorFinding` at that handler's `file:line` **before** the unit's turn ends, an `adviceDelivered{injected}`, a `workerAdviceResponse`, and a `teamLedger` the gate panel renders. Launch alone is not a pass: the run must reach a terminal state.
 
