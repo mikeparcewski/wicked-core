@@ -3253,6 +3253,17 @@ impl TurnResult {
 /// for short confirmations, not for general-purpose forms with rich types. A
 /// multi-property or non-string schema is immediately cancelled so the adapter
 /// cannot stall waiting for a response that wicked-core will never provide.
+///
+/// Re-verified against `@agentclientprotocol/sdk` 1.5.0 (core#234 DoD; #212 checked 1.3.0,
+/// where the method was still spelled `unstable_createElicitation` — the surface has since
+/// stabilised as `createElicitation`, with the `elicitation/create` wire method and the field
+/// paths this arm reads unchanged). In 1.5.0 `CreateElicitationRequest` is a union over
+/// `mode`, and the paths still resolve: `message` is required at the top level of every
+/// variant, and `requestedSchema` (`ElicitationSchema`, with the optional `properties` map
+/// this function reads) sits at the top level of the `mode: "form"` variant. A `mode: "url"`
+/// request carries `url`/`elicitationId` and NO `requestedSchema` — non-conforming here,
+/// since `start_acp_process` advertises `elicitation: {form: {}}` and nothing else — and if
+/// one arrived the missing `properties` would return `None` and the arm would cancel it.
 fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>)> {
     let props = schema.get("properties").and_then(Value::as_object)?;
     if props.len() != 1 {
@@ -17972,8 +17983,14 @@ transport = "stdio"
 
     /// Test 39: EpochCleanup guard drops clean — `active_workers` and `run_epoch` are
     /// reclaimed when the guard (constructed the same way `exec_turn` does it) is dropped
-    /// after a successful `exec_turn_acp` call. This validates the RAII invariant required
-    /// by core#234's DoD: the guard must remove epoch state on drop, with no leak.
+    /// after a successful `exec_turn_acp` call. This validates the RAII invariant: the guard
+    /// must remove epoch state on drop, with no leak.
+    ///
+    /// It validates ONLY that invariant. Because it builds the guard itself, it passes whether
+    /// or not production installs one — deleting the `epoch_guard` construction in
+    /// [`AcpStepRunner::exec_turn`] leaves this test green. The wiring half of core#234's DoD is
+    /// `a_completed_acp_turn_reclaims_the_epoch_the_actor_allocated` below, which fails on that
+    /// same deletion.
     #[test]
     #[cfg(unix)]
     fn epoch_cleanup_guard_drop_removes_run_state_no_leak() {
@@ -18055,6 +18072,129 @@ transport = "stdio"
             "active_workers entry must be removed after EpochCleanup::drop (no leak)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 39b (core#234 DoD, the wiring half): the guard is INSTALLED BY PRODUCTION CODE.
+    ///
+    /// Test 39 above hand-builds an `EpochCleanup` and drops it, so it proves the RAII guard
+    /// reclaims state — but it is blind to whether `exec_turn` ever builds one. Delete the
+    /// `epoch_guard` construction in [`AcpStepRunner::exec_turn`] and test 39 still passes; the
+    /// per-ACP-run epoch leak core#234 gap 1 describes would ship green. This test closes that
+    /// hole: it never names `EpochCleanup`, drives a real `AcpStepRunner` over a real ACP
+    /// subprocess through the public `StepRunner::run_unit` seam, and asserts the run's epoch
+    /// state is reclaimed by the time the turn returns.
+    ///
+    /// The setup mirrors the actor's own allocation in `dispatch_unit` (`actor.rs`, the
+    /// `begin_launch` / `next_epoch` pair guarded by `is_acp && unit.tool_cmd.is_none()`), which
+    /// is the only production producer of a non-zero `StepInput::elicitation_epoch`.
+    ///
+    /// Expected values: `true` before the turn and `false` after come from
+    /// `DES-002-actor-teardown.md` ("Worker spawned with input; EpochCleanup guard decrements
+    /// `active_workers` on exit") and from `has_active_run`'s documented contract ("Returns
+    /// `false` after `cleanup_run` runs"). Neither is read back out of the code under test.
+    #[test]
+    #[cfg(unix)]
+    fn a_completed_acp_turn_reclaims_the_epoch_the_actor_allocated() {
+        use crate::skills_snapshot::test_support::scratch as canonical_scratch;
+        use crate::workflow::{StepInput, StepRunner};
+
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-epoch-reclaim");
+        let _home = EnvPin::set("HOME", &home);
+        let ledger = home.join("ledger.ndjson");
+        let bridge = write_recording_bridge(&home);
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "reclaim-seat"
+display_name = "Reclaim seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let maps = Arc::clone(runner.elicitation_maps());
+
+        // What the actor does before handing the unit to the runner, and nothing more.
+        let (epoch, launch_seq) = {
+            let mut m = maps.lock().unwrap_or_else(|p| p.into_inner());
+            let seq = m.begin_launch("run-reclaim", true);
+            (m.next_epoch("run-reclaim"), seq)
+        };
+        assert_eq!(epoch, 1, "the run's first ACP unit is handed epoch 1");
+        {
+            let m = maps.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                m.has_active_run("run-reclaim"),
+                "precondition: the allocation the actor just made is visible"
+            );
+            assert!(
+                m.active_workers
+                    .contains(&("run-reclaim".to_string(), launch_seq)),
+                "precondition: the launch token the actor just minted is visible"
+            );
+        }
+
+        let mut u = crate::domain::WorkUnit::pending("run-reclaim:u1", "run-reclaim", 1, "go");
+        u.assigned_cli = Some("reclaim-seat".to_string());
+        let input = StepInput {
+            run_id: "run-reclaim".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-reclaim".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: epoch,
+            process_gen: None,
+            launch_seq,
+            required_skills: Vec::new(),
+        };
+
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        // The turn really went over ACP — a wrapped fallback would leave the ledger empty, and
+        // then the reclamation below would be proving nothing about the ACP carrier.
+        assert_eq!(
+            ledger_entries(&ledger).len(),
+            2,
+            "session/new + one prompt reached the bridge (the turn was served over ACP)"
+        );
+
+        // The reclamation. `run_unit` has returned, so every `exec_turn` exit path has run.
+        let m = maps.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !m.has_active_run("run-reclaim"),
+            "run_epoch leaked: exec_turn never installed an EpochCleanup guard for the epoch the \
+             actor allocated (core#234 gap 1/2 — cleanup_run never ran in production)"
+        );
+        assert!(
+            !m.active_workers.iter().any(|(r, _)| r == "run-reclaim"),
+            "active_workers leaked: the launch token minted by begin_launch outlived the turn"
+        );
+        drop(m);
+        runner.drop_session("run-reclaim");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ── F-079 (core#441): the ACP skills lever from the SEAT binary; the launcher environment ─
