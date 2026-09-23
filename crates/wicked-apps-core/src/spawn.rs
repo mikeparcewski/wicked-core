@@ -1243,6 +1243,42 @@ pub fn seat_instance_suffix(seat_key: &str) -> Option<&str> {
     seat_key.split_once(SEAT_INSTANCE_SEP).map(|(_, s)| s)
 }
 
+/// The root-name BASE an instance suffix is appended to (core#595). The CLI comes from the binary
+/// and the instance from the key, so the key's CLI prefix decides it:
+///
+/// - the prefix IS the CLI's root name (`claude#2` running `claude`) → `claude` → `claude-2`;
+/// - an operator alias (`my-claude#2` running `claude`) → `claude-my-claude` → `claude-my-claude-2`.
+///
+/// Injective, so two seat keys never share one configuration home: a plain instance suffix is
+/// `[A-Za-z0-9_]+` (no `-`), so a plain root has exactly one `-` after the CLI name and an alias
+/// root at least two; distinct aliases differ in the prefix, split off at the last `-`. The alias
+/// is `[a-z0-9_-]+` and nothing else: lowercase so a case-insensitive filesystem cannot fold two
+/// keys together, and no separators, so it cannot re-aim the root. An empty alias (`#2`) is
+/// refused. Keys without a suffix are unaffected: they name the CLI's only instance.
+fn instance_root_base(
+    root_name: &str,
+    seat_key: &str,
+    suffix: Option<&str>,
+) -> anyhow::Result<String> {
+    let prefix = seat_cli_key(seat_key);
+    if suffix.is_none() || prefix == root_name {
+        return Ok(root_name.to_string());
+    }
+    if prefix.is_empty()
+        || !prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "seat key {seat_key:?} runs `{root_name}`, and its name before `{SEAT_INSTANCE_SEP}` is \
+             not [a-z0-9_-]+; spell the instance `{root_name}{SEAT_INSTANCE_SEP}<n>` or \
+             `<alias>{SEAT_INSTANCE_SEP}<n>` (refused rather than sanitized — two seat keys must \
+             never resolve to one configuration home)"
+        );
+    }
+    Ok(format!("{root_name}-{prefix}"))
+}
+
 /// The seat root's DIRECTORY NAME for one instance (core#591): `root_name` itself for the CLI's
 /// only instance, else `<root_name>-<suffix>` — `claude#2` → `claude-2`.
 ///
@@ -1335,16 +1371,7 @@ fn seat_config_in(
         });
     };
     let suffix = seat_instance_suffix(seat_key);
-    // The CLI comes from the binary, the instance from the key: an instance key must name the CLI
-    // it runs, or `#2` / `opus#2` running `claude` would land in `claude#2`'s home (core#595).
-    if suffix.is_some() && seat_cli_key(seat_key) != name {
-        anyhow::bail!(
-            "seat key {seat_key:?} runs `{name}` but does not name it; a second instance of \
-             `{name}` is spelled `{name}{SEAT_INSTANCE_SEP}<n>` (two seat keys must never resolve \
-             to one configuration home)"
-        );
-    }
-    let name = seat_instance_root_name(name, suffix)?;
+    let name = seat_instance_root_name(&instance_root_base(name, seat_key, suffix)?, suffix)?;
     let root = base()?.join(name);
     refuse_symlinked_home(&root)?;
     let set: Vec<(&'static str, std::path::PathBuf)> = match cli {
@@ -3138,24 +3165,37 @@ rebase.autosquash\0";
     /// `a_relative_worker_home_refuses_the_claude_ballot_before_spawning` and
     /// `a_differently_cased_claude_is_not_a_claude_carrier_on_a_case_sensitive_filesystem`.
     /// Asserted here, at the resolver, so the ordering is pinned where it is decided.
-    /// core#595 review (codex HIGH): the CLI comes from the BINARY and the instance from the KEY,
-    /// so without this check `#2` or `opus#2` running `claude` would resolve `claude-2` — the
-    /// home `claude#2` owns — and two roster seats would share one configuration home and one
-    /// fence. An instance key must name the CLI it runs; anything else is refused, not folded.
+    /// core#595 review (codex HIGH, then MEDIUM): the CLI comes from the BINARY and the instance
+    /// from the KEY. `#2` or `opus#2` running `claude` must not land in `claude#2`'s home, and an
+    /// operator alias like `my-claude#2` must still convene, in a home of its own. Expected roots
+    /// are fixed strings, not derived from the code under test.
     #[test]
-    fn an_instance_key_must_name_the_cli_it_runs() {
+    fn instance_keys_resolve_injectively_and_aliases_get_their_own_home() {
         let base = std::env::temp_dir().join("seat-prefix-check-never-created");
-        for key in ["#2", "opus#2", "codex#2", "Claude#2"] {
-            let got = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, key);
+        let root_of = |key: &str| match seat_config_in(|| Ok(base.clone()), SeatCli::Claude, key) {
+            Ok(SeatConfig::Isolated { root: Some(r), .. }) => Ok(r
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string()),
+            other => Err(format!("{other:?}")),
+        };
+        for (key, want) in [
+            ("claude", "claude"),
+            ("claude#2", "claude-2"),
+            ("my-claude#2", "claude-my-claude-2"),
+            ("opus#2", "claude-opus-2"),
+            ("codex#2", "claude-codex-2"),
+        ] {
+            assert_eq!(root_of(key).as_deref(), Ok(want), "{key:?} running claude");
+        }
+        for key in ["#2", "Claude#2", "MY-CLAUDE#2", "a/b#2", "..#2", "a.b#2"] {
             assert!(
-                got.is_err(),
-                "{key:?} running claude must be refused, not resolved to claude-2: {got:?}"
+                root_of(key).is_err(),
+                "{key:?} must be refused, not folded: {:?}",
+                root_of(key)
             );
         }
-        assert!(
-            seat_config_in(|| Ok(base.clone()), SeatCli::Claude, "claude#2").is_ok(),
-            "claude#2 running claude is the one spelling of that instance"
-        );
     }
 
     #[test]
