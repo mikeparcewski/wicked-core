@@ -1696,7 +1696,11 @@ fn private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
 /// directory (`<name>.<pid>.<seq>.tmp`, [`settings_temp_name`]), then `rename` over `path` — a
 /// reader sees the old file or the new one, never a torn one, and a planted link at `path` is
 /// replaced as a link (rename does not follow its target).
-fn write_atomic(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);

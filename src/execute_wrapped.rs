@@ -984,13 +984,11 @@ pub(crate) fn ensure_secondary_instance_fence(seat_key: &str) -> anyhow::Result<
     let settings = serde_json::json!({ "permissions": { "deny": shared } });
     let bytes = serde_json::to_vec(&settings).map_err(anyhow::Error::msg)?;
     let settings_path = dir.join("settings.json");
-    // Temp-then-rename: a concurrent ballot reader sees the previous valid file or the new one,
-    // never a partial write. The secondary home has no prior sanitization (unlike the primary),
-    // so the window to a same-uid race is narrow; a full `write_atomic` port would require
-    // touching the NO-TOUCH acp_runner.rs, so the simpler form is used here.
-    let tmp = settings_path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, &settings_path)?;
+    // The SAME primitive the primary fence uses (core#595 review): a `<name>.<pid>.<seq>.tmp`
+    // temp name, so concurrent councils in one process never share a temp path (a pid-only
+    // name failed 228 of 240 concurrent writes with ENOENT, and each failure refuses to
+    // convene); exclusive create; mode 0600; fsync; cleanup on error.
+    crate::acp_runner::write_atomic(dir, &settings_path, &bytes)?;
     Ok(())
 }
 
@@ -4080,6 +4078,85 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 
 #[cfg(test)]
 mod tests {
+    /// core#595 review: the secondary-instance fence must survive CONCURRENT writers and be as
+    /// private as the primary. Many threads released by one barrier all write `claude#2`'s fence.
+    /// Expected outcomes are fixed facts (every call Ok; mode 0600 like the primary's
+    /// `write_atomic`), not values derived from the code under test.
+    #[test]
+    fn concurrent_secondary_fence_writes_all_succeed_and_the_fence_is_private() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let hatch = INHERIT_OPERATOR_CONFIG_ENV;
+        let prev_hatch = std::env::var_os(hatch);
+        std::env::remove_var(hatch);
+        let prev_home = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        let base = std::env::temp_dir().join(format!("wfence-concurrent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+
+        const THREADS: usize = 24;
+        let mut failures: Vec<String> = Vec::new();
+        for _round in 0..10 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let b = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        b.wait();
+                        ensure_secondary_instance_fence("claude#2").map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Err(e) = h.join().expect("fence thread panicked") {
+                    failures.push(e);
+                }
+            }
+        }
+        let fence = base.join("claude-2").join("settings.json");
+        let parsed: Result<serde_json::Value, _> = std::fs::read(&fence)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()));
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&fence)
+                .map(|m| m.permissions().mode() & 0o777)
+                .ok()
+        };
+
+        let _ = std::fs::remove_dir_all(&base);
+        match prev_home {
+            Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
+            None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
+        }
+        if let Some(v) = prev_hatch {
+            std::env::set_var(hatch, v);
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} of {} concurrent fence writes failed (refusing to convene): {:?}",
+            failures.len(),
+            THREADS * 10,
+            failures.iter().take(3).collect::<Vec<_>>()
+        );
+        let v = parsed.expect("the fence is valid JSON after the concurrent writes");
+        assert!(
+            v["permissions"]["deny"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "the fence carries deny rules"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            mode,
+            Some(0o600),
+            "the secondary fence must be owner-only, like the primary"
+        );
+    }
+
     /// (r2-N2 on #452) The runner's exit marker is read structurally: the code it carries, and
     /// `None` for every other shape of output.
     #[test]
