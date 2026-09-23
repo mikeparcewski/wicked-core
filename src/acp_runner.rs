@@ -922,6 +922,12 @@ struct AcpProcess {
     /// `cli_key`, so the stock `claude` seat — key `claude`, binary `claude-agent-acp` —
     /// advertised the capability and then cancelled every `elicitation/create`).
     elicitation_advertised: bool,
+    /// Whether this process's `initialize` result advertised the adapter's mid-turn steering
+    /// request (`result._meta.steering.supported == true`; claude-agent-acp 0.73.0
+    /// `acp-agent.js:853-859`). Read ONCE from the captured result in `start_acp_process`, never
+    /// re-probed per turn — the same one-decision-per-process rule as `elicitation_advertised`
+    /// (DES-TEAMING-001 §5.2). `false` ⇒ this session never receives a `_session/steering` frame.
+    steering_supported: bool,
     /// Whether `AcpConfig::verified_version` (if any) matched the ACTUAL resolved binary this
     /// process was spawned from, computed ONCE in `start_acp_process` before spawn — never
     /// re-probed per turn, since this field describes a fact about the running process, not
@@ -2750,6 +2756,7 @@ fn start_acp_process_with_write_roots(
         session_id,
         next_id,
         elicitation_advertised: form_enabled,
+        steering_supported: steering_advertised(&init),
         governance_verified,
         sandbox_downgrade,
         version_pin_drift,
@@ -2794,6 +2801,14 @@ fn unauthenticated_error(
 }
 
 // ── JSON-RPC helpers ──────────────────────────────────────────────────────────
+
+/// Whether an `initialize` response advertises `_session/steering`: the adapter puts it in the
+/// TOP-LEVEL `_meta` (sibling of `agentCapabilities`), `_meta.steering.supported: true`
+/// (claude-agent-acp 0.73.0 `acp-agent.js:853-859`). Anything else — absent, `false`, a string —
+/// is not an advertisement.
+fn steering_advertised(init: &Value) -> bool {
+    init["result"]["_meta"]["steering"]["supported"] == Value::Bool(true)
+}
 
 fn rpc_send(
     stdin: &mut BufWriter<ChildStdin>,
@@ -3861,6 +3876,7 @@ fn exec_turn_acp(
         tx,
         gate,
         None,
+        None,
     )
 }
 
@@ -3877,9 +3893,19 @@ fn exec_turn_acp_posture(
     tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
     posture: Option<&AcpWritePosture>,
+    team: Option<&crate::team::TeamTurn>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
+
+    // DES-TEAMING-001 §5.2 (S3): a teamed turn on a steering-capable process can take HIGH
+    // advice at each terminal `tool_call_update`. Say so on the attempt's record, so advice still
+    // queued when the turn ends is disclosed as "turn ended before a boundary", not "no channel".
+    if let Some(t) = team.filter(|_| proc.steering_supported) {
+        t.mailbox.mark_steering_channel(&t.key);
+    }
+    // Steering requests in flight: request id → the finding ids it carried.
+    let mut pending_steers: HashMap<u64, Vec<String>> = HashMap::new();
 
     // Clone the write_lock Arc so we can hold it around each proc.stdin write without
     // borrowing proc for the whole function. shared_run_terminal's try_lock() must see
@@ -4392,6 +4418,20 @@ fn exec_turn_acp_posture(
                                 MAX_OUT,
                                 &mut answer_from,
                             );
+                            // DES-TEAMING-001 §5.2: the delivery point. ONLY this main arm
+                            // drains — the `'elicit` sub-loop's does not, so advice waits while
+                            // the worker waits on a human.
+                            if let Some(t) = team {
+                                if proc.steering_supported && is_terminal_tool_call_update(&v) {
+                                    steer_at_boundary(
+                                        proc,
+                                        &write_lock,
+                                        t,
+                                        tx,
+                                        &mut pending_steers,
+                                    );
+                                }
+                            }
                         }
                         // The agent asking permission for a tool call. This is a REQUEST, not a
                         // notification: it carries an `id` and blocks the agent until answered.
@@ -4467,11 +4507,26 @@ fn exec_turn_acp_posture(
                     }
                     break 'exec;
                 }
-                // A response to some OTHER outbound id — nothing is waiting on it here.
+                // A response to some OTHER outbound id. The one kind this loop waits on is the
+                // answer to a steering request it sent (DES-TEAMING-001 §5.2).
+                if let (Some(t), Some(ids)) = (
+                    team,
+                    v.get("id")
+                        .and_then(Value::as_u64)
+                        .and_then(|rid| pending_steers.remove(&rid)),
+                ) {
+                    resolve_steer(t, &v, ids, tx);
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'exec,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'exec,
         }
+    }
+
+    // A steer still unanswered when the turn ended: give the adapter a short grace to answer it
+    // (a clean end only — a dead or timed-out bridge will not), then disclose what is left.
+    if let Some(t) = team {
+        settle_pending_steers(proc, t, tx, &mut pending_steers, found);
     }
 
     // No `stopReason` and no timeout means the bridge stopped answering — it died mid-turn. Its
@@ -4788,6 +4843,224 @@ fn answer_after_last_tool_call(raw: &str, answer_from: usize) -> String {
         tail.to_string()
     } else {
         whole
+    }
+}
+
+// ── DES-TEAMING-001 S3: monitor→worker advice over `_session/steering` ─────────────────────
+
+/// How long a turn that ended cleanly waits for the answer to a steering request still in flight.
+/// The adapter answers `promptRequired` synchronously for a settled turn (`acp-agent.js:1228-1238`),
+/// so this is a bound, not an expected wait.
+const STEER_ANSWER_GRACE: Duration = Duration::from_secs(5);
+
+/// A tool call's TERMINAL frame: `tool_call_update` with `status` `completed` or `failed`
+/// (claude-agent-acp 0.73.0 `acp-agent.js:7280-7290`). The edit that call made has landed.
+fn is_terminal_tool_call_update(v: &Value) -> bool {
+    let update = &v["params"]["update"];
+    update["sessionUpdate"].as_str() == Some("tool_call_update")
+        && matches!(update["status"].as_str(), Some("completed" | "failed"))
+}
+
+/// The delivery point (DES-TEAMING-001 §5.2). Drains ALL advice queued for this attempt, drops any
+/// finding whose evidence text is gone from a fresh snapshot (`superseded`), and sends what is
+/// left as ONE `_session/steering` request carrying `idleBehavior: "promptRequired"`. The caller
+/// has checked `proc.steering_supported`; a process that never advertised steering never gets here.
+fn steer_at_boundary(
+    proc: &mut AcpProcess,
+    write_lock: &Arc<Mutex<()>>,
+    team: &crate::team::TeamTurn,
+    tx: &std::sync::mpsc::Sender<Command>,
+    pending: &mut HashMap<u64, Vec<String>>,
+) {
+    use crate::team::{Delivery, Severity, SteerOutcome, CARRIER_ACP_STEERING};
+    let key = &team.key;
+    let emit = |ev: CoreEvent| {
+        let _ = tx.send(Command::EmitEvent(ev));
+    };
+    // Only HIGH is ever steered (the mailbox already refuses the rest; this is the second lock).
+    let advice: Vec<crate::team::Advice> = team
+        .mailbox
+        .take_queued(key)
+        .into_iter()
+        .filter(|a| a.finding.severity == Severity::High)
+        .collect();
+    if advice.is_empty() {
+        return;
+    }
+    let not_delivered = |ids: Vec<String>, detail: String| {
+        for id in &ids {
+            team.mailbox.record(
+                key,
+                id,
+                Delivery::NotDelivered {
+                    detail: detail.clone(),
+                },
+            );
+        }
+        emit(crate::team::advice_delivered(
+            key,
+            ids,
+            CARRIER_ACP_STEERING,
+            SteerOutcome::NotDelivered,
+            Some(detail),
+        ));
+    };
+    // Re-confirm against a FRESH snapshot: the premature-finding guard at the moment of delivery.
+    let Some((worktree, git_dir)) = team.confirm_root.as_ref() else {
+        not_delivered(
+            advice.into_iter().map(|a| a.finding.finding_id).collect(),
+            "no worktree baseline to re-confirm the finding against; the finding goes to the gate"
+                .to_string(),
+        );
+        return;
+    };
+    let refs: Vec<&crate::team::Finding> = advice.iter().map(|a| &a.finding).collect();
+    let present = match crate::team::evidence_still_present(worktree, git_dir, &refs) {
+        Ok(p) => p,
+        Err(e) => {
+            not_delivered(
+                advice.into_iter().map(|a| a.finding.finding_id).collect(),
+                crate::team::cap_utf8(
+                    &format!(
+                        "could not re-confirm against a fresh snapshot ({e}); the finding goes \
+                         to the gate"
+                    ),
+                    crate::team::DETAIL_CAP,
+                ),
+            );
+            return;
+        }
+    };
+    let mut live = Vec::new();
+    for (a, ok) in advice.into_iter().zip(present) {
+        if ok {
+            live.push(a);
+        } else {
+            team.mailbox
+                .record(key, &a.finding.finding_id, Delivery::Superseded);
+        }
+    }
+    if live.is_empty() {
+        return;
+    }
+    let (text, sent, rest) = crate::team::advice_block(live);
+    team.mailbox.requeue_front(key, rest);
+    let ids: Vec<String> = sent.into_iter().map(|a| a.finding.finding_id).collect();
+    let rid = proc.next_id;
+    proc.next_id += 1;
+    let written = {
+        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        rpc_send(
+            &mut proc.stdin,
+            rid,
+            crate::team::STEER_METHOD,
+            crate::team::steer_params(&proc.session_id, &text),
+        )
+    };
+    match written {
+        Ok(()) => {
+            pending.insert(rid, ids);
+        }
+        Err(e) => not_delivered(
+            ids,
+            crate::team::cap_utf8(
+                &format!("the steering request could not be written ({e})"),
+                crate::team::DETAIL_CAP,
+            ),
+        ),
+    }
+}
+
+/// The adapter answered a steering request (DES-TEAMING-001 §5.2): one `adviceDelivered`, and the
+/// findings it carried recorded `injected` or not delivered. A refusal never ends the turn.
+fn resolve_steer(
+    team: &crate::team::TeamTurn,
+    v: &Value,
+    ids: Vec<String>,
+    tx: &std::sync::mpsc::Sender<Command>,
+) {
+    use crate::team::{Delivery, SteerOutcome};
+    let (outcome, detail) = crate::team::classify_steer_answer(v);
+    for id in &ids {
+        let delivery = if outcome == SteerOutcome::Injected {
+            Delivery::Injected
+        } else {
+            Delivery::NotDelivered {
+                detail: format!(
+                    "steer {}{}",
+                    outcome.as_str(),
+                    detail
+                        .as_deref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default()
+                ),
+            }
+        };
+        team.mailbox.record(&team.key, id, delivery);
+    }
+    let _ = tx.send(Command::EmitEvent(crate::team::advice_delivered(
+        &team.key,
+        ids,
+        crate::team::CARRIER_ACP_STEERING,
+        outcome,
+        detail,
+    )));
+}
+
+/// Steering requests still unanswered when the turn loop ended. After a CLEAN end the adapter is
+/// alive and answers within [`STEER_ANSWER_GRACE`] (a settled turn → `promptRequired`, which
+/// starts nothing); frames that are not those answers are ignored — the turn is over. Whatever is
+/// still unanswered is disclosed `turn_ended`: nothing confirmed it reached the worker.
+fn settle_pending_steers(
+    proc: &mut AcpProcess,
+    team: &crate::team::TeamTurn,
+    tx: &std::sync::mpsc::Sender<Command>,
+    pending: &mut HashMap<u64, Vec<String>>,
+    clean_end: bool,
+) {
+    if clean_end {
+        let deadline = Instant::now() + STEER_ANSWER_GRACE;
+        while !pending.is_empty() {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(line) = proc.line_rx.recv_timeout(left) else {
+                break;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if agent_method(&v).is_some() {
+                continue;
+            }
+            if let Some(ids) = v
+                .get("id")
+                .and_then(Value::as_u64)
+                .and_then(|rid| pending.remove(&rid))
+            {
+                resolve_steer(team, &v, ids, tx);
+            }
+        }
+    }
+    let detail =
+        "the turn ended with the steering request unanswered; the finding goes to the gate";
+    for (_, ids) in pending.drain() {
+        for id in &ids {
+            team.mailbox.record(
+                &team.key,
+                id,
+                crate::team::Delivery::NotDelivered {
+                    detail: detail.to_string(),
+                },
+            );
+        }
+        let _ = tx.send(Command::EmitEvent(crate::team::advice_delivered(
+            &team.key,
+            ids,
+            crate::team::CARRIER_ACP_STEERING,
+            crate::team::SteerOutcome::TurnEnded,
+            Some(detail.to_string()),
+        )));
     }
 }
 
@@ -5238,6 +5511,10 @@ pub struct AcpStepRunner {
     /// (the ACP inject path — there is no PTY to write into mid-turn). Keyed by run_id;
     /// drained in [`AcpStepRunner::exec_turn`], pruned with the run's sessions.
     pending_injects: InjectQueue,
+    /// HIGH monitor advice waiting for the next tool-call boundary of its attempt
+    /// (DES-TEAMING-001 §5.2). Written by the team supervisor (S2, #601), drained by the ACP turn
+    /// loop, swept at the end of every attempt's turn ([`crate::team::finish_attempt`]).
+    steer_mailbox: crate::team::SteerMailbox,
     /// (F-7R2-019) Session keys whose startup failed on authentication — see [`AuthFailedSessions`].
     auth_failed: AuthFailedSessions,
     /// Last activity per CHAT id — set on open, on every ensure, and on every turn.
@@ -5595,6 +5872,7 @@ impl AcpStepRunner {
             tx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
+            steer_mailbox: crate::team::SteerMailbox::default(),
             auth_failed: Arc::new(Mutex::new(HashSet::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             chat_scopes: Arc::new(Mutex::new(HashMap::new())),
@@ -5614,6 +5892,15 @@ impl AcpStepRunner {
 
     fn emit_event(&self, ev: CoreEvent) {
         let _ = self.tx.send(Command::EmitEvent(ev));
+    }
+
+    /// The steer mailbox handle the team supervisor writes HIGH advice into (DES-TEAMING-001
+    /// §5.2). Cloning shares the one mailbox.
+    // Taken by S2's supervisor in `spawn_with_acp_sessions` (#601); until it lands only the unix
+    // carrier tests do.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
+    pub(crate) fn steer_mailbox(&self) -> crate::team::SteerMailbox {
+        self.steer_mailbox.clone()
     }
 
     // ── Chat sessions (crew#165 / core#13) ──────────────────────────────────────
@@ -6544,6 +6831,20 @@ impl AcpStepRunner {
 
         let output = self.exec_turn_inner(input, emit);
 
+        // DES-TEAMING-001 §5.1/§5.3 (S3): on EVERY carrier this unit may have landed on — ACP,
+        // or the wrapped fallback — advice still queued did not reach the worker mid-turn and is
+        // disclosed as such; a successful turn's `ADVICE` lines answer the delivered findings.
+        // The engine's own judge/triage sessions share the unit's key but are not the worker.
+        if !crate::execute_wrapped::is_engine_internal(&input.unit) {
+            for ev in crate::team::finish_attempt(
+                &self.steer_mailbox,
+                &(input.run_id.clone(), input.unit.ord, input.attempt),
+                (output.status == StepStatus::Ok).then_some(output.output.as_str()),
+            ) {
+                self.emit_event(ev);
+            }
+        }
+
         // On a normal bus-worker return, publication owns the in-flight marker until
         // `task.completed` is durable. A panic never reaches this assignment, so Drop
         // clears the marker and the degraded recovery path can terminalize the task.
@@ -7447,6 +7748,7 @@ impl AcpStepRunner {
                 ),
             }
         }
+        let team_turn = crate::team::TeamTurn::for_unit(input, &self.steer_mailbox);
         let turn = exec_turn_acp_posture(
             &mut proc,
             &prompt,
@@ -7459,6 +7761,7 @@ impl AcpStepRunner {
             &self.tx,
             gate.as_ref(),
             fence.as_ref(),
+            team_turn.as_ref(),
         );
         let superseded = {
             let maps = self
@@ -7674,6 +7977,7 @@ impl StepRunner for AcpStepRunner {
     /// `wait()` on the child process, which blocks. Doing that on the actor thread would stall
     /// the entire actor while waiting for the subprocess to exit.
     fn on_run_complete(&self, run_id: &str) {
+        self.steer_mailbox.prune_run(run_id);
         // crew#277: in-flight WRAPPED workers (the fallback path every non-ACP CLI takes) must
         // die with the run too — a canceled run's hung `copilot -p` survived ~90 minutes because
         // only ACP sessions had kill handles.
@@ -7903,6 +8207,10 @@ fn acp_read_only_unproven_at_spawn(
 
 #[cfg(test)]
 mod tests {
+    /// DES-TEAMING-001 S3 (#602): steering advice into the working ACP session.
+    #[cfg(unix)]
+    mod steer;
+
     use super::{
         is_transient_cli_failure, is_worker_originated_failure, should_retry_worker,
         MAX_TRANSIENT_RETRIES,

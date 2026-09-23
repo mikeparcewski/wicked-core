@@ -3105,6 +3105,49 @@ mod tests {
                 "reason", "remedy",
             ],
         );
+        // DES-TEAMING-001 §7 (S3, #602): monitor advice delivery and the worker's answer.
+        check(
+            CoreEvent::AdviceDelivered {
+                session: s(),
+                ord: 3,
+                attempt: 1,
+                finding_ids: vec![s()],
+                carrier: "acp_steering".to_string(),
+                outcome: "injected".to_string(),
+                detail: None,
+            },
+            "adviceDelivered",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "findingIds",
+                "carrier",
+                "outcome",
+                "detail",
+            ],
+        );
+        check(
+            CoreEvent::WorkerAdviceResponse {
+                session: s(),
+                ord: 3,
+                attempt: 1,
+                finding_id: s(),
+                disposition: "declined".to_string(),
+                reason: s(),
+            },
+            "workerAdviceResponse",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "findingId",
+                "disposition",
+                "reason",
+            ],
+        );
         // Review of #456 (F4/F6): the seat's write containment at distribution; a kept worktree.
         check(
             CoreEvent::SandboxPosture {
