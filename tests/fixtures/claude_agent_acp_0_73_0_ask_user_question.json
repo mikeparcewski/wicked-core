@@ -1,0 +1,146 @@
+{
+  "_provenance": "Output of askUserQuestionsToCreateRequest(questions, 'mock-session', 'toolu_01') from @agentclientprotocol/claude-agent-acp 0.73.0 dist/elicitation.js, run under node against the package's own dependencies (core#594). Regenerate from the adapter; never hand-edit to match the validator.",
+  "single_select": {
+    "mode": "form",
+    "sessionId": "mock-session",
+    "toolCallId": "toolu_01",
+    "message": "Which database should the service use?",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "question_0": {
+          "type": "string",
+          "title": "Database",
+          "oneOf": [
+            {
+              "const": "Postgres",
+              "title": "Postgres",
+              "description": "Managed relational store"
+            },
+            {
+              "const": "SQLite",
+              "title": "SQLite",
+              "description": "Embedded file store"
+            }
+          ]
+        },
+        "question_0_custom": {
+          "type": "string",
+          "title": "Other",
+          "description": "Type your own answer instead of choosing an option above (optional).",
+          "_meta": {
+            "_askUserQuestionCustomAnswer": {
+              "questionId": "question_0",
+              "isCustomAnswer": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "multi_select": {
+    "mode": "form",
+    "sessionId": "mock-session",
+    "toolCallId": "toolu_01",
+    "message": "Which languages should the scaffold include?",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "question_0": {
+          "type": "array",
+          "title": "Languages",
+          "items": {
+            "anyOf": [
+              {
+                "const": "Rust",
+                "title": "Rust"
+              },
+              {
+                "const": "TypeScript",
+                "title": "TypeScript"
+              }
+            ]
+          }
+        },
+        "question_0_custom": {
+          "type": "string",
+          "title": "Other",
+          "description": "Type your own answer instead of choosing an option above (optional).",
+          "_meta": {
+            "_askUserQuestionCustomAnswer": {
+              "questionId": "question_0",
+              "isCustomAnswer": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "two_questions": {
+    "mode": "form",
+    "sessionId": "mock-session",
+    "toolCallId": "toolu_01",
+    "message": "Please answer the following questions.",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "question_0": {
+          "type": "string",
+          "title": "Database",
+          "description": "Which database should the service use?",
+          "oneOf": [
+            {
+              "const": "Postgres",
+              "title": "Postgres",
+              "description": "Managed relational store"
+            },
+            {
+              "const": "SQLite",
+              "title": "SQLite",
+              "description": "Embedded file store"
+            }
+          ]
+        },
+        "question_0_custom": {
+          "type": "string",
+          "title": "Other",
+          "description": "Type your own answer instead of choosing an option above (optional).",
+          "_meta": {
+            "_askUserQuestionCustomAnswer": {
+              "questionId": "question_0",
+              "isCustomAnswer": true
+            }
+          }
+        },
+        "question_1": {
+          "type": "array",
+          "title": "Languages",
+          "description": "Which languages should the scaffold include?",
+          "items": {
+            "anyOf": [
+              {
+                "const": "Rust",
+                "title": "Rust"
+              },
+              {
+                "const": "TypeScript",
+                "title": "TypeScript"
+              }
+            ]
+          }
+        },
+        "question_1_custom": {
+          "type": "string",
+          "title": "Other",
+          "description": "Type your own answer instead of choosing an option above (optional).",
+          "_meta": {
+            "_askUserQuestionCustomAnswer": {
+              "questionId": "question_1",
+              "isCustomAnswer": true
+            }
+          }
+        }
+      }
+    }
+  }
+}
