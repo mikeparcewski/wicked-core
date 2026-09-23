@@ -281,3 +281,95 @@ fn headerless_hunk_is_not_docs_only() {
     assert_eq!(s.code_files, 1, "{s:?}");
     assert_eq!(review_plan(&s).monitors, 1);
 }
+
+// Review on #600: `remove_dir_all` and `remove_file` were listed but not `remove_dir`, so
+// `std::fs::remove_dir(path)?;` in a small change got one standard monitor and no reviewer. The
+// markers are now grouped by family; each family member has a realistic fixture line here, and the
+// last assertion keeps the table and the fixtures in step.
+#[test]
+fn every_destructive_family_member_summons_deep_review() {
+    let fixtures = [
+        // Rust std::fs
+        "std::fs::remove_dir(path)?;",
+        "fs::remove_dir_all(&worktree)?;",
+        "std::fs::remove_file(&lock)?;",
+        // Node fs
+        "await fs.rm(dir, { recursive: true, force: true });",
+        "fs.rmSync(dir, { recursive: true });",
+        "fs.rmdir(dir, cb);",
+        "fs.unlink(file, cb);",
+        "fs.unlinkSync(file);",
+        "await rimraf(dist);",
+        // Python
+        "os.remove(path)",
+        "os.unlink(path)",
+        "os.rmdir(path)",
+        "shutil.rmtree(tmp)",
+        // shell
+        "rm -r build",
+        "rm -rf target",
+        "rm -f state.db",
+        "rmdir empty",
+        // git
+        "git clean -fdx",
+        "git branch -D feat/old",
+        "git push --force origin main",
+        "git push -f origin main",
+        "git reset --hard origin/main",
+        "git worktree remove --force run-1",
+        // SQL
+        "DROP TABLE runs;",
+        "ALTER TABLE runs DROP COLUMN cost;",
+        "DROP INDEX idx_runs;",
+        "DROP DATABASE wicked;",
+        "DROP SCHEMA memory;",
+        "TRUNCATE TABLE events;",
+        "DELETE FROM memories WHERE scope = ?;",
+        // generic verbs
+        "store.erase_scope(scope)?;",
+        "purge_expired(&conn)?;",
+        "wipe_state_home()?;",
+    ];
+    let want = ReviewPlan {
+        monitors: 2,
+        depth: Depth::Deep,
+        post_hoc_reviewer: true,
+    };
+    for line in fixtures {
+        let d = format!(
+            "diff --git a/src/plan.rs b/src/plan.rs\n--- a/src/plan.rs\n+++ b/src/plan.rs\n@@ -1 +1,2 @@\n fn f() {{}}\n+{line}\n"
+        );
+        let s = signals_from_diff(&d);
+        assert!(s.destructive, "not destructive: {line:?} -> {s:?}");
+        assert_eq!(review_plan(&s), want, "{line:?}");
+    }
+    let lower: Vec<String> = fixtures.iter().map(|l| l.to_ascii_lowercase()).collect();
+    for m in THRESHOLDS.destructive_line_markers {
+        assert!(
+            lower.iter().any(|l| l.contains(m)),
+            "marker {m:?} has no fixture line"
+        );
+    }
+}
+
+#[test]
+fn destructive_words_in_a_docs_comment_stay_at_zero() {
+    let d = "\
+diff --git a/docs/ops.md b/docs/ops.md
+--- a/docs/ops.md
++++ b/docs/ops.md
+@@ -1 +1,2 @@
+ # Ops
++<!-- the sweep calls remove_dir and git push --force; see the runbook -->
+";
+    let s = signals_from_diff(d);
+    assert!(!s.destructive, "{s:?}");
+    assert_eq!(
+        review_plan(&s),
+        ReviewPlan {
+            monitors: 0,
+            depth: Depth::None,
+            post_hoc_reviewer: false
+        }
+    );
+}

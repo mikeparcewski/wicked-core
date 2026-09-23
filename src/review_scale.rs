@@ -120,24 +120,46 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
         "path_policy",
         "write_posture",
     ],
+    // Grouped by family (review on #600: listing `remove_dir_all` without `remove_dir` let
+    // `std::fs::remove_dir(path)?` through). Matched as lowercase substrings, so one entry covers
+    // its longer forms: `remove_dir` covers `remove_dir_all`, `unlink` covers `unlinkSync` and
+    // `os.unlink`, `rmdir` covers `fs.rmdir` and `os.rmdir`, `rm -r` covers `rm -rf`.
     destructive_line_markers: &[
-        "remove_dir_all",
+        // Rust std::fs
+        "remove_dir",
         "remove_file",
-        "rm -rf",
-        "rm -r ",
-        "rmsync",
-        "rimraf",
+        // Node fs and rimraf
+        "fs.rm(",
+        "rmsync(",
+        "rmdir",
         "unlink",
+        "rimraf",
+        // Python os and shutil
+        "os.remove(",
+        "shutil.rmtree(",
+        // shell
+        "rm -r",
+        "rm -f",
+        // git
+        "git clean",
+        "branch -d",
+        "push --force",
+        "push -f",
+        "reset --hard",
+        "worktree remove",
+        "--force",
+        // SQL
+        "drop table",
+        "drop column",
+        "drop index",
+        "drop database",
+        "drop schema",
+        "truncate table",
+        "delete from",
+        // generic verbs, any language
         "erase",
         "purge",
         "wipe",
-        "--force",
-        "push -f",
-        "reset --hard",
-        "drop table",
-        "drop column",
-        "truncate table",
-        "delete from",
     ],
     destructive_path_markers: &["migration"],
 };
