@@ -950,6 +950,11 @@ fn baseline_diff_enabled(worktree: &Path) -> bool {
 }
 
 /// Apply a configured slot over the auto-detected check of the same name.
+/// The formatter slot, whether auto-detected (`cargo-fmt-check`) or configured (`formatter`).
+fn is_formatter_check(name: &str) -> bool {
+    name == "cargo-fmt-check" || name == "formatter"
+}
+
 fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
     match r {
         Resolved::Default => {}
@@ -1062,7 +1067,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     // A configured command (Node-shaped or not — the rule is the same for every configured slot)
     // needs the tree provisioned when a `package.json` is present and `node_modules` is missing:
     // `npx vitest …` resolves from node_modules.
-    let configured_node = [&r_typecheck, &r_lint, &r_test, &r_targeted]
+    let configured_node = [&r_typecheck, &r_lint, &r_test, &r_targeted, &r_formatter]
         .iter()
         .any(|r| matches!(r, Resolved::Command(_)))
         || e2e.is_some();
@@ -1725,7 +1730,14 @@ pub(crate) fn run_with_sandbox_ctx(
         // BASELINE-DIFF (F-RC2-009): a FAILURE (not a timeout, not a spawn failure, not the
         // install — those say nothing about the base) is compared against the run base before it
         // may deny. No known base ⇒ the failure denies as it always did.
-        if !run.passed() && run.spawn_error.is_none() && !run.timed_out && check.name != "install" {
+        // A formatter check is excluded too (core#551): a formatting diff is deterministic and
+        // never environmental, so "the base fails identically" must not excuse it.
+        if !run.passed()
+            && run.spawn_error.is_none()
+            && !run.timed_out
+            && check.name != "install"
+            && !is_formatter_check(&check.name)
+        {
             match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
                 (Some(head), _) if !baseline_diff => {
                     run.base = Some(Box::new(BaseRun {
@@ -4061,6 +4073,82 @@ mod tests {
     /// recorded, never denying, the floor PASSES and the base run is paid for once (cached);
     /// (3) a head that fixes `other` and breaks nothing is `pre_existing_in_sandbox` — passes;
     /// (4) `baseline_diff: false` restores the plain denial, with the opt-out on the record.
+    /// core#551 (review): a configured Node formatter is a Node check like any other, so a
+    /// formatter-only `checks.json` still schedules `install` first — it must not run `npx`/`npm`
+    /// against an unprovisioned tree.
+    #[test]
+    fn a_formatter_only_node_config_schedules_install_first() {
+        let wt = scratch("fmt-node-install");
+        std::fs::write(
+            wt.join("package.json"),
+            "{\"name\":\"x\",\"version\":\"0.0.0\"}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            "{\"formatter\": [\"npm\", \"run\", \"format:check\"]}\n",
+        )
+        .unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec!["install".to_string(), "formatter".to_string()],
+            "{names:?}"
+        );
+    }
+
+    /// core#551 (review): a formatting diff is deterministic, never environmental, so a formatter
+    /// failure the base ALSO has is still a denial — the baseline diff must not excuse it the way
+    /// it excuses a pre-existing test failure.
+    #[test]
+    fn a_formatter_failure_the_base_shares_still_denies() {
+        let repo = scratch("fmt-basediff");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fmt_basediff_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"src/lib.rs\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
+        // Unformatted on the BASE and unchanged on the head: the base fails fmt identically.
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn add(a: i32,b: i32)->i32{a+b}\n",
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!(
+                "repo_checks: no sandbox tool here — the floor failed closed instead of running"
+            );
+            return;
+        }
+        assert!(
+            !report.passed,
+            "a shared formatting failure must still deny: {report:?}"
+        );
+        let fmt = &report.checks[0];
+        assert_eq!(fmt.name, "cargo-fmt-check");
+        assert!(fmt.exit_code.is_some_and(|e| e != 0), "{fmt:?}");
+        assert!(
+            fmt.base.is_none(),
+            "the formatter is never baseline-compared: {:?}",
+            fmt.base
+        );
+        assert!(fmt.denies(), "{fmt:?}");
+        let denial = report.denial_reason();
+        assert!(denial.contains("cargo-fmt-check"), "{denial}");
+    }
+
     #[test]
     fn baseline_diff_denies_only_regressions() {
         let repo = scratch("basediff");

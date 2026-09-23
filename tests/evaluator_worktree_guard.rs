@@ -801,16 +801,18 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
     assert!(passed && skipped.is_empty());
     assert_eq!(
         checks.len(),
-        1,
-        "one check detected: the Cargo manifest's `cargo test`"
+        2,
+        "two checks detected from the Cargo manifest: `cargo fmt --check` first, then `cargo test` (core#551)"
     );
-    assert_eq!(checks[0].name, "cargo-test");
-    assert_eq!(checks[0].argv, vec!["cargo", "test"]);
+    assert_eq!(checks[0].name, "cargo-fmt-check");
     assert_eq!(checks[0].exit_code, Some(0), "{:?}", checks[0]);
+    assert_eq!(checks[1].name, "cargo-test");
+    assert_eq!(checks[1].argv, vec!["cargo", "test"]);
+    assert_eq!(checks[1].exit_code, Some(0), "{:?}", checks[1]);
     assert!(
-        checks[0].stdout_tail.contains("test result: ok"),
+        checks[1].stdout_tail.contains("test result: ok"),
         "the engine observed cargo's own output: {}",
-        checks[0].stdout_tail
+        checks[1].stdout_tail
     );
     assert!(
         !evs.iter()
@@ -1005,7 +1007,9 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     assert_eq!(floor, "creator");
     assert_eq!(outcome, "failed");
     assert!(!passed);
-    let c = &checks[0];
+    // The formatter runs first and is clean here; the regression is in `cargo-test` (core#551).
+    assert_eq!(checks[0].name, "cargo-fmt-check");
+    let c = &checks[1];
     assert_eq!(c.name, "cargo-test");
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
@@ -1492,7 +1496,9 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         assert_eq!(floor, want_floor);
         assert_eq!(outcome, "passed");
         assert!(passed);
-        let c = &checks[0];
+        // `cargo-fmt-check` is first and clean; the shared failure is in `cargo-test` (core#551).
+        let c = &checks[1];
+        assert_eq!(c.name, "cargo-test");
         assert_eq!(
             c.exit_code,
             Some(101),
