@@ -3919,6 +3919,9 @@ fn exec_turn_acp_posture(
     tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
     posture: Option<&AcpWritePosture>,
+    // DES-TEAMING-001 §4.2/§5.2: the unit's team context — `Some` for a worker unit turn (its S3
+    // steer mailbox and re-confirmation root); a TEAMED one also emits `unitCheckpoint` at each
+    // terminal tool call. Chat turns, monitor turns and the engine's own sessions pass `None`.
     team: Option<&crate::team::TeamTurn>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
@@ -4444,9 +4447,15 @@ fn exec_turn_acp_posture(
                                 MAX_OUT,
                                 &mut answer_from,
                             );
-                            // DES-TEAMING-001 §5.2: the delivery point. ONLY this main arm
-                            // drains — the `'elicit` sub-loop's does not, so advice waits while
-                            // the worker waits on a human.
+                            // DES-TEAMING-001 S2: a teamed unit's terminal tool call is a
+                            // semantic checkpoint — the monitor supervisor paces its batches on it.
+                            if let Some(ev) = team.and_then(|t| t.observe(&v)) {
+                                let _ = tx.send(Command::EmitEvent(ev));
+                            }
+                            // DES-TEAMING-001 §5.2: the delivery point — the same boundary the
+                            // checkpoint is emitted at. ONLY this main arm drains — the `'elicit`
+                            // sub-loop's does not, so advice waits while the worker waits on a
+                            // human.
                             if let Some(t) = team {
                                 if proc.steering_supported && is_terminal_tool_call_update(&v) {
                                     steer_at_boundary(
@@ -5570,6 +5579,15 @@ pub struct AcpStepRunner {
     /// Key: `(run_id, session_key, launch_seq)`. Value: `(write_lock, kill_handle)`.
     /// Created in `spawn_with_acp_sessions`; PTY and injected runners hold an empty registry.
     pub write_reg: WriteReg,
+    /// DES-TEAMING-001 S2: the warm READ-ONLY monitor sessions, keyed
+    /// `team:<run>:<ord>:<attempt>:<monitorId>`. Kept apart from `sessions` so no chat surface
+    /// (enumerate, reaper, `ChatDelta`) ever sees a monitor.
+    monitors: Arc<Mutex<HashMap<String, Arc<Mutex<AcpProcess>>>>>,
+    /// The team supervisor, installed by `spawn_with_acp_sessions`; `None` elsewhere (no unit is
+    /// teamed without it).
+    team: std::sync::OnceLock<crate::team::TeamHandle>,
+    /// Per-`(run, ord)` team plans — the plain parameter S4/S5 replace (DES §8).
+    team_plans: Arc<Mutex<HashMap<(String, u32), crate::team::TeamPlan>>>,
 }
 
 /// Why a chat's warm sessions were released — carried on `ChatClosed` so an operator can tell a
@@ -5910,6 +5928,9 @@ impl AcpStepRunner {
             operational_home: None,
             elicitation_maps,
             write_reg,
+            monitors: Arc::new(Mutex::new(HashMap::new())),
+            team: std::sync::OnceLock::new(),
+            team_plans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -7779,7 +7800,9 @@ impl AcpStepRunner {
                 ),
             }
         }
-        let team_turn = crate::team::TeamTurn::for_unit(input, &self.steer_mailbox);
+        // DES-TEAMING-001 §4.2/§5.2: the turn's team context; a teamed unit's supervisor attaches
+        // at turn start.
+        let team_turn = self.team_attach(input, &cli_key);
         let turn = exec_turn_acp_posture(
             &mut proc,
             &prompt,
@@ -7974,6 +7997,324 @@ impl AcpStepRunner {
     }
 }
 
+// ── DES-TEAMING-001 S2 (#601): the monitor subscription's carrier half ───────────────────────────
+//
+// `team_attach` (turn start) and `team_finish` (the worker thread, after the turn) are the two
+// seams the supervisor is driven through; `monitor_ensure`/`monitor_turn` run a monitor as a warm,
+// READ-ONLY ACP session beside the chat machinery, judged by the chat boundary, emitting no chat
+// events. Nothing here injects into the worker (S3) or reaches the gate (S6).
+
+/// Why `seat` cannot be a monitor, or its launch facts (DES §4.1 (b)): the seat must have an ACP
+/// adapter on stdio that is ADMITTED to input governance — the read-only boundary is enforced by
+/// answering `session/request_permission`, which an unadmitted adapter never sends.
+fn monitor_admission(
+    seat: &str,
+) -> Result<
+    (
+        AcpConfig,
+        wicked_apps_core::spawn::SeatCli,
+        crate::skills_snapshot::WorkerCli,
+    ),
+    String,
+> {
+    let (config, seat_cli, worker_cli) = acp_launch_facts(seat)
+        .ok_or_else(|| format!("seat '{seat}' has no ACP adapter configured"))?;
+    if config.transport == AcpTransport::Http {
+        return Err(format!(
+            "seat '{seat}' runs its ACP adapter over HTTP, which a monitor does not support"
+        ));
+    }
+    if !config.acp_input_governance {
+        return Err(format!(
+            "seat '{seat}' runs an ACP adapter that is not admitted to input governance \
+             (acp_input_governance=false): its tool calls are never put to \
+             session/request_permission, so the read-only boundary cannot hold \
+             (DES-TEAMING-001 §4.1)"
+        ));
+    }
+    Ok((config, seat_cli, worker_cli))
+}
+
+/// Arm `proc` as a monitor: every permission request it makes is judged by the chat boundary
+/// over its scope — its private scratch root is the ONLY write root, the unit's worktree is
+/// READ-ONLY, anything else is refused — with the seat INSTANCE's own configuration home carved
+/// out (core#591): the same `chat_boundary` a scoped chat on that instance is judged by.
+fn arm_monitor(
+    proc: &mut AcpProcess,
+    scope: &ChatScope,
+    seat_cli: wicked_apps_core::spawn::SeatCli,
+    seat: &str,
+) {
+    proc.chat_boundary = Some(chat_boundary(scope, seat_cli, seat));
+}
+
+fn chat_scope_of(scope: &crate::team::MonitorScope) -> ChatScope {
+    ChatScope {
+        cwd: scope.cwd.clone(),
+        code_graph_db: scope.code_graph_db.clone(),
+        read_roots: scope.read_roots.clone(),
+    }
+}
+
+impl AcpStepRunner {
+    /// Install the team supervisor (`spawn_with_acp_sessions`). Once.
+    pub(crate) fn install_team(&self, handle: crate::team::TeamHandle) {
+        let _ = self.team.set(handle);
+    }
+
+    /// Team unit `ord` of `run_id` with `plan` (DES §8). A PLAIN PARAMETER: S4's policy (the
+    /// monitor count) and S5's `RoutingInfo::Teamed` (the candidates) replace this caller, not the
+    /// supervisor. A unit with no plan is not teamed: it emits no checkpoint and gets no monitor.
+    pub fn set_team_plan(&self, run_id: &str, ord: u32, plan: crate::team::TeamPlan) {
+        self.team_plans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((run_id.to_string(), ord), plan);
+    }
+
+    /// The attempt's `TeamCmd::Attach` context, when the unit is teamed and a supervisor runs.
+    fn team_ctx(&self, input: &StepInput, creator: &str) -> Option<crate::team::AttachCtx> {
+        self.team.get()?;
+        let plan = self
+            .team_plans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(input.run_id.clone(), input.unit.ord))
+            .cloned()?;
+        let baseline = input.unit.worktree_baseline.as_ref();
+        let repo = match (
+            input.workdir.as_ref(),
+            baseline.and_then(|b| b.git_dir.as_deref()),
+        ) {
+            (Some(w), Some(g)) => Some(crate::team::Repo {
+                workdir: w.clone(),
+                git_dir: std::path::PathBuf::from(g),
+            }),
+            _ => None,
+        };
+        Some(crate::team::AttachCtx {
+            run_id: input.run_id.clone(),
+            ord: input.unit.ord,
+            attempt: input.attempt,
+            creator: creator.to_string(),
+            plan,
+            repo,
+            baseline_tree: baseline.map(|b| b.tree.clone()),
+            criterion: input.unit.description.clone(),
+            phase: input.unit.phase_id().unwrap_or("?").to_string(),
+            code_graph_db: input
+                .governance
+                .as_ref()
+                .and_then(|g| g.code_graph_db.clone()),
+        })
+    }
+
+    /// Turn start (DES §4.2, §5.2): the turn's team context. For a TEAMED unit (a plan names
+    /// monitors and a supervisor runs) `TeamCmd::Attach` is sent first and the context is
+    /// `teamed`, so the carrier emits `unitCheckpoint`; every other worker unit still gets its
+    /// context — the S3 mailbox and re-confirmation root — but checkpoints nothing. `None` for the
+    /// engine's own judge/triage sessions: they share the unit's key but are not the worker.
+    fn team_attach(&self, input: &StepInput, creator: &str) -> Option<crate::team::TeamTurn> {
+        if crate::execute_wrapped::is_engine_internal(&input.unit) {
+            return None;
+        }
+        let teamed = match (self.team_ctx(input, creator), self.team.get()) {
+            (Some(ctx), Some(team)) => {
+                team.send(crate::team::TeamCmd::Attach(ctx));
+                true
+            }
+            _ => false,
+        };
+        crate::team::TeamTurn::for_unit(input, &self.steer_mailbox, teamed)
+    }
+
+    /// Warm (or return) monitor session `pool_key` on seat instance `seat`, READ-ONLY over
+    /// `scope`. Mirrors `chat_ensure` — admission, the scratch root, the skills ladder, the runtime
+    /// admission — but records no chat scope, touches no chat activity and emits no chat event.
+    fn monitor_ensure(
+        &self,
+        pool_key: &str,
+        seat: &str,
+        scope: &crate::team::MonitorScope,
+    ) -> Result<Arc<Mutex<AcpProcess>>, String> {
+        if let Some(p) = self
+            .monitors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(pool_key)
+        {
+            return Ok(Arc::clone(p));
+        }
+        let (config, seat_cli, worker_cli) = monitor_admission(seat)?;
+        let scope = chat_scope_of(scope);
+        scoped_seat_admission(seat, &scope, &config)?;
+        ensure_chat_scratch_root(&scope.cwd).map_err(|e| format!("monitor '{pool_key}': {e}"))?;
+        // The same ladder a chat seat is handed from; unlike a chat, a monitor may run
+        // skill-less (its work is the diff in its prompt), but a FAILED ladder refuses it.
+        let snapshot = match crate::skills_snapshot::resolve_ladder()
+            .map_err(|e| format!("seat '{seat}': {e}"))?
+        {
+            crate::skills_snapshot::Ladder::Root(s) => {
+                crate::skills_snapshot::fence_admit(&s, self.operational_home.as_deref())
+                    .map_err(|e| format!("seat '{seat}': {e}"))?;
+                Some(s)
+            }
+            crate::skills_snapshot::Ladder::Absent => None,
+            crate::skills_snapshot::Ladder::Failed(why) => {
+                return Err(format!("seat '{seat}': skills ladder failed — {why}"));
+            }
+        };
+        let delivery = snapshot
+            .as_ref()
+            .map(|s| s.delivery(&worker_cli))
+            .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
+        let mut proc = start_acp_process_with_write_roots(
+            &config,
+            &scope.cwd,
+            scope.code_graph_db.as_deref(),
+            None,
+            &[],
+            &scope.read_roots,
+            &[],
+            &delivery,
+            seat_cli,
+            seat,
+            None,
+            self.operational_home.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+        scoped_seat_runtime_admission(
+            seat,
+            &scope,
+            &config,
+            proc.sandbox_downgrade.as_ref(),
+            proc.governance_verified,
+        )?;
+        proc.skills = snapshot;
+        arm_monitor(&mut proc, &scope, seat_cli, seat);
+        let arc = Arc::new(Mutex::new(proc));
+        self.monitors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(pool_key.to_string(), Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// One monitor turn: the reply after the turn's last tool call. Epoch 0, so an elicitation the
+    /// monitor raises is cancelled (monitors never ask a human). A failed turn evicts the session;
+    /// the next batch re-opens it.
+    fn monitor_turn(
+        &self,
+        pool_key: &str,
+        prompt: &str,
+        budget: Duration,
+    ) -> Result<String, String> {
+        let arc = self
+            .monitors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(pool_key)
+            .cloned()
+            .ok_or_else(|| format!("monitor '{pool_key}' is not open"))?;
+        let noop = |_: &str| {};
+        let result = {
+            let mut proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+            exec_turn_acp(
+                &mut proc,
+                prompt,
+                &[],
+                &noop,
+                budget,
+                Arc::clone(&self.elicitation_maps),
+                "",
+                0,
+                &self.tx,
+                None,
+            )
+        };
+        match result {
+            Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.chat_answer()),
+            Ok(turn) => {
+                self.monitor_close(pool_key);
+                Err(format!(
+                    "monitor turn ended {:?}: {}",
+                    turn.status,
+                    crate::team::cap_utf8(turn.output.trim(), 400)
+                ))
+            }
+            Err(e) => {
+                self.monitor_close(pool_key);
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Close one monitor session. The process is dropped (kill + wait) on its own thread.
+    fn monitor_close(&self, pool_key: &str) {
+        let gone = self
+            .monitors
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(pool_key);
+        if let Some(p) = gone {
+            std::thread::spawn(move || drop(p));
+        }
+    }
+
+    /// Close every monitor session of `run_id` (`on_run_complete`), off the calling thread.
+    fn monitors_close_run(&self, run_id: &str) {
+        let prefix = format!("team:{run_id}:");
+        let gone: Vec<_> = {
+            let mut m = self.monitors.lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<String> = m
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            keys.into_iter().filter_map(|k| m.remove(&k)).collect()
+        };
+        if !gone.is_empty() {
+            std::thread::spawn(move || drop(gone));
+        }
+    }
+}
+
+/// The supervisor's view of the runner — WEAK, so the supervisor thread never keeps the runner
+/// (and through it the actor channel) alive.
+pub(crate) struct RunnerHost(pub(crate) std::sync::Weak<AcpStepRunner>);
+
+impl RunnerHost {
+    fn runner(&self) -> Result<Arc<AcpStepRunner>, String> {
+        self.0
+            .upgrade()
+            .ok_or_else(|| "the engine is shutting down".to_string())
+    }
+}
+
+impl crate::team::MonitorHost for RunnerHost {
+    fn admitted(&self, seat: &str) -> Result<(), String> {
+        monitor_admission(seat).map(|_| ())
+    }
+    fn open(
+        &self,
+        pool_key: &str,
+        seat: &str,
+        scope: &crate::team::MonitorScope,
+    ) -> Result<(), String> {
+        self.runner()?
+            .monitor_ensure(pool_key, seat, scope)
+            .map(|_| ())
+    }
+    fn turn(&self, pool_key: &str, prompt: &str, budget: Duration) -> Result<String, String> {
+        self.runner()?.monitor_turn(pool_key, prompt, budget)
+    }
+    fn close(&self, pool_key: &str) {
+        if let Ok(r) = self.runner() {
+            r.monitor_close(pool_key);
+        }
+    }
+}
+
 impl Default for AcpStepRunner {
     fn default() -> Self {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -8004,6 +8345,20 @@ impl StepRunner for AcpStepRunner {
         self.exec_turn(input, &noop)
     }
 
+    /// DES-TEAMING-001 §4.7: the attempt's final pass, bounded by `FINAL_PASS_BUDGET`. `None` for
+    /// a unit that is not teamed.
+    fn team_finish(
+        &self,
+        input: &StepInput,
+        output: &StepOutput,
+    ) -> Option<crate::team::TeamLedger> {
+        let creator = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+        let ctx = self.team_ctx(input, creator)?;
+        self.team
+            .get()?
+            .finish(ctx, output.status == StepStatus::Ok)
+    }
+
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec_turn(input, emit)
     }
@@ -8016,6 +8371,15 @@ impl StepRunner for AcpStepRunner {
     /// the entire actor while waiting for the subprocess to exit.
     fn on_run_complete(&self, run_id: &str) {
         self.steer_mailbox.prune_run(run_id);
+        // DES-TEAMING-001 S2: the run's monitors close with it (off this thread).
+        if let Some(team) = self.team.get() {
+            team.send(crate::team::TeamCmd::RunComplete(run_id.to_string()));
+        }
+        self.monitors_close_run(run_id);
+        self.team_plans
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(r, _), _| r != run_id);
         // crew#277: in-flight WRAPPED workers (the fallback path every non-ACP CLI takes) must
         // die with the run too — a canceled run's hung `copilot -p` survived ~90 minutes because
         // only ACP sessions had kill handles.
@@ -20540,5 +20904,316 @@ transport = "stdio"
         // compare-and-remove, now against the set).
         maps.deregister_tool_child("run-c", 999);
         assert_eq!(maps.take_tool_child_pgroups("run-c"), vec![333, 444]);
+    }
+}
+
+/// DES-TEAMING-001 S2 (#601) through the REAL ACP turn loop: a scripted bridge drives the
+/// frames, so what is pinned is the carrier's behaviour, not a hand-built event. Kept in its own
+/// module, away from the steering/turn tests S3 adds.
+#[cfg(all(test, unix))]
+mod team_s2_tests {
+    use super::*;
+    use crate::test_env::ENV_LOCK;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-team-acp-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A Python ACP bridge: the handshake, then for every `session/prompt` the behaviour named
+    /// by argv[1]. `tool_edit`: one `edit` tool call (`tool_call`, a non-terminal update, three
+    /// message chunks, the terminal `completed` update). `write_attempt`: asks permission to
+    /// WRITE argv[2], writes it ONLY if the answer is an allow option, and records the answer
+    /// in argv[3].
+    fn bridge(dir: &std::path::Path, behaviour: &str, args: &[&str]) -> AcpConfig {
+        let script = dir.join("team-bridge.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import sys, json
+behaviour = sys.argv[1]
+def w(o): print(json.dumps(o), flush=True)
+def r():
+    while True:
+        line = sys.stdin.readline()
+        if not line: return None
+        line = line.strip()
+        if line:
+            try: return json.loads(line)
+            except Exception: pass
+req = r(); w({"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":1,"capabilities":{}}})
+req = r(); w({"jsonrpc":"2.0","id":req["id"],"result":{"sessionId":"team-s"}})
+def upd(u): w({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"team-s","update":u}})
+while True:
+    req = r()
+    if req is None: break
+    if req.get("method") != "session/prompt": continue
+    pid = req["id"]
+    if behaviour == "tool_edit":
+        upd({"sessionUpdate":"tool_call","toolCallId":"toolu_A","kind":"edit",
+             "title":"Edit src/a.rs","status":"pending","locations":[{"path":sys.argv[2]}]})
+        upd({"sessionUpdate":"tool_call_update","toolCallId":"toolu_A","status":"in_progress"})
+        for t in ["I ", "edited ", "it"]:
+            upd({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":t}})
+        upd({"sessionUpdate":"tool_call_update","toolCallId":"toolu_A","status":"completed",
+             "_meta":{"claudeCode":{"toolName":"Edit"}}})
+    elif behaviour == "write_attempt":
+        target, ledger = sys.argv[2], sys.argv[3]
+        w({"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{
+            "sessionId":"team-s","toolName":"Write",
+            "toolCall":{"toolCallId":"toolu_W","kind":"edit","title":"Write "+target,
+                        "rawInput":{"file_path":target,"content":"pwned\n"}},
+            "options":[{"optionId":"allow","kind":"allow_once","name":"Allow"},
+                       {"optionId":"reject","kind":"reject_once","name":"Reject"}]}})
+        ans = r()
+        chosen = (((ans or {}).get("result") or {}).get("outcome") or {}).get("optionId", "none")
+        if chosen == "allow":
+            open(target, "w").write("pwned\n")
+        open(ledger, "w").write(chosen)
+        upd({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"DONE"}})
+    w({"jsonrpc":"2.0","id":pid,"result":{"stopReason":"end_turn"}})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut start_args = vec![behaviour.to_string()];
+        start_args.extend(args.iter().map(|s| s.to_string()));
+        AcpConfig {
+            binary: script.to_string_lossy().into_owned(),
+            start_args,
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: true,
+            os_sandbox: false,
+            acp_governance_env: None,
+            verified_version: None,
+        }
+    }
+
+    fn start(config: &AcpConfig, cwd: &std::path::Path) -> AcpProcess {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        start_acp_process(
+            config,
+            cwd,
+            None,
+            None,
+            wicked_apps_core::spawn::SeatCli::Other,
+            None,
+        )
+        .expect("bridge starts")
+    }
+
+    fn turn(
+        proc: &mut AcpProcess,
+        tx: &std::sync::mpsc::Sender<Command>,
+        team: Option<&crate::team::TeamTurn>,
+    ) -> TurnResult {
+        let noop: &DeltaSink = &|_: &str| {};
+        exec_turn_acp_posture(
+            proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(20),
+            Arc::new(Mutex::new(ElicitationMaps::new())),
+            "run-1",
+            0,
+            tx,
+            None,
+            None,
+            team,
+        )
+        .expect("turn runs")
+    }
+
+    fn checkpoints(rx: &std::sync::mpsc::Receiver<Command>) -> Vec<CoreEvent> {
+        rx.try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(ev @ CoreEvent::UnitCheckpoint { .. }) => Some(ev),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// DES §12-1: a teamed unit whose bridge sends `tool_call` (kind `edit`), a non-terminal
+    /// update, three message chunks and the terminal `completed` update emits EXACTLY ONE
+    /// `unitCheckpoint` with that kind, title and (repo-relative) path. The same turn on a
+    /// non-teamed unit emits none.
+    #[test]
+    fn a_teamed_acp_unit_emits_one_checkpoint_per_terminal_tool_call_and_a_plain_one_none() {
+        let dir = scratch("checkpoint");
+        let target = dir.join("src").join("a.rs");
+        let config = bridge(&dir, "tool_edit", &[&target.to_string_lossy()]);
+        let mut proc = start(&config, &dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let team = crate::team::TeamTurn::new(
+            ("run-1".into(), 3, 1),
+            crate::team::SteerMailbox::default(),
+            None,
+            Some(dir.clone()),
+            true,
+        );
+        let _ = turn(&mut proc, &tx, Some(&team));
+        assert_eq!(
+            checkpoints(&rx),
+            vec![CoreEvent::UnitCheckpoint {
+                session: "run-1".into(),
+                ord: 3,
+                attempt: 1,
+                seq: 1,
+                tool_call_id: "toolu_A".into(),
+                kind: "edit".into(),
+                title: "Edit src/a.rs".into(),
+                status: "completed".into(),
+                paths: vec!["src/a.rs".into()],
+            }]
+        );
+        let _ = turn(&mut proc, &tx, None);
+        assert_eq!(checkpoints(&rx), vec![], "a non-teamed unit emits none");
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DES §12-5 (read-only half): a MONITOR session asks to Write into the unit's worktree and
+    /// is answered with the REJECT option — the file is untouched and the worktree's tree id is
+    /// unchanged. The control: the same bridge on an UNARMED session is allowed and does write,
+    /// so the test can see a write when one happens.
+    #[test]
+    fn a_monitor_cannot_write_the_worktree_even_when_it_asks() {
+        let dir = scratch("readonly");
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        let git = |args: &[&str]| crate::worktree_guard::git(&wt, args, &[]).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(wt.join("src/a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ]);
+        let repo = crate::team::Repo {
+            workdir: wt.clone(),
+            git_dir: wt.join(".git"),
+        };
+        let before = repo.snapshot().unwrap();
+        let target = wt.join("src/a.rs");
+        let ledger = dir.join("answer.txt");
+        let scratch_root = dir.join("monitor-scratch");
+        std::fs::create_dir_all(&scratch_root).unwrap();
+        let scope = ChatScope {
+            cwd: scratch_root.clone(),
+            code_graph_db: None,
+            read_roots: vec![wt.to_string_lossy().into_owned()],
+        };
+        let config = bridge(
+            &dir,
+            "write_attempt",
+            &[&target.to_string_lossy(), &ledger.to_string_lossy()],
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let mut monitor = start(&config, &scratch_root);
+        arm_monitor(
+            &mut monitor,
+            &scope,
+            wicked_apps_core::spawn::SeatCli::Claude,
+            "claude#2",
+        );
+        let _ = turn(&mut monitor, &tx, None);
+        let monitor_answer = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let monitor_text = std::fs::read_to_string(&target).unwrap();
+        let monitor_tree = repo.snapshot().unwrap();
+        drop(monitor);
+
+        let mut unarmed = start(&config, &scratch_root);
+        let _ = turn(&mut unarmed, &tx, None);
+        let control_answer = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let control_text = std::fs::read_to_string(&target).unwrap();
+        drop(unarmed);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(monitor_answer, "reject", "the monitor's write is refused");
+        assert_eq!(
+            monitor_text, "fn a() {}\n",
+            "the worktree file is untouched"
+        );
+        assert_eq!(monitor_tree, before, "the worktree tree id is unchanged");
+        assert_eq!(
+            control_answer, "allow",
+            "control: an unarmed session is allowed"
+        );
+        assert_eq!(control_text, "pwned\n", "control: and its write lands");
+    }
+
+    /// DES §4.1 (b): a seat whose ACP adapter is not admitted to input governance cannot be a
+    /// monitor, and says why; neither can a seat with no ACP adapter at all.
+    #[test]
+    fn an_unadmitted_or_unconfigured_seat_is_refused_as_a_monitor() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = scratch("admission-home");
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            r#"
+[[cli]]
+key = "claude"
+display_name = "Claude"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/team-test/claude-bridge"
+transport = "stdio"
+acp_input_governance = true
+
+[[cli]]
+key = "codex"
+display_name = "Codex"
+binary = "codex"
+headless_invocation = "codex exec \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/team-test/codex-bridge"
+transport = "stdio"
+acp_input_governance = false
+"#,
+        )
+        .unwrap();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let claude2 = monitor_admission("claude#2").map(|(c, _, _)| c.binary);
+        let codex2 = monitor_admission("codex#2").map(|(c, _, _)| c.binary);
+        let none = monitor_admission("no-such-cli#2").map(|(c, _, _)| c.binary);
+        match prior {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(claude2, Ok("/opt/team-test/claude-bridge".to_string()));
+        assert!(
+            codex2
+                .as_ref()
+                .is_err_and(|e| e.contains("acp_input_governance=false")),
+            "{codex2:?}"
+        );
+        assert!(none.is_err(), "{none:?}");
     }
 }

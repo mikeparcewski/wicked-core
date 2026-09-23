@@ -410,6 +410,18 @@ pub trait StepRunner: Send + Sync {
     /// The default no-op is correct for stateless runners (e.g. `WrappedCliStepRunner`).
     /// Must be fire-and-forget — never block the actor thread.
     fn close_cli_session(&self, _run_id: &str, _cli_key: &str) {}
+
+    /// DES-TEAMING-001 §4.7 (S2, #601): after the unit's turn, run its team's FINAL PASS — review
+    /// the settled tree, re-confirm every finding — and return the attempt's
+    /// [`TeamLedger`](crate::team::TeamLedger). Blocks at most the final-pass budget. The default
+    /// is `None` (no team), so every non-ACP runner and every test runner is unchanged.
+    fn team_finish(
+        &self,
+        _input: &StepInput,
+        _output: &StepOutput,
+    ) -> Option<crate::team::TeamLedger> {
+        None
+    }
 }
 
 /// The deterministic stub's output for `unit` — `stub-output for <description>`, and for an

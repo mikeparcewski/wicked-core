@@ -1199,6 +1199,62 @@ pub enum CoreEvent {
         disposition: String,
         reason: String,
     },
+    // ── DES-TEAMING-001 S2 (#601): monitor subscription. Additive; wire shapes in DES §7. ─────
+    /// A TEAMED unit's tool call reached a terminal status on the ACP carrier (a
+    /// `tool_call_update` with `status` `completed` | `failed`) — the semantic checkpoint a
+    /// monitor batch is paced on (never a token). `session` is the run id. `seq` is monotonic per
+    /// attempt from 1. `kind` is the ACP ToolKind verbatim (`"other"` when the agent sent none),
+    /// remembered from the earlier `tool_call`/refinement frames; `title` ≤ 256 B; `paths` from
+    /// the call's `locations`, ≤ 16. Emitted only for a unit with a team context, so a
+    /// non-teamed unit emits none.
+    UnitCheckpoint {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        seq: u64,
+        tool_call_id: String,
+        kind: String,
+        title: String,
+        status: String,
+        paths: Vec<String>,
+    },
+    /// The team supervisor summoned a read-only monitor on a seat instance for a unit's attempt
+    /// (`status: "attached"`), or could not (`status: "failed"`, `error` says why: the candidate
+    /// is the creator's instance, its adapter is not admitted to input governance, the unit has
+    /// no worktree baseline, or the session did not start). Never retried within the attempt.
+    MonitorAttached {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        monitor_id: String,
+        seat: String,
+        status: String,
+        reason: String,
+        error: Option<String>,
+    },
+    /// A monitor finding that PASSED the mechanical checks: parsed, at or above the bar
+    /// (`high` | `medium`), its `evidence` equal to line `line` of `path` in the snapshot tree
+    /// `tree`, and first-seen by its id (`f-` + 16 hex of sha256(path, normalized evidence)).
+    /// Advisory: nothing in the fold reads it. `evidence` ≤ 512 B, `claim` and `suggestion`
+    /// ≤ 2 KB; `inDiff` says whether `path` changed baseline..`tree`; `checkpointSeq` is the
+    /// last checkpoint the batch covered (0 when none — a final pass on a wrapped unit).
+    MonitorFinding {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        finding_id: String,
+        monitor_id: String,
+        seat: String,
+        severity: String,
+        path: String,
+        line: u32,
+        evidence: String,
+        claim: String,
+        suggestion: Option<String>,
+        tree: String,
+        in_diff: bool,
+        checkpoint_seq: u64,
+    },
 }
 
 /// Render a [`crate::domain::UnitDenial`] in the events wire's camelCase convention (the persisted
@@ -2375,6 +2431,83 @@ impl CoreEvent {
                 "disposition": disposition,
                 "reason": reason,
             }),
+            // DES-TEAMING-001 §7 (S2, #601). Every field always present; `Option` → `null`.
+            CoreEvent::UnitCheckpoint {
+                session,
+                ord,
+                attempt,
+                seq,
+                tool_call_id,
+                kind,
+                title,
+                status,
+                paths,
+            } => json!({
+                "type": "unitCheckpoint",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "seq": seq,
+                "toolCallId": tool_call_id,
+                "kind": kind,
+                "title": title,
+                "status": status,
+                "paths": paths,
+            }),
+            CoreEvent::MonitorAttached {
+                session,
+                ord,
+                attempt,
+                monitor_id,
+                seat,
+                status,
+                reason,
+                error,
+            } => json!({
+                "type": "monitorAttached",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "monitorId": monitor_id,
+                "seat": seat,
+                "status": status,
+                "reason": reason,
+                "error": error,
+            }),
+            CoreEvent::MonitorFinding {
+                session,
+                ord,
+                attempt,
+                finding_id,
+                monitor_id,
+                seat,
+                severity,
+                path,
+                line,
+                evidence,
+                claim,
+                suggestion,
+                tree,
+                in_diff,
+                checkpoint_seq,
+            } => json!({
+                "type": "monitorFinding",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "findingId": finding_id,
+                "monitorId": monitor_id,
+                "seat": seat,
+                "severity": severity,
+                "path": path,
+                "line": line,
+                "evidence": evidence,
+                "claim": claim,
+                "suggestion": suggestion,
+                "tree": tree,
+                "inDiff": in_diff,
+                "checkpointSeq": checkpoint_seq,
+            }),
         }
     }
 }
@@ -2883,6 +3016,78 @@ mod tests {
             serde_json::json!({"type":"workerAdviceResponse","session":"run-1","ord":3,
                 "attempt":1,"findingId":"f-3fa9c2e1d0b4a7e6","disposition":"declined",
                 "reason":"campaign.rs:325 documents the exclusion"})
+        );
+    }
+
+    /// DES-TEAMING-001 §7 (S2, #601): the three S2 events serialize to EXACTLY the DES shapes —
+    /// the fixtures below are the §7 examples typed out key by key (DES order), with the `<…>`
+    /// placeholders filled in. Compared as serialized bytes after both sides pass through
+    /// `serde_json` (whose maps are key-sorted here, so key order is canonical on both sides): a
+    /// renamed, missing, extra or `Option`-skipped key fails.
+    #[test]
+    fn s2_team_events_match_the_des_wire_shapes_byte_for_byte() {
+        let same = |ev: CoreEvent, fixture: &str| {
+            let want: serde_json::Value = serde_json::from_str(fixture).expect("fixture parses");
+            assert_eq!(
+                serde_json::to_string(&ev.to_json()).unwrap(),
+                serde_json::to_string(&want).unwrap()
+            );
+        };
+        same(
+            CoreEvent::UnitCheckpoint {
+                session: "run-1".into(),
+                ord: 3,
+                attempt: 1,
+                seq: 17,
+                tool_call_id: "toolu_01".into(),
+                kind: "edit".into(),
+                title: "Edit src/retire.ts".into(),
+                status: "completed".into(),
+                paths: vec!["src/retire.ts".into()],
+            },
+            r#"{"type":"unitCheckpoint","session":"run-1","ord":3,"attempt":1,
+                "seq":17,"toolCallId":"toolu_01","kind":"edit","title":"Edit src/retire.ts",
+                "status":"completed","paths":["src/retire.ts"]}"#,
+        );
+        same(
+            CoreEvent::MonitorAttached {
+                session: "run-1".into(),
+                ord: 3,
+                attempt: 1,
+                monitor_id: "m1".into(),
+                seat: "claude#2".into(),
+                status: "attached".into(),
+                reason: "review_plan monitors=1 (critical,destructive)".into(),
+                error: None,
+            },
+            r#"{"type":"monitorAttached","session":"run-1","ord":3,"attempt":1,
+                "monitorId":"m1","seat":"claude#2","status":"attached",
+                "reason":"review_plan monitors=1 (critical,destructive)","error":null}"#,
+        );
+        same(
+            CoreEvent::MonitorFinding {
+                session: "run-1".into(),
+                ord: 3,
+                attempt: 1,
+                finding_id: "f-3fa9c2e1d0b4a7e6".into(),
+                monitor_id: "m1".into(),
+                seat: "claude#2".into(),
+                severity: "high".into(),
+                path: "src/retire.ts".into(),
+                line: 41,
+                evidence: "fetchCoverage(scope).then(setCount)".into(),
+                claim: "no cancellation".into(),
+                suggestion: None,
+                tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                in_diff: true,
+                checkpoint_seq: 17,
+            },
+            r#"{"type":"monitorFinding","session":"run-1","ord":3,"attempt":1,
+                "findingId":"f-3fa9c2e1d0b4a7e6","monitorId":"m1","seat":"claude#2",
+                "severity":"high","path":"src/retire.ts","line":41,
+                "evidence":"fetchCoverage(scope).then(setCount)","claim":"no cancellation",
+                "suggestion":null,"tree":"4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                "inDiff":true,"checkpointSeq":17}"#,
         );
     }
 }

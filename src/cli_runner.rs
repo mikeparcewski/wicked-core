@@ -759,6 +759,11 @@ fn run_unit_and_judge_with_roster(
     crate::workflow::UnitEvidence,
 ) {
     let output = runner.run_unit_streaming(input, emit_delta);
+    // DES-TEAMING-001 §4.7 (S2, #601): a teamed unit's final pass runs here, on the settled tree,
+    // before the guard's first look. The ledger is ADVISORY and S2 stops at producing it: S6
+    // (#603) carries it into `UnitEvidence.team` and the judge's WORK payload. `None` for every
+    // non-teamed unit (the trait default).
+    let _team_ledger = runner.team_finish(input, &output);
     // (F-7R2-006 / review RT-1) The seats a JUDGE may run under: the registry seats the RUN
     // configured (`run_roster`, when the caller knows it), minus the run's bench, minus every
     // seat the launcher's health probe declared unusable — a signed-out seat cannot render a

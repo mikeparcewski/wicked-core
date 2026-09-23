@@ -317,14 +317,16 @@ fn team_turn(
     attempt: u32,
     root: (std::path::PathBuf, std::path::PathBuf),
 ) -> TeamTurn {
-    TeamTurn {
-        key: ("run-s3".to_string(), 3, attempt),
-        mailbox: mailbox.clone(),
-        confirm_root: Some(root),
-    }
+    TeamTurn::new(
+        ("run-s3".to_string(), 3, attempt),
+        mailbox.clone(),
+        Some(root),
+        None,
+        false,
+    )
 }
 
-fn key(attempt: u32) -> crate::team::AdviceKey {
+fn key(attempt: u32) -> crate::team::UnitKey {
     ("run-s3".to_string(), 3, attempt)
 }
 
