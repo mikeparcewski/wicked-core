@@ -4,6 +4,7 @@
 - **Rev 2 (2026-09-23):** moved from `.product/` (untracked since #562) to `docs/design/`; §6.7 records the HIGH-dispute escalation as a blocking decision with two exact options; §6.2 extends monitor exclusion to the bus-mediated judge (`GateEvalRequest.excluded_seats`). Both come from review on #604.
 - **Rev 3 (2026-09-23):** operator ruling on Q1, written into §6.3/§6.7. An unresolved HIGH goes to a council. YES continues the run autonomously. NO **or no verdict** pauses for a human (fail-closed). The rev 2 Option A/B block is replaced by the ruling.
 - **Rev 4 (2026-09-23):** S2 builder corrections, verified on `d5d9708`. The ACP spawn path does not resolve seat-instance keys yet, so that prerequisite is now build step 0 (§4.1, §9, §10). §4.7 is re-ordered: S2's final batch carries no declines; S3 parses `ADVICE` and then runs the HOLD/WITHDRAW round. §7 notes that fixtures compare JSON values, not key order.
+- **Rev 5 (2026-09-23):** review on #604 at `0493046`. (1) The ruling is **extended, pending operator confirmation** (§6.7): every **unaccepted** HIGH (declined-and-held, unanswered, or never delivered) is unresolved and takes the council path, so `combine_verdict(true, None)` can no longer approve one. (2) `findingId` now includes a stable location anchor, so two identical hazardous lines in one file are two findings; a secondary `lineKey` keeps moved-line correlation (§4.6).
 - **Date:** 2026-09-23
 - **Scope:** wicked-core (S2 monitor subscription, S3 monitor→worker injection, S6 gate adjudication — engine half), wicked-crew (S6 read route + api-types), wicked-studio (S6 surfaces)
 - **Related:** #590 (the operator-approved proposal), #599 (S1, merged as `d5d9708`: the `AskUserQuestion` elicitation channel), #595 (seat-instance keys, `claude#2`), S4 (complexity policy, `feat/590-s4-review-scale`), S5 (deterministic `RoutingInfo::Teamed` + the decision-council entry point) — S4 and S5 are built elsewhere; this document names only the interface it consumes from them (§8).
@@ -103,7 +104,11 @@ Every `FINDING` line goes through these checks in order. The first failure drops
 1. **Parse:** the line is strict JSON with all required keys, `path` is repo-relative with no `..`, and `line` ≥ 1. Else `malformed`.
 2. **Bar:** `severity ∈ {high, medium}`. `low` is dropped (`belowBar`). Only `high` is ever injected into the worker (§5). `medium` reaches the gate only.
 3. **Confirm against the settled tree:** `git cat-file -p <T_k>:<path>` exists, and its line `line` equals `evidence` after trimming and collapsing whitespace. Else `unconfirmed`. This is the mechanical "file:line or it did not happen" rule: a finding that cites a line that is not there never surfaces. `inDiff` is recorded as whether `path` is in the baseline..`T_k` name-status list. Out-of-diff findings are allowed (a caller the change broke) and labelled.
-4. **Dedup:** `findingId = "f-" + hex(sha256(path ‖ "\n" ‖ normalized evidence))[..16]`. The key is the line's **text**, not its number, so an edit that shifts lines does not mint a new finding. A second monitor with the same id is recorded in `corroboratedBy` and not re-emitted. The same monitor repeating it counts as `duplicate`. An id the worker already answered is never re-injected.
+4. **Dedup, two keys.**
+   - **`anchor`** — a stable location context, resolved in this order: (i) the nearest enclosing symbol at `path:line` in the run's estate graph (the graph the monitor is bound to, §4.1; a `SearchEntity`-class lookup of the symbol whose span contains the line, used only when the graph's copy of the file matches the blob at `T_k`, since the graph may lag the worktree); else (ii) the hunk header context of the hunk containing the line in `git diff-tree -p <baseline> <T_k> -- <path>` (git's `@@ … @@ <funcname>` text, which is git's own enclosing-function heuristic); else (iii) the empty string (file-level). The anchor is recorded on the finding.
+   - **`findingId = "f-" + hex(sha256(path ‖ "\n" ‖ anchor ‖ "\n" ‖ normalized evidence))[..16]`** — the identity. Two identical hazardous lines in two functions of one file are two findings. The same line text in the same function is one finding wherever the line number lands, so an edit that shifts lines does not mint a new one.
+   - **`lineKey = "l-" + hex(sha256(path ‖ "\n" ‖ normalized evidence))[..16]`** — the secondary key, used for moved-line correlation only: re-confirmation (§4.7 step 3) finds the finding's line at `T_final` by `lineKey` within the same anchor first, then anywhere in the file. It never merges findings.
+   - A second monitor with the same `findingId` is recorded in `corroboratedBy` and not re-emitted. The same monitor repeating it counts as `duplicate`. An id the worker already answered is never re-injected. Two identical lines inside one function (a rare true collision) are one finding by design; the claim names one line and the worker fixes both or neither.
 
 Survivors are emitted as `monitorFinding` (§7).
 
@@ -113,9 +118,9 @@ After `runner.run_unit_streaming` returns Ok (`src/cli_runner.rs:761`), the work
 
 1. **(S2)** Abandon any in-flight batch. Snapshot `T_final`. Summon monitors per S4 on the baseline..`T_final` diff if none are attached yet. This is how wrapped units are monitored.
 2. **(S2)** Run one final **review** batch per monitor over `T_{last}`..`T_final`. It carries **no declines**: the worker's dispositions do not exist until step 4.
-3. **(S2)** Re-confirm every finding against `T_final`. If the evidence text is gone from the file, the finding becomes `superseded` (the worker changed it). If the text moved, `finalLine` is updated.
+3. **(S2)** Re-confirm every finding against `T_final` by `lineKey`: first inside its `anchor`, then anywhere in the file. If the evidence text is gone from the file, the finding becomes `superseded` (the worker changed it). If the text moved, `finalLine` is updated.
 4. **(S3)** Parse the worker's `ADVICE` lines (§5.3) from `StepOutput.output` → `workerAdviceResponse`.
-5. **(S3)** **Hold round.** For each monitor with ≥1 finding the worker declined, send one more turn on the same warm session. It lists each declined finding with the worker's reason and asks for `HOLD <id> — <reason>` or `WITHDRAW <id> — <reason>`, then `DONE`. No reply for a declined id counts as HOLD (§6.3). Monitors with no declines get no turn.
+5. **(S3)** **Hold round.** For each monitor with ≥1 **unaccepted** finding (declined, unanswered, or never delivered), send one more turn on the same warm session. It lists each such finding with its state (the worker's decline reason, "no answer", or "not delivered — <adviceDelivered outcome or carrier>") and asks for `HOLD <id> — <reason>` or `WITHDRAW <id> — <reason>`, then `DONE`. No reply for an id counts as HOLD (§6.3). Monitors whose findings were all accepted or superseded get no turn.
 6. **(S6)** Send each unresolved HIGH to the council (§6.3).
 7. Return the `TeamLedger`. The worker thread puts it in `UnitEvidence.team` (`src/workflow.rs:265`, additive) and renders it into `work_for_agent` (§6.2).
 
@@ -210,16 +215,21 @@ One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existi
 
 ### 6.3 Disputes: when a one-off council is convened, and what it returns
 
-**Unresolved HIGH (operator definition, 2026-09-23).** A finding is **unresolved** when:
-1. `severity == "high"`,
-2. the worker **declined** it (`status == "declined"`; a decline is only possible for a delivered finding, since the worker sees the id only in delivered advice), and
-3. the authoring monitor **held** it at the final pass (`monitorReply.kind == "hold"`).
+**Unresolved HIGH.** The operator's definition (2026-09-23) was "declined by the worker, held by the monitor". Review on #604 (`0493046`, HIGH) showed that leaves a hole: a HIGH the worker never answered, or that never reached the worker, was not unresolved, so with the judge skipped `combine_verdict(true, None)` (`src/validator.rs:2263-2270`) approved it. This document therefore uses the **extended, fail-closed** definition below. **It is an extension of the ruling that the operator still has to confirm** (§6.7).
 
-**Assumption, stated because the ruling is fail-closed:** a monitor that gives no HOLD/WITHDRAW for a declined finding at the final pass (turn timeout, crash, final-pass budget expired, malformed reply) counts as **HOLD**. Withdrawal must be explicit. A monitor's silence never clears a finding.
+A finding is **unresolved** when:
+1. `severity == "high"`, and
+2. it is **unaccepted**: `status ∉ {"accepted", "withdrawn", "superseded"}`. That is any of
+   - `declined` — the worker refused it with a reason, or with none;
+   - `unanswered` with `delivery == "injected"` — delivered, no `ADVICE` line;
+   - `unanswered` with `delivery == "not_delivered"` — never reached the worker (non-steering carrier, `turn_ended`, `refused`); and
+3. the authoring monitor **held** it in the hold round (`monitorReply.kind == "hold"`, which includes no reply).
+
+**Assumption, stated because the ruling is fail-closed:** a monitor that gives no HOLD/WITHDRAW for an unaccepted finding in the hold round (turn timeout, crash, final-pass budget expired, malformed reply) counts as **HOLD**. Withdrawal must be explicit. A monitor's silence never clears a finding.
 
 **What the council is handed.** This is the input to S5's decision-council entry point (§8). One council per unresolved HIGH, at most `MAX_DISPUTES` per attempt:
 - `question`: "The worker declined this HIGH finding and the monitor holds it. Should the run continue autonomously with the worker's refusal standing? YES = continue. NO = a human must decide."
-- `positions`: `[{by:"worker <seat>", position:"YES — the refusal stands", reason:<DECLINE reason>}, {by:"monitor <seat>", position:"NO — the finding stands", reason:<HOLD reason, or "no reply (counted as hold)">}]`
+- `positions`: `[{by:"worker <seat>", position:"YES — the refusal stands", reason:<DECLINE reason | "no answer" | "not delivered — <outcome>">}, {by:"monitor <seat>", position:"NO — the finding stands", reason:<HOLD reason, or "no reply (counted as hold)">}]`. When the worker never saw the finding, its position is still YES (the work as submitted stands) and its reason says so: the council then judges the finding on the evidence alone.
 - `evidence`: the finding (severity, claim, suggestion), `path:finalLine` with the evidence line, the `T_final` hunk around it (±20 lines from `git diff-tree -p -U20 <baseline> <T_final> -- <path>`, capped at 16 KB), the unit's criterion, and the tree id `T_final`.
 - `excluded seats`: the creator instance and every monitor in `corroboratedBy ∪ {author}`. Parties do not vote.
 
@@ -258,7 +268,7 @@ One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existi
 
 **The hole this closes (review on #604, HIGH).** `combine_verdict` approves when the deterministic floor passes and no agent verdict rejects (`src/validator.rs:2263-2270`); `agent == None` counts as no rejection. When no judge runs (`judge_skipped`, `src/cli_runner.rs:960-985`, `:1062-1081`; also when excluding the monitors leaves no eligible seat, §6.2), a unit could auto-approve with an unresolved HIGH in its ledger. Run `aee254f1` had `agentVerdict: "skipped"`.
 
-**Ruling.** Every unresolved HIGH (§6.3) goes to a council. Council **YES** → the run continues autonomously. Council **NO** → human pause. **Fail-closed:** if the council cannot produce a verdict (no quorum, benched seats, error, timeout, over the cap), that is treated as NO and the run pauses for a human. **It never auto-continues without a YES.** The verdict is recorded at the gate as evidence.
+**Ruling (operator, 2026-09-23).** Every unresolved HIGH (§6.3) goes to a council. Council **YES** → the run continues autonomously. Council **NO** → human pause. **Fail-closed:** if the council cannot produce a verdict (no quorum, benched seats, error, timeout, over the cap), that is treated as NO and the run pauses for a human. **It never auto-continues without a YES.** The verdict is recorded at the gate as evidence.
 
 **Mechanism.**
 - **Where:** in `apply_and_finish_unit` (`src/pipeline.rs:827`), after `outcome` is computed and after `teamLedger` + `GateEvaluated` are emitted, and **before** `GateDecided`/`UnitDone` are emitted (`src/pipeline.rs:1540-1576`).
@@ -270,7 +280,7 @@ One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existi
   - The prompt lists each unresolved HIGH: `findingId`, `path:finalLine`, claim, the worker's reason, the monitor's reason, and the council verdict (agreement and dissent, or the no-verdict reason).
   - The human answers through the existing `POST /runs/:id/gate` (`routes.ts:2942`): approve → `resumed` then `gateDecided{allow:true}` + `unitDone`; reject → cancel; approve+amend → the creator reruns with the amendment.
   - `awaitingHuman.gateKind` gains the token `"team_dispute"`. The api-types `gateKind` stays an open string, and studio's `SteeringGate` renders the ledger for that ord (§6.5).
-- **Scope of the ruling (named so it is not assumed):** a HIGH that was **not** declined-and-held is not unresolved and is not sent to a council. That covers a HIGH never delivered (non-steering carrier) and a HIGH the worker left `unanswered`. Such a HIGH reaches the gate as evidence only. Whether those should also pause when the judge is skipped is Q4 (§13).
+- **Extension of the ruling, pending operator confirmation (review on #604 at `0493046`, HIGH).** The operator's words were "declined by the worker, held by the monitor". Read literally, a HIGH that was **not delivered** (non-steering carrier, a `turn_ended`/`refused` steer) or that the worker left **unanswered** was never unresolved, never reached a council, and with the judge skipped `combine_verdict(true, None)` approved it. The same fail-closed reasoning the ruling applies to a missing council verdict applies here: an unaccepted HIGH is unresolved whatever the reason it was not accepted (§6.3). Under the extension, **every** HIGH that is not `accepted`, `withdrawn` or `superseded` and that the monitor holds takes the council path: YES → continue, NO or no verdict → human pause. The operator has not yet confirmed this reading. If it is rejected, §6.3 item 2 shrinks back to `declined` and acceptance #16 (h)–(i) are removed; nothing else changes.
 
 ## 7. Wire contract — new CoreEvent variants
 
@@ -296,6 +306,9 @@ Every variant is mapped by hand in `CoreEvent::to_json` (`src/event.rs:1269-1275
 // S2 — supervisor, per confirmed, above-bar, first-seen finding.
 {"type":"monitorFinding","session":"<run>","ord":3,"attempt":1,
  "findingId":"f-3fa9c2e1d0b4a7e6","monitorId":"m1","seat":"claude#2",
+ "lineKey":"l-9c0e4b7a1d2f3e58",  // sha256(path ‖ normalized evidence): moved-line correlation only
+ "anchor":"retire",               // enclosing symbol (estate graph), else the hunk header funcname, else ""
+ "anchorSource":"graph",          // "graph" | "hunk" | "none"
  "severity":"high",               // "high" | "medium"
  "path":"src/retire.ts","line":41,
  "evidence":"fetchCoverage(scope).then(setCount)",   // ≤512 B
@@ -324,6 +337,7 @@ Every variant is mapped by hand in `CoreEvent::to_json` (`src/event.rs:1269-1275
               "status":"completed",   // "completed" | "budget_exhausted" | "failed" | "timed_out"
               "error":null}],
  "findings":[{"findingId":"f-3fa9c2e1d0b4a7e6","monitorId":"m1","seat":"claude#2",
+              "lineKey":"l-9c0e4b7a1d2f3e58","anchor":"retire","anchorSource":"graph",
               "severity":"high","path":"src/retire.ts","line":41,"finalLine":43,
               "evidence":"…","claim":"…","suggestion":null,"tree":"<T_k>","inDiff":true,
               "corroboratedBy":[],
@@ -403,7 +417,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 1. A teamed ACP unit on a mock bridge that emits `tool_call` (kind `edit`) then `tool_call_update{status:"completed"}` emits exactly one `unitCheckpoint` with that `kind`, `title` and `paths`. A non-teamed unit emits none.
 2. 30 checkpoints inside 60 s with one tree change produce **one** monitor batch. A checkpoint burst with an unchanged tree id produces zero batches.
 3. A monitor reply citing `path:line` whose text does not match the snapshot tree emits no `monitorFinding` and increments `rejected.unconfirmed`. A matching reply emits one, with the tree id.
-4. Two monitors citing the same line text emit one `monitorFinding`, and the ledger lists the second in `corroboratedBy`. A `low` finding emits nothing and counts `belowBar`.
+4. Two monitors citing the same line text in the same anchor emit one `monitorFinding`, and the ledger lists the second in `corroboratedBy`. **Collision:** two identical hazardous lines in two functions of one file (fixture: the same `store.erase_scope(scope)?;` in `retire()` and `purge()`) emit **two** `monitorFinding`s with different `findingId`s, the same `lineKey`, and different `anchor`s. A finding whose line moves between batches keeps its `findingId` and gets its `finalLine` updated by `lineKey`. With no graph and no hunk header (a new file), the anchor is `""` and the id still differs from a finding in another file. A `low` finding emits nothing and counts `belowBar`.
 5. A monitor candidate equal to the creator instance, or on an unadmitted adapter, yields `monitorAttached{status:"failed"}` and no process. A monitor's `Write` into the worktree is denied by the boundary (the permission answer is the reject option), and the worktree tree id is unchanged.
 6. A unit whose diff is docs-only (S4 `monitors: 0`) spawns no monitor process and emits no `monitorAttached`.
 
@@ -423,7 +437,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
     (c) **bus path:** the published `GateEvalRequest` JSON carries `"excluded_seats":["claude#2","claude#3"]`; a response with `judge_cli: "claude#2"` or `judge_cli: null` folds as a DENY with the fail-closed reason; a response with a distinct `judge_cli` is honoured;
     (d) with an empty ledger, the bus request carries `"excluded_seats":[]` and a `judge_cli: null` response is honoured exactly as today;
     (e) excluding the monitors leaves no eligible seat → `judge_skipped` names the monitors. The judge prompt on (a)–(c) contains the rendered ledger inside the WORK fence.
-15. **Council trigger:** a HIGH that the worker declined with a reason and the monitor held convenes exactly one council. Its input carries the finding, both reasons, the `T_final` hunk at `path:finalLine` and the criterion, and it excludes the creator and the authoring/corroborating monitors. Any one of HIGH / declined / held removed convenes none. A monitor with no final-pass reply for a declined HIGH counts as held and convenes one.
+15. **Council trigger:** an unaccepted HIGH the monitor held convenes exactly one council. Its input carries the finding, the worker's position (decline reason, "no answer", or "not delivered — <outcome>"), the monitor's reason, the `T_final` hunk at `path:finalLine` and the criterion, and it excludes the creator and the authoring/corroborating monitors. An `accepted`, `withdrawn` or `superseded` HIGH, a MEDIUM, or a monitor `WITHDRAW` convenes none. A monitor with no hold-round reply for an unaccepted HIGH counts as held and convenes one.
 16. **Continue or pause (§6.7).** Fixture: a teamed unit whose floor passes, whose evaluator passes and whose ledger holds one unresolved HIGH. The council result is injected through a stub of S5's entry point.
     (a) **Council YES → no pause:** `unitDone` and `gateDecided{allow:true}` are emitted, there is no `awaitingHuman`, and the ledger records `dispute.verdict:"yes"`.
     (b) **Council NO → human pause:** `awaitingHuman{gateKind:"team_dispute"}` for that ord; the session is `awaiting_human`; there is no `unitDone` and no `gateDecided{allow:true}` for that ord.
@@ -432,6 +446,8 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
     (e) The same fixture with the floor failing emits `unitDenied` and no `team_dispute` pause.
     (f) `combine_verdict` receives identical inputs in (a)–(c).
     (g) Approving the `team_dispute` gate through `POST /runs/:id/gate` emits `resumed`, then `gateDecided{allow:true}` and `unitDone`, for that ord.
+    (h) **Unanswered (extension, §6.7):** the same fixture with the HIGH `delivery:"injected"`, no `ADVICE` line, and the monitor holding (or silent): council NO and every no-verdict reason pause exactly as (b)–(d); council YES continues as (a). With `judge_skipped` set, there is never a `unitDone` without a council YES.
+    (i) **Not delivered (extension, §6.7):** the same fixture on a bridge that does not advertise steering (`delivery:"not_delivered"`), and again with a steer answered `promptRequired`: identical outcomes to (h). The council input's worker position reads `"not delivered — …"`.
 17. `GET /api/v1/runs/:id/team` returns the ledgers for a teamed run and `units: []` for a run without monitors. The api-types fixture round-trips the Rust `to_json` output for all seven events.
 18. Studio: the gate panel shows each finding's severity, `path:line`, the worker's disposition and reason, and the council verdict. Approve/reject still go through `POST /runs/:id/gate`.
 
@@ -443,4 +459,4 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 - **Q2. Monitor independence.** Only claude is ACP-admitted (§2), so every monitor today is `claude#N` reviewing a claude creator. Same model, correlated blind spots. Each instance also needs its own signed-in config home, and #591's per-instance login is out of scope there. Admitting a second adapter to input governance (the codex-acp research is `registry.rs:252-300`) is what makes monitors model-diverse. Until then, independence is instance-level only.
 - **Q3. Pre-emptive steering.** The adapter delivers a steer at priority `now`, which **aborts** the current generation (adapter `acp-agent.js:1196-1206`). The client cannot ask for `later`. Every injected HIGH therefore costs an interrupted cycle and a context jolt mid-task. Whether that helps or hurts work quality is an empirical question for the rig. If it hurts, the remedy is to batch HIGH advice to fewer, later checkpoints, not a second mechanism.
 - Smaller: `unitCheckpoint` also serves studio (live tool activity) and could be emitted for every ACP unit, but volume argues against it. The per-attempt ledger is lost on a daemon restart mid-unit: findings emitted before the crash survive in the event log only.
-- **Q4. HIGH findings outside the ruling.** A HIGH that was never delivered (non-steering carrier) or that the worker left `unanswered` is not "declined and held", so it is not sent to a council and cannot pause the run. With the judge skipped, such a unit can still auto-approve. Should the ruling extend to these, e.g. by treating `unanswered` as declined?
+- **Q4. Operator confirmation needed for the extended ruling (§6.7).** This document treats every unaccepted HIGH the monitor holds (declined, unanswered, or never delivered) as unresolved, so it takes the council path. The operator's ruling named only "declined and held". Confirm or narrow.
