@@ -127,6 +127,10 @@ pub type WriteReg = Arc<Mutex<HashMap<(String, String, u64), SessionHandles>>>;
 
 // ── ElicitationMaps (DES-002) ─────────────────────────────────────────────────
 
+/// The largest elicitation option (bytes) the decider surface carries; longer entries are
+/// dropped at registration and never count as answerable at validation (core#599 review).
+const ELICITATION_OPTION_CAP: usize = 512;
+
 /// A human response delivered via `resolveElicitation` — the value that
 /// unblocks the `'elicit` dual-poll loop inside `exec_turn_acp`.
 #[derive(Debug, Clone)]
@@ -287,7 +291,7 @@ impl ElicitationMaps {
 
         // Filter options: drop entries > 512 bytes or empty string; cap list at 100.
         let options = options.map(|opts| {
-            const OPT_CAP: usize = 512;
+            const OPT_CAP: usize = ELICITATION_OPTION_CAP;
             const LIST_CAP: usize = 100;
             let mut filtered: Vec<String> = opts
                 .into_iter()
@@ -3299,10 +3303,14 @@ fn validate_elicitation_schema(schema: &Value) -> Result<ElicitationField, Strin
         .and_then(Value::as_object)
         .ok_or_else(|| "the requested schema has no properties".to_string())?;
     // A `<field>_custom` string beside `<field>` is the adapter's free-text "Other" companion,
-    // not a second question.
+    // not a second question — but only when the adapter's own marker proves it
+    // (`_meta._askUserQuestionCustomAnswer` naming `<field>` with `isCustomAnswer: true`).
+    // An unmarked `_custom` field is a real field (core#599 review).
     let is_companion = |name: &str, prop: &Value| {
-        name.strip_suffix("_custom")
-            .is_some_and(|base| props.contains_key(base))
+        let marker = &prop["_meta"]["_askUserQuestionCustomAnswer"];
+        name.strip_suffix("_custom").is_some_and(|base| {
+            props.contains_key(base) && marker["questionId"].as_str() == Some(base)
+        }) && marker["isCustomAnswer"].as_bool() == Some(true)
             && prop
                 .get("type")
                 .and_then(Value::as_str)
@@ -3329,8 +3337,8 @@ fn validate_elicitation_schema(schema: &Value) -> Result<ElicitationField, Strin
         Some("array") => {
             let items = prop.get("items").unwrap_or(&Value::Null);
             match select_options(items, key)? {
-                Some(opts) if !opts.is_empty() => (Some(opts), true),
-                _ => {
+                Some(opts) => (Some(opts), true),
+                None => {
                     return Err(format!(
                         "multi-select field `{key}` has no option list to choose from"
                     ))
@@ -3366,28 +3374,41 @@ struct ElicitationField {
 
 /// The option values of a select schema node: `oneOf[].const` / `anyOf[].const` (titled enum,
 /// the adapter's shape) or `enum` (plain). `Ok(None)` when the node is free text; `Err` when
-/// an option list is present but not entirely strings (it could not be answered faithfully).
+/// an option list is present but not entirely strings (it could not be answered faithfully),
+/// or when no option survives the filter `ElicitationMaps::register` applies (empty or over
+/// [`ELICITATION_OPTION_CAP`] bytes) — such a select would surface `options: Some([])`, which
+/// no answer can satisfy (core#599 review).
 fn select_options(node: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
     let malformed = || format!("field `{key}` has an option that is not a string");
-    for titled in ["oneOf", "anyOf"] {
-        if let Some(arr) = node.get(titled).and_then(Value::as_array) {
-            return arr
-                .iter()
+    let listed = ["oneOf", "anyOf"]
+        .iter()
+        .find_map(|titled| node.get(*titled).and_then(Value::as_array))
+        .map(|arr| {
+            arr.iter()
                 .map(|o| o.get("const").and_then(Value::as_str).map(str::to_string))
                 .collect::<Option<Vec<_>>>()
-                .map(Some)
-                .ok_or_else(malformed);
-        }
+        })
+        .or_else(|| {
+            node.get("enum").and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .map(|o| o.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+            })
+        });
+    let Some(listed) = listed else {
+        return Ok(None);
+    };
+    let answerable: Vec<String> = listed
+        .ok_or_else(malformed)?
+        .into_iter()
+        .filter(|o| !o.is_empty() && o.len() <= ELICITATION_OPTION_CAP)
+        .collect();
+    if answerable.is_empty() {
+        return Err(format!(
+            "field `{key}` has no answerable option to choose from"
+        ));
     }
-    match node.get("enum").and_then(Value::as_array) {
-        Some(arr) => arr
-            .iter()
-            .map(|o| o.as_str().map(str::to_string))
-            .collect::<Option<Vec<_>>>()
-            .map(Some)
-            .ok_or_else(malformed),
-        None => Ok(None),
-    }
+    Ok(Some(answerable))
 }
 
 /// A stream-aware banner gate over one turn's `agent_message_chunk` deltas (core#410, F-068):
@@ -16366,6 +16387,66 @@ No further next steps — both questions fully answered.";
         let reason = validate_elicitation_schema(&adapter_ask_schema("two_questions"))
             .expect_err("two questions cannot ride the one-answer surface");
         assert!(reason.contains("2 questions"), "{reason}");
+    }
+
+    /// core#599 review: a `<field>_custom` string WITHOUT the adapter's
+    /// `_meta._askUserQuestionCustomAnswer` marker is a real second field, not the "Other"
+    /// companion, so a two-field form fails closed instead of silently dropping one field.
+    #[test]
+    fn unmarked_custom_suffix_field_is_a_real_field_not_a_companion() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "name": {"type": "string"},
+            "name_custom": {"type": "string"}
+        }, "required": ["name", "name_custom"]});
+        let reason = validate_elicitation_schema(&schema)
+            .expect_err("an unmarked `_custom` field must count as a second field");
+        assert!(reason.contains("2 questions"), "{reason}");
+        // A marker naming a DIFFERENT question, or not claiming to be a custom answer, is not
+        // proof either.
+        for meta in [
+            serde_json::json!({"questionId": "other", "isCustomAnswer": true}),
+            serde_json::json!({"questionId": "name", "isCustomAnswer": false}),
+        ] {
+            let schema = serde_json::json!({"type": "object", "properties": {
+                "name": {"type": "string"},
+                "name_custom": {"type": "string", "_meta": {"_askUserQuestionCustomAnswer": meta}}
+            }});
+            assert!(validate_elicitation_schema(&schema).is_err(), "{meta}");
+        }
+    }
+
+    /// core#599 review: options `register` would drop (empty, or over 512 bytes) must not
+    /// count at validation time — a select left with no answerable option fails closed with a
+    /// reason instead of surfacing `options: Some([])`, which no answer can satisfy.
+    #[test]
+    fn select_with_only_unanswerable_options_fails_closed() {
+        let long = "x".repeat(513);
+        for schema in [
+            serde_json::json!({"type": "object", "properties": {
+                "picks": {"type": "array", "items": {"anyOf": [{"const": ""}]}}
+            }}),
+            serde_json::json!({"type": "object", "properties": {
+                "pick": {"type": "string", "oneOf": [{"const": ""}, {"const": long}]}
+            }}),
+            serde_json::json!({"type": "object", "properties": {
+                "pick": {"type": "string", "enum": [""]}
+            }}),
+        ] {
+            let reason = validate_elicitation_schema(&schema)
+                .expect_err("a select with no answerable option must cancel");
+            assert!(
+                reason.contains("no answerable option"),
+                "{schema}: {reason}"
+            );
+        }
+        // Answerable options survive; the unanswerable ones are not offered.
+        let mixed = serde_json::json!({"type": "object", "properties": {
+            "pick": {"type": "string", "oneOf": [{"const": ""}, {"const": "yes"}, {"const": long}]}
+        }});
+        assert_eq!(
+            validate_elicitation_schema(&mixed).unwrap().options,
+            Some(vec!["yes".to_string()])
+        );
     }
 
     /// A plain `enum` select still reads its options; a select with a non-string option, or a
