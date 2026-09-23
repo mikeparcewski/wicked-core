@@ -5896,8 +5896,9 @@ impl AcpStepRunner {
 
     /// The steer mailbox handle the team supervisor writes HIGH advice into (DES-TEAMING-001
     /// §5.2). Cloning shares the one mailbox.
-    // Taken by S2's supervisor in `spawn_with_acp_sessions` (#601); until it lands only tests do.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Taken by S2's supervisor in `spawn_with_acp_sessions` (#601); until it lands only the unix
+    // carrier tests do.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub(crate) fn steer_mailbox(&self) -> crate::team::SteerMailbox {
         self.steer_mailbox.clone()
     }

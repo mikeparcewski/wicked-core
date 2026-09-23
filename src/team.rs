@@ -498,12 +498,9 @@ fn parse_advice_line(line: &str) -> Option<AdviceResponse> {
         return None;
     }
     let rest = rest[18..].strip_prefix(": ")?;
-    let (disposition, rest) = if let Some(r) = rest.strip_prefix("ACCEPT") {
-        (Disposition::Accepted, r)
-    } else if let Some(r) = rest.strip_prefix("DECLINE") {
-        (Disposition::Declined, r)
-    } else {
-        return None;
+    let (disposition, rest) = match rest.strip_prefix("ACCEPT") {
+        Some(r) => (Disposition::Accepted, r),
+        None => (Disposition::Declined, rest.strip_prefix("DECLINE")?),
     };
     // `\b`: the keyword must not run on into a word character (`ACCEPTED` is not `ACCEPT`).
     if rest
