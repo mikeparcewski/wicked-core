@@ -1168,6 +1168,37 @@ pub enum CoreEvent {
         action: String,
         reason: String,
     },
+    /// (DES-TEAMING-001 §5.2 / §7, S3 #602; additive) What became of HIGH monitor advice for one
+    /// attempt of a unit. `carrier: "acp_steering"` — one `_session/steering` request, always sent
+    /// with `idleBehavior: "promptRequired"`, was answered: `outcome` is `"injected"` (it reached
+    /// the running turn), `"turn_ended"` (the adapter answered `promptRequired`: the turn had
+    /// settled, nothing was started, the advice goes to the gate) or `"refused"` (a JSON-RPC error,
+    /// in `detail`; the turn continues). `outcome: "not_delivered"` — the advice never rode a
+    /// steer: the carrier has no mid-turn channel (`carrier: "none"`: wrapped, PTY, an ACP adapter
+    /// not advertising steering) or the turn ended before another tool-call boundary; `detail`
+    /// says which. `detail` is `null`, never absent, when there is nothing to add.
+    AdviceDelivered {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        finding_ids: Vec<String>,
+        carrier: String,
+        outcome: String,
+        detail: Option<String>,
+    },
+    /// (DES-TEAMING-001 §5.3 / §7, S3 #602; additive) The worker's answer to one delivered
+    /// finding, read from its final output line `ADVICE <id>: ACCEPT|DECLINE — <reason>` (the
+    /// last line per id wins). `disposition` is `"accepted"` or `"declined"`; `reason` is ≤2 KB
+    /// and may be `""` (a refusal with no evidence is recorded as exactly that). The worker may
+    /// decline: the gate, not the monitor, decides.
+    WorkerAdviceResponse {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        finding_id: String,
+        disposition: String,
+        reason: String,
+    },
 }
 
 /// Render a [`crate::domain::UnitDenial`] in the events wire's camelCase convention (the persisted
@@ -2310,6 +2341,40 @@ impl CoreEvent {
                 "action": action,
                 "reason": reason,
             }),
+            CoreEvent::AdviceDelivered {
+                session,
+                ord,
+                attempt,
+                finding_ids,
+                carrier,
+                outcome,
+                detail,
+            } => json!({
+                "type": "adviceDelivered",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "findingIds": finding_ids,
+                "carrier": carrier,
+                "outcome": outcome,
+                "detail": detail,
+            }),
+            CoreEvent::WorkerAdviceResponse {
+                session,
+                ord,
+                attempt,
+                finding_id,
+                disposition,
+                reason,
+            } => json!({
+                "type": "workerAdviceResponse",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "findingId": finding_id,
+                "disposition": disposition,
+                "reason": reason,
+            }),
         }
     }
 }
@@ -2762,6 +2827,62 @@ mod tests {
             j["cacheReadTokens"].as_u64().unwrap() + j["cacheCreationTokens"].as_u64().unwrap()
                 <= j["inputTokens"].as_u64().unwrap(),
             "cache split must be a subset of the input total"
+        );
+    }
+
+    /// DES-TEAMING-001 §7 (S3): the two advice events' EXACT wire shape — every key always
+    /// present (`detail: null`, never absent), camelCase, nothing extra. crew-api-types mirrors
+    /// these byte for byte; a renamed or dropped key fails here first.
+    #[test]
+    fn advice_events_wire_shape_is_exact() {
+        let keys = |j: &serde_json::Value| {
+            let mut k: Vec<String> = j.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let j = CoreEvent::AdviceDelivered {
+            session: "run-1".into(),
+            ord: 3,
+            attempt: 1,
+            finding_ids: vec!["f-3fa9c2e1d0b4a7e6".into()],
+            carrier: "acp_steering".into(),
+            outcome: "injected".into(),
+            detail: None,
+        }
+        .to_json();
+        assert_eq!(
+            j,
+            serde_json::json!({"type":"adviceDelivered","session":"run-1","ord":3,"attempt":1,
+                "findingIds":["f-3fa9c2e1d0b4a7e6"],"carrier":"acp_steering",
+                "outcome":"injected","detail":null})
+        );
+        assert_eq!(
+            keys(&j),
+            [
+                "attempt",
+                "carrier",
+                "detail",
+                "findingIds",
+                "ord",
+                "outcome",
+                "session",
+                "type"
+            ]
+        );
+        let j = CoreEvent::WorkerAdviceResponse {
+            session: "run-1".into(),
+            ord: 3,
+            attempt: 1,
+            finding_id: "f-3fa9c2e1d0b4a7e6".into(),
+            disposition: "declined".into(),
+            reason: "campaign.rs:325 documents the exclusion".into(),
+        }
+        .to_json();
+        assert_eq!(
+            j,
+            serde_json::json!({"type":"workerAdviceResponse","session":"run-1","ord":3,
+                "attempt":1,"findingId":"f-3fa9c2e1d0b4a7e6","disposition":"declined",
+                "reason":"campaign.rs:325 documents the exclusion"})
         );
     }
 }
