@@ -39,18 +39,49 @@ fn edge(from: &str, to: &str, kind: EdgeKind) -> Edge {
     Edge::new(sym(from), sym(to), kind, ResolutionTier::Parsed, "fixture")
 }
 
+const BASE: &str = "b45e0000000000000000000000000000000000000";
+const HEAD: &str = "4ead0000000000000000000000000000000000000";
+
+fn indexed_at(store: &mut SqliteStore, commit: &str) {
+    store
+        .set_repo_info(&RepoInfo {
+            commit: Some(commit.to_string()),
+            ..Default::default()
+        })
+        .expect("set_repo_info");
+}
+
+/// A graph indexed at the run base, which is what every score needs.
 fn graph(nodes: &[Node], edges: &[Edge]) -> SqliteStore {
     let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("in-memory store");
     store.begin_batch().expect("begin");
     store.upsert_nodes(nodes).expect("nodes");
     store.upsert_edges(edges).expect("edges");
     store.commit_batch().expect("commit");
+    indexed_at(&mut store, BASE);
     store
+}
+
+fn ready(store: &SqliteStore) -> Graph<'_> {
+    Graph::Ready {
+        store,
+        base_commit: BASE,
+    }
 }
 
 /// `hot` in `src/core.rs` lines 10-30 with forty callers, and optionally one test that calls it.
 fn hot_graph(with_test: bool) -> SqliteStore {
-    let mut nodes = vec![node("hot", NodeKind::Function, "src/core.rs", (10, 30))];
+    hot_graph_at(10, with_test)
+}
+
+/// [`hot_graph`] with `hot` starting at `start` (its callers are elsewhere).
+fn hot_graph_at(start: u32, with_test: bool) -> SqliteStore {
+    let mut nodes = vec![node(
+        "hot",
+        NodeKind::Function,
+        "src/core.rs",
+        (start, start + 20),
+    )];
     let mut edges = Vec::new();
     for i in 0..40u32 {
         let caller = format!("caller{i}");
@@ -147,7 +178,7 @@ fn ten_line_change_to_a_symbol_with_forty_dependents_scores_60_to_80() {
 
     // No test reaches `hot`: reach 60 + test gap 20.
     let store = hot_graph(false);
-    let a = assess(&diff, Graph::Ready(&store), None);
+    let a = assess(&diff, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
     assert_eq!((s.changed_symbols, s.dependents), (1, 40), "{s:?}");
     assert_eq!(a.score, 80, "{a:?}");
@@ -155,7 +186,7 @@ fn ten_line_change_to_a_symbol_with_forty_dependents_scores_60_to_80() {
 
     // One test reaches it: reach 60, no gap.
     let store = hot_graph(true);
-    let a = assess(&diff, Graph::Ready(&store), None);
+    let a = assess(&diff, ready(&store), None);
     assert_eq!(a.score, 60, "{a:?}");
     assert_eq!(a.plan, PLAN_DEEP);
     assert!((60..=80).contains(&a.score));
@@ -175,7 +206,7 @@ fn six_hundred_line_new_leaf_file_scores_20() {
     assert!(diff.touched[0].old_lines.is_empty(), "{:?}", diff.touched);
 
     let store = hot_graph(true);
-    let a = assess(&diff, Graph::Ready(&store), None);
+    let a = assess(&diff, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
     assert_eq!((s.changed_symbols, s.dependents), (1, 0), "{s:?}");
     assert_eq!(a.score, 20, "{a:?}");
@@ -208,7 +239,7 @@ fn event_schema_change_with_three_consumers_crosses_the_contract_band() {
     let store = consumers("CoreEvent", "src/event.rs");
     let a = assess(
         &signals_from_diff(&file_diff("src/event.rs", hunk)),
-        Graph::Ready(&store),
+        ready(&store),
         None,
     );
     let s = a.signals.as_ref().expect("graph was read");
@@ -221,7 +252,7 @@ fn event_schema_change_with_three_consumers_crosses_the_contract_band() {
     let store = consumers("Plain", "src/plain.rs");
     let a = assess(
         &signals_from_diff(&file_diff("src/plain.rs", hunk)),
-        Graph::Ready(&store),
+        ready(&store),
         None,
     );
     assert!(!a.signals.as_ref().expect("graph was read").contract_change);
@@ -256,7 +287,7 @@ fn no_graph_scores_100_and_docs_only_scores_0_without_one() {
     );
     assert_eq!(a.score, 100);
     assert!(
-        a.reasons[0].contains("older than the run base bbbb"),
+        a.reasons[0].contains("aaaa is not the run base bbbb"),
         "{:?}",
         a.reasons
     );
@@ -281,7 +312,7 @@ fn destructive_path_scores_at_least_the_floor() {
         "@@ -1,4 +1,4 @@\n-if confirmed {\n+if true {\n     std::fs::remove_dir(path)?;\n }\n";
     let diff = signals_from_diff(&file_diff("src/sweep.rs", hunk));
     assert!(diff.destructive);
-    let a = assess(&diff, Graph::Ready(&store), None);
+    let a = assess(&diff, ready(&store), None);
     assert_eq!(a.score, THRESHOLDS.destructive_floor as u8, "{a:?}");
     assert_eq!(a.plan, PLAN_MOST);
 
@@ -289,7 +320,7 @@ fn destructive_path_scores_at_least_the_floor() {
     let mut d = hot_diff();
     d.push_str("+    std::fs::remove_dir_all(&worktree)?;\n");
     let store = hot_graph(false);
-    let a = assess(&signals_from_diff(&d), Graph::Ready(&store), None);
+    let a = assess(&signals_from_diff(&d), ready(&store), None);
     assert_eq!(a.score, 80, "{a:?}");
 }
 
@@ -311,7 +342,7 @@ fn the_model_hook_can_raise_but_never_lower() {
     let diff = signals_from_diff(&hot_diff());
     for (add, want) in [(0, 60), (10, 70), (20, 80), (15, 70), (200, 80)] {
         let hook = Adds(add, Cell::new(0));
-        let a = assess(&diff, Graph::Ready(&store), Some(&hook));
+        let a = assess(&diff, ready(&store), Some(&hook));
         assert_eq!((a.deterministic, a.score), (60, want), "add {add}: {a:?}");
         assert_eq!(hook.1.get(), 1);
         assert_eq!(a.plan, plan_at(want));
@@ -323,11 +354,7 @@ fn the_model_hook_can_raise_but_never_lower() {
 
     // Below the consultation floor the hook is never asked.
     let hook = Adds(20, Cell::new(0));
-    let a = assess(
-        &signals_from_diff(DOCS_ONLY),
-        Graph::Ready(&store),
-        Some(&hook),
-    );
+    let a = assess(&signals_from_diff(DOCS_ONLY), ready(&store), Some(&hook));
     assert_eq!((a.score, hook.1.get()), (0, 0), "{a:?}");
     assert!(a.model.is_none());
 
@@ -456,67 +483,64 @@ fn bands_table() {
 // ── Graph age ────────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn graph_age_reads_repo_info_and_git_ancestry() {
-    let scratch = std::env::temp_dir().join(format!(
-        "wicked-review-scale-age-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&scratch).expect("scratch");
-    let git = |args: &[&str]| {
-        crate::worktree_guard::git_string(&scratch, args, &[]).expect("git in scratch")
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "fixture@example.invalid"]);
-    git(&["config", "user.name", "fixture"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "a"]);
-    let a = git(&["rev-parse", "HEAD"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "b"]);
-    let b = git(&["rev-parse", "HEAD"]);
+fn graph_age_requires_the_indexed_commit_to_be_the_base() {
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("in-memory store");
+    assert!(matches!(graph_age(&store, BASE), GraphAge::Missing(_)));
+    indexed_at(&mut store, "");
+    assert!(matches!(graph_age(&store, BASE), GraphAge::Missing(_)));
 
-    let mut store = graph(&[], &[]);
-    assert!(matches!(
-        graph_age(&store, &scratch, &b),
-        GraphAge::Missing(_)
-    ));
+    indexed_at(&mut store, BASE);
+    assert_eq!(graph_age(&store, BASE), GraphAge::Current, "same commit");
 
-    let at = |store: &mut SqliteStore, commit: &str| {
-        store
-            .set_repo_info(&RepoInfo {
-                commit: Some(commit.to_string()),
-                ..Default::default()
-            })
-            .expect("set_repo_info");
-    };
-    at(&mut store, &b);
-    assert_eq!(
-        graph_age(&store, &scratch, &b),
-        GraphAge::Current,
-        "same commit"
-    );
-    assert_eq!(
-        graph_age(&store, &scratch, &a),
-        GraphAge::Current,
-        "indexed after the base"
-    );
-    at(&mut store, &a);
-    assert_eq!(
-        graph_age(&store, &scratch, &b),
-        GraphAge::Stale {
-            indexed: a.clone(),
-            base: b.clone()
-        },
-        "indexed before the base"
-    );
-    at(&mut store, "0000000000000000000000000000000000000000");
+    // Review on #600: a graph at a DESCENDANT of the base was accepted, but its spans are the
+    // head's, not the base's, and the base-side lookup misses a shifted symbol. Newer is stale too.
+    for other in [HEAD, "0000000000000000000000000000000000000000"] {
+        indexed_at(&mut store, other);
+        assert_eq!(
+            graph_age(&store, BASE),
+            GraphAge::Stale {
+                indexed: other.to_string(),
+                base: BASE.to_string()
+            },
+            "any other commit is stale"
+        );
+    }
+}
+
+/// Review on #600: the PR inserts 100 lines above `hot`, so a graph indexed at the PR's head
+/// records `hot` at 110-130 while the diff's base-side lookup asks about 12-21. Against the base
+/// graph the edit still scores 80; against the head graph it must fail closed at 100, never 20.
+#[test]
+fn hot_symbol_shifted_by_an_insertion_above_it_still_scores_80() {
+    let mut hunk = String::from("@@ -1,0 +1,100 @@\n");
+    for i in 0..100 {
+        hunk.push_str(&format!("+// inserted {i}\n"));
+    }
+    hunk.push_str("@@ -12,5 +112,5 @@\n");
+    for i in 0..5 {
+        hunk.push_str(&format!("-    old{i}\n+    new{i}\n"));
+    }
+    let diff = signals_from_diff(&file_diff("src/core.rs", &hunk));
+    assert_eq!((diff.lines_added, diff.lines_removed), (105, 5));
+
+    // Indexed at the base: `hot` is at 10-30, the touched lines 12-16 hit it.
+    let base_graph = hot_graph_at(10, false);
+    let a = assess(&diff, ready(&base_graph), None);
+    assert_eq!(a.signals.as_ref().expect("read").dependents, 40, "{a:?}");
+    assert_eq!((a.score, a.plan), (80, PLAN_MOST), "{a:?}");
+
+    // Indexed at the head: `hot` is at 110-130. Scoring this would say 20; the rule says stale.
+    let mut head_graph = hot_graph_at(110, false);
+    indexed_at(&mut head_graph, HEAD);
+    let a = assess(&diff, ready(&head_graph), None);
+    assert_eq!((a.score, a.plan), (100, PLAN_MOST), "{a:?}");
+    assert!(a.signals.is_none(), "never scored: {a:?}");
     assert!(
-        matches!(graph_age(&store, &scratch, &b), GraphAge::Stale { .. }),
-        "an unknown commit is not trusted"
+        a.reasons[0].contains("is not the run base"),
+        "{:?}",
+        a.reasons
     );
-    let _ = std::fs::remove_dir_all(&scratch);
+    assert_ne!(a.score, 20);
 }
 
 // ── The diff side ────────────────────────────────────────────────────────────────────────────
@@ -616,7 +640,7 @@ rename to docs/memory.md
     assert!(s.critical, "the a/ side is a critical subsystem: {s:?}");
     assert_eq!(s.touched[0].old_path, "src/memory.rs");
     let store = graph(&[], &[]);
-    let a = assess(&s, Graph::Ready(&store), None);
+    let a = assess(&s, ready(&store), None);
     assert_eq!(a.score, 40, "reach 20 + critical 20: {a:?}");
 }
 
@@ -634,7 +658,7 @@ deleted file mode 100644
     let s = signals_from_diff(d);
     assert!(s.destructive && s.critical, "{s:?}");
     let store = graph(&[], &[]);
-    assert_eq!(assess(&s, Graph::Ready(&store), None).plan, PLAN_MOST);
+    assert_eq!(assess(&s, ready(&store), None).plan, PLAN_MOST);
 }
 
 // Same fail-open class: a hunk with no `diff --git` header was counted as lines but no file, so
@@ -644,7 +668,7 @@ fn headerless_hunk_is_not_docs_only() {
     let s = signals_from_diff("@@ -1 +1 @@\n-a\n+b\n");
     assert_eq!(s.code_files, 1, "{s:?}");
     let store = graph(&[], &[]);
-    assert_eq!(assess(&s, Graph::Ready(&store), None).plan.monitors, 1);
+    assert_eq!(assess(&s, ready(&store), None).plan.monitors, 1);
 }
 
 // Review on #600: `remove_dir_all` and `remove_file` were listed but not `remove_dir`, so
@@ -703,11 +727,7 @@ fn every_destructive_family_member_summons_the_top_band() {
         );
         let s = signals_from_diff(&d);
         assert!(s.destructive, "not destructive: {line:?} -> {s:?}");
-        assert_eq!(
-            assess(&s, Graph::Ready(&store), None).plan,
-            PLAN_MOST,
-            "{line:?}"
-        );
+        assert_eq!(assess(&s, ready(&store), None).plan, PLAN_MOST, "{line:?}");
     }
     let lower: Vec<String> = fixtures.iter().map(|l| l.to_ascii_lowercase()).collect();
     for m in THRESHOLDS.destructive_line_markers {
@@ -731,7 +751,7 @@ diff --git a/docs/ops.md b/docs/ops.md
     let s = signals_from_diff(d);
     assert!(!s.destructive, "{s:?}");
     let store = graph(&[], &[]);
-    assert_eq!(assess(&s, Graph::Ready(&store), None).plan, PLAN_NONE);
+    assert_eq!(assess(&s, ready(&store), None).plan, PLAN_NONE);
 }
 
 // Review on #600: only `+`/`-` lines were scanned for destructive markers, so a change that only
@@ -761,5 +781,5 @@ fn guard_change_around_context_line_destructive_call_is_destructive() {
     );
     assert!(s.destructive, "remove_dir on a context line: {s:?}");
     let store = graph(&[], &[]);
-    assert_eq!(assess(&s, Graph::Ready(&store), None).plan, PLAN_MOST);
+    assert_eq!(assess(&s, ready(&store), None).plan, PLAN_MOST);
 }

@@ -12,9 +12,9 @@
 //! 1. [`signals_from_diff`] (pure): unified diff -> [`ChangeSignals`]: the touched non-docs files
 //!    with the base-side lines each hunk touches, plus the destructive and critical-path markers.
 //!    Diff-only, so destructive detection works without a graph.
-//! 2. [`graph_age`] (I/O: `repo_info` and one `git merge-base`): is the graph indexed at or after
-//!    the run's base commit? Older, absent or unreadable is [`GraphAge::Stale`] or
-//!    [`GraphAge::Missing`].
+//! 2. [`graph_age`] (one `repo_info` read): is the graph indexed AT the run's base commit, the
+//!    commit the diff's old side is taken from? Anything else is [`GraphAge::Stale`] or
+//!    [`GraphAge::Missing`], and [`assess`] applies this itself.
 //! 3. [`impact_signals`] (graph reads): C = the changed symbols, R = their dependents within
 //!    `hops` (callers, importers, injected-edge consumers), the products R lands in, whether a
 //!    published surface changed, and the test gap.
@@ -30,8 +30,6 @@
 //! Every number and word list lives in [`THRESHOLDS`], so tuning the policy is a one-table edit.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-
 use wicked_apps_core::{GraphRead, Node, NodeKind};
 use wicked_estate_core::{SymbolId, TraversalSpec};
 
@@ -74,9 +72,9 @@ impl ChangeSignals {
 /// Whether the repo graph can speak for the run's base commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GraphAge {
-    /// Indexed at the run's base commit or at a descendant of it.
+    /// Indexed at the run's base commit, the commit the diff's old side is taken from.
     Current,
-    /// Indexed at a commit the base does not descend from: older, or unrelated.
+    /// Indexed at any other commit: older, newer, or unrelated.
     Stale { indexed: String, base: String },
     /// No graph, no recorded commit, or unreadable.
     Missing(String),
@@ -88,7 +86,7 @@ impl GraphAge {
         match self {
             GraphAge::Current => None,
             GraphAge::Stale { indexed, base } => Some(format!(
-                "graph indexed at {indexed} is older than the run base {base}"
+                "graph indexed at {indexed} is not the run base {base}"
             )),
             GraphAge::Missing(why) => Some(format!("no graph: {why}")),
         }
@@ -152,9 +150,14 @@ pub(crate) struct ModelBonus {
     pub rationale: String,
 }
 
-/// The graph a run reads, or why it cannot.
+/// The graph a run reads, with the commit its diff's old side is taken from, or why it cannot.
+/// [`assess`] checks [`graph_age`] itself, so no caller can score against a graph whose spans
+/// belong to another commit.
 pub(crate) enum Graph<'a> {
-    Ready(&'a dyn GraphRead),
+    Ready {
+        store: &'a dyn GraphRead,
+        base_commit: &'a str,
+    },
     Unavailable(String),
 }
 
@@ -257,8 +260,8 @@ const PLAN_MOST: ReviewPlan = ReviewPlan {
 /// - **Destructive floor 70**: the issue's HIGH was a one-handler defect before a memory erase
 ///   that survived the creator, the evaluator, a human gate and a PR. A destructive path gets the
 ///   top band whatever its reach, and it is detected from the diff alone so it works with no graph.
-/// - **No graph, or a graph older than the run's base, scores 100.** A policy that cannot see the
-///   dependents must not guess low.
+/// - **No graph, or a graph not indexed at the run's base, scores 100.** A policy that cannot see
+///   the dependents, or sees them at another commit's line numbers, must not guess low.
 /// - **Bands**: 0-19 nothing; 20-39 one standard monitor; 40-69 two deep monitors and a post-hoc
 ///   reviewer; 70-100 three deep monitors and a post-hoc reviewer on a different CLI than the
 ///   worker. Three is the ceiling: a monitor that flags everything is noise (issue risk 2), and
@@ -360,14 +363,15 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
     test_name_prefixes: &["test"],
 };
 
-/// Whether the graph at `store` speaks for `base_commit`. `repo` is a checkout where both the
-/// base and the indexed commit are reachable (the run's worktree). One `git merge-base`; anything
-/// git cannot confirm is stale, and a graph with no recorded commit is missing.
-pub(crate) fn graph_age<S: GraphRead + ?Sized>(
-    store: &S,
-    repo: &Path,
-    base_commit: &str,
-) -> GraphAge {
+/// Whether the graph at `store` speaks for `base_commit`: ONE rule, the indexed commit IS the base
+/// commit. The diff's old side is the base (`repo::create_worktree_based` checks the run tree out
+/// at `base.commit`, and the run diff is `base_commit..run_branch`), and [`impact_signals`] maps
+/// hunks by base-side path and line, so the graph's spans must be the base's spans. A graph at a
+/// DESCENDANT is not enough: an insertion above a hot symbol shifts its span, the base-side lookup
+/// misses it, and a hot edit scores as a leaf (review on #600). The engine never re-indexes at run
+/// start; the graph is whatever onboarding indexed the registered root at, which the base lift
+/// (`RunBase::lifted`) can leave behind. Anything but equality is stale, and stale scores 100.
+pub(crate) fn graph_age<S: GraphRead + ?Sized>(store: &S, base_commit: &str) -> GraphAge {
     let indexed = match store.repo_info() {
         Err(e) => return GraphAge::Missing(format!("repo info unreadable: {e}")),
         Ok(None) => return GraphAge::Missing("the graph records no repo info".into()),
@@ -377,17 +381,12 @@ pub(crate) fn graph_age<S: GraphRead + ?Sized>(
         },
     };
     if indexed == base_commit {
-        return GraphAge::Current;
-    }
-    // The base is an ancestor of the indexed commit: the graph is at or after the base. Any
-    // failure (not an ancestor, unknown commit, no git) is stale.
-    let args = ["merge-base", "--is-ancestor", base_commit, indexed.as_str()];
-    match crate::worktree_guard::git(repo, &args, &[]) {
-        Ok(_) => GraphAge::Current,
-        Err(_) => GraphAge::Stale {
+        GraphAge::Current
+    } else {
+        GraphAge::Stale {
             indexed,
             base: base_commit.to_string(),
-        },
+        }
     }
 }
 
@@ -571,9 +570,10 @@ pub(crate) fn assess(
         )
     } else {
         let read = match graph {
-            Graph::Ready(store) => {
-                impact_signals(store, diff).map_err(|e| format!("graph read failed: {e}"))
-            }
+            Graph::Ready { store, base_commit } => match graph_age(store, base_commit).reason() {
+                Some(reason) => Err(reason),
+                None => impact_signals(store, diff).map_err(|e| format!("graph read failed: {e}")),
+            },
             Graph::Unavailable(reason) => Err(reason),
         };
         match read {
