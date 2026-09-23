@@ -2186,8 +2186,9 @@ mod tests {
     }
 
     /// `UnitDistributedEventJson` in the shipped block names EVERY key `event_to_json` emits for
-    /// `unitDistributed`, with the literal tag, `seatConstraint: string | null` and the four
-    /// routing methods `pipeline::apply_distributions` emits.
+    /// `unitDistributed`, with the literal tag, `seatConstraint: string | null` and every routing
+    /// method `pipeline::apply_distributions` maps (`teamed` since core#590 S5; `council` and
+    /// `degraded` for a recorded run's replayed frames).
     fn assert_unit_distributed_declared(from_dts: &str) {
         let iface_start = from_dts
             .find("export interface UnitDistributedEventJson extends CoreEventJson {")
@@ -2226,7 +2227,13 @@ mod tests {
             iface.contains("\n  seatConstraint: string | null\n"),
             "seatConstraint is a real `string | null` property: {iface}"
         );
-        for method in ["'council'", "'degraded'", "'evaluator_distinct'", "'tool'"] {
+        for method in [
+            "'council'",
+            "'degraded'",
+            "'evaluator_distinct'",
+            "'tool'",
+            "'teamed'",
+        ] {
             assert!(
                 iface.contains(method),
                 "routingMethod names {method} (pipeline::apply_distributions emits it)"

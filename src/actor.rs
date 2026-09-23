@@ -1156,9 +1156,7 @@ pub(crate) fn run(
                     entity_mode,
                     &session_id,
                     workflow.as_deref(),
-                    dispatcher.clone(),
                     &mut |ev| emit(&mut subscribers, ev),
-                    operational_home.as_deref(),
                 );
                 if let Err(e) = res {
                     emit(
@@ -1468,25 +1466,18 @@ pub(crate) fn run(
                         fail_run_by_id(&mut store, &mut subscribers, &runner, &self_tx, &run_id, e);
                     }
                     Ok(pre) => {
-                        // Blocking half (worker thread): convene the council off the actor thread
-                        // so the actor stays responsive (serves reads, handles gates) while the
-                        // council votes. Posts PlanReady or PlanFailed back when done.
+                        // Second half (worker thread): route the units off the actor thread (the
+                        // skills snapshot it may resolve is file I/O). No council convenes
+                        // (core#590 S5). Posts PlanReady or PlanFailed back when done.
                         let tx = self_tx.clone();
-                        let disp = dispatcher.clone();
-                        let op_home = operational_home.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on_benched(
                                         &pre.units,
                                         &pre.clis,
                                         &sid,
-                                        None,
-                                        &disp,
-                                        Some(relay),
-                                        op_home.as_deref(),
                                         &pre.session.benched_seats,
                                     )
                                 }));
@@ -1659,21 +1650,14 @@ pub(crate) fn run(
                     }
                     Ok(pre) => {
                         let tx = self_tx.clone();
-                        let disp = dispatcher.clone();
-                        let op_home = operational_home.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on_benched(
                                         &pre.units,
                                         &pre.clis,
                                         &sid,
-                                        None,
-                                        &disp,
-                                        Some(relay),
-                                        op_home.as_deref(),
                                         &pre.session.benched_seats,
                                     )
                                 }));
@@ -2441,14 +2425,8 @@ pub(crate) fn run(
             }
             // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
             Command::LaunchCampaign { def, reply } => {
-                let seams = campaign_seams(
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &registry,
-                    process_gen,
-                    &lifecycle_maps,
-                );
+                let seams =
+                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
                 let res = crate::campaign::launch(
                     &mut store,
                     &mut subscribers,
@@ -2459,14 +2437,8 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::ResumeCampaign { id, reply } => {
-                let seams = campaign_seams(
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &registry,
-                    process_gen,
-                    &lifecycle_maps,
-                );
+                let seams =
+                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
                 let res = crate::campaign::resume(
                     &mut store,
                     &mut subscribers,
@@ -2477,14 +2449,8 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelCampaign { id, reply } => {
-                let seams = campaign_seams(
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &registry,
-                    process_gen,
-                    &lifecycle_maps,
-                );
+                let seams =
+                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
                 let res = crate::campaign::cancel(
                     &mut store,
                     &mut subscribers,
@@ -2504,14 +2470,8 @@ pub(crate) fn run(
                 decision,
                 reply,
             } => {
-                let seams = campaign_seams(
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &registry,
-                    process_gen,
-                    &lifecycle_maps,
-                );
+                let seams =
+                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
                 let res = crate::campaign::confirm_gate(
                     &mut store,
                     &mut subscribers,
@@ -2534,14 +2494,8 @@ pub(crate) fn run(
             Command::CampaignRunFinished { run_id, outcome } => {
                 // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
                 // points). No-op if the run isn't campaign-owned.
-                let seams = campaign_seams(
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &registry,
-                    process_gen,
-                    &lifecycle_maps,
-                );
+                let seams =
+                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
                 if let Err(e) = crate::campaign::on_run_finished(
                     &mut store,
                     &mut subscribers,
@@ -2555,14 +2509,8 @@ pub(crate) fn run(
             }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
-                let seams = campaign_seams(
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &registry,
-                    process_gen,
-                    &lifecycle_maps,
-                );
+                let seams =
+                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
                 if let Err(e) = crate::campaign::on_node_awaiting(
                     &mut store,
                     &mut subscribers,
@@ -2573,6 +2521,26 @@ pub(crate) fn run(
                 ) {
                     emit_run_error(&mut subscribers, &run_id, e);
                 }
+            }
+            Command::ConveneDecision { req, clis, reply } => {
+                // (core#590 S5) The ballots are slow subprocess turns: run them off the actor
+                // thread, relaying the council's lifecycle events back through the emit point.
+                let disp = dispatcher.clone();
+                let op_home = operational_home.clone();
+                let relay = council_event_relay(self_tx.clone());
+                std::thread::spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::decision::convene_decision(
+                            &req,
+                            &clis,
+                            &disp,
+                            Some(relay),
+                            op_home.as_deref(),
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
+                    let _ = reply.send(result);
+                });
             }
             Command::RegisterWorkflow { json, reply } => {
                 let result = serde_json::from_str::<crate::workflow::WorkflowDef>(&json)
@@ -2911,23 +2879,21 @@ pub(crate) fn run(
                         }
                     }
                     None => {
-                        // Re-run the council off the actor thread; post back ReassignReady.
+                        // Re-route off the actor thread; post back ReassignReady. (core#590 S5:
+                        // routing convenes no council — the re-route is the deterministic pick.)
                         let tx = self_tx.clone();
-                        let disp = dispatcher.clone();
-                        let op_home = operational_home.clone();
                         let run_id_c = run_id.clone();
                         let prev_cli_c = previous_cli.clone();
-                        // (F-7R2-006) The one-unit re-council honours the run's bench too.
                         // An explicit operator reassign (`{cli:null}`) — the environment may have
                         // been fixed since the run's bench was written (a sign-in, a quota reset):
-                        // the re-council runs over a CLEARED bench and its own ballots re-bench
-                        // whatever is still dead (DES-L3 §4; the `:3775` precedent). Without this
-                        // the lever was a no-op after a sign-in (F-RC2-007).
+                        // the re-route runs over a CLEARED bench (DES-L3 §4; the `:3775`
+                        // precedent). Without this the lever was a no-op after a sign-in
+                        // (F-RC2-007).
                         let benched_c: Vec<crate::domain::BenchedSeat> = Vec::new();
-                        let units_for_council = units.clone();
+                        let units_for_routing = units.clone();
                         let clis_keys = session.clis.clone();
                         let ord_c = ord;
-                        // Emit UnitReassigned now (new_cli=None indicates council re-run).
+                        // Emit UnitReassigned now (new_cli=None indicates a re-route).
                         emit(
                             &mut subscribers,
                             CoreEvent::UnitReassigned {
@@ -2947,31 +2913,25 @@ pub(crate) fn run(
                                 .into_iter()
                                 .filter(|c| clis_keys.contains(&c.key))
                                 .collect();
-                            // Re-run the council for just this one unit.
-                            let unit_slice: Vec<_> = units_for_council
-                                .into_iter()
-                                .filter(|u| u.ord == ord_c)
-                                .collect();
-                            let relay = council_event_relay(tx.clone());
+                            // Re-route the WHOLE plan and take this unit's seat: the
+                            // evaluator≠creator fence must see the run's builders, or a re-routed
+                            // review unit would land on the first seat — a builder's (core#590 S5).
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on_benched(
-                                        &unit_slice,
+                                        &units_for_routing,
                                         &clis,
                                         &run_id_c,
-                                        None,
-                                        &disp,
-                                        Some(relay),
-                                        op_home.as_deref(),
                                         &benched_c,
                                     )
                                 }));
                             match result {
                                 Ok(Ok(dists)) => {
-                                    let new_cli_key = dists
-                                        .into_iter()
-                                        .next()
-                                        .map(|d| d.assigned_cli)
+                                    let new_cli_key = units_for_routing
+                                        .iter()
+                                        .zip(dists)
+                                        .find(|(u, _)| u.ord == ord_c)
+                                        .map(|(_, d)| d.assigned_cli)
                                         .unwrap_or_else(|| prev_cli_c.clone());
                                     let _ = tx.send(Command::ReassignReady {
                                         run_id: run_id_c,
@@ -2990,11 +2950,11 @@ pub(crate) fn run(
                                     // and emits the error event — prevents a permanent wedge.
                                     // `.context` keeps the typed `NoEligibleSeat` reachable by
                                     // `downcast_ref` (anyhow looks through context), so an
-                                    // all-benched `{cli:null}` re-council parks at the gate too.
+                                    // all-benched `{cli:null}` re-route parks at the gate too.
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: run_id_c,
                                         error: e.context(format!(
-                                            "reassign council re-run failed for ord={ord_c}"
+                                            "reassign re-route failed for ord={ord_c}"
                                         )),
                                     });
                                 }
@@ -3005,13 +2965,13 @@ pub(crate) fn run(
                                             let payload = _panic;
                                             let msg = payload
                                                 .downcast_ref::<&str>()
-                                                .map(|s| format!("reassign council thread panicked for ord={ord_c}: {s}"))
+                                                .map(|s| format!("reassign re-route thread panicked for ord={ord_c}: {s}"))
                                                 .or_else(|| {
                                                     payload
                                                         .downcast_ref::<String>()
-                                                        .map(|s| format!("reassign council thread panicked for ord={ord_c}: {s}"))
+                                                        .map(|s| format!("reassign re-route thread panicked for ord={ord_c}: {s}"))
                                                 })
-                                                .unwrap_or_else(|| format!("reassign council thread panicked for ord={ord_c}"));
+                                                .unwrap_or_else(|| format!("reassign re-route thread panicked for ord={ord_c}"));
                                             msg
                                         }),
                                     });
@@ -3438,7 +3398,6 @@ enum Progress {
 
 /// Bundle the engine seams for the campaign driver (DES-CAMPAIGN-001).
 fn campaign_seams<'a>(
-    dispatcher: &'a Arc<dyn Dispatcher + Send + Sync>,
     runner: &'a Arc<dyn StepRunner>,
     self_tx: &'a Sender<Command>,
     registry: &'a crate::workflow::WorkflowRegistry,
@@ -3446,7 +3405,6 @@ fn campaign_seams<'a>(
     lifecycle_maps: &'a Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
 ) -> crate::campaign::Seams<'a> {
     crate::campaign::Seams {
-        dispatcher,
         runner,
         self_tx,
         registry,
@@ -3466,12 +3424,12 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
     });
 }
 
-/// Build an [`crate::distribute::EventRelay`] that posts council lifecycle events
+/// Build an [`crate::decision::EventRelay`] that posts council lifecycle events
 /// (convened / deliberated / voted) back to the actor's single emit point via
 /// `Command::EmitEvent`, so the UI can watch deliberation live. The `Mutex` makes the
 /// captured `Sender` shareable from the relay's `Fn + Sync` closure — the same pattern
 /// as the CliOutputDelta back-channel.
-fn council_event_relay(tx: Sender<Command>) -> crate::distribute::EventRelay {
+fn council_event_relay(tx: Sender<Command>) -> crate::decision::EventRelay {
     let tx = std::sync::Mutex::new(tx);
     std::sync::Arc::new(move |ev| {
         if let Ok(g) = tx.lock() {
@@ -3514,7 +3472,6 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
 pub(crate) fn launch_run_inner(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
-    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
@@ -3570,16 +3527,10 @@ pub(crate) fn launch_run_inner(
         spec.project_graph.clone(),
         spec.project_id.clone(),
         spec.workflow.as_deref(),
-        dispatcher,
         &mut |ev| emit(subscribers, ev),
         Some(registry),
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
-        // The engine's own state home, derived from the same governance store path the ACP
-        // runner fences workers from — so the run's first council ballot is fenced like a worker.
-        in_process_governance()
-            .and_then(|g| crate::state_home::operational_home_of_db(&g.db_path))
-            .as_deref(),
     )?;
     match advance_or_pause(
         store,

@@ -638,7 +638,6 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use wicked_apps_core::GraphStore;
-use wicked_council::types::Dispatcher;
 
 use crate::command::Command;
 use crate::domain::{get_session, put_node, SessionStatus};
@@ -649,7 +648,6 @@ use crate::workflow::StepRunner;
 /// (bundled to keep the driver signatures readable). All shared references — no aliasing with the
 /// `&mut store` / `&mut subscribers` / `&mut in_flight` the driver also carries.
 pub(crate) struct Seams<'a> {
-    pub dispatcher: &'a Arc<dyn Dispatcher + Send + Sync>,
     pub runner: &'a Arc<dyn StepRunner>,
     pub self_tx: &'a Sender<Command>,
     /// The actor-owned workflow registry (built-ins + file overlay + runtime-registered defs).
@@ -801,7 +799,6 @@ fn dispatch(
         crate::actor::launch_run_inner(
             store,
             subscribers,
-            seams.dispatcher,
             seams.runner,
             seams.self_tx,
             in_flight,
@@ -1488,7 +1485,6 @@ pub(crate) fn resume(
                     Some(spec) => crate::actor::launch_run_inner(
                         store,
                         subscribers,
-                        seams.dispatcher,
                         seams.runner,
                         seams.self_tx,
                         in_flight,
@@ -2225,16 +2221,6 @@ mod tests {
                 }
             }
         }
-        struct NoopDispatcher;
-        impl wicked_council::types::Dispatcher for NoopDispatcher {
-            fn dispatch(
-                &self,
-                _c: &AgenticCli,
-                _t: &wicked_council::CouncilTask,
-            ) -> Option<wicked_council::types::Vote> {
-                None
-            }
-        }
 
         fn alive(pid: i32) -> bool {
             unsafe { libc::kill(pid, 0) == 0 }
@@ -2353,12 +2339,9 @@ mod tests {
         let lifecycle_maps = Some(maps.clone());
 
         let (tx, _rx) = channel::<Command>();
-        let dispatcher: Arc<dyn wicked_council::types::Dispatcher + Send + Sync> =
-            Arc::new(NoopDispatcher);
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let registry = crate::workflow::WorkflowRegistry::default();
         let seams = Seams {
-            dispatcher: &dispatcher,
             runner: &runner,
             self_tx: &tx,
             registry: &registry,
@@ -2547,28 +2530,15 @@ mod tests {
                 }
             }
         }
-        struct NoopDispatcher;
-        impl wicked_council::types::Dispatcher for NoopDispatcher {
-            fn dispatch(
-                &self,
-                _c: &AgenticCli,
-                _t: &wicked_council::CouncilTask,
-            ) -> Option<wicked_council::types::Vote> {
-                None
-            }
-        }
 
         let (tx, cmd_rx) = channel::<Command>();
         let (ev_tx, ev_rx) = channel::<CoreEvent>();
         h.cmd_rx = cmd_rx;
         h.ev_rx = ev_rx;
-        let dispatcher: Arc<dyn wicked_council::types::Dispatcher + Send + Sync> =
-            Arc::new(NoopDispatcher);
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let registry = crate::workflow::WorkflowRegistry::default();
         let lifecycle_maps = None;
         let seams = Seams {
-            dispatcher: &dispatcher,
             runner: &runner,
             self_tx: &tx,
             registry: &registry,

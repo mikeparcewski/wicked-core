@@ -127,9 +127,11 @@ export interface UnitDistributedEventJson extends CoreEventJson {
   ord: number
   /** The roster key of the assigned seat. */
   cli: string
-  /** How the seat was chosen: the council verdict, a degrade to the first candidate, an
-   * evaluator ≠ creator reassignment, or a deterministic tool execution. */
-  routingMethod: 'council' | 'degraded' | 'evaluator_distinct' | 'tool'
+  /** How the seat was chosen: \`'teamed'\` — the deterministic pick, no council (core#590 S5,
+   * what every seated unit gets now) — an evaluator ≠ creator reassignment, or a deterministic
+   * tool execution. \`'council'\` and \`'degraded'\` are no longer emitted by a new run; they stay
+   * in the set because a recorded run's replayed frames carry them. */
+  routingMethod: 'council' | 'degraded' | 'evaluator_distinct' | 'tool' | 'teamed'
   agreementPct: number | null
   returned: number | null
   /** Seats convened for the council that produced this assignment (\`null\` = unknown). */
