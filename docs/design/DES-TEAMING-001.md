@@ -1,7 +1,8 @@
 # DES-TEAMING-001 — Real-time teaming: monitors on the live unit, advice into the worker, the gate decides
 
-- **Status:** PROPOSED (rev 2). **S6 is BLOCKED on an operator decision (§6.7).** S2 and S3 are not blocked.
+- **Status:** PROPOSED (rev 3). The operator ruled on the HIGH-dispute question on 2026-09-23 (§6.7), so nothing is blocked.
 - **Rev 2 (2026-09-23):** moved from `.product/` (untracked since #562) to `docs/design/`; §6.7 records the HIGH-dispute escalation as a blocking decision with two exact options; §6.2 extends monitor exclusion to the bus-mediated judge (`GateEvalRequest.excluded_seats`). Both come from review on #604.
+- **Rev 3 (2026-09-23):** operator ruling on Q1, written into §6.3/§6.7. An unresolved HIGH goes to a council. YES continues the run autonomously. NO **or no verdict** pauses for a human (fail-closed). The rev 2 Option A/B block is replaced by the ruling.
 - **Date:** 2026-09-23
 - **Scope:** wicked-core (S2 monitor subscription, S3 monitor→worker injection, S6 gate adjudication — engine half), wicked-crew (S6 read route + api-types), wicked-studio (S6 surfaces)
 - **Related:** #590 (the operator-approved proposal), #599 (S1, merged as `d5d9708`: the `AskUserQuestion` elicitation channel), #595 (seat-instance keys, `claude#2`), S4 (complexity policy, `feat/590-s4-review-scale`), S5 (deterministic `RoutingInfo::Teamed` + the decision-council entry point) — S4 and S5 are built elsewhere; this document names only the interface it consumes from them (§8).
@@ -127,7 +128,7 @@ If the budget expires, the ledger records `finalPass: "timed_out"` with what was
 | `DIFF_CAP` | 48 KB per batch | Prompt bound. Truncation is disclosed in the prompt. |
 | `MONITOR_TURN_BUDGET` | 240 s | A batch turn that runs over is abandoned, and the batch is lost (disclosed). |
 | `FINAL_PASS_BUDGET` | 300 s | The gate never waits unboundedly on advice. |
-| `MAX_DISPUTES` | 3 per attempt | Councils are the spikiest thing the platform does. HIGH-first, and a dispute past the cap is marked `notAdjudicated`. |
+| `MAX_DISPUTES` | 3 per attempt | Councils are the spikiest thing the platform does. A dispute past the cap gets **no verdict** (`reason: "cap"`), which pauses for a human (§6.7). The cap bounds cost; it never lets a dispute through. |
 
 ## 5. S3 — monitor→worker injection
 
@@ -201,25 +202,36 @@ One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existi
    | Inline, pinned validator | `src/cli_runner.rs:932-988` | `[DETERMINISTIC_VALIDATOR_SEAT, work_author]` (`:937`) | `excluded` becomes that array **plus** `ledger_authors`, passed to `distinct_judge_available`, to the distinct-seat pre-check at `:938-960`, and to `agent_validate_with_refusals` (`:988`). |
    | Inline, default judge (F-7R2-005) | `src/cli_runner.rs:1010-1032` | `[work_author]` (`:1020`) | Same: plus `ledger_authors`, for `distinct_judge_available` (`:1021`) and `agent_validate_with_refusals` (`:1029`). |
 
-   `ledger_authors` = every `seat` and every `corroboratedBy` monitor's seat among the ledger's findings (any status), deduplicated. When excluding them leaves no eligible judge, the existing "no eligible judge seat distinct from …" path records `judge_skipped` with the monitors named in the reason (`:960-985`, `:1062-1081`). That is disclosed as UNGATED, not a silent self-grade, and it is exactly the case §6.7 decides about.
+   `ledger_authors` = every `seat` and every `corroboratedBy` monitor's seat among the ledger's findings (any status), deduplicated. When excluding them leaves no eligible judge, the existing "no eligible judge seat distinct from …" path records `judge_skipped` with the monitors named in the reason (`:960-985`, `:1062-1081`). That is disclosed as UNGATED, not a silent self-grade, and it is exactly the case the §6.7 ruling covers.
 2. **The evaluator unit.** When the actor assembles `prior_outputs` for a unit that reviews ord *n* (`src/actor.rs:6650-6671`), it appends the rendered ledger of *n* as `PriorUnitOutput { label: "[team findings — unit n]" }`.
 3. **The rework.** When the gate or evaluator `request_changes`, the amendment persisted by `rewind_to_creator` (`src/actor.rs:6673-6700`) includes the unresolved findings. They reach the creator's next attempt the way every other review note does.
 
 ### 6.3 Disputes: when a one-off council is convened, and what it returns
 
-**Trigger (all four must hold):**
-1. `severity == "high"` (the injection bar),
-2. the finding was delivered (`delivery == "injected"`),
-3. the worker answered `DECLINE` with a non-empty reason, and
-4. at the final pass, the authoring monitor answered `HOLD` (a monitor that withdraws, or does not answer, ends the dispute: the finding goes to the gate as `declined` or `withdrawn`).
+**Unresolved HIGH (operator definition, 2026-09-23).** A finding is **unresolved** when:
+1. `severity == "high"`,
+2. the worker **declined** it (`status == "declined"`; a decline is only possible for a delivered finding, since the worker sees the id only in delivered advice), and
+3. the authoring monitor **held** it at the final pass (`monitorReply.kind == "hold"`).
 
-**What the council is handed.** This is the input to S5's decision-council entry point (§8). One council per dispute, at most `MAX_DISPUTES`:
-- `question`: "Does the finding stand against the settled change?"
-- `positions`: `[{by:"monitor <seat>", position:"finding stands", reason:<HOLD reason>}, {by:"worker <seat>", position:"refusal stands", reason:<DECLINE reason>}]`
+**Assumption, stated because the ruling is fail-closed:** a monitor that gives no HOLD/WITHDRAW for a declined finding at the final pass (turn timeout, crash, final-pass budget expired, malformed reply) counts as **HOLD**. Withdrawal must be explicit. A monitor's silence never clears a finding.
+
+**What the council is handed.** This is the input to S5's decision-council entry point (§8). One council per unresolved HIGH, at most `MAX_DISPUTES` per attempt:
+- `question`: "The worker declined this HIGH finding and the monitor holds it. Should the run continue autonomously with the worker's refusal standing? YES = continue. NO = a human must decide."
+- `positions`: `[{by:"worker <seat>", position:"YES — the refusal stands", reason:<DECLINE reason>}, {by:"monitor <seat>", position:"NO — the finding stands", reason:<HOLD reason, or "no reply (counted as hold)">}]`
 - `evidence`: the finding (severity, claim, suggestion), `path:finalLine` with the evidence line, the `T_final` hunk around it (±20 lines from `git diff-tree -p -U20 <baseline> <T_final> -- <path>`, capped at 16 KB), the unit's criterion, and the tree id `T_final`.
 - `excluded seats`: the creator instance and every monitor in `corroboratedBy ∪ {author}`. Parties do not vote.
 
-**What comes back and where it goes.** The verdict `{verdict: "finding_stands" | "refusal_stands" | "no_consensus", agreementPct, dissent, seats}` is written into the finding's `dispute` object in the ledger. It then reaches the gate through §6.2 like every other ledger fact. **The council verdict is evidence, not a decision.** Nothing in the fold reads `dispute.verdict`. The judge, the evaluator and the human read it. A council that cannot convene (no eligible seats, budget) records `verdict: "not_convened"` with the reason. It never blocks and never defaults either way.
+**What comes back.** Each dispute is recorded in the finding's `dispute` object:
+- `verdict: "yes"` — the council produced a YES;
+- `verdict: "no"` — the council produced a NO;
+- `verdict: "no_verdict"` — anything else, with `reason ∈ {"no_quorum", "seats_benched", "error", "timeout", "cap"}`:
+  - `no_quorum`: S5 reports no verdict;
+  - `seats_benched`: no eligible non-party seats;
+  - `error`: the council call failed;
+  - `timeout`: the council or the final-pass budget expired before a verdict;
+  - `cap`: the dispute was beyond `MAX_DISPUTES`.
+
+`agreementPct`, `dissent` and `seats` are recorded for `yes`/`no` and are `null` for `no_verdict`. The verdict is **recorded as evidence at the gate**: it is in the ledger, in the judge's WORK, in the evaluator's prior context and in the human gate prompt. It controls exactly one thing, whether the run continues autonomously or pauses for a human (§6.7). It never approves or denies the unit: `combine_verdict` does not read it.
 
 ### 6.4 crew (read side only)
 
@@ -236,36 +248,27 @@ One renderer, `team::render_for_gate(&TeamLedger) -> String`, feeds three existi
 
 ### 6.6 What S6 deliberately does not do
 
-It adds no auto-deny on an open finding and never reads the council verdict as a decision. Each would make a monitor or a council the decider (#590 risk 4). Whether an unresolved HIGH forces a **human pause** (not a deny) is the blocking decision in §6.7.
+- No auto-deny on any finding.
+- No fold input from monitors: `combine_verdict` and `combined` are computed exactly as today.
+- The council verdict can only choose between **continue autonomously** and **pause for a human** (§6.7). It can never approve a unit the gate denied, and never deny one. A human pause is not a denial: the human decides.
 
-### 6.7 BLOCKING S6: does an unresolved HIGH dispute force a human pause? (operator decision pending)
+### 6.7 Unresolved HIGH → council → continue or pause (operator ruling, 2026-09-23)
 
-**The hole (review on #604, HIGH).** `combine_verdict` approves when the deterministic floor passes and no agent verdict rejects (`src/validator.rs:2263-2270`); `agent == None` counts as no rejection. When no judge runs (`judge_skipped`, `src/cli_runner.rs:960-985`, `:1062-1081`; also when excluding the monitors leaves no eligible seat, §6.2), a unit can auto-approve while its ledger holds a HIGH the worker declined, the monitor held, and a council either upheld or never adjudicated. Run `aee254f1` had `agentVerdict: "skipped"`. S6's builder must not pick an option. The operator's answer drops into one of the two blocks below unchanged.
+**The hole this closes (review on #604, HIGH).** `combine_verdict` approves when the deterministic floor passes and no agent verdict rejects (`src/validator.rs:2263-2270`); `agent == None` counts as no rejection. When no judge runs (`judge_skipped`, `src/cli_runner.rs:960-985`, `:1062-1081`; also when excluding the monitors leaves no eligible seat, §6.2), a unit could auto-approve with an unresolved HIGH in its ledger. Run `aee254f1` had `agentVerdict: "skipped"`.
 
-**Shared definition.** A finding is a **qualifying HIGH dispute** when all of the following hold in the attempt's `TeamLedger`:
-- `severity == "high"`,
-- `delivery == "injected"`,
-- `status == "declined"` (the worker declined it with a reason),
-- `monitorReply.kind == "hold"`, and
-- `dispute.verdict ∈ {"finding_stands", "not_adjudicated", "not_convened", "no_consensus"}`. That is every verdict except `"refusal_stands"`. `no_consensus` and `not_convened` count as not adjudicated.
+**Ruling.** Every unresolved HIGH (§6.3) goes to a council. Council **YES** → the run continues autonomously. Council **NO** → human pause. **Fail-closed:** if the council cannot produce a verdict (no quorum, benched seats, error, timeout, over the cap), that is treated as NO and the run pauses for a human. **It never auto-continues without a YES.** The verdict is recorded at the gate as evidence.
 
-**Option A: no escalation (rev 1 as written).**
-- The fold never reads the ledger. The ledger is evidence to the judge (when one runs), to the evaluator unit and to the human at any gate the run already has.
-- Consequence, stated plainly: with the judge skipped and the floor passing, a qualifying HIGH dispute **can** auto-approve. The protection is only that `gateEvaluated.ungatedReason` and the ledger disclose it.
-- Code: nothing beyond §6.1–§6.5.
-- Acceptance: #16 (Option A form).
-
-**Option B: a qualifying HIGH dispute forces a conditional human pause.**
-- **Where:** in the actor's fold, **after** `apply_and_finish_unit` computes `outcome.approved` (`src/pipeline.rs:1540-1576`) and **before** the unit is advanced. The decision logic (`combine_verdict`) is unchanged.
-- **Condition:** `outcome.approved == true` **and** the ledger holds ≥1 qualifying HIGH dispute. If the fold denied, nothing changes: the pause never turns a deny into anything.
-- **Action:** `pause_for_human(…, gate_kind: "team_dispute", prompt)` (`src/actor.rs:6070-6110`). This pause fires on **every** run, including runs launched with no human confirmation. The prompt lists each qualifying finding (`findingId`, `path:finalLine`, claim, worker reason, monitor reason, council verdict with agreement and dissent). `GateDecided`/`UnitDone` are **not** emitted until a human answers `POST /runs/:id/gate`: approve advances the unit, reject cancels the run, and approve+amend reruns the creator with the amendment (the existing arms, `routes.ts:2942`). `awaitingHuman.gateKind` gains the token `"team_dispute"`. The api-types `gateKind` stays an open string, and the studio `SteeringGate` renders the ledger for that ord (§6.5).
-- **What this does and does not make authoritative:** monitors and the council still cannot deny or approve. They can only require that a human looks. The human remains the decider.
-- **Acceptance (B-1, the proof it cannot auto-approve with the judge skipped):** Build a teamed unit whose floor passes, whose judge is skipped (`judge_skipped = Some(..)`, `agent_verdict = None`), whose evaluator pass is true, and whose ledger holds one qualifying HIGH dispute. For each `dispute.verdict` in `{finding_stands, not_adjudicated, not_convened, no_consensus}`, the fold must emit `awaitingHuman{gateKind:"team_dispute"}` for that ord, the session status must be `awaiting_human`, and **no** `unitDone` or `gateDecided{allow:true}` may be emitted for that ord.
-- **Acceptance (B-2):** the same unit with `dispute.verdict == "refusal_stands"`, or with the finding `accepted`/`withdrawn`/`superseded`, or with `monitorReply.kind == "withdraw"`, emits `unitDone` with no pause.
-- **Acceptance (B-3):** the same unit with the floor failing emits `unitDenied` and no `team_dispute` pause.
-- **Acceptance (B-4):** approving the `team_dispute` gate through `POST /runs/:id/gate` emits `resumed` then `unitDone` for that ord.
-
-**Out of both options (named so it is not assumed):** a HIGH that was never delivered (non-steering carrier) or left `unanswered` is not a dispute. It reaches the gate as evidence only, under either option.
+**Mechanism.**
+- **Where:** in `apply_and_finish_unit` (`src/pipeline.rs:827`), after `outcome` is computed and after `teamLedger` + `GateEvaluated` are emitted, and **before** `GateDecided`/`UnitDone` are emitted (`src/pipeline.rs:1540-1576`).
+- **Condition:** `outcome.approved == true` **and** the ledger holds ≥1 unresolved HIGH whose `dispute.verdict != "yes"`.
+  - If the fold denied, the unit is denied as today (`unitDenied`) and there is no pause. The rework amendment carries the findings (§6.2).
+  - If every unresolved HIGH has `dispute.verdict == "yes"`, the unit continues as today. This holds even when the judge was skipped: under the ruling, a council YES is the only way an unresolved HIGH continues autonomously.
+- **Action:** withhold `GateDecided`/`UnitDone`, and have the actor call `pause_for_human(…, gate_kind: "team_dispute", prompt)` (`src/actor.rs:6070-6110`).
+  - The pause fires on **every** run, including runs launched with no human confirmation.
+  - The prompt lists each unresolved HIGH: `findingId`, `path:finalLine`, claim, the worker's reason, the monitor's reason, and the council verdict (agreement and dissent, or the no-verdict reason).
+  - The human answers through the existing `POST /runs/:id/gate` (`routes.ts:2942`): approve → `resumed` then `gateDecided{allow:true}` + `unitDone`; reject → cancel; approve+amend → the creator reruns with the amendment.
+  - `awaitingHuman.gateKind` gains the token `"team_dispute"`. The api-types `gateKind` stays an open string, and studio's `SteeringGate` renders the ledger for that ord (§6.5).
+- **Scope of the ruling (named so it is not assumed):** a HIGH that was **not** declined-and-held is not unresolved and is not sent to a council. That covers a HIGH never delivered (non-steering carrier) and a HIGH the worker left `unanswered`. Such a HIGH reaches the gate as evidence only. Whether those should also pause when the judge is skipped is Q4 (§13).
 
 ## 7. Wire contract — new CoreEvent variants
 
@@ -326,9 +329,11 @@ Every variant is mapped by hand in `CoreEvent::to_json` (`src/event.rs:1269-1275
               "status":"declined",            // "accepted" | "declined" | "withdrawn" | "unanswered" | "superseded"
               "workerReason":"…",             // null unless answered
               "monitorReply":{"kind":"hold","reason":"…"},   // null | {"kind":"hold"|"withdraw","reason"}
-              "dispute":{"verdict":"finding_stands",         // null when no dispute
-                         // "finding_stands" | "refusal_stands" | "no_consensus" | "not_convened" | "not_adjudicated"
-                         "agreementPct":67,"dissent":1,"seats":["codex","pi"],"reason":null}}],
+              "dispute":{"verdict":"no",                     // null when the finding is not an unresolved HIGH
+                         // "yes" (continue) | "no" (pause) | "no_verdict" (pause, fail-closed)
+                         "reason":null,                      // no_verdict only: "no_quorum" | "seats_benched" | "error" | "timeout" | "cap"
+                         "agreementPct":67,"dissent":1,"seats":["codex","pi"]}}],   // null ×3 for no_verdict
+ "teamPause":true,               // the fold withheld unitDone and paused with gateKind "team_dispute"
  "rejected":{"malformed":0,"belowBar":2,"unconfirmed":1,"duplicate":0}}
 ```
 
@@ -354,7 +359,7 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 | `monitor_ensure` / `monitor_turn` | core | `src/acp_runner.rs`, beside `chat_turn` (`:6187`) |
 | `StepRunner::team_finish` (default `None`) | core | `src/workflow.rs:365` trait |
 | Final pass call, ledger render into WORK, monitor seats excluded from the judge (all three paths) | core | `src/cli_runner.rs:761`, `:885-895`; bus `:97-112`, `:351-394`, `:911-925`; inline `:937`, `:988`, `:1020`, `:1029` |
-| (Option B only) `team_dispute` pause after an approving fold | core | `src/actor.rs` fold, `pause_for_human` `:6070` |
+| `team_dispute` pause after an approving fold with an unresolved HIGH lacking a council YES | core | `src/pipeline.rs:827`, `:1540-1576`; `pause_for_human` `src/actor.rs:6070` |
 | `UnitEvidence.team`, `WorkUnit.team_ledger`, `teamLedger` emission | core | `src/workflow.rs:265`, `src/domain.rs`, `src/pipeline.rs:1540` |
 | Ledger into evaluator prior context and rework amendment | core | `src/actor.rs:6650-6700` |
 | Seven `to_json` arms + core-ts `.d.ts` regen | core | `src/event.rs`, `crates/wicked-core-ts` |
@@ -380,7 +385,7 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 | **1. Stream volume** (380 `unitOutputDelta`/run) | Monitors never see deltas. A batch needs a tree-changing checkpoint **and** 60 s **and** an idle monitor **and** budget, **and** a changed tree id. Hard caps: `MAX_BATCHES`, `DIFF_CAP`. Incremental diffs go to a warm session. Zero monitors (and zero checkpoints) until S4's policy asks for one. | §4.2, §4.3, §4.8 |
 | **2. Monitor noise** | The bar drops `low`. Only `high` interrupts the worker. Dedup is on line text across monitors. Answered ids are never re-raised. The `rejected` counters are shown at the gate, so a monitor's noise rate is visible evidence. | §4.6, §5.2, §7 |
 | **3. Premature findings** | Monitors see settled diffs, not narration. Every finding must quote the exact line at `path:line` in the snapshot tree (mechanical, no model). It is re-confirmed before injection and again at `T_final`. A finding whose text disappeared becomes `superseded`. | §4.2, §4.6, §5.2, §4.7 |
-| **4. Monitors becoming authoritative** | No fold branch reads a finding or a council verdict. Monitors are excluded from judging. The worker may decline. Disputes go to a council of non-parties whose verdict is evidence. The judge, evaluator and human decide. | §5.3, §6.2, §6.3, §6.6 |
+| **4. Monitors becoming authoritative** | `combine_verdict` never reads a finding or a verdict. Monitors are excluded from judging on every path. The worker may decline. A disputed HIGH goes to a council of non-parties, whose only power is to let the run continue (YES) or send it to a human (NO or no verdict). The human, not the monitor, decides the paused case. | §5.3, §6.2, §6.3, §6.6, §6.7 |
 | Advice arriving after the turn → a detached turn | `idleBehavior: "promptRequired"` on every steer. `turn_ended` is disclosed and the advice goes to the gate. | §5.2 |
 | Advice for one attempt reaching another | The mailbox is keyed `(run, ord, attempt)`. | §5.2 |
 | A monitor writing the worktree | Admitted seats only. The chat boundary makes the worktree read-only. The worktree guard's final look is unchanged. | §4.1 |
@@ -412,8 +417,15 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
     (c) **bus path:** the published `GateEvalRequest` JSON carries `"excluded_seats":["claude#2","claude#3"]`; a response with `judge_cli: "claude#2"` or `judge_cli: null` folds as a DENY with the fail-closed reason; a response with a distinct `judge_cli` is honoured;
     (d) with an empty ledger, the bus request carries `"excluded_seats":[]` and a `judge_cli: null` response is honoured exactly as today;
     (e) excluding the monitors leaves no eligible seat → `judge_skipped` names the monitors. The judge prompt on (a)–(c) contains the rendered ledger inside the WORK fence.
-15. **Dispute trigger:** HIGH + injected + `DECLINE` with a reason + monitor `HOLD` convenes exactly one council, whose input carries the finding, both reasons, the `T_final` hunk at `path:finalLine`, and excludes the creator and author seats. Any one condition removed convenes none.
-16. A council verdict never changes `combined` (`combine_verdict` inputs are identical with and without it). **Option A form:** the same unit with and without the verdict folds to the same `GateDecided.allow`. **Option B form:** replaced by §6.7 B-1…B-4. Which form ships is the §6.7 decision.
+15. **Council trigger:** a HIGH that the worker declined with a reason and the monitor held convenes exactly one council. Its input carries the finding, both reasons, the `T_final` hunk at `path:finalLine` and the criterion, and it excludes the creator and the authoring/corroborating monitors. Any one of HIGH / declined / held removed convenes none. A monitor with no final-pass reply for a declined HIGH counts as held and convenes one.
+16. **Continue or pause (§6.7).** Fixture: a teamed unit whose floor passes, whose evaluator passes and whose ledger holds one unresolved HIGH. The council result is injected through a stub of S5's entry point.
+    (a) **Council YES → no pause:** `unitDone` and `gateDecided{allow:true}` are emitted, there is no `awaitingHuman`, and the ledger records `dispute.verdict:"yes"`.
+    (b) **Council NO → human pause:** `awaitingHuman{gateKind:"team_dispute"}` for that ord; the session is `awaiting_human`; there is no `unitDone` and no `gateDecided{allow:true}` for that ord.
+    (c) **No verdict → human pause:** for each of `no_quorum`, `seats_benched`, `error`, `timeout` and `cap`, the outcome is the same as (b), with `dispute.verdict:"no_verdict"` and the matching `reason`.
+    (d) **A skipped judge can never auto-approve an unresolved HIGH:** repeat (b) and (c) with `judge_skipped = Some(..)` and `agent_verdict = None`, and the outcome is identical: a pause, never `unitDone`. Only (a) continues, and it continues because of the council's YES, not the absent judge.
+    (e) The same fixture with the floor failing emits `unitDenied` and no `team_dispute` pause.
+    (f) `combine_verdict` receives identical inputs in (a)–(c).
+    (g) Approving the `team_dispute` gate through `POST /runs/:id/gate` emits `resumed`, then `gateDecided{allow:true}` and `unitDone`, for that ord.
 17. `GET /api/v1/runs/:id/team` returns the ledgers for a teamed run and `units: []` for a run without monitors. The api-types fixture round-trips the Rust `to_json` output for all seven events.
 18. Studio: the gate panel shows each finding's severity, `path:line`, the worker's disposition and reason, and the council verdict. Approve/reject still go through `POST /runs/:id/gate`.
 
@@ -421,7 +433,8 @@ The S2/S3 seam is the mailbox type and the `TeamTurn` parameter, both fixed by t
 
 ## 13. Open questions
 
-- **Q1. BLOCKING S6: does a qualifying HIGH dispute force a human pause?** Moved to §6.7, with Option A and Option B written out and their acceptance tests. S6 does not start its fold work until the operator picks one.
+- **Q1. Resolved (operator, 2026-09-23):** an unresolved HIGH goes to a council. YES continues; NO or no verdict pauses for a human (§6.7).
 - **Q2. Monitor independence.** Only claude is ACP-admitted (§2), so every monitor today is `claude#N` reviewing a claude creator. Same model, correlated blind spots. Each instance also needs its own signed-in config home, and #591's per-instance login is out of scope there. Admitting a second adapter to input governance (the codex-acp research is `registry.rs:252-300`) is what makes monitors model-diverse. Until then, independence is instance-level only.
 - **Q3. Pre-emptive steering.** The adapter delivers a steer at priority `now`, which **aborts** the current generation (adapter `acp-agent.js:1196-1206`). The client cannot ask for `later`. Every injected HIGH therefore costs an interrupted cycle and a context jolt mid-task. Whether that helps or hurts work quality is an empirical question for the rig. If it hurts, the remedy is to batch HIGH advice to fewer, later checkpoints, not a second mechanism.
 - Smaller: `unitCheckpoint` also serves studio (live tool activity) and could be emitted for every ACP unit, but volume argues against it. The per-attempt ledger is lost on a daemon restart mid-unit: findings emitted before the crash survive in the event log only.
+- **Q4. HIGH findings outside the ruling.** A HIGH that was never delivered (non-steering carrier) or that the worker left `unanswered` is not "declined and held", so it is not sent to a council and cannot pause the run. With the judge skipped, such a unit can still auto-approve. Should the ruling extend to these, e.g. by treating `unanswered` as declined?
