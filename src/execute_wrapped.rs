@@ -975,8 +975,7 @@ pub(crate) fn ensure_secondary_instance_fence(seat_key: &str) -> anyhow::Result<
     if inherits_operator_config() {
         return Ok(());
     }
-    let config =
-        wicked_apps_core::spawn::seat_config_for_carrier_seat("claude", seat_key)?;
+    let config = wicked_apps_core::spawn::seat_config_for_carrier_seat("claude", seat_key)?;
     config.ensure_dirs()?;
     let dir = config
         .claude_dir()
@@ -1390,27 +1389,28 @@ impl WrappedCliStepRunner {
         // variable, every foreign seat variable STRIPPED, the inherit hatch keeps the operator's
         // own. Fail CLOSED on a resolver error — the launch is refused, never run under the
         // daemon's configuration.
-        let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier_seat(&binary, &cli_key)
-            .and_then(|c| c.ensure_dirs().map(|()| c))
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return StepOutput {
-                    run_id: input.run_id.clone(),
-                    unit_ix: input.unit_ix,
-                    attempt: input.attempt,
-                    output: format!(
+        let seat_config =
+            match wicked_apps_core::spawn::seat_config_for_carrier_seat(&binary, &cli_key)
+                .and_then(|c| c.ensure_dirs().map(|()| c))
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return StepOutput {
+                        run_id: input.run_id.clone(),
+                        unit_ix: input.unit_ix,
+                        attempt: input.attempt,
+                        output: format!(
                         "(worker config dir refused the launch of `{cli_key}`: {e}; refusing to \
                          run the worker under the daemon's own CLI configuration)"
                     ),
-                    status: StepStatus::Failed,
-                    usage: None,
-                    files: Vec::new(),
-                    tools: Vec::new(),
-                    governed: false,
-                };
-            }
-        };
+                        status: StepStatus::Failed,
+                        usage: None,
+                        files: Vec::new(),
+                        tools: Vec::new(),
+                        governed: false,
+                    };
+                }
+            };
         // F-079 (core#441), the codex lever: populate the seat's ENGINE-MINTED `CODEX_HOME/skills`
         // from the pinned snapshot BEFORE the handoff is reported or the command is built — a
         // population failure refuses the launch naming the seat; a relaunch on an unchanged
@@ -5587,10 +5587,8 @@ mod tests {
             return;
         }
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "wicked-claude2-cfg-home-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wicked-claude2-cfg-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bin = dir.join("bin");
         let worker_home = dir.join("worker");

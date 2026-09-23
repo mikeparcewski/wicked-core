@@ -569,15 +569,13 @@ pub(crate) fn distribute_units_against_benched(
         // secondary instance before the ballot runs — fail closed on error, as above.
         for cli in clis.iter().filter(|c| is_claude_ballot(c)) {
             if wicked_apps_core::spawn::seat_cli_key(&cli.key) != cli.key.as_str() {
-                crate::execute_wrapped::ensure_secondary_instance_fence(&cli.key).map_err(
-                    |e| {
-                        anyhow::anyhow!(
-                            "council for {session_id}: the instance fence for `{}` could not be \
+                crate::execute_wrapped::ensure_secondary_instance_fence(&cli.key).map_err(|e| {
+                    anyhow::anyhow!(
+                        "council for {session_id}: the instance fence for `{}` could not be \
                              written ({e}); refusing to convene without its deny fence",
-                            cli.key
-                        )
-                    },
-                )?;
+                        cli.key
+                    )
+                })?;
             }
         }
         fenced = fenced_roster(clis, operational_home).map_err(|e| {
@@ -1718,8 +1716,9 @@ mod tests {
         let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
         let seen: Arc<std::sync::Mutex<Vec<AgenticCli>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let dispatcher: Arc<dyn Dispatcher + Send + Sync> =
-            Arc::new(RecordingDispatcher { seen: Arc::clone(&seen) });
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(RecordingDispatcher {
+            seen: Arc::clone(&seen),
+        });
 
         distribute_units_on(
             std::slice::from_ref(&unit),
