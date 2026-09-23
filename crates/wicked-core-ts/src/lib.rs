@@ -3118,7 +3118,14 @@ mod tests {
             },
             "adviceDelivered",
             &[
-                "type", "session", "ord", "attempt", "findingIds", "carrier", "outcome", "detail",
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "findingIds",
+                "carrier",
+                "outcome",
+                "detail",
             ],
         );
         check(
