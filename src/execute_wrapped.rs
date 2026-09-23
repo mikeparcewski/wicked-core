@@ -983,6 +983,9 @@ pub(crate) fn ensure_secondary_instance_fence(seat_key: &str) -> anyhow::Result<
     let shared = shared_deny_rules(None).map_err(anyhow::Error::msg)?;
     let settings = serde_json::json!({ "permissions": { "deny": shared } });
     let bytes = serde_json::to_vec(&settings).map_err(anyhow::Error::msg)?;
+    // The same re-sanitize the primary home gets: a stale or planted `settings.local.json` would
+    // merge over the deny fence written below, and `hooks/` / `plugins/` run code.
+    crate::acp_runner::sanitize_claude_home(dir)?;
     let settings_path = dir.join("settings.json");
     // The SAME primitive the primary fence uses (core#595 review): a `<name>.<pid>.<seq>.tmp`
     // temp name, so concurrent councils in one process never share a temp path (a pid-only
@@ -4078,6 +4081,57 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 
 #[cfg(test)]
 mod tests {
+    /// core#595 review (codex HIGH): a secondary home gets the SAME re-sanitize as the primary.
+    /// A stale or planted `claude-2/settings.local.json` merges over the fence's `settings.json`,
+    /// and `hooks/` runs code, so both must be gone after the fence is ensured. Fixed facts: the
+    /// planted entries were created by this test; nothing is derived from the code under test.
+    #[test]
+    fn secondary_fence_sanitizes_the_instance_home_like_the_primary() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let hatch = INHERIT_OPERATOR_CONFIG_ENV;
+        let prev_hatch = std::env::var_os(hatch);
+        std::env::remove_var(hatch);
+        let prev_home = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        let base = std::env::temp_dir().join(format!("wfence-sanitize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+
+        let home = base.join("claude-2");
+        std::fs::create_dir_all(home.join("hooks")).unwrap();
+        std::fs::write(home.join("hooks").join("pre.sh"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            home.join("settings.local.json"),
+            br#"{"permissions":{"allow":["Read(**)"]}}"#,
+        )
+        .unwrap();
+        let result = ensure_secondary_instance_fence("claude#2").map_err(|e| e.to_string());
+        let local_left = home.join("settings.local.json").exists();
+        let hooks_left = home.join("hooks").exists();
+        let fence_written = home.join("settings.json").is_file();
+
+        let _ = std::fs::remove_dir_all(&base);
+        match prev_home {
+            Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
+            None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
+        }
+        if let Some(v) = prev_hatch {
+            std::env::set_var(hatch, v);
+        }
+
+        assert!(result.is_ok(), "fence refused: {result:?}");
+        assert!(fence_written, "the fence settings.json is written");
+        assert!(
+            !local_left,
+            "a planted settings.local.json would override the deny fence"
+        );
+        assert!(
+            !hooks_left,
+            "a planted hooks/ dir would run code in the secondary instance"
+        );
+    }
+
     /// core#595 review: the secondary-instance fence must survive CONCURRENT writers and be as
     /// private as the primary. Many threads released by one barrier all write `claude#2`'s fence.
     /// Expected outcomes are fixed facts (every call Ok; mode 0600 like the primary's
