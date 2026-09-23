@@ -1749,9 +1749,14 @@ mod tests {
             .collect();
         // Directory fences: derive the expected path from HOME directly, never from
         // shared_deny_rules — the point is to catch a missing rule in that function.
+        // Fence rules spell every path with forward slashes on every OS (the documented Windows
+        // form is `C:/Users/me/.ssh/**`, execute_wrapped.rs tests). A raw USERPROFILE is
+        // `C:\Users\...`, so normalise the separator HERE with a plain replace — never through
+        // `rule_path`, which is the code under test and would make this assertion vacuous again.
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .replace('\\', "/");
         for must_contain in [
             // Credential and key protection: these are the rules that stop reads of SSH keys,
             // AWS credentials and git credential files by a worker running in the secondary home.
