@@ -226,3 +226,58 @@ fn most_review_is_the_ceiling() {
     };
     assert_eq!(review_plan(&everything).monitors, THRESHOLDS.max_monitors);
 }
+
+// Review on #600: only the `b/` side was classified, so moving code out of a critical subsystem
+// into a docs path read as docs-only and summoned nothing (fail-open).
+#[test]
+fn code_to_docs_rename_is_behavioural_and_critical() {
+    let d = "\
+diff --git a/src/memory.rs b/docs/memory.md
+similarity index 100%
+rename from src/memory.rs
+rename to docs/memory.md
+";
+    let s = signals_from_diff(d);
+    assert_eq!((s.docs_files, s.code_files), (0, 1), "{s:?}");
+    assert!(s.critical, "the a/ side is a critical subsystem: {s:?}");
+    assert_eq!(
+        review_plan(&s),
+        ReviewPlan {
+            monitors: 2,
+            depth: Depth::Standard,
+            post_hoc_reviewer: true
+        }
+    );
+}
+
+#[test]
+fn deleted_critical_file_is_destructive_and_critical() {
+    let d = "\
+diff --git a/src/memory.rs b/src/memory.rs
+deleted file mode 100644
+--- a/src/memory.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-fn recall() {}
+-fn store() {}
+";
+    let s = signals_from_diff(d);
+    assert!(s.destructive && s.critical, "{s:?}");
+    assert_eq!(
+        review_plan(&s),
+        ReviewPlan {
+            monitors: 3,
+            depth: Depth::Deep,
+            post_hoc_reviewer: true
+        }
+    );
+}
+
+// Same fail-open class: a hunk with no `diff --git` header was counted as lines but no file, so
+// it read as docs-only. An unattributed hunk counts as code.
+#[test]
+fn headerless_hunk_is_not_docs_only() {
+    let s = signals_from_diff("@@ -1 +1 @@\n-a\n+b\n");
+    assert_eq!(s.code_files, 1, "{s:?}");
+    assert_eq!(review_plan(&s).monitors, 1);
+}

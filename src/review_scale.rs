@@ -176,39 +176,59 @@ enum Kind {
 }
 
 /// Derive [`ChangeSignals`] from a unified diff (`git diff` output).
+///
+/// Fails closed: a file is behavioural if EITHER side of its header is (a rename from
+/// `src/memory.rs` to `docs/memory.md` moves code out of a critical subsystem), and a hunk with no
+/// file header counts as code.
 pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
     let t = &THRESHOLDS;
     let mut s = ChangeSignals::default();
     let mut subsystems = BTreeSet::new();
-    let mut kind = Kind::Code;
+    let mut kind = None;
     let mut in_hunk = false;
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            let path = rest.rsplit(" b/").next().unwrap_or(rest);
-            kind = classify(path);
-            in_hunk = false;
-            match kind {
+        let header = line.strip_prefix("diff --git ");
+        if header.is_some() || (kind.is_none() && line.starts_with("@@")) {
+            let rest = header.unwrap_or("a/ b/");
+            let (a, b) = rest.split_once(" b/").unwrap_or((rest, rest));
+            let sides = [a.strip_prefix("a/").unwrap_or(a), b];
+            let code: Vec<&str> = sides
+                .into_iter()
+                .filter(|p| !p.is_empty() && classify(p) != Kind::Docs)
+                .collect();
+            let k = match code.last() {
+                Some(p) => classify(p),
+                None if header.is_none() => Kind::Code,
+                None => Kind::Docs,
+            };
+            match k {
                 Kind::Docs => s.docs_files += 1,
                 Kind::Test => s.test_files += 1,
                 Kind::Config => s.config_files += 1,
                 Kind::Code => s.code_files += 1,
             }
-            if kind != Kind::Docs {
-                subsystems.insert(subsystem(path));
-                s.critical |= has_token(path, t.critical_path_markers);
-                s.destructive |= has_token(path, t.destructive_path_markers);
+            subsystems.extend(code.iter().map(|p| subsystem(p)));
+            if k != Kind::Docs {
+                for p in sides {
+                    s.critical |= has_token(p, t.critical_path_markers);
+                    s.destructive |= has_token(p, t.destructive_path_markers);
+                }
             }
-        } else if line.starts_with("@@") {
+            kind = Some(k);
+            in_hunk = false;
+        }
+        let behavioural = kind.is_some_and(|k| k != Kind::Docs);
+        if line.starts_with("@@") {
             in_hunk = true;
         } else if !in_hunk {
-            s.destructive |= kind != Kind::Docs && line.starts_with("deleted file mode");
+            s.destructive |= behavioural && line.starts_with("deleted file mode");
         } else if let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix('-')) {
             if line.starts_with('+') {
                 s.lines_added += 1;
             } else {
                 s.lines_removed += 1;
             }
-            if kind != Kind::Docs {
+            if behavioural {
                 let text = text.to_ascii_lowercase();
                 s.destructive |= t.destructive_line_markers.iter().any(|m| text.contains(m));
             }
