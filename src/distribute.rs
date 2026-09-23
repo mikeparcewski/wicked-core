@@ -564,6 +564,22 @@ pub(crate) fn distribute_units_against_benched(
                  without its deny fence"
             )
         })?;
+        // core#595: secondary claude ballots (`claude#2`) run under `<base>/claude-2`, which
+        // `ensure_shared_worker_fence` does not cover. Write a matching fence for every
+        // secondary instance before the ballot runs — fail closed on error, as above.
+        for cli in clis.iter().filter(|c| is_claude_ballot(c)) {
+            if wicked_apps_core::spawn::seat_cli_key(&cli.key) != cli.key.as_str() {
+                crate::execute_wrapped::ensure_secondary_instance_fence(&cli.key).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "council for {session_id}: the instance fence for `{}` could not be \
+                             written ({e}); refusing to convene without its deny fence",
+                            cli.key
+                        )
+                    },
+                )?;
+            }
+        }
         fenced = fenced_roster(clis, operational_home).map_err(|e| {
             anyhow::anyhow!(
                 "council for {session_id}: the ballot's state-home fence could not be built ({e}); \
@@ -1667,6 +1683,75 @@ mod tests {
                 && expected.contains(&format!("Edit({opr}/**)")),
             "{expected:?}"
         );
+        match prev_hatch {
+            Some(v) => std::env::set_var(hatch, v),
+            None => std::env::remove_var(hatch),
+        }
+        std::env::set_var(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            wicked_apps_core::spawn::hermetic_test_worker_home(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#595 HIGH-3: convening a council that seats a SECONDARY claude ballot (`claude#2`)
+    /// must write the deny fence to the INSTANCE home (`<worker>/claude-2/settings.json`).
+    /// `ensure_shared_worker_fence` writes only `<worker>/claude`; before this fix nothing
+    /// wrote to `claude-2`, so the ballot started unfenced.
+    ///
+    /// FAILS on base (c163cf9): `<worker>/claude-2/settings.json` does not exist.
+    #[test]
+    fn convening_a_secondary_claude_ballot_writes_fence_to_the_instance_home() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let hatch = crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV;
+        let prev_hatch = std::env::var_os(hatch);
+        std::env::remove_var(hatch);
+        let base = std::env::temp_dir().join(format!(
+            "wdistribute-secondary-fence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+
+        let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
+        let seen: Arc<std::sync::Mutex<Vec<AgenticCli>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> =
+            Arc::new(RecordingDispatcher { seen: Arc::clone(&seen) });
+
+        distribute_units_on(
+            std::slice::from_ref(&unit),
+            &[claude_seat("claude#2")],
+            "s2",
+            None,
+            &dispatcher,
+            None,
+            None,
+        )
+        .expect("distribute a roster with a secondary claude ballot");
+
+        assert!(
+            base.join("claude-2").join("settings.json").exists(),
+            "the fence must be written at the secondary instance home \
+             (<worker>/claude-2/settings.json); it is missing — the ballot ran without a deny fence"
+        );
+        // The content must match the shared deny rules (same generator, same file).
+        let bytes = std::fs::read(base.join("claude-2").join("settings.json")).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let deny: Vec<String> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            deny,
+            crate::execute_wrapped::shared_deny_rules(None).unwrap(),
+            "the secondary fence must carry the same shared deny rules as the primary"
+        );
+
         match prev_hatch {
             Some(v) => std::env::set_var(hatch, v),
             None => std::env::remove_var(hatch),

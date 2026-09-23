@@ -956,6 +956,45 @@ pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
     Ok(rules)
 }
 
+/// Write the shared deny fence to a SECONDARY claude instance's configuration home (core#595).
+///
+/// `ensure_shared_worker_fence` (in `acp_runner`) writes only `<base>/claude` — the primary
+/// instance. A secondary ballot (`claude#2`) runs under `<base>/claude-2` (dispatched by
+/// `wicked_council::dispatch::run_in_isolation` via `seat_config_for_carrier_seat`), so it starts
+/// without a `settings.json` deny fence unless this function writes one. The content is identical
+/// — `shared_deny_rules(None)` — for the same reason the shared file omits operational-home and
+/// state-home rules: those ride each session's own settings, not a file two launches share.
+///
+/// No-op when `seat_key` names the CLI's primary instance (no `#` suffix) or when the operator's
+/// inherit hatch is set (the ballot then runs on the operator's own configuration). `Err` refuses
+/// the council, fail closed — as `ensure_shared_worker_fence` does for the primary.
+pub(crate) fn ensure_secondary_instance_fence(seat_key: &str) -> anyhow::Result<()> {
+    if wicked_apps_core::spawn::seat_cli_key(seat_key) == seat_key {
+        return Ok(());
+    }
+    if inherits_operator_config() {
+        return Ok(());
+    }
+    let config =
+        wicked_apps_core::spawn::seat_config_for_carrier_seat("claude", seat_key)?;
+    config.ensure_dirs()?;
+    let dir = config
+        .claude_dir()
+        .ok_or_else(|| anyhow::anyhow!("no claude dir for secondary seat {seat_key:?}"))?;
+    let shared = shared_deny_rules(None).map_err(anyhow::Error::msg)?;
+    let settings = serde_json::json!({ "permissions": { "deny": shared } });
+    let bytes = serde_json::to_vec(&settings).map_err(anyhow::Error::msg)?;
+    let settings_path = dir.join("settings.json");
+    // Temp-then-rename: a concurrent ballot reader sees the previous valid file or the new one,
+    // never a partial write. The secondary home has no prior sanitization (unlike the primary),
+    // so the window to a same-uid race is narrow; a full `write_atomic` port would require
+    // touching the NO-TOUCH acp_runner.rs, so the simpler form is used here.
+    let tmp = settings_path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &settings_path)?;
+    Ok(())
+}
+
 /// The admission-time fence check for a snapshot root (canonical), on both carriers, before any
 /// process starts. The root's state home is DERIVED from its shape (`state_home::of_snapshot`);
 /// `Err(why)` when the worker Read fence would cover the root or cannot be built around it — it
@@ -1351,7 +1390,7 @@ impl WrappedCliStepRunner {
         // variable, every foreign seat variable STRIPPED, the inherit hatch keeps the operator's
         // own. Fail CLOSED on a resolver error — the launch is refused, never run under the
         // daemon's configuration.
-        let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier(&binary)
+        let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier_seat(&binary, &cli_key)
             .and_then(|c| c.ensure_dirs().map(|()| c))
         {
             Ok(c) => c,
@@ -2120,14 +2159,18 @@ pub(crate) fn build_worker_command(
 }
 
 /// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
+/// Mirrors `resolve_invocation`'s two-step key lookup: exact key first, then the CLI key
+/// behind it (core#595), so `claude#2` inherits the `claude` registry record's flag.
 pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
     let user = wicked_council::registry::default_user_path();
-    wicked_council::registry::load(user.as_deref())
-        .unwrap_or_else(|_| wicked_council::registry::builtin())
-        .into_iter()
-        .find(|cli| cli.key == cli_key)
-        .and_then(|cli| cli.acp)
-        .is_some_and(|acp| acp.os_sandbox)
+    let clis = wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin());
+    for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+        if let Some(cli) = clis.iter().find(|c| c.key == key) {
+            return cli.acp.as_ref().is_some_and(|acp| acp.os_sandbox);
+        }
+    }
+    false
 }
 
 /// Point a worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at `<cwd>/tmp` (core#264, crew#427):
@@ -2860,11 +2903,17 @@ pub(crate) fn resolve_seat_posture(cli_key: &str) -> Vec<String> {
 /// `~/.config/wicked-council/clis.toml`. Returns the RAW declared flags (uncapped): the security
 /// cap lives in [`bound_ungated_posture`], which [`resolve_seat_posture`] applies on top.
 pub(crate) fn seat_posture_from(cli_key: &str, user_path: Option<&Path>) -> Vec<String> {
-    wicked_council::registry::load(user_path)
-        .ok()
-        .and_then(|clis| clis.into_iter().find(|c| c.key == cli_key))
-        .map(|c| c.trust_flags)
-        .unwrap_or_default()
+    // Exact key first, then the CLI behind it (core#595): a `claude#2` seat finds no registry
+    // record under `"claude#2"` but inherits `"claude"`'s trust_flags. Mirrors the same
+    // two-step loop `resolve_invocation` already applies to `headless_invocation`.
+    if let Ok(clis) = wicked_council::registry::load(user_path) {
+        for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+            if let Some(c) = clis.iter().find(|c| c.key == key) {
+                return c.trust_flags.clone();
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Cap a NON-claude seat's resolved `posture` so it can never FULLY DISABLE the seat's own sandbox
@@ -5525,6 +5574,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#595 HIGH-1: a SECONDARY claude instance on the wrapped carrier uses its OWN instance
+    /// home (`<worker>/claude-2`), not the primary home (`<worker>/claude`). Before the fix,
+    /// `seat_config_for_carrier(&binary)` passed an empty seat key and resolved the primary home
+    /// for every instance. A fake `claude` records its `CLAUDE_CONFIG_DIR` to a ledger file.
+    ///
+    /// FAILS on base (c163cf9): `CLAUDE_CONFIG_DIR` == `<worker>/claude` so `assert_ne!` fires.
+    #[cfg(unix)]
+    #[test]
+    fn a_secondary_claude_wrapped_worker_uses_its_own_instance_home_not_the_primary() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-claude2-cfg-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let worker_home = dir.join("worker");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&worker_home).unwrap();
+        let ledger = dir.join("seen-config-dir.txt");
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{CLAUDE_CONFIG_DIR:-UNSET}}\" > \"{}\"\nexit 0\n",
+                ledger.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("claude#2".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
+        let input = StepInput {
+            run_id: "run-claude2-cfg-home".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let _out = WrappedCliStepRunner::default().run_unit(&input);
+        let seen = std::fs::read_to_string(&ledger)
+            .expect("the fake claude ran and recorded its config dir")
+            .trim()
+            .to_string();
+        assert_ne!(
+            std::path::PathBuf::from(&seen),
+            worker_home.join("claude"),
+            "claude#2 must NOT share the primary claude home (<worker>/claude); got: {seen}"
+        );
+        assert_eq!(
+            std::path::PathBuf::from(&seen),
+            worker_home.join("claude-2"),
+            "claude#2 must use its own instance home (<worker>/claude-2); got: {seen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GOV-008 Boundary 1, wrapped-CLI carrier — the sibling of the ACP path's
     /// `acp_spawn_kernel_denies_an_outside_write_when_os_sandbox_is_enabled`. An END-TO-END KERNEL
     /// proof, NOT an argv assertion: it drives the SAME command-building the wrapped `exec` uses
@@ -5856,6 +5979,64 @@ mod tests {
         assert!(
             !capped.iter().any(|f| f.contains("dangerously-bypass")),
             "the resolved governed-worker posture must never be the full bypass (crew#427)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#595 HIGH-2: `seat_posture_from("codex#2", ...)` must fall back to the `codex`
+    /// registry record and return its `trust_flags`, not an empty `Vec`. Before the fix,
+    /// the lookup did `clis.iter().find(|c| c.key == "codex#2")` which found nothing.
+    ///
+    /// FAILS on base (c163cf9): result is `[]`, expected `["--sandbox", "workspace-write"]`.
+    #[test]
+    fn secondary_instance_inherits_trust_flags_from_its_cli_registry_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "wc-posture-instance-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clis = dir.join("clis.toml");
+        std::fs::write(
+            &clis,
+            "[[cli]]\n\
+             key = \"codex\"\n\
+             display_name = \"Codex\"\n\
+             binary = \"codex\"\n\
+             headless_invocation = \"codex {PROMPT}\"\n\
+             trust_flags = [\"--sandbox\", \"workspace-write\"]\n",
+        )
+        .unwrap();
+        let result = seat_posture_from("codex#2", Some(&clis));
+        assert_eq!(
+            result,
+            vec!["--sandbox".to_string(), "workspace-write".to_string()],
+            "codex#2 must inherit codex's trust_flags via the seat_cli_key fallback; got {result:?}"
+        );
+        // Sanity: the exact key still wins when the operator registers the instance outright.
+        let clis2 = dir.join("clis2.toml");
+        std::fs::write(
+            &clis2,
+            "[[cli]]\n\
+             key = \"codex\"\n\
+             display_name = \"Codex\"\n\
+             binary = \"codex\"\n\
+             headless_invocation = \"codex {PROMPT}\"\n\
+             trust_flags = [\"--sandbox\", \"workspace-write\"]\n\
+             [[cli]]\n\
+             key = \"codex#2\"\n\
+             display_name = \"Codex-2\"\n\
+             binary = \"codex\"\n\
+             headless_invocation = \"codex {PROMPT}\"\n\
+             trust_flags = [\"--sandbox\", \"read-only\"]\n",
+        )
+        .unwrap();
+        let exact = seat_posture_from("codex#2", Some(&clis2));
+        assert_eq!(
+            exact,
+            vec!["--sandbox".to_string(), "read-only".to_string()],
+            "an explicit codex#2 registry record must win over the codex fallback; got {exact:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
