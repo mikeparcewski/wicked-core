@@ -1334,7 +1334,17 @@ fn seat_config_in(
             strip: SEAT_CONFIG_ENV.to_vec(),
         });
     };
-    let name = seat_instance_root_name(name, seat_instance_suffix(seat_key))?;
+    let suffix = seat_instance_suffix(seat_key);
+    // The CLI comes from the binary, the instance from the key: an instance key must name the CLI
+    // it runs, or `#2` / `opus#2` running `claude` would land in `claude#2`'s home (core#595).
+    if suffix.is_some() && seat_cli_key(seat_key) != name {
+        anyhow::bail!(
+            "seat key {seat_key:?} runs `{name}` but does not name it; a second instance of \
+             `{name}` is spelled `{name}{SEAT_INSTANCE_SEP}<n>` (two seat keys must never resolve \
+             to one configuration home)"
+        );
+    }
+    let name = seat_instance_root_name(name, suffix)?;
     let root = base()?.join(name);
     refuse_symlinked_home(&root)?;
     let set: Vec<(&'static str, std::path::PathBuf)> = match cli {
@@ -3128,6 +3138,26 @@ rebase.autosquash\0";
     /// `a_relative_worker_home_refuses_the_claude_ballot_before_spawning` and
     /// `a_differently_cased_claude_is_not_a_claude_carrier_on_a_case_sensitive_filesystem`.
     /// Asserted here, at the resolver, so the ordering is pinned where it is decided.
+    /// core#595 review (codex HIGH): the CLI comes from the BINARY and the instance from the KEY,
+    /// so without this check `#2` or `opus#2` running `claude` would resolve `claude-2` — the
+    /// home `claude#2` owns — and two roster seats would share one configuration home and one
+    /// fence. An instance key must name the CLI it runs; anything else is refused, not folded.
+    #[test]
+    fn an_instance_key_must_name_the_cli_it_runs() {
+        let base = std::env::temp_dir().join("seat-prefix-check-never-created");
+        for key in ["#2", "opus#2", "codex#2", "Claude#2"] {
+            let got = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, key);
+            assert!(
+                got.is_err(),
+                "{key:?} running claude must be refused, not resolved to claude-2: {got:?}"
+            );
+        }
+        assert!(
+            seat_config_in(|| Ok(base.clone()), SeatCli::Claude, "claude#2").is_ok(),
+            "claude#2 running claude is the one spelling of that instance"
+        );
+    }
+
     #[test]
     fn a_rootless_cli_is_decided_without_resolving_the_worker_home() {
         let decision = seat_config_in(
