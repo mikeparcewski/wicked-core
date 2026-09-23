@@ -390,7 +390,7 @@ If S4's or S5's final Rust names differ, only the read sites named in the right-
 | Final pass call, ledger render into WORK, monitor seats excluded from the judge (all three paths) | core | `src/cli_runner.rs:761`, `:885-895`; bus `:97-112`, `:351-394`, `:911-925`; inline `:937`, `:988`, `:1020`, `:1029` |
 | `team_dispute` pause: `UnitOutcome.team_pause` set by the fold, performed by the actor | core | fold `src/pipeline.rs:827`, `:1540-1576`; `UnitOutcome` `src/execute.rs:36`; actor `src/actor.rs:5358-5376`, `:5400-5444`; `pause_for_human` `:6071` |
 | `team_dispute` resume: `confirm_gate` reads `gate_kind` first; approve emits `Resumed` + `GateDecided` + `UnitDone` and advances the cursor, no re-dispatch | core | `src/actor.rs:7785`, `:7864-7870`, `:8023-8034`, `:8055`, `:8061-8072`, `:8101`; `src/interaction.rs:59-76`, `:161`, `:184` |
-| Final-pass timeout synthesis (hold + `no_verdict`/`timeout` for every still-unaccepted HIGH) | core | `src/team.rs` final pass, before `team_finish` returns (§4.7) |
+| Final-pass timeout synthesis (hold + `no_verdict`/`timeout` for every still-unaccepted HIGH) | core | `src/team.rs` final pass, before `team::finish` returns (§4.7) |
 | `UnitEvidence.team`, `WorkUnit.team_ledger`, `teamLedger` emission | core | `src/workflow.rs:265`, `src/domain.rs`, `src/pipeline.rs:1540` |
 | Ledger into evaluator prior context and rework amendment | core | `src/actor.rs:6650-6700` |
 | Six `to_json` arms + core-ts `.d.ts` regen | core | `src/event.rs`, `crates/wicked-core-ts` |
