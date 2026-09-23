@@ -61,6 +61,7 @@ mod skills_snapshot;
 mod sources;
 mod spawn_audit;
 mod state_home;
+mod team;
 mod terminal;
 mod validator;
 mod validator_vault;

@@ -23,7 +23,8 @@
 //!   install` without; the pnpm/yarn frozen-lockfile equivalents) — ALWAYS with
 //!   `--ignore-scripts`: a dependency's lifecycle script is the one piece of repo-controlled code
 //!   the floor has no reason to run;
-//! * `Cargo.toml` → `cargo test`.
+//! * `Cargo.toml` → `cargo fmt --all --check` (formatting checked first, before tests), then
+//!   `cargo test`.
 //!
 //! Each command's exit code, duration and the TAIL of its stdout/stderr are captured as a
 //! [`CheckRun`] and attached to the gate: the fold persists the [`RepoChecksReport`] on the unit,
@@ -213,7 +214,7 @@ pub const DENIAL_SOURCE_TIMEOUT: &str = "repo_checks_timeout";
 /// One check the floor detected: a name, the exact argv, and where it was read from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoCheck {
-    /// `install` | `typecheck` | `lint` | `test` | `test_targeted` | `cargo-test`.
+    /// `install` | `typecheck` | `lint` | `test` | `test_targeted` | `cargo-fmt-check` | `cargo-test`.
     pub name: String,
     pub argv: Vec<String>,
     /// Provenance an operator can verify: `package.json scripts.test`, `Cargo.toml`,
@@ -893,6 +894,11 @@ struct ChecksConfig {
     /// check; `false` is accepted and means the same. `timeout_s` and the baseline diff apply
     /// (a base lacking the key fails closed: "the change introduced it").
     e2e: Option<CheckCommand>,
+    /// Override or disable the formatter check auto-detected from `Cargo.toml`. Default: when
+    /// `Cargo.toml` is present, runs `cargo fmt --all --check`. Set to `false` to disable, or
+    /// supply an explicit command. `timeout_s` applies; the baseline diff does not (a formatting
+    /// diff is a deterministic regression, never environmental).
+    formatter: Option<CheckCommand>,
     /// The per-check BASE bound in seconds (install keeps its own); scaled by the host-load factor.
     timeout_s: Option<u64>,
     /// Run the FULL `test` at verify even when `test_targeted` is declared.
@@ -944,6 +950,11 @@ fn baseline_diff_enabled(worktree: &Path) -> bool {
 }
 
 /// Apply a configured slot over the auto-detected check of the same name.
+/// The formatter slot, whether auto-detected (`cargo-fmt-check`) or configured (`formatter`).
+fn is_formatter_check(name: &str) -> bool {
+    name == "cargo-fmt-check" || name == "formatter"
+}
+
 fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
     match r {
         Resolved::Default => {}
@@ -1042,6 +1053,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let r_test = resolve(&cfg.test, "test")?;
     let r_targeted = resolve(&cfg.test_targeted, "test_targeted")?;
     let r_e2e = resolve(&cfg.e2e, "e2e")?;
+    let r_formatter = resolve(&cfg.formatter, "formatter")?;
     // `e2e` is a VERIFY-stage check only (the base run copies the stage, so never at the creator).
     let e2e = match r_e2e {
         Resolved::Command(argv) if ctx.stage == FloorStage::Verify => Some(RepoCheck {
@@ -1055,7 +1067,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     // A configured command (Node-shaped or not — the rule is the same for every configured slot)
     // needs the tree provisioned when a `package.json` is present and `node_modules` is missing:
     // `npx vitest …` resolves from node_modules.
-    let configured_node = [&r_typecheck, &r_lint, &r_test, &r_targeted]
+    let configured_node = [&r_typecheck, &r_lint, &r_test, &r_targeted, &r_formatter]
         .iter()
         .any(|r| matches!(r, Resolved::Command(_)))
         || e2e.is_some();
@@ -1063,6 +1075,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let mut typecheck: Option<RepoCheck> = None;
     let mut lint: Option<RepoCheck> = None;
     let mut test: Option<RepoCheck> = None;
+    let mut cargo_fmt: Option<RepoCheck> = None;
     let mut cargo: Option<RepoCheck> = None;
     if let Some(probed) = probe(worktree, "package.json")? {
         let is_file = probed.is_file();
@@ -1159,6 +1172,12 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             Some(_) => return Err("`Cargo.lock` is not a regular file".to_string()),
             None => false,
         };
+        cargo_fmt = Some(RepoCheck {
+            name: "cargo-fmt-check".into(),
+            argv: s(&["cargo", "fmt", "--all", "--check"]),
+            source: "Cargo.toml".into(),
+            timeout_s: None,
+        });
         cargo = Some(RepoCheck {
             name: "cargo-test".into(),
             argv: if has_lock {
@@ -1173,6 +1192,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     // The repo config speaks over the manifests.
     apply(&mut typecheck, r_typecheck, "typecheck");
     apply(&mut lint, r_lint, "lint");
+    apply(&mut cargo_fmt, r_formatter, "formatter");
     // A configured `test` replaces EVERY auto-detected test check (`test` and `cargo-test`);
     // `false` removes them.
     match r_test {
@@ -1212,7 +1232,10 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
         }
     }
     // `e2e` LAST: after the test set, only where the stage admits it (see above).
-    let mut out: Vec<RepoCheck> = [install, typecheck, lint, test, cargo, e2e]
+    // The formatter runs right after `install` and BEFORE every other check (core#551 review): a
+    // formatting diff is the cheapest, most deterministic denial, and CI runs it first too. A test
+    // that fails earlier would otherwise skip it and hide the "format first" denial.
+    let mut out: Vec<RepoCheck> = [install, cargo_fmt, typecheck, lint, test, cargo, e2e]
         .into_iter()
         .flatten()
         .collect();
@@ -1710,7 +1733,14 @@ pub(crate) fn run_with_sandbox_ctx(
         // BASELINE-DIFF (F-RC2-009): a FAILURE (not a timeout, not a spawn failure, not the
         // install — those say nothing about the base) is compared against the run base before it
         // may deny. No known base ⇒ the failure denies as it always did.
-        if !run.passed() && run.spawn_error.is_none() && !run.timed_out && check.name != "install" {
+        // A formatter check is excluded too (core#551): a formatting diff is deterministic and
+        // never environmental, so "the base fails identically" must not excuse it.
+        if !run.passed()
+            && run.spawn_error.is_none()
+            && !run.timed_out
+            && check.name != "install"
+            && !is_formatter_check(&check.name)
+        {
             match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
                 (Some(head), _) if !baseline_diff => {
                     run.base = Some(Box::new(BaseRun {
@@ -2716,9 +2746,14 @@ mod tests {
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
         std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let checks = detect(&wt).unwrap();
-        assert_eq!(checks[0].argv, s(&["pnpm", "run", "lint"]));
-        assert_eq!(checks[1].name, "cargo-test");
-        assert_eq!(checks[1].argv, s(&["cargo", "test"]));
+        assert_eq!(
+            checks[0].name, "cargo-fmt-check",
+            "the formatter precedes every other check"
+        );
+        assert_eq!(checks[0].argv, s(&["cargo", "fmt", "--all", "--check"]));
+        assert_eq!(checks[1].argv, s(&["pnpm", "run", "lint"]));
+        assert_eq!(checks[2].name, "cargo-test");
+        assert_eq!(checks[2].argv, s(&["cargo", "test"]));
         // No manifests at all ⇒ nothing detected, and a run of it is a vacuous pass that SAYS so.
         let empty = scratch("detect-empty");
         assert!(detect(&empty).unwrap().is_empty());
@@ -2838,7 +2873,16 @@ mod tests {
             !wt.join("Cargo.lock").exists(),
             "the engine-written lockfile must not be left for the worktree guard to deny"
         );
-        let c = &report.checks[0];
+        assert_eq!(
+            report.checks[0].name, "cargo-fmt-check",
+            "formatter runs before tests"
+        );
+        assert!(
+            report.checks[0].exit_code == Some(0),
+            "properly formatted fixture passes fmt check: {:?}",
+            report.checks[0]
+        );
+        let c = &report.checks[1];
         assert_eq!(c.name, "cargo-test");
         assert!(
             c.exit_code.is_some_and(|e| e != 0),
@@ -2875,6 +2919,101 @@ mod tests {
         assert!(
             !wt.join("target").exists(),
             "no ./target in the reviewed tree"
+        );
+    }
+
+    /// core#551: a worktree with an unformatted Rust file must fail the floor — the formatter check
+    /// runs before tests and a formatting diff is a deterministic denial.
+    #[test]
+    fn unformatted_rust_fails_fmt_floor() {
+        let wt = scratch("fmt-fail");
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"fmt_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"lib.rs\"\n[workspace]\n",
+        )
+        .unwrap();
+        // Deliberately unformatted: rustfmt would expand `{ x }` to a multi-line body.
+        std::fs::write(wt.join("lib.rs"), "pub fn add(a: i32,b: i32)->i32{a+b}\n").unwrap();
+        let report = run(&wt);
+        assert!(
+            !report.passed,
+            "an unformatted Rust file must fail the floor: {report:?}"
+        );
+        if report.sandbox_error.is_some() {
+            eprintln!(
+                "repo_checks: no sandbox tool here — the floor failed closed instead of running"
+            );
+            return;
+        }
+        let fmt = report
+            .checks
+            .iter()
+            .find(|c| c.name == "cargo-fmt-check")
+            .expect("cargo-fmt-check must appear in the checks");
+        assert!(
+            fmt.exit_code.is_some_and(|e| e != 0),
+            "cargo-fmt-check exits non-zero on a formatting diff: {fmt:?}"
+        );
+        assert_eq!(
+            report.detected[0].name, "cargo-fmt-check",
+            "formatter must be listed FIRST in detected checks"
+        );
+        let denial = report.denial_reason();
+        assert!(
+            denial.contains("cargo-fmt-check") && denial.contains(CRITERION),
+            "the denial names the formatter check: {denial}"
+        );
+    }
+
+    /// core#551 control: a properly formatted Rust file must produce no formatter diff — the floor
+    /// must not deny a worktree solely because of formatting when the code IS already formatted.
+    #[test]
+    fn formatted_rust_worktree_passes_fmt_floor() {
+        let wt = scratch("fmt-pass");
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"fmt_pass_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"lib.rs\"\n[workspace]\n",
+        )
+        .unwrap();
+        // Properly formatted Rust — rustfmt produces no diff.
+        std::fs::write(
+            wt.join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+        // Detection: cargo-fmt-check must be first in the detected set.
+        let checks = detect(&wt).unwrap();
+        assert_eq!(
+            checks[0].name, "cargo-fmt-check",
+            "formatter is detected first for a Rust workspace: {checks:?}"
+        );
+        // Execution: cargo-fmt-check exits 0 — no diff in the formatted fixture.
+        // Other checks (cargo-test, lockfile writes) may fail in restricted environments;
+        // the control claim is narrowly about the formatter exit code.
+        let report = run(&wt);
+        if report.sandbox_error.is_some() {
+            eprintln!(
+                "repo_checks: no sandbox tool here — the floor failed closed instead of running"
+            );
+            return;
+        }
+        // No escape hatch past the sandbox check: the formatter was detected above, so it MUST
+        // have run — a missing or unspawnable check is a floor defect, not an environment fact.
+        let fmt = report
+            .checks
+            .iter()
+            .find(|c| c.name == "cargo-fmt-check")
+            .expect("cargo-fmt-check must run when detected");
+        assert!(
+            fmt.spawn_error.is_none(),
+            "cargo-fmt-check must be invocable where cargo is: {:?}",
+            fmt.spawn_error
+        );
+        assert!(
+            fmt.exit_code == Some(0),
+            "cargo-fmt-check exits 0 on formatted code — no false positive: {fmt:?}"
         );
     }
 
@@ -2949,7 +3088,7 @@ mod tests {
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["cargo-test"],
+            vec!["cargo-fmt-check", "cargo-test"],
             "what WOULD have run is still on the record"
         );
         let denial = report.denial_reason();
@@ -3407,11 +3546,12 @@ mod tests {
         std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         std::fs::write(wt.join("Cargo.lock"), "# lock\n").unwrap();
         let checks = detect(&wt).unwrap();
-        assert_eq!(checks[0].argv, s(&["cargo", "test", "--locked"]));
+        assert_eq!(checks[0].name, "cargo-fmt-check");
+        assert_eq!(checks[1].argv, s(&["cargo", "test", "--locked"]));
         assert!(engine_generated_candidates(&wt, &checks).is_empty());
         std::fs::remove_file(wt.join("Cargo.lock")).unwrap();
         let checks = detect(&wt).unwrap();
-        assert_eq!(checks[0].argv, s(&["cargo", "test"]));
+        assert_eq!(checks[1].argv, s(&["cargo", "test"]));
         assert_eq!(
             engine_generated_candidates(&wt, &checks),
             vec!["Cargo.lock"]
@@ -3939,6 +4079,110 @@ mod tests {
     /// recorded, never denying, the floor PASSES and the base run is paid for once (cached);
     /// (3) a head that fixes `other` and breaks nothing is `pre_existing_in_sandbox` — passes;
     /// (4) `baseline_diff: false` restores the plain denial, with the opt-out on the record.
+    /// core#551 (review): a configured Node formatter is a Node check like any other, so a
+    /// formatter-only `checks.json` still schedules `install` first — it must not run `npx`/`npm`
+    /// against an unprovisioned tree.
+    #[test]
+    fn a_formatter_only_node_config_schedules_install_first() {
+        let wt = scratch("fmt-node-install");
+        std::fs::write(
+            wt.join("package.json"),
+            "{\"name\":\"x\",\"version\":\"0.0.0\"}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            "{\"formatter\": [\"npm\", \"run\", \"format:check\"]}\n",
+        )
+        .unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec!["install".to_string(), "formatter".to_string()],
+            "{names:?}"
+        );
+    }
+
+    /// core#551 (review): on a Node repo with a `test` script AND a configured formatter, the
+    /// formatter runs before the tests — a failing test must not skip the "format first" denial.
+    #[test]
+    fn a_configured_node_formatter_runs_before_the_test_script() {
+        let wt = scratch("fmt-node-order");
+        std::fs::write(
+            wt.join("package.json"),
+            "{\"name\":\"x\",\"version\":\"0.0.0\",\"scripts\":{\"test\":\"vitest run\"}}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            "{\"formatter\": [\"npm\", \"run\", \"format:check\"]}\n",
+        )
+        .unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "install".to_string(),
+                "formatter".to_string(),
+                "test".to_string()
+            ],
+            "{names:?}"
+        );
+    }
+
+    /// core#551 (review): a formatting diff is deterministic, never environmental, so a formatter
+    /// failure the base ALSO has is still a denial — the baseline diff must not excuse it the way
+    /// it excuses a pre-existing test failure.
+    #[test]
+    fn a_formatter_failure_the_base_shares_still_denies() {
+        let repo = scratch("fmt-basediff");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fmt_basediff_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"src/lib.rs\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
+        // Unformatted on the BASE and unchanged on the head: the base fails fmt identically.
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn add(a: i32,b: i32)->i32{a+b}\n",
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!(
+                "repo_checks: no sandbox tool here — the floor failed closed instead of running"
+            );
+            return;
+        }
+        assert!(
+            !report.passed,
+            "a shared formatting failure must still deny: {report:?}"
+        );
+        let fmt = &report.checks[0];
+        assert_eq!(fmt.name, "cargo-fmt-check");
+        assert!(fmt.exit_code.is_some_and(|e| e != 0), "{fmt:?}");
+        assert!(
+            fmt.base.is_none(),
+            "the formatter is never baseline-compared: {:?}",
+            fmt.base
+        );
+        assert!(fmt.denies(), "{fmt:?}");
+        let denial = report.denial_reason();
+        assert!(denial.contains("cargo-fmt-check"), "{denial}");
+    }
+
     #[test]
     fn baseline_diff_denies_only_regressions() {
         let repo = scratch("basediff");
@@ -3951,13 +4195,19 @@ mod tests {
         .unwrap();
         std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
         let body = |shared: bool, other: bool, stable: bool| {
-            let t = |ok: bool| if ok { "" } else { "assert!(false, \"BOOM\");" };
+            let fn_body = |ok: bool| -> &'static str {
+                if ok {
+                    "{}"
+                } else {
+                    "{\n        assert!(false, \"BOOM\");\n    }"
+                }
+            };
             format!(
-                "#[cfg(test)]\nmod t {{\n    #[test]\n    fn shared() {{ {} }}\n    #[test]\n    \
-                 fn other() {{ {} }}\n    #[test]\n    fn stable() {{ {} }}\n}}\n",
-                t(shared),
-                t(other),
-                t(stable)
+                "#[cfg(test)]\nmod t {{\n    #[test]\n    fn shared() {}\n    #[test]\n    \
+                 fn other() {}\n    #[test]\n    fn stable() {}\n}}\n",
+                fn_body(shared),
+                fn_body(other),
+                fn_body(stable)
             )
         };
         std::fs::write(repo.join("src/lib.rs"), body(false, false, true)).unwrap();
@@ -3983,7 +4233,11 @@ mod tests {
         assert!(!report.passed, "{report:?}");
         assert_eq!(report.outcome(), "failed");
         assert_eq!(report.denial_source(), DENIAL_SOURCE);
-        let c = &report.checks[0];
+        assert_eq!(
+            report.checks[0].name, "cargo-fmt-check",
+            "formatter passes on formatted code"
+        );
+        let c = &report.checks[1];
         assert_eq!(c.name, "cargo-test");
         assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:?}");
         assert_eq!(c.regressions, vec!["test t::stable".to_string()]);
@@ -4050,9 +4304,9 @@ mod tests {
         // the shared failures are listed, the base run comes back from the cache.
         std::fs::write(repo.join("src/lib.rs"), body(false, false, true)).unwrap();
         let report = run_floor(&repo, &ctx);
-        assert!(report.passed, "{:?}", report.checks[0]);
+        assert!(report.passed, "{:?}", report.checks[1]);
         assert_eq!(report.outcome(), "passed");
-        let c = &report.checks[0];
+        let c = &report.checks[1];
         assert!(!c.passed() && !c.denies());
         assert_eq!(c.outcome(), "failed");
         assert_eq!(c.classification.as_deref(), Some(FLOOR_ENV_MISMATCH));
@@ -4079,8 +4333,8 @@ mod tests {
         // (3) PRE_EXISTING_IN_SANDBOX: the head fixes `other`, breaks nothing ⇒ passes.
         std::fs::write(repo.join("src/lib.rs"), body(false, true, true)).unwrap();
         let report = run_floor(&repo, &ctx);
-        assert!(report.passed, "{:?}", report.checks[0]);
-        let c = &report.checks[0];
+        assert!(report.passed, "{:?}", report.checks[1]);
+        let c = &report.checks[1];
         assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
         assert_eq!(c.pre_existing, vec!["test t::shared".to_string()]);
         assert!(c.regressions.is_empty() && !c.denies());
@@ -4091,7 +4345,7 @@ mod tests {
         std::fs::write(repo.join(CONFIG_PATH), r#"{"baseline_diff":false}"#).unwrap();
         let report = run_floor(&repo, &ctx);
         assert!(!report.passed);
-        let c = &report.checks[0];
+        let c = &report.checks[1];
         assert!(c.classification.is_none() && c.denies());
         assert!(
             c.base
