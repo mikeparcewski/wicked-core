@@ -1206,6 +1206,52 @@ mod tests {
         );
     }
 
+    /// T0 connection rule, file identity: a bus file deleted and recreated under the same path is a
+    /// DIFFERENT database. `shared` must notice (the path still exists) and open the new file — the
+    /// old handle is leaked, never closed — instead of polling and emitting on the unlinked one.
+    #[test]
+    fn shared_reopens_a_bus_file_recreated_under_the_same_path() {
+        let path = tmp_bus("shared-recreated");
+        let old = BusDb::shared(&path).unwrap();
+        old.emit(&BusEmit::new(
+            RUN_REQUESTED,
+            "t",
+            "t",
+            serde_json::json!({"n": "old"}),
+        ))
+        .unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+        // Another writer recreates the bus at the same path and emits one row.
+        let external = BusDb::open(&path).unwrap();
+        let fresh_id = external
+            .emit(&BusEmit::new(
+                RUN_REQUESTED,
+                "t",
+                "t",
+                serde_json::json!({"n": "new"}),
+            ))
+            .unwrap();
+        drop(external);
+
+        let again = BusDb::shared(&path).unwrap();
+        let rows = again.poll(RUN_REQUESTED, 0, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.payload["n"].clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!("new")],
+            "the next shared() handle reads the recreated file"
+        );
+        assert_eq!(again.tail_event_id().unwrap(), fresh_id);
+        assert_eq!(
+            shared_bus_stats(&path).map(|s| s.0),
+            Some(2),
+            "the reopen is counted"
+        );
+    }
+
     /// T0 connection rule: one handle per bus file per process; clones and repeat calls share it.
     #[test]
     fn shared_opens_once_per_file_and_clones_share_the_connection() {

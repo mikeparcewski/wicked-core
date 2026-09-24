@@ -328,6 +328,63 @@ fn exec_boot_mediates_over_the_same_single_connection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// T0 (review finding): the bridge's start point separates history from new requests by EVENT ID.
+/// A row already on the bus when `spawn` returns is history and is never launched — even when its
+/// `emitted_at` is not earlier than the spawn (another writer's clock, or the same millisecond) —
+/// and a request emitted the moment `spawn` returns is always delivered.
+#[test]
+fn a_request_right_after_spawn_is_delivered_and_history_is_never_replayed() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmp_dir("floor");
+    let bus_db = dir.join("bus.db").to_string_lossy().to_string();
+
+    // History: a request written BEFORE the engine exists, stamped with a clock that is not behind
+    // the spawn (what a same-millisecond write looks like to a wall-clock floor).
+    let history = rusqlite::Connection::open(&bus_db).unwrap();
+    drop(BusDb::open(&bus_db).unwrap()); // the bus schema, via a test-side (external) writer
+    let skewed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    history
+        .execute(
+            "INSERT INTO events (event_type, domain, subdomain, payload, schema_version, \
+             idempotency_key, emitted_at, expires_at, dedup_expires_at) \
+             VALUES (?1, 'wicked-cli', 'cli.run', ?2, '1.0.0', 'history-1', ?3, ?4, ?4)",
+            rusqlite::params![
+                RUN_REQUESTED,
+                r#"{"problem":"Do step one","args":{"session_id":"history-run"}}"#,
+                skewed,
+                skewed + 3_600_000
+            ],
+        )
+        .unwrap();
+    drop(history);
+
+    std::env::set_var("WICKED_BUS_DB", &bus_db);
+    std::env::remove_var("WICKED_BUS_EXEC");
+    let core = Core::spawn_with_engine(
+        dir.join("f.db").to_string_lossy().to_string(),
+        Arc::new(StubDispatcher),
+        Arc::new(FastRunner),
+    );
+    let events = core.subscribe();
+    launch_over_the_bus(&bus_db, &events, "right-after-spawn");
+    // Give the bridge a few more polls to (wrongly) pick up history.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let sessions = core.sessions().unwrap();
+    std::env::remove_var("WICKED_BUS_DB");
+    drop(core);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(sessions.iter().any(|s| s == "right-after-spawn"));
+    assert!(
+        !sessions.iter().any(|s| s == "history-run"),
+        "a row on the bus before spawn returned must never be launched: {sessions:?}"
+    );
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
 /// race it): the engine paths these tests drive fire `wicked.*` governance emissions, which with no
