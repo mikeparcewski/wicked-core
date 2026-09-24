@@ -13,11 +13,14 @@
 //!
 //! ## Actor-safety (the load-bearing invariant — same posture as the launch bridge)
 //!  * The `cli-runner` subscriber and the `task.completed` poller each run on their OWN `std::thread`
-//!    with their OWN `rusqlite` connection to the bus db (a different file from the estate store the
-//!    actor owns — no writer-lock contention). Neither holds a store handle: the `cli-runner` reads only
-//!    the dispatched event + publishes the result; the actor stays the ONLY writer.
+//!    and use the process-wide shared bus handle ([`BusDb::shared`], one connection per bus file per
+//!    process; the bus is a different file from the estate store the actor owns — no writer-lock
+//!    contention). They are actor-safe because they run off the actor thread. Neither holds a store
+//!    handle: the `cli-runner` reads only the dispatched event + publishes the result; the actor stays
+//!    the ONLY writer.
 //!  * The actor reaches nothing here by a blocking poll. It only *publishes* `task.dispatched`, a single
-//!    bounded local INSERT into a WAL-mode db via an actor-thread-local [`BusDb`] — the reducer's publish
+//!    bounded local INSERT (`BusDb::emit_bounded`) through a clone of that shared handle held
+//!    actor-thread-locally — opened by a bus thread, never by the actor — the reducer's publish
 //!    role (§2.3), analogous to the actor's own store writes, never an unbounded poll or a CLI call.
 //!  * The `task.completed` poller reaches the actor ONLY by sending `Command::ApplyStepResult` over a
 //!    `Sender<Command>` clone — the exact `self_tx` write-back the in-process worker already uses.
@@ -82,11 +85,26 @@ pub const TASK_DISPATCHED: &str = "wicked.crew.task.dispatched";
 pub const TASK_COMPLETED: &str = "wicked.crew.task.completed";
 
 /// Gate evaluation events — wicked-core publishes a request; the governed evaluator daemon responds.
-/// When `WICKED_BUS_DB` is set, `run_unit_and_judge_with_roster` publishes one of these instead of
+/// When exec mediation is armed for the unit ([`gate_eval_bus_db`]),
+/// `run_unit_and_judge_with_roster` publishes one of these instead of
 /// spawning a raw `claude -p` subprocess, and blocks (up to [`GATE_EVAL_TIMEOUT`]) for the response.
 /// The daemon runs under its OWN governed session (no `--dangerously-skip-permissions`).
 pub const GATE_EVAL_REQUESTED: &str = "wicked.gate.eval.requested";
 pub const GATE_EVAL_RESPONDED: &str = "wicked.gate.eval.responded";
+
+/// The bus db the gate judge publishes its evaluation request to, or `None` for the inline judge.
+///
+/// DES-TEAMING-002 T0: the bus judge belongs to EXEC MEDIATION, so it is used ONLY over a bus exec
+/// mediation actually ARMED for this unit — `exec_bus`, passed by the caller: the cli-runner's own
+/// bus, or the actor's armed publisher's when a publish fell back in-process. Never process env:
+/// `WICKED_BUS_DB` alone is only the bus handoff (crew sets it on every boot), and `WICKED_BUS_EXEC`
+/// with a bus exec could not initialise leaves exec UNARMED — re-reading env there would send the
+/// in-process worker's judge to a bus that is not there and DENY on the infrastructure failure. The
+/// bus round-trip has no in-product responder except under exec (`scripts/gate_eval_daemon.py`),
+/// and denies after [`GATE_EVAL_TIMEOUT`].
+fn gate_eval_bus_db(exec_bus: Option<&str>) -> Option<String> {
+    exec_bus.filter(|p| !p.is_empty()).map(str::to_string)
+}
 
 /// Wall-clock budget for the bus-mediated gate evaluator. On timeout the gate falls back to
 /// deterministic-only (no agent verdict), so `combine_verdict(det_pass, None)` decides.
@@ -369,7 +387,7 @@ fn bus_request_agent_verdict(
         };
     }
 
-    let db = match BusDb::open(bus_db_path) {
+    let db = match BusDb::shared(bus_db_path) {
         Ok(d) => d,
         Err(e) => bus_deny!(format!(
             "gate eval bus-path DENY (fail-closed): cannot open bus db: {e}"
@@ -679,6 +697,9 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
 /// from every registry record; empty = no intersection (the bus path, tests). `benched` — the
 /// run's BENCHED seat keys (`AgentSession::benched_seats`, F-7R2-006): never a judge.
+///
+/// `exec_bus` — the bus exec mediation resolved for this unit (`None` off exec): the pinned judge
+/// publishes its evaluation request there ([`gate_eval_bus_db`]).
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -686,12 +707,13 @@ pub(crate) fn run_unit_and_judge(
     emit_delta: &DeltaSink,
     run_roster: &[String],
     benched: &[String],
+    exec_bus: Option<&str>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
-    run_unit_and_judge_with_roster(
+    run_unit_and_judge_on(
         runner,
         input,
         agent_review_target,
@@ -699,6 +721,7 @@ pub(crate) fn run_unit_and_judge(
         &crate::registry_roster(),
         run_roster,
         benched,
+        exec_bus,
     )
 }
 
@@ -745,6 +768,7 @@ fn with_floor_heartbeat<R>(
 /// The roster-injectable core of [`run_unit_and_judge`] — split out ONLY so the seat-selection (C1) is
 /// unit-testable with a fabricated roster and no live registry. Production always passes the live
 /// [`crate::registry_roster`].
+#[cfg(test)]
 fn run_unit_and_judge_with_roster(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -753,6 +777,33 @@ fn run_unit_and_judge_with_roster(
     roster: &[crate::AgenticCli],
     run_roster: &[String],
     benched: &[String],
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    run_unit_and_judge_on(
+        runner,
+        input,
+        agent_review_target,
+        emit_delta,
+        roster,
+        run_roster,
+        benched,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_unit_and_judge_on(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    agent_review_target: Option<&str>,
+    emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    benched: &[String],
+    exec_bus: Option<&str>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -909,11 +960,13 @@ fn run_unit_and_judge_with_roster(
             let Some(v) = input.unit.validator.as_ref().filter(|v| v.approved) else {
                 break 'pinned None;
             };
-            // BUS PATH: when `WICKED_BUS_DB` is set, publish a gate-evaluation request and wait for
-            // the governed evaluator daemon to respond (no subprocess, no dangerous flags, no TTY).
-            // On timeout or any error the function returns a hard DENY (fail-closed governance —
-            // a timeout must never silently approve a gate by falling back to deterministic-only).
-            if let Ok(bus_path) = std::env::var("WICKED_BUS_DB") {
+            // BUS PATH: only over a bus exec mediation ARMED for this unit (`gate_eval_bus_db`; never
+            // process env — DES-TEAMING-002 T0), publish a gate-evaluation request and
+            // wait for the governed evaluator daemon to respond (no subprocess, no dangerous flags,
+            // no TTY). On timeout or any error the function returns a hard DENY (fail-closed
+            // governance — a timeout must never silently approve a gate by falling back to
+            // deterministic-only).
+            if let Some(bus_path) = gate_eval_bus_db(exec_bus) {
                 // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
                 // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
                 let work_author = input.unit.assigned_cli.as_deref();
@@ -1275,32 +1328,27 @@ thread_local! {
     static EXEC_PUBLISHER: RefCell<Option<BusDb>> = const { RefCell::new(None) };
 }
 
-/// Arm exec-mediation on the CURRENT (actor) thread with an open bus publisher. Returns `false` if the
-/// bus db can't be opened — the caller then leaves exec mode OFF and the default in-process path stands
-/// (the same disable-on-uninitialized posture as the launch bridge's floor snapshot).
-pub(crate) fn arm_exec_publisher(bus_db_path: &str) -> bool {
-    match BusDb::open(bus_db_path) {
-        Ok(db) => {
-            // #8: the publisher INSERT runs on the single-writer actor thread — a 5s busy-wait behind a
-            // concurrent writer would stall every other actor command. A short timeout makes SQLITE_BUSY
-            // surface fast so `try_publish_dispatched` falls back to the in-process worker instead.
-            let _ = db.set_busy_timeout(Duration::from_millis(250));
-            EXEC_PUBLISHER.with(|cell| *cell.borrow_mut() = Some(db));
-            true
-        }
-        Err(e) => {
-            eprintln!(
-                "wicked-core: exec-mediation disabled — cannot open bus db {bus_db_path} to publish \
-                 task.dispatched: {e}; falling back to in-process dispatch"
-            );
-            false
-        }
-    }
+/// Arm exec-mediation on the CURRENT (actor) thread with the bus handle a bus thread already opened
+/// (DES-TEAMING-002 T0: the actor never opens the bus). The handle is the process-wide shared one, so
+/// arming adds no connection.
+pub(crate) fn arm_exec_publisher(db: BusDb) {
+    EXEC_PUBLISHER.with(|cell| *cell.borrow_mut() = Some(db));
 }
+
+/// The actor's publish budget (finding #8): the `task.dispatched` INSERT runs on the single-writer
+/// actor thread, so it waits at most this long for the shared connection and for SQLite's busy
+/// handler; past it, `try_publish_dispatched` falls back to the in-process worker.
+const PUBLISH_BUDGET: Duration = Duration::from_millis(250);
 
 /// Disarm exec-mediation on the current thread (actor loop exit).
 pub(crate) fn disarm_exec_publisher() {
     EXEC_PUBLISHER.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// The bus exec mediation is armed over on THIS thread (the actor), if any — handed to the
+/// in-process worker's judge when a publish falls back in-process.
+pub(crate) fn armed_exec_bus() -> Option<String> {
+    EXEC_PUBLISHER.with(|cell| cell.borrow().as_ref().map(|db| db.path().to_string()))
 }
 
 /// Whether exec-mediation is armed on THIS thread (the actor). `dispatch_unit` branches on this.
@@ -1373,8 +1421,16 @@ pub(crate) fn try_publish_dispatched(
             input.launch_seq,
         );
         let ev = BusEmit::new(TASK_DISPATCHED, CORE_DOMAIN, "core.task", payload).with_key(key);
-        match db.emit(&ev) {
-            Ok(_) => true,
+        match db.emit_bounded(&ev, PUBLISH_BUDGET) {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                eprintln!(
+                    "wicked-core: exec-mediation bus handle busy past {PUBLISH_BUDGET:?} for {}#{}; \
+                     falling back to in-process dispatch",
+                    input.run_id, input.unit_ix
+                );
+                false
+            }
             Err(e) => {
                 eprintln!(
                     "wicked-core: exec-mediation failed to publish task.dispatched for {}#{}: {e}; \
@@ -1440,8 +1496,8 @@ fn persist_cursor(db: &BusDb, consumer: &str, id: i64) {
     }
 }
 
-/// Both exec-mediation consumers, each with an OPEN bus connection and a RESOLVED start floor — built on
-/// the actor thread BEFORE the publisher is armed (the ATOMIC-ARM invariant, finding #4). Owning the open
+/// Both exec-mediation consumers, each with the bus handle and a RESOLVED start floor — built on a bus
+/// thread (never the actor, DES-TEAMING-002 T0) BEFORE the publisher is armed (the ATOMIC-ARM invariant, finding #4). Owning the open
 /// connections here (rather than opening lazily inside each spawned thread) is what makes "both consumers
 /// can initialize" a fact the caller checks before arming: if either can't open its bus db or resolve its
 /// cursor, [`init_exec_consumers`] returns `None` and the caller leaves exec-mediation OFF, so a
@@ -1460,8 +1516,6 @@ pub(crate) struct ExecConsumers {
     /// Generation UUID of the predecessor consumer (from startup reclamation). `Some` when a
     /// prior process left cursor rows that were migrated; `None` on first boot or clean shutdown.
     predecessor_gen: Option<uuid::Uuid>,
-    /// Bus db path — kept so `run_cli_runner` can open a second connection for `find_completed`.
-    bus_db_path: String,
 }
 
 /// Perform startup cursor reclamation for a Core instance (DES-002 mechanism B):
@@ -1577,10 +1631,10 @@ pub(crate) fn reclaim_predecessor_cursors(
 
 /// Initialize BOTH consumers against `bus_db_path` (finding #4 — atomicity). Returns `None` if EITHER
 /// consumer cannot open the bus db or resolve its durable cursor; the caller then does NOT arm the
-/// publisher (the in-process path stands). Runs on the actor thread; the opened connections are MOVED
-/// into the consumer threads by [`spawn_exec_consumers`] (`rusqlite::Connection` is `Send`), so a
-/// successful init here == a working bus handle in the thread — no second-open race that could leave the
-/// publisher armed with a dead consumer.
+/// publisher (the in-process path stands). Runs on a bus thread, never the actor (DES-TEAMING-002 T0);
+/// both consumers hold clones of the ONE process-wide bus handle ([`BusDb::shared`]), MOVED into the
+/// consumer threads by [`spawn_exec_consumers`], so a successful init here == a working bus handle in
+/// the thread — no second-open race that could leave the publisher armed with a dead consumer.
 ///
 /// `workspace_id` uniquely identifies this Core instance (used as the stable-key scope so different
 /// Core actors sharing one bus db don't collide). `actor_process_gen` is the UUID generated once per
@@ -1593,7 +1647,7 @@ pub(crate) fn init_exec_consumers(
     let c_name = consumer_name(actor_process_gen);
     let cc_name = completed_consumer_name(actor_process_gen);
 
-    let cli_runner_db = BusDb::open(bus_db_path)
+    let cli_runner_db = BusDb::shared(bus_db_path)
         .map_err(|e| eprintln!("wicked-core: cli-runner cannot open bus db {bus_db_path}: {e}"))
         .ok()?;
 
@@ -1605,7 +1659,7 @@ pub(crate) fn init_exec_consumers(
         reclaim_predecessor_cursors(&cli_runner_db, workspace_id, &c_name, &cc_name)?;
 
     let cli_runner_floor = resume_floor(&cli_runner_db, &c_name)?;
-    let completed_db = BusDb::open(bus_db_path)
+    let completed_db = BusDb::shared(bus_db_path)
         .map_err(|e| {
             eprintln!("wicked-core: task.completed poller cannot open bus db {bus_db_path}: {e}")
         })
@@ -1619,7 +1673,6 @@ pub(crate) fn init_exec_consumers(
         consumer_name: c_name,
         completed_consumer_name: cc_name,
         predecessor_gen,
-        bus_db_path: bus_db_path.to_string(),
     })
 }
 
@@ -1642,12 +1695,10 @@ pub(crate) fn spawn_exec_consumers(
         consumer_name,
         completed_consumer_name,
         predecessor_gen,
-        bus_db_path,
     } = consumers;
     vec![
         run_cli_runner(
             cli_runner_db,
-            bus_db_path,
             cli_runner_floor,
             runner,
             tx.clone(),
@@ -1723,7 +1774,6 @@ fn cancellable_sleep(stop: &Arc<AtomicBool>, interval: Duration) {
 #[allow(clippy::too_many_arguments)]
 fn run_cli_runner(
     db: BusDb,
-    bus_db_path: String,
     floor_init: i64,
     runner: Arc<dyn StepRunner>,
     actor_tx: Sender<Command>,
@@ -1786,16 +1836,10 @@ fn run_cli_runner(
                         // This task was dispatched by the previous process (now dead). Check
                         // find_completed first: the predecessor may have finished the work and
                         // published task.completed before crashing without advancing its cursor.
-                        let real_completion = BusDb::open(&bus_db_path).ok().and_then(|scan_db| {
-                            scan_db
-                                .find_completed(
-                                    &completed_consumer_name,
-                                    &task.run_id,
-                                    task.launch_seq,
-                                )
-                                .ok()
-                                .flatten()
-                        });
+                        let real_completion = db
+                            .find_completed(&completed_consumer_name, &task.run_id, task.launch_seq)
+                            .ok()
+                            .flatten();
 
                         if let Some(completion_ev) = real_completion {
                             // Real completion found — apply it and gate cursor advance on ack.
@@ -2024,6 +2068,8 @@ fn run_cli_runner(
                     // (F-7R2-006): the bus-mediated judge picks from the whole registry roster.
                     &[],
                     &[],
+                    // Exec mediation's judge publishes over the bus this consumer runs on.
+                    Some(db.path()),
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),
@@ -2426,7 +2472,7 @@ mod tests {
         };
 
         // Arm the publisher on THIS thread, publish, then disarm (thread-local is per-thread).
-        assert!(arm_exec_publisher(&bus_path), "arm publisher");
+        arm_exec_publisher(BusDb::shared(&bus_path).expect("arm publisher"));
         assert!(
             try_publish_dispatched(&input, None, false),
             "publish task.dispatched"
@@ -2499,7 +2545,7 @@ mod tests {
             required_skills: Vec::new(),
         };
 
-        assert!(arm_exec_publisher(&bus_path), "arm publisher");
+        arm_exec_publisher(BusDb::shared(&bus_path).expect("arm publisher"));
         assert!(
             try_publish_dispatched(&input, None, false),
             "publish task.dispatched"
@@ -3142,7 +3188,7 @@ mod tests {
         };
         // Publish a dispatched task to a real bus db so we can round-trip through serde.
         let bus_path = tmp_bus("t7a");
-        assert!(arm_exec_publisher(&bus_path), "arm publisher");
+        arm_exec_publisher(BusDb::shared(&bus_path).expect("arm publisher"));
         assert!(
             try_publish_dispatched(&input, None, true),
             "publish task.dispatched"
@@ -3540,7 +3586,7 @@ mod tests {
             launch_seq: 1,
             required_skills: Vec::new(),
         };
-        assert!(arm_exec_publisher(&bus_path_a), "arm publisher t38a");
+        arm_exec_publisher(BusDb::shared(&bus_path_a).expect("arm publisher t38a"));
         assert!(
             try_publish_dispatched(&input_a, None, false),
             "publish t38a"
@@ -3571,7 +3617,6 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 run_cli_runner(
                     BusDb::open(&bus_path_clone).unwrap(),
-                    bus_path_clone,
                     0,
                     runner,
                     cmd_tx,
@@ -3641,7 +3686,7 @@ mod tests {
             launch_seq: 1,
             required_skills: Vec::new(),
         };
-        assert!(arm_exec_publisher(&bus_path_b), "arm publisher t38b");
+        arm_exec_publisher(BusDb::shared(&bus_path_b).expect("arm publisher t38b"));
         assert!(
             try_publish_dispatched(&input_b, None, false),
             "publish t38b"
@@ -3675,7 +3720,6 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 run_cli_runner(
                     BusDb::open(&bus_path_clone).unwrap(),
-                    bus_path_clone,
                     0,
                     runner,
                     cmd_tx,
@@ -3999,5 +4043,389 @@ mod floor_heartbeat_tests {
             seen.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
             vec!["floor — 0 min"]
         );
+    }
+}
+
+/// DES-TEAMING-002 T0 (amended) — the gate judge's BUS path is exec mediation's, not the bus
+/// handoff's. Crew now hands every engine `WICKED_BUS_DB`; before this seam that variable ALONE
+/// rerouted every pinned judge to `wicked.gate.eval.requested` and a 180 s fail-closed wait for an
+/// evaluator daemon no product runs. The judge must take the bus only when `WICKED_BUS_EXEC` is on.
+#[cfg(test)]
+mod judge_routing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn seat(key: &str, invocation: &str) -> crate::AgenticCli {
+        use wicked_council::{Category, Confidence, InputMode};
+        crate::AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: invocation.into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            health: None,
+        }
+    }
+
+    struct OkRunner;
+    impl StepRunner for OkRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "the work".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn the_bus_judge_needs_an_armed_exec_bus() {
+        assert_eq!(gate_eval_bus_db(None), None);
+        assert_eq!(gate_eval_bus_db(Some("")), None);
+        assert_eq!(
+            gate_eval_bus_db(Some("/b/bus.db")),
+            Some("/b/bus.db".to_string())
+        );
+    }
+
+    /// Restores each named variable to what it was when captured, on drop.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bus_db_without_exec_keeps_the_inline_judge_for_an_evidence_floor_pinned_unit() {
+        // The crate-wide env lock for the WHOLE scope (it mutates process env the judge reads);
+        // declared first so it is released last, after `_restore` puts both variables back.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore::capture(&["WICKED_BUS_DB", "WICKED_BUS_EXEC"]);
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-judge-routing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_string_lossy().to_string();
+
+        // The default crew boot after T0: the engine HAS a bus, exec mediation is OFF.
+        std::env::set_var("WICKED_BUS_DB", &bus_path);
+        std::env::remove_var("WICKED_BUS_EXEC");
+
+        // A stand-in evaluator daemon, so the pre-fix bus path fails this test in seconds, not
+        // after the 180 s timeout: it answers every request it sees and counts them.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let responder = {
+            let (requests, stop, bus_path) = (requests.clone(), stop.clone(), bus_path.clone());
+            std::thread::spawn(move || {
+                let db = BusDb::open(&bus_path).unwrap();
+                let mut floor = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    for ev in db.poll(GATE_EVAL_REQUESTED, floor, 20).unwrap_or_default() {
+                        floor = ev.event_id;
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let eval_id = ev.payload["eval_id"].as_str().unwrap_or("").to_string();
+                        let _ = db.emit(&BusEmit::new(
+                            GATE_EVAL_RESPONDED,
+                            "test",
+                            "test.gate",
+                            serde_json::json!({"eval_id": eval_id, "pass": true, "reasoning": "stand-in"}),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        // The built-in Evaluator phases' floor: the approved evidence-floor validator.
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "review the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
+            script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        // claude = the deterministic validator's author, pi = the creator: the inline judge has
+        // no distinct seat and records WHY (judge_skipped) without spawning anything.
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let runner: Arc<dyn StepRunner> = Arc::new(OkRunner);
+        let noop: &DeltaSink = &|_: &str| {};
+        let started = Instant::now();
+        let (_out, _verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = responder.join();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "WICKED_BUS_DB without WICKED_BUS_EXEC must never publish wicked.gate.eval.requested"
+        );
+        assert!(
+            evidence.judge_skipped.is_some(),
+            "the INLINE judge ran (it records why no distinct seat judged); got {:?}",
+            evidence.judge_skipped
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "no bus wait: the judge returned in {elapsed:?}"
+        );
+    }
+
+    /// Review finding (#613 round 3): with `WICKED_BUS_EXEC=1` and a `WICKED_BUS_DB` exec mediation
+    /// cannot initialise, exec never arms and the unit runs on the in-process worker (no armed exec
+    /// bus). Its judge must stay inline — re-reading process env would take the bus path and DENY on
+    /// the infrastructure failure. The judge uses the bus ONLY when the caller passes an armed one.
+    #[test]
+    fn an_unarmed_exec_env_keeps_the_inline_judge() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore::capture(&["WICKED_BUS_DB", "WICKED_BUS_EXEC"]);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-unarmed-exec-judge-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let not_a_dir = dir.join("not-a-dir");
+        std::fs::write(&not_a_dir, "a file where the bus directory should be").unwrap();
+        std::env::set_var("WICKED_BUS_EXEC", "1");
+        std::env::set_var(
+            "WICKED_BUS_DB",
+            not_a_dir.join("bus.db").to_string_lossy().to_string(),
+        );
+
+        let mut unit = crate::domain::WorkUnit::pending("ua:u1", "ua", 1, "review the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
+            script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "ua".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-ua".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let runner: Arc<dyn StepRunner> = Arc::new(OkRunner);
+        let noop: &DeltaSink = &|_: &str| {};
+        // The in-process worker's call: no armed exec bus (`armed_exec_bus()` is `None`).
+        let (_out, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            verdict
+                .as_ref()
+                .is_none_or(|v| !v.reasoning.contains("bus-path")),
+            "no bus-path verdict for an unarmed exec: {verdict:?}"
+        );
+        assert!(
+            evidence.judge_skipped.is_some(),
+            "the INLINE judge ran (it records why no distinct seat judged)"
+        );
+    }
+
+    /// Review finding (#613 round 2): the env-free exec entry (`Core::spawn_with_engine_exec`) arms
+    /// exec mediation over an explicit bus path with NO `WICKED_BUS_*` in the process env. Its
+    /// cli-runner must judge a pinned unit over THAT bus (`gate.eval.requested`), not inline —
+    /// the judge must follow the resolved exec bus, not only process env.
+    #[test]
+    fn the_env_free_exec_consumer_judges_a_pinned_unit_over_its_own_bus() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore::capture(&["WICKED_BUS_DB", "WICKED_BUS_EXEC"]);
+        std::env::remove_var("WICKED_BUS_DB");
+        std::env::remove_var("WICKED_BUS_EXEC");
+
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-exec-judge-routing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_string_lossy().to_string();
+
+        /// Counts judge turns that reach the runner (the INLINE judge runs through it).
+        struct CountingRunner(AtomicUsize);
+        impl StepRunner for CountingRunner {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                if input.unit.session_id == "validator" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nok".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let gen = uuid::Uuid::new_v4();
+        let mut unit = crate::domain::WorkUnit::pending("xr:u1", "xr", 1, "review the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
+            script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "xr".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-xr".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: Some(gen),
+            launch_seq: 1,
+            required_skills: Vec::new(),
+        };
+        let bus = BusDb::shared(&bus_path).unwrap();
+        arm_exec_publisher(bus.clone());
+        assert!(
+            try_publish_dispatched(&input, None, false),
+            "task.dispatched published"
+        );
+        disarm_exec_publisher();
+
+        // A stand-in evaluator daemon, so the bus judge returns at once when it is used.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let responder = {
+            let (requests, stop, bus_path) = (requests.clone(), stop.clone(), bus_path.clone());
+            std::thread::spawn(move || {
+                let db = BusDb::open(&bus_path).unwrap();
+                let mut floor = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    for ev in db.poll(GATE_EVAL_REQUESTED, floor, 20).unwrap_or_default() {
+                        floor = ev.event_id;
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let eval_id = ev.payload["eval_id"].as_str().unwrap_or("").to_string();
+                        let _ = db.emit(&BusEmit::new(
+                            GATE_EVAL_RESPONDED,
+                            "test",
+                            "test.gate",
+                            serde_json::json!({"eval_id": eval_id, "pass": true, "reasoning": "stand-in"}),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        let runner = Arc::new(CountingRunner(AtomicUsize::new(0)));
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let runner_stop = Arc::new(AtomicBool::new(false));
+        let consumer = run_cli_runner(
+            bus.clone(),
+            0,
+            runner.clone(),
+            cmd_tx,
+            None,
+            gen,
+            None,
+            consumer_name(gen),
+            completed_consumer_name(gen),
+            Duration::from_millis(50),
+            runner_stop.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while bus
+            .poll(TASK_COMPLETED, 0, 10)
+            .unwrap_or_default()
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        runner_stop.store(true, Ordering::SeqCst);
+        let _ = consumer.join();
+        stop.store(true, Ordering::SeqCst);
+        let _ = responder.join();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the exec consumer judged over its bus (one gate.eval.requested)"
+        );
+        assert_eq!(runner.0.load(Ordering::SeqCst), 0, "and not inline");
     }
 }

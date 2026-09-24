@@ -23,21 +23,39 @@
 //! nullable, so writing the base NOT NULL columns is sufficient and forward-compatible).
 //!
 //! ## Actor-safety (the load-bearing invariant)
-//! The poll loop NEVER runs on the single-writer actor thread. [`spawn_run_requested_poller`] runs on
-//! its own `std::thread`, opens its OWN `rusqlite` connection to the bus db (a different file from the
-//! estate store — no writer-lock contention with the actor), and reaches the actor ONLY by sending
+//! The poll loop NEVER runs on the single-writer actor thread. The launch bridge runs on its own
+//! `std::thread` and polls through the process-wide shared bus handle ([`BusDb::shared`] — see the
+//! connection rule below; the bus is a different file from the estate store, so there is no
+//! writer-lock contention with the actor). It is actor-safe because it runs off the actor thread and
+//! reaches the actor ONLY by sending
 //! `Command::LaunchRun` over a `Sender<Command>` clone. That is exactly the `self_tx` write-back
 //! pattern the unit workers already use: a blocking SQLite poll on the bus db can never stall the
 //! actor, and the launch itself is applied serially on the actor like any other command.
+//!
+//! ## One connection per bus file per process (DES-TEAMING-002 T0)
+//! Production code never opens a private connection: it takes [`BusDb::shared`], a process-wide
+//! handle (one `rusqlite` connection per bus file, behind a mutex) that is opened once and NEVER
+//! closed for the life of the process. Why: crew hands the engine the SAME bus file its own
+//! better-sqlite3 seams hold open in the same process. SQLite's POSIX advisory locks belong to the
+//! process, and closing ANY descriptor for the file drops all of them; one SQLite library defers
+//! such a close while its own siblings hold locks, a second library does not know about them. A
+//! connection this library opened and later closed would therefore release the locks crew's seams
+//! hold, and the next external emitter's close could checkpoint and unlink `-wal`/`-shm` under them
+//! (F-E2E-021). A handle that never closes cannot do that. Clones of a [`BusDb`] share the one
+//! connection; dropping a clone closes nothing. [`BusDb::open`] (a private connection) is kept for
+//! tests that play an external writer; `tests/bus_handoff.rs` fails the build if production code
+//! calls it.
 //!
 //! ## Cross-platform
 //! `rusqlite` is built with the `bundled` feature (SQLite compiled from source — no system libsqlite
 //! dependency), timestamps are plain `SystemTime` epoch-millis, and paths are caller-supplied — no
 //! unix-only APIs.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -237,9 +255,15 @@ fn load_bus_ttls(db_path: &str) -> (i64, i64) {
 }
 
 /// A handle to a wicked-bus SQLite event log. Wraps a `rusqlite::Connection` so callers never name
-/// `rusqlite` directly. Open one per thread that emits/polls — SQLite connections are not `Sync`.
+/// `rusqlite` directly. The connection sits behind a mutex (each call locks it for its own
+/// statements), so a handle is `Send + Sync` and clones share ONE connection. Production code takes
+/// [`BusDb::shared`] — see the module doc's connection rule.
+#[derive(Clone)]
 pub struct BusDb {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
+    /// The path this handle was opened at — so a consumer holding the handle can name its bus
+    /// (e.g. exec mediation's judge publishes over the SAME bus it consumes, with no env lookup).
+    path: Arc<str>,
     /// Default event TTL in hours (`config.ttl_hours`), loaded from the wicked-bus `config.json` at
     /// open time (falls back to [`DEFAULT_TTL_HOURS`]). Threaded into [`emit`] so `expires_at` matches
     /// what JS `emit()` computes under the SAME operator config.
@@ -256,11 +280,211 @@ impl BusDb {
     /// afterwards (JS layers its migration-3 nullable columns on top). Also loads the operator's
     /// `ttl_hours`/`dedup_ttl_hours` from `config.json` so emitted rows carry the SAME two-timer TTL a
     /// JS `emit()` would under that config.
+    ///
+    /// A PRIVATE connection, closed when the last clone drops: for tests that play an external
+    /// writer. Production code takes [`BusDb::shared`].
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open bus db at {path}"))?;
+        let (default_ttl_hours, dedup_ttl_hours) = init_bus_connection(&conn, path)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: Arc::from(path),
+            default_ttl_hours,
+            dedup_ttl_hours,
+        })
+    }
+
+    /// The process-wide handle to the bus db at `path`: opened on first use, then the SAME
+    /// connection for every caller in this process, and never closed (the registry holds it for the
+    /// life of the process). A failed open is not cached, so a later call retries; a connection
+    /// that opened but could not be initialized is leaked rather than closed, because closing it
+    /// would be exactly the open-and-close this handle exists to prevent. Opens run on the calling
+    /// thread: callers keep them off the actor thread (`actor::run` opens only from bus threads).
+    pub fn shared(path: &str) -> Result<Self> {
+        let key = shared_key(path);
+        let mut registry = shared_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = registry.get(&key) {
+            // A bus file deleted and recreated under the same path is a DIFFERENT database: reuse
+            // the handle only while the path still names the file it opened (same identity). On a
+            // mismatch the old connection stays open (never closed) and a fresh one is registered.
+            if entry.identity.is_some() && file_identity(&key) == entry.identity {
+                return Ok(entry.db.clone());
+            }
+        }
+        let conn = Connection::open(path).with_context(|| format!("open bus db at {path}"))?;
+        let (default_ttl_hours, dedup_ttl_hours) = match init_bus_connection(&conn, path) {
+            Ok(ttls) => ttls,
+            Err(e) => {
+                std::mem::forget(conn);
+                return Err(e);
+            }
+        };
+        let db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: Arc::from(path),
+            default_ttl_hours,
+            dedup_ttl_hours,
+        };
+        let opener = std::thread::current().name().unwrap_or("").to_string();
+        let identity = file_identity(&key);
+        let opens = match registry.get(&key) {
+            Some(replaced) => {
+                // Never close the replaced connection either: leak one strong reference to it.
+                std::mem::forget(replaced.db.clone());
+                replaced.opens + 1
+            }
+            None => 1,
+        };
+        registry.insert(
+            key,
+            SharedEntry {
+                db: db.clone(),
+                opens,
+                opener,
+                identity,
+            },
+        );
+        SHARED_OPENS_TOTAL.fetch_add(1, Ordering::SeqCst);
+        Ok(db)
+    }
+
+    /// Lock the connection, waiting at most `max_wait` for another thread's statement to finish.
+    /// `None` when the wait runs out. For the actor's bounded publish (it must never block on the
+    /// bus); everything else locks unbounded through the methods below.
+    fn try_lock_for(&self, max_wait: Duration) -> Option<MutexGuard<'_, Connection>> {
+        let deadline = std::time::Instant::now() + max_wait;
+        loop {
+            match self.conn.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// The path this handle was opened at.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish with a BOUNDED cost: wait at most `max_wait` for the shared connection and at most
+    /// `max_wait` on SQLite's busy handler, then give up. `Ok(None)` = the connection was busy in
+    /// this process. For the exec seam's actor-thread publish (finding #8): a stall there stalls
+    /// every actor command, so a busy bus must surface fast and the caller falls back in-process.
+    pub fn emit_bounded(&self, event: &BusEmit, max_wait: Duration) -> Result<Option<i64>> {
+        let Some(conn) = self.try_lock_for(max_wait) else {
+            return Ok(None);
+        };
+        conn.busy_timeout(max_wait)?;
+        let res = self.emit_on(&conn, event);
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        res.map(Some)
+    }
+}
+
+/// The busy timeout every bus connection runs with (wicked-bus lib/db.js uses the same).
+const BUSY_TIMEOUT_MS: u64 = 5000;
+
+struct SharedEntry {
+    db: BusDb,
+    /// How many connections this process opened for the path (1 unless the file was replaced).
+    opens: usize,
+    /// The name of the thread that opened the current connection ("" when unnamed).
+    opener: String,
+    /// The identity of the file the current connection opened ([`file_identity`]), taken right
+    /// after the open; `None` if it could not be read (the next lookup then reopens).
+    identity: Option<FileIdentity>,
+}
+
+/// Which file a path names, as the OS identifies it.
+///
+/// - Unix: `(st_dev, st_ino)`. While our connection holds the old file open its inode cannot be
+///   reused, so a file deleted and recreated under the same path always has a different identity.
+/// - Windows: the file's creation time (`MetadataExt::creation_time`, stable std; the volume serial
+///   and file index are not stable std). The case this guards barely exists there: SQLite opens the file without
+///   `FILE_SHARE_DELETE`, so the OS refuses to delete a bus file our handle holds open. Creation
+///   time is a best-effort second line (NTFS "tunneling" can carry it over to a file recreated
+///   under the same name within seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity(u64, u64);
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileIdentity(meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(FileIdentity(meta.creation_time(), 0))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+static SHARED_OPENS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+fn shared_registry() -> &'static Mutex<HashMap<PathBuf, SharedEntry>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, SharedEntry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The registry key: the path with its PARENT canonicalized (the file itself may not exist yet), so
+/// two spellings of one bus file share one connection.
+fn shared_key(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::canonicalize(parent)
+                .map(|dir| dir.join(name))
+                .unwrap_or_else(|_| p.to_path_buf())
+        }
+        _ => p.to_path_buf(),
+    }
+}
+
+/// What the process-wide registry knows about the bus file at `path`: `(connections opened, name of
+/// the thread that opened the current one)`, or `None` if this process never opened it. Test and
+/// diagnostic surface for the connection rule.
+#[doc(hidden)]
+pub fn shared_bus_stats(path: &str) -> Option<(usize, String)> {
+    let registry = shared_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry
+        .get(&shared_key(path))
+        .map(|e| (e.opens, e.opener.clone()))
+}
+
+/// Apply the bus PRAGMAs and ensure the schema on a fresh connection; returns the operator's TTLs.
+fn init_bus_connection(conn: &Connection, path: &str) -> Result<(i64, i64)> {
+    {
         // Match wicked-bus lib/db.js PRAGMAs. WAL + a busy timeout so a concurrent JS writer/sweeper
         // never trips us with SQLITE_BUSY.
-        conn.busy_timeout(Duration::from_millis(5000))?;
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(EVENTS_DDL)
@@ -271,14 +495,11 @@ impl BusDb {
         // Stable-owner registry (DES-002 startup reclamation — see CURSOR_OWNERS_DDL).
         conn.execute_batch(CURSOR_OWNERS_DDL)
             .context("ensure core_exec_meta table")?;
-        let (default_ttl_hours, dedup_ttl_hours) = load_bus_ttls(path);
-        Ok(Self {
-            conn,
-            default_ttl_hours,
-            dedup_ttl_hours,
-        })
     }
+    Ok(load_bus_ttls(path))
+}
 
+impl BusDb {
     /// Publish `event`. Computes the bus's two-timer TTL (`expires_at = emitted_at + ttl`,
     /// `dedup_expires_at = emitted_at + 24h`) exactly as JS `emit()` does, so the JS poller's
     /// `expires_at > now` visibility check and 24h dedup sweep behave identically. Returns the new
@@ -286,6 +507,11 @@ impl BusDb {
     /// returned (the JS bus raises WB-002 for a hard dup; here a re-emit of a *deterministic* event is
     /// the normal at-least-once case, so we resolve to the existing row instead).
     pub fn emit(&self, event: &BusEmit) -> Result<i64> {
+        let conn = self.lock();
+        self.emit_on(&conn, event)
+    }
+
+    fn emit_on(&self, conn: &Connection, event: &BusEmit) -> Result<i64> {
         let idempotency_key = event.idempotency_key.clone().unwrap_or_else(fresh_key);
         let emitted_at = now_ms();
         // Per-event TTL override wins, else the operator config's `ttl_hours` (mirrors JS `emit`:
@@ -295,7 +521,7 @@ impl BusDb {
         let dedup_expires_at = emitted_at + self.dedup_ttl_hours * MS_PER_HOUR;
         let payload_str = serde_json::to_string(&event.payload)?;
 
-        let res = self.conn.execute(
+        let res = conn.execute(
             "INSERT INTO events (event_type, domain, subdomain, payload, schema_version, \
              idempotency_key, emitted_at, expires_at, dedup_expires_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -312,7 +538,7 @@ impl BusDb {
             ],
         );
         match res {
-            Ok(_) => Ok(self.conn.last_insert_rowid()),
+            Ok(_) => Ok(conn.last_insert_rowid()),
             // A UNIQUE(idempotency_key) collision → the event is already on the bus. Resolve its id
             // (at-least-once idempotency, not a failure). Narrowed to the UNIQUE extended code: a
             // CHECK(length)/NOT NULL breach is ALSO a `ConstraintViolation`, but it is NOT a dedup —
@@ -324,8 +550,7 @@ impl BusDb {
                 if e.code == ErrorCode::ConstraintViolation
                     && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
             {
-                let existing: Option<i64> = self
-                    .conn
+                let existing: Option<i64> = conn
                     .query_row(
                         "SELECT event_id FROM events WHERE idempotency_key = ?1",
                         [&idempotency_key],
@@ -347,7 +572,7 @@ impl BusDb {
     /// must be read on the caller's thread, not lazily inside the poller.
     pub fn tail_event_id(&self) -> Result<i64> {
         Ok(self
-            .conn
+            .lock()
             .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
                 r.get(0)
             })?)
@@ -360,7 +585,7 @@ impl BusDb {
     /// fallback runs the unit instead of the actor blocking. (Consumers keep the default 5s — they poll
     /// off-actor, so a busy-wait there costs nothing on the critical path.)
     pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
-        self.conn.busy_timeout(timeout)?;
+        self.lock().busy_timeout(timeout)?;
         Ok(())
     }
 
@@ -369,21 +594,14 @@ impl BusDb {
     /// A persisted value ⇒ resume STRICTLY after it, so a `task.dispatched`-but-unhandled event that
     /// existed before a crash/restart is re-polled and run (the LOST-ON-CRASH fix) rather than skipped.
     pub fn load_cursor(&self, consumer: &str) -> Result<Option<i64>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT last_event_id FROM core_exec_cursors WHERE consumer_name = ?1",
-                [consumer],
-                |r| r.get(0),
-            )
-            .optional()?)
+        load_cursor_on(&self.lock(), consumer)
     }
 
     /// Persist a consumer's cursor (upsert). Called ONLY AFTER an event has been handled+acked (the
     /// completed event published, or the `ApplyStepResult` enqueued) so the durable floor never advances
     /// past unfinished work — at-least-once across restarts.
     pub fn save_cursor(&self, consumer: &str, last_event_id: i64) -> Result<()> {
-        self.conn.execute(
+        self.lock().execute(
             "INSERT INTO core_exec_cursors(consumer_name, last_event_id) VALUES (?1, ?2) \
              ON CONFLICT(consumer_name) DO UPDATE SET last_event_id = excluded.last_event_id",
             rusqlite::params![consumer, last_event_id],
@@ -395,7 +613,7 @@ impl BusDb {
     /// (DES-002) to delete the predecessor's cursor row AFTER migrating its position to the new name.
     /// A missing row is a no-op (idempotent delete).
     pub fn delete_cursor(&self, name: &str) -> Result<()> {
-        self.conn.execute(
+        self.lock().execute(
             "DELETE FROM core_exec_cursors WHERE consumer_name = ?1",
             rusqlite::params![name],
         )?;
@@ -408,7 +626,7 @@ impl BusDb {
     /// closed rather than silently minting a new owner and racing with the old one.
     pub fn get_stable(&self, key: &str) -> Result<Option<String>> {
         Ok(self
-            .conn
+            .lock()
             .query_row(
                 "SELECT value FROM core_exec_meta WHERE key = ?1",
                 rusqlite::params![key],
@@ -421,7 +639,7 @@ impl BusDb {
     /// reclamation AFTER migrating predecessor cursor positions and deleting old rows, so the
     /// stable record always reflects a consumer whose cursor row actually exists.
     pub fn set_stable(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
+        self.lock().execute(
             "INSERT INTO core_exec_meta(key, value) VALUES (?1, ?2) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value],
@@ -449,9 +667,10 @@ impl BusDb {
         run_id: &str,
         launch_seq: u64,
     ) -> Result<Option<BusEvent>> {
-        let floor = self.load_cursor(consumer)?.unwrap_or(0);
+        let conn = self.lock();
+        let floor = load_cursor_on(&conn, consumer)?.unwrap_or(0);
         let now = now_ms();
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT event_id, event_type, domain, subdomain, payload FROM events \
              WHERE event_id > ?1 AND expires_at > ?2 AND event_type = ?3 ORDER BY event_id ASC",
         )?;
@@ -494,7 +713,8 @@ impl BusDb {
     /// [`matches_filter`]).
     pub fn poll(&self, filter: &str, after_event_id: i64, batch: usize) -> Result<Vec<BusEvent>> {
         let now = now_ms();
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
             "SELECT event_id, event_type, domain, subdomain, payload FROM events \
              WHERE event_id > ?1 AND expires_at > ?2 ORDER BY event_id ASC",
         )?;
@@ -529,6 +749,16 @@ impl BusDb {
         }
         Ok(out)
     }
+}
+
+fn load_cursor_on(conn: &Connection, consumer: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT last_event_id FROM core_exec_cursors WHERE consumer_name = ?1",
+            [consumer],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// A guaranteed-unique idempotency key for an event the caller did NOT pin one for (i.e. "always a new
@@ -702,81 +932,247 @@ pub fn spawn_run_requested_poller(
     // returns, any subsequently-emitted request has a strictly higher id than the floor. If the
     // snapshot CANNOT be read here, the floor is UNKNOWN — we must NOT fall back to 0. Starting at 0
     // would replay EVERY non-expired historical `run.requested` (up to the TTL window, ~72h) as a fresh
-    // launch: a mass-duplicate storm. Instead treat the bridge as un-initialized and disable it (the
-    // same posture as the thread-side open-failure path below), spawning a thread that just exits.
-    let floor_init: Option<i64> = BusDb::open(&bus_db_path)
-        .ok()
-        .and_then(|db| db.tail_event_id().ok());
-    let floor_init = match floor_init {
-        Some(f) => f,
-        None => {
+    // launch: a mass-duplicate storm. Instead treat the bridge as un-initialized and disable it,
+    // spawning a thread that just exits. The snapshot reads the SAME process-wide connection the
+    // poller then polls on (no open-and-close).
+    let snapshot = BusDb::shared(&bus_db_path).and_then(|db| db.tail_event_id().map(|t| (db, t)));
+    let (db, floor_init) = match snapshot {
+        Ok(ok) => ok,
+        Err(e) => {
             eprintln!(
-                "wicked-core: bus bridge disabled — cannot snapshot cursor floor from bus db \
-                 {bus_db_path}; refusing to replay history"
+                "wicked-core: bus bridge disabled — cannot snapshot cursor floor from bus db                  {bus_db_path}: {e:#}; refusing to replay history"
             );
             return std::thread::spawn(|| {});
         }
     };
-    std::thread::spawn(move || {
-        let db = match BusDb::open(&bus_db_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: bus bridge disabled — cannot open bus db {bus_db_path}: {e}"
-                );
-                return;
-            }
-        };
-        // Start at the tail SNAPSHOTTED BEFORE SPAWN (above): only requests newer than connect-time
-        // drive launches, and a request emitted right after connect is never missed.
-        let mut floor: i64 = floor_init;
-        let filter = RUN_REQUESTED; // exact-match filter
+    std::thread::Builder::new()
+        .name(BUS_POLLER_THREAD.into())
+        .spawn(move || {
+            let _live = LiveBridge::enter();
+            run_requested_poll_loop(db, floor_init, tx, roster, entity_mode, poll_interval, stop)
+        })
+        .expect("spawn the bus bridge thread")
+}
 
-        while !stop.load(Ordering::SeqCst) {
-            let events = match db.poll(filter, floor, 100) {
-                Ok(evs) => evs,
-                Err(e) => {
-                    eprintln!("wicked-core: bus poll error: {e}");
-                    Vec::new()
+/// The name of the launch-bridge thread (the thread that opens and owns the engine's bus handle on a
+/// default boot). Tests assert the handle was opened here, never on the actor thread.
+pub const BUS_POLLER_THREAD: &str = "wicked-core-bus-poller";
+
+/// Launch-bridge threads alive in this process (test + diagnostic surface: a bridge must never
+/// outlive the engine that armed it).
+static LIVE_BUS_BRIDGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one live bridge thread for as long as it is held.
+struct LiveBridge;
+impl LiveBridge {
+    fn enter() -> Self {
+        LIVE_BUS_BRIDGES.fetch_add(1, Ordering::SeqCst);
+        LiveBridge
+    }
+}
+impl Drop for LiveBridge {
+    fn drop(&mut self) {
+        LIVE_BUS_BRIDGES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How many launch-bridge threads are alive in this process.
+#[doc(hidden)]
+pub fn live_bus_bridges() -> usize {
+    LIVE_BUS_BRIDGES.load(Ordering::SeqCst)
+}
+
+/// The name of the thread that opens the bus and runs exec mediation's consumer init at actor start
+/// (DES-TEAMING-002 T0 — never the actor thread).
+pub const BUS_EXEC_INIT_THREAD: &str = "wicked-core-bus-exec-init";
+
+/// How long `Core::spawn*` waits for the launch bridge to open the bus and read its start point
+/// before it reports the bridge not armed (DES-TEAMING-002 T0).
+pub const BUS_ARM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What arming the launch bridge came to, as `Core::bus_bridge_state` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusBridgeState {
+    /// No bus was configured (`WICKED_BUS_DB` unset): no bridge.
+    NoBus,
+    /// The bridge polls `wicked.crew.run.requested` strictly after event id `floor` — the bus tail
+    /// when `spawn` returned.
+    Armed { floor: i64 },
+    /// The bridge could not open the bus or read its start point within [`BUS_ARM_TIMEOUT`]; it
+    /// polls nothing (it never guesses a start point). `reason` says why.
+    NotArmed { reason: String },
+}
+
+/// Where `Core::spawn*` leaves the armed bridge. The actor thread starts FIRST (its store open runs
+/// while the bridge arms), so the slot is filled after it. Both `spawn` and the actor hold it, and
+/// the bridge has ONE owner in the end: whichever drops the last reference drops the
+/// [`ArmedBridge`], which stops and joins it — the actor at its exit, or `spawn` itself when the
+/// actor already returned early (e.g. it could not open its store). No path leaves it running.
+pub(crate) type BridgeSlot = Arc<Mutex<Option<ArmedBridge>>>;
+
+/// The launch bridge as `Core::spawn*` armed it: the thread to stop + join at actor exit, and the
+/// state to report.
+pub(crate) struct ArmedBridge {
+    pub(crate) handle: Option<JoinHandle<()>>,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) state: BusBridgeState,
+}
+
+impl Drop for ArmedBridge {
+    /// Stop the bridge thread and join it: dropping the bridge is how its owner ends it.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Arm the launch bridge with a synchronous, BOUNDED handshake (DES-TEAMING-002 T0). Runs on the
+/// caller of `Core::spawn*` — never the actor. The bridge thread opens the process-wide bus handle
+/// and reads `MAX(event_id)`; the caller waits at most `timeout` for that floor and returns only
+/// once the bridge is armed with it. So a request emitted after `spawn` returns has an id above
+/// the floor and is delivered, and a row already on the bus is history and is never launched —
+/// whatever its `emitted_at` says (the floor is an event id, never a wall-clock time). On a
+/// timeout or an open error the bridge is NOT armed: the thread exits without polling (a late
+/// snapshot would be a guess), and the state says why.
+pub(crate) fn arm_run_requested_bridge(
+    bus_db_path: String,
+    tx: Sender<Command>,
+    roster: Vec<AgenticCli>,
+    entity_mode: EntityMode,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> ArmedBridge {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (floor_tx, floor_rx) = std::sync::mpsc::sync_channel::<Result<i64, String>>(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let thread_stop = stop.clone();
+    let path = bus_db_path.clone();
+    let spawned = std::thread::Builder::new()
+        .name(BUS_POLLER_THREAD.into())
+        .spawn(move || {
+            let _live = LiveBridge::enter();
+            let snapshot = BusDb::shared(&path).and_then(|db| db.tail_event_id().map(|t| (db, t)));
+            match snapshot {
+                Ok((db, floor)) => {
+                    // The caller gave up (timed out) → it dropped its ends: exit without polling.
+                    if floor_tx.send(Ok(floor)).is_err() || go_rx.recv().is_err() {
+                        return;
+                    }
+                    run_requested_poll_loop(
+                        db,
+                        floor,
+                        tx,
+                        roster,
+                        entity_mode,
+                        poll_interval,
+                        thread_stop,
+                    )
                 }
-            };
-            for ev in events {
-                match launch_from_event(&tx, &db, &roster, entity_mode, &ev, &stop) {
-                    // Handled (launched OR idempotent redelivery) → advance PAST this request.
-                    Ok(()) => {
-                        floor = ev.event_id;
-                    }
-                    // The Core dropped, or we're stopping — exit the thread so its `join()` returns.
-                    Err(BridgeError::ActorGone) | Err(BridgeError::Stopped) => return,
-                    // Poison payload → advance past it (retrying is futile; don't wedge the batch).
-                    Err(BridgeError::Permanent(e)) => {
-                        eprintln!(
-                            "wicked-core: bus bridge dropping unprocessable event {} (permanent): {e}",
-                            ev.event_id
-                        );
-                        floor = ev.event_id;
-                    }
-                    // Transient fault → do NOT advance the floor; break the batch and re-poll after the
-                    // sleep so this request is RETRIED (at-least-once, not at-most-once).
-                    Err(BridgeError::Retriable(e)) => {
-                        eprintln!(
-                            "wicked-core: bus bridge could not launch run for event {} (transient, \
-                             will retry): {e}",
-                            ev.event_id
-                        );
-                        break;
-                    }
+                Err(e) => {
+                    let _ = floor_tx.send(Err(format!("{e:#}")));
                 }
             }
-            // Sleep in short slices so `stop` is honored promptly.
-            let mut slept = Duration::ZERO;
-            let slice = Duration::from_millis(50);
-            while slept < poll_interval && !stop.load(Ordering::SeqCst) {
-                std::thread::sleep(slice);
-                slept += slice;
+        });
+    let handle = match spawned {
+        Ok(h) => h,
+        Err(e) => {
+            return ArmedBridge {
+                handle: None,
+                stop,
+                state: BusBridgeState::NotArmed {
+                    reason: format!("cannot spawn the bus bridge thread: {e}"),
+                },
             }
         }
-    })
+    };
+    let state = match floor_rx.recv_timeout(timeout) {
+        Ok(Ok(floor)) if go_tx.send(()).is_ok() => BusBridgeState::Armed { floor },
+        Ok(Ok(_)) => BusBridgeState::NotArmed {
+            reason: "the bus bridge thread exited before it was armed".into(),
+        },
+        Ok(Err(reason)) => BusBridgeState::NotArmed {
+            reason: format!("cannot open bus db {bus_db_path}: {reason}"),
+        },
+        Err(_) => BusBridgeState::NotArmed {
+            reason: format!(
+                "bus db {bus_db_path} did not answer within {timeout:?} (locked or slow)"
+            ),
+        },
+    };
+    if let BusBridgeState::NotArmed { reason } = &state {
+        eprintln!(
+            "wicked-core: bus bridge NOT armed — {reason}; no `wicked.crew.run.requested` is \
+             launched from the bus by this engine"
+        );
+    }
+    ArmedBridge {
+        handle: Some(handle),
+        stop,
+        state,
+    }
+}
+
+fn run_requested_poll_loop(
+    db: BusDb,
+    floor_init: i64,
+    tx: Sender<Command>,
+    roster: Vec<AgenticCli>,
+    entity_mode: EntityMode,
+    poll_interval: Duration,
+    stop: Arc<AtomicBool>,
+) {
+    // Start at `floor_init` — an event id read synchronously before the caller returned (the
+    // caller's own snapshot, or the arming handshake): only requests after it drive launches, and
+    // none emitted after the caller returned is missed.
+    let mut floor: i64 = floor_init;
+    let filter = RUN_REQUESTED; // exact-match filter
+
+    while !stop.load(Ordering::SeqCst) {
+        let events = match db.poll(filter, floor, 100) {
+            Ok(evs) => evs,
+            Err(e) => {
+                eprintln!("wicked-core: bus poll error: {e}");
+                Vec::new()
+            }
+        };
+        for ev in events {
+            match launch_from_event(&tx, &db, &roster, entity_mode, &ev, &stop) {
+                // Handled (launched OR idempotent redelivery) → advance PAST this request.
+                Ok(()) => {
+                    floor = ev.event_id;
+                }
+                // The Core dropped, or we're stopping — exit the thread so its `join()` returns.
+                Err(BridgeError::ActorGone) | Err(BridgeError::Stopped) => return,
+                // Poison payload → advance past it (retrying is futile; don't wedge the batch).
+                Err(BridgeError::Permanent(e)) => {
+                    eprintln!(
+                        "wicked-core: bus bridge dropping unprocessable event {} (permanent): {e}",
+                        ev.event_id
+                    );
+                    floor = ev.event_id;
+                }
+                // Transient fault → do NOT advance the floor; break the batch and re-poll after the
+                // sleep so this request is RETRIED (at-least-once, not at-most-once).
+                Err(BridgeError::Retriable(e)) => {
+                    eprintln!(
+                        "wicked-core: bus bridge could not launch run for event {} (transient, \
+                         will retry): {e}",
+                        ev.event_id
+                    );
+                    break;
+                }
+            }
+        }
+        // Sleep in short slices so `stop` is honored promptly.
+        let mut slept = Duration::ZERO;
+        let slice = Duration::from_millis(50);
+        while slept < poll_interval && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(slice);
+            slept += slice;
+        }
+    }
 }
 
 enum BridgeError {
@@ -923,6 +1319,85 @@ mod tests {
         dir.join("bus.db").to_str().unwrap().to_string()
     }
 
+    /// T0 connection rule, file identity: a bus file deleted and recreated under the same path is a
+    /// DIFFERENT database. `shared` must notice (the path still exists) and open the new file — the
+    /// old handle is leaked, never closed — instead of polling and emitting on the unlinked one.
+    #[cfg(unix)] // Windows refuses to delete a file SQLite holds open — see `FileIdentity`.
+    #[test]
+    fn shared_reopens_a_bus_file_recreated_under_the_same_path() {
+        let path = tmp_bus("shared-recreated");
+        let old = BusDb::shared(&path).unwrap();
+        old.emit(&BusEmit::new(
+            RUN_REQUESTED,
+            "t",
+            "t",
+            serde_json::json!({"n": "old"}),
+        ))
+        .unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+        // Another writer recreates the bus at the same path and emits one row.
+        let external = BusDb::open(&path).unwrap();
+        let fresh_id = external
+            .emit(&BusEmit::new(
+                RUN_REQUESTED,
+                "t",
+                "t",
+                serde_json::json!({"n": "new"}),
+            ))
+            .unwrap();
+        drop(external);
+
+        let again = BusDb::shared(&path).unwrap();
+        let rows = again.poll(RUN_REQUESTED, 0, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.payload["n"].clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!("new")],
+            "the next shared() handle reads the recreated file"
+        );
+        assert_eq!(again.tail_event_id().unwrap(), fresh_id);
+        assert_eq!(
+            shared_bus_stats(&path).map(|s| s.0),
+            Some(2),
+            "the reopen is counted"
+        );
+    }
+
+    /// T0 connection rule: one handle per bus file per process; clones and repeat calls share it.
+    #[test]
+    fn shared_opens_once_per_file_and_clones_share_the_connection() {
+        let path = tmp_bus("shared-once");
+        let a = BusDb::shared(&path).unwrap();
+        let b = BusDb::shared(&path).unwrap();
+        assert!(Arc::ptr_eq(&a.conn, &b.conn), "one connection");
+        let id = a
+            .emit(&BusEmit::new(
+                RUN_REQUESTED,
+                "t",
+                "t",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        assert_eq!(b.tail_event_id().unwrap(), id);
+        drop(a);
+        drop(b);
+        assert_eq!(shared_bus_stats(&path).map(|s| s.0), Some(1));
+        let c = BusDb::shared(&path).unwrap();
+        assert_eq!(
+            c.tail_event_id().unwrap(),
+            id,
+            "dropping handles closed nothing"
+        );
+        assert_eq!(
+            shared_bus_stats(&path).map(|s| s.0),
+            Some(1),
+            "and reopened nothing"
+        );
+    }
+
     #[test]
     fn emit_then_poll_roundtrips_within_rust() {
         let db = BusDb::open(&tmp_bus("rt")).unwrap();
@@ -961,7 +1436,7 @@ mod tests {
             "a re-emit of a pinned-key event dedups to the same id"
         );
         let count: i64 = db
-            .conn
+            .lock()
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "only one physical row exists");
@@ -1073,7 +1548,7 @@ mod tests {
             ))
             .unwrap();
         let (expires_at, dedup_expires_at): (i64, i64) = db
-            .conn
+            .lock()
             .query_row(
                 "SELECT expires_at, dedup_expires_at FROM events WHERE event_id = ?1",
                 [id],
@@ -1115,7 +1590,7 @@ mod tests {
                 "re-save upserts in place"
             );
             let count: i64 = db
-                .conn
+                .lock()
                 .query_row("SELECT COUNT(*) FROM core_exec_cursors", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(count, 1, "one row per consumer");

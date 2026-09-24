@@ -770,6 +770,7 @@ mod wal_checkpoint_tests {
 /// between `shared_run_terminal` (holds `write_reg`, then acquires `maps`) and
 /// session-start helpers (acquire `maps` alone).
 pub(crate) fn run(
+    bus_bridge: crate::bus::BridgeSlot,
     path: String,
     rx: Receiver<Command>,
     self_tx: Sender<Command>,
@@ -974,27 +975,12 @@ pub(crate) fn run(
         }
     }
 
-    // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): if a bus db is configured via `WICKED_BUS_DB`, spawn
-    // the launch poller. It runs on its OWN thread with its OWN SQLite connection to the bus db (a
-    // different file from the estate store this actor owns), and reaches this actor ONLY by sending
-    // `Command::LaunchRun` over `self_tx` — the exact self_tx write-back pattern the unit workers use.
-    // So a blocking bus poll can never stall the single writer. Opt-in via env so existing embeddings
-    // /tests (env unset) are unaffected. The `bus_stop` flag + join on loop-exit below guarantee the
-    // poller thread is not leaked when the last `Core` drops.
-    let bus_stop = Arc::new(AtomicBool::new(false));
-    let bus_bridge: Option<std::thread::JoinHandle<()>> = std::env::var("WICKED_BUS_DB")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(|bus_db| {
-            crate::bus::spawn_run_requested_poller(
-                bus_db,
-                self_tx.clone(),
-                crate::registry_roster(),
-                crate::scope::EntityMode::Shared,
-                std::time::Duration::from_millis(500),
-                bus_stop.clone(),
-            )
-        });
+    // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): the launch poller `Core::spawn*` arms (when
+    // `WICKED_BUS_DB` is set) on the caller's thread while this one starts, with a bounded handshake —
+    // never here (DES-TEAMING-002 T0: this thread never opens the bus and never waits on it). It
+    // reaches this actor ONLY by sending `Command::LaunchRun` over `self_tx`, and `spawn` leaves it
+    // in `bus_bridge` for the stop + join on loop-exit below, so the poller thread is not leaked when
+    // the last `Core` drops; the bus connection itself stays open for the life of the process.
 
     // Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) — OPT-IN. Resolve the bus db to mediate
     // execution over: the explicit `spawn_with_engine_exec` override wins; otherwise the env gate
@@ -1018,41 +1004,61 @@ pub(crate) fn run(
     // So we first CONFIRM both consumers can initialize (bus-db open ok + durable cursor resolved) via
     // `init_exec_consumers`; only then do we arm the publisher and spawn the consumer threads. If either
     // step fails, exec mode stays OFF and the default in-process path stands.
+    // DES-TEAMING-002 T0: the opens and the cursor reclamation run on a BUS thread, never this one;
+    // this thread waits for that thread's answer, which keeps exec mode's startup contract exactly as
+    // it was (armed before the first command, redrive before the orphan report).
     let exec_stop = Arc::new(AtomicBool::new(false));
-    let exec_handles: Vec<std::thread::JoinHandle<()>> = match &exec_bus_db {
-        Some(bus_db) => match crate::cli_runner::init_exec_consumers(bus_db, bus_db, process_gen) {
-            Some(consumers) if crate::cli_runner::arm_exec_publisher(bus_db) => {
-                let interval = std::time::Duration::from_millis(100);
-                let handles = crate::cli_runner::spawn_exec_consumers(
-                    consumers,
-                    runner.clone(),
-                    self_tx.clone(),
-                    lifecycle_maps.clone(),
-                    process_gen,
-                    interval,
-                    exec_stop.clone(),
-                );
-                // RESTART RECOVERY (seam finding #1): re-drive any session persisted `Executing` — a
-                // dispatch lost across a crash/restart (task.dispatched never completed, or its result
-                // never applied) recovers by re-dispatching the cursor unit under a BUMPED attempt so a
-                // genuinely NEW `task.dispatched` is emitted (a same-keyed re-emit would dedup to the
-                // terminal row the cli-runner's cursor is already past → no re-run). Armed-mode ONLY, so
-                // the default in-process path — which has no cross-restart durability — is untouched.
-                redrive_executing_sessions(
-                    &mut store,
-                    &mut subscribers,
-                    &runner,
-                    &self_tx,
-                    &mut in_flight,
-                    &lifecycle_maps,
-                    &actor_maps,
-                    process_gen,
-                    is_acp,
-                );
-                handles
-            }
-            _ => Vec::new(),
-        },
+    let exec_init = exec_bus_db.as_ref().and_then(|bus_db| {
+        let bus_db = bus_db.clone();
+        std::thread::Builder::new()
+            .name(crate::bus::BUS_EXEC_INIT_THREAD.into())
+            .spawn(move || {
+                let consumers =
+                    crate::cli_runner::init_exec_consumers(&bus_db, &bus_db, process_gen)?;
+                let publisher = crate::bus::BusDb::shared(&bus_db)
+                    .map_err(|e| {
+                        eprintln!(
+                            "wicked-core: exec-mediation disabled — no bus handle for {bus_db}: {e}"
+                        )
+                    })
+                    .ok()?;
+                Some((consumers, publisher))
+            })
+            .ok()
+            .and_then(|h| h.join().ok().flatten())
+    });
+    let exec_handles: Vec<std::thread::JoinHandle<()>> = match exec_init {
+        Some((consumers, publisher)) => {
+            crate::cli_runner::arm_exec_publisher(publisher);
+            let interval = std::time::Duration::from_millis(100);
+            let handles = crate::cli_runner::spawn_exec_consumers(
+                consumers,
+                runner.clone(),
+                self_tx.clone(),
+                lifecycle_maps.clone(),
+                process_gen,
+                interval,
+                exec_stop.clone(),
+            );
+            // RESTART RECOVERY (seam finding #1): re-drive any session persisted `Executing` — a
+            // dispatch lost across a crash/restart (task.dispatched never completed, or its result
+            // never applied) recovers by re-dispatching the cursor unit under a BUMPED attempt so a
+            // genuinely NEW `task.dispatched` is emitted (a same-keyed re-emit would dedup to the
+            // terminal row the cli-runner's cursor is already past → no re-run). Armed-mode ONLY, so
+            // the default in-process path — which has no cross-restart durability — is untouched.
+            redrive_executing_sessions(
+                &mut store,
+                &mut subscribers,
+                &runner,
+                &self_tx,
+                &mut in_flight,
+                &lifecycle_maps,
+                &actor_maps,
+                process_gen,
+                is_acp,
+            );
+            handles
+        }
         None => Vec::new(),
     };
     // Whatever the mode, anything still persisted `Executing` at this point has no worker in THIS
@@ -3317,10 +3323,13 @@ pub(crate) fn run(
         }
     }
     // Stop + join the bus bridge poller (if any) so it is never leaked past the actor's lifetime.
-    bus_stop.store(true, Ordering::SeqCst);
-    if let Some(h) = bus_bridge {
-        let _ = h.join();
-    }
+    // (`ArmedBridge::drop` sets its stop flag and joins it; an early return above drops this
+    // thread's reference instead, and the last reference — here or in `spawn` — does the same.)
+    let armed = bus_bridge
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    drop(armed);
     // Stop + join the exec-mediation threads (cli-runner + task.completed poller) and disarm the
     // actor-thread publisher, so exec mode leaks no thread past the actor's lifetime (DES §5, R1).
     // BOUNDED-join, not unbounded (seam finding #5): the cli-runner may be mid-CLI (an unbounded
@@ -7002,6 +7011,9 @@ fn dispatch_unit(
         .collect();
     let runner = runner.clone();
     let tx = self_tx.clone();
+    // The bus exec mediation is armed over (a publish that fell back in-process): the judge still
+    // publishes there — read HERE, on the actor thread that owns the thread-local publisher.
+    let exec_bus = crate::cli_runner::armed_exec_bus();
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -7038,6 +7050,7 @@ fn dispatch_unit(
             &emit,
             &run_roster_keys,
             &benched_keys,
+            exec_bus.as_deref(),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,

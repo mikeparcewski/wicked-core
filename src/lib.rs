@@ -94,8 +94,9 @@ pub use applications::{
     Application, SeedKind,
 };
 pub use bus::{
-    deterministic_key, matches_filter, BusBridge, BusDb, BusEmit, BusEvent, CORE_DOMAIN,
-    RUN_LAUNCHED, RUN_REQUESTED,
+    deterministic_key, live_bus_bridges, matches_filter, shared_bus_stats, BusBridge,
+    BusBridgeState, BusDb, BusEmit, BusEvent, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD,
+    BUS_POLLER_THREAD, CORE_DOMAIN, RUN_LAUNCHED, RUN_REQUESTED,
 };
 pub use campaign::{
     all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
@@ -353,10 +354,51 @@ pub struct Core {
     /// read: routing it through the command channel would queue an evidence read behind whatever the
     /// single writer is doing.
     log_root: std::path::PathBuf,
+    /// What arming the launch bridge came to at spawn (DES-TEAMING-002 T0) — see
+    /// [`Core::bus_bridge_state`].
+    bus_bridge_state: crate::bus::BusBridgeState,
     _shutdown: Arc<ShutdownGuard>,
 }
 
+/// Arm the launch bridge for a `Core` about to spawn, when `WICKED_BUS_DB` names a bus
+/// (DES-TEAMING-002 T0). Runs on the `spawn` caller's thread; bounded by
+/// [`crate::bus::BUS_ARM_TIMEOUT`].
+fn arm_bus_bridge(
+    tx: &Sender<Command>,
+    slot: &crate::bus::BridgeSlot,
+) -> crate::bus::BusBridgeState {
+    match std::env::var("WICKED_BUS_DB")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
+        None => crate::bus::BusBridgeState::NoBus,
+        Some(bus_db) => {
+            let armed = crate::bus::arm_run_requested_bridge(
+                bus_db,
+                tx.clone(),
+                crate::registry_roster(),
+                crate::scope::EntityMode::Shared,
+                std::time::Duration::from_millis(500),
+                crate::bus::BUS_ARM_TIMEOUT,
+            );
+            let state = armed.state.clone();
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(armed);
+            state
+        }
+    }
+}
+
 impl Core {
+    /// What arming the launch bridge came to when this `Core` spawned (DES-TEAMING-002 T0):
+    /// [`BusBridgeState::NoBus`] without `WICKED_BUS_DB`, `Armed { floor }` when it polls from the
+    /// bus tail as of `spawn`, or `NotArmed { reason }` when the bus did not open or answer within
+    /// [`BUS_ARM_TIMEOUT`] — the engine then launches nothing from the bus, and says so here.
+    pub fn bus_bridge_state(&self) -> &BusBridgeState {
+        &self.bus_bridge_state
+    }
+
     /// Spawn the store actor over the estate store at `path`, with the production engine seams: the
     /// real council dispatcher + the ACP multi-CLI session runner. ACP is the default — each CLI
     /// runs its wrapper binary in a persistent session so turns within a run share prompt-cache.
@@ -517,8 +559,13 @@ impl Core {
         ));
         let empty_write_reg: crate::acp_runner::WriteReg =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
+        // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
+        let bus_bridge: crate::bus::BridgeSlot = Default::default();
+        let bus_bridge_actor = bus_bridge.clone();
         std::thread::spawn(move || {
             actor::run(
+                bus_bridge_actor,
                 path,
                 rx,
                 self_tx,
@@ -531,11 +578,15 @@ impl Core {
                 empty_write_reg,
             )
         });
+        // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
+        // it polls strictly after the bus tail as of now, or has reported itself not armed.
+        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
         let core = Core {
             tx: tx.clone(),
             pty,
             chat: None, // PTY runner — ACP chat sessions unavailable
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
+            bus_bridge_state,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -588,8 +639,13 @@ impl Core {
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
+        // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
+        // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
+        let bus_bridge: crate::bus::BridgeSlot = Default::default();
+        let bus_bridge_actor = bus_bridge.clone();
         std::thread::spawn(move || {
             actor::run(
+                bus_bridge_actor,
                 path,
                 rx,
                 self_tx,
@@ -603,11 +659,15 @@ impl Core {
             )
         });
         spawn_chat_reaper(&runner);
+        // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
+        // it polls strictly after the bus tail as of now, or has reported itself not armed.
+        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
         let core = Core {
             tx: tx.clone(),
             pty,
             chat: Some(runner.clone()),
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
+            bus_bridge_state,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -633,8 +693,13 @@ impl Core {
         ));
         let spawn_write_reg: crate::acp_runner::WriteReg =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
+        // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
+        let bus_bridge: crate::bus::BridgeSlot = Default::default();
+        let bus_bridge_actor = bus_bridge.clone();
         std::thread::spawn(move || {
             actor::run(
+                bus_bridge_actor,
                 path,
                 rx,
                 self_tx,
@@ -647,11 +712,15 @@ impl Core {
                 spawn_write_reg,
             )
         });
+        // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
+        // it polls strictly after the bus tail as of now, or has reported itself not armed.
+        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
         Core {
             tx: tx.clone(),
             pty,
             chat: None, // injected runner (tests / bus seam) — ACP chat sessions unavailable
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
+            bus_bridge_state,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }
@@ -669,8 +738,9 @@ impl Core {
     /// bus into a `LaunchRun` on this actor, and emits `wicked.run.launched` back onto the bus when a
     /// run starts. `roster` is the council seats a launched run runs with (a caller passes
     /// [`registry_roster`] in production). The returned [`BusBridge`] owns the thread — drop it (or
-    /// call [`BusBridge::stop`]) to stop polling. The poller runs entirely off the actor thread with
-    /// its own SQLite connection to the bus db, reaching the actor only via commands (actor-safe).
+    /// call [`BusBridge::stop`]) to stop polling. The poller polls through the process-wide shared
+    /// bus handle ([`BusDb::shared`]); it is actor-safe because it runs entirely off the actor thread
+    /// and reaches the actor only via commands.
     pub fn connect_bus(
         &self,
         bus_db_path: impl Into<String>,
