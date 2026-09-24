@@ -4072,8 +4072,32 @@ mod judge_routing_tests {
         );
     }
 
+    /// Restores each named variable to what it was when captured, on drop.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     #[test]
     fn bus_db_without_exec_keeps_the_inline_judge_for_an_evidence_floor_pinned_unit() {
+        // The crate-wide env lock for the WHOLE scope (it mutates process env the judge reads);
+        // declared first so it is released last, after `_restore` puts both variables back.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore::capture(&["WICKED_BUS_DB", "WICKED_BUS_EXEC"]);
         let dir =
             std::env::temp_dir().join(format!("wicked-core-judge-routing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4148,7 +4172,6 @@ mod judge_routing_tests {
 
         stop.store(true, Ordering::SeqCst);
         let _ = responder.join();
-        std::env::remove_var("WICKED_BUS_DB");
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(

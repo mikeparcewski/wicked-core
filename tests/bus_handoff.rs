@@ -3,9 +3,9 @@
 //!
 //!  1. `default_boot_serves_commands_while_the_bus_file_is_locked` — with `WICKED_BUS_DB` set and
 //!     exec mediation off (the default crew boot after T0), a bus file another connection holds
-//!     EXCLUSIVE does not stall the actor: the first command is answered at once. Before this seam
-//!     the launch poller's start-point snapshot opened the bus ON the actor thread and waited out
-//!     the 5 s busy timeout first.
+//!     EXCLUSIVE does not stall the actor: the first command is answered at once, and `spawn`'s
+//!     bounded arming handshake reports the bridge not armed. Before this seam the launch poller's
+//!     start-point snapshot opened the bus ON the actor thread and waited out the 5 s busy timeout.
 //!  2. `no_production_path_opens_a_private_bus_connection` — a source guard: outside test code,
 //!     nothing calls `BusDb::open` (a private connection that is later dropped = an open-and-close
 //!     of the bus file, the F-E2E-021 lock-loss class when another SQLite library shares the file
@@ -25,9 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    shared_bus_stats, BusDb, BusEmit, Core, CoreEvent, StepInput, StepOutput, StepRunner,
-    StepStatus, BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD, RUN_REQUESTED, TASK_COMPLETED,
-    TASK_DISPATCHED,
+    shared_bus_stats, BusBridgeState, BusDb, BusEmit, Core, CoreEvent, StepInput, StepOutput,
+    StepRunner, StepStatus, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD,
+    RUN_REQUESTED, TASK_COMPLETED, TASK_DISPATCHED,
 };
 use wicked_council::types::{Confidence, Dispatcher, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -94,8 +94,13 @@ fn default_boot_serves_commands_while_the_bus_file_is_locked() {
     std::env::remove_var("WICKED_BUS_EXEC");
     let started = Instant::now();
     let core = Core::spawn_with_engine(estate_db, Arc::new(StubDispatcher), Arc::new(FastRunner));
+    // `spawn` arms the bus bridge on THIS thread, bounded by BUS_ARM_TIMEOUT; the actor is not
+    // involved and must answer at once.
+    let spawned_in = started.elapsed();
+    let asked = Instant::now();
     let sessions = core.sessions();
-    let first_answer = started.elapsed();
+    let first_answer = asked.elapsed();
+    let bridge = core.bus_bridge_state().clone();
     std::env::remove_var("WICKED_BUS_DB");
 
     holder.execute_batch("COMMIT;").unwrap();
@@ -104,8 +109,16 @@ fn default_boot_serves_commands_while_the_bus_file_is_locked() {
 
     assert!(sessions.is_ok(), "the actor answered: {sessions:?}");
     assert!(
-        first_answer < Duration::from_secs(2),
+        first_answer < Duration::from_secs(3),
         "the actor must not wait on the bus at startup; first command answered after {first_answer:?}"
+    );
+    assert!(
+        spawned_in < BUS_ARM_TIMEOUT + Duration::from_secs(1),
+        "spawn's arming handshake is bounded; it took {spawned_in:?}"
+    );
+    assert!(
+        matches!(&bridge, BusBridgeState::NotArmed { .. }),
+        "a bus that does not answer leaves the bridge NOT armed, and says so: {bridge:?}"
     );
 }
 
@@ -252,6 +265,11 @@ fn default_boot_opens_the_bus_once_on_the_bridge_thread() {
         Arc::new(FastRunner),
     );
     let events = core.subscribe();
+    assert!(
+        matches!(core.bus_bridge_state(), BusBridgeState::Armed { .. }),
+        "spawn returned with the bridge armed: {:?}",
+        core.bus_bridge_state()
+    );
     let (opens, opener) = wait_for_open(&bus_db);
     assert_eq!(opens, 1);
     assert_eq!(

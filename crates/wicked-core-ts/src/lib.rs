@@ -740,6 +740,25 @@ impl Core {
         })
     }
 
+    /// What arming the engine's launch bridge came to when this `Core` spawned (DES-TEAMING-002 T0),
+    /// as JSON: `{ "state": "none" }` (no `WICKED_BUS_DB`), `{ "state": "armed", "floor": <event id> }`,
+    /// or `{ "state": "not-armed", "reason": "…" }` — the bus did not open or answer within the arming
+    /// bound, so this engine launches nothing from the bus. crew reports `not-armed` on
+    /// `/health.warnings` (`bus.unavailable`).
+    #[napi]
+    pub fn bus_bridge_state(&self) -> String {
+        match self.inner.bus_bridge_state() {
+            wicked_core::BusBridgeState::NoBus => serde_json::json!({ "state": "none" }),
+            wicked_core::BusBridgeState::Armed { floor } => {
+                serde_json::json!({ "state": "armed", "floor": floor })
+            }
+            wicked_core::BusBridgeState::NotArmed { reason } => {
+                serde_json::json!({ "state": "not-armed", "reason": reason })
+            }
+        }
+        .to_string()
+    }
+
     /// EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
     /// governance events to (`WICKED_ESTATE_DB`; wicked-crew#495) — as a JSON number string, over
     /// a READ-ONLY connection (never the single-writer actor's handle; the store must already

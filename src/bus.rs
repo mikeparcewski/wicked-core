@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS core_exec_meta (
 );
 "#;
 
-pub(crate) fn now_ms() -> i64 {
+fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -300,9 +300,10 @@ impl BusDb {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = registry.get(&key) {
-            // A bus file deleted and recreated under the same path is a different database: the
-            // old connection stays open (never closed) and a fresh one is registered.
-            if key.exists() {
+            // A bus file deleted and recreated under the same path is a DIFFERENT database: reuse
+            // the handle only while the path still names the file it opened (same identity). On a
+            // mismatch the old connection stays open (never closed) and a fresh one is registered.
+            if entry.identity.is_some() && file_identity(&key) == entry.identity {
                 return Ok(entry.db.clone());
             }
         }
@@ -320,6 +321,7 @@ impl BusDb {
             dedup_ttl_hours,
         };
         let opener = std::thread::current().name().unwrap_or("").to_string();
+        let identity = file_identity(&key);
         let opens = match registry.get(&key) {
             Some(replaced) => {
                 // Never close the replaced connection either: leak one strong reference to it.
@@ -334,6 +336,7 @@ impl BusDb {
                 db: db.clone(),
                 opens,
                 opener,
+                identity,
             },
         );
         SHARED_OPENS_TOTAL.fetch_add(1, Ordering::SeqCst);
@@ -389,6 +392,40 @@ struct SharedEntry {
     opens: usize,
     /// The name of the thread that opened the current connection ("" when unnamed).
     opener: String,
+    /// The identity of the file the current connection opened ([`file_identity`]), taken right
+    /// after the open; `None` if it could not be read (the next lookup then reopens).
+    identity: Option<FileIdentity>,
+}
+
+/// Which file a path names, as the OS identifies it.
+///
+/// - Unix: `(st_dev, st_ino)`. While our connection holds the old file open its inode cannot be
+///   reused, so a file deleted and recreated under the same path always has a different identity.
+/// - Windows: the file's creation time (`MetadataExt::creation_time`, stable std; the volume serial
+///   and file index are not stable std). The case this guards barely exists there: SQLite opens the file without
+///   `FILE_SHARE_DELETE`, so the OS refuses to delete a bus file our handle holds open. Creation
+///   time is a best-effort second line (NTFS "tunneling" can carry it over to a file recreated
+///   under the same name within seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity(u64, u64);
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileIdentity(meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(FileIdentity(meta.creation_time(), 0))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 static SHARED_OPENS_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -527,29 +564,6 @@ impl BusDb {
             .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
                 r.get(0)
             })?)
-    }
-
-    /// The start point for a poller that connects AFTER the moment it must not miss anything from
-    /// (`start_ms`, epoch ms): just before the first row emitted at or after `start_ms`, else the
-    /// tail. So every row emitted from `start_ms` on is delivered however late the poller connects;
-    /// a row emitted before it but written later (another writer's clock, same millisecond) may be
-    /// delivered too, which at-least-once consumers absorb. [`spawn_run_requested_poller_off_actor`]
-    /// uses it in place of a synchronous tail snapshot on the actor thread.
-    pub fn floor_before(&self, start_ms: i64) -> Result<i64> {
-        let conn = self.lock();
-        let first_after: Option<i64> = conn.query_row(
-            "SELECT MIN(event_id) FROM events WHERE emitted_at >= ?1",
-            [start_ms],
-            |r| r.get(0),
-        )?;
-        match first_after {
-            Some(id) => Ok(id - 1),
-            None => Ok(conn.query_row(
-                "SELECT COALESCE(MAX(event_id), 0) FROM events",
-                [],
-                |r| r.get(0),
-            )?),
-        }
     }
 
     /// Override the connection's SQLite busy timeout. Used by the exec-mediation PUBLISHER (finding #8):
@@ -935,45 +949,118 @@ pub const BUS_POLLER_THREAD: &str = "wicked-core-bus-poller";
 /// (DES-TEAMING-002 T0 — never the actor thread).
 pub const BUS_EXEC_INIT_THREAD: &str = "wicked-core-bus-exec-init";
 
-/// The actor's startup wiring for the launch bridge (DES-TEAMING-002 T0): identical to
-/// [`spawn_run_requested_poller`] except that the bus is opened and the start point snapshotted ON
-/// the bridge thread, so the actor never opens the bus and never waits on it — a locked or slow bus
-/// file costs the actor nothing. The happens-before guarantee is kept by TIME instead of by a
-/// synchronous snapshot: `start_ms` is taken by `Core::spawn*` before it returns, and the bridge
-/// starts at [`BusDb::floor_before`]`(start_ms)`, so a request emitted after `spawn` returned is
-/// delivered however late the bridge thread connects (the old snapshot, read in the actor's startup
-/// preamble, could miss one emitted in that preamble's window).
-pub(crate) fn spawn_run_requested_poller_off_actor(
+/// How long `Core::spawn*` waits for the launch bridge to open the bus and read its start point
+/// before it reports the bridge not armed (DES-TEAMING-002 T0).
+pub const BUS_ARM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What arming the launch bridge came to, as `Core::bus_bridge_state` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusBridgeState {
+    /// No bus was configured (`WICKED_BUS_DB` unset): no bridge.
+    NoBus,
+    /// The bridge polls `wicked.crew.run.requested` strictly after event id `floor` — the bus tail
+    /// when `spawn` returned.
+    Armed { floor: i64 },
+    /// The bridge could not open the bus or read its start point within [`BUS_ARM_TIMEOUT`]; it
+    /// polls nothing (it never guesses a start point). `reason` says why.
+    NotArmed { reason: String },
+}
+
+/// Where `Core::spawn*` leaves the armed bridge for the actor to stop + join at its exit. The actor
+/// thread starts FIRST (its store open runs while the bridge arms), so the slot is filled after it.
+pub(crate) type BridgeSlot = Arc<Mutex<Option<ArmedBridge>>>;
+
+/// The launch bridge as `Core::spawn*` armed it: the thread to stop + join at actor exit, and the
+/// state to report.
+pub(crate) struct ArmedBridge {
+    pub(crate) handle: Option<JoinHandle<()>>,
+    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) state: BusBridgeState,
+}
+
+/// Arm the launch bridge with a synchronous, BOUNDED handshake (DES-TEAMING-002 T0). Runs on the
+/// caller of `Core::spawn*` — never the actor. The bridge thread opens the process-wide bus handle
+/// and reads `MAX(event_id)`; the caller waits at most `timeout` for that floor and returns only
+/// once the bridge is armed with it. So a request emitted after `spawn` returns has an id above
+/// the floor and is delivered, and a row already on the bus is history and is never launched —
+/// whatever its `emitted_at` says (the floor is an event id, never a wall-clock time). On a
+/// timeout or an open error the bridge is NOT armed: the thread exits without polling (a late
+/// snapshot would be a guess), and the state says why.
+pub(crate) fn arm_run_requested_bridge(
     bus_db_path: String,
-    start_ms: i64,
     tx: Sender<Command>,
     roster: Vec<AgenticCli>,
     entity_mode: EntityMode,
     poll_interval: Duration,
-    stop: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
+    timeout: Duration,
+) -> ArmedBridge {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (floor_tx, floor_rx) = std::sync::mpsc::sync_channel::<Result<i64, String>>(1);
+    let (go_tx, go_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let thread_stop = stop.clone();
+    let path = bus_db_path.clone();
+    let spawned = std::thread::Builder::new()
         .name(BUS_POLLER_THREAD.into())
         .spawn(move || {
-            let snapshot = BusDb::shared(&bus_db_path)
-                .and_then(|db| db.floor_before(start_ms).map(|f| (db, f)));
+            let snapshot = BusDb::shared(&path).and_then(|db| db.tail_event_id().map(|t| (db, t)));
             match snapshot {
-                Ok((db, floor_init)) => run_requested_poll_loop(
-                    db,
-                    floor_init,
-                    tx,
-                    roster,
-                    entity_mode,
-                    poll_interval,
-                    stop,
-                ),
-                Err(e) => eprintln!(
-                    "wicked-core: bus bridge disabled — cannot open bus db {bus_db_path}: {e:#}; \
-                     the engine runs without a bus"
-                ),
+                Ok((db, floor)) => {
+                    // The caller gave up (timed out) → it dropped its ends: exit without polling.
+                    if floor_tx.send(Ok(floor)).is_err() || go_rx.recv().is_err() {
+                        return;
+                    }
+                    run_requested_poll_loop(
+                        db,
+                        floor,
+                        tx,
+                        roster,
+                        entity_mode,
+                        poll_interval,
+                        thread_stop,
+                    )
+                }
+                Err(e) => {
+                    let _ = floor_tx.send(Err(format!("{e:#}")));
+                }
             }
-        })
-        .expect("spawn the bus bridge thread")
+        });
+    let handle = match spawned {
+        Ok(h) => h,
+        Err(e) => {
+            return ArmedBridge {
+                handle: None,
+                stop,
+                state: BusBridgeState::NotArmed {
+                    reason: format!("cannot spawn the bus bridge thread: {e}"),
+                },
+            }
+        }
+    };
+    let state = match floor_rx.recv_timeout(timeout) {
+        Ok(Ok(floor)) if go_tx.send(()).is_ok() => BusBridgeState::Armed { floor },
+        Ok(Ok(_)) => BusBridgeState::NotArmed {
+            reason: "the bus bridge thread exited before it was armed".into(),
+        },
+        Ok(Err(reason)) => BusBridgeState::NotArmed {
+            reason: format!("cannot open bus db {bus_db_path}: {reason}"),
+        },
+        Err(_) => BusBridgeState::NotArmed {
+            reason: format!(
+                "bus db {bus_db_path} did not answer within {timeout:?} (locked or slow)"
+            ),
+        },
+    };
+    if let BusBridgeState::NotArmed { reason } = &state {
+        eprintln!(
+            "wicked-core: bus bridge NOT armed — {reason}; no `wicked.crew.run.requested` is \
+             launched from the bus by this engine"
+        );
+    }
+    ArmedBridge {
+        handle: Some(handle),
+        stop,
+        state,
+    }
 }
 
 fn run_requested_poll_loop(
@@ -985,8 +1072,9 @@ fn run_requested_poll_loop(
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
 ) {
-    // Start at `floor_init` — the caller's synchronous tail snapshot, or the off-actor bridge's time
-    // floor: only requests newer than it drive launches, and none emitted after it is missed.
+    // Start at `floor_init` — an event id read synchronously before the caller returned (the
+    // caller's own snapshot, or the arming handshake): only requests after it drive launches, and
+    // none emitted after the caller returned is missed.
     let mut floor: i64 = floor_init;
     let filter = RUN_REQUESTED; // exact-match filter
 
@@ -1180,35 +1268,10 @@ mod tests {
         dir.join("bus.db").to_str().unwrap().to_string()
     }
 
-    /// T0: the off-actor bridge's start point keeps every row emitted from `start_ms` on, and
-    /// falls back to the tail when nothing is that new.
-    #[test]
-    fn floor_before_keeps_every_row_from_the_start_moment() {
-        let db = BusDb::open(&tmp_bus("floor-before")).unwrap();
-        assert_eq!(db.floor_before(0).unwrap(), 0, "empty log: the tail");
-        let ev = |k: &str| BusEmit::new(RUN_REQUESTED, "t", "t", serde_json::json!({})).with_key(k);
-        let a = db.emit(&ev("a")).unwrap();
-        let start = now_ms() + 1;
-        while now_ms() < start {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            db.floor_before(start).unwrap(),
-            a,
-            "nothing after start: the tail"
-        );
-        let b = db.emit(&ev("b")).unwrap();
-        let _c = db.emit(&ev("c")).unwrap();
-        assert_eq!(
-            db.floor_before(start).unwrap(),
-            b - 1,
-            "just before the first row from start on"
-        );
-    }
-
     /// T0 connection rule, file identity: a bus file deleted and recreated under the same path is a
     /// DIFFERENT database. `shared` must notice (the path still exists) and open the new file — the
     /// old handle is leaked, never closed — instead of polling and emitting on the unlinked one.
+    #[cfg(unix)] // Windows refuses to delete a file SQLite holds open — see `FileIdentity`.
     #[test]
     fn shared_reopens_a_bus_file_recreated_under_the_same_path() {
         let path = tmp_bus("shared-recreated");

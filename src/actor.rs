@@ -770,7 +770,7 @@ mod wal_checkpoint_tests {
 /// between `shared_run_terminal` (holds `write_reg`, then acquires `maps`) and
 /// session-start helpers (acquire `maps` alone).
 pub(crate) fn run(
-    spawned_at_ms: i64,
+    bus_bridge: crate::bus::BridgeSlot,
     path: String,
     rx: Receiver<Command>,
     self_tx: Sender<Command>,
@@ -975,30 +975,12 @@ pub(crate) fn run(
         }
     }
 
-    // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): if a bus db is configured via `WICKED_BUS_DB`, spawn
-    // the launch poller. It runs on its OWN thread, and reaches this actor ONLY by sending
-    // `Command::LaunchRun` over `self_tx` — the exact self_tx write-back pattern the unit workers use.
-    // DES-TEAMING-002 T0: crew hands every engine `WICKED_BUS_DB`, so the bridge thread — not this
-    // one — opens the process-wide bus handle and snapshots its start point: this thread never opens
-    // the bus and never waits on it, so a locked or slow bus file cannot delay the first command.
-    // Opt-in via env so existing embeddings/tests (env unset) are unaffected. The `bus_stop` flag +
-    // join on loop-exit below guarantee the poller thread is not leaked when the last `Core` drops;
-    // the bus connection itself stays open for the life of the process (bus.rs connection rule).
-    let bus_stop = Arc::new(AtomicBool::new(false));
-    let bus_bridge: Option<std::thread::JoinHandle<()>> = std::env::var("WICKED_BUS_DB")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(|bus_db| {
-            crate::bus::spawn_run_requested_poller_off_actor(
-                bus_db,
-                spawned_at_ms,
-                self_tx.clone(),
-                crate::registry_roster(),
-                crate::scope::EntityMode::Shared,
-                std::time::Duration::from_millis(500),
-                bus_stop.clone(),
-            )
-        });
+    // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): the launch poller `Core::spawn*` arms (when
+    // `WICKED_BUS_DB` is set) on the caller's thread while this one starts, with a bounded handshake —
+    // never here (DES-TEAMING-002 T0: this thread never opens the bus and never waits on it). It
+    // reaches this actor ONLY by sending `Command::LaunchRun` over `self_tx`, and `spawn` leaves it
+    // in `bus_bridge` for the stop + join on loop-exit below, so the poller thread is not leaked when
+    // the last `Core` drops; the bus connection itself stays open for the life of the process.
 
     // Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) — OPT-IN. Resolve the bus db to mediate
     // execution over: the explicit `spawn_with_engine_exec` override wins; otherwise the env gate
@@ -3341,9 +3323,15 @@ pub(crate) fn run(
         }
     }
     // Stop + join the bus bridge poller (if any) so it is never leaked past the actor's lifetime.
-    bus_stop.store(true, Ordering::SeqCst);
-    if let Some(h) = bus_bridge {
-        let _ = h.join();
+    let armed = bus_bridge
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(armed) = armed {
+        armed.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = armed.handle {
+            let _ = h.join();
+        }
     }
     // Stop + join the exec-mediation threads (cli-runner + task.completed poller) and disarm the
     // actor-thread publisher, so exec mode leaks no thread past the actor's lifetime (DES §5, R1).
