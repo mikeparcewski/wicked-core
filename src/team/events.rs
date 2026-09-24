@@ -30,7 +30,10 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Dispute, Finding, LedgerFinding, LedgerMonitor, MonitorReply, Severity, TeamLedger};
+use super::{
+    Dispute, FinalPass, Finding, FindingStatus, LedgerDelivery, LedgerFinding, LedgerMonitor,
+    MonitorReply, MonitorStatus, NoVerdictReason, ReplyKind, Severity, TeamLedger, Verdict,
+};
 use crate::bus::{deterministic_key, BusEmit, CORE_DOMAIN};
 
 /// The bus `subdomain` every team event is published under (DES-002 §4.1).
@@ -371,6 +374,145 @@ pub fn gate_id(run_id: &str, gate_seq: u32) -> String {
     format!("g-{run_id}-{gate_seq}")
 }
 
+// ── Closed token sets (DES-002 §6): every enum a payload documents is typed ─────────────────────
+
+wire_enum! {
+    /// `path.started.selection`.
+    pub enum Selection { Chosen = "chosen", Random = "random" }
+}
+wire_enum! {
+    /// `path.scored.basis`.
+    pub enum ScoreBasis { Intent = "intent", Diff = "diff" }
+}
+wire_enum! {
+    /// `path.scored.plan.depth` (S4 `Depth`).
+    pub enum ScoreDepth { None = "none", Standard = "standard", Deep = "deep" }
+}
+wire_enum! {
+    /// `plan.proposed.kind`.
+    pub enum ProposalKind { Initial = "initial", Change = "change", Edit = "edit" }
+}
+wire_enum! {
+    /// A plan step's `owner`.
+    pub enum StepOwner { Pa = "pa", Team = "team" }
+}
+wire_enum! {
+    /// A composed step's `added_by`.
+    pub enum AddedBy { Plan = "plan", Floor = "floor" }
+}
+wire_enum! {
+    /// `plan.revised.reason`.
+    pub enum ReviseReason {
+        FloorRaised = "floor_raised",
+        PaAdded = "pa_added",
+        MemberRequest = "member_request",
+    }
+}
+wire_enum! {
+    /// The approval mode (`plan.accepted.mode`, `gate.opened{plan_approval}.mode`).
+    pub enum PlanMode { Auto = "auto", Manual = "manual" }
+}
+wire_enum! {
+    /// `member.joined.role`.
+    pub enum MemberRole { Monitor = "monitor" }
+}
+wire_enum! {
+    /// `member.joined.status`.
+    pub enum AttachStatus { Attached = "attached", Failed = "failed" }
+}
+wire_enum! {
+    /// `checkpoint.reached.status`.
+    pub enum CheckpointStatus { Completed = "completed", Failed = "failed" }
+}
+wire_enum! {
+    /// `finding.raised.anchor_source`.
+    pub enum AnchorSource { Graph = "graph", Hunk = "hunk", None = "none" }
+}
+wire_enum! {
+    /// `advice.delivered.channel`.
+    pub enum Channel { AcpSteering = "acp_steering", Boundary = "boundary", None = "none" }
+}
+wire_enum! {
+    /// `advice.delivered.outcome`.
+    pub enum DeliveryOutcome {
+        Injected = "injected",
+        TurnEnded = "turn_ended",
+        Refused = "refused",
+        NotDelivered = "not_delivered",
+    }
+}
+wire_enum! {
+    /// `advice.answered.disposition`.
+    pub enum AdviceDisposition { Accepted = "accepted", Declined = "declined" }
+}
+wire_enum! {
+    /// `step.completed.status`: `StepStatus` as `status_to_str` spells it.
+    pub enum StepCompletion {
+        Ok = "ok",
+        Failed = "failed",
+        Cancelled = "cancelled",
+        ElicitationFailed = "elicitation_failed",
+        TimedOut = "timed_out",
+    }
+}
+wire_enum! {
+    /// `step.reviewed.verdict`.
+    pub enum StepVerdict { Accepted = "accepted", Rejected = "rejected" }
+}
+wire_enum! {
+    /// `step.reviewed.to`: who reworks a rejected step.
+    pub enum ReworkBy { Member = "member", Pa = "pa" }
+}
+wire_enum! {
+    /// `finding.settled.status`.
+    pub enum SettledStatus { Held = "held", Withdrawn = "withdrawn", Superseded = "superseded" }
+}
+wire_enum! {
+    /// `council.called.trigger`.
+    pub enum CouncilTrigger { UnresolvedHigh = "unresolved_high", MemberStep = "member_step" }
+}
+wire_enum! {
+    /// `ledger.folded.transport`.
+    pub enum Transport { Bus = "bus", None = "none" }
+}
+wire_enum! {
+    /// `gate.opened{unit_review}.ledger_source`.
+    pub enum LedgerSource { Folded = "folded", Synthesized = "synthesized", NoBus = "no_bus" }
+}
+wire_enum! {
+    /// `gate.opened{plan_approval}.reason`.
+    pub enum ApprovalReason {
+        ManualMode = "manual_mode",
+        HighRisk = "high_risk",
+        IntoHighRisk = "into_high_risk",
+        Override = "override",
+    }
+}
+wire_enum! {
+    /// A gate's kind (`gate.decided.kind`; `gate.opened` is tagged by the same tokens).
+    pub enum GateKind {
+        UnitReview = "unit_review",
+        PlanApproval = "plan_approval",
+        TeamDispute = "team_dispute",
+        TeamTransport = "team_transport",
+    }
+}
+wire_enum! {
+    /// `gate.decided.decision`.
+    pub enum GateDecision {
+        Allow = "allow",
+        Deny = "deny",
+        Paused = "paused",
+        HumanApproved = "human_approved",
+        HumanAmended = "human_amended",
+        HumanRejected = "human_rejected",
+    }
+}
+wire_enum! {
+    /// `path.ended.status`: the terminal `SessionStatus`.
+    pub enum PathStatus { Completed = "completed", Failed = "failed", Cancelled = "cancelled" }
+}
+
 // ── The envelope and the payload bodies (DES-002 §6) ─────────────────────────────────────────────
 
 /// The fields every team payload carries.
@@ -395,17 +537,17 @@ pub struct PlanStep {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// `"pa"` (default) | `"team"`.
+    /// Default `pa`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
+    pub owner: Option<StepOwner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<Vec<String>>,
     /// A raised gate, as the workflow's externally tagged `GateSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Value>,
-    /// On a composed plan: `"plan"` | `"floor"`.
+    /// On a composed plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub added_by: Option<String>,
+    pub added_by: Option<AddedBy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_reason: Option<String>,
     /// On `plan.revised.added`: the step's catalog position precedes a done step.
@@ -425,8 +567,7 @@ pub struct PlanOverride {
 pub struct PathStarted {
     /// The PA seat instance.
     pub cli: String,
-    /// `"chosen"` | `"random"`.
-    pub selection: String,
+    pub selection: Selection,
     pub roster: Vec<String>,
     /// The problem text, ≤8 KB.
     pub request: String,
@@ -457,7 +598,7 @@ pub struct ScoreSignals {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScorePlan {
     pub monitors: u8,
-    pub depth: String,
+    pub depth: ScoreDepth,
     pub post_hoc_reviewer: bool,
     pub post_hoc_other_cli: bool,
 }
@@ -467,8 +608,7 @@ pub struct ScorePlan {
 pub struct PathScored {
     /// [`score_source_intent`] | [`score_source_diff`].
     pub score_source: String,
-    /// `"intent"` | `"diff"`.
-    pub basis: String,
+    pub basis: ScoreBasis,
     pub score: u8,
     pub deterministic: u8,
     pub reasons: Vec<String>,
@@ -491,8 +631,7 @@ pub struct PlanProposed {
     /// [`mint_proposal_id`].
     pub proposal_id: String,
     pub base_rev: Option<u32>,
-    /// `"initial"` | `"change"` | `"edit"`.
-    pub kind: String,
+    pub kind: ProposalKind,
     pub preset: Option<String>,
     pub steps: Vec<PlanStep>,
     pub monitors: MonitorsAsk,
@@ -508,8 +647,7 @@ pub struct PlanProposed {
 pub struct PlanRevised {
     pub plan_rev: u32,
     pub proposal_id: Option<String>,
-    /// `"floor_raised"` | `"pa_added"` | `"member_request"`.
-    pub reason: String,
+    pub reason: ReviseReason,
     pub from_band: String,
     pub to_band: String,
     pub high_risk: bool,
@@ -523,8 +661,7 @@ pub struct PlanAccepted {
     pub workflow_id: String,
     pub band: String,
     pub high_risk: bool,
-    /// `"auto"` | `"manual"`.
-    pub mode: String,
+    pub mode: PlanMode,
     pub steps: Vec<PlanStep>,
     #[serde(rename = "override")]
     pub override_: Option<PlanOverride>,
@@ -545,10 +682,8 @@ pub struct MemberJoined {
     pub member_id: String,
     pub open_seq: u32,
     pub seat: String,
-    /// `"monitor"`.
-    pub role: String,
-    /// `"attached"` | `"failed"`.
-    pub status: String,
+    pub role: MemberRole,
+    pub status: AttachStatus,
     pub reason: String,
     pub error: Option<String>,
 }
@@ -559,8 +694,7 @@ pub struct MemberLeft {
     pub member_id: String,
     pub open_seq: u32,
     pub seat: String,
-    /// `"completed"` | `"budget_exhausted"` | `"failed"` | `"timed_out"`.
-    pub status: String,
+    pub status: MonitorStatus,
     pub batches: u32,
     pub error: Option<String>,
 }
@@ -591,8 +725,7 @@ pub struct CheckpointReached {
     pub tool_call_id: String,
     pub kind: String,
     pub title: String,
-    /// `"completed"` | `"failed"`.
-    pub status: String,
+    pub status: CheckpointStatus,
     pub paths: Vec<String>,
 }
 
@@ -607,9 +740,9 @@ pub struct FindingRaised {
     /// DES-001 §4.6 fields T6 builds; `null` until then.
     pub line_key: Option<String>,
     pub anchor: Option<String>,
-    pub anchor_source: Option<String>,
-    /// `"high"` | `"medium"`.
-    pub severity: String,
+    pub anchor_source: Option<AnchorSource>,
+    /// The bar: `high` | `medium`; anything else is refused at parse.
+    pub severity: Severity,
     pub path: String,
     pub line: u32,
     pub evidence: String,
@@ -628,10 +761,8 @@ pub struct AdviceDelivered {
     /// The steer id | [`delivery_id_boundary`] | [`delivery_id_end`].
     pub delivery_id: String,
     pub steer_id: Option<String>,
-    /// `"acp_steering"` | `"boundary"` | `"none"`.
-    pub channel: String,
-    /// `"injected"` | `"turn_ended"` | `"refused"` | `"not_delivered"`.
-    pub outcome: String,
+    pub channel: Channel,
+    pub outcome: DeliveryOutcome,
     pub detail: Option<String>,
 }
 
@@ -642,8 +773,7 @@ pub struct AdviceAnswered {
     /// [`answered_in`].
     pub answered_in: String,
     pub finding_id: String,
-    /// `"accepted"` | `"declined"`.
-    pub disposition: String,
+    pub disposition: AdviceDisposition,
     pub reason: String,
 }
 
@@ -681,9 +811,7 @@ pub struct ChangeRequested {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepCompleted {
     pub step_id: String,
-    /// `StepStatus` as `status_to_str` spells it: `"ok"` | `"failed"` | `"cancelled"` |
-    /// `"elicitation_failed"` | `"timed_out"`.
-    pub status: String,
+    pub status: StepCompletion,
     pub tree: Option<String>,
     pub output_bytes: u64,
     pub output_ref: String,
@@ -693,10 +821,9 @@ pub struct StepCompleted {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepReviewed {
     pub step_id: String,
-    /// `"accepted"` | `"rejected"`.
-    pub verdict: String,
-    /// On `"rejected"`: `"member"` | `"pa"`.
-    pub to: Option<String>,
+    pub verdict: StepVerdict,
+    /// On `rejected`: who reworks it.
+    pub to: Option<ReworkBy>,
     pub reason: String,
 }
 
@@ -705,8 +832,7 @@ pub struct StepReviewed {
 pub struct FindingSettled {
     pub raise_seq: u32,
     pub finding_id: String,
-    /// `"held"` | `"withdrawn"` | `"superseded"`.
-    pub status: String,
+    pub status: SettledStatus,
     pub reason: String,
     pub final_line: Option<u32>,
 }
@@ -724,8 +850,7 @@ pub struct CouncilCalled {
     /// [`subject_finding`] | [`subject_step`].
     pub subject: String,
     pub finding_id: Option<String>,
-    /// `"unresolved_high"` | `"member_step"`.
-    pub trigger: String,
+    pub trigger: CouncilTrigger,
     pub question: String,
     pub positions: Vec<CouncilPosition>,
     pub evidence: String,
@@ -738,10 +863,9 @@ pub struct CouncilCalled {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CouncilRuled {
     pub subject: String,
-    /// `"yes"` | `"no"` | `"no_verdict"`.
-    pub verdict: String,
-    /// On `no_verdict`: `"no_quorum"` | `"seats_benched"` | `"error"` | `"timeout"` | `"cap"`.
-    pub reason: Option<String>,
+    pub verdict: Verdict,
+    /// On `no_verdict`.
+    pub reason: Option<NoVerdictReason>,
     /// `null` when no council was convened (`seats_benched`, `cap`).
     pub task_id: Option<String>,
     pub consensus: bool,
@@ -771,11 +895,9 @@ pub struct Transcript {
 /// 22 — `ledger.folded` (S).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LedgerFolded {
-    /// `"completed"` | `"timed_out"` | `"skipped"` | `"stream_gap"`.
-    pub final_pass: String,
+    pub final_pass: FinalPass,
     pub ledger: TeamLedger,
-    /// `"bus"` | `"none"`.
-    pub transport: String,
+    pub transport: Transport,
     pub transcript: Transcript,
 }
 
@@ -792,17 +914,15 @@ pub enum GateOpenedKind {
     UnitReview {
         /// The S row the gate used; `null` for a synthesized or no-bus snapshot.
         ledger_ref: Option<String>,
-        /// `"folded"` | `"synthesized"` | `"no_bus"`.
-        ledger_source: String,
+        ledger_source: LedgerSource,
     },
     PlanApproval {
         reviewing_ord: u32,
         plan_rev: u32,
         band: String,
         high_risk: bool,
-        mode: String,
-        /// `"manual_mode"` | `"high_risk"` | `"into_high_risk"` | `"override"`.
-        reason: String,
+        mode: PlanMode,
+        reason: ApprovalReason,
         diff: PlanDiff,
     },
     TeamDispute {
@@ -829,11 +949,9 @@ pub struct GateOpened {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateDecided {
     pub gate_id: String,
-    /// `"unit_review"` | `"plan_approval"` | `"team_dispute"` | `"team_transport"`.
-    pub kind: String,
-    /// unit_review: `"allow"` | `"deny"` | `"paused"`; a human decision (any kind):
-    /// `"human_approved"` | `"human_amended"` | `"human_rejected"`.
-    pub decision: String,
+    pub kind: GateKind,
+    /// `unit_review`: allow | deny | paused; a human decision (any kind): human_*.
+    pub decision: GateDecision,
     pub combined: Option<bool>,
     pub team_pause: bool,
     pub unresolved: Vec<String>,
@@ -842,8 +960,7 @@ pub struct GateDecided {
 /// 25 — `path.ended` (E).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathEnded {
-    /// `"completed"` | `"failed"` | `"cancelled"`.
-    pub status: String,
+    pub status: PathStatus,
 }
 
 macro_rules! bodies {
@@ -1027,7 +1144,10 @@ pub struct TeamRow {
 /// A finding the worker has not accepted: `status ∉ {accepted, withdrawn, superseded}`
 /// (DES-001 §6.3 item 2).
 pub fn is_unaccepted(f: &LedgerFinding) -> bool {
-    !matches!(f.status.as_str(), "accepted" | "withdrawn" | "superseded")
+    !matches!(
+        f.status,
+        FindingStatus::Accepted | FindingStatus::Withdrawn | FindingStatus::Superseded
+    )
 }
 
 /// DES-001 §6.3: HIGH, not accepted, and held by its monitor. A missing hold-round reply counts
@@ -1035,7 +1155,9 @@ pub fn is_unaccepted(f: &LedgerFinding) -> bool {
 pub fn is_unresolved_high(f: &LedgerFinding) -> bool {
     f.finding.severity == Severity::High
         && is_unaccepted(f)
-        && f.monitor_reply.as_ref().is_none_or(|r| r.kind == "hold")
+        && f.monitor_reply
+            .as_ref()
+            .is_none_or(|r| r.kind == ReplyKind::Hold)
 }
 
 /// The findings a council must rule on (DES-001 §6.3, acceptance #15).
@@ -1048,10 +1170,13 @@ pub fn unresolved_highs(ledger: &TeamLedger) -> Vec<&LedgerFinding> {
 }
 
 /// DES-001 §6.7: an unresolved HIGH whose council did not say YES (no verdict counts as NO).
+/// An incomplete record (`stream_gap`) pauses too: it goes to a human, never auto-approved
+/// (DES-002 §4.7).
 pub fn ledger_pauses(ledger: &TeamLedger) -> bool {
-    unresolved_highs(ledger)
-        .iter()
-        .any(|f| f.dispute.as_ref().is_none_or(|d| d.verdict != "yes"))
+    ledger.final_pass == FinalPass::StreamGap
+        || unresolved_highs(ledger)
+            .iter()
+            .any(|f| f.dispute.as_ref().is_none_or(|d| d.verdict != Verdict::Yes))
 }
 
 /// The gate's half of DES-001 §6.7: a unit pauses `team_dispute` only when the gate approved
@@ -1072,6 +1197,12 @@ pub fn gate_pauses(approved: bool, ledger: &TeamLedger) -> bool {
 /// `skipped` when the attempt's `step.completed` did not return `ok`, else `completed`.
 /// `teamPause` is [`ledger_pauses`].
 ///
+/// **No row is dropped silently.** Every payload enum is a closed set, so a malformed row never
+/// parses into a [`TeamRow`]. A row that names a finding this stream never raised (an
+/// `advice.*`, `finding.settled` or `council.ruled{finding:<n>}` with no `finding.raised` for
+/// `<n>`) means the record is incomplete: `final_pass` becomes `stream_gap` and the ledger
+/// pauses.
+///
 /// Not on the stream, so not folded: `rejected{}` (a rejected monitor line is never raised) and a
 /// corroboration that arrives after the finding was raised. The supervisor, which owns both,
 /// overlays them on the fold's result before it publishes `ledger.folded`.
@@ -1087,6 +1218,8 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
 
     let mut monitors: Vec<MonitorAcc> = Vec::new();
     let mut findings: Vec<FindingAcc> = Vec::new();
+    // Rows about findings, applied once every raise is known (order-independent).
+    let mut about: Vec<&TeamRow> = Vec::new();
     let mut skipped = false;
     for row in ordered {
         let env = &row.event.env;
@@ -1096,7 +1229,7 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                 if b.open_seq >= m.open_seq {
                     m.open_seq = b.open_seq;
                     m.seat = b.seat.clone();
-                    m.joined_failed = (b.status == "failed").then(|| b.error.clone());
+                    m.joined_failed = (b.status == AttachStatus::Failed).then(|| b.error.clone());
                 }
             }
             TeamBody::MemberLeft(b) => {
@@ -1104,67 +1237,79 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                 m.open_seq = m.open_seq.max(b.open_seq);
                 m.left.insert(b.open_seq, b.clone());
             }
-            TeamBody::FindingRaised(b) => {
-                let Some(severity) = Severity::parse(&b.severity) else {
-                    continue;
-                };
-                if findings.iter().any(|f| f.raise_seq == b.raise_seq) {
-                    continue;
-                }
-                findings.push(FindingAcc {
-                    raise_seq: b.raise_seq,
-                    finding: Finding {
-                        finding_id: b.finding_id.clone(),
-                        monitor_id: b.member_id.clone(),
-                        seat: env.by.clone(),
-                        severity,
-                        path: b.path.clone(),
-                        line: b.line,
-                        evidence: b.evidence.clone(),
-                        claim: b.claim.clone(),
-                        suggestion: b.suggestion.clone(),
-                        tree: b.tree.clone(),
-                        in_diff: b.in_diff,
-                        checkpoint_seq: 0,
-                    },
-                    corroborated_by: b.corroborated_by.clone(),
-                    injected: false,
-                    answer: None,
-                    settled: None,
-                    ruling: None,
-                });
-            }
-            TeamBody::AdviceDelivered(b) => {
-                if let Some(f) = finding_entry(&mut findings, b.raise_seq) {
-                    f.injected |= b.outcome == "injected";
-                }
-            }
-            TeamBody::AdviceAnswered(b) => {
-                if let Some(f) = finding_entry(&mut findings, b.raise_seq) {
-                    f.answer = Some(b.clone());
-                }
-            }
-            TeamBody::FindingSettled(b) => {
-                if let Some(f) = finding_entry(&mut findings, b.raise_seq) {
-                    f.settled = Some(b.clone());
-                }
-            }
-            TeamBody::CouncilRuled(b) => {
-                let seq = b
-                    .subject
-                    .strip_prefix("finding:")
-                    .and_then(|n| n.parse::<u32>().ok());
-                if let Some(f) = seq.and_then(|n| finding_entry(&mut findings, n)) {
-                    f.ruling = Some(b.clone());
-                }
-            }
-            TeamBody::StepCompleted(b) => skipped |= b.status != "ok",
+            // Keys are (ord, attempt, raise_seq): after the key dedup one raise per raise_seq.
+            TeamBody::FindingRaised(b) => findings.push(FindingAcc {
+                raise_seq: b.raise_seq,
+                finding: Finding {
+                    finding_id: b.finding_id.clone(),
+                    monitor_id: b.member_id.clone(),
+                    seat: env.by.clone(),
+                    severity: b.severity,
+                    path: b.path.clone(),
+                    line: b.line,
+                    evidence: b.evidence.clone(),
+                    claim: b.claim.clone(),
+                    suggestion: b.suggestion.clone(),
+                    tree: b.tree.clone(),
+                    in_diff: b.in_diff,
+                    checkpoint_seq: 0,
+                },
+                corroborated_by: b.corroborated_by.clone(),
+                injected: false,
+                answer: None,
+                settled: None,
+                ruling: None,
+            }),
+            TeamBody::AdviceDelivered(_)
+            | TeamBody::AdviceAnswered(_)
+            | TeamBody::FindingSettled(_)
+            | TeamBody::CouncilRuled(_) => about.push(row),
+            TeamBody::StepCompleted(b) => skipped |= b.status != StepCompletion::Ok,
             _ => {}
         }
     }
 
+    let mut gap = false;
+    for row in about {
+        let seq = match &row.event.body {
+            TeamBody::AdviceDelivered(b) => b.raise_seq,
+            TeamBody::AdviceAnswered(b) => b.raise_seq,
+            TeamBody::FindingSettled(b) => b.raise_seq,
+            TeamBody::CouncilRuled(b) => match b.subject.strip_prefix("finding:") {
+                Some(n) => match n.parse::<u32>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        gap = true;
+                        continue;
+                    }
+                },
+                // A member-step dispute: not a finding's council.
+                None => continue,
+            },
+            _ => unreachable!("only finding rows are collected"),
+        };
+        let Some(f) = finding_entry(&mut findings, seq) else {
+            gap = true;
+            continue;
+        };
+        match &row.event.body {
+            TeamBody::AdviceDelivered(b) => f.injected |= b.outcome == DeliveryOutcome::Injected,
+            TeamBody::AdviceAnswered(b) => f.answer = Some(b.clone()),
+            TeamBody::FindingSettled(b) => f.settled = Some(b.clone()),
+            TeamBody::CouncilRuled(b) => f.ruling = Some(b.clone()),
+            _ => {}
+        }
+    }
+
+    let final_pass = if gap {
+        FinalPass::StreamGap
+    } else if skipped {
+        FinalPass::Skipped
+    } else {
+        FinalPass::Completed
+    };
     let mut ledger = TeamLedger {
-        final_pass: if skipped { "skipped" } else { "completed" }.to_string(),
+        final_pass,
         rendered_to_judge: false,
         monitors: monitors.into_iter().map(MonitorAcc::into_ledger).collect(),
         findings: findings.into_iter().map(FindingAcc::into_ledger).collect(),
@@ -1180,32 +1325,32 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
 /// pass timed out)"}` / `{verdict:"no_verdict", reason:"timeout"}`. Recorded results are kept;
 /// MEDIUM and accepted/withdrawn/superseded findings are untouched. `teamPause` is recomputed.
 pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
-    ledger.final_pass = "timed_out".to_string();
+    ledger.final_pass = FinalPass::TimedOut;
     for f in &mut ledger.findings {
         if f.finding.severity != Severity::High || !is_unaccepted(f) {
             continue;
         }
         if f.monitor_reply.is_none() {
             f.monitor_reply = Some(MonitorReply {
-                kind: "hold".to_string(),
+                kind: ReplyKind::Hold,
                 reason: "no reply (final pass timed out)".to_string(),
             });
         }
         if f.dispute.is_none() {
-            f.dispute = Some(no_verdict("timeout"));
+            f.dispute = Some(no_verdict(NoVerdictReason::Timeout));
         }
     }
     ledger.team_pause = ledger_pauses(&ledger);
     ledger
 }
 
-fn no_verdict(reason: &str) -> Dispute {
+fn no_verdict(reason: NoVerdictReason) -> Dispute {
     Dispute {
-        verdict: "no_verdict".to_string(),
+        verdict: Verdict::NoVerdict,
         agreement_pct: None,
         dissent: None,
         seats: Vec::new(),
-        reason: Some(reason.to_string()),
+        reason: Some(reason),
     }
 }
 
@@ -1223,11 +1368,11 @@ impl MonitorAcc {
     fn into_ledger(self) -> LedgerMonitor {
         let earlier_batches = self.left.values().next_back().map_or(0, |l| l.batches);
         let (status, batches, error) = match (self.left.get(&self.open_seq), self.joined_failed) {
-            (Some(l), _) => (l.status.clone(), l.batches, l.error.clone()),
-            (None, Some(error)) => ("failed".to_string(), earlier_batches, error),
+            (Some(l), _) => (l.status, l.batches, l.error.clone()),
+            (None, Some(error)) => (MonitorStatus::Failed, earlier_batches, error),
             // Open with no `member.left`: the final pass never closed it (fail-visible).
             (None, None) => (
-                "timed_out".to_string(),
+                MonitorStatus::TimedOut,
                 earlier_batches,
                 Some("no member.left for this opening".to_string()),
             ),
@@ -1278,48 +1423,47 @@ struct FindingAcc {
 
 impl FindingAcc {
     fn into_ledger(self) -> LedgerFinding {
-        let settled = self.settled.as_ref().map(|s| s.status.as_str());
+        let settled = self.settled.as_ref().map(|s| s.status);
         let status = match settled {
-            Some(s @ ("withdrawn" | "superseded")) => s.to_string(),
-            _ => self
-                .answer
-                .as_ref()
-                .map_or_else(|| "unanswered".to_string(), |a| a.disposition.clone()),
+            Some(SettledStatus::Withdrawn) => FindingStatus::Withdrawn,
+            Some(SettledStatus::Superseded) => FindingStatus::Superseded,
+            _ => match self.answer.as_ref().map(|a| a.disposition) {
+                Some(AdviceDisposition::Accepted) => FindingStatus::Accepted,
+                Some(AdviceDisposition::Declined) => FindingStatus::Declined,
+                None => FindingStatus::Unanswered,
+            },
         };
         let monitor_reply = self.settled.as_ref().and_then(|s| {
-            let kind = match s.status.as_str() {
-                "held" => "hold",
-                "withdrawn" => "withdraw",
-                _ => return None,
+            let kind = match s.status {
+                SettledStatus::Held => ReplyKind::Hold,
+                SettledStatus::Withdrawn => ReplyKind::Withdraw,
+                SettledStatus::Superseded => return None,
             };
             Some(MonitorReply {
-                kind: kind.to_string(),
+                kind,
                 reason: s.reason.clone(),
             })
         });
-        let dispute = self.ruling.map(|r| match r.verdict.as_str() {
-            "yes" | "no" => Dispute {
-                verdict: r.verdict.clone(),
+        let dispute = self.ruling.map(|r| match r.verdict {
+            Verdict::Yes | Verdict::No => Dispute {
+                verdict: r.verdict,
                 agreement_pct: Some(r.agreement_pct),
                 dissent: Some(r.dissent.len() as u32),
                 seats: Vec::new(),
-                reason: r.reason.clone(),
+                reason: r.reason,
             },
-            _ => Dispute {
-                verdict: r.verdict.clone(),
-                ..no_verdict(r.reason.as_deref().unwrap_or("error"))
-            },
+            // A no-verdict with no reason is the council call failing to say why: `error`.
+            Verdict::NoVerdict => no_verdict(r.reason.unwrap_or(NoVerdictReason::Error)),
         });
         LedgerFinding {
             finding: self.finding,
             final_line: self.settled.as_ref().and_then(|s| s.final_line),
             corroborated_by: self.corroborated_by,
             delivery: if self.injected {
-                "injected"
+                LedgerDelivery::Injected
             } else {
-                "not_delivered"
-            }
-            .to_string(),
+                LedgerDelivery::NotDelivered
+            },
             status,
             worker_reason: self.answer.map(|a| a.reason),
             monitor_reply,

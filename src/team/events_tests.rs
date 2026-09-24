@@ -8,6 +8,12 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::bus::{deterministic_key, BusDb};
+use crate::team::{FinalPass, LedgerDelivery};
+
+/// A wire token as its typed enum (panics on an unknown token: fixtures only).
+fn tok<T: serde::de::DeserializeOwned>(s: &str) -> T {
+    serde_json::from_value(json!(s)).unwrap_or_else(|e| panic!("token {s:?}: {e}"))
+}
 
 const FIXTURES: &str = include_str!("events_fixtures.json");
 
@@ -653,8 +659,8 @@ impl Stream {
                 member_id: member.into(),
                 open_seq: 1,
                 seat: seat.into(),
-                role: "monitor".into(),
-                status: "attached".into(),
+                role: tok("monitor"),
+                status: tok("attached"),
                 reason: "team plan monitors=1".into(),
                 error: None,
             }),
@@ -668,7 +674,7 @@ impl Stream {
                 member_id: member.into(),
                 open_seq: 1,
                 seat: seat.into(),
-                status: "completed".into(),
+                status: tok("completed"),
                 batches,
                 error: None,
             }),
@@ -685,7 +691,7 @@ impl Stream {
                 line_key: None,
                 anchor: None,
                 anchor_source: None,
-                severity: severity.into(),
+                severity: tok(severity),
                 path: "src/retire.ts".into(),
                 line: 40 + seq,
                 evidence: EVIDENCE.into(),
@@ -712,8 +718,8 @@ impl Stream {
                 finding_id: fid(seq),
                 delivery_id: delivery_id.into(),
                 steer_id: (channel == "acp_steering").then(|| delivery_id.to_string()),
-                channel: channel.into(),
-                outcome: outcome.into(),
+                channel: tok(channel),
+                outcome: tok(outcome),
                 detail: None,
             }),
         )
@@ -730,7 +736,7 @@ impl Stream {
                 raise_seq: seq,
                 answered_in: answered_in(step, 1),
                 finding_id: fid(seq),
-                disposition: disposition.into(),
+                disposition: tok(disposition),
                 reason: reason.into(),
             }),
         )
@@ -748,7 +754,7 @@ impl Stream {
             TeamBody::FindingSettled(FindingSettled {
                 raise_seq: seq,
                 finding_id: fid(seq),
-                status: status.into(),
+                status: tok(status),
                 reason: reason.into(),
                 final_line,
             }),
@@ -761,8 +767,8 @@ impl Stream {
             "council:task-9",
             TeamBody::CouncilRuled(CouncilRuled {
                 subject: subject_finding(seq),
-                verdict: verdict.into(),
-                reason: reason.map(str::to_string),
+                verdict: tok(verdict),
+                reason: reason.map(tok),
                 task_id: convened.then(|| "task-9".to_string()),
                 consensus: convened,
                 agreement_pct: if convened { 67 } else { 0 },
@@ -782,7 +788,7 @@ impl Stream {
             "claude#1",
             TeamBody::StepCompleted(StepCompleted {
                 step_id: "build".into(),
-                status: status.into(),
+                status: tok(status),
                 tree: Some("t-final".into()),
                 output_bytes: 10,
                 output_ref: "unit:r1:3:1".into(),
@@ -1123,7 +1129,7 @@ fn fixture_16_continue_or_pause() {
     };
     for outcome in ["none", "turn_ended"] {
         let yes = with_ruling(undelivered(outcome), "yes", None).fold();
-        assert_eq!(yes.findings[0].delivery, "not_delivered");
+        assert_eq!(yes.findings[0].delivery, LedgerDelivery::NotDelivered);
         assert!(!yes.team_pause, "(i) yes {outcome}");
         assert!(
             with_ruling(undelivered(outcome), "no", None)
@@ -1203,7 +1209,7 @@ fn a_failed_step_skips_the_final_pass() {
     s.joined("m1", "claude#2")
         .raised(1, "medium")
         .completed("failed");
-    assert_eq!(s.fold().final_pass, "skipped");
+    assert_eq!(s.fold().final_pass, FinalPass::Skipped);
 }
 
 #[test]
@@ -1262,7 +1268,7 @@ fn fold_is_idempotent_under_duplicates_and_order() {
     assert_eq!(
         fold(&[]),
         TeamLedger {
-            final_pass: "completed".into(),
+            final_pass: FinalPass::Completed,
             rendered_to_judge: false,
             monitors: vec![],
             findings: vec![],
