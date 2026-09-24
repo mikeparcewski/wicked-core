@@ -1,7 +1,21 @@
 # DES-TEAMING-002 — The team model on the bus: one transport, one grammar, one phase catalog
 
-- **Status:** DRAFT (rev 7). **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
+- **Status:** DRAFT (rev 8). **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
 - **Date:** 2026-09-23
+- **Rev 8 (2026-09-24):** review on #612 at `369fc50` (2 MEDIUM, both leftovers, verified).
+  1. The `advice.delivered` example still named the supervisor's sweep and `delivery_id "sweep"`. It is now R-only with `"end:<attempt>"`.
+  2. `step.completed.status` now lists all five spellings `status_to_str` emits (`src/cli_runner.rs:285-296`; `StepStatus`, `src/workflow.rs:175-196`).
+
+  A final sweep checked every JSON example and enum comment against the §6/§7 owner and key tables and against the code spellings, and fixed nine more:
+  - payload numbering now matches the event table (two blocks were both "20");
+  - the `path.scored`, `step.claimed` and `step.completed` headers named a second producer (only one owns each);
+  - `path.scored` carried a dropped `score_seq`;
+  - `member.*` lacked their `ord`/`attempt` key fields, and `member.joined.status` said `"joined"` where S2 spells `"attached"` (`src/team.rs:1070`);
+  - `council.ruled` showed a `seats` field `DecisionVerdict` does not have (now `task_id`, `consensus`, `src/decision.rs:292-310`);
+  - `gate.decided.kind` lacked `team_transport`, and `PauseReason` now gains `TeamTransport`;
+  - the `finding.raised` example presented DES-001 §4.6's `anchor`/`line_key` as existing fields, but on main `finding_id` is `sha256(path ‖ evidence)` (`src/team.rs:386-392`), so they are marked "T6 builds them";
+  - every remaining enum comment now cites the code that spells it (S2 monitor status, S3 `SteerOutcome` and `Disposition`, checkpoint status, severity, terminal `SessionStatus`);
+  - the envelope's `by` is stated as "who the row is about", not the owner.
 - **Rev 7 (2026-09-24):** review on #612 at `6a81b1d` (3 HIGH, each verified at the code), resolved under one rule added as §4.0: **commands go through the API, facts go on the bus, each fact has exactly one owner, and no consumer turns a bus row into a command on someone else's state.**
   1. The `TeamPublisher` is **reliable**. It reuses the engine's durable emit-outbox pattern (NDJSON spool, `DEADLETTER_MARKER`, idempotent replay; `crates/wicked-apps-core/src/emit.rs:453-470`, `:614`) with a bounded retry. A required fact that cannot be published pauses the run (`team_transport`), or marks it `transport:"none"` before any team work begins (§4.1).
   2. **The actor reads no bus row.** User plans, preset launches, plan edits and approval edits are API commands. PA plans arrive on `Command::ApplyStepResult` (`src/command.rs:218`). The supervisor's re-scores and member-step rulings arrive as its own commands. The engine publishes `plan.proposed` after accepting any of them.
@@ -208,7 +222,7 @@ Retention bounds the replay:
   "run_id": "<run>",           // always
   "ord": 3,                    // the unit; null on run-level events
   "attempt": 1,                // null on run-level events
-  "by": "claude#1",            // seat instance | "engine" | "human" | "council:<task_id>"
+  "by": "claude#1",            // who the row is about or authored it: seat instance | "engine" | "human" | "council:<task_id>". NOT the owner: the owner is fixed per type (§7)
   "at": 1758600000000,         // publisher's epoch ms (the bus stamps emitted_at too)
   "re": null                   // causal reference: "<noun>.<verb>#<entity id>" or null
   // …event fields
@@ -295,7 +309,7 @@ Owners: **E** engine (actor, via the `TeamPublisher`), **S** supervisor, **R** a
 Exact payloads (envelope fields omitted after the first):
 
 ```jsonc
-// 1 — engine, at launch admission (LaunchSpec.primary resolved, §8.1)
+// 1 — path.started (E), at launch admission (LaunchSpec.primary resolved, §8.1)
 {"run_id":"r1","ord":null,"attempt":null,"by":"engine","at":…,"re":null,
  "cli":"claude#1",                 // the PA seat instance
  "selection":"chosen",             // "chosen" | "random"
@@ -304,10 +318,9 @@ Exact payloads (envelope fields omitted after the first):
  "workflow":"feature",             // the preset name the launch named, or null (§8.4)
  "plan":false}                     // true when the launch carried a user-composed plan
 
-// 2 — worker thread; S4 assess() on the predicted touch set, then on each settled diff
+// 2 — path.scored (E): S4 assess() on the declared touch set; a diff score arrives from S as Command::TeamRescored (§4.0)
 {"score_source":"intent:p-…",     // "intent:<proposal_id>" | "diff:<ord>:<attempt>:<rescore_seq>" (§6.1)
  "basis":"intent",                 // "intent" | "diff"
- "score_seq":1,                    // per run, monotonic
  "score":70,"deterministic":70,"reasons":["destructive ⇒ floor 70","reach 21-100 dependents: +60"],
  "model":null,                     // {"add":10,"rationale":"…"} or null
  "signals":{"changed_symbols":4,"dependents":37,"products":1,"contract_change":false,"test_gap":0.5,
@@ -315,10 +328,10 @@ Exact payloads (envelope fields omitted after the first):
  "plan":{"monitors":3,"depth":"deep","post_hoc_reviewer":true,"post_hoc_other_cli":true},
  "tree":null}                      // the T_k the diff was taken at; null for "intent"
 
-// 3 — plan.proposed: any author; steps name catalog entries plus the step fields §8.3 allows
-{"proposal_id":"p-…",             // minted by the author (§6.1); the engine assigns plan_rev on acceptance
+// 3 — plan.proposed (E, after accepting the command or step result that carries it, §4.0); steps name catalog entries plus the step fields §8.3 allows
+{"proposal_id":"p-…",             // derived by the engine from the command's source id (§6.1); plan_rev is assigned on acceptance
  "base_rev":null,                  // the accepted rev this changes; null for the first plan
- "kind":"initial",                 // "initial" | "change" (a PA PLAN+ or an accepted member request) | "edit" (an approval edit)
+ "kind":"initial",                 // "initial" | "change" (a PA PLAN+, incl. an accepted member request) | "edit" (a human edit: an approval edit or Core::propose_plan)
  "by":"claude#1",                  // PA seat | "human"
  "preset":null,                    // the preset name when launched from one
  "steps":[{"catalog":"understand","id":"understand"},
@@ -333,7 +346,7 @@ Exact payloads (envelope fields omitted after the first):
  "override":null,                  // manual mode only (§8.5): {"remove":["review"],"reason":"…"}
  "rationale":"…"}                  // ≤4 KB
 
-// 4 — plan.revised: the plan grew (§8.7)
+// 4 — plan.revised (E): the plan grew (§8.7)
 {"plan_rev":2,"by":"engine",       // always "engine" (it assigns plan_rev)
  "proposal_id":null,               // the plan.proposed{kind:"change"} this composes; null for a floor raise
  "reason":"floor_raised",          // "floor_raised" | "pa_added" | "member_request"
@@ -341,7 +354,7 @@ Exact payloads (envelope fields omitted after the first):
  "added":[{"catalog":"test_plan","id":"test-plan","added_by":"floor","floor_reason":"band 40-69 requires test_plan","late":false},
           {"catalog":"design","id":"design","added_by":"floor","floor_reason":"band 40-69 requires design","late":true}]}   // late: its catalog position precedes a done step
 
-// 5 — plan.accepted: composed, floor-filled, and approved or auto-released
+// 5 — plan.accepted (E): composed, floor-filled, and approved or auto-released
 {"plan_rev":1,"workflow_id":"r1:plan-1",
  "by":"engine",                    // "engine" (auto release) | "human" (approved at the plan_approval gate)
  "band":"40-69","high_risk":false,"mode":"manual",       // mode: "auto" | "manual" (§8.6)
@@ -349,50 +362,51 @@ Exact payloads (envelope fields omitted after the first):
  "override":null,                  // as recorded, manual mode only
  "proposal_id":"p-…"}              // the proposal this accepts
 
-// 5a — plan.refused: compose refused a proposal; the run keeps its accepted rev
-{"proposal_id":"p-…","base_rev":1,"by":"engine","reason":"step `review` lowers its entry's gate"}
+// 6 — plan.refused (E): compose refused a proposal; the run keeps its accepted rev
+{"proposal_id":"p-…","base_rev":1,"by":"engine","reason":"step `review` lowers its entry's gate"}   // reason: free text naming the refusing rule (floor, pin, schema, "override in auto mode")
 
-// 6 / 7 — supervisor
-{"member_id":"m1","open_seq":1,     // open_seq: this member's session openings in the attempt (re-opened after a failed turn)
- "seat":"claude#2","role":"monitor","status":"joined",   // role: "monitor" (the only value today); status: "joined" | "failed"
+// 7 / 8 — member.joined / member.left (S)
+{"ord":3,"attempt":1,"member_id":"m1","open_seq":1,   // open_seq: this member's session openings in the attempt (re-opened after a failed turn)
+ "seat":"claude#2","role":"monitor","status":"attached",   // role: "monitor" (the only value today); status: "attached" | "failed", as S2 spells it (src/team.rs:1070)
  "reason":"path.scored#2 monitors=3","error":null}
-{"member_id":"m1","seat":"claude#2","status":"budget_exhausted",         // "completed" | "budget_exhausted" | "failed" | "timed_out"
+{"ord":3,"attempt":1,"member_id":"m1","open_seq":1,"seat":"claude#2","status":"budget_exhausted",   // "completed" | "budget_exhausted" | "failed" | "timed_out", as S2's LedgerMonitor spells it (src/team.rs:966-973)
  "batches":10,"error":null}
 
-// 8 — worker thread (PA) or supervisor (a member taking a plan step)
+// 9 — step.claimed (R): the attempt's worker thread, for a PA step or a member's step alike (a member step runs as a normal unit, §8.8)
 {"ord":3,"attempt":1,"by":"claude#1",
  "step_id":"build","role":"creator","kind":"build","phase":"build",
  "criterion":"…",                  // ≤2 KB
  "baseline_tree":"<tree id>",      // null when unbound (then: not monitored, disclosed)
  "repo":{"workdir":"…","git_dir":"…"},
- "code_graph_db":"…"}              // what AttachCtx carried (S2 src/team.rs:625-645)
+ "code_graph_db":"…"}              // what AttachCtx carries today (src/team.rs:625-645)
 
-// 9 — ACP carrier, only for a unit with a team context (unchanged from DES-001 §7 unitCheckpoint)
+// 10 — checkpoint.reached (R: the attempt's ACP carrier), only for a unit with a team context (the fields of today's unitCheckpoint, src/event.rs:1210)
 {"ord":3,"attempt":1,"by":"claude#1","seq":17,"tool_call_id":"toolu_…","kind":"edit",
- "title":"Edit src/retire.ts","status":"completed","paths":["src/retire.ts"]}
+ "title":"Edit src/retire.ts","status":"completed","paths":["src/retire.ts"]}   // kind: ACP ToolKind verbatim; status: "completed" | "failed" (src/team.rs:266)
 
-// 10 — supervisor (DES-001 §4.6 unchanged: parse → bar → confirm → dedup)
+// 11 — finding.raised (S; `by` is the authoring member). DES-001 §4.6's parse → bar → confirm → dedup
 {"ord":3,"attempt":1,"by":"claude#2","re":"checkpoint.reached#17",
  "raise_seq":4,                     // the supervisor's per-attempt emission counter: the key (§6.1)
- "finding_id":"f-3fa9c2e1d0b4a7e6","member_id":"m1","line_key":"l-9c0e4b7a1d2f3e58",   // identity, never a key
- "anchor":"retire","anchor_source":"graph","severity":"high","path":"src/retire.ts","line":41,
+ "finding_id":"f-3fa9c2e1d0b4a7e6","member_id":"m1",   // identity, never a key. On main it is sha256(path ‖ normalized evidence) (src/team.rs:386-392)
+ "line_key":"l-9c0e4b7a1d2f3e58","anchor":"retire","anchor_source":"graph",   // DES-001 §4.6 fields NOT built on main (no anchor or line_key in src/team.rs); T6 builds them. anchor_source: "graph" | "hunk" | "none"
+ "severity":"high","path":"src/retire.ts","line":41,   // severity: "high" | "medium" ("low" is dropped at the bar, src/team.rs:345, :1585-1594)
  "evidence":"fetchCoverage(scope).then(setCount)","claim":"…","suggestion":null,
  "tree":"<T_k>","in_diff":true,"corroborated_by":[]}
 
-// 11 — the carrier (mid-turn), the injector (next step boundary) or the supervisor's sweep
+// 12 — advice.delivered (R only): the carrier mid-turn, the worker thread at the next step boundary, or the worker thread's attempt-end row
 {"ord":3,"attempt":1,"by":"engine","re":"finding.raised#4",
  "raise_seq":4,"finding_id":"f-3fa9c2e1d0b4a7e6",   // one row per finding
- "delivery_id":"s-…",                // steer_id | "boundary:<step_id>:<attempt>" | "sweep" (§6.1)
+ "delivery_id":"s-…",                // steer_id | "boundary:<step_id>:<attempt>" | "end:<attempt>" (§6.1)
  "steer_id":"s-…",                   // acp_steering only: groups the rows one steer request carried; null otherwise
  "channel":"acp_steering",         // "acp_steering" | "boundary" | "none"
- "outcome":"injected",             // "injected" | "turn_ended" | "refused" | "not_delivered"
+ "outcome":"injected",             // "injected" | "turn_ended" | "refused" | "not_delivered", as S3's SteerOutcome spells them (src/team.rs:1704-1709); an "end:" row is always channel "none", outcome "not_delivered"
  "detail":null}
 
-// 12 — worker thread, from the PA's `ADVICE <id>: ACCEPT|DECLINE — <reason>` lines (S3 parser, src/team.rs:1989)
+// 13 — advice.answered (R): the worker thread, from the PA's `ADVICE <id>: ACCEPT|DECLINE — <reason>` lines (S3 parser, src/team.rs:1989)
 {"ord":3,"attempt":1,"by":"claude#1","re":"finding.raised#4","raise_seq":4,"answered_in":"build:1",   // the step:attempt whose output carried the line
- "finding_id":"f-3fa9c2e1d0b4a7e6","disposition":"declined","reason":"campaign.rs:325 documents the exclusion"}   // "accepted" | "declined"
+ "finding_id":"f-3fa9c2e1d0b4a7e6","disposition":"declined","reason":"campaign.rs:325 documents the exclusion"}   // "accepted" | "declined" (src/team.rs:1676-1679)
 
-// 13 / 14 — help.requested (R: the PA asks) and help.answered (S: a member answers)
+// 14 / 15 — help.requested (R: the PA asks) and help.answered (S: a member answers)
 {"ord":3,"attempt":1,"by":"claude#1","help_id":"h-1a2b…",
  "help_seq":2,                      // R's per-attempt counter; help_id is derived from it, never from the question
  "question":"…","context":"…"}     // ≤4 KB each
@@ -400,27 +414,27 @@ Exact payloads (envelope fields omitted after the first):
  "answer_id":"t-…",                 // S's member-turn id
  "answer":"…","evidence":["src/x.rs:41"]}
 
-// 14a — change.requested (S): a member asks for plan steps (§8.7). The PA's verdict comes back in its step output, not here.
+// 16 — change.requested (S): a member asks for plan steps (§8.7). The PA's verdict comes back in its step output, not here.
 {"ord":3,"attempt":1,"by":"claude#2","change_id":"c-…","change_seq":1,
  "steps":[{"catalog":"test_plan","id":"test-plan-2"}],      // the plan.proposed step shape
  "reason":"…"}
 
-// 15 — the worker thread after run_unit_streaming returns; a member's step from the supervisor
-{"ord":3,"attempt":1,"by":"claude#1","step_id":"build","status":"ok",   // "ok" | "failed" | "cancelled": the wire spelling of StepStatus (src/workflow.rs:175, which has no serde derive)
+// 17 — step.completed (R): the attempt's worker thread after run_unit_streaming returns, for a PA step or a member's step alike
+{"ord":3,"attempt":1,"by":"claude#1","step_id":"build","status":"ok",   // "ok" | "failed" | "cancelled" | "elicitation_failed" | "timed_out": StepStatus (src/workflow.rs:175-196) exactly as status_to_str spells it (src/cli_runner.rs:285-296)
  "tree":"<T_final>","output_bytes":12345,"output_ref":"unit:r1:3:1"}    // where get_work_output finds it
 
-// 16 — the PA's `STEP <id>: ACCEPT|REJECT — <reason>` line at its next turn (Decision 3)
+// 18 — step.reviewed (R): the PA's `STEP <id>: ACCEPT|REJECT <to:member|pa> — <reason>` line at its next turn (§8.8)
 {"ord":4,"attempt":1,"by":"claude#1","re":"step.completed#test-plan","step_id":"test-plan",
  "verdict":"accepted",             // "accepted" | "rejected"
  "to":null,                        // on "rejected": "member" | "pa"
  "reason":"…"}
 
-// 17 — supervisor, hold round (DES-001 §4.7 step 5); also "superseded" from re-confirmation
+// 19 — finding.settled (S): the hold round (DES-001 §4.7 step 5); also "superseded" from re-confirmation
 {"ord":3,"attempt":1,"by":"claude#2","re":"advice.answered#4","raise_seq":4,"finding_id":"f-3fa9…",
  "status":"held",                  // "held" | "withdrawn" | "superseded"
  "reason":"no reply (counted as hold)","final_line":43}
 
-// 18 — supervisor, one per unresolved HIGH or member-step dispute (DES-001 §6.3 input, verbatim)
+// 20 — council.called (S): one per unresolved HIGH or member-step dispute (DES-001 §6.3 input, verbatim)
 {"ord":3,"attempt":1,"by":"engine","re":"finding.settled#4",
  "subject":"finding:4",            // "finding:<raise_seq>" | "step:<step_id>:<attempt>"
  "finding_id":"f-3fa9…",           // identity, for a finding subject
@@ -431,41 +445,41 @@ Exact payloads (envelope fields omitted after the first):
  "excluded_seats":["claude#1","claude#2"],
  "transcript":[1201,1207,1215,1220]}   // event_ids of raised/delivered/answered/settled for this finding
 
-// 19 — the council thread (DecisionVerdict, src/decision.rs:292)
+// 21 — council.ruled (S): the DecisionVerdict its convene_decision call returned (src/decision.rs:292-310); `by` names the council
 {"ord":3,"attempt":1,"by":"council:<task_id>","re":"council.called#finding:4","subject":"finding:4",
  "verdict":"no",                   // "yes" | "no" | "no_verdict"
  "reason":null,                    // no_verdict: "no_quorum" | "seats_benched" | "error" | "timeout" | "cap"
- "agreement_pct":67,"dissent":["…"],"seats":["codex","pi"],"returned":3,"seated":3}
+ "task_id":"…","consensus":true,"agreement_pct":67,"dissent":["…"],"returned":3,"seated":3}   // DecisionVerdict's fields; it has no seat list (src/decision.rs:292-310)
 
-// 19a — ledger.folded (S): once per attempt, the fold of the attempt's stream (DES-001 §7 teamLedger + transcript)
+// 22 — ledger.folded (S): once per attempt, the fold of the attempt's stream (DES-001 §7 teamLedger + transcript)
 {"ord":3,"attempt":1,"by":"engine","final_pass":"completed",   // "completed" | "timed_out" | "skipped" | "stream_gap"
  "ledger":{ /* TeamLedger exactly as DES-001 §7: monitors[], findings[] (status, delivery, monitor_reply, dispute), rejected{}, team_pause */ },
  "transport":"bus",               // "bus" | "none" (the local no-bus snapshot, §4.1)
  "transcript":{"from_event_id":1180,"to_event_id":1290,"count":31,
                "events":[ /* the attempt's wicked.team.* rows, event_id-ordered, ≤256 KB; "truncated":true past the cap */ ]}}
 
-// 20 — gate.opened (E only). kind:"unit_review": the actor, on the ApplyStepResult that carries the snapshot, before the fold
+// 23 — gate.opened (E only). kind:"unit_review": the actor, on the ApplyStepResult that carries the snapshot, before the fold
 {"gate_id":"g-r1-3",              // "g-<run>-<gate_seq>" for every kind (AgentSession.gate_seq)
  "kind":"unit_review",             // "unit_review" | "plan_approval" | "team_dispute" | "team_transport"
  "ord":3,"attempt":1,"by":"engine",
  "ledger_ref":"ledger.folded#3:1"} // the S fact the gate reads; the snapshot itself rides UnitEvidence.team
 
-// 20 — gate.opened, kind:"plan_approval": the engine, when the approval matrix requires it (§8.6)
+// 23 (cont.) — gate.opened, kind:"plan_approval" (E), when the approval matrix requires it (§8.6)
 {"gate_id":"g-r1-4",              // gate_seq 4: a re-opened gate for a newer plan_rev gets a new one
  "kind":"plan_approval","ord":2,"attempt":1,"by":"engine",   // ord = the first not-yet-dispatched unit
  "reviewing_ord":1,"plan_rev":1,"band":"70-100","high_risk":true,"mode":"auto",
  "reason":"high_risk",             // "manual_mode" | "high_risk" | "into_high_risk" | "override"
  "diff":{"from_rev":null,"added":["architecture","security_review"]}}
 
-// 21 — gate.decided (E only): the fold decides unit_review; a human decision is published by E after confirm_gate accepts it (§4.0)
+// 24 — gate.decided (E only): the fold decides unit_review; a human decision is published by E after confirm_gate accepts it (§4.0)
 {"gate_id":"g-r1-3",              // the gate this decides
- "kind":"unit_review",            // "unit_review" | "plan_approval" | "team_dispute"
+ "kind":"unit_review",            // "unit_review" | "plan_approval" | "team_dispute" | "team_transport"
  "ord":3,"attempt":1,"by":"engine","re":"gate.opened#g-r1-3",
  "decision":"paused",              // unit_review: "allow" | "deny" | "paused"; human (any kind): "human_approved" | "human_amended" | "human_rejected"
  "combined":true,"team_pause":true,"unresolved":["f-3fa9…"]}
 
-// 22 — engine, at finalize/fail/cancel
-{"run_id":"r1","ord":null,"attempt":null,"by":"engine","status":"completed"}   // "completed" | "failed" | "cancelled"
+// 25 — path.ended (E), at finalize/fail/cancel
+{"run_id":"r1","ord":null,"attempt":null,"by":"engine","status":"completed"}   // "completed" | "failed" | "cancelled": the terminal SessionStatus values (src/domain.rs:17-31)
 ```
 
 ## 7. Producer / consumer matrix (§4.0)
@@ -637,7 +651,7 @@ Rules:
 2. calls `pause_for_human(…, gate_kind: "plan_approval", prompt)` (`src/actor.rs:6022`) with `ord` = the first **not-yet-dispatched** unit of the new plan and `reviewing_ord` = the unit whose output produced the plan, and
 3. the team publisher emits `gate.opened{kind:"plan_approval", gate_id}`, with `gate_id` from `AgentSession.gate_seq`, incremented in the same batch as the pause (§6.1).
 
-`PauseReason` (`src/actor.rs:6298-6309`) gains `PlanApproval`, mapped to the token at `:6124-6128`. The pause is durable exactly as every pause is: the session state and the open `interaction_request` commit in one batch (`src/actor.rs:6036-6046`).
+`PauseReason` (`src/actor.rs:6298-6309`) gains `PlanApproval` and `TeamTransport` (§4.1), mapped to the tokens `plan_approval` and `team_transport` at `:6124-6128`. The pause is durable exactly as every pause is: the session state and the open `interaction_request` commit in one batch (`src/actor.rs:6036-6046`).
 
 **Resume through `confirm_gate`** (`src/actor.rs:7736`). The rule is DES-001 §6.7's: read the open row's `gate_kind` (`InteractionRequest.gate_kind`, `src/interaction.rs:76`, via `list_interactions`, `:161`) **before** `resolve_open_for_session` (`src/actor.rs:7815`; `src/interaction.rs:184`). For `plan_approval`:
 - **Approve** releases the plan. The answer is the `confirm_gate` command (`POST /api/v1/runs/:id/gate`, §4.0), and the **engine** publishes `gate.decided{kind:"plan_approval", decision:"human_approved"}` and `plan.accepted{by:"human"}`. After both acknowledgements (§4.1) it emits `Resumed` and then calls `dispatch_unit` at the cursor. The existing arm bumps `attempt` when the cursor unit is `Done`/`Rejected` (`src/actor.rs:7976-7984`); the `plan_approval` arm skips that bump. It asserts the cursor unit is `Pending`, so a finished unit is never re-dispatched.
