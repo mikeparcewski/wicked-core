@@ -152,7 +152,10 @@ pub use interaction::{
 pub use knowledge::RecalledKnowledge;
 pub use memory::{now_secs, validate_scope_path, RecalledMemory};
 pub use pipeline::SessionResult;
-pub use plan::{compose, plan_from_def, PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID};
+pub use plan::{
+    compose, plan_from_def, FieldRule, PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID,
+    STEP_FIELD_RULES,
+};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,

@@ -362,6 +362,240 @@ fn a_step_cannot_replace_what_its_entry_already_fixes() {
     );
 }
 
+/// The field table (`STEP_FIELD_RULES`) is exhaustive and enforced: every `PlanStep` field has a
+/// row, and every field whose rule is not `Free` refuses a loosening step with its named reason
+/// while accepting the entry's own value. Run against a synthetic entry that sets EVERY field, so
+/// no rule is vacuous because the shipped catalog happens to leave a field empty.
+#[test]
+fn every_step_field_is_classified_and_every_loosening_is_refused() {
+    use wicked_core::{FieldRule, PhaseDef, STEP_FIELD_RULES};
+    let entries: Vec<PhaseDef> = serde_json::from_value(json!([
+        {"id": "full", "kind": "build", "role": "creator", "instructions": "own",
+         "gate_type": "execution", "gate": {"human_confirm": {"unconditional": false}},
+         "executes_code": true, "required_deliverables": ["r.json"], "skill_ref": "own-skill",
+         "allowed_skills": ["a"], "validator_pin": EVIDENCE_FLOOR_PIN},
+        {"id": "tool", "kind": "recon", "executor": {"type": "tool", "cmd": []}}
+    ]))
+    .unwrap();
+
+    // A fully populated step serializes every field: the table must name exactly those.
+    let full_step = json!({"catalog": "full", "id": "x", "instructions": "own", "gate": "auto",
+        "gate_type": "value", "validator_pin": "p", "executes_code": true, "skill_ref": "s",
+        "allowed_skills": [], "required_deliverables": [], "depends_on": [],
+        "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator"});
+    let parsed: wicked_core::PlanStep = serde_json::from_value(full_step).unwrap();
+    let mut keys: Vec<String> = serde_json::to_value(&parsed)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    let mut table: Vec<String> = STEP_FIELD_RULES
+        .iter()
+        .map(|(f, _)| f.to_string())
+        .collect();
+    table.sort();
+    assert_eq!(
+        keys, table,
+        "STEP_FIELD_RULES must classify every PlanStep field"
+    );
+
+    let compose_one = |entry: &str, extra: Value| {
+        let mut step = json!({"catalog": entry, "id": "x"});
+        for (k, v) in extra.as_object().unwrap() {
+            step[k] = v.clone();
+        }
+        let plan: PlanSteps = serde_json::from_value(json!({ "steps": [step] })).unwrap();
+        compose(&entries, &plan)
+    };
+    // (field → the loosening steps and the reason each must be refused with, plus the entry's
+    // own value, which must be accepted).
+    // (catalog entry, step fields, expected refusal reason)
+    type Loosening<'a> = Vec<(&'a str, Value, &'a str)>;
+    // (catalog entry, step fields) restating the entry's own value
+    type Restate<'a> = (&'a str, Value);
+    let loosen: BTreeMap<&str, (Loosening, Restate)> = BTreeMap::from([
+        (
+            "role",
+            (
+                vec![("full", json!({"role": "evaluator"}), "role_changed")],
+                ("full", json!({"role": "creator"})),
+            ),
+        ),
+        (
+            "kind",
+            (
+                vec![("full", json!({"kind": "recon"}), "kind_not_allowed")],
+                ("full", json!({"kind": "build"})),
+            ),
+        ),
+        (
+            "gate",
+            (
+                vec![
+                    ("full", json!({"gate": "auto"}), "gate_lowered"),
+                    (
+                        "full",
+                        json!({"gate": {"human_confirm_if": "verdict_not_pass"}}),
+                        "gate_lowered",
+                    ),
+                ],
+                (
+                    "full",
+                    json!({"gate": {"human_confirm": {"unconditional": false}}}),
+                ),
+            ),
+        ),
+        (
+            "validator_pin",
+            (
+                vec![("full", json!({"validator_pin": null}), "pin_removed")],
+                ("full", json!({"validator_pin": EVIDENCE_FLOOR_PIN})),
+            ),
+        ),
+        (
+            "executes_code",
+            (
+                vec![(
+                    "full",
+                    json!({"executes_code": false}),
+                    "executes_code_lowered",
+                )],
+                ("full", json!({"executes_code": true})),
+            ),
+        ),
+        (
+            "required_deliverables",
+            (
+                vec![
+                    (
+                        "full",
+                        json!({"required_deliverables": []}),
+                        "deliverable_removed",
+                    ),
+                    (
+                        "full",
+                        json!({"required_deliverables": ["other.json"]}),
+                        "deliverable_removed",
+                    ),
+                ],
+                (
+                    "full",
+                    json!({"required_deliverables": ["r.json", "more.json"]}),
+                ),
+            ),
+        ),
+        (
+            "executor",
+            (
+                vec![
+                    (
+                        "full",
+                        json!({"executor": {"type": "tool", "cmd": ["sh"]}}),
+                        "executor_not_allowed",
+                    ),
+                    (
+                        "full",
+                        json!({"executor": {"type": "agent"}}),
+                        "executor_not_allowed",
+                    ),
+                    (
+                        "tool",
+                        json!({"executor": {"type": "agent"}}),
+                        "tool_command_missing",
+                    ),
+                    (
+                        "tool",
+                        json!({"executor": {"type": "tool", "cmd": []}}),
+                        "tool_command_missing",
+                    ),
+                    ("tool", json!({}), "tool_command_missing"),
+                ],
+                (
+                    "tool",
+                    json!({"executor": {"type": "tool", "cmd": ["true"]}}),
+                ),
+            ),
+        ),
+        (
+            "instructions",
+            (
+                vec![(
+                    "full",
+                    json!({"instructions": "other"}),
+                    "instructions_changed",
+                )],
+                ("full", json!({"instructions": "own"})),
+            ),
+        ),
+        (
+            "skill_ref",
+            (
+                vec![(
+                    "full",
+                    json!({"skill_ref": "wicked-garden-domain"}),
+                    "skill_ref_changed",
+                )],
+                ("full", json!({"skill_ref": "own-skill"})),
+            ),
+        ),
+        (
+            "allowed_skills",
+            (
+                vec![
+                    (
+                        "full",
+                        json!({"allowed_skills": ["b"]}),
+                        "allowed_skills_changed",
+                    ),
+                    (
+                        "full",
+                        json!({"allowed_skills": []}),
+                        "allowed_skills_changed",
+                    ),
+                ],
+                ("full", json!({"allowed_skills": ["a"]})),
+            ),
+        ),
+    ]);
+    for (field, rule) in STEP_FIELD_RULES {
+        match rule {
+            FieldRule::Identity => {}
+            FieldRule::Free => {
+                let change = match field {
+                    "gate_type" => json!({"gate_type": null}),
+                    "depends_on" => json!({"depends_on": []}),
+                    "owner" => json!({"owner": "team"}),
+                    other => panic!("no free-field case for {other}"),
+                };
+                compose_one("full", change).unwrap_or_else(|e| panic!("free {field}: {e}"));
+            }
+            _ => {
+                let (cases, same) = loosen
+                    .get(field)
+                    .unwrap_or_else(|| panic!("{field} ({rule:?}) has no loosening case"));
+                for (entry, step, reason) in cases {
+                    let r = compose_one(entry, step.clone())
+                        .expect_err(&format!("{field}: {step} must be refused"));
+                    assert_eq!(r.reason(), *reason, "{field}: {step}: {r}");
+                }
+                compose_one(same.0, same.1.clone())
+                    .unwrap_or_else(|e| panic!("{field}: the entry's own value is a no-op: {e}"));
+            }
+        }
+    }
+    // Setting a SetIfUnset field on an entry that leaves it unset is allowed.
+    let def = compose_one(
+        "tool",
+        json!({"executor": {"type": "tool", "cmd": ["true"]}, "skill_ref": "s",
+               "instructions": "i", "allowed_skills": ["a"]}),
+    )
+    .unwrap();
+    assert_eq!(def.phases[0].skill_ref.as_deref(), Some("s"));
+}
+
 /// C1 acceptance (c): a misspelled step key is refused at parse.
 #[test]
 fn a_misspelled_step_key_is_refused() {
