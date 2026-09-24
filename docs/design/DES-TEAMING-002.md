@@ -1,14 +1,25 @@
 # DES-TEAMING-002 — The team model on the bus: one transport, one grammar, one phase catalog
 
-- **Status:** DRAFT (rev 5). **No `[OPERATOR DECISION]` block remains.** The operator decided all three on 2026-09-23, and each decision is written into the text it governs. **Decision 1:** no pre-canned workflows. One phase catalog; the S4 score sets the minimum phases; plans re-decide mid-run upward only; user-composed plans and named presets go through the same mechanism; every workflow consumer migrates onto the catalog (§8.3–§8.7, §11). **Decision 2:** a plan needs human approval by default; auto mode proceeds without it; high risk always needs it (§8.6). **Decision 3:** the PA owns a member's step (§8.8). One item is a **recommendation awaiting the operator**: the floor-override rule (§8.5).
+- **Status:** DRAFT (rev 6). **No `[OPERATOR DECISION]` block remains.** The operator decided all three on 2026-09-23, and each decision is written into the text it governs. **Decision 1:** no pre-canned workflows. One phase catalog; the S4 score sets the minimum phases; plans re-decide mid-run upward only; user-composed plans and named presets go through the same mechanism; every workflow consumer migrates onto the catalog (§8.3–§8.7, §11). **Decision 2:** a plan needs human approval by default; auto mode proceeds without it; high risk always needs it (§8.6). **Decision 3:** the PA owns a member's step (§8.8). One item is a **recommendation awaiting the operator**: the floor-override rule (§8.5).
 - **Date:** 2026-09-23
+- **Rev 6 (2026-09-23):** review on #612 at `ea4a2cb` (1 HIGH, the same class as rev 4's). `help_id` hashed the question text, so a second, distinct request with the same question deduped onto the first (`src/bus.rs:316-342`). It is now derived from the producer's per-attempt `help_seq`. The class is closed by **one rule** in §6.1: no key is derived from content a later distinct request can repeat; keys come from a producer-assigned sequence or id. Walking every key against it changed nine more:
+  - `path.scored` → `score_source`;
+  - `member.*` + `open_seq` (monitors re-open after a failed turn, `src/team.rs:667`);
+  - `finding.raised`, `finding.settled` → the supervisor's `raise_seq`, with `finding_id` kept as payload identity only;
+  - `advice.delivered` → `delivery_id`;
+  - `advice.answered` + `answered_in`;
+  - `help.answered` → `answer_id`;
+  - `council.*` → `subject` built from `raise_seq` or step:attempt;
+  - `gate.decided` engine-published only.
+
+  T1 gains the table-driven rule test.
 - **Rev 5 (2026-09-23):** review on #612 at `c2443f1` (3 HIGH, each verified at the code), plus a re-sweep of every "as today"/"unchanged" claim against the code.
   1. A gate-originated `plan.proposed` takes its `source` from the gate's `gate_id`. The interaction id is `deterministic_id(session, "gate", ord)` (`src/interaction.rs:141-144`), which every gate at that ord reuses (§6.1, T3 (i)).
   2. Supervisor restart is **one mechanism, a startup replay of live runs**, with run-level team state persisted on the session. A restart never resumes an in-flight attempt (the attempt is reported orphaned or redriven at attempt+1, `src/actor.rs:1058-1065`, `:3993-4030`), so the replay's job is plan and gate state plus the prior attempt's findings (§4.7, T6 (k)).
   3. **[COORDINATOR RECOMMENDATION] Evaluator ≠ creator for team runs.** Never `creator_seat`: a distinct CLI, else a second usable instance of an eligible CLI (`same_cli_instance`), else refuse `NoEligibleSeat`. Today a bench-free roster keeps review on the creator seat (`src/distribute.rs:286-290`, `:417-426`; refusal only when a bench caused it, `:388-409`). Legacy consumers keep today's behaviour until their migration seam (§8.1, §11.3, seam D1).
 
   The sweep corrected four overclaims (§16.1).
-- **Rev 4 (2026-09-23):** review on #612 at `5ba3a2c` (2 HIGH, 1 MEDIUM, each verified at the code), plus a sweep of every idempotency key against its payload. (1) A plan with a creator step and no declared `touch[]` now scores `no_graph_score` (100, "no declared scope"), S4's fail-closed rule (`src/review_scale.rs:264-265`, `:281`). Only a plan with no creator step may score 0 (§8.2, §8.4, T2 (g)). (2) Gates are keyed by a `gate_id` minted from a per-run gate sequence, so a re-opened `plan_approval` gate is a new row, not a dedup onto the old one (`src/bus.rs:316-345`) (§6, §8.6, T3 (i)). (3) `advice.delivered` is one row per finding (§6, §8.9, T5). The sweep fixed seven more keys (§6.1). The T5–T9 acceptance text that rev 3 cited as "rev 2's" is now inlined.
+- **Rev 4 (2026-09-23):** review on #612 at `5ba3a2c` (2 HIGH, 1 MEDIUM, each verified at the code), plus a sweep of every idempotency key against its payload. (1) A plan with a creator step and no declared `touch[]` now scores `no_graph_score` (100, "no declared scope"), S4's fail-closed rule (`src/review_scale.rs:264-265`, `:281`). Only a plan with no creator step may score 0 (§8.2, §8.4, T2 (g)). (2) Gates are keyed by a `gate_id` minted from a per-run gate sequence, so a re-opened `plan_approval` gate is a new row, not a dedup onto the old one (`src/bus.rs:316-342`) (§6, §8.6, T3 (i)). (3) `advice.delivered` is one row per finding (§6, §8.9, T5). The sweep fixed seven more keys (§6.1). The T5–T9 acceptance text that rev 3 cited as "rev 2's" is now inlined.
 - **Rev 3 (2026-09-23):** folds in the operator decisions above and the consumer constraint: every workflow consumer is inventoried (§11.1), mapped onto the catalog (§11.2) and given a before/after behaviour table with named contract tests (§11.3). Migrating them is in scope, one seam per consumer, with no dual path (§14). New: the phase catalog (§8.3), plans and presets (§8.4), the floor and high-risk table (§8.5), the approval matrix and the `plan_approval` gate (§8.6), `plan.revised` with the re-score trigger (§8.7). The event table gains `plan.revised`, and `gate.opened`/`gate.decided` gain `kind` (§6). Citations re-verified at core `main` `fe94ffc`, which now includes S4 (#600).
 - **Rev 2 (2026-09-23):** review on #612 at `06db4cd`: the exact idempotency-key algorithm with test vectors; the explicit `owner` field; the step-boundary dedup keyed on `outcome:"injected"`; an enum sweep.
 - **Supersedes:** the transport and orchestration parts of DES-TEAMING-001 (§15 lists every clause), and the per-surface workflow files (§10, §11). DES-001's landed seams stay: S1 elicitation (#599), S3's steer over `_session/steering` (#607), S5 `RoutingInfo::Teamed` + `Core::convene_decision` (#608), S4 impact scoring (#600), S2 monitors (#609), the batching/confirmation/dedup rules (DES-001 §4.3–§4.6), the gate render and judge exclusion (§6.2), and the unresolved-HIGH ruling (§6.3, §6.7).
@@ -173,48 +184,66 @@ Twenty-three types. `Key` is the idempotency key's parts after `["team", <type>,
 | # | Type | Pub | Sub | Key parts | When |
 |---|---|---|---|---|---|
 | 1 | `wicked.team.path.started` | engine (actor → publisher) | S, I, R, U | — | launch admitted; PA seat known |
-| 2 | `wicked.team.path.scored` | worker thread / S (S4 `assess`) | engine, S, R, U | `basis`, `score_seq` | intent score at plan time; diff re-score at checkpoints and `step.completed` (§8.7) |
+| 2 | `wicked.team.path.scored` | worker thread / S (S4 `assess`) | engine, S, R, U | `score_source` | intent score at plan time; diff re-score at checkpoints and `step.completed` (§8.7) |
 | 3 | `wicked.team.plan.proposed` | worker thread (PA's `understand` block, PA `PLAN+`, accepted member request) / crew (user plan, preset, approval edit) | engine, R, U | `proposal_id` | any plan or plan change from any author (§8.4) |
 | 4 | `wicked.team.plan.revised` | engine only (it assigns `plan_rev`) | S, R, U | `plan_rev` | the plan grew (§8.7): a composed revision, or an automatic floor raise |
 | 5 | `wicked.team.plan.accepted` | engine | S, R, U | `plan_rev` | composed, floor-filled, approved or auto-released |
 | 5a | `wicked.team.plan.refused` | engine | R, U | `proposal_id` | compose refused a proposal (floor, pin, schema); the run keeps its accepted rev |
-| 6 | `wicked.team.member.joined` | S | R, U | `ord`, `attempt`, `member_id` | a monitor session opened (or failed) |
-| 7 | `wicked.team.member.left` | S | R, U | `ord`, `attempt`, `member_id` | budget exhausted, failed, closed |
+| 6 | `wicked.team.member.joined` | S | R, U | `ord`, `attempt`, `member_id`, `open_seq` | a monitor session opened (or failed) |
+| 7 | `wicked.team.member.left` | S | R, U | `ord`, `attempt`, `member_id`, `open_seq` | budget exhausted, failed, closed |
 | 8 | `wicked.team.step.claimed` | worker thread (PA) / S (member) | S, C, I, R, U | `step_id`, `attempt`, `by` | before the step's turn starts |
 | 9 | `wicked.team.checkpoint.reached` | C | S, R, U | `ord`, `attempt`, `seq` | terminal `tool_call_update` of a team unit |
-| 10 | `wicked.team.finding.raised` | S | C, I, R, U | `ord`, `attempt`, `finding_id` | confirmed, above-bar, first-seen finding |
-| 11 | `wicked.team.advice.delivered` | C (mid-turn) / I (boundary) / S (sweep) | S, I, R, U | `ord`, `attempt`, `finding_id`, `channel`, `outcome` | **one row per finding**: it reached (or could not reach) the PA on one channel |
-| 12 | `wicked.team.advice.answered` | worker thread (`ADVICE` lines) | S, R, U | `ord`, `attempt`, `finding_id` | end of the PA's turn |
+| 10 | `wicked.team.finding.raised` | S | C, I, R, U | `ord`, `attempt`, `raise_seq` | confirmed, above-bar, first-seen finding |
+| 11 | `wicked.team.advice.delivered` | C (mid-turn) / I (boundary) / S (sweep) | S, I, R, U | `ord`, `attempt`, `raise_seq`, `delivery_id` | **one row per finding**: it reached (or could not reach) the PA on one channel |
+| 12 | `wicked.team.advice.answered` | worker thread (`ADVICE` lines) | S, R, U | `ord`, `attempt`, `raise_seq`, `answered_in` | end of the PA's turn |
 | 13 | `wicked.team.help.requested` | worker thread / C (`HELP:`) / S (member `plan_change`) | S, R, U | `help_id` | the PA asks the team, or a member asks for a plan change |
-| 14 | `wicked.team.help.answered` | S (a member) / crew (human) / worker thread (PA `PLAN` answer) | I, C, engine, R, U | `help_id`, `by` | an answer |
+| 14 | `wicked.team.help.answered` | S (a member) / crew (human) / worker thread (PA `PLAN` answer) | I, C, engine, R, U | `help_id`, `answer_id` | an answer |
 | 15 | `wicked.team.step.completed` | worker thread / S (member) | S, G, R, U | `step_id`, `attempt`, `by` | the step's turn returned |
 | 16 | `wicked.team.step.reviewed` | worker thread (PA `STEP` line) | S, R, U | `step_id`, `attempt` | the PA accepted or rejected a member's step (§8.8) |
-| 17 | `wicked.team.finding.settled` | S (hold round) | G, R, U | `ord`, `attempt`, `finding_id` | held / withdrawn / superseded |
-| 18 | `wicked.team.council.called` | S | R, U | `ord`, `attempt`, `subject_id` | an unresolved HIGH, or a member-step dispute |
-| 19 | `wicked.team.council.ruled` | council thread | S, I, R, U | `ord`, `attempt`, `subject_id` | `convene_decision` returned |
+| 17 | `wicked.team.finding.settled` | S (hold round) | G, R, U | `ord`, `attempt`, `raise_seq` | held / withdrawn / superseded |
+| 18 | `wicked.team.council.called` | S | R, U | `ord`, `attempt`, `subject` | an unresolved HIGH, or a member-step dispute |
+| 19 | `wicked.team.council.ruled` | council thread | S, I, R, U | `ord`, `attempt`, `subject` | `convene_decision` returned |
 | 20 | `wicked.team.gate.opened` | S (`unit_review`) / engine (`plan_approval`, `team_dispute`) | G, R, U | `gate_id` | a gate opened; a re-opened gate is a new `gate_id` |
-| 21 | `wicked.team.gate.decided` | engine / crew (human) | R, U | `gate_id` | a gate decided (one decision per `gate_id`) |
+| 21 | `wicked.team.gate.decided` | engine (including human decisions, after `confirm_gate`) | R, U | `gate_id` | a gate decided (one decision per `gate_id`) |
 | 22 | `wicked.team.path.ended` | engine | S, R, U | — | the run reached a terminal state |
 
-### 6.1 Identity rules behind the keys (rev 4 sweep)
+### 6.1 Identity rule for every key (rev 6; closes the class)
 
-A key must name exactly the entity **one row** describes, at the scope where that entity is unique, because `BusDb::emit` resolves a duplicate key to the existing row (`src/bus.rs:316-345`). Rev 4 checked every row against its payload and publishers:
+**The rule.** No idempotency key is derived from content that a later, distinct request can repeat. Keys come from a **producer-assigned sequence or id**: a counter the one producer of that row increments, an id the producer mints, or the id of the upstream row or request that caused it. The one exception is a hash of the **full** payload, where resending an identical payload must dedup, and no row in this table uses it.
 
-| Row | Rev 3 key | Mismatch | Rev 4 key and rule |
-|---|---|---|---|
-| `plan.proposed` | `plan_rev` | Two authors (a user edit and a PA `PLAN+`) could each claim rev n+1; the second silently resolved to the first. Only the actor can assign a rev. | `proposal_id` = `"p-" + deterministic_key([run, by, source])`, where `source` is the event or request that produced it (the `understand` step's `step.completed` id, the gate's `gate_id` for a gate-originated proposal — never the interaction id, which every gate at one ord reuses (`src/interaction.rs:141-144`) — and the launch's session id for a launch). `plan_rev` is assigned by the engine on `plan.revised`/`plan.accepted` only. |
-| `plan.revised` | `plan_rev` | Published by the worker thread and the engine alike, but only the actor holds the counter. | Engine-only; the PA and member paths publish `plan.proposed` and the engine revises. |
-| `plan.accepted{refused}` | `plan_rev` | A refusal carried the previous rev and collided with the earlier acceptance row. | A refusal is its own row, `plan.refused`, keyed by `proposal_id`. |
-| `member.joined` / `member.left` | `member_id` | Member ids (`m1`, …) are unique per attempt only: the pool key is `team:<run>:<ord>:<attempt>:<monitorId>` (`src/team.rs:728-731`). | `ord`, `attempt`, `member_id` |
-| `checkpoint.reached` | `attempt`, `seq` | `seq` is per attempt of one unit; two units' attempt 1 / seq 1 collided. | `ord`, `attempt`, `seq` |
-| `finding.raised`, `advice.answered`, `finding.settled` | `finding_id` (± `attempt`) | `finding_id` is a content hash (path, anchor, evidence), so the same line re-found in a rework attempt or another unit collided. | `ord`, `attempt`, `finding_id` |
-| `advice.delivered` | `finding_id`, `channel` | The payload batched `finding_ids`, and a finding can have more than one outcome on one channel over an attempt. | One row per finding: `ord`, `attempt`, `finding_id`, `channel`, `outcome`. A steer that carried several findings publishes one row each, sharing `steer_id`. |
-| `council.called` / `council.ruled` | `subject_id`, `attempt` | `subject_id` is a finding id or a step id, both unique only within a unit. | `ord`, `attempt`, `subject_id` |
-| `gate.opened` / `gate.decided` | `kind`, `ord`, `attempt` (+ `decision`) | A `plan_approval` gate re-opens at the same ord and attempt for a newer `plan_rev` (approve-with-edit refused, or a second revision before the next unit), and resolved to the old row. The durable interaction id cannot disambiguate: it is `deterministic_id(session, "gate", ord)` (`src/interaction.rs:141-144`) and is reused by every gate at that ord. | `gate_id`. For engine gates (`plan_approval`, `team_dispute`) it is `"g-" + run + "-" + gate_seq`: `AgentSession.gate_seq` is a per-run counter incremented by `pause_for_human` in the same batch that writes the pause (`src/actor.rs:6036-6046`), so a re-publish after a crash reuses it and every new opening gets a new one. For `unit_review` it is `"g-" + run + "-u" + ord + "-" + attempt`: exactly one per attempt, shared by the worker's timeout synthesis and the supervisor's late publish on purpose. `gate.decided` references its `gate_id`, one decision per gate. |
-| Every other gate kind | — | `team_dispute`: an approve-with-amend reruns at attempt n+1, which is a new gate either way; re-opening at the same attempt cannot happen (a refused answer leaves the row open rather than re-opening it: `confirm_gate` refuses before resolving, `src/actor.rs:7758`). `unit_review`: one per attempt by construction. | Covered by the `gate_id` rule above. |
-| `help.requested` | `help_id` | `help_id` was not defined. | `help_id` = `"h-" + deterministic_key([run, ord, attempt, by, normalized question])` |
-| `path.started`, `path.scored` (`basis`, `score_seq`), `step.claimed` / `step.completed` (`step_id`, `attempt`, `by`), `step.reviewed` (`step_id`, `attempt`), `help.answered` (`help_id`, `by`), `path.ended` | unchanged | none: each names one entity at the scope where it is unique (`step_id` is unique across every rev of a run's plan, and `compose` refuses a duplicate id). | unchanged |
+**Why it matters.** `BusDb::emit` resolves a duplicate key to the existing row and returns its id (`src/bus.rs:316-342`). A key built from content therefore makes a second, distinct request **vanish without an error**. That is what happened to the rev 4 and rev 5 `help_id`, which hashed the question text.
 
+**Content hashes that stay (as payload, not key).** `finding_id` and `line_key` remain what DES-001 §4.6 made them: the finding's *identity*, used for dedup and correlation **inside** the supervisor, which is the single producer and emits each finding once per attempt. Neither is ever a bus key.
+
+**Every key, with its source of uniqueness** (all keys are prefixed `["team", <event_type>, <run_id>]`, §4.1):
+
+| # | Event | Key parts | Source of uniqueness (who assigns it) | Rev 6 change |
+|---|---|---|---|---|
+| 1 | `path.started` | — | the run id: one path per run, minted at launch | — |
+| 2 | `path.scored` | `score_source` | `"intent:" + proposal_id` (one intent score per proposal) or `"diff:" + ord + ":" + attempt + ":" + rescore_seq` (`rescore_seq`: the supervisor's per-attempt re-score counter, §8.7) | was `basis`, `score_seq`: two producers (worker thread, supervisor) shared one counter |
+| 3 | `plan.proposed` | `proposal_id` | `"p-" + deterministic_key([run, by, source])` where `source` is producer-assigned: the launch's session id (user plan / preset); the `understand` step's `step.completed` event id (PA plan); `ord:attempt:plan_block_seq` (a PA `PLAN+` block; `plan_block_seq` is the per-output block counter the worker's parser assigns); the accepted `help_id` (member request); the `gate_id` (approval edit) | `PLAN+` source now names its block sequence |
+| 4 | `plan.revised` | `plan_rev` | the engine's per-run plan counter (actor, single writer) | — |
+| 5 | `plan.accepted` | `plan_rev` | the same counter | — |
+| 5a | `plan.refused` | `proposal_id` | one refusal per proposal | — |
+| 6 | `member.joined` | `ord`, `attempt`, `member_id`, `open_seq` | `member_id` is the supervisor's per-attempt id; `open_seq` counts that member's session openings in the attempt. A monitor is **re-opened** after a failed turn (`src/team.rs:667`, `:885`, `:909`) | `open_seq` added |
+| 7 | `member.left` | `ord`, `attempt`, `member_id`, `open_seq` | the opening it closes | `open_seq` added |
+| 8 | `step.claimed` | `step_id`, `attempt`, `by` | the engine's attempt counter: every (re-)dispatch of a step is a new attempt, including a rework, a PA takeover and a redrive | — |
+| 9 | `checkpoint.reached` | `ord`, `attempt`, `seq` | the carrier's per-attempt checkpoint counter | — |
+| 10 | `finding.raised` | `ord`, `attempt`, `raise_seq` | the supervisor's per-attempt emission counter; `finding_id` rides in the payload | was `finding_id` (content hash) |
+| 11 | `advice.delivered` | `ord`, `attempt`, `raise_seq`, `delivery_id` | `delivery_id` = the steer's `steer_id` (the carrier's per-process request id), or `"boundary:" + step_id + ":" + attempt` of the step whose prompt carried it (one render per step attempt), or `"sweep"` (one per attempt) | was `finding_id`, `channel`, `outcome`: a finding refused at two successive tool calls repeated all three |
+| 12 | `advice.answered` | `ord`, `attempt`, `raise_seq`, `answered_in` | `answered_in` = the `step_id:attempt` whose output carried the `ADVICE` line (the last line per id wins inside one output) | was `finding_id`: an answer revised at a later step collided |
+| 13 | `help.requested` | `help_id` | `"h-" + deterministic_key([run, ord, attempt, by, help_seq])`, where `help_seq` is the producer's per-attempt counter: the worker's parser numbers `HELP:` lines in output order; the carrier numbers mid-turn ones in the same sequence; the supervisor numbers a member's `plan_change` requests. The question and context are payload only | **was content-derived (question text)** |
+| 14 | `help.answered` | `help_id`, `answer_id` | `answer_id` is producer-assigned: the supervisor's member-turn id, the answering `step_id:attempt` (a PA `PLAN` verdict), or crew's request id for a human answer (`POST /api/v1/runs/:id/help/:help_id` mints it) | was `help_id`, `by`: a second answer from the same author collided |
+| 15 | `step.completed` | `step_id`, `attempt`, `by` | the attempt counter | — |
+| 16 | `step.reviewed` | `step_id`, `attempt` | the reviewed attempt: the first `STEP` line for it wins; later lines for that attempt are logged and ignored | — |
+| 17 | `finding.settled` | `ord`, `attempt`, `raise_seq` | the finding's emission id: one settlement per finding per attempt | was `finding_id` |
+| 18 | `council.called` | `ord`, `attempt`, `subject` | `subject` = `"finding:" + raise_seq`, or `"step:" + step_id + ":" + attempt` for a member-step dispute. One council per subject (`MAX_DISPUTES` caps the count) | was `subject_id` (a finding content hash for findings) |
+| 19 | `council.ruled` | `ord`, `attempt`, `subject` | the call it answers | as 18 |
+| 20 | `gate.opened` | `gate_id` | `AgentSession.gate_seq` (engine gates) or `u<ord>-<attempt>` (unit review), §8.6 | — |
+| 21 | `gate.decided` | `gate_id` | one decision per gate. **Engine-published only**, including human decisions, after `confirm_gate` accepts the answer, so two concurrent human clicks produce one row | publisher narrowed from "engine / crew" |
+| 22 | `path.ended` | — | one terminal state per run | — |
+
+**How the rule is enforced.** T1 adds a table-driven test. For every event type, two distinct logical requests that share all content except the producer-assigned part produce two rows; a re-publish of the same logical request produces one. The `help.requested` fixture is two `HELP:` lines with the same question and different context, and then with different `plan_change` steps: two rows, two `help_id`s.
 
 Exact payloads (envelope fields omitted after the first):
 
@@ -229,7 +258,8 @@ Exact payloads (envelope fields omitted after the first):
  "plan":false}                     // true when the launch carried a user-composed plan
 
 // 2 — worker thread; S4 assess() on the predicted touch set, then on each settled diff
-{"basis":"intent",                 // "intent" | "diff"
+{"score_source":"intent:p-…",     // "intent:<proposal_id>" | "diff:<ord>:<attempt>:<rescore_seq>" (§6.1)
+ "basis":"intent",                 // "intent" | "diff"
  "score_seq":1,                    // per run, monotonic
  "score":70,"deterministic":70,"reasons":["destructive ⇒ floor 70","reach 21-100 dependents: +60"],
  "model":null,                     // {"add":10,"rationale":"…"} or null
@@ -276,7 +306,8 @@ Exact payloads (envelope fields omitted after the first):
 {"proposal_id":"p-…","base_rev":1,"by":"engine","reason":"step `review` lowers its entry's gate"}
 
 // 6 / 7 — supervisor
-{"member_id":"m1","seat":"claude#2","role":"monitor","status":"joined",   // role: "monitor" (the only value today); status: "joined" | "failed"
+{"member_id":"m1","open_seq":1,     // open_seq: this member's session openings in the attempt (re-opened after a failed turn)
+ "seat":"claude#2","role":"monitor","status":"joined",   // role: "monitor" (the only value today); status: "joined" | "failed"
  "reason":"path.scored#2 monitors=3","error":null}
 {"member_id":"m1","seat":"claude#2","status":"budget_exhausted",         // "completed" | "budget_exhausted" | "failed" | "timed_out"
  "batches":10,"error":null}
@@ -295,29 +326,33 @@ Exact payloads (envelope fields omitted after the first):
 
 // 10 — supervisor (DES-001 §4.6 unchanged: parse → bar → confirm → dedup)
 {"ord":3,"attempt":1,"by":"claude#2","re":"checkpoint.reached#17",
- "finding_id":"f-3fa9c2e1d0b4a7e6","member_id":"m1","line_key":"l-9c0e4b7a1d2f3e58",
+ "raise_seq":4,                     // the supervisor's per-attempt emission counter: the key (§6.1)
+ "finding_id":"f-3fa9c2e1d0b4a7e6","member_id":"m1","line_key":"l-9c0e4b7a1d2f3e58",   // identity, never a key
  "anchor":"retire","anchor_source":"graph","severity":"high","path":"src/retire.ts","line":41,
  "evidence":"fetchCoverage(scope).then(setCount)","claim":"…","suggestion":null,
  "tree":"<T_k>","in_diff":true,"corroborated_by":[]}
 
 // 11 — the carrier (mid-turn), the injector (next step boundary) or the supervisor's sweep
-{"ord":3,"attempt":1,"by":"engine","re":"finding.raised#f-3fa9c2e1d0b4a7e6",
- "finding_id":"f-3fa9c2e1d0b4a7e6",   // one row per finding
+{"ord":3,"attempt":1,"by":"engine","re":"finding.raised#4",
+ "raise_seq":4,"finding_id":"f-3fa9c2e1d0b4a7e6",   // one row per finding
+ "delivery_id":"s-…",                // steer_id | "boundary:<step_id>:<attempt>" | "sweep" (§6.1)
  "steer_id":"s-…",                   // acp_steering only: groups the rows one steer request carried; null otherwise
  "channel":"acp_steering",         // "acp_steering" | "boundary" | "none"
  "outcome":"injected",             // "injected" | "turn_ended" | "refused" | "not_delivered"
  "detail":null}
 
 // 12 — worker thread, from the PA's `ADVICE <id>: ACCEPT|DECLINE — <reason>` lines (S3 parser, src/team.rs:1989)
-{"ord":3,"attempt":1,"by":"claude#1","re":"finding.raised#f-3fa9c2e1d0b4a7e6",
+{"ord":3,"attempt":1,"by":"claude#1","re":"finding.raised#4","raise_seq":4,"answered_in":"build:1",   // the step:attempt whose output carried the line
  "finding_id":"f-3fa9c2e1d0b4a7e6","disposition":"declined","reason":"campaign.rs:325 documents the exclusion"}   // "accepted" | "declined"
 
 // 13 / 14 — the PA asks; a member (or a human through crew) answers
 {"ord":3,"attempt":1,"by":"claude#1","help_id":"h-1a2b…",
+ "help_seq":2,                      // the producer's per-attempt counter; help_id is derived from it, never from the question
  "kind":"question",                // "question" (the PA asks) | "plan_change" (a member asks for plan steps, §8.7)
  "question":"…","context":"…",     // ≤4 KB each
  "steps":null}                     // plan_change only: steps in the plan.proposed step shape
 {"ord":3,"attempt":1,"by":"claude#2","re":"help.requested#h-1a2b…","help_id":"h-1a2b…",
+ "answer_id":"t-…",                 // member-turn id | answering step:attempt | crew request id
  "answer":"…","evidence":["src/x.rs:41"],
  "verdict":null}                   // plan_change only, set by the PA's PLAN line: "accepted" | "declined"
 
@@ -332,13 +367,14 @@ Exact payloads (envelope fields omitted after the first):
  "reason":"…"}
 
 // 17 — supervisor, hold round (DES-001 §4.7 step 5); also "superseded" from re-confirmation
-{"ord":3,"attempt":1,"by":"claude#2","re":"advice.answered#f-3fa9…","finding_id":"f-3fa9…",
+{"ord":3,"attempt":1,"by":"claude#2","re":"advice.answered#4","raise_seq":4,"finding_id":"f-3fa9…",
  "status":"held",                  // "held" | "withdrawn" | "superseded"
  "reason":"no reply (counted as hold)","final_line":43}
 
 // 18 — supervisor, one per unresolved HIGH or member-step dispute (DES-001 §6.3 input, verbatim)
-{"ord":3,"attempt":1,"by":"engine","re":"finding.settled#f-3fa9…",
- "subject_id":"f-3fa9…",          // a finding_id, or a step_id for a member-step dispute
+{"ord":3,"attempt":1,"by":"engine","re":"finding.settled#4",
+ "subject":"finding:4",            // "finding:<raise_seq>" | "step:<step_id>:<attempt>"
+ "finding_id":"f-3fa9…",           // identity, for a finding subject
  "trigger":"unresolved_high",      // "unresolved_high" | "member_step" (§8.8)
  "question":"…","positions":[{"by":"worker claude#1","position":"YES — the refusal stands","reason":"…"},
                              {"by":"monitor claude#2","position":"NO — the finding stands","reason":"…"}],
@@ -347,7 +383,7 @@ Exact payloads (envelope fields omitted after the first):
  "transcript":[1201,1207,1215,1220]}   // event_ids of raised/delivered/answered/settled for this finding
 
 // 19 — the council thread (DecisionVerdict, src/decision.rs:292)
-{"ord":3,"attempt":1,"by":"council:<task_id>","re":"council.called#f-3fa9…","subject_id":"f-3fa9…",
+{"ord":3,"attempt":1,"by":"council:<task_id>","re":"council.called#finding:4","subject":"finding:4",
  "verdict":"no",                   // "yes" | "no" | "no_verdict"
  "reason":null,                    // no_verdict: "no_quorum" | "seats_benched" | "error" | "timeout" | "cap"
  "agreement_pct":67,"dissent":["…"],"seats":["codex","pi"],"returned":3,"seated":3}
@@ -763,7 +799,11 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 *Accept:* (a) with no flags, the engine's `WICKED_BUS_DB` equals `resolveCrewBus(...).dbPath`; (b) `--engine-exec` mediates over the same file; (c) `--bus-db X` wins for both; (d) a bus that cannot open logs one line and the daemon serves un-teamed.
 
 **T1 — Wire contract (core).** `src/team/events.rs`: all event types, payloads, key builders (the §4.1 algorithm and vectors), `fold`; catalog annotations; api-types.
-*Accept:* (a) every type is four segments; (b) value-compared round-trip fixtures; (c) `fold` reproduces DES-001's acceptance fixtures (#8, #11, #15, #16 a–k); (d) `fold` is idempotent under duplicates; (e) the §4.1 test vectors match `crate::bus::deterministic_key` and the crew JS helper; (f) `gen_event_catalog.py --check` is green.
+*Accept:* (a) every type is four segments; (b) value-compared round-trip fixtures; (c) `fold` reproduces DES-001's acceptance fixtures (#8, #11, #15, #16 a–k); (d) `fold` is idempotent under duplicates; (e) the §4.1 test vectors match `crate::bus::deterministic_key` and the crew JS helper; (f) `gen_event_catalog.py --check` is green; (g) **the §6.1 identity rule, table-driven over all 23 types:**
+  - for every type, two distinct logical requests identical in every content field and differing only in the producer-assigned part (`help_seq`, `raise_seq`, `open_seq`, `delivery_id`, `answer_id`, `plan_block_seq`, `rescore_seq`, `gate_seq`, attempt) produce **two** rows with distinct `event_id`s;
+  - a re-publish of the same logical request produces **one**;
+  - named fixture: two `HELP:` lines in one output with the same question and different context yield two `help.requested` rows; two member `plan_change` requests with the same question and different steps yield two;
+  - a grep test fails the build if a key builder in `src/team/events.rs` takes a payload text field (question, claim, evidence, reason, context).
 
 **C1 — Phase catalog + compose (core).** `src/catalog.rs` (12 entries, §8.3/§11.2), `PhaseDef.owner`/`WorkUnit.owner`, `plan::compose` with the step rules, and the evidence-floor pin moved onto the entries.
 *Accept:* (a) `compose` of every §11.2 mapping yields a def whose per-phase `(kind, role, gate, validator_pin, executes_code, executor, skill_ref, instructions, depends_on)` equals today's def **except** exactly the bold cells of §11.2 (one fixture per consumer, generated from today's defs); (b) a step that lowers a gate, removes a pin, changes `role`, or sets `executor` on a non-Tool entry is refused with a named reason; (c) a misspelled step key is refused (`deny_unknown_fields`); (d) an owner-omitted def serializes byte-identically; (e) `attach_pinned_validators` attaches every catalog pin (an unapproved swap is refused, `src/pipeline.rs:246-258`).
