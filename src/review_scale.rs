@@ -627,57 +627,102 @@ enum Kind {
 
 /// Derive [`ChangeSignals`] from a unified diff (`git diff` output).
 ///
-/// Fails closed: a file is behavioural if EITHER side of its header is (a rename from
-/// `src/memory.rs` to `docs/memory.md` moves code out of a critical subsystem), a hunk with no
-/// file header counts as code, and destructive markers are read from a behavioural hunk's context
-/// lines as well as its `+`/`-` lines (a guard change around an existing destructive call). Only
-/// `+`/`-` lines count toward `lines_added`/`lines_removed`.
+/// A `diff --git` line only DELIMITS a file (review on #600: splitting it on the first ` b/`
+/// misread `src/a b/core.rs`). A file's paths come from its `---`/`+++` headers (git-unquoted;
+/// `/dev/null` is an absent side: new or deleted) and, for a hunk-less rename or copy, from the
+/// `rename from`/`rename to` (`copy from`/`copy to`) lines.
+///
+/// Fails closed: a file is behavioural if EITHER side is (a rename from `src/memory.rs` to
+/// `docs/memory.md` moves code out of a critical subsystem), a block that names no path counts
+/// as code, and destructive markers are read from a behavioural hunk's context lines as well as
+/// its `+`/`-` lines (a guard change around an existing destructive call). Only `+`/`-` lines
+/// count toward `lines_added`/`lines_removed`.
 pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
-    let t = &THRESHOLDS;
     let mut s = ChangeSignals::default();
-    let mut kind = None;
-    let mut in_hunk = false;
+    // Split into per-file blocks. Lines before the first header form a headerless block.
+    let mut blocks: Vec<Vec<&str>> = vec![Vec::new()];
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            blocks.push(Vec::new());
+        } else if let Some(block) = blocks.last_mut() {
+            block.push(line);
+        }
+    }
+    for block in &blocks {
+        file_block(block, &mut s);
+    }
+    s
+}
+
+/// One file's header lines and hunks.
+fn file_block(lines: &[&str], s: &mut ChangeSignals) {
+    let t = &THRESHOLDS;
+    let hunks = lines
+        .iter()
+        .position(|l| l.starts_with("@@"))
+        .unwrap_or(lines.len());
+    let (mut old, mut new) = (None::<String>, None::<String>);
+    let mut deleted = false;
+    for l in &lines[..hunks] {
+        if let Some(p) = l.strip_prefix("--- ") {
+            old = Some(header_path(p, "a/"));
+        } else if let Some(p) = l.strip_prefix("+++ ") {
+            let p = header_path(p, "b/");
+            deleted |= p.is_empty();
+            new = Some(p);
+        } else if let Some(p) = l
+            .strip_prefix("rename from ")
+            .or_else(|| l.strip_prefix("copy from "))
+        {
+            old.get_or_insert_with(|| git_unquote(p));
+        } else if let Some(p) = l
+            .strip_prefix("rename to ")
+            .or_else(|| l.strip_prefix("copy to "))
+        {
+            new.get_or_insert_with(|| git_unquote(p));
+        } else if l.starts_with("deleted file mode") {
+            deleted = true;
+        }
+    }
+    let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
+    let sides = [old.as_str(), new.as_str()];
+    let named = sides.iter().any(|p| !p.is_empty());
+    if !named && hunks == lines.len() {
+        return; // nothing to attribute: no path and no hunk
+    }
+    let code: Vec<&str> = sides
+        .iter()
+        .copied()
+        .filter(|p| !p.is_empty() && classify(p) != Kind::Docs)
+        .collect();
+    let k = match code.last() {
+        Some(p) => classify(p),
+        None if !named => Kind::Code,
+        None => Kind::Docs,
+    };
+    match k {
+        Kind::Docs => s.docs_files += 1,
+        Kind::Test => s.test_files += 1,
+        Kind::Config => s.config_files += 1,
+        Kind::Code => s.code_files += 1,
+    }
+    let behavioural = k != Kind::Docs;
+    if behavioural {
+        for p in sides {
+            s.critical |= has_token(p, t.critical_path_markers);
+            s.destructive |= has_token(p, t.destructive_path_markers);
+        }
+        s.destructive |= deleted;
+        s.touched.push(TouchedFile {
+            path: code.last().copied().unwrap_or("").to_string(),
+            old_path: old.clone(),
+            old_lines: BTreeSet::new(),
+        });
+    }
     // Base-side line number of the next old line in the current hunk.
     let mut old_next: u32 = 0;
-    for line in diff.lines() {
-        let header = line.strip_prefix("diff --git ");
-        if header.is_some() || (kind.is_none() && line.starts_with("@@")) {
-            let rest = header.unwrap_or("a/ b/");
-            let (a, b) = rest.split_once(" b/").unwrap_or((rest, rest));
-            let sides = [a.strip_prefix("a/").unwrap_or(a), b];
-            let code: Vec<&str> = sides
-                .iter()
-                .copied()
-                .filter(|p| !p.is_empty() && classify(p) != Kind::Docs)
-                .collect();
-            let k = match code.last() {
-                Some(p) => classify(p),
-                None if header.is_none() => Kind::Code,
-                None => Kind::Docs,
-            };
-            match k {
-                Kind::Docs => s.docs_files += 1,
-                Kind::Test => s.test_files += 1,
-                Kind::Config => s.config_files += 1,
-                Kind::Code => s.code_files += 1,
-            }
-            if k != Kind::Docs {
-                for p in sides {
-                    s.critical |= has_token(p, t.critical_path_markers);
-                    s.destructive |= has_token(p, t.destructive_path_markers);
-                }
-                s.touched.push(TouchedFile {
-                    path: code.last().copied().unwrap_or("").to_string(),
-                    old_path: sides[0].to_string(),
-                    old_lines: BTreeSet::new(),
-                });
-            }
-            kind = Some(k);
-            in_hunk = false;
-        }
-        let behavioural = kind.is_some_and(|k| k != Kind::Docs);
+    for line in &lines[hunks..] {
         if let Some(h) = line.strip_prefix("@@") {
-            in_hunk = true;
             // `@@ -a[,b] +c[,d] @@`: `a` is the first base-side line (0 for a new file).
             old_next = h
                 .trim_start()
@@ -685,38 +730,90 @@ pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
                 .and_then(|r| r.split([',', ' ']).next())
                 .and_then(|a| a.parse().ok())
                 .unwrap_or(0);
-        } else if !in_hunk {
-            s.destructive |= behavioural && line.starts_with("deleted file mode");
-        } else {
-            let (added, removed) = (line.starts_with('+'), line.starts_with('-'));
-            // Some tools strip the space off an empty context line.
-            let context = line.starts_with(' ') || line.is_empty();
-            s.lines_added += u32::from(added);
-            s.lines_removed += u32::from(removed);
-            // Context lines are scanned too (review on #600: a change that only loosens the guard
-            // around an existing destructive call leaves the call itself on a context line).
-            if behavioural && (added || removed || context) {
-                let text = line.get(1..).unwrap_or("").to_ascii_lowercase();
-                s.destructive |= t.destructive_line_markers.iter().any(|m| text.contains(m));
-                if let Some(f) = s.touched.last_mut() {
-                    if removed {
-                        f.old_lines.insert(old_next);
-                    } else if added {
-                        // An insertion touches the symbol either side of it.
-                        f.old_lines.extend(
-                            [old_next.saturating_sub(1), old_next]
-                                .into_iter()
-                                .filter(|l| *l > 0),
-                        );
-                    }
+            continue;
+        }
+        let (added, removed) = (line.starts_with('+'), line.starts_with('-'));
+        // Some tools strip the space off an empty context line.
+        let context = line.starts_with(' ') || line.is_empty();
+        s.lines_added += u32::from(added);
+        s.lines_removed += u32::from(removed);
+        // Context lines are scanned too (review on #600: a change that only loosens the guard
+        // around an existing destructive call leaves the call itself on a context line).
+        if behavioural && (added || removed || context) {
+            let text = line.get(1..).unwrap_or("").to_ascii_lowercase();
+            s.destructive |= t.destructive_line_markers.iter().any(|m| text.contains(m));
+            if let Some(f) = s.touched.last_mut() {
+                if removed {
+                    f.old_lines.insert(old_next);
+                } else if added {
+                    // An insertion touches the symbol either side of it.
+                    f.old_lines.extend(
+                        [old_next.saturating_sub(1), old_next]
+                            .into_iter()
+                            .filter(|l| *l > 0),
+                    );
                 }
             }
-            if removed || context {
-                old_next += 1;
-            }
+        }
+        if removed || context {
+            old_next += 1;
         }
     }
-    s
+}
+
+/// The path on a `---`/`+++` line: git-unquoted, a trailing `\t<timestamp>` dropped from an
+/// unquoted path, `/dev/null` as the empty (absent) side, and the `a/`/`b/` prefix removed.
+fn header_path(raw: &str, prefix: &str) -> String {
+    let p = if raw.starts_with('"') {
+        git_unquote(raw)
+    } else {
+        raw.split('\t').next().unwrap_or("").to_string()
+    };
+    if p == "/dev/null" {
+        return String::new();
+    }
+    p.strip_prefix(prefix).map_or(p.clone(), str::to_string)
+}
+
+/// Undo git's C-style path quoting (`"…"` with `\"`, `\\`, `\t`, `\n`, … and `\ooo` octal
+/// bytes for non-ASCII under `core.quotePath`). An unquoted string is returned as is.
+fn git_unquote(raw: &str) -> String {
+    let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return raw.to_string();
+    };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut it = inner.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'a') => bytes.push(7),
+            Some(b'b') => bytes.push(8),
+            Some(b'f') => bytes.push(12),
+            Some(b'v') => bytes.push(11),
+            Some(d @ b'0'..=b'7') => {
+                let mut v = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match it.peek() {
+                        Some(n @ b'0'..=b'7') => {
+                            v = v * 8 + u32::from(n - b'0');
+                            it.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(v as u8);
+            }
+            Some(other) => bytes.push(other),
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn classify(path: &str) -> Kind {

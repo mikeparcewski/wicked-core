@@ -546,9 +546,9 @@ fn hot_symbol_shifted_by_an_insertion_above_it_still_scores_80() {
 /// Review on #600: a pure rename/move has no hunks, so `old_lines` is empty and the file node was
 /// never seeded; a heavily imported module read as one unindexed symbol with no dependents (20).
 /// The old path IS in the graph, so its file node is the changed symbol and its importers count.
-#[test]
-fn rename_only_of_a_heavily_imported_module_counts_its_importers() {
-    let mut nodes = vec![node("core_file", NodeKind::File, "src/core.rs", (1, 200))];
+/// A file node at `path` with forty importers and no other symbol.
+fn imported_file_graph(path: &str) -> SqliteStore {
+    let mut nodes = vec![node("core_file", NodeKind::File, path, (1, 200))];
     let mut edges = Vec::new();
     for i in 0..40u32 {
         let importer = format!("importer{i}");
@@ -560,7 +560,12 @@ fn rename_only_of_a_heavily_imported_module_counts_its_importers() {
         ));
         edges.push(edge(&importer, "core_file", EdgeKind::Imports));
     }
-    let store = graph(&nodes, &edges);
+    graph(&nodes, &edges)
+}
+
+#[test]
+fn rename_only_of_a_heavily_imported_module_counts_its_importers() {
+    let store = imported_file_graph("src/core.rs");
     let d = "\
 diff --git a/src/core.rs b/src/runtime/core.rs
 similarity index 100%
@@ -588,6 +593,105 @@ rename to src/runtime/core.rs
         (1, 0, 20),
         "{a:?}"
     );
+}
+
+// Review on #600: the `diff --git a/X b/Y` line was split on the first " b/", so an old path
+// containing " b/" (`src/a b/core.rs`) recorded `src/a`, the graph lookup missed, and a hot module
+// scored as an unindexed leaf. Paths come from the `---`/`+++` headers (git-unquoted, `/dev/null`
+// = absent) and from `rename from`/`rename to` for hunk-less renames; `diff --git` only delimits.
+#[test]
+fn old_path_containing_space_b_slash_is_read_from_the_headers() {
+    let path = "src/a b/core.rs";
+    let store = imported_file_graph(path);
+    let d = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n-x\n+y\n line\n"
+    );
+    let diff = signals_from_diff(&d);
+    assert_eq!(
+        (
+            diff.touched[0].old_path.as_str(),
+            diff.touched[0].path.as_str()
+        ),
+        (path, path),
+        "{:?}",
+        diff.touched
+    );
+    let a = assess(&diff, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!((s.changed_symbols, s.dependents), (1, 40), "{s:?}");
+    assert_eq!((a.score, a.plan), (80, PLAN_MOST), "{a:?}");
+}
+
+#[test]
+fn quoted_header_paths_are_git_unquoted() {
+    // git quotes a path with a tab, a quote, a backslash, or (core.quotePath) non-ASCII bytes.
+    let d = "\
+diff --git \"a/src/caf\\303\\251 dir/core.rs\" \"b/src/caf\\303\\251 dir/core.rs\"
+--- \"a/src/caf\\303\\251 dir/core.rs\"
++++ \"b/src/caf\\303\\251 dir/core.rs\"
+@@ -1 +1 @@
+-x
++y
+diff --git \"a/src/we\\\"ird\\\\tab\\t.rs\" \"b/src/we\\\"ird\\\\tab\\t.rs\"
+--- \"a/src/we\\\"ird\\\\tab\\t.rs\"
++++ \"b/src/we\\\"ird\\\\tab\\t.rs\"
+@@ -1 +1 @@
+-x
++y
+";
+    let diff = signals_from_diff(d);
+    assert_eq!(diff.code_files, 2, "{diff:?}");
+    assert_eq!(diff.touched[0].old_path, "src/caf\u{e9} dir/core.rs");
+    assert_eq!(diff.touched[0].path, "src/caf\u{e9} dir/core.rs");
+    assert_eq!(diff.touched[1].old_path, "src/we\"ird\\tab\t.rs");
+
+    let store = imported_file_graph("src/caf\u{e9} dir/core.rs");
+    let one = signals_from_diff(
+        d.split("diff --git \"a/src/we")
+            .next()
+            .expect("first block"),
+    );
+    let a = assess(&one, ready(&store), None);
+    assert_eq!(a.signals.as_ref().expect("read").dependents, 40, "{a:?}");
+}
+
+#[test]
+fn dev_null_on_either_side_is_new_or_deleted() {
+    // New: no old path, so nothing is looked up in the graph (unindexed, 20), not destructive.
+    let new = signals_from_diff(
+        "diff --git a/src/new.rs b/src/new.rs\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+fn n() {}\n",
+    );
+    assert_eq!(
+        (
+            new.touched[0].old_path.as_str(),
+            new.touched[0].path.as_str()
+        ),
+        ("", "src/new.rs"),
+        "{:?}",
+        new.touched
+    );
+    assert!(!new.destructive && new.code_files == 1, "{new:?}");
+
+    // Deleted, with no `deleted file mode` line: `+++ /dev/null` alone says so.
+    let gone = signals_from_diff(
+        "diff --git a/src/old.rs b/src/old.rs\n--- a/src/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-fn o() {}\n",
+    );
+    assert_eq!(
+        (
+            gone.touched[0].old_path.as_str(),
+            gone.touched[0].path.as_str()
+        ),
+        ("src/old.rs", "src/old.rs"),
+        "{:?}",
+        gone.touched
+    );
+    assert!(gone.destructive, "{gone:?}");
+
+    // A deleted docs file is still docs-only.
+    let doc = signals_from_diff(
+        "diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-hi\n",
+    );
+    assert!(!doc.behavioural() && !doc.destructive, "{doc:?}");
 }
 
 // ── The diff side ────────────────────────────────────────────────────────────────────────────
