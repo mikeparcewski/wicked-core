@@ -1,7 +1,13 @@
 # DES-TEAMING-002 — The team model on the bus: one transport, one grammar, one phase catalog
 
-- **Status:** DRAFT (rev 6). **No `[OPERATOR DECISION]` block remains.** The operator decided all three on 2026-09-23, and each decision is written into the text it governs. **Decision 1:** no pre-canned workflows. One phase catalog; the S4 score sets the minimum phases; plans re-decide mid-run upward only; user-composed plans and named presets go through the same mechanism; every workflow consumer migrates onto the catalog (§8.3–§8.7, §11). **Decision 2:** a plan needs human approval by default; auto mode proceeds without it; high risk always needs it (§8.6). **Decision 3:** the PA owns a member's step (§8.8). One item is a **recommendation awaiting the operator**: the floor-override rule (§8.5).
+- **Status:** DRAFT (rev 7). **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
 - **Date:** 2026-09-23
+- **Rev 7 (2026-09-24):** review on #612 at `6a81b1d` (3 HIGH, each verified at the code), resolved under one rule added as §4.0: **commands go through the API, facts go on the bus, each fact has exactly one owner, and no consumer turns a bus row into a command on someone else's state.**
+  1. The `TeamPublisher` is **reliable**. It reuses the engine's durable emit-outbox pattern (NDJSON spool, `DEADLETTER_MARKER`, idempotent replay; `crates/wicked-apps-core/src/emit.rs:453-470`, `:614`) with a bounded retry. A required fact that cannot be published pauses the run (`team_transport`), or marks it `transport:"none"` before any team work begins (§4.1).
+  2. **The actor reads no bus row.** User plans, preset launches, plan edits and approval edits are API commands. PA plans arrive on `Command::ApplyStepResult` (`src/command.rs:218`). The supervisor's re-scores and member-step rulings arrive as its own commands. The engine publishes `plan.proposed` after accepting any of them.
+  3. **Crew publishes no fact.** It only POSTs; `gate.decided` and every plan fact are engine-only.
+
+  To give every type one owner: `ledger.folded` (S) splits from `gate.opened` (E), `change.requested` (S) splits from `help.requested` (R), the attempt-end not-delivered row moves to R, and the human `help.answered` path is removed (human-directed questions stay S1 elicitation). §7 is now the producer/consumer matrix. Both confirmed recommendations are folded in, and their markers removed.
 - **Rev 6 (2026-09-23):** review on #612 at `ea4a2cb` (1 HIGH, the same class as rev 4's). `help_id` hashed the question text, so a second, distinct request with the same question deduped onto the first (`src/bus.rs:316-342`). It is now derived from the producer's per-attempt `help_seq`. The class is closed by **one rule** in §6.1: no key is derived from content a later distinct request can repeat; keys come from a producer-assigned sequence or id. Walking every key against it changed nine more:
   - `path.scored` → `score_source`;
   - `member.*` + `open_seq` (monitors re-open after a failed turn, `src/team.rs:667`);
@@ -16,7 +22,7 @@
 - **Rev 5 (2026-09-23):** review on #612 at `c2443f1` (3 HIGH, each verified at the code), plus a re-sweep of every "as today"/"unchanged" claim against the code.
   1. A gate-originated `plan.proposed` takes its `source` from the gate's `gate_id`. The interaction id is `deterministic_id(session, "gate", ord)` (`src/interaction.rs:141-144`), which every gate at that ord reuses (§6.1, T3 (i)).
   2. Supervisor restart is **one mechanism, a startup replay of live runs**, with run-level team state persisted on the session. A restart never resumes an in-flight attempt (the attempt is reported orphaned or redriven at attempt+1, `src/actor.rs:1058-1065`, `:3993-4030`), so the replay's job is plan and gate state plus the prior attempt's findings (§4.7, T6 (k)).
-  3. **[COORDINATOR RECOMMENDATION] Evaluator ≠ creator for team runs.** Never `creator_seat`: a distinct CLI, else a second usable instance of an eligible CLI (`same_cli_instance`), else refuse `NoEligibleSeat`. Today a bench-free roster keeps review on the creator seat (`src/distribute.rs:286-290`, `:417-426`; refusal only when a bench caused it, `:388-409`). Legacy consumers keep today's behaviour until their migration seam (§8.1, §11.3, seam D1).
+  3. **Evaluator ≠ creator for team runs** (then a coordinator recommendation; confirmed by the operator in rev 7). Never `creator_seat`: a distinct CLI, else a second usable instance of an eligible CLI (`same_cli_instance`), else refuse `NoEligibleSeat`. Today a bench-free roster keeps review on the creator seat (`src/distribute.rs:286-290`, `:417-426`; refusal only when a bench caused it, `:388-409`). Legacy consumers keep today's behaviour until their migration seam (§8.1, §11.3, seam D1).
 
   The sweep corrected four overclaims (§16.1).
 - **Rev 4 (2026-09-23):** review on #612 at `5ba3a2c` (2 HIGH, 1 MEDIUM, each verified at the code), plus a sweep of every idempotency key against its payload. (1) A plan with a creator step and no declared `touch[]` now scores `no_graph_score` (100, "no declared scope"), S4's fail-closed rule (`src/review_scale.rs:264-265`, `:281`). Only a plan with no creator step may score 0 (§8.2, §8.4, T2 (g)). (2) Gates are keyed by a `gate_id` minted from a per-run gate sequence, so a re-opened `plan_approval` gate is a new row, not a dedup onto the old one (`src/bus.rs:316-342`) (§6, §8.6, T3 (i)). (3) `advice.delivered` is one row per finding (§6, §8.9, T5). The sweep fixed seven more keys (§6.1). The T5–T9 acceptance text that rev 3 cited as "rev 2's" is now inlined.
@@ -89,14 +95,49 @@ The bus is already the fabric with the properties the team model needs and the f
 
 ## 3. Shape in one paragraph
 
-A run starts a **path**. The launch names the PA seat (chosen or random), and either a phase selection (a user plan or a named preset) or nothing, and publishes `wicked.team.path.started`. With nothing named, the PA's first step (`understand`) predicts the touch set and proposes a plan. The engine scores the path with S4 (`path.scored`). The band sets the **floor**: the minimum phases, drawn from one **phase catalog**, whose entries are `PhaseDef`s, so gates, pins and floors keep working. Missing floor phases are added and marked. The plan then passes the **approval matrix**: manual mode, or high risk in any mode, opens a `plan_approval` gate (`gate.opened{kind:"plan_approval"}` → `gate.decided`); otherwise it is accepted at once (`plan.accepted`). Every step is bracketed by `step.claimed` and `step.completed` on the bus, with `checkpoint.reached` at each terminal tool call. At checkpoints the diff is re-scored; a higher band raises the floor through `plan.revised`, which only ever adds phases and never re-runs finished ones. The PA and accepted member requests can revise the plan too, under the same matrix. Members hold a durable cursor on the run's `wicked.team.**` stream. They raise findings, answer help, and take steps the PA must accept. Advice reaches the PA at its next step boundary on every carrier, and mid-turn on Claude ACP. Disputes go to a one-off council (`council.called`/`council.ruled`). The final pass folds the attempt's stream into one ledger (`gate.opened{kind:"unit_review"}`) that the engine gate reads, and the fold's decision is published (`gate.decided`). Crew relays `wicked.team.**` onto `/ws`, and studio renders the feed, the plan card, the phase picker and both gates.
+A run starts a **path**. The launch names the PA seat (chosen or random), and either a phase selection (a user plan or a named preset) or nothing, and publishes `wicked.team.path.started`. With nothing named, the PA's first step (`understand`) predicts the touch set and proposes a plan. The engine scores the path with S4 (`path.scored`). The band sets the **floor**: the minimum phases, drawn from one **phase catalog**, whose entries are `PhaseDef`s, so gates, pins and floors keep working. Missing floor phases are added and marked. The plan then passes the **approval matrix**: manual mode, or high risk in any mode, opens a `plan_approval` gate (`gate.opened{kind:"plan_approval"}` → `gate.decided`); otherwise it is accepted at once (`plan.accepted`). Every step is bracketed by `step.claimed` and `step.completed` on the bus, with `checkpoint.reached` at each terminal tool call. At checkpoints the diff is re-scored; a higher band raises the floor through `plan.revised`, which only ever adds phases and never re-runs finished ones. The PA and accepted member requests can revise the plan too, under the same matrix. Members hold a durable cursor on the run's `wicked.team.**` stream. They raise findings, answer help, and take steps the PA must accept. Advice reaches the PA at its next step boundary on every carrier, and mid-turn on Claude ACP. Disputes go to a one-off council (`council.called`/`council.ruled`). The final pass folds the attempt's stream into one ledger (`ledger.folded`, S), and the engine opens the unit gate on it (`gate.opened{kind:"unit_review"}`, E), and the fold's decision is published (`gate.decided`). Crew relays `wicked.team.**` onto `/ws`, and studio renders the feed, the plan card, the phase picker and both gates.
 
 ## 4. Transport: the bus is the one fabric
+
+### 4.0 The rule: commands go through the API, facts go on the bus
+
+**COMMANDS go through the API; FACTS go on the bus.**
+
+A **command** is a request to change state. Examples: a launch, a user-composed plan, a plan edit, a gate answer, a preset save. Crew submits a command to the engine through the existing API: `POST /api/v1/runs` → `Core::launch_run` (`src/lib.rs:715`); `POST /api/v1/runs/:id/gate` → `Core::confirm_gate` (`src/lib.rs:742`); plus the new `Core::propose_plan` and `Core::put_preset`. The engine validates the command, and **the owner of the resulting state publishes the fact**.
+
+The bus carries only **facts**, each published by **exactly one owner** (§7). No consumer turns a bus row into a command on someone else's state.
+
+When an in-process core component must feed the actor, it uses the actor's existing command channel, the `Sender<Command>` that every off-actor thread already uses (`src/bus.rs:27-33`):
+- the worker thread's step result, `Command::ApplyStepResult` (`src/command.rs:218`), which carries the step output with its `PLAN+`, `STEP` and `PLAN <id>` lines and the ledger snapshot;
+- the supervisor's own measurements: `Command::TeamRescored` (a re-score of the settled tree it took) and `Command::TeamStepRuling` (a council verdict it convened);
+- the publisher's acknowledgements, `Command::TeamPublished` / `Command::TeamTransportFailed` (§4.1).
+
+A command carries the sender's own result, never a relayed bus row. **The actor reads no bus row.** Every rule below that says "cites §4.0" follows this.
+
 
 ### 4.1 Publishing
 
 - **Where:** `BusDb::emit(&BusEmit)` (`src/bus.rs:288`) on a connection owned by the publishing thread (`:239-241`). `domain` = `CORE_DOMAIN` (`wicked-core`, `src/cli_runner.rs:73`); `subdomain` = `core.team`.
-- **Publishers and their threads.** Off-actor threads publish directly on their own connection: the worker thread (`run_unit_and_judge_with_roster`, `src/cli_runner.rs:748`), the supervisor thread (S2's, re-homed), the ACP carrier's turn loop (`src/acp_runner.rs:3910`, which already writes stdin under a lock inside the turn), and the council thread (`src/actor.rs:2525-2544`). The actor thread **never opens the bus**: the four actor-originated events (`path.started`, `plan.accepted`, `path.ended`, `gate.decided`) go through a `TeamPublisher` — one thread, one connection, one `mpsc::Sender<BusEmit>` the actor holds — so a busy bus can never stall the single writer (`src/bus.rs:27-33` applied to writes). Fire-and-forget from the actor; the publisher logs a failed emit and drops it (the fold snapshot, not the bus, is the gate's record, §4.4).
+- **Owners and their threads (§4.0, §7).** Each event type has one owner:
+  - **Engine (E):** the actor, publishing through the `TeamPublisher`.
+  - **Supervisor (S):** its own thread and connection; the council calls it makes (`Core::convene_decision`, `src/lib.rs:1286`, ballots off-actor at `src/actor.rs:2525-2544`) return to it, and it publishes the ruling.
+  - **Attempt runner (R):** the worker thread of one attempt (`run_unit_and_judge_with_roster`, `src/cli_runner.rs:748`) together with that attempt's ACP carrier turn loop (`src/acp_runner.rs:3910`).
+
+  The actor thread **never opens the bus**: E's events go through the `TeamPublisher` (one thread, one connection, one `mpsc::Sender` the actor holds), so a busy bus can never stall the single writer (`src/bus.rs:27-33`).
+- **Publishing is reliable, reusing the engine's durable emit-outbox pattern.** Every publisher (E through the `TeamPublisher`, S, R) calls one wrapper, `TeamBus::publish`.
+  - **The pattern it reuses** is `wicked_apps_core::emit`'s: a failed write is spooled as one NDJSON line to an outbox with a loud `DEADLETTER_MARKER` on stderr (`crates/wicked-apps-core/src/emit.rs:12-16`, `:453-470`). The record is the envelope plus `deadletter_reason`, `ts` and `pid` (`:90-105`). It can be replayed idempotently (`replay_outbox`, `:614`; napi `replay_emit_outbox`, `crates/wicked-core-ts/src/lib.rs:774-790`; crew CLI `wicked-crew governance replay`, `packages/crew/src/cli/governance.ts:2`).
+  - **Outbox and retry:** the team outbox is `<state home>/team-outbox.ndjson`. `TeamBus::publish` retries a failed emit from the outbox on a **bounded** schedule: 5 attempts at 1, 2, 4, 8 and 16 s, about 31 s in all. A retry can never double-publish, because the key is deterministic (§6.1) and `BusDb::emit` resolves a duplicate to the existing row (`src/bus.rs:316-342`). Past the bound, the line stays in the outbox for `Core::replay_team_outbox`, the same shape as `replay_emit_outbox`.
+  - **Acknowledgements:** the `TeamPublisher` acknowledges each engine event to the actor through `Command::TeamPublished { token }` or `Command::TeamTransportFailed { token, reason }`. The actor defers the dependent step until then and never blocks.
+- **Required transitions never continue silently.** Four engine facts are *required*:
+
+  | Fact | The engine waits for its acknowledgement before | If it cannot be published within the bound |
+  |---|---|---|
+  | `path.started` | dispatching the run's first unit | the run proceeds **un-teamed** with `AgentSession.team.transport = "none"`, set **before any team work begins**; it is disclosed on the fan-out (a `teamTransportDisabled` CoreEvent, §4.6) and in every unit's snapshot |
+  | `plan.accepted` | dispatching the plan's first unit | the run **pauses** with `gate_kind:"team_transport"` and the reason in the prompt |
+  | `gate.opened` | — (the pause itself is already durable in the store, `src/actor.rs:6036-6046`) | the pause stands, answerable as usual; its `awaitingHuman` prompt names the missing fact |
+  | `gate.decided` | emitting `Resumed` and dispatching | the run stays paused with `gate_kind:"team_transport"` |
+
+  S and R facts past the bound are spooled and disclosed. A missing `ledger.folded` reaches the gate wait's fail-closed timeout, which pauses (§8.11). A missing `step.claimed` makes that attempt un-teamed, with `transport:"none"` in its snapshot, before its turn starts.
 - **Idempotency key.** Every team event pins `deterministic_key(&["team", <event_type>, <run_id>, <entity ids…>])` (`src/bus.rs:545`), so a re-publish after a retry, a restart or a duplicate delivery resolves to the existing row (`:319-345`). The key parts per event are in §6. **The algorithm, exactly as `deterministic_key` computes it (`src/bus.rs:545-553`):** SHA-256 over the concatenation, for **every** part in order, of the part's UTF-8 bytes followed by one `0x00` byte (so the last part is NUL-terminated too; this is not a `\0`-join); keep the first **16** bytes of the digest; encode each as two **lowercase** hex digits (`{:02x}`), giving a 32-character key. Crew's JS publishers (§7) must reproduce it byte for byte: `const h = createHash('sha256'); for (const p of parts) { h.update(Buffer.from(p, 'utf8')); h.update(Buffer.from([0])); } key = h.digest().subarray(0, 16).toString('hex');`.
   - **Test vector.** parts `["team", "wicked.team.finding.raised", "run-1", "f-3fa9c2e1d0b4a7e6"]` → `f8289d402fc42823fd875fcf4456bd8f`. parts `["team", "wicked.team.path.started", "run-1"]` → `25ea4932f42b6e22f1aacd16bc3dcdd9`. A `\0`-join **without** the trailing NUL gives `fed61d5909428bb7aec506ad09dc86d1` for the first vector, which is wrong, and that mismatch is the failure the vector exists to catch. The values were computed by a byte-for-byte transcription of `deterministic_key` (no build was run for this draft). T1 pins them in a Rust unit test against `crate::bus::deterministic_key`, and in a crew test against the JS helper, so the two implementations cannot drift.
 - **One db.** The engine needs a bus path whether or not exec mediation is on. Crew hands the engine **its own cross-product bus** (the sidecar `resolveCrewBus` already resolves, `cli/index.ts:129-137`) as `WICKED_BUS_DB` on every boot, not only under `--engine-exec` (`adapter.ts:1183-1191`). Exec mediation keeps its `WICKED_BUS_EXEC` switch; it now mediates over the same file. A daemon with no usable bus runs **un-teamed and says so**: nothing can be published, so the worker thread builds the unit's snapshot locally (not published) with `transport:"none"`, an empty ledger and an empty transcript, and the gate renders it as un-teamed (§8.11). It never silently falls back to an in-process channel.
@@ -110,7 +151,7 @@ Every consumer is a named cursor with a filter, and every consumer is idempotent
 | Team supervisor (monitors' host) | core thread (S2's, re-homed) | `team-supervisor-<actor_process_gen>` (`consumer_name` pattern, `src/cli_runner.rs:1407`); no durable floor is needed because start-up replays (§4.7) | `wicked.team.**` | **Replay, then tail** (§4.7): at spawn it snapshots `tail_event_id()` = T (`src/bus.rs:348`), replays `wicked.team.**` for every live run from that run's `stream_floor` up to T, then polls live from T | per `(run, ord, attempt)` state keyed by `finding_id`, `step_id`, `checkpoint.seq` |
 | Steer point (S3) | ACP carrier, per attempt | none persisted — the attempt's floor is the `event_id` of its own `step.claimed` | `wicked.team.finding.raised` | the attempt's `step.claimed` id | a per-attempt `delivered: BTreeSet<finding_id>` (replaces the mailbox `records`) |
 | Step-boundary injector | worker thread, before `run_unit_streaming` (`src/cli_runner.rs:761`) | none — one bounded read per step | `wicked.team.**` for `(run)` | the run's `path.started` id | renders only items for which no `advice.delivered` row with `outcome:"injected"` exists yet, on **any** `channel` (`acp_steering` or `boundary`) |
-| Gate wait (worker thread) | `src/cli_runner.rs:761` after the run returns | none — the `bus_request_agent_verdict` pattern (`:417-440`) | `wicked.team.gate.opened` | the attempt's `step.completed` id | matches `run_id, ord, attempt` |
+| Gate wait (worker thread) | `src/cli_runner.rs:761` after the run returns | none — the `bus_request_agent_verdict` pattern (`:417-445`) | `wicked.team.ledger.folded` | the attempt's `step.completed` id | matches `run_id, ord, attempt` |
 | Crew `/ws` relay | daemon | plugin `wicked-crew-team-relay` (the `ws-relay.ts:47-55` pattern) | `wicked.team.**` | `cursor_init: "latest"`, `maxRetries: 0` | none needed: it broadcasts, never re-emits |
 | Crew read route | `GET /api/v1/runs/:id/team` | none — `pollResolve(liveDb, archDir, {lastEventId: 0, filter})` (`lib/query.js:41`), paged, filtered by `payload.run_id` | `wicked.team.**` | 0 | dedup by `event_id` across tiers (`lib/query.js:184`) |
 | Studio | `/ws` `teamEvent` frames + the read route on late join | — | — | — | folds by the payload ids |
@@ -121,7 +162,7 @@ The bus `event_id` is the order (`ORDER BY event_id ASC`, `src/bus.rs:497-499`).
 
 ### 4.4 Retention, and what the record is
 
-The bus is the live record and the transcript's source for at least the TTL window (72 h visible; rows deleted at 24 h by the v1 sweep, moved to warm buckets by the v2 sweep, kept forever when no sweep runs — `reqs/SPEC.md:804-818`, `lib/sweep.js:53`, `lib/sweep-v2.js:2-3`). A per-event TTL cannot extend a row's life (`dedup_expires_at` is config-level, `src/bus.rs:294`; the `retention` column is design-only). So the **durable evidence** of what the gate saw is the fold's snapshot, persisted exactly as DES-001 §6.1 (`WorkUnit.team_ledger`, `UnitEvidence.team`, the evidence bundle at `routes.ts:2879`), with the difference that the snapshot now carries the attempt's **transcript** (every team event of the attempt, capped, §6 `gate.opened`). The ledger IS the stream: the snapshot is a deterministic fold of the stream (`team::fold(events) -> TeamLedger`, a pure function tested on fixtures), and the studio transcript view reads the bus while it can and the snapshot afterwards.
+The bus is the live record and the transcript's source for at least the TTL window (72 h visible; rows deleted at 24 h by the v1 sweep, moved to warm buckets by the v2 sweep, kept forever when no sweep runs — `reqs/SPEC.md:804-818`, `lib/sweep.js:53`, `lib/sweep-v2.js:2-3`). A per-event TTL cannot extend a row's life (`dedup_expires_at` is config-level, `src/bus.rs:294`; the `retention` column is design-only). So the **durable evidence** of what the gate saw is the fold's snapshot, persisted exactly as DES-001 §6.1 (`WorkUnit.team_ledger`, `UnitEvidence.team`, the evidence bundle at `routes.ts:2879`), with the difference that the snapshot now carries the attempt's **transcript** (every team event of the attempt, capped, §6 `ledger.folded`). The ledger IS the stream: the snapshot is a deterministic fold of the stream (`team::fold(events) -> TeamLedger`, a pure function tested on fixtures), and the studio transcript view reads the bus while it can and the snapshot afterwards.
 
 ### 4.5 The relay to `/ws`
 
@@ -152,7 +193,7 @@ Because consumers are keyed by entity id (§6.1), a row seen both in replay and 
 Retention bounds the replay:
 - The bus deletes rows 24 h after emission (`dedup_expires_at`; `reqs/SPEC.md:804-818`).
 - An attempt lasts at most `WICKED_UNIT_TIMEOUT_SECS` (default 7200 s; `src/acp_runner.rs:5911-5914`, `src/execute_wrapped.rs:1185-1189`), so every row of the attempt that died is inside the window.
-- A run that has been live longer than 24 h (e.g. paused at a gate for days) can have lost older rows. What those rows fed is already durable: the plan in `AgentSession.team`, each finished attempt's ledger in its unit's `gate.opened` snapshot (`UnitEvidence.team`, §4.4).
+- A run that has been live longer than 24 h (e.g. paused at a gate for days) can have lost older rows. What those rows fed is already durable: the plan in `AgentSession.team`, each finished attempt's ledger in its unit's `ledger.folded` snapshot (`UnitEvidence.team`, §4.4).
 - When `path.started` itself is gone, the supervisor logs one `stream_gap` line per run and carries nothing from before the gap. The gate of any unit whose attempt rows are missing gets `final_pass:"stream_gap"` and `team_pause:true`: an incomplete team record goes to a human, never auto-approved.
 
 **Cost:** one live-tier scan at spawn, bounded by 24 h of rows.
@@ -179,33 +220,37 @@ Retention bounds the replay:
 
 ## 6. The events
 
-Twenty-three types. `Key` is the idempotency key's parts after `["team", <type>, run_id]`. `Pub` is who publishes; `Sub` who consumes (S = supervisor, C = ACP carrier steer point, I = step-boundary injector, G = gate wait / fold, R = crew relay + read route, U = studio).
+Twenty-five types. `Key` is the idempotency key's parts after `["team", <type>, run_id]`. `Owner` is the one component that publishes it; `Consumers` read it.
 
-| # | Type | Pub | Sub | Key parts | When |
+Owners: **E** engine (actor, via the `TeamPublisher`), **S** supervisor, **R** attempt runner (worker thread + its carrier). Consumers additionally: **X** crew (relay + read routes), **U** studio. The actor consumes **no** bus row (§4.0); §7 is the full matrix.
+
+| # | Type | Owner (sole publisher) | Consumers | Key parts | When |
 |---|---|---|---|---|---|
-| 1 | `wicked.team.path.started` | engine (actor → publisher) | S, I, R, U | — | launch admitted; PA seat known |
-| 2 | `wicked.team.path.scored` | worker thread / S (S4 `assess`) | engine, S, R, U | `score_source` | intent score at plan time; diff re-score at checkpoints and `step.completed` (§8.7) |
-| 3 | `wicked.team.plan.proposed` | worker thread (PA's `understand` block, PA `PLAN+`, accepted member request) / crew (user plan, preset, approval edit) | engine, R, U | `proposal_id` | any plan or plan change from any author (§8.4) |
-| 4 | `wicked.team.plan.revised` | engine only (it assigns `plan_rev`) | S, R, U | `plan_rev` | the plan grew (§8.7): a composed revision, or an automatic floor raise |
-| 5 | `wicked.team.plan.accepted` | engine | S, R, U | `plan_rev` | composed, floor-filled, approved or auto-released |
-| 5a | `wicked.team.plan.refused` | engine | R, U | `proposal_id` | compose refused a proposal (floor, pin, schema); the run keeps its accepted rev |
-| 6 | `wicked.team.member.joined` | S | R, U | `ord`, `attempt`, `member_id`, `open_seq` | a monitor session opened (or failed) |
-| 7 | `wicked.team.member.left` | S | R, U | `ord`, `attempt`, `member_id`, `open_seq` | budget exhausted, failed, closed |
-| 8 | `wicked.team.step.claimed` | worker thread (PA) / S (member) | S, C, I, R, U | `step_id`, `attempt`, `by` | before the step's turn starts |
-| 9 | `wicked.team.checkpoint.reached` | C | S, R, U | `ord`, `attempt`, `seq` | terminal `tool_call_update` of a team unit |
-| 10 | `wicked.team.finding.raised` | S | C, I, R, U | `ord`, `attempt`, `raise_seq` | confirmed, above-bar, first-seen finding |
-| 11 | `wicked.team.advice.delivered` | C (mid-turn) / I (boundary) / S (sweep) | S, I, R, U | `ord`, `attempt`, `raise_seq`, `delivery_id` | **one row per finding**: it reached (or could not reach) the PA on one channel |
-| 12 | `wicked.team.advice.answered` | worker thread (`ADVICE` lines) | S, R, U | `ord`, `attempt`, `raise_seq`, `answered_in` | end of the PA's turn |
-| 13 | `wicked.team.help.requested` | worker thread / C (`HELP:`) / S (member `plan_change`) | S, R, U | `help_id` | the PA asks the team, or a member asks for a plan change |
-| 14 | `wicked.team.help.answered` | S (a member) / crew (human) / worker thread (PA `PLAN` answer) | I, C, engine, R, U | `help_id`, `answer_id` | an answer |
-| 15 | `wicked.team.step.completed` | worker thread / S (member) | S, G, R, U | `step_id`, `attempt`, `by` | the step's turn returned |
-| 16 | `wicked.team.step.reviewed` | worker thread (PA `STEP` line) | S, R, U | `step_id`, `attempt` | the PA accepted or rejected a member's step (§8.8) |
-| 17 | `wicked.team.finding.settled` | S (hold round) | G, R, U | `ord`, `attempt`, `raise_seq` | held / withdrawn / superseded |
-| 18 | `wicked.team.council.called` | S | R, U | `ord`, `attempt`, `subject` | an unresolved HIGH, or a member-step dispute |
-| 19 | `wicked.team.council.ruled` | council thread | S, I, R, U | `ord`, `attempt`, `subject` | `convene_decision` returned |
-| 20 | `wicked.team.gate.opened` | S (`unit_review`) / engine (`plan_approval`, `team_dispute`) | G, R, U | `gate_id` | a gate opened; a re-opened gate is a new `gate_id` |
-| 21 | `wicked.team.gate.decided` | engine (including human decisions, after `confirm_gate`) | R, U | `gate_id` | a gate decided (one decision per `gate_id`) |
-| 22 | `wicked.team.path.ended` | engine | S, R, U | — | the run reached a terminal state |
+| 1 | `wicked.team.path.started` | E | S, X, U | — | launch admitted; PA seat known (required, §4.1) |
+| 2 | `wicked.team.path.scored` | E (a diff score arrives as the supervisor's `Command::TeamRescored`, §4.0) | X, U | `score_source` | intent score at plan time; diff re-score at checkpoints and `step.completed` (§8.7) |
+| 3 | `wicked.team.plan.proposed` | E (after accepting the command or step result that carries it, §4.0) | S, X, U | `proposal_id` | a plan or plan change was submitted (§8.4) |
+| 4 | `wicked.team.plan.revised` | E | S, X, U | `plan_rev` | the plan grew (§8.7) |
+| 5 | `wicked.team.plan.accepted` | E | S, X, U | `plan_rev` | composed, floor-filled, approved or auto-released (required, §4.1) |
+| 6 | `wicked.team.plan.refused` | E | X, U | `proposal_id` | compose refused a proposal; the run keeps its accepted rev |
+| 7 | `wicked.team.member.joined` | S | X, U | `ord`, `attempt`, `member_id`, `open_seq` | a monitor session opened (or failed) |
+| 8 | `wicked.team.member.left` | S | X, U | `ord`, `attempt`, `member_id`, `open_seq` | budget exhausted, failed, closed |
+| 9 | `wicked.team.step.claimed` | R | S, X, U | `step_id`, `attempt`, `by` | before the step's turn starts |
+| 10 | `wicked.team.checkpoint.reached` | R (carrier) | S, X, U | `ord`, `attempt`, `seq` | terminal `tool_call_update` of a team unit |
+| 11 | `wicked.team.finding.raised` | S | R, X, U | `ord`, `attempt`, `raise_seq` | confirmed, above-bar, first-seen finding |
+| 12 | `wicked.team.advice.delivered` | R (carrier mid-turn; worker thread at the boundary and at attempt end) | S, R, X, U | `ord`, `attempt`, `raise_seq`, `delivery_id` | one row per finding per delivery |
+| 13 | `wicked.team.advice.answered` | R (worker thread, `ADVICE` lines) | S, X, U | `ord`, `attempt`, `raise_seq`, `answered_in` | end of the PA's turn |
+| 14 | `wicked.team.help.requested` | R (worker thread / carrier, `HELP:` lines) | S, X, U | `help_id` | the PA asks the team |
+| 15 | `wicked.team.help.answered` | S (a member's turn) | R, X, U | `help_id`, `answer_id` | a member answers |
+| 16 | `wicked.team.change.requested` | S (a member's turn) | R, X, U | `change_id` | a member asks for plan steps (§8.7) |
+| 17 | `wicked.team.step.completed` | R | S, X, U | `step_id`, `attempt`, `by` | the step's turn returned |
+| 18 | `wicked.team.step.reviewed` | R (worker thread, `STEP` line) | S, X, U | `step_id`, `attempt` | the PA accepted or rejected a member's step (§8.8) |
+| 19 | `wicked.team.finding.settled` | S (hold round) | X, U | `ord`, `attempt`, `raise_seq` | held / withdrawn / superseded |
+| 20 | `wicked.team.council.called` | S | X, U | `ord`, `attempt`, `subject` | an unresolved HIGH, or a member-step dispute |
+| 21 | `wicked.team.council.ruled` | S (the verdict of the council it convened) | R, X, U | `ord`, `attempt`, `subject` | `convene_decision` returned |
+| 22 | `wicked.team.ledger.folded` | S | R, X, U | `ord`, `attempt` | the final pass folded the attempt's stream into its `TeamLedger` (§8.11) |
+| 23 | `wicked.team.gate.opened` | E | X, U | `gate_id` | a gate opened (`unit_review`, `plan_approval`, `team_dispute`, `team_transport`) (required) |
+| 24 | `wicked.team.gate.decided` | E (human decisions included, after `confirm_gate` accepts them) | X, U | `gate_id` | a gate decided (required) |
+| 25 | `wicked.team.path.ended` | E | S, X, U | — | the run reached a terminal state |
 
 ### 6.1 Identity rule for every key (rev 6; closes the class)
 
@@ -217,33 +262,35 @@ Twenty-three types. `Key` is the idempotency key's parts after `["team", <type>,
 
 **Every key, with its source of uniqueness** (all keys are prefixed `["team", <event_type>, <run_id>]`, §4.1):
 
-| # | Event | Key parts | Source of uniqueness (who assigns it) | Rev 6 change |
+| # | Event | Key parts | Source of uniqueness (who assigns it) | Changed |
 |---|---|---|---|---|
-| 1 | `path.started` | — | the run id: one path per run, minted at launch | — |
-| 2 | `path.scored` | `score_source` | `"intent:" + proposal_id` (one intent score per proposal) or `"diff:" + ord + ":" + attempt + ":" + rescore_seq` (`rescore_seq`: the supervisor's per-attempt re-score counter, §8.7) | was `basis`, `score_seq`: two producers (worker thread, supervisor) shared one counter |
-| 3 | `plan.proposed` | `proposal_id` | `"p-" + deterministic_key([run, by, source])` where `source` is producer-assigned: the launch's session id (user plan / preset); the `understand` step's `step.completed` event id (PA plan); `ord:attempt:plan_block_seq` (a PA `PLAN+` block; `plan_block_seq` is the per-output block counter the worker's parser assigns); the accepted `help_id` (member request); the `gate_id` (approval edit) | `PLAN+` source now names its block sequence |
-| 4 | `plan.revised` | `plan_rev` | the engine's per-run plan counter (actor, single writer) | — |
-| 5 | `plan.accepted` | `plan_rev` | the same counter | — |
-| 5a | `plan.refused` | `proposal_id` | one refusal per proposal | — |
-| 6 | `member.joined` | `ord`, `attempt`, `member_id`, `open_seq` | `member_id` is the supervisor's per-attempt id; `open_seq` counts that member's session openings in the attempt. A monitor is **re-opened** after a failed turn (`src/team.rs:667`, `:885`, `:909`) | `open_seq` added |
-| 7 | `member.left` | `ord`, `attempt`, `member_id`, `open_seq` | the opening it closes | `open_seq` added |
-| 8 | `step.claimed` | `step_id`, `attempt`, `by` | the engine's attempt counter: every (re-)dispatch of a step is a new attempt, including a rework, a PA takeover and a redrive | — |
-| 9 | `checkpoint.reached` | `ord`, `attempt`, `seq` | the carrier's per-attempt checkpoint counter | — |
-| 10 | `finding.raised` | `ord`, `attempt`, `raise_seq` | the supervisor's per-attempt emission counter; `finding_id` rides in the payload | was `finding_id` (content hash) |
-| 11 | `advice.delivered` | `ord`, `attempt`, `raise_seq`, `delivery_id` | `delivery_id` = the steer's `steer_id` (the carrier's per-process request id), or `"boundary:" + step_id + ":" + attempt` of the step whose prompt carried it (one render per step attempt), or `"sweep"` (one per attempt) | was `finding_id`, `channel`, `outcome`: a finding refused at two successive tool calls repeated all three |
-| 12 | `advice.answered` | `ord`, `attempt`, `raise_seq`, `answered_in` | `answered_in` = the `step_id:attempt` whose output carried the `ADVICE` line (the last line per id wins inside one output) | was `finding_id`: an answer revised at a later step collided |
-| 13 | `help.requested` | `help_id` | `"h-" + deterministic_key([run, ord, attempt, by, help_seq])`, where `help_seq` is the producer's per-attempt counter: the worker's parser numbers `HELP:` lines in output order; the carrier numbers mid-turn ones in the same sequence; the supervisor numbers a member's `plan_change` requests. The question and context are payload only | **was content-derived (question text)** |
-| 14 | `help.answered` | `help_id`, `answer_id` | `answer_id` is producer-assigned: the supervisor's member-turn id, the answering `step_id:attempt` (a PA `PLAN` verdict), or crew's request id for a human answer (`POST /api/v1/runs/:id/help/:help_id` mints it) | was `help_id`, `by`: a second answer from the same author collided |
-| 15 | `step.completed` | `step_id`, `attempt`, `by` | the attempt counter | — |
-| 16 | `step.reviewed` | `step_id`, `attempt` | the reviewed attempt: the first `STEP` line for it wins; later lines for that attempt are logged and ignored | — |
-| 17 | `finding.settled` | `ord`, `attempt`, `raise_seq` | the finding's emission id: one settlement per finding per attempt | was `finding_id` |
-| 18 | `council.called` | `ord`, `attempt`, `subject` | `subject` = `"finding:" + raise_seq`, or `"step:" + step_id + ":" + attempt` for a member-step dispute. One council per subject (`MAX_DISPUTES` caps the count) | was `subject_id` (a finding content hash for findings) |
-| 19 | `council.ruled` | `ord`, `attempt`, `subject` | the call it answers | as 18 |
-| 20 | `gate.opened` | `gate_id` | `AgentSession.gate_seq` (engine gates) or `u<ord>-<attempt>` (unit review), §8.6 | — |
-| 21 | `gate.decided` | `gate_id` | one decision per gate. **Engine-published only**, including human decisions, after `confirm_gate` accepts the answer, so two concurrent human clicks produce one row | publisher narrowed from "engine / crew" |
-| 22 | `path.ended` | — | one terminal state per run | — |
+| 1 | `path.started` | — | the run id: one path per run, minted at launch (E) |  |
+| 2 | `path.scored` | `score_source` | `"intent:" + proposal_id` (E, one per proposal) or `"diff:" + ord + ":" + attempt + ":" + rescore_seq`: `rescore_seq` is assigned by the supervisor and carried in `Command::TeamRescored`, so E publishes it unchanged |  |
+| 3 | `plan.proposed` | `proposal_id` | `"p-" + deterministic_key([run, by, source])`. Every `source` is an id the engine received with the command (§4.0): the launch's session id (user plan, preset); the `understand` step's `ord:attempt` from its `ApplyStepResult` (PA plan); `ord:attempt:plan_block_seq` (a `PLAN+` block, numbered by the step-output parser); the accepted `change_id` (member request); the `gate_id` (approval edit); the `Core::propose_plan` call's request id (a mid-run human plan edit, minted by crew per POST) | rev 7: every source arrives on a command, not the bus |
+| 4 | `plan.revised` | `plan_rev` | the engine's per-run plan counter |  |
+| 5 | `plan.accepted` | `plan_rev` | the same counter |  |
+| 6 | `plan.refused` | `proposal_id` | one refusal per proposal |  |
+| 7 | `member.joined` | `ord`, `attempt`, `member_id`, `open_seq` | S's per-attempt member id and its opening counter (a monitor is re-opened after a failed turn, `src/team.rs:667`, `:885`, `:909`) |  |
+| 8 | `member.left` | `ord`, `attempt`, `member_id`, `open_seq` | the opening it closes |  |
+| 9 | `step.claimed` | `step_id`, `attempt`, `by` | the engine's attempt counter: every (re-)dispatch of a step is a new attempt |  |
+| 10 | `checkpoint.reached` | `ord`, `attempt`, `seq` | the carrier's per-attempt checkpoint counter |  |
+| 11 | `finding.raised` | `ord`, `attempt`, `raise_seq` | S's per-attempt emission counter; `finding_id` rides in the payload |  |
+| 12 | `advice.delivered` | `ord`, `attempt`, `raise_seq`, `delivery_id` | `delivery_id` = the carrier's `steer_id`, or `"boundary:" + step_id + ":" + attempt` of the step whose prompt carried it, or `"end:" + attempt` (the attempt-end not-delivered row, now R's instead of an S sweep) | rev 7: the not-delivered row moved from S to R, so the type has one owner |
+| 13 | `advice.answered` | `ord`, `attempt`, `raise_seq`, `answered_in` | the `step_id:attempt` whose output carried the line |  |
+| 14 | `help.requested` | `help_id` | `"h-" + deterministic_key([run, ord, attempt, by, help_seq])`; `help_seq` is R's per-attempt counter over `HELP:` lines (the step-output parser and the carrier share it) | rev 7: member plan-change requests moved to `change.requested` |
+| 15 | `help.answered` | `help_id`, `answer_id` | `answer_id` = S's member-turn id | rev 7: S only; no crew or PA answers (a human-directed question is S1 elicitation; a PA verdict on a member request is part of its step output) |
+| 16 | `change.requested` | `change_id` | `"c-" + deterministic_key([run, ord, attempt, member_id, change_seq])`; `change_seq` is S's per-attempt counter | new in rev 7 |
+| 17 | `step.completed` | `step_id`, `attempt`, `by` | the attempt counter |  |
+| 18 | `step.reviewed` | `step_id`, `attempt` | the reviewed attempt; the first `STEP` line for it wins |  |
+| 19 | `finding.settled` | `ord`, `attempt`, `raise_seq` | the finding's emission id |  |
+| 20 | `council.called` | `ord`, `attempt`, `subject` | `"finding:" + raise_seq` or `"step:" + step_id + ":" + attempt` |  |
+| 21 | `council.ruled` | `ord`, `attempt`, `subject` | the call it answers |  |
+| 22 | `ledger.folded` | `ord`, `attempt` | one final pass per attempt | new in rev 7 (was `gate.opened{kind:"unit_review"}` published by S, which gave `gate.opened` two owners) |
+| 23 | `gate.opened` | `gate_id` | `AgentSession.gate_seq` (every engine gate, including `unit_review` and `team_transport`) | rev 7: E only |
+| 24 | `gate.decided` | `gate_id` | one decision per gate; E publishes human decisions after `confirm_gate` accepts them |  |
+| 25 | `path.ended` | — | one terminal state per run |  |
 
-**How the rule is enforced.** T1 adds a table-driven test. For every event type, two distinct logical requests that share all content except the producer-assigned part produce two rows; a re-publish of the same logical request produces one. The `help.requested` fixture is two `HELP:` lines with the same question and different context, and then with different `plan_change` steps: two rows, two `help_id`s.
+**How the rule is enforced.** T1 adds a table-driven test over all 25 types. For every event type, two distinct logical requests that share all content except the producer-assigned part produce two rows; a re-publish of the same logical request produces one. The `help.requested` fixture is two `HELP:` lines with the same question and different context: two rows, two `help_id`s. The `change.requested` fixture is two member requests with the same text and different steps: two rows.
 
 Exact payloads (envelope fields omitted after the first):
 
@@ -345,16 +392,18 @@ Exact payloads (envelope fields omitted after the first):
 {"ord":3,"attempt":1,"by":"claude#1","re":"finding.raised#4","raise_seq":4,"answered_in":"build:1",   // the step:attempt whose output carried the line
  "finding_id":"f-3fa9c2e1d0b4a7e6","disposition":"declined","reason":"campaign.rs:325 documents the exclusion"}   // "accepted" | "declined"
 
-// 13 / 14 — the PA asks; a member (or a human through crew) answers
+// 13 / 14 — help.requested (R: the PA asks) and help.answered (S: a member answers)
 {"ord":3,"attempt":1,"by":"claude#1","help_id":"h-1a2b…",
- "help_seq":2,                      // the producer's per-attempt counter; help_id is derived from it, never from the question
- "kind":"question",                // "question" (the PA asks) | "plan_change" (a member asks for plan steps, §8.7)
- "question":"…","context":"…",     // ≤4 KB each
- "steps":null}                     // plan_change only: steps in the plan.proposed step shape
+ "help_seq":2,                      // R's per-attempt counter; help_id is derived from it, never from the question
+ "question":"…","context":"…"}     // ≤4 KB each
 {"ord":3,"attempt":1,"by":"claude#2","re":"help.requested#h-1a2b…","help_id":"h-1a2b…",
- "answer_id":"t-…",                 // member-turn id | answering step:attempt | crew request id
- "answer":"…","evidence":["src/x.rs:41"],
- "verdict":null}                   // plan_change only, set by the PA's PLAN line: "accepted" | "declined"
+ "answer_id":"t-…",                 // S's member-turn id
+ "answer":"…","evidence":["src/x.rs:41"]}
+
+// 14a — change.requested (S): a member asks for plan steps (§8.7). The PA's verdict comes back in its step output, not here.
+{"ord":3,"attempt":1,"by":"claude#2","change_id":"c-…","change_seq":1,
+ "steps":[{"catalog":"test_plan","id":"test-plan-2"}],      // the plan.proposed step shape
+ "reason":"…"}
 
 // 15 — the worker thread after run_unit_streaming returns; a member's step from the supervisor
 {"ord":3,"attempt":1,"by":"claude#1","step_id":"build","status":"ok",   // "ok" | "failed" | "cancelled": the wire spelling of StepStatus (src/workflow.rs:175, which has no serde derive)
@@ -388,14 +437,18 @@ Exact payloads (envelope fields omitted after the first):
  "reason":null,                    // no_verdict: "no_quorum" | "seats_benched" | "error" | "timeout" | "cap"
  "agreement_pct":67,"dissent":["…"],"seats":["codex","pi"],"returned":3,"seated":3}
 
-// 20 — gate.opened. kind:"unit_review": the supervisor, once per attempt, the fold of the attempt's stream (DES-001 §7 teamLedger + transcript)
-{"gate_id":"g-r1-u3-1",           // unit_review: "g-<run>-u<ord>-<attempt>"; engine gates: "g-<run>-<gate_seq>"
- "kind":"unit_review",             // "unit_review" | "plan_approval" | "team_dispute"
- "ord":3,"attempt":1,"by":"engine","final_pass":"completed",   // "completed" | "timed_out" | "skipped"
+// 19a — ledger.folded (S): once per attempt, the fold of the attempt's stream (DES-001 §7 teamLedger + transcript)
+{"ord":3,"attempt":1,"by":"engine","final_pass":"completed",   // "completed" | "timed_out" | "skipped" | "stream_gap"
  "ledger":{ /* TeamLedger exactly as DES-001 §7: monitors[], findings[] (status, delivery, monitor_reply, dispute), rejected{}, team_pause */ },
  "transport":"bus",               // "bus" | "none" (the local no-bus snapshot, §4.1)
  "transcript":{"from_event_id":1180,"to_event_id":1290,"count":31,
                "events":[ /* the attempt's wicked.team.* rows, event_id-ordered, ≤256 KB; "truncated":true past the cap */ ]}}
+
+// 20 — gate.opened (E only). kind:"unit_review": the actor, on the ApplyStepResult that carries the snapshot, before the fold
+{"gate_id":"g-r1-3",              // "g-<run>-<gate_seq>" for every kind (AgentSession.gate_seq)
+ "kind":"unit_review",             // "unit_review" | "plan_approval" | "team_dispute" | "team_transport"
+ "ord":3,"attempt":1,"by":"engine",
+ "ledger_ref":"ledger.folded#3:1"} // the S fact the gate reads; the snapshot itself rides UnitEvidence.team
 
 // 20 — gate.opened, kind:"plan_approval": the engine, when the approval matrix requires it (§8.6)
 {"gate_id":"g-r1-4",              // gate_seq 4: a re-opened gate for a newer plan_rev gets a new one
@@ -404,10 +457,10 @@ Exact payloads (envelope fields omitted after the first):
  "reason":"high_risk",             // "manual_mode" | "high_risk" | "into_high_risk" | "override"
  "diff":{"from_rev":null,"added":["architecture","security_review"]}}
 
-// 21 — gate.decided: the fold (unit_review), the engine (plan_approval auto release is plan.accepted, not a gate) or a human (crew)
-{"gate_id":"g-r1-u3-1",           // the gate this decides
+// 21 — gate.decided (E only): the fold decides unit_review; a human decision is published by E after confirm_gate accepts it (§4.0)
+{"gate_id":"g-r1-3",              // the gate this decides
  "kind":"unit_review",            // "unit_review" | "plan_approval" | "team_dispute"
- "ord":3,"attempt":1,"by":"engine","re":"gate.opened#g-r1-u3-1",
+ "ord":3,"attempt":1,"by":"engine","re":"gate.opened#g-r1-3",
  "decision":"paused",              // unit_review: "allow" | "deny" | "paused"; human (any kind): "human_approved" | "human_amended" | "human_rejected"
  "combined":true,"team_pause":true,"unresolved":["f-3fa9…"]}
 
@@ -415,17 +468,43 @@ Exact payloads (envelope fields omitted after the first):
 {"run_id":"r1","ord":null,"attempt":null,"by":"engine","status":"completed"}   // "completed" | "failed" | "cancelled"
 ```
 
-## 7. Who reads what
+## 7. Producer / consumer matrix (§4.0)
 
-| Consumer | Reads | Produces |
-|---|---|---|
-| Supervisor (core) | `path.started` (arm a run), `plan.accepted` (member targets), `step.claimed` (track an attempt; open monitors lazily), `checkpoint.reached` (batch trigger, DES-001 §4.3), `advice.answered` (dispositions into the next batch prompt), `help.requested` (a member turn), `step.completed` (final pass), `council.ruled` (into the ledger), `path.ended` (forget) | `member.joined/left`, `finding.raised`, `advice.delivered{channel:"none"}` (sweep), `help.answered`, `step.claimed/completed` for a member's step, `finding.settled`, `council.called`, `gate.opened` |
-| ACP carrier steer point (core) | `finding.raised{severity:"high"}` for its attempt, `help.answered` for its open asks | `checkpoint.reached`, `advice.delivered{channel:"acp_steering"}`, `help.requested` (mid-turn `HELP` line) |
-| Step-boundary injector (core, worker thread) | `finding.raised` with no `advice.delivered{outcome:"injected"}` on any channel, `help.answered`, `council.ruled`, a member's `step.completed` awaiting review | `advice.delivered{channel:"boundary", outcome:"injected"}` |
-| Gate wait + fold (core, worker thread) | `gate.opened` for its attempt | `UnitEvidence.team` (the snapshot), then the engine gate as DES-001 §6.2 |
-| Engine (actor) | `plan.proposed`, `plan.revised` (floor fill → compose → approval matrix → register or pause), `path.scored` (floor ratchet), `help.answered` (a PA `PLAN` accept) | `path.started`, `plan.revised{reason:"floor_raised"}`, `plan.accepted`, `gate.opened`/`gate.decided` (`plan_approval`, `team_dispute`), `path.ended` |
-| Crew | the relay; the read route | `plan.proposed{by:"human"}` (user plan, preset launch, approval edit), `gate.decided{kind:"plan_approval", by:"human"}`, `help.answered{by:"human"}`, `gate.decided{by:"human"}` — all through crew's existing JS `bus.emit` with the deterministic key (`projects/events.ts:93-108`) |
-| Studio | `teamEvent` frames; `GET /runs/:id/team` on late join | POSTs to crew only |
+Every event has **one owner**, the only component that publishes it. **E** is the engine (the actor, through the `TeamPublisher`), **S** the supervisor, **R** the attempt runner (the attempt's worker thread plus its carrier). **X** is crew (relay and read routes), **U** studio. The actor consumes no row.
+
+| # | Event | Owner (sole publisher) | Consumers | Does a consumer change state from it? |
+|---|---|---|---|---|
+| 1 | `path.started` | E | S (arms the run's state), X, U | S: own state only |
+| 2 | `path.scored` | E | X, U | no |
+| 3 | `plan.proposed` | E | S (member targets), X, U | S: own state only |
+| 4 | `plan.revised` | E | S, X, U | S: own state only |
+| 5 | `plan.accepted` | E | S, X, U | S: own state only |
+| 6 | `plan.refused` | E | X, U | no |
+| 7 | `member.joined` | S | X, U | no |
+| 8 | `member.left` | S | X, U | no |
+| 9 | `step.claimed` | R | S (attaches the attempt), X, U | S: own state only |
+| 10 | `checkpoint.reached` | R | S (batch and re-score trigger), X, U | S: own state only; its re-score reaches the actor as S's own measurement (`TeamRescored`), not as the row |
+| 11 | `finding.raised` | S | R (steer mid-turn; render at the boundary), X, U | R: its own prompt only (advisory) |
+| 12 | `advice.delivered` | R | S (ledger), R (dedup), X, U | S, R: own state only |
+| 13 | `advice.answered` | R | S (dispositions, hold round), X, U | S: own state only |
+| 14 | `help.requested` | R | S (a member turn), X, U | S: own state only |
+| 15 | `help.answered` | S | R (renders it to the PA), X, U | R: its own prompt only |
+| 16 | `change.requested` | S | R (renders it to the PA), X, U | R: its own prompt only; the engine gets the steps only from the PA's `PLAN+` in `ApplyStepResult` |
+| 17 | `step.completed` | R | S (final pass), X, U | S: own state only |
+| 18 | `step.reviewed` | R | S (ledger; a `HOLD` may trigger a council), X, U | S: own state only; a council verdict reaches the actor as S's own `TeamStepRuling` |
+| 19 | `finding.settled` | S | X, U | no |
+| 20 | `council.called` | S | X, U | no |
+| 21 | `council.ruled` | S | R (renders it to the PA), X, U | R: its own prompt only |
+| 22 | `ledger.folded` | S | R (gate wait: the snapshot becomes its `UnitEvidence.team`), X, U | R: its own step result only; the actor receives it on `ApplyStepResult` |
+| 23 | `gate.opened` | E | X, U | no |
+| 24 | `gate.decided` | E | X, U | no |
+| 25 | `path.ended` | E | S (forgets the run), X, U | S: own state only |
+
+**Assertions (checked by T1, T4 (e), T8 (g)):**
+1. **No fact has two owners.** Each of the 25 types appears once in the Owner column, with a single letter. Rev 7 split the three types that had two owners: `gate.opened` (the S snapshot is now `ledger.folded`), `help.requested` (member plan changes are now `change.requested`), and `help.answered` (the human and PA answer paths are gone). The attempt-end not-delivered row moved from S to R.
+2. **No consumer changes state it does not own.** Every consumer's effect is on its own state: the supervisor's attempt state, the runner's own prompt and evidence, the relay's broadcast, studio's view.
+3. **The engine is changed only by commands.** These are the API (`launch_run`, `confirm_gate`, `propose_plan`, `put_preset`) and the actor's existing command channel: `ApplyStepResult` from the worker, `TeamRescored`/`TeamStepRuling` carrying the supervisor's own measurements, and `TeamPublished`/`TeamTransportFailed` from the publisher.
+4. **Crew publishes nothing.** It relays, reads and POSTs.
 
 ## 8. Lifecycle, step by step
 
@@ -434,7 +513,7 @@ Exact payloads (envelope fields omitted after the first):
 - `LaunchSpec` gains `primary: Option<String>` (`src/lib.rs:193-216`), a seat-instance key from `clis`. `None` means the engine picks uniformly at random among the eligible seats (the `seat_candidates` set S5 computes, `src/distribute.rs:11`) and records `selection:"random"`. Crew's `POST /runs` body gains `primary` (`LaunchSchema`, `packages/crew/src/api/routes.ts:476-500`); studio's composer gains a seat picker with a **Random** option.
 - The PA seat is the run's **creator seat**. `teamed_distribution` (`src/distribute.rs:166`, result at `:174`) pins `winner` to the PA for every creator-role unit whose `owner` is `pa` (§8.8). `enforce_evaluator_distinct` (`src/distribute.rs:387`, fn `:547`) moves every evaluator unit off the creator seats.
 - **What it does today when it cannot.** A **bench-free** roster with no distinct seat keeps the review/test unit on its creator seat, disclosed as `distinctness_fallback:"creator_seat"` (`src/distribute.rs:286-290`, set at `:417-426`). The plan is refused with `NoEligibleSeat` **only** when a bench caused the shortfall (`:388-409`). A distinct instance of the creator's own CLI (`claude#2` grading `claude#1`) is already accepted and disclosed as `"same_cli_instance"` (`:291-294`).
-- **[COORDINATOR RECOMMENDATION — the operator can override] Team runs never use `creator_seat`.** For a team run, `distribute_units_against_benched` refuses whenever `same_seat` is non-empty, with or without a bench. In order:
+- **Team runs never use `creator_seat`** (operator decision, 2026-09-24). For a team run, `distribute_units_against_benched` refuses whenever `same_seat` is non-empty, with or without a bench. In order:
   1. a distinct CLI;
   2. else a distinct **instance** of an eligible CLI (`same_cli_instance`, core#595/#605 instance seats);
   3. else `NoEligibleSeat`, naming the unit and the missing instance.
@@ -499,7 +578,7 @@ Validation is `deny_unknown_fields` (`src/workflow.rs:640`) plus these rules. It
 
 A plan is a `plan.proposed` event whatever its author. The payload's `steps[]` is an ordered list of `{catalog, id, …step fields}`; `by` is the author (`"claude#1"` for the PA, `"human"` for a user).
 - **PA-composed:** the launch names no phases. The run's first unit is `understand` on the PA seat, and its plan block is parsed at the step boundary.
-- **User-composed:** the launch carries `plan: {steps:[…], touch?:[…]}` (crew `POST /runs` gains `plan`; studio's phase picker produces it). Crew publishes `plan.proposed{by:"human", kind:"initial"}` at launch, before any unit runs. The plan runs its own steps; `understand` runs only if the user included it. The intent score comes from the plan's declared `touch[]`. **A plan that has any creator step (`build` or `produce`) and a missing or empty `touch[]` scores `no_graph_score` (100, reason `"no declared scope"`)**. That is S4's fail-closed rule (`src/review_scale.rs:264-265`, `no_graph_score: 100` at `:281`) applied to a plan that will change something but has not said what. Only a plan with **no** creator step may score 0 on an empty `touch[]`. The diff re-score (§8.7) ratchets the floor from there, and the PA may add phases at any of its step boundaries as a `plan.revised`, so a user plan is never silently replaced.
+- **User-composed:** the launch carries `plan: {steps:[…], touch?:[…]}` (crew `POST /runs` gains `plan`; studio's phase picker produces it). The plan is part of the **launch command** (`POST /api/v1/runs` → `Core::launch_run`, §4.0). The engine validates it and then publishes `plan.proposed{by:"human", kind:"initial"}`, before any unit runs. Crew publishes nothing. The plan runs its own steps; `understand` runs only if the user included it. The intent score comes from the plan's declared `touch[]`. **A plan that has any creator step (`build` or `produce`) and a missing or empty `touch[]` scores `no_graph_score` (100, reason `"no declared scope"`)**. That is S4's fail-closed rule (`src/review_scale.rs:264-265`, `no_graph_score: 100` at `:281`) applied to a plan that will change something but has not said what. Only a plan with **no** creator step may score 0 on an empty `touch[]`. The diff re-score (§8.7) ratchets the floor from there, and the PA may add phases at any of its step boundaries as a `plan.revised`, so a user plan is never silently replaced.
 - **Preset:** the launch carries `preset: "<name>"`. The engine expands the preset into `steps[]` and publishes `plan.proposed{by:"human", preset:"<name>"}`. A preset is **only** a saved phase selection, a named `steps[]`.
 
 Every `plan.proposed`, from any author, goes through the same pipeline: **floor fill** (§8.5), then **compose** (§8.3), then the **approval matrix** (§8.6), then `plan.accepted`.
@@ -535,7 +614,7 @@ Rules:
 - **Floor fill:** every floor phase type missing from `steps[]` is **inserted** at its catalog-order position and marked `added_by:"floor"` with `floor_reason` (for example `"band 40-69 requires design"`). The PA and the user may **add** phases and steps anywhere at any time. They may not remove or reorder a floor phase before its catalog-order predecessors. Duplicates are allowed (two `review`s).
 - **Ratchet:** the run's floor band is the maximum band any score in the run has reached. It only goes up.
 
-**[RECOMMENDATION to the operator] Floor override.** An **auto-mode** run can never go below the floor: there is no override. A **manual-mode** run (§8.6) may carry an explicit override, `plan.override: {remove: ["review"], reason: "…"}`. It is recorded on the plan (`plan.accepted.override`), shown at the plan gate and the unit gate, and requires the plan approval gate like every manual-mode plan. It never removes a phase that carries a validator pin in a high-risk band. Alternative: no override in any mode. Deleting this block and the `override` field is the whole change.
+**Floor override (operator decision, 2026-09-24).** An **auto-mode** run can never go below the floor: a plan carrying an override is **refused** in auto mode (`plan.refused`, reason `"override in auto mode"`). A **manual-mode** run (§8.6) may carry an explicit override, `plan.override: {remove: ["review"], reason: "…"}`. It is recorded on the plan (`plan.accepted.override`), shown at the `plan_approval` gate and at the unit gate, and requires that gate like every manual-mode plan. It never removes a phase that carries a validator pin in a high-risk band.
 
 ### 8.6 Plan approval (operator decision 2, 2026-09-23)
 
@@ -561,8 +640,8 @@ Rules:
 `PauseReason` (`src/actor.rs:6298-6309`) gains `PlanApproval`, mapped to the token at `:6124-6128`. The pause is durable exactly as every pause is: the session state and the open `interaction_request` commit in one batch (`src/actor.rs:6036-6046`).
 
 **Resume through `confirm_gate`** (`src/actor.rs:7736`). The rule is DES-001 §6.7's: read the open row's `gate_kind` (`InteractionRequest.gate_kind`, `src/interaction.rs:76`, via `list_interactions`, `:161`) **before** `resolve_open_for_session` (`src/actor.rs:7815`; `src/interaction.rs:184`). For `plan_approval`:
-- **Approve** releases the plan: publish `gate.decided{kind:"plan_approval", decision:"human_approved"}` and `plan.accepted{by:"human"}`, emit `Resumed`, then `dispatch_unit` at the cursor. The existing arm bumps `attempt` when the cursor unit is `Done`/`Rejected` (`src/actor.rs:7976-7984`); the `plan_approval` arm skips that bump. It asserts the cursor unit is `Pending`, so a finished unit is never re-dispatched.
-- **Approve with amend:** the amend body is an edited `steps[]`. It becomes `plan.proposed{by:"human", kind:"edit"}`, goes through floor fill and compose, and is accepted directly as rev n+1: the human who edited it approved it. A refusal publishes `plan.refused` and **re-opens** the gate with the reason. The re-opened gate gets a new `gate_seq`, and so a new `gate_id` (§6.1). The first gate's `gate.decided{decision:"human_amended"}` stays the record of the first answer.
+- **Approve** releases the plan. The answer is the `confirm_gate` command (`POST /api/v1/runs/:id/gate`, §4.0), and the **engine** publishes `gate.decided{kind:"plan_approval", decision:"human_approved"}` and `plan.accepted{by:"human"}`. After both acknowledgements (§4.1) it emits `Resumed` and then calls `dispatch_unit` at the cursor. The existing arm bumps `attempt` when the cursor unit is `Done`/`Rejected` (`src/actor.rs:7976-7984`); the `plan_approval` arm skips that bump. It asserts the cursor unit is `Pending`, so a finished unit is never re-dispatched.
+- **Approve with amend:** the amend body of the `confirm_gate` command is an edited `steps[]`. It becomes `plan.proposed{by:"human", kind:"edit"}`, goes through floor fill and compose, and is accepted directly as rev n+1: the human who edited it approved it. A refusal publishes `plan.refused` and **re-opens** the gate with the reason. The re-opened gate gets a new `gate_seq`, and so a new `gate_id` (§6.1). The first gate's `gate.decided{decision:"human_amended"}` stays the record of the first answer.
 - **Reject:** cancel, as today.
 
 The event sequence is `plan.proposed` → `gate.opened{kind:"plan_approval"}` → `gate.decided{kind:"plan_approval"}` → `plan.accepted`. When no approval is needed it is `plan.proposed` → `plan.accepted{by:"engine"}`.
@@ -570,9 +649,9 @@ The event sequence is `plan.proposed` → `gate.opened{kind:"plan_approval"}` �
 ### 8.7 Re-deciding mid-run: `plan.revised`
 
 The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, added[], from_band, to_band}` whenever it does. It is the only publisher, because only the actor assigns `plan_rev` (§6.1). There are three triggers:
-1. **The PA adds phases or steps:** a `PLAN+` block in the PA's output at any step boundary (the `ADVICE` parser family, `src/team.rs:1989`). The worker thread publishes it as `plan.proposed{kind:"change"}`, and the engine composes it into `plan.revised{reason:"pa_added"}`.
-2. **A member asks, and the PA accepts:** a member publishes `help.requested{kind:"plan_change", steps:[…]}`, and the PA answers `PLAN <help_id>: ACCEPT|DECLINE — <reason>` at its next boundary. Only `ACCEPT` leads to a revision: the worker thread publishes `plan.proposed{kind:"change"}` referencing the `help_id`, and the engine publishes `plan.revised{reason:"member_request"}`.
-3. **Automatic floor raise.** A re-score crosses into a higher band. The engine publishes `path.scored{basis:"diff"}` and then `plan.revised{reason:"floor_raised"}` with the newly-required floor phases.
+1. **The PA adds phases or steps:** a `PLAN+` block in the PA's output at any step boundary (the `ADVICE` parser family, `src/team.rs:1989`). It reaches the actor inside the step's output on `Command::ApplyStepResult` (`src/command.rs:218`, §4.0). The engine publishes `plan.proposed{kind:"change"}` and composes it into `plan.revised{reason:"pa_added"}`.
+2. **A member asks, and the PA accepts:** the supervisor publishes `change.requested{change_id, steps}` (S). The injector renders it to the PA at its next boundary, and the PA answers `PLAN <change_id>: ACCEPT|DECLINE — <reason>`. An `ACCEPT` restates the accepted steps as a `PLAN+` block, so the engine receives them in the step output (`ApplyStepResult`) and **never reads the member's row**. The engine publishes `plan.proposed{kind:"change"}` citing the `change_id`, then `plan.revised{reason:"member_request"}`.
+3. **Automatic floor raise.** The supervisor re-scores the settled diff and sends its own measurement to the actor as `Command::TeamRescored { run_id, ord, attempt, rescore_seq, assessment }` (§4.0). When the band rises, the engine publishes `path.scored{basis:"diff"}` and then `plan.revised{reason:"floor_raised"}` with the newly-required floor phases.
 
 **Re-score trigger and cost bound.** The re-score is `assess` (`src/review_scale.rs:563`) on the settled diff `baseline..T_k`: the same snapshot and `git diff-tree` the monitor batch already takes (DES-001 §4.3–§4.4), so it adds graph reads only.
 - It runs at a tree-changing `checkpoint.reached`, when **all** of these hold: the tree id differs from the last re-score's; at least `RESCORE_MIN_INTERVAL` = 60 s has passed since the attempt's previous re-score; and the attempt's re-scores are under `RESCORE_MAX` = 10.
@@ -592,7 +671,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
 
 - **Members** are the monitors S2 built: read-only ACP sessions on distinct seat instances (`MonitorHost`, `src/team.rs:659-670`), opened lazily at the first due batch (DES-001 §4.1). Their **input** is the stream: the supervisor's cursor (§4.2) feeds each member settled diffs at checkpoints, exactly as DES-001 §4.3–§4.5. It also passes every `advice.answered`, `help.requested` and `council.ruled` since the member's last turn.
 - **Guidance** is `finding.raised`. The DES-001 contract is unchanged: parse, bar, mechanical confirmation at `path:line`, dedup by `finding_id`.
-- **Support** is `help.answered`. The PA asks with one line, `HELP: <question>`; a human-directed question stays with S1 (`AskUserQuestion` → `ElicitationCreated`, `src/event.rs:1145`).
+- **Support** is `help.answered` (S). The PA asks with one line, `HELP: <question>` (`help.requested`, R). Only members answer on the bus. A human-directed question stays with S1 (`AskUserQuestion` → `ElicitationCreated`, `src/event.rs:1145`), so there is no human `help.answered` path.
 - **Work.** A plan step with `owner:"team"` (§8.3; `PhaseDef.owner: StepOwner { Pa, Team }`, `#[serde(default, skip_serializing_if = "StepOwner::is_pa")]`) is carried by `plan_from_def` into `WorkUnit.owner`, the way `role` is carried (`src/plan.rs:155` → `src/domain.rs:451`). The PA pin skips it. The supervisor assigns a member whose seat the step's skills admit, publishes `step.claimed{by:<member>}`, and runs it as a normal unit on that seat: `assigned_cli` is the member, with a **writable** unit session, not the member's read-only monitor session. It then publishes `step.completed{by:<member>}`.
 - **The PA owns it.** A member's step counts only once the PA accepts it:
   - At the PA's next step boundary the member's output is rendered as `[team step — <step_id> by <seat>]` prior context (`src/actor.rs:6601-6620`). The PA answers `STEP <step_id>: ACCEPT — <reason>` or `STEP <step_id>: REJECT <to:member|pa> — <reason>`, which becomes `step.reviewed{verdict, to, reason}`.
@@ -600,7 +679,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
   - `rejected`: the step goes back to the member (`to:member`, a rework attempt with the reason as its amendment, the `rework_amendment` path, `src/actor.rs:6627-6650`) or to the PA (`to:pa`, re-planned onto the PA seat). A member step is rejected at most `MAX_STEP_REWORK` = 2 times before the third rejection goes to the PA.
 - **Evaluator ≠ creator still applies per step.** The engine gate judges the member's step as a unit whose creator is the member (`work_author = assigned_cli`, `src/cli_runner.rs:919`, `:937-942`, `:1020-1025`), with the ledger's authors excluded (DES-001 §6.2). The PA's `step.reviewed` is team evidence, never the gate.
 - **A dispute over a member step uses the council path.** A member may answer a `REJECT` with `HOLD <step_id> — <reason>` in its next turn. That is a concrete dispute, so the supervisor publishes `council.called{trigger:"member_step"}` with the question *"The PA rejected this step; the member holds its output. Should the member's output count as submitted?"* and the two positions.
-  - **YES:** the output counts, and the PA's rejection is recorded as dissent.
+  - **YES:** the output counts, and the PA's rejection is recorded as dissent. The supervisor, having convened the council, sends the verdict to the actor as `Command::TeamStepRuling { run_id, step_id, attempt, verdict }` (§4.0); the engine applies it to the unit.
   - **NO:** the rejection stands.
   - **No verdict:** a human pause, gate kind `team_dispute`, exactly DES-001 §6.7's fail-closed rule.
 
@@ -618,14 +697,14 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
 
 - **Triggers:** DES-001 §6.3's unresolved HIGH (not `accepted`/`withdrawn`/`superseded`, and held by its member), plus §8.8's member-step dispute. Nothing else convenes a council.
 - **The call is a team event.** `council.called` carries the DES-001 §6.3 input verbatim plus `transcript`: the `event_id`s of the exchange, so the council reads what was said. The supervisor then calls `Core::convene_decision` (`src/lib.rs:1286`) with the non-party roster. The ballots' `CouncilConvened`/`CouncilDeliberated`/`CouncilVoted` CoreEvents stay engine telemetry (§4.6).
-- **The ruling is a team event.** The council thread publishes `council.ruled` from the `DecisionVerdict` (`src/decision.rs:292`).
+- **The ruling is a team event.** The supervisor publishes `council.ruled` from the `DecisionVerdict` its `convene_decision` call returned (`src/decision.rs:292`). It is S's own fact: S convened the council.
 - **Three-way, on the record:** the PA's position is `advice.answered` (or `step.reviewed`), the team's is `finding.settled{status:"held"}` (or a member `HOLD`), and the council's is `council.ruled{dissent[]}`. The injector renders the ruling back to the PA at its next boundary.
 - **Continue or pause (as DES-001 §6.7 specifies; not yet built on main: `team_dispute` appears nowhere in `src/`, so T6 builds it):** YES continues autonomously; NO or no verdict produces `team_pause`, which becomes `awaitingHuman{gate_kind:"team_dispute"}` and `gate.opened{kind:"team_dispute"}`.
 
 ### 8.11 The gate consumes the stream (operator step 9)
 
-- **Final pass and fold, on the supervisor.** `step.completed` triggers DES-001 §4.7 steps 1–6. Then `team::fold(&events_of_attempt) -> TeamLedger` (a pure function over the attempt's rows) runs, and the supervisor publishes `gate.opened{kind:"unit_review", ledger, transcript}`.
-- **The worker thread waits, bounded**, with the `bus_request_agent_verdict` loop (`src/cli_runner.rs:417-445`), for at most `FINAL_PASS_BUDGET`. On timeout it synthesizes DES-001 §4.7's fail-closed ledger and publishes `gate.opened{kind:"unit_review", final_pass:"timed_out"}` itself, under the same key.
+- **Final pass and fold, on the supervisor.** `step.completed` triggers DES-001 §4.7 steps 1–6. Then `team::fold(&events_of_attempt) -> TeamLedger` (a pure function over the attempt's rows) runs, and the supervisor publishes `ledger.folded{ledger, transcript}`, an S fact.
+- **The worker thread waits, bounded**, with the `bus_request_agent_verdict` loop (`src/cli_runner.rs:417-445`), for at most `FINAL_PASS_BUDGET`. On timeout it synthesizes DES-001 §4.7's fail-closed ledger itself (`final_pass:"timed_out"`) **without publishing it**, because `ledger.folded` has one owner (S). The snapshot rides `Command::ApplyStepResult` to the actor, which publishes `gate.opened{kind:"unit_review", ledger_ref}` (E) and folds.
 - **Where the snapshot goes:** into `UnitEvidence.team` (`src/workflow.rs:265`). From there it reaches the judge's WORK fence, the evaluator's prior context and the rework amendment, as in DES-001 §6.2. `render_for_gate` also renders a compact transcript (≤16 KB), so reviewers have the outcomes **and** the comms.
 - **A failed step** skips the final pass (`src/cli_runner.rs:876`).
 - **No bus:** the worker builds the snapshot locally with `transport:"none"` (§4.1).
@@ -639,17 +718,17 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
   - the user's ordered selection, with optional per-step instructions;
   - a **presets** dropdown (`GET /api/v1/presets`) and **Save as preset**;
   - the **floor-added** phases, rendered from the engine's floor fill of the draft (`POST /api/v1/plans/preview` → `{steps[], added_by_floor[], band, high_risk}`), marked "added by floor — band 40–69 requires design", and not removable in auto mode;
-  - in manual mode, a disclosed override control if the operator keeps the §8.5 recommendation.
-- **Plan card** on the run page: `plan.proposed` / `plan.revised` / `plan.accepted`, the band, floor-added and late phases, **Edit** and **Stop**.
+  - in manual mode, a disclosed override control (§8.5); in auto mode none.
+- **Plan card** on the run page: `plan.proposed` / `plan.revised` / `plan.accepted`, the band, floor-added and late phases, **Edit** and **Stop**. **Edit** sends the command `POST /api/v1/runs/:id/plan` → `Core::propose_plan` (§4.0).
 - **Plan approval gate:** `SteeringGate` (`studio src/components/SteeringGate.tsx:85`) renders `gate_kind:"plan_approval"` with the plan diff (previous rev → this rev). Approve, approve-with-edit and reject go through `POST /api/v1/runs/:id/gate` (`packages/crew/src/api/routes.ts:2943`).
 - **Unit gate panel:** *Team findings* and *Team comms* from `GET /api/v1/runs/:id/team`. `VerdictDetail` (`studio src/components/VerdictDetail.tsx:90`) shows `final_pass`, the `rejected` counters and `transport`.
 
 ## 9. Authority model
 
 - **Advice never decides.** It is never binding: `combine_verdict` (`src/validator.rs:2263`) reads no team event, and the fold's inputs are byte-identical with and without a team (DES-001 §6.6).
-- **The floor binds everyone.** The floor is engine data: the PA cannot remove it, and neither can a user in auto mode. A manual-mode override is explicit, recorded and approved (§8.5, recommendation).
+- **The floor binds everyone.** The floor is engine data: the PA cannot remove it, and neither can a user in auto mode. A manual-mode override is explicit, recorded and approved at the `plan_approval` gate (§8.5).
 - **Approval is the existing gate.** Plan approval is a `pause_for_human` gate resolved through `confirm_gate`, and nothing but a human (or auto mode below high risk) releases a plan.
-- **Evaluator ≠ creator is per step.** The PA is the run's creator seat, and evaluator ≠ creator is preserved per step by `role` on the catalog entry (never plan-editable) and the fence (`src/distribute.rs:387`), which for team runs never falls back to the creator seat (§8.1, recommendation). **Today** the judge excludes only the work author (`src/cli_runner.rs:919`, `:937-942`, `:1020-1025`); excluding every ledger author (DES-001 §6.2) is not built on main (no `excluded_seats` in `src/cli_runner.rs`) and is built in T5.
+- **Evaluator ≠ creator is per step.** The PA is the run's creator seat, and evaluator ≠ creator is preserved per step by `role` on the catalog entry (never plan-editable) and the fence (`src/distribute.rs:387`), which for team runs never falls back to the creator seat (§8.1). **Today** the judge excludes only the work author (`src/cli_runner.rs:919`, `:937-942`, `:1020-1025`); excluding every ledger author (DES-001 §6.2) is not built on main (no `excluded_seats` in `src/cli_runner.rs`) and is built in T5.
 - **The PA owns a member's step.** It counts only after `step.reviewed{verdict:"accepted"}`, and the gate still judges it with judge ≠ member.
 - **The council's power is narrow.** It rules on one question, and its ruling chooses only between autonomous continue and a human pause (DES-001 §6.7).
 
@@ -730,7 +809,7 @@ Common to every consumer (not repeated per row):
 - The run now publishes `wicked.team.*` events (path, plan, gate) on the bus, and studio renders them.
 - The per-run def id becomes `"<run>:plan-<rev>"`; the launch's `workflow` field on the wire, in `LaunchSpec` (`src/lib.rs:224`) and in the bus payload keeps its name and now names a **preset**.
 - Delivery classification reads the preset's `system` flag (the `is_system` it replaces, `adapter.ts:560`) instead of the def.
-- **Evaluator seat (recommendation, §8.1):** after migration, a consumer launched on a roster with no distinct seat and no usable second instance is **refused** (`NoEligibleSeat`) where today it runs its review/test unit on the creator seat with `creator_seat` disclosed. Where an instance is configured, the unit moves to it (`same_cli_instance`). Each M-seam's contract tests assert this change for its consumer.
+- **Evaluator seat (§8.1):** after migration, a consumer launched on a roster with no distinct seat and no usable second instance is **refused** (`NoEligibleSeat`) where today it runs its review/test unit on the creator seat with `creator_seat` disclosed. Where an instance is configured, the unit moves to it (`same_cli_instance`). Each M-seam's contract tests assert this change for its consumer.
 - **Plan approval** applies per §8.6. A launcher that omits `humanConfirm` is auto and pauses only at high risk. A read-only or tool-only plan has no creator step, so its floor is empty and it never scores high risk.
 
 | Consumer | What changes (gates, floors, seat routing, human_confirm, outputs, events, studio) | What must stay identical (named contract tests) |
@@ -767,16 +846,19 @@ Common to every consumer (not repeated per row):
 | **Migration regressions** | One seam per consumer, a before/after table, and named contract tests. No dual path: the def is deleted in the same seam. | §11.3, §14 |
 | **An approval gate re-running work** | The `plan_approval` arm dispatches only a `Pending` cursor unit and never bumps `attempt`. | §8.6 |
 | **Duplicates** (at-least-once) | Deterministic keys; consumers keyed by entity id. | §4.1, §4.2 |
-| **Bus rows expire** | The `gate.opened` snapshot is persisted on the unit. | §4.4 |
+| **Bus rows expire** | The `ledger.folded` snapshot is persisted on the unit (`UnitEvidence.team`). | §4.4 |
 | **No bus** | A local snapshot with `transport:"none"`, never an in-process fallback. | §4.1 |
 | **Actor stall** | The actor never opens the bus. | §4.1 |
+| **A dropped fact fails open** | Reliable publishing with a bounded retry; a required fact that cannot land pauses the run or disables teaming before team work begins. | §4.1, P1 |
+| **Two components writing one fact / a consumer mutating someone else's state** | §4.0: one owner per fact, commands through the API, and the actor reads no bus row; asserted by the §7 matrix and grep tests (T4 (e), T8 (g)). | §4.0, §7 |
 | **Restart mid-step** | The attempt never survives (orphaned or redriven at attempt+1); team state is persisted on the session; the supervisor replays live runs from `stream_floor` before tailing; a gap past retention pauses for a human (`stream_gap`). | §4.7 |
-| **Evaluator on the creator seat** | Team runs refuse rather than fall back (recommendation); a second usable instance is the only fallback. | §8.1, D1 |
+| **Evaluator on the creator seat** | Team runs refuse rather than fall back; a second signed-in instance is the only fallback. | §8.1, D1 |
 
 ## 13. Where each piece lives
 
 | Piece | Repo | Location |
 |---|---|---|
+| `TeamBus::publish` (team outbox, bounded retry, reusing `wicked_apps_core::emit`'s spool pattern), `TeamPublisher` acknowledgements, `Core::replay_team_outbox` | core | new `src/team/bus.rs`; the pattern at `crates/wicked-apps-core/src/emit.rs:453-470`, `:614` |
 | `TeamPublisher` thread; actor-side `path.started`, `plan.accepted`, `plan.revised`, `gate.opened`/`gate.decided` (plan approval), `path.ended` | core | new `src/team/bus.rs`; hooks at launch admission, `apply_step_result` (`src/actor.rs:4269`), `pause_for_human` (`:6022`), `confirm_gate` (`:7736`), terminal paths |
 | Event types, payloads, keys, `fold(events) -> TeamLedger` | core | `src/team/events.rs` (pure) |
 | Catalog (12 `PhaseDef` entries), built-in presets, `plan::compose`, floor fill | core | new `src/catalog.rs`; `src/plan.rs` (beside `plan_from_def`, `:94`) |
@@ -788,7 +870,7 @@ Common to every consumer (not repeated per row):
 | Supervisor on the bus; member steps; council calls | core | `src/team.rs` |
 | Worker-thread seam: `step.claimed`/`step.completed`, boundary injector, gate wait | core | `src/cli_runner.rs:748-766` |
 | ACP carrier: `checkpoint.reached`, steer from the bus | core | `src/acp_runner.rs:4440`, `:4903`, `:8128` |
-| Bus handoff at boot; `teamEvent` relay; `GET /runs/:id/team`; `GET /catalog`; `GET/PUT/DELETE /presets`; `POST /plans/preview`; `POST /runs {plan, preset}`; api-types | crew | `packages/crew/src/cli/index.ts:99-137`, `core/adapter.ts:1183-1191`; new `packages/crew/src/team/ws-relay.ts`; `api/routes.ts`; `packages/crew-api-types/index.d.ts` |
+| Bus handoff at boot; `teamEvent` relay; `GET /runs/:id/team`; `GET /catalog`; `GET/PUT/DELETE /presets`; `POST /plans/preview`; the commands `POST /runs {plan, workflow}` and `POST /runs/:id/plan` (→ `Core::propose_plan`); api-types. Crew publishes no team fact (§4.0) | crew | `packages/crew/src/cli/index.ts:99-137`, `core/adapter.ts:1183-1191`; new `packages/crew/src/team/ws-relay.ts`; `api/routes.ts`; `packages/crew-api-types/index.d.ts` |
 | Phase picker, preset dropdown, plan card, plan approval gate, team panels | studio | `ChatInput.tsx` (new `PhasePicker`), `SteeringGate.tsx:85`, `VerdictDetail.tsx:90`, `NarratorFeed.tsx`, `store/runtime.ts:219` |
 
 ## 14. Build order: disjoint seams, each buildable by one agent
@@ -799,10 +881,10 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 *Accept:* (a) with no flags, the engine's `WICKED_BUS_DB` equals `resolveCrewBus(...).dbPath`; (b) `--engine-exec` mediates over the same file; (c) `--bus-db X` wins for both; (d) a bus that cannot open logs one line and the daemon serves un-teamed.
 
 **T1 — Wire contract (core).** `src/team/events.rs`: all event types, payloads, key builders (the §4.1 algorithm and vectors), `fold`; catalog annotations; api-types.
-*Accept:* (a) every type is four segments; (b) value-compared round-trip fixtures; (c) `fold` reproduces DES-001's acceptance fixtures (#8, #11, #15, #16 a–k); (d) `fold` is idempotent under duplicates; (e) the §4.1 test vectors match `crate::bus::deterministic_key` and the crew JS helper; (f) `gen_event_catalog.py --check` is green; (g) **the §6.1 identity rule, table-driven over all 23 types:**
+*Accept:* (a) every type is four segments; (b) value-compared round-trip fixtures; (c) `fold` reproduces DES-001's acceptance fixtures (#8, #11, #15, #16 a–k); (d) `fold` is idempotent under duplicates; (e) the §4.1 test vectors match `crate::bus::deterministic_key` and the crew JS helper; (f) `gen_event_catalog.py --check` is green; (g) **the §6.1 identity rule, table-driven over all 25 types:**
   - for every type, two distinct logical requests identical in every content field and differing only in the producer-assigned part (`help_seq`, `raise_seq`, `open_seq`, `delivery_id`, `answer_id`, `plan_block_seq`, `rescore_seq`, `gate_seq`, attempt) produce **two** rows with distinct `event_id`s;
   - a re-publish of the same logical request produces **one**;
-  - named fixture: two `HELP:` lines in one output with the same question and different context yield two `help.requested` rows; two member `plan_change` requests with the same question and different steps yield two;
+  - named fixture: two `HELP:` lines in one output with the same question and different context yield two `help.requested` rows; two member `change.requested` rows with the same text and different steps yield two;
   - a grep test fails the build if a key builder in `src/team/events.rs` takes a payload text field (question, claim, evidence, reason, context).
 
 **C1 — Phase catalog + compose (core).** `src/catalog.rs` (12 entries, §8.3/§11.2), `PhaseDef.owner`/`WorkUnit.owner`, `plan::compose` with the step rules, and the evidence-floor pin moved onto the entries.
@@ -811,10 +893,17 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 **C2 — Presets (core + crew).** `src/preset.rs` rows, the built-in seeding, `Core::{put,delete,list}_preset`, crew routes, and `launch_run` resolving `workflow` as a preset name.
 *Accept:* (a) a built-in preset named `feature` launches the same unit list C1(a) fixed; (b) `PUT /presets/my-flow` then `POST /runs {workflow:"my-flow"}` launches that selection (**preset launch**); (c) a project-scoped preset shadows a built-in only for that project; (d) a built-in cannot be deleted; (e) a bus `wicked.crew.run.requested {workflow:"my-flow"}` and a campaign node naming it both launch it with no crew involvement in resolution; (f) presets survive a daemon restart.
 
+**P1 — Reliable publishing (core).** `TeamBus::publish` with the team outbox (the `wicked_apps_core::emit` spool pattern), bounded retry, the `TeamPublisher` acknowledgements, the required-transition gates, and `Core::replay_team_outbox`.
+*Accept:*
+- (a) with the bus db made unwritable for 10 s, every team event lands in `team-outbox.ndjson` with a `DEADLETTER_MARKER` line on stderr, and is published once the bus returns (one row each: replay dedups);
+- (b) unwritable past the 31 s bound: a failing `path.started` makes the run proceed with `transport:"none"` **before** its first unit dispatches, with `teamTransportDisabled` on the fan-out and in every snapshot; a failing `plan.accepted` pauses the run `team_transport` **before** the plan's first unit dispatches; a failing `gate.decided` keeps the run paused `team_transport` (no `Resumed`, no dispatch);
+- (c) the actor thread never blocks on a publish (a test holds the bus lock for 60 s while the actor keeps answering `subscribe`);
+- (d) `Core::replay_team_outbox` replays the leftover lines idempotently: a line replayed twice lands once.
+
 **T2 — Floor table + floor fill (core).** `THRESHOLDS.floors` and the high-risk rule; `signals_from_paths`; floor fill with `added_by:"floor"`; the empty floor for a plan with no creator step.
 *Accept:* (a) for scores 10/30/50/80 and for a destructive signal at a score of 10 (with the destructive floor tuned to 0 in the fixture), the floor and `high_risk` equal §8.5's table; (b) **a user plan below the floor gets the floor phases added**, each marked `added_by:"floor"` with its `floor_reason`, and `plan.accepted.steps` shows them; (c) a user plan that already contains the floor is unchanged; (d) a read-only plan (`understand` only) and a tool-only plan have an empty floor; (e) no graph means score 100, so the band 70–100 floor applies; **(g) an auto-mode `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch` omitted, and again with `touch:[]`, scores 100 with reason `"no declared scope"`, gets the 70–100 floor, and pauses `plan_approval` (high risk) before `build` dispatches. The same launch with `touch:["src/x.rs"]` scores from the graph. A read-only plan (`understand` only) with `touch` omitted scores 0 and does not pause;** (f) the table is the only place the values live (a grep test for literal band numbers outside `THRESHOLDS`).
 
-**D1 — Team-run evaluator distinctness (core; coordinator recommendation, §8.1).** For a team run, `creator_seat` is never used.
+**D1 — Team-run evaluator distinctness (core; operator decision, §8.1).** For a team run, `creator_seat` is never used.
 *Accept:*
 - (a) a team run on a one-seat roster `[claude]` whose launch also lists a usable `claude#2` puts its review/test units on `claude#2` with `distinctnessFallback:"same_cli_instance"`;
 - (b) the same roster without `claude#2`, bench-free, is refused `NoEligibleSeat` naming the units;
@@ -840,11 +929,11 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 - (b) **revision into high risk:** in auto mode, a re-score into band 70–100 (or a destructive signal) pauses `plan_approval`; a revision in auto mode that stays below high risk does not pause; in manual mode every revision pauses;
 - (c) a floor phase whose catalog position precedes a done step is inserted at the cursor with `late:true`, and no done unit is re-dispatched (no `unitDispatched` for any done ord after the revision);
 - (d) **a PA revision on a user plan:** a user-composed plan plus a PA `PLAN+` block produces `plan.proposed{kind:"change", by:<PA>}` and then the engine's `plan.revised{reason:"pa_added"}`. The user's steps are all still present, in order. Two concurrent proposals against the same `base_rev` (a PA `PLAN+` and a human edit) produce two distinct `plan.proposed` rows (distinct `proposal_id`) and two successive revisions; neither is dropped;
-- (e) a member `help.requested{kind:"plan_change"}` produces a revision only after the PA's `PLAN … ACCEPT`;
+- (e) a member `change.requested` produces a revision only after the PA's `PLAN <change_id>: ACCEPT` plus its `PLAN+` block arrive in `ApplyStepResult`. A test asserts the actor holds no bus connection and never calls `BusDb::poll`;
 - (f) a 30-checkpoint burst in 60 s with one tree change produces at most one re-score; the attempt's re-scores never exceed 11.
 
 **T5 — Worker-thread seam (core).** `step.claimed`/`step.completed`; the boundary injector (`outcome:"injected"` dedup on any channel); the gate wait with its fail-closed timeout; the `UnitEvidence.team` snapshot; the transcript render; judge exclusion of ledger authors.
-*Accept:* (a) `step.claimed` has a lower `event_id` than every `checkpoint.reached` of the attempt (in-process **and** bus-worker path, `src/cli_runner.rs:1976-2018`); (b) a wrapped unit with an undelivered HIGH on the stream receives a `[team advice]` prior-context block on its next step and one `advice.delivered{channel:"boundary", outcome:"injected"}` row **per rendered finding** (a block that renders three findings publishes three rows with distinct keys); a second step does **not** render it again (an `injected` row exists), whether it was answered or not, and the same holds for a finding already `injected` over `acp_steering`; a finding whose only row is `outcome:"turn_ended"`, `"refused"` or `"not_delivered"` **is** rendered at the next boundary; (c) with no `gate.opened` within a shortened `FINAL_PASS_BUDGET`, the worker publishes `gate.opened{final_pass:"timed_out"}` with the synthesized holds and the unit pauses `team_dispute`; a late supervisor `gate.opened` dedups to the same row; (d) the judge prompt contains the ledger and the transcript inside the WORK fence; DES-001 acceptance #14 (a)–(e) hold with `excluded_seats` from the folded ledger; (e) under `spawn_with_engine` with no bus, the unit produces no team rows and `UnitEvidence.team` holds the local snapshot with `transport:"none"` and an empty ledger.
+*Accept:* (a) `step.claimed` has a lower `event_id` than every `checkpoint.reached` of the attempt (in-process **and** bus-worker path, `src/cli_runner.rs:1976-2018`); (b) a wrapped unit with an undelivered HIGH on the stream receives a `[team advice]` prior-context block on its next step and one `advice.delivered{channel:"boundary", outcome:"injected"}` row **per rendered finding** (a block that renders three findings publishes three rows with distinct keys); a second step does **not** render it again (an `injected` row exists), whether it was answered or not, and the same holds for a finding already `injected` over `acp_steering`; a finding whose only row is `outcome:"turn_ended"`, `"refused"` or `"not_delivered"` **is** rendered at the next boundary; (c) with no `ledger.folded` within a shortened `FINAL_PASS_BUDGET`, the worker synthesizes the `final_pass:"timed_out"` snapshot itself **without publishing it**; the engine publishes `gate.opened{kind:"unit_review"}` and the unit pauses `team_dispute`; a late supervisor `ledger.folded` is published by S alone and changes nothing already decided; (d) the judge prompt contains the ledger and the transcript inside the WORK fence; DES-001 acceptance #14 (a)–(e) hold with `excluded_seats` from the folded ledger; (e) under `spawn_with_engine` with no bus, the unit produces no team rows and `UnitEvidence.team` holds the local snapshot with `transport:"none"` and an empty ledger.
 
 **T6 — Supervisor on the bus + member steps (core).** Re-homes #609 onto a cursor; deletes `TeamCmd`/`TeamHandle`/`team_finish`/the hold buffer/the S2 CoreEvents; member steps; council calls.
 *Accept:*
@@ -865,8 +954,15 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 **T7 — ACP carrier (core).** `checkpoint.reached`; the steer sourced from the bus; `advice.delivered{acp_steering}`.
 *Accept:* DES-001 S3 acceptance #7–#12 with rows instead of mailbox state: (a) a HIGH row published before a terminal `tool_call_update` produces exactly one `_session/steering` with `idleBehavior:"promptRequired"` and one `advice.delivered{outcome:"injected"}` row per carried finding, sharing one `steer_id`; (b) `promptRequired` ⇒ `turn_ended`, and the boundary injector delivers it on the next step; (c) a non-advertising bridge receives no steer and the finding is `channel:"none"`; (d) a MEDIUM row is never steered; (e) a row for attempt 1 never reaches attempt 2; (f) a finding delivered mid-turn is not re-rendered at the boundary.
 
-**T8 — Crew surface.** `teamEvent` relay; `GET /runs/:id/team`; `GET /catalog`; `POST /plans/preview`; `POST /runs {plan}`; human-side publishes.
-*Accept:* (a) every `wicked.team.*` row on the bus arrives on `/ws` as `{type:"teamEvent", event}` within the poll interval, tagged `project_id` when filed; (b) the read route returns the attempt's rows ordered by `event_id` with the folded ledger, `units: []` for an un-teamed run, and the persisted snapshot when the bus has no rows (fixture: rows deleted); (c) a plan edit publishes `plan.proposed{by:"human"}` with the deterministic key and a repeat POST publishes no second row; (d) approving a `team_dispute` gate publishes `gate.decided{by:"human"}` and `resumed` follows as DES-001 §6.7 (approve never re-dispatches); plus: (e) `POST /plans/preview` returns the same floor fill T2 computes; (f) `POST /runs {plan:{steps}}` publishes `plan.proposed{by:"human"}` before the first unit dispatches.
+**T8 — Crew surface (commands only, §4.0).** `teamEvent` relay; `GET /runs/:id/team`; `GET /catalog`; `POST /plans/preview`; the commands `POST /runs {plan, workflow}`, `POST /runs/:id/plan` and `POST /runs/:id/gate`. Crew publishes **no** `wicked.team.*` row.
+*Accept:*
+- (a) every `wicked.team.*` row on the bus arrives on `/ws` as `{type:"teamEvent", event}` within the poll interval, tagged `project_id` when filed;
+- (b) the read route returns the attempt's rows ordered by `event_id` with the folded ledger, `units: []` for an un-teamed run, and the persisted snapshot when the bus has no rows (fixture: rows deleted);
+- (c) `POST /runs/:id/plan` calls `Core::propose_plan`. The **engine** then publishes `plan.proposed{by:"human"}`, and a repeat POST with the same request id publishes no second row;
+- (d) approving a `team_dispute` gate calls `confirm_gate`; the **engine** publishes `gate.decided{by:"human"}` and `resumed` follows as DES-001 §6.7 (approve never re-dispatches);
+- (e) `POST /plans/preview` returns the same floor fill T2 computes;
+- (f) `POST /runs {plan:{steps}}` makes the **engine** publish `plan.proposed{by:"human"}` before the first unit dispatches;
+- (g) a grep test fails the build if crew source calls `bus.emit` with a `wicked.team.` type.
 
 **T9 — Studio (later seam, after T8).** Phase picker, presets dropdown and save, floor-added markers, plan card, plan approval gate, team panels, launch seat picker.
 *Accept:* (a) picking `build` alone for a repo change that previews at band 40–69 shows `test_plan`, `design` and `review` added by floor, and in auto mode they cannot be removed; (b) saving a preset and relaunching it reproduces the selection; (c) the plan approval gate shows the plan diff and approves through `POST /runs/:id/gate`; (d) a run with one HIGH finding, a decline, a hold and a council NO shows, in order, the finding, the delivery, the answer, the hold, the call and the ruling in the feed, and the gate panel groups them under the finding with the human's approve/reject still going through `POST /runs/:id/gate`; (e) a late-joining tab renders the same list from the read route; (f) an un-teamed run shows `transport: none`, not an empty "clean" team; (g) Playwright at 1440×700, via the studio UI, not the API. Test with Playwright at 1440×700, through the UI.
@@ -896,14 +992,14 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 
 | DES-001 clause | Status under DES-002 | Replacement |
 |---|---|---|
-| §3 "A per-daemon TeamSupervisor subscribes to the engine's event fan-out … emitted as `teamLedger`" | superseded | §3; the supervisor holds a bus cursor; `gate.opened{kind:"unit_review"}` |
+| §3 "A per-daemon TeamSupervisor subscribes to the engine's event fan-out … emitted as `teamLedger`" | superseded | §3; the supervisor holds a bus cursor; `ledger.folded` (S) and `gate.opened{kind:"unit_review"}` (E) |
 | §4.2 "Source: engine CoreEvents in-process"; "The one event it consumes: `unitCheckpoint`"; "Attach, finish and context … travel on a direct `TeamCmd` channel" | superseded | §4.2, §6 #7/#8/#14, §10 |
-| §4.7 "Owner: the shared worker-thread seam … `team::finish` … process-wide handle … `TeamCmd::Finish`" | superseded | §8.11: `step.completed` plus a bounded wait for `gate.opened`; the timeout synthesis is kept |
+| §4.7 "Owner: the shared worker-thread seam … `team::finish` … process-wide handle … `TeamCmd::Finish`" | superseded | §8.11: `step.completed` plus a bounded wait for `ledger.folded`; the timeout synthesis is kept |
 | §4.7 step 4 "(S3) Parse the worker's `ADVICE` lines → `workerAdviceResponse`" | transport superseded | `advice.answered`; the parser stays |
 | §5.2 "Mailbox … written by the supervisor … drain all of it" | superseded | §8.9: the source is a bus poll; the delivery point and the request are unchanged |
 | §5.1 rows "ACP, adapter does not advertise it … gate only" and "Wrapped non-claude … Gate only" | superseded | §8.9: every carrier gets advice at its next step boundary |
 | §5.3 "Teaming does not route a worker's question to a monitor" | narrowed | §8.8: `HELP:` goes to the team; `AskUserQuestion` still goes to a human |
-| §6.1 "emitted once as `teamLedger` … before `GateEvaluated`" | superseded | `gate.opened{kind:"unit_review"}`; the CoreEvent order is unchanged |
+| §6.1 "emitted once as `teamLedger` … before `GateEvaluated`" | superseded | `ledger.folded` (S) then `gate.opened{kind:"unit_review"}` (E); the CoreEvent order is unchanged |
 | §6.4 route shape | extended | adds `transcript` and the snapshot fallback |
 | §6.5 live-feed CoreEvents | superseded | `teamEvent` frames |
 | §7 (six `CoreEvent` variants) | superseded | §6 |
@@ -915,7 +1011,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 
 ## 16. Open questions (not blocking the build)
 
-- **Q1. The operator inject bar** (`InjectWorkerMessage`, `src/actor.rs:2557`) is the one remaining prompt-side channel that is not a team event. Folding it into `help.answered{by:"human"}` is deferred: it has its own event (`workerMessageInjected`, `src/event.rs:1045`) and its own consumers.
+- **Q1. The operator inject bar** (`InjectWorkerMessage`, `src/actor.rs:2557`) stays what it is: an API **command** to the engine, delivered on the next matching unit's prompt, with its own telemetry (`workerMessageInjected`, `src/event.rs:1045`). Under §4.0 it could never become a team fact published by crew. If it is ever surfaced on the team stream, it will be as an engine-owned fact published after the engine accepts the command.
 - **Q2. Bus retention for evidence.** The snapshot covers the gate. Keeping raw transcripts past the TTL would be a wicked-bus feature (`retention: forever` exists only in `DESIGN-v2.md:97`).
 - **Q3. SPEC filter text vs code.** `reqs/SPEC.md:700-727` documents single-level `.*` only, but the code and three crew consumers use `prefix.**`. SPEC should match the code.
 - **Q4. Member seat diversity.** Unchanged from DES-001 §13 Q2: only claude is ACP-admitted.
@@ -928,7 +1024,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 
 | Claim | Where | What the code does | Fix |
 |---|---|---|---|
-| The fence refuses `NoEligibleSeat` "when none exists, exactly as today" | §8.1 | A bench-free roster keeps review on the creator seat, disclosed as `creator_seat` (`src/distribute.rs:286-290`, `:417-426`); refusal only when a bench caused it (`:388-409`) | Rewritten; team-run rule as a coordinator recommendation; seam D1 |
+| The fence refuses `NoEligibleSeat` "when none exists, exactly as today" | §8.1 | A bench-free roster keeps review on the creator seat, disclosed as `creator_seat` (`src/distribute.rs:286-290`, `:417-426`); refusal only when a bench caused it (`:388-409`) | Rewritten; team-run rule (operator-confirmed); seam D1 |
 | "The judge excludes every party" | §9 | Only the work author is excluded today (`src/cli_runner.rs:919`, `:937-942`, `:1020-1025`); no `excluded_seats` exists | Stated as today vs built in T5 |
 | "Continue or pause (DES-001 §6.7, unchanged)" | §8.10 | `team_dispute` appears nowhere in `src/`; DES-001's S6 is not built | Stated as specified-not-built; T6 builds it |
 | The team-dispute re-open argument cited `src/actor.rs:7736` | §6.1 | The refuse-before-resolve rule is at `src/actor.rs:7758` | Cite corrected |
