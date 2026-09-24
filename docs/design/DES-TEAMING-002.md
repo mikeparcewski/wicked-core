@@ -1,7 +1,17 @@
 # DES-TEAMING-002 — The team model on the bus: one transport, one grammar, one phase catalog
 
-- **Status:** DRAFT (rev 8). **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
+- **Status:** DRAFT (rev 9). **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
 - **Date:** 2026-09-23
+- **Rev 9 (2026-09-24):** review on #612 at `522a804` (1 HIGH, 1 MEDIUM, both verified in the rev-7 reliability section).
+  1. A failed `path.started` left its outbox line behind, so a later replay could arm team state for a run on `transport:"none"`. The **supersede rule** fixes it: an irreversible fallback writes an outbox tombstone before it is acknowledged, and replay and drain skip superseded lines. No event type is added.
+  2. `gate.opened.ledger_ref` dangled for a synthesized or no-bus snapshot. It is now `null` with `ledger_source`, and consumers read `UnitEvidence.team`. The "before the fold" wording now names `apply_step_result` → `GateEvaluated`.
+
+  A sweep of the class adds §4.8, twelve failure and fallback paths each tabulated with (a) persisted, (b) on the bus, (c) references and (d) replay. It found three more gaps, now fixed:
+  - one owner's facts could be reordered on replay (`gate.decided` before `gate.opened`): the fix is a per-publisher, per-run FIFO;
+  - a published-then-retention-deleted fact could re-publish from an old line: the fix is outbox compaction;
+  - a late S fold could publish a ledger the gate never used: the fix is a deadline tombstone plus the "`ledger_ref` is authoritative" rule.
+
+  P1 gains acceptance (e)–(i).
 - **Rev 8 (2026-09-24):** review on #612 at `369fc50` (2 MEDIUM, both leftovers, verified).
   1. The `advice.delivered` example still named the supervisor's sweep and `delivery_id "sweep"`. It is now R-only with `"end:<attempt>"`.
   2. `step.completed.status` now lists all five spellings `status_to_str` emits (`src/cli_runner.rs:285-296`; `StepStatus`, `src/workflow.rs:175-196`).
@@ -141,6 +151,14 @@ A command carries the sender's own result, never a relayed bus row. **The actor 
 - **Publishing is reliable, reusing the engine's durable emit-outbox pattern.** Every publisher (E through the `TeamPublisher`, S, R) calls one wrapper, `TeamBus::publish`.
   - **The pattern it reuses** is `wicked_apps_core::emit`'s: a failed write is spooled as one NDJSON line to an outbox with a loud `DEADLETTER_MARKER` on stderr (`crates/wicked-apps-core/src/emit.rs:12-16`, `:453-470`). The record is the envelope plus `deadletter_reason`, `ts` and `pid` (`:90-105`). It can be replayed idempotently (`replay_outbox`, `:614`; napi `replay_emit_outbox`, `crates/wicked-core-ts/src/lib.rs:774-790`; crew CLI `wicked-crew governance replay`, `packages/crew/src/cli/governance.ts:2`).
   - **Outbox and retry:** the team outbox is `<state home>/team-outbox.ndjson`. `TeamBus::publish` retries a failed emit from the outbox on a **bounded** schedule: 5 attempts at 1, 2, 4, 8 and 16 s, about 31 s in all. A retry can never double-publish, because the key is deterministic (§6.1) and `BusDb::emit` resolves a duplicate to the existing row (`src/bus.rs:316-342`). Past the bound, the line stays in the outbox for `Core::replay_team_outbox`, the same shape as `replay_emit_outbox`.
+  - **Order: one FIFO per publisher and run.** Each owner drains its own outbox lines for a run **in emit order**, and a later fact of that run waits behind an earlier unpublished one. So E's `gate.decided` can never land before E's `gate.opened`, and no replay reorders one owner's facts. Order across owners is the bus's `event_id`, as always (§4.3).
+  - **Compaction:** a line is removed from the outbox once it is published, or once it is superseded (next rule). An old line therefore cannot re-publish a fact whose bus row was already written and later deleted by retention.
+  - **The supersede rule (tombstone).** When a publish failure triggers an **irreversible fallback**, the publisher appends a **tombstone** to the outbox in the same step, *before* it acknowledges the fallback to the actor. Irreversible fallbacks are: the run on `transport:"none"`, an attempt on `transport:"none"`, a `team_transport` pause resolved as continue-without-team or cancel, and a fold past its deadline. Two tombstone forms:
+    - `{"superseded":"<idempotency key>","reason":…}` for one fact;
+    - `{"superseded_run":"<run>","from_event":"<type>","reason":…}` for every later line of that run from that owner.
+
+    `replay_team_outbox` and the live drain skip every superseded line and compact it. No event type is added: the tombstone lives only in the outbox, the bus never sees it, and the fallback itself is disclosed through the persisted state and the engine fan-out.
+  - **Crash between tombstone and store write:** the tombstone is written first, then the actor persists the fallback. On boot, a team run with no acknowledged `path.started` (`AgentSession.team.stream_floor` unset) is set to `transport:"none"`, so the store and the tombstoned outbox agree. The reverse order cannot happen.
   - **Acknowledgements:** the `TeamPublisher` acknowledges each engine event to the actor through `Command::TeamPublished { token }` or `Command::TeamTransportFailed { token, reason }`. The actor defers the dependent step until then and never blocks.
 - **Required transitions never continue silently.** Four engine facts are *required*:
 
@@ -151,7 +169,16 @@ A command carries the sender's own result, never a relayed bus row. **The actor 
   | `gate.opened` | — (the pause itself is already durable in the store, `src/actor.rs:6036-6046`) | the pause stands, answerable as usual; its `awaitingHuman` prompt names the missing fact |
   | `gate.decided` | emitting `Resumed` and dispatching | the run stays paused with `gate_kind:"team_transport"` |
 
-  S and R facts past the bound are spooled and disclosed. A missing `ledger.folded` reaches the gate wait's fail-closed timeout, which pauses (§8.11). A missing `step.claimed` makes that attempt un-teamed, with `transport:"none"` in its snapshot, before its turn starts.
+  S and R facts past the bound are spooled and disclosed:
+  - **A missing `ledger.folded`** reaches the gate wait's fail-closed timeout, which pauses (§8.11). S's spooled line is tombstoned when the fold's deadline passes, so a late replay never publishes a ledger the gate did not use.
+  - **A missing `step.claimed`** makes that attempt un-teamed, with `transport:"none"` in its snapshot, before its turn starts. The attempt's pending R lines are tombstoned from `step.claimed` on.
+
+  **A `team_transport` pause has three answers**, through `confirm_gate` (§4.0):
+  - **approve:** retry the pending fact, one more bounded round; still failing means still paused;
+  - **approve with amend `"continue without team"`:** `transport:"none"` from this point, and the run's pending lines are tombstoned;
+  - **reject:** cancel. Pending lines are tombstoned, and `path.ended` is spooled normally so a later drain lets consumers forget the run.
+
+  Every failure and fallback path, with what is persisted, what is on the bus, what references point at and what a replay does, is tabulated in §4.8.
 - **Idempotency key.** Every team event pins `deterministic_key(&["team", <event_type>, <run_id>, <entity ids…>])` (`src/bus.rs:545`), so a re-publish after a retry, a restart or a duplicate delivery resolves to the existing row (`:319-345`). The key parts per event are in §6. **The algorithm, exactly as `deterministic_key` computes it (`src/bus.rs:545-553`):** SHA-256 over the concatenation, for **every** part in order, of the part's UTF-8 bytes followed by one `0x00` byte (so the last part is NUL-terminated too; this is not a `\0`-join); keep the first **16** bytes of the digest; encode each as two **lowercase** hex digits (`{:02x}`), giving a 32-character key. Crew's JS publishers (§7) must reproduce it byte for byte: `const h = createHash('sha256'); for (const p of parts) { h.update(Buffer.from(p, 'utf8')); h.update(Buffer.from([0])); } key = h.digest().subarray(0, 16).toString('hex');`.
   - **Test vector.** parts `["team", "wicked.team.finding.raised", "run-1", "f-3fa9c2e1d0b4a7e6"]` → `f8289d402fc42823fd875fcf4456bd8f`. parts `["team", "wicked.team.path.started", "run-1"]` → `25ea4932f42b6e22f1aacd16bc3dcdd9`. A `\0`-join **without** the trailing NUL gives `fed61d5909428bb7aec506ad09dc86d1` for the first vector, which is wrong, and that mismatch is the failure the vector exists to catch. The values were computed by a byte-for-byte transcription of `deterministic_key` (no build was run for this draft). T1 pins them in a Rust unit test against `crate::bus::deterministic_key`, and in a crew test against the JS helper, so the two implementations cannot drift.
 - **One db.** The engine needs a bus path whether or not exec mediation is on. Crew hands the engine **its own cross-product bus** (the sidecar `resolveCrewBus` already resolves, `cli/index.ts:129-137`) as `WICKED_BUS_DB` on every boot, not only under `--engine-exec` (`adapter.ts:1183-1191`). Exec mediation keeps its `WICKED_BUS_EXEC` switch; it now mediates over the same file. A daemon with no usable bus runs **un-teamed and says so**: nothing can be published, so the worker thread builds the unit's snapshot locally (not published) with `transport:"none"`, an empty ledger and an empty transcript, and the gate renders it as un-teamed (§8.11). It never silently falls back to an in-process channel.
@@ -208,11 +235,30 @@ Retention bounds the replay:
 - The bus deletes rows 24 h after emission (`dedup_expires_at`; `reqs/SPEC.md:804-818`).
 - An attempt lasts at most `WICKED_UNIT_TIMEOUT_SECS` (default 7200 s; `src/acp_runner.rs:5911-5914`, `src/execute_wrapped.rs:1185-1189`), so every row of the attempt that died is inside the window.
 - A run that has been live longer than 24 h (e.g. paused at a gate for days) can have lost older rows. What those rows fed is already durable: the plan in `AgentSession.team`, each finished attempt's ledger in its unit's `ledger.folded` snapshot (`UnitEvidence.team`, §4.4).
-- When `path.started` itself is gone, the supervisor logs one `stream_gap` line per run and carries nothing from before the gap. The gate of any unit whose attempt rows are missing gets `final_pass:"stream_gap"` and `team_pause:true`: an incomplete team record goes to a human, never auto-approved.
+- When `path.started` itself is gone, the supervisor logs one `stream_gap` line per run and carries nothing from before the gap. For any unit whose attempt rows are missing, S publishes `ledger.folded{final_pass:"stream_gap", team_pause:true}` from what it could rebuild, and the gate opens on that row: an incomplete team record goes to a human, never auto-approved.
 
 **Cost:** one live-tier scan at spawn, bounded by 24 h of rows.
 
-## 5. Grammar and envelope
+### 4.8 Failure and fallback paths: what is persisted, on the bus, referenced and replayed
+
+The rule every row obeys: **nothing on the bus references a fact that is not there, and no replay publishes a fact the run has already moved past.** A missing referent is only legitimate when retention deleted it, and consumers treat that as "aged out", not as an error.
+
+| # | Path | (a) Persisted (core store) | (b) On the bus | (c) References | (d) A later replay / drain |
+|---|---|---|---|---|---|
+| 1 | `path.started` fails past the bound | `AgentSession.team.transport = "none"` + reason, written after the tombstone; every unit's `UnitEvidence.team` snapshot says `transport:"none"` | nothing for the run, ever (no other team fact is generated for a `transport:"none"` run) | none: no team rows exist to reference | `superseded_run` tombstone ⇒ **publishes nothing** for the run (P1 (e)) |
+| 2 | `plan.accepted` fails past the bound | the plan rev in `AgentSession.team.plan`; the `team_transport` pause (session + open interaction row, `src/actor.rs:6036-6046`) | the run's earlier facts; not `plan.accepted`, nor anything E queued after it (FIFO) | `plan.proposed` exists and is referenced by nothing unpublished | approve: the queued lines publish in order. Continue without team: tombstone ⇒ nothing more, plus row 1's state. Reject: tombstone, then only `path.ended` |
+| 3 | `gate.opened` fails past the bound | the pause, durable as every pause | not `gate.opened`, nor E's later facts (FIFO) | `gate.decided` cannot land first (FIFO), so it never dangles | lands in order when the bus returns; a gate answered meanwhile makes `gate.decided` required (row 4) |
+| 4 | `gate.decided` fails past the bound | the decision in the resolved interaction row; the run stays paused `team_transport` | `gate.opened` but not its decision | nothing references the missing decision (`Resumed` and the dispatch wait for it) | as row 2 |
+| 5 | `step.claimed` fails (R) | the attempt's snapshot with `transport:"none"` | nothing from R for that attempt | none | attempt tombstone ⇒ nothing for that attempt |
+| 6 | Bus absent at boot | `transport:"none"` on every run launched without a bus; snapshots built locally, `ledger_source:"no_bus"` | nothing | `gate.opened` is not published (no bus); the unit's gate reads `UnitEvidence.team` | nothing: no lines are generated or spooled without a bus |
+| 7 | Final-pass timeout (worker synthesizes) | `UnitEvidence.team` = the synthesized fail-closed ledger | `gate.opened{ledger_ref:null, ledger_source:"synthesized"}`; no `ledger.folded` for the attempt, or an `unused` one if S published just before its deadline | `ledger_ref` null ⇒ consumers read `UnitEvidence.team` | S's spooled fold line is tombstoned at its deadline ⇒ never published late |
+| 8 | Rows deleted by the 24 h retention | `AgentSession.team`; every `UnitEvidence.team` snapshot | recent rows only | `re`/`ledger_ref` to a deleted row = aged out: the read route falls back to the persisted snapshot (§6.4 of DES-001; T8 (b)) | compaction removes published lines, so an old line cannot re-publish a deleted row's fact |
+| 9 | Supervisor / daemon restart mid-step | `AgentSession.team`; the dead attempt's snapshot is never written (the attempt never folded) | the dead attempt's rows (within retention) | the redriven attempt n+1 references attempt n's findings as `carried_from_attempt` (rows that exist, or their persisted copy) | S's replay rebuilds state from `stream_floor`; the outbox drains in order; nothing is re-published twice (keys) |
+| 10 | Restart with the stream gone (`path.started` aged out) | as 9 | nothing for the gap | `ledger.folded{final_pass:"stream_gap"}` references only rows it could read | nothing to replay for the gap; the gate pauses (team_pause) |
+| 11 | Council with no verdict | `dispute:{verdict:"no_verdict", reason}` in the ledger; the `team_dispute` pause | `council.called`, `council.ruled{verdict:"no_verdict"}`, `ledger.folded`, `gate.opened{kind:"team_dispute"}` | all present | nothing special: normal FIFO drain if any failed |
+| 12 | Crash between a tombstone and the store write | the store is updated on boot (row 1's rule) | nothing for the superseded facts | none | the tombstone is already written ⇒ nothing (P1 (f)) |
+
+
 
 - **Type:** `wicked.team.<noun>.<past-tense-verb>` — four segments, lowercase (`reqs/SPEC.md:379-393`). The domain segment `team` is a functional domain like `gate` in `wicked.gate.eval.requested` (`src/cli_runner.rs:88`); the `domain` column (publisher identity) is `wicked-core` for engine-published events and `wicked-crew` for the human-originated ones (§7).
 - **Envelope (every payload):**
@@ -458,11 +504,12 @@ Exact payloads (envelope fields omitted after the first):
  "transcript":{"from_event_id":1180,"to_event_id":1290,"count":31,
                "events":[ /* the attempt's wicked.team.* rows, event_id-ordered, ≤256 KB; "truncated":true past the cap */ ]}}
 
-// 23 — gate.opened (E only). kind:"unit_review": the actor, on the ApplyStepResult that carries the snapshot, before the fold
+// 23 — gate.opened (E only). kind:"unit_review": the actor, when it applies the step result (apply_step_result, src/actor.rs:4269), before the fold emits GateEvaluated (src/pipeline.rs:1519)
 {"gate_id":"g-r1-3",              // "g-<run>-<gate_seq>" for every kind (AgentSession.gate_seq)
  "kind":"unit_review",             // "unit_review" | "plan_approval" | "team_dispute" | "team_transport"
  "ord":3,"attempt":1,"by":"engine",
- "ledger_ref":"ledger.folded#3:1"} // the S fact the gate reads; the snapshot itself rides UnitEvidence.team
+ "ledger_ref":"ledger.folded#3:1", // the S row the gate used; null when the snapshot was synthesized by the worker (final-pass timeout) or built with no bus
+ "ledger_source":"folded"}         // "folded" (ledger_ref set) | "synthesized" | "no_bus"; with null ledger_ref, consumers read UnitEvidence.team
 
 // 23 (cont.) — gate.opened, kind:"plan_approval" (E), when the approval matrix requires it (§8.6)
 {"gate_id":"g-r1-4",              // gate_seq 4: a re-opened gate for a newer plan_rev gets a new one
@@ -718,7 +765,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
 ### 8.11 The gate consumes the stream (operator step 9)
 
 - **Final pass and fold, on the supervisor.** `step.completed` triggers DES-001 §4.7 steps 1–6. Then `team::fold(&events_of_attempt) -> TeamLedger` (a pure function over the attempt's rows) runs, and the supervisor publishes `ledger.folded{ledger, transcript}`, an S fact.
-- **The worker thread waits, bounded**, with the `bus_request_agent_verdict` loop (`src/cli_runner.rs:417-445`), for at most `FINAL_PASS_BUDGET`. On timeout it synthesizes DES-001 §4.7's fail-closed ledger itself (`final_pass:"timed_out"`) **without publishing it**, because `ledger.folded` has one owner (S). The snapshot rides `Command::ApplyStepResult` to the actor, which publishes `gate.opened{kind:"unit_review", ledger_ref}` (E) and folds.
+- **The worker thread waits, bounded**, with the `bus_request_agent_verdict` loop (`src/cli_runner.rs:417-445`), for at most `FINAL_PASS_BUDGET`. On timeout it synthesizes DES-001 §4.7's fail-closed ledger itself (`final_pass:"timed_out"`) **without publishing it**, because `ledger.folded` has one owner (S). The snapshot rides `Command::ApplyStepResult` to the actor, which publishes `gate.opened{kind:"unit_review", ledger_ref:null, ledger_source:"synthesized"}` (E) and folds. Consumers then read the gate's ledger from `UnitEvidence.team` (read route, evidence bundle). A `ledger.folded` S publishes afterwards is never the gate's ledger. S drops a fold past its deadline and tombstones any spooled line for it (§4.1), and any row that did land before the tombstone is labelled `unused` by the read route, because `gate.opened.ledger_ref` is the only authority on what the gate read.
 - **Where the snapshot goes:** into `UnitEvidence.team` (`src/workflow.rs:265`). From there it reaches the judge's WORK fence, the evaluator's prior context and the rework amendment, as in DES-001 §6.2. `render_for_gate` also renders a compact transcript (≤16 KB), so reviewers have the outcomes **and** the comms.
 - **A failed step** skips the final pass (`src/cli_runner.rs:876`).
 - **No bus:** the worker builds the snapshot locally with `transport:"none"` (§4.1).
@@ -912,7 +959,12 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 - (a) with the bus db made unwritable for 10 s, every team event lands in `team-outbox.ndjson` with a `DEADLETTER_MARKER` line on stderr, and is published once the bus returns (one row each: replay dedups);
 - (b) unwritable past the 31 s bound: a failing `path.started` makes the run proceed with `transport:"none"` **before** its first unit dispatches, with `teamTransportDisabled` on the fan-out and in every snapshot; a failing `plan.accepted` pauses the run `team_transport` **before** the plan's first unit dispatches; a failing `gate.decided` keeps the run paused `team_transport` (no `Resumed`, no dispatch);
 - (c) the actor thread never blocks on a publish (a test holds the bus lock for 60 s while the actor keeps answering `subscribe`);
-- (d) `Core::replay_team_outbox` replays the leftover lines idempotently: a line replayed twice lands once.
+- (d) `Core::replay_team_outbox` replays the leftover lines idempotently: a line replayed twice lands once;
+- (e) **replay after a `transport:"none"` fallback publishes nothing for that run.** A run whose `path.started` failed past the bound has a `superseded_run` tombstone before its `transport:"none"` is persisted; after the bus returns, `replay_team_outbox` and the live drain publish **zero** rows for that run, and the supervisor never arms it. The same holds for an attempt whose `step.claimed` failed, and for a `team_transport` pause answered "continue without team" or rejected (only `path.ended` is published for the rejected run);
+- (f) crash between the tombstone and the store write: on boot the run is `transport:"none"` and replay publishes nothing for it;
+- (g) per-run FIFO: with `gate.opened` failing and `gate.decided` queued behind it, the bus never holds a `gate.decided` whose `gate.opened` is absent, in live draining or after replay;
+- (h) a final-pass timeout gives `gate.opened{ledger_ref:null, ledger_source:"synthesized"}`; S's late fold publishes nothing, and its spooled line, if any, is tombstoned; the read route serves the gate's ledger from `UnitEvidence.team`;
+- (i) every path in the §4.8 table has a named fixture asserting its four columns.
 
 **T2 — Floor table + floor fill (core).** `THRESHOLDS.floors` and the high-risk rule; `signals_from_paths`; floor fill with `added_by:"floor"`; the empty floor for a plan with no creator step.
 *Accept:* (a) for scores 10/30/50/80 and for a destructive signal at a score of 10 (with the destructive floor tuned to 0 in the fixture), the floor and `high_risk` equal §8.5's table; (b) **a user plan below the floor gets the floor phases added**, each marked `added_by:"floor"` with its `floor_reason`, and `plan.accepted.steps` shows them; (c) a user plan that already contains the floor is unchanged; (d) a read-only plan (`understand` only) and a tool-only plan have an empty floor; (e) no graph means score 100, so the band 70–100 floor applies; **(g) an auto-mode `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch` omitted, and again with `touch:[]`, scores 100 with reason `"no declared scope"`, gets the 70–100 floor, and pauses `plan_approval` (high risk) before `build` dispatches. The same launch with `touch:["src/x.rs"]` scores from the graph. A read-only plan (`understand` only) with `touch` omitted scores 0 and does not pause;** (f) the table is the only place the values live (a grep test for literal band numbers outside `THRESHOLDS`).
