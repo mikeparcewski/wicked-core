@@ -1,7 +1,10 @@
 # DES-TEAMING-002 — The team model on the bus: one transport, one grammar, one phase catalog
 
-- **Status:** DRAFT (rev 9). **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
+- **Status:** rev 10, ready for review. **No open operator items.** The operator decided all three design questions (2026-09-23, §8.3–§8.8) and on 2026-09-24 confirmed the two remaining recommendations: the floor-override rule (§8.5) and "team runs never use `creator_seat`" (§8.1). Every decision is written into the text it governs.
 - **Date:** 2026-09-23
+- **Rev 10 (2026-09-24):** review on #612 at `548d273` (no HIGH; 2 MEDIUM, both undecided choices, now decided by the coordinator).
+  1. The `path.started` fallback is disclosed only by persisted `transport:"none"` on the run and attempt snapshots, served by `GET /api/v1/runs/:id/team` and studio's run-header banner. The proposed `teamTransportDisabled` CoreEvent is removed, keeping §4.6's one-mechanism rule (§4.1, P1 (b), §8.12, T8 (b)).
+  2. migration/cleanup maps to `build`: evidence pin, `executes_code`, creator role. This is a known behaviour change recorded in §11.3 and M2 and pinned by the C1 fixture; Q5 is closed.
 - **Rev 9 (2026-09-24):** review on #612 at `522a804` (1 HIGH, 1 MEDIUM, both verified in the rev-7 reliability section).
   1. A failed `path.started` left its outbox line behind, so a later replay could arm team state for a run on `transport:"none"`. The **supersede rule** fixes it: an irreversible fallback writes an outbox tombstone before it is acknowledged, and replay and drain skip superseded lines. No event type is added.
   2. `gate.opened.ledger_ref` dangled for a synthesized or no-bus snapshot. It is now `null` with `ledger_source`, and consumers read `UnitEvidence.team`. The "before the fold" wording now names `apply_step_result` → `GateEvaluated`.
@@ -164,7 +167,7 @@ A command carries the sender's own result, never a relayed bus row. **The actor 
 
   | Fact | The engine waits for its acknowledgement before | If it cannot be published within the bound |
   |---|---|---|
-  | `path.started` | dispatching the run's first unit | the run proceeds **un-teamed** with `AgentSession.team.transport = "none"`, set **before any team work begins**; it is disclosed on the fan-out (a `teamTransportDisabled` CoreEvent, §4.6) and in every unit's snapshot |
+  | `path.started` | dispatching the run's first unit | the run proceeds **un-teamed** with `AgentSession.team.transport = "none"`, set **before any team work begins**; it is disclosed by that **persisted state** alone: `transport:"none"` on the run and in every unit's snapshot, read through the existing read path (`GET /api/v1/runs/:id/team` returns `{transport:"none", reason}`, and studio's run header shows an "un-teamed: team transport unavailable" banner, §8.12). No CoreEvent is added: §4.6 keeps each concern on one mechanism |
   | `plan.accepted` | dispatching the plan's first unit | the run **pauses** with `gate_kind:"team_transport"` and the reason in the prompt |
   | `gate.opened` | — (the pause itself is already durable in the store, `src/actor.rs:6036-6046`) | the pause stands, answerable as usual; its `awaitingHuman` prompt names the missing fact |
   | `gate.decided` | emitting `Resumed` and dispatching | the run stays paused with `gate_kind:"team_transport"` |
@@ -782,6 +785,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
   - in manual mode, a disclosed override control (§8.5); in auto mode none.
 - **Plan card** on the run page: `plan.proposed` / `plan.revised` / `plan.accepted`, the band, floor-added and late phases, **Edit** and **Stop**. **Edit** sends the command `POST /api/v1/runs/:id/plan` → `Core::propose_plan` (§4.0).
 - **Plan approval gate:** `SteeringGate` (`studio src/components/SteeringGate.tsx:85`) renders `gate_kind:"plan_approval"` with the plan diff (previous rev → this rev). Approve, approve-with-edit and reject go through `POST /api/v1/runs/:id/gate` (`packages/crew/src/api/routes.ts:2943`).
+- **Run header banner:** when `GET /api/v1/runs/:id/team` reports `transport:"none"` (the run, or an attempt), the run header shows "un-teamed: team transport unavailable" with the reason. This is the only disclosure of a `path.started` or `step.claimed` fallback (§4.1); it is read from persisted state, not a live event.
 - **Unit gate panel:** *Team findings* and *Team comms* from `GET /api/v1/runs/:id/team`. `VerdictDetail` (`studio src/components/VerdictDetail.tsx:90`) shows `final_pass`, the `rejected` counters and `transport`.
 
 ## 9. Authority model
@@ -877,7 +881,7 @@ Common to every consumer (not repeated per row):
 |---|---|---|
 | feature | **Floor fill** may add phases by band (e.g. band 70–100 adds `test_plan`, `architecture`, `security_review`). **`test` and the final review move to an evaluator seat** (role neutral → evaluator), so the fence places them off the creator. The final review loses no pin (it maps to the unpinned `critique`). **Manual mode:** the clarify boundary's pause becomes `gate_kind:"plan_approval"` instead of `"def"`, one pause when the two coincide. The PA's `understand` step emits the plan block. | Gate ladder and pins on build / adversarial-review / test; deliver gate; evidence bundle shape. core `tests/p10_methodology.rs`, `tests/governed_floor_and_fence.rs`, `tests/p2_gates.rs`, `tests/p14_gate_phase.rs`, `tests/dead_seat_gate.rs`; crew `tests/deliver-launch.test.ts`, `tests/deliver-phase.test.ts`, `tests/deliverable-floor-launch.test.ts` |
 | bug | **Floor fill** adds `review` at band ≥ 20 (bug has none today). **Manual mode:** a new `plan_approval` pause after triage. | reproduce → fix → verify order, the fix sweep instructions, verify's `human_confirm_if` gate and pin. The same core tests; crew `tests/deliver-launch.test.ts` |
-| migration | **cutover and cleanup gain the evidence-floor pin and the creator role**; cleanup gains a worktree (`executes_code`). Risky: cleanup's current def does not declare code work although it edits code, so the pin may now deny a cleanup that passed ungated. **Smallest option:** map cleanup to `produce` (unpinned, no worktree) and record the mismatch as a follow-up. A new `understand` ord 1 is added. Floor fill applies. | cutover's **unconditional** human gate; verify's gate and pin. core `tests/p14_gate_phase.rs`, `tests/governed_floor_and_fence.rs` |
+| migration | **cutover and cleanup gain the evidence-floor pin and the creator role.** **cleanup → `build` (decision, 2026-09-24):** it removes the old path, so it is code work. It gains a worktree (`executes_code`), the evidence pin and the creator role. That is the stricter and correct classification, and a **known behaviour change**: a cleanup that passed ungated today can now be denied by the evidence floor, and it runs on a creator seat, so its judge is a distinct seat. A new `understand` ord 1 is added. Floor fill applies. | cutover's **unconditional** human gate; verify's gate and pin. core `tests/p14_gate_phase.rs`, `tests/governed_floor_and_fence.rs` |
 | deliver | Composed by floor fill instead of crew; the deliver unit id stays `deliver`, so `is_deliver_unit` is unchanged. | Deliver gate and `auto_deliver` behaviour; PR text. crew `tests/deliver-*.test.ts` (all 15), core `tests/deliver_refusal_gate.rs` |
 | chat | None: a read-only plan, empty floor, never high risk. | Chat surface launch and output. crew chat promote tests; studio `ChatPanel` tests |
 | onboarding | None: a tool-only plan, empty floor. | Index then annotate, placeholders `{repo_root}` / `{code_graph_db}`. crew `tests/onboarding-phases.test.ts`, `tests/onboarding-run-seats.test.ts` |
@@ -949,7 +953,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
   - a grep test fails the build if a key builder in `src/team/events.rs` takes a payload text field (question, claim, evidence, reason, context).
 
 **C1 — Phase catalog + compose (core).** `src/catalog.rs` (12 entries, §8.3/§11.2), `PhaseDef.owner`/`WorkUnit.owner`, `plan::compose` with the step rules, and the evidence-floor pin moved onto the entries.
-*Accept:* (a) `compose` of every §11.2 mapping yields a def whose per-phase `(kind, role, gate, validator_pin, executes_code, executor, skill_ref, instructions, depends_on)` equals today's def **except** exactly the bold cells of §11.2 (one fixture per consumer, generated from today's defs); (b) a step that lowers a gate, removes a pin, changes `role`, or sets `executor` on a non-Tool entry is refused with a named reason; (c) a misspelled step key is refused (`deny_unknown_fields`); (d) an owner-omitted def serializes byte-identically; (e) `attach_pinned_validators` attaches every catalog pin (an unapproved swap is refused, `src/pipeline.rs:246-258`).
+*Accept:* (a) `compose` of every §11.2 mapping yields a def whose per-phase `(kind, role, gate, validator_pin, executes_code, executor, skill_ref, instructions, depends_on)` equals today's def **except** exactly the bold cells of §11.2 (one fixture per consumer, generated from today's defs). The migration fixture pins cleanup as `build`: `kind:build`, `role:creator`, `validator_pin:EVIDENCE_FLOOR_PIN`, `executes_code:true`; (b) a step that lowers a gate, removes a pin, changes `role`, or sets `executor` on a non-Tool entry is refused with a named reason; (c) a misspelled step key is refused (`deny_unknown_fields`); (d) an owner-omitted def serializes byte-identically; (e) `attach_pinned_validators` attaches every catalog pin (an unapproved swap is refused, `src/pipeline.rs:246-258`).
 
 **C2 — Presets (core + crew).** `src/preset.rs` rows, the built-in seeding, `Core::{put,delete,list}_preset`, crew routes, and `launch_run` resolving `workflow` as a preset name.
 *Accept:* (a) a built-in preset named `feature` launches the same unit list C1(a) fixed; (b) `PUT /presets/my-flow` then `POST /runs {workflow:"my-flow"}` launches that selection (**preset launch**); (c) a project-scoped preset shadows a built-in only for that project; (d) a built-in cannot be deleted; (e) a bus `wicked.crew.run.requested {workflow:"my-flow"}` and a campaign node naming it both launch it with no crew involvement in resolution; (f) presets survive a daemon restart.
@@ -957,7 +961,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 **P1 — Reliable publishing (core).** `TeamBus::publish` with the team outbox (the `wicked_apps_core::emit` spool pattern), bounded retry, the `TeamPublisher` acknowledgements, the required-transition gates, and `Core::replay_team_outbox`.
 *Accept:*
 - (a) with the bus db made unwritable for 10 s, every team event lands in `team-outbox.ndjson` with a `DEADLETTER_MARKER` line on stderr, and is published once the bus returns (one row each: replay dedups);
-- (b) unwritable past the 31 s bound: a failing `path.started` makes the run proceed with `transport:"none"` **before** its first unit dispatches, with `teamTransportDisabled` on the fan-out and in every snapshot; a failing `plan.accepted` pauses the run `team_transport` **before** the plan's first unit dispatches; a failing `gate.decided` keeps the run paused `team_transport` (no `Resumed`, no dispatch);
+- (b) unwritable past the 31 s bound: a failing `path.started` makes the run proceed with `transport:"none"` **before** its first unit dispatches, with `transport:"none"` persisted on the run and in every snapshot, served by `GET /api/v1/runs/:id/team` (`{transport:"none", reason}`) and shown as studio's run-header banner, with **no** new CoreEvent (a grep test asserts no `teamTransportDisabled` exists); a failing `plan.accepted` pauses the run `team_transport` **before** the plan's first unit dispatches; a failing `gate.decided` keeps the run paused `team_transport` (no `Resumed`, no dispatch);
 - (c) the actor thread never blocks on a publish (a test holds the bus lock for 60 s while the actor keeps answering `subscribe`);
 - (d) `Core::replay_team_outbox` replays the leftover lines idempotently: a line replayed twice lands once;
 - (e) **replay after a `transport:"none"` fallback publishes nothing for that run.** A run whose `path.started` failed past the bound has a `superseded_run` tombstone before its `transport:"none"` is persisted; after the bus returns, `replay_team_outbox` and the live drain publish **zero** rows for that run, and the supervisor never arms it. The same holds for an attempt whose `step.claimed` failed, and for a `team_transport` pause answered "continue without team" or rejected (only `path.ended` is published for the rejected run);
@@ -1023,7 +1027,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 **T8 — Crew surface (commands only, §4.0).** `teamEvent` relay; `GET /runs/:id/team`; `GET /catalog`; `POST /plans/preview`; the commands `POST /runs {plan, workflow}`, `POST /runs/:id/plan` and `POST /runs/:id/gate`. Crew publishes **no** `wicked.team.*` row.
 *Accept:*
 - (a) every `wicked.team.*` row on the bus arrives on `/ws` as `{type:"teamEvent", event}` within the poll interval, tagged `project_id` when filed;
-- (b) the read route returns the attempt's rows ordered by `event_id` with the folded ledger, `units: []` for an un-teamed run, and the persisted snapshot when the bus has no rows (fixture: rows deleted);
+- (b) the read route returns the attempt's rows ordered by `event_id` with the folded ledger, and the run's `transport` (`"bus"` | `"none"`, with its reason); `units: []` for an un-teamed run, and the persisted snapshot when the bus has no rows (fixture: rows deleted);
 - (c) `POST /runs/:id/plan` calls `Core::propose_plan`. The **engine** then publishes `plan.proposed{by:"human"}`, and a repeat POST with the same request id publishes no second row;
 - (d) approving a `team_dispute` gate calls `confirm_gate`; the **engine** publishes `gate.decided{by:"human"}` and `resumed` follows as DES-001 §6.7 (approve never re-dispatches);
 - (e) `POST /plans/preview` returns the same floor fill T2 computes;
@@ -1043,7 +1047,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 | Seam | Consumer(s) | Extra acceptance / risk note |
 |---|---|---|
 | M1 | feature, bug (+ C3: deliver composition moves from `composeDeliverWorkflow` into floor fill) | All crew `tests/deliver-*.test.ts` green; the feature role changes (test and final review on evaluator seats) asserted |
-| M2 | migration | cleanup mapping decided (`build` vs the smallest option `produce`, §11.3) before the seam starts |
+| M2 | migration | cleanup is `build` (§11.2, §11.3). The contract tests assert the change: cleanup's unit carries `EVIDENCE_FLOOR_PIN`, `executes_code:true` and `role:creator`, and a cleanup that leaves no evidence is denied |
 | M3 | chat | — |
 | M4 | onboarding | `onboarding-phases`, `onboarding-run-seats` |
 | M5 | survey-repo, memories, domain-graph-slice | a new preset launch test each (none exists today) |
@@ -1081,7 +1085,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 - **Q2. Bus retention for evidence.** The snapshot covers the gate. Keeping raw transcripts past the TTL would be a wicked-bus feature (`retention: forever` exists only in `DESIGN-v2.md:97`).
 - **Q3. SPEC filter text vs code.** `reqs/SPEC.md:700-727` documents single-level `.*` only, but the code and three crew consumers use `prefix.**`. SPEC should match the code.
 - **Q4. Member seat diversity.** Unchanged from DES-001 §13 Q2: only claude is ACP-admitted.
-- **Q5. migration/cleanup** declares no code work although it edits code (§11.3, M2). Decide `build` vs `produce` before M2 starts.
+- **Q5. migration/cleanup: decided (2026-09-24)** as `build` (§11.2, §11.3, M2).
 - **Q6. Security review skill id.** `security_review`'s `skill_ref` names the garden QE security specialist; the exact skill id is fixed in C1 against garden's catalog.
 
 ### 16.1 Rev 5 sweep: every "as today" / "unchanged" claim checked against the code
