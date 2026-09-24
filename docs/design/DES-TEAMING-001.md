@@ -376,12 +376,37 @@ Every variant is mapped by hand in `CoreEvent::to_json` (`src/event.rs:1269-1275
 
 | From | What this design reads | Where it is read |
 |---|---|---|
-| **S4** (`src/review_scale.rs`, branch `feat/590-s4-review-scale` @ `da957f4`, stub) | `signals_from_diff(&str) -> ChangeSignals` and `review_plan(&ChangeSignals) -> ReviewPlan`, from which **only `monitors: u8`** is used: the target monitor count for the diff so far. It is evaluated at every batch and at the final pass, and the count only grows within an attempt. `depth` and `post_hoc_reviewer` are not read by S2. | supervisor, per batch (§4.3) and final pass (§4.7) |
+| **S4** (`src/review_scale.rs`, PR #600, impact model per §8.1) | `signals_from_diff(&str) -> ChangeSignals`, `graph_age(&store, base_commit) -> GraphAge`, and `assess(&ChangeSignals, Graph, Option<&dyn ModelAssessment>) -> Assessment`, from which **only `plan.monitors: u8`** is used: the target monitor count for the diff so far. It is evaluated at every batch and at the final pass, and the count only grows within an attempt. `plan.depth`, `plan.post_hoc_reviewer` and `plan.post_hoc_other_cli` are not read by S2. The supervisor passes `Graph::Ready { store, base_commit }`: the run's repo graph (`code_graph::resolved_code_graph_db`, opened read-only) and the run's `base_commit` (`WorktreeReady`, `src/actor.rs:1406`); `assess` checks `graph_age` itself, and a missing graph is passed as `Graph::Unavailable(reason)`. Either scores 100. | supervisor, per batch (§4.3) and final pass (§4.7) |
 | **S5** (deterministic `RoutingInfo::Teamed`, no mode selector) | For the unit: the creator's seat instance and an **ordered list of monitor-candidate seat instances** (e.g. `["claude#2","claude#3"]`). The supervisor takes the first `monitors` candidates that pass §4.1. An empty list means no monitors. | `exec_turn_inner` builds `TeamCmd::Attach` (§4.2) |
 | **S5** (decision-council entry point) | The call `question, positions, evidence, excluded seats → verdict, agreementPct, dissent, seats`. It must be callable **off the actor**, from the worker thread, and must emit its own council events. | final pass step 5 (§6.3) |
 | **S1** (#599, merged) | Nothing new. The worker's `AskUserQuestion` stays human-routed (§5.3). | — |
 
 If S4's or S5's final Rust names differ, only the read sites named in the right-hand column change.
+
+### 8.1 S4 — impact model (operator decision, 2026-09-23; supersedes the size buckets)
+
+How much review a change summons is read from **what depends on what it touched**, not from how many lines it has. A ten-line edit to a symbol with forty callers outranks a six-hundred-line new leaf file. `src/review_scale.rs` is a pure policy over plain data plus two read seams; every number and word list is one table (`THRESHOLDS`).
+
+**Inputs per unit** (the settled diff + the run's repo estate graph, read in-process through `GraphRead` — the same `traverse`/`blast_radius(3)` the `wicked-estate blast-radius` CLI runs; no subprocess, no new dependency):
+
+| Signal | How it is read |
+|---|---|
+| **C** changed symbols | `signals_from_diff` reads each file's paths from its `---`/`+++` headers (git-unquoted; `/dev/null` = new or deleted) and from `rename from`/`rename to` for hunk-less renames — the `diff --git` line only delimits files — and keeps, per non-docs file, the base-side lines each hunk touches (removed lines, and both neighbours of an insertion). A graph node whose span contains a touched line is in C; when none does (a pure rename/move, a mode change, lines outside every symbol) the file's node is the changed symbol, so its importers count. Only a touched file the graph does not know (a new file) counts as one changed symbol nothing reaches. |
+| **R** dependents | `store.traverse(c, TraversalSpec::blast_radius(3))` per seed: callers, importers, and injected-edge consumers (`EdgeKind::Other`) within 3 hops, union over C, minus C. |
+| **span** | distinct products (`crates/<x>`, `packages/<x>`, else the root) C and R land in |
+| **contract change** | a touched path matches `contract_path_markers` (`api-types`, `/event.rs`, `schema`, `/mcp`, `.d.ts`, …) or a changed **type** matches `contract_symbol_markers` (`event`, `schema`, `tool`, `api`, `request`, `response`, `dto`, `payload`) |
+| **G** test gap | the share of C that no test symbol (test path, or `test`-prefixed name) reaches within 3 hops |
+| **destructive**, **critical** | the diff-only line and path markers. Destructive stays diff-only so it works with no graph. |
+
+**Deterministic score 0–100:** reach 0 with no changed symbols; else 20 for 0–5 dependents (a behavioural change nothing depends on yet still gets one monitor), 40 for 6–20, 60 for 21–100, 80 above; +10 per product beyond the first (max +20); +20 contract change; +20 × G only when R is non-empty; +20 critical; destructive ⇒ `max(score, 70)`; cap 100. Docs-only scores 0 (no symbols). Every contribution is a line in `Assessment.reasons`.
+
+**Bands → plan:** 0–19 → 0 monitors / none / no post-hoc; 20–39 → 1 / standard / no; 40–69 → 2 / deep / post-hoc; 70–100 → 3 / deep / post-hoc **on a different CLI than the worker** (`post_hoc_other_cli`).
+
+**Model hook (optional, non-deterministic):** `ModelAssessment::assess(&ImpactSignals, deterministic) -> Option<ModelBonus>` may ADD 0, 10 or 20 with a recorded rationale, is consulted only when the deterministic score is ≥ 20, and can never subtract (anything else is clamped). Not wired to a CLI in #600.
+
+**Fail closed, one rule:** the indexed commit must BE the run's base commit (`graph_age`: `repo_info().commit == base_commit`). The run tree is created at `base.commit` (`src/repo.rs:963`, `git worktree add … <base.commit>`), the run diff is `base_commit..run_branch` (`src/actor.rs:1588`), and hunks are mapped by base-side path and line, so the graph's spans must be the base's spans. A graph at a descendant is stale too: an insertion above a hot symbol shifts its span and the base-side lookup misses it (review on #600). The engine never re-indexes at run start (`WorktreeReady`, `src/actor.rs:1534`, only persists `workdir`/`base_commit`); the graph is whatever onboarding indexed the registered root at, which the base lift (`RunBase::lifted`, `src/repo.rs:705`) can leave behind. No graph, an unreadable graph, or any other commit ⇒ score 100 with the reason recorded; `assess` applies the rule itself. There is no quiet fallback to line counts.
+
+**Fixed expectations (tests in `src/review_scale/tests.rs`):** a 10-line change to a symbol with 40 dependents scores 80 untested / 60 tested; a 600-line new leaf file scores 20; an event-schema change with 3 consumers scores 40 (the same change to a plain type: 20); no graph ⇒ 100; a head-indexed graph against a base-side diff (hot symbol shifted by an insertion above it) ⇒ 100, never 20, while the base graph still scores 80; a destructive leaf floors at 70; the model hook can raise but not lower.
 
 ## 9. Where each piece lives
 

@@ -53,6 +53,9 @@ mod remote_write_fence;
 mod repo;
 mod repo_checks;
 mod repo_intel;
+// S4 of #590: summoned by S2 (monitors) and S5 (teamed mode); unused until they land.
+#[allow(dead_code)]
+mod review_scale;
 mod scope;
 mod session_runner;
 mod skills_snapshot;
