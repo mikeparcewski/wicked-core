@@ -374,3 +374,13 @@ fn an_owner_omitted_def_serializes_byte_identically() {
     let s = serde_json::to_value(&team).unwrap();
     assert_eq!(s["phases"][0]["owner"], json!("team"));
 }
+
+/// Arm the hermetic emit spool before `main` (core#311), as every test binary does: an emission a
+/// test triggers must never spool to the operator's real replay queue.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
