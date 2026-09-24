@@ -96,6 +96,7 @@ SEAMS = [
     ("wicked-core", "crates/wicked-orchestration/src/gate.rs", "const", "rust_consts"),
     ("wicked-core", "crates/wicked-governance/src/events.rs", "const", "rust_consts"),
     ("wicked-core", "crates/wicked-governance/src/engine.rs", "const", "rust_consts"),
+    ("wicked-core", "src/team/events.rs", "const", "rust_consts"),
     ("wicked-garden", "scripts/_bus.py", "registry", "python_map"),
     ("wicked-garden", "scripts/qe/lib/gate.mjs", "emit", "literals"),
     ("wicked-ledger", "lib/bus-emit.mjs", "emit", "literals"),
@@ -119,6 +120,7 @@ DOMAIN_NOTES = {
     "gate": "governed evaluator round-trip (wicked-core engine)",
     "interactive": "wicked-interactive registry (`src/service/events.js` EVENT_TYPES is the contract)",
     "qe": "QE acceptance gate + lifecycle (garden gate CLI, wicked-ledger)",
+    "team": "team model on the bus (wicked-core `src/team/events.rs`, DES-TEAMING-002 §6); `domain` stamp `wicked-core`, subdomain `core.team`; one owner per type (E engine, S supervisor, R attempt runner)",
     "test": "legacy-stable QE-lifecycle spelling kept at the wicked-testing retirement — the `domain` stamp is `qe`",
 }
 
