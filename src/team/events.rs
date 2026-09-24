@@ -1076,30 +1076,260 @@ pub fn gate_pauses(approved: bool, ledger: &TeamLedger) -> bool {
 /// corroboration that arrives after the finding was raised. The supervisor, which owns both,
 /// overlays them on the fold's result before it publishes `ledger.folded`.
 pub fn fold(rows: &[TeamRow]) -> TeamLedger {
-    let _ = rows;
-    todo!("T1 fold")
+    let mut ordered: Vec<&TeamRow> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.event_id);
+    let mut keys = HashSet::new();
+    let mut ids = HashSet::new();
+    ordered.retain(|r| match r.event.key() {
+        Ok(k) => keys.insert(k),
+        Err(_) => ids.insert(r.event_id),
+    });
+
+    let mut monitors: Vec<MonitorAcc> = Vec::new();
+    let mut findings: Vec<FindingAcc> = Vec::new();
+    let mut skipped = false;
+    for row in ordered {
+        let env = &row.event.env;
+        match &row.event.body {
+            TeamBody::MemberJoined(b) => {
+                let m = monitor_entry(&mut monitors, &b.member_id, &b.seat);
+                if b.open_seq >= m.open_seq {
+                    m.open_seq = b.open_seq;
+                    m.seat = b.seat.clone();
+                    m.joined_failed = (b.status == "failed").then(|| b.error.clone());
+                }
+            }
+            TeamBody::MemberLeft(b) => {
+                let m = monitor_entry(&mut monitors, &b.member_id, &b.seat);
+                m.open_seq = m.open_seq.max(b.open_seq);
+                m.left.insert(b.open_seq, b.clone());
+            }
+            TeamBody::FindingRaised(b) => {
+                let Some(severity) = Severity::parse(&b.severity) else {
+                    continue;
+                };
+                if findings.iter().any(|f| f.raise_seq == b.raise_seq) {
+                    continue;
+                }
+                findings.push(FindingAcc {
+                    raise_seq: b.raise_seq,
+                    finding: Finding {
+                        finding_id: b.finding_id.clone(),
+                        monitor_id: b.member_id.clone(),
+                        seat: env.by.clone(),
+                        severity,
+                        path: b.path.clone(),
+                        line: b.line,
+                        evidence: b.evidence.clone(),
+                        claim: b.claim.clone(),
+                        suggestion: b.suggestion.clone(),
+                        tree: b.tree.clone(),
+                        in_diff: b.in_diff,
+                        checkpoint_seq: 0,
+                    },
+                    corroborated_by: b.corroborated_by.clone(),
+                    injected: false,
+                    answer: None,
+                    settled: None,
+                    ruling: None,
+                });
+            }
+            TeamBody::AdviceDelivered(b) => {
+                if let Some(f) = finding_entry(&mut findings, b.raise_seq) {
+                    f.injected |= b.outcome == "injected";
+                }
+            }
+            TeamBody::AdviceAnswered(b) => {
+                if let Some(f) = finding_entry(&mut findings, b.raise_seq) {
+                    f.answer = Some(b.clone());
+                }
+            }
+            TeamBody::FindingSettled(b) => {
+                if let Some(f) = finding_entry(&mut findings, b.raise_seq) {
+                    f.settled = Some(b.clone());
+                }
+            }
+            TeamBody::CouncilRuled(b) => {
+                let seq = b
+                    .subject
+                    .strip_prefix("finding:")
+                    .and_then(|n| n.parse::<u32>().ok());
+                if let Some(f) = seq.and_then(|n| finding_entry(&mut findings, n)) {
+                    f.ruling = Some(b.clone());
+                }
+            }
+            TeamBody::StepCompleted(b) => skipped |= b.status != "ok",
+            _ => {}
+        }
+    }
+
+    let mut ledger = TeamLedger {
+        final_pass: if skipped { "skipped" } else { "completed" }.to_string(),
+        rendered_to_judge: false,
+        monitors: monitors.into_iter().map(MonitorAcc::into_ledger).collect(),
+        findings: findings.into_iter().map(FindingAcc::into_ledger).collect(),
+        rejected: Default::default(),
+        team_pause: false,
+    };
+    ledger.team_pause = ledger_pauses(&ledger);
+    ledger
 }
 
 /// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every unaccepted HIGH
 /// missing a hold-round reply or a council verdict gets `{kind:"hold", reason:"no reply (final
 /// pass timed out)"}` / `{verdict:"no_verdict", reason:"timeout"}`. Recorded results are kept;
 /// MEDIUM and accepted/withdrawn/superseded findings are untouched. `teamPause` is recomputed.
-pub fn synthesize_timeout(ledger: TeamLedger) -> TeamLedger {
-    let _ = ledger;
-    todo!("T1 synthesize_timeout")
+pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
+    ledger.final_pass = "timed_out".to_string();
+    for f in &mut ledger.findings {
+        if f.finding.severity != Severity::High || !is_unaccepted(f) {
+            continue;
+        }
+        if f.monitor_reply.is_none() {
+            f.monitor_reply = Some(MonitorReply {
+                kind: "hold".to_string(),
+                reason: "no reply (final pass timed out)".to_string(),
+            });
+        }
+        if f.dispute.is_none() {
+            f.dispute = Some(no_verdict("timeout"));
+        }
+    }
+    ledger.team_pause = ledger_pauses(&ledger);
+    ledger
 }
 
-#[allow(dead_code)]
-fn unused_imports_until_fold(
-    _: (
-        &BTreeMap<u8, u8>,
-        &HashSet<u8>,
-        Finding,
-        LedgerMonitor,
-        MonitorReply,
-        Dispute,
-    ),
-) {
+fn no_verdict(reason: &str) -> Dispute {
+    Dispute {
+        verdict: "no_verdict".to_string(),
+        agreement_pct: None,
+        dissent: None,
+        seats: Vec::new(),
+        reason: Some(reason.to_string()),
+    }
+}
+
+/// One monitor's rows: its latest opening, and each opening's `member.left`.
+struct MonitorAcc {
+    id: String,
+    seat: String,
+    open_seq: u32,
+    /// The latest opening failed to attach, with its error.
+    joined_failed: Option<Option<String>>,
+    left: BTreeMap<u32, MemberLeft>,
+}
+
+impl MonitorAcc {
+    fn into_ledger(self) -> LedgerMonitor {
+        let earlier_batches = self.left.values().next_back().map_or(0, |l| l.batches);
+        let (status, batches, error) = match (self.left.get(&self.open_seq), self.joined_failed) {
+            (Some(l), _) => (l.status.clone(), l.batches, l.error.clone()),
+            (None, Some(error)) => ("failed".to_string(), earlier_batches, error),
+            // Open with no `member.left`: the final pass never closed it (fail-visible).
+            (None, None) => (
+                "timed_out".to_string(),
+                earlier_batches,
+                Some("no member.left for this opening".to_string()),
+            ),
+        };
+        LedgerMonitor {
+            monitor_id: self.id,
+            seat: self.seat,
+            batches,
+            status,
+            error,
+        }
+    }
+}
+
+fn monitor_entry<'a>(
+    monitors: &'a mut Vec<MonitorAcc>,
+    id: &str,
+    seat: &str,
+) -> &'a mut MonitorAcc {
+    let i = match monitors.iter().position(|m| m.id == id) {
+        Some(i) => i,
+        None => {
+            monitors.push(MonitorAcc {
+                id: id.to_string(),
+                seat: seat.to_string(),
+                open_seq: 0,
+                joined_failed: None,
+                left: BTreeMap::new(),
+            });
+            monitors.len() - 1
+        }
+    };
+    &mut monitors[i]
+}
+
+/// One finding's rows, keyed by the supervisor's `raise_seq`.
+struct FindingAcc {
+    raise_seq: u32,
+    finding: Finding,
+    corroborated_by: Vec<String>,
+    /// Some delivery answered `injected` (any channel).
+    injected: bool,
+    /// The latest `ADVICE` line for it.
+    answer: Option<AdviceAnswered>,
+    settled: Option<FindingSettled>,
+    ruling: Option<CouncilRuled>,
+}
+
+impl FindingAcc {
+    fn into_ledger(self) -> LedgerFinding {
+        let settled = self.settled.as_ref().map(|s| s.status.as_str());
+        let status = match settled {
+            Some(s @ ("withdrawn" | "superseded")) => s.to_string(),
+            _ => self
+                .answer
+                .as_ref()
+                .map_or_else(|| "unanswered".to_string(), |a| a.disposition.clone()),
+        };
+        let monitor_reply = self.settled.as_ref().and_then(|s| {
+            let kind = match s.status.as_str() {
+                "held" => "hold",
+                "withdrawn" => "withdraw",
+                _ => return None,
+            };
+            Some(MonitorReply {
+                kind: kind.to_string(),
+                reason: s.reason.clone(),
+            })
+        });
+        let dispute = self.ruling.map(|r| match r.verdict.as_str() {
+            "yes" | "no" => Dispute {
+                verdict: r.verdict.clone(),
+                agreement_pct: Some(r.agreement_pct),
+                dissent: Some(r.dissent.len() as u32),
+                seats: Vec::new(),
+                reason: r.reason.clone(),
+            },
+            _ => Dispute {
+                verdict: r.verdict.clone(),
+                ..no_verdict(r.reason.as_deref().unwrap_or("error"))
+            },
+        });
+        LedgerFinding {
+            finding: self.finding,
+            final_line: self.settled.as_ref().and_then(|s| s.final_line),
+            corroborated_by: self.corroborated_by,
+            delivery: if self.injected {
+                "injected"
+            } else {
+                "not_delivered"
+            }
+            .to_string(),
+            status,
+            worker_reason: self.answer.map(|a| a.reason),
+            monitor_reply,
+            dispute,
+        }
+    }
+}
+
+fn finding_entry(findings: &mut [FindingAcc], raise_seq: u32) -> Option<&mut FindingAcc> {
+    findings.iter_mut().find(|f| f.raise_seq == raise_seq)
 }
 
 #[cfg(test)]
