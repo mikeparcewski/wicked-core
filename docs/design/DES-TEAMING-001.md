@@ -389,7 +389,7 @@ How much review a change summons is read from **what depends on what it touched*
 
 | Signal | How it is read |
 |---|---|
-| **C** changed symbols | `signals_from_diff` keeps, per non-docs file, the base-side lines each hunk touches (removed lines, and both neighbours of an insertion). A graph node whose span contains a touched line is in C; a touched file with no indexed symbol (a new file) counts as one changed symbol nothing reaches. |
+| **C** changed symbols | `signals_from_diff` keeps, per non-docs file, the base-side lines each hunk touches (removed lines, and both neighbours of an insertion). A graph node whose span contains a touched line is in C; when none does (a pure rename/move, a mode change, lines outside every symbol) the file's node is the changed symbol, so its importers count. Only a touched file the graph does not know (a new file) counts as one changed symbol nothing reaches. |
 | **R** dependents | `store.traverse(c, TraversalSpec::blast_radius(3))` per seed: callers, importers, and injected-edge consumers (`EdgeKind::Other`) within 3 hops, union over C, minus C. |
 | **span** | distinct products (`crates/<x>`, `packages/<x>`, else the root) C and R land in |
 | **contract change** | a touched path matches `contract_path_markers` (`api-types`, `/event.rs`, `schema`, `/mcp`, `.d.ts`, …) or a changed **type** matches `contract_symbol_markers` (`event`, `schema`, `tool`, `api`, `request`, `response`, `dto`, `payload`) |

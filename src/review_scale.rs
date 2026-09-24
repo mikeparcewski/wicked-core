@@ -96,8 +96,9 @@ impl GraphAge {
 /// What the graph says about the change. Plain data, so the score is testable without a graph.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ImpactSignals {
-    /// |C|: symbols whose lines the diff touches. A touched file with no indexed symbol (a new
-    /// file, an unindexed file) counts as one changed symbol with no dependents.
+    /// |C|: symbols whose lines the diff touches; a touched file with none (a rename, a mode
+    /// change, lines outside every symbol) is its file node. A touched file the graph does not
+    /// know (a new file) counts as one changed symbol with no dependents.
     pub changed_symbols: u32,
     /// |R|: distinct dependents of C within [`Thresholds::hops`], outside C.
     pub dependents: u32,
@@ -427,14 +428,17 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
                 .iter()
                 .any(|l| sp.start_line <= *l && *l <= sp.end_line)
         };
-        // The symbols whose lines the diff touches; a file whose touched lines sit outside every
-        // symbol (top-level statements, imports) is represented by its file node.
+        // The symbols whose lines the diff touches. Otherwise the file node stands for the file:
+        // touched lines outside every symbol (top-level statements, imports), or NO touched lines
+        // at all (a pure rename/move, a mode change), whose importers still count (review on
+        // #600: a rename of a heavily imported module read as a leaf). Only an old path the
+        // graph does not know (a new file) is unindexed.
         let mut hits: Vec<&Node> = in_file
             .iter()
             .copied()
             .filter(|n| n.kind != NodeKind::File && overlaps(n))
             .collect();
-        if hits.is_empty() && !f.old_lines.is_empty() {
+        if hits.is_empty() {
             hits = in_file
                 .iter()
                 .copied()

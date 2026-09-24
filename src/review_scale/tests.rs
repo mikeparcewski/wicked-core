@@ -543,6 +543,53 @@ fn hot_symbol_shifted_by_an_insertion_above_it_still_scores_80() {
     assert_ne!(a.score, 20);
 }
 
+/// Review on #600: a pure rename/move has no hunks, so `old_lines` is empty and the file node was
+/// never seeded; a heavily imported module read as one unindexed symbol with no dependents (20).
+/// The old path IS in the graph, so its file node is the changed symbol and its importers count.
+#[test]
+fn rename_only_of_a_heavily_imported_module_counts_its_importers() {
+    let mut nodes = vec![node("core_file", NodeKind::File, "src/core.rs", (1, 200))];
+    let mut edges = Vec::new();
+    for i in 0..40u32 {
+        let importer = format!("importer{i}");
+        nodes.push(node(
+            &importer,
+            NodeKind::File,
+            &format!("src/user{i}.rs"),
+            (1, 50),
+        ));
+        edges.push(edge(&importer, "core_file", EdgeKind::Imports));
+    }
+    let store = graph(&nodes, &edges);
+    let d = "\
+diff --git a/src/core.rs b/src/runtime/core.rs
+similarity index 100%
+rename from src/core.rs
+rename to src/runtime/core.rs
+";
+    let diff = signals_from_diff(d);
+    assert_eq!((diff.code_files, diff.lines_added), (1, 0), "{diff:?}");
+    assert!(diff.touched[0].old_lines.is_empty(), "{:?}", diff.touched);
+
+    let a = assess(&diff, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!((s.changed_symbols, s.dependents), (1, 40), "{s:?}");
+    assert!(a.score >= 60, "{a:?}");
+    assert_eq!((a.score, a.plan), (80, PLAN_MOST), "{a:?}");
+
+    // A truly new file (its old path absent from the graph) is still one unindexed symbol.
+    let new_leaf = signals_from_diff(
+        "diff --git a/src/leaf.rs b/src/leaf.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/leaf.rs\n@@ -0,0 +1 @@\n+fn leaf() {}\n",
+    );
+    let a = assess(&new_leaf, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(
+        (s.changed_symbols, s.dependents, a.score),
+        (1, 0, 20),
+        "{a:?}"
+    );
+}
+
 // ── The diff side ────────────────────────────────────────────────────────────────────────────
 
 #[test]
