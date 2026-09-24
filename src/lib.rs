@@ -124,6 +124,7 @@ pub use gate_hook::{
     ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION,
     GATE_SCOPE_ENV,
 };
+pub use team::{TeamLedger, TeamPlan};
 // Governance evals — the JSON-string seams the core-ts binding wraps 1:1
 // (`core.governanceEvals(argsJson)` / `core.governanceCorpusImport(argsJson)`); the report and
 // receipt JSON these return are the pinned crew `/testing/evals` wire contract, passed through
@@ -556,6 +557,26 @@ impl Core {
         // The runner knows the store it serves (codex round 8): the database's canonical parent is
         // the daemon's operational state home, fenced on every launch — snapshot or not.
         let runner = std::sync::Arc::new(AcpStepRunner::new_for_store(tx.clone(), &path));
+        // DES-TEAMING-001 S2 (#601): the per-daemon team supervisor, subscribed to the engine's own
+        // event fan-out (queued ahead of the actor's start, so it sees every event), running
+        // monitors through a WEAK handle on this runner. Dormant until a unit is teamed.
+        {
+            let (sub_tx, sub_rx) = channel();
+            let _ = tx.send(Command::Subscribe(sub_tx));
+            let emit_tx = tx.clone();
+            let emit: crate::team::Emit = std::sync::Arc::new(move |ev| {
+                let _ = emit_tx.send(Command::EmitEvent(ev));
+            });
+            let host: std::sync::Arc<dyn crate::team::MonitorHost> = std::sync::Arc::new(
+                crate::acp_runner::RunnerHost(std::sync::Arc::downgrade(&runner)),
+            );
+            runner.install_team(crate::team::spawn_supervisor(
+                host,
+                emit,
+                sub_rx,
+                crate::team::TeamLimits::from_env(),
+            ));
+        }
         // Share the maps and write registry already inside the runner so the actor and the
         // ACP execution layer use a single consistent lock.
         let actor_maps = runner.elicitation_maps().clone();

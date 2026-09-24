@@ -24,7 +24,7 @@ fn f(id: &str, severity: Severity) -> Finding {
     }
 }
 
-fn key() -> AdviceKey {
+fn key() -> UnitKey {
     ("run-1".to_string(), 3, 1)
 }
 
@@ -118,7 +118,7 @@ fn leftover_advice_is_disclosed_not_delivered_with_the_reason() {
     assert_eq!(j["findingIds"], serde_json::json!([A]));
     assert!(m.take_queued(&key()).is_empty());
 
-    let k2: AdviceKey = ("run-1".to_string(), 3, 2);
+    let k2: UnitKey = ("run-1".to_string(), 3, 2);
     m.mark_steering_channel(&k2);
     assert!(m.queue(k2.clone(), f(B, Severity::High)));
     let j = finish_attempt(&m, &k2, Some("ok"))[0].to_json();
