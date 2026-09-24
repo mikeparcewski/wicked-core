@@ -1271,3 +1271,134 @@ fn fold_is_idempotent_under_duplicates_and_order() {
         }
     );
 }
+
+// ── Fail-closed parsing and folding (review of #616) ─────────────────────────────────────────────
+
+/// A severity the bar does not know is refused at parse: it can never reach the fold as a
+/// finding that silently vanishes.
+#[test]
+fn an_unknown_severity_is_rejected_at_parse() {
+    for bad in ["hihg", "low", "HIGH", ""] {
+        let mut p = fixture(FINDING_RAISED);
+        p["severity"] = json!(bad);
+        assert!(
+            TeamEvent::from_payload(FINDING_RAISED, &p).is_err(),
+            "severity {bad:?} must not parse"
+        );
+    }
+}
+
+/// Every enum §6 documents is a closed set on the wire: an unknown token is refused at parse.
+#[test]
+fn an_unknown_token_in_any_enum_field_is_rejected_at_parse() {
+    let cases: [(&str, &str); 24] = [
+        (PATH_STARTED, "selection"),
+        (PATH_SCORED, "basis"),
+        (PLAN_PROPOSED, "kind"),
+        (PLAN_REVISED, "reason"),
+        (PLAN_ACCEPTED, "mode"),
+        (MEMBER_JOINED, "role"),
+        (MEMBER_JOINED, "status"),
+        (MEMBER_LEFT, "status"),
+        (CHECKPOINT_REACHED, "status"),
+        (FINDING_RAISED, "severity"),
+        (ADVICE_DELIVERED, "channel"),
+        (ADVICE_DELIVERED, "outcome"),
+        (ADVICE_ANSWERED, "disposition"),
+        (STEP_COMPLETED, "status"),
+        (STEP_REVIEWED, "verdict"),
+        (STEP_REVIEWED, "to"),
+        (FINDING_SETTLED, "status"),
+        (COUNCIL_CALLED, "trigger"),
+        (COUNCIL_RULED, "verdict"),
+        (LEDGER_FOLDED, "final_pass"),
+        (LEDGER_FOLDED, "transport"),
+        (GATE_DECIDED, "kind"),
+        (GATE_DECIDED, "decision"),
+        (PATH_ENDED, "status"),
+    ];
+    for (t, field) in cases {
+        let mut p = fixture(t);
+        assert!(p.get(field).is_some(), "{t}.{field} exists");
+        p[field] = json!("not_a_token");
+        assert!(
+            TeamEvent::from_payload(t, &p).is_err(),
+            "{t}.{field} = \"not_a_token\" must not parse"
+        );
+    }
+    let nested: [(&str, &[&str]); 8] = [
+        (PATH_SCORED, &["plan", "depth"]),
+        (PLAN_PROPOSED, &["steps", "2", "owner"]),
+        (PLAN_ACCEPTED, &["steps", "0", "added_by"]),
+        (GATE_OPENED, &["ledger_source"]),
+        (LEDGER_FOLDED, &["ledger", "findings", "0", "status"]),
+        (LEDGER_FOLDED, &["ledger", "findings", "0", "delivery"]),
+        (LEDGER_FOLDED, &["ledger", "monitors", "0", "status"]),
+        (
+            LEDGER_FOLDED,
+            &["ledger", "findings", "0", "dispute", "verdict"],
+        ),
+    ];
+    for (t, path) in nested {
+        let mut p = fixture(t);
+        let mut slot = &mut p;
+        for seg in path {
+            slot = match seg.parse::<usize>() {
+                Ok(i) => &mut slot[i],
+                Err(_) => &mut slot[*seg],
+            };
+        }
+        assert!(!slot.is_null(), "{t}.{path:?} exists");
+        *slot = json!("not_a_token");
+        assert!(
+            TeamEvent::from_payload(t, &p).is_err(),
+            "{t}.{path:?} = \"not_a_token\" must not parse"
+        );
+    }
+}
+
+/// A row that names a finding the stream never raised is not dropped: the record is incomplete,
+/// so the fold says `stream_gap` and pauses (DES-002 §4.7: an incomplete team record goes to a
+/// human, never auto-approved). Every raised HIGH is in the ledger.
+#[test]
+fn a_high_never_disappears_and_an_orphan_row_is_a_stream_gap() {
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2")
+        .raised(1, "high")
+        .raised(2, "high")
+        .injected(2)
+        .answered(2, "build", "accepted", "fixed")
+        // raise_seq 7 was never raised on this stream (lost, or aged out):
+        .answered(7, "build", "declined", "documented")
+        .completed("ok")
+        .left("m1", "claude#2", 1);
+    let l = s.fold_json();
+    assert_eq!(
+        l["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["findingId"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(fid(1)), json!(fid(2))],
+        "every raised HIGH is in the ledger"
+    );
+    assert_eq!(l["finalPass"], json!("stream_gap"));
+    assert_eq!(l["teamPause"], json!(true));
+
+    // Each orphan kind is a gap: a delivery, a settle and a council ruling on an unraised finding.
+    for orphan in ["delivered", "settled", "ruled"] {
+        let mut s = Stream::new();
+        s.joined("m1", "claude#2")
+            .raised(1, "medium")
+            .completed("ok");
+        match orphan {
+            "delivered" => s.injected(9),
+            "settled" => s.settled(9, "withdrawn", "gone", None),
+            _ => s.ruled(9, "yes", None),
+        };
+        let l = s.fold_json();
+        assert_eq!(l["finalPass"], json!("stream_gap"), "{orphan}");
+        assert_eq!(l["teamPause"], json!(true), "{orphan}");
+    }
+}
