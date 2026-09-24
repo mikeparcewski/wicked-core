@@ -735,8 +735,9 @@ impl Core {
     /// predates the rule — crew's two-library stress suite keys on its presence.
     #[napi]
     pub fn bus_connection_stats(path: String) -> Option<String> {
-        wicked_core::shared_bus_stats(&path)
-            .map(|(opens, opener)| serde_json::json!({ "opens": opens, "opener": opener }).to_string())
+        wicked_core::shared_bus_stats(&path).map(|(opens, opener)| {
+            serde_json::json!({ "opens": opens, "opener": opener }).to_string()
+        })
     }
 
     /// EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
