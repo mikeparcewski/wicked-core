@@ -663,7 +663,9 @@ pub trait MonitorHost: Send + Sync {
     fn admitted(&self, seat: &str) -> Result<(), String>;
     /// Start (or reuse) the monitor session `pool_key` on `seat`, read-only over `scope`.
     fn open(&self, pool_key: &str, seat: &str, scope: &MonitorScope) -> Result<(), String>;
-    /// One monitor turn; the reply text.
+    /// One monitor turn; the reply text. `Err` means the turn failed AND the host closed the
+    /// session (`AcpStepRunner::monitor_turn` evicts on any failure): the supervisor reopens it
+    /// on the next batch through [`MonitorHost::open`].
     fn turn(&self, pool_key: &str, prompt: &str, budget: Duration) -> Result<String, String>;
     /// Close the session.
     fn close(&self, pool_key: &str);
@@ -878,7 +880,14 @@ impl UnitTeam {
             run_id: self.ctx.run_id.clone(),
             ord: self.ctx.ord,
             attempt: self.ctx.attempt,
-            reason: format!("team plan monitors={}", self.ctx.plan.monitors),
+            reason: if m.batches > 0 {
+                format!(
+                    "team plan monitors={}; reopened after a failed turn",
+                    self.ctx.plan.monitors
+                )
+            } else {
+                format!("team plan monitors={}", self.ctx.plan.monitors)
+            },
         }
     }
 
@@ -896,8 +905,11 @@ impl UnitTeam {
             BatchOutcome::SnapshotFailed(e) => m.error = Some(e),
             // The tree did not move: nothing opened, nothing spent.
             BatchOutcome::Skipped => {}
+            // The host EVICTS the session on any failed turn (`monitor_turn` → `monitor_close`),
+            // so the slot goes back to `Pending`: the next batch reopens it (`needs_open`) and
+            // runs, instead of every later turn failing "monitor is not open" (codex, #609 r2).
             BatchOutcome::TurnFailed { error, timed_out } => {
-                m.state = SlotState::Open;
+                m.state = SlotState::Pending;
                 m.batches += 1;
                 m.primed = false;
                 m.timed_out |= timed_out;
@@ -923,7 +935,8 @@ impl UnitTeam {
                         severity,
                         path: raw.path,
                         line: raw.line,
-                        evidence: cap_utf8(&raw.evidence, EVIDENCE_CAP),
+                        // Confirmed exact and within the cap (`run_job`): never truncated.
+                        evidence: raw.evidence,
                         claim: cap_utf8(&raw.claim, CLAIM_CAP),
                         suggestion: raw.suggestion.as_deref().map(|s| cap_utf8(s, CLAIM_CAP)),
                         tree: tree.clone(),
@@ -1101,6 +1114,25 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost, emit: &Emit) -> BatchDone
             rejected.below_bar += 1;
             continue;
         };
+        // `evidence` IS the line text (DES §7: ≤ 512 B). A longer quote is refused HERE, as
+        // unconfirmed — never confirmed exact and then truncated, which would emit evidence that
+        // is not the line and let the final re-confirmation call a present line superseded
+        // (codex, #609 r2). Said in the daemon log, since `rejected` carries counts only.
+        if f.evidence.len() > EVIDENCE_CAP {
+            rejected.unconfirmed += 1;
+            eprintln!(
+                "[wicked-core] team: {}:{}:{} monitor {} finding at {}:{} rejected as unconfirmed: \
+                 evidence over cap ({} B > {EVIDENCE_CAP} B)",
+                job.run_id,
+                job.ord,
+                job.attempt,
+                job.monitor_id,
+                f.path,
+                f.line,
+                f.evidence.len()
+            );
+            continue;
+        }
         if !confirm(repo.file(&tree, &f.path).as_deref(), f.line, &f.evidence) {
             rejected.unconfirmed += 1;
             continue;

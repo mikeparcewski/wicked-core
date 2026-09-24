@@ -87,13 +87,19 @@ impl Drop for Fixture {
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A monitor host that counts what it is asked and answers from a script keyed by seat.
+/// A monitor host that counts what it is asked and answers from a script keyed by seat. It keeps
+/// the real host's session rule: a turn runs only on an OPEN key, and a failed turn EVICTS the
+/// session (`AcpStepRunner::monitor_turn` closes it), so the next turn on that key fails
+/// "is not open" unless the supervisor reopened it.
 #[derive(Default)]
 struct FakeHost {
     opens: Mutex<Vec<String>>,
+    open_keys: Mutex<std::collections::HashSet<String>>,
     turns: AtomicUsize,
     replies: Mutex<HashMap<String, String>>,
     unadmitted: Vec<String>,
+    /// Fail the next turn (and evict its session), once.
+    fail_next_turn: std::sync::atomic::AtomicBool,
 }
 
 impl MonitorHost for FakeHost {
@@ -104,12 +110,20 @@ impl MonitorHost for FakeHost {
             Ok(())
         }
     }
-    fn open(&self, _pool_key: &str, seat: &str, _scope: &MonitorScope) -> Result<(), String> {
+    fn open(&self, pool_key: &str, seat: &str, _scope: &MonitorScope) -> Result<(), String> {
         self.opens.lock().unwrap().push(seat.to_string());
+        self.open_keys.lock().unwrap().insert(pool_key.to_string());
         Ok(())
     }
     fn turn(&self, pool_key: &str, _prompt: &str, _budget: Duration) -> Result<String, String> {
         self.turns.fetch_add(1, Ordering::Relaxed);
+        if !self.open_keys.lock().unwrap().contains(pool_key) {
+            return Err(format!("monitor '{pool_key}' is not open"));
+        }
+        if self.fail_next_turn.swap(false, Ordering::Relaxed) {
+            self.open_keys.lock().unwrap().remove(pool_key);
+            return Err("monitor turn ended Failed: the bridge died".to_string());
+        }
         let replies = self.replies.lock().unwrap();
         Ok(replies
             .iter()
@@ -117,7 +131,9 @@ impl MonitorHost for FakeHost {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "DONE".to_string()))
     }
-    fn close(&self, _pool_key: &str) {}
+    fn close(&self, pool_key: &str) {
+        self.open_keys.lock().unwrap().remove(pool_key);
+    }
 }
 
 fn recorder() -> (Emit, Arc<Mutex<Vec<CoreEvent>>>) {
@@ -718,6 +734,116 @@ fn the_final_pass_reviews_the_settled_tree_and_reconfirms_every_finding() {
             (1, Some(2), "unanswered".to_string()),
             (3, None, "superseded".to_string()),
         ]
+    );
+}
+
+/// codex review of #609 r2 (HIGH): the host EVICTS a monitor session on any failed turn
+/// (`monitor_turn` → `monitor_close`), but the slot went back to `Open`, so the next batch skipped
+/// `host.open` and every later turn of the attempt failed "monitor is not open". One rule now: a
+/// failed turn puts the slot back to `Pending`, and the next batch reopens the session and runs.
+#[test]
+fn a_failed_monitor_turn_evicts_the_session_and_the_next_batch_reopens_it() {
+    let fx = Fixture::new("reopen");
+    let host = Arc::new(FakeHost::default());
+    host.replies.lock().unwrap().insert(
+        "m1".into(),
+        r#"FINDING {"severity":"high","path":"src/lib.rs","line":3,"evidence":"    let x = 3;","claim":"magic"}
+DONE"#
+            .into(),
+    );
+    let (emit, seen) = recorder();
+    let limits = TeamLimits {
+        batch_min_interval: Duration::ZERO,
+        ..TeamLimits::default()
+    };
+    let mut core = TeamCore::new(host.clone(), emit.clone(), limits);
+    core.attach(fx.ctx(1, &["claude#2"]));
+    fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    core.on_event(&checkpoint(1, "edit"));
+    host.fail_next_turn.store(true, Ordering::Relaxed);
+    assert_eq!(pump(&mut core, &host, &emit, Instant::now()), 1);
+    assert_eq!(
+        host.turns.load(Ordering::Relaxed),
+        1,
+        "the first turn ran and failed"
+    );
+    assert!(findings(&seen).is_empty());
+    // The worker keeps editing; the next batch must reopen the evicted session and review.
+    fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 3;\n}\n");
+    core.on_event(&checkpoint(2, "edit"));
+    assert_eq!(pump(&mut core, &host, &emit, Instant::now()), 1);
+    assert_eq!(
+        host.opens.lock().unwrap().len(),
+        2,
+        "the session was reopened after the eviction"
+    );
+    assert_eq!(host.turns.load(Ordering::Relaxed), 2);
+    let found = findings(&seen);
+    assert_eq!(
+        found.len(),
+        1,
+        "the reopened monitor reviewed the batch: {found:?}"
+    );
+    let ledger = core
+        .take(fx.ctx(1, &["claude#2"]))
+        .lock()
+        .unwrap()
+        .ledger("completed");
+    assert_eq!(ledger.monitors[0].batches, 2);
+    assert_eq!(ledger.monitors[0].status, "completed");
+}
+
+/// codex review of #609 r2 (MEDIUM): `evidence` IS the line text, so a quote over the 512 B cap
+/// is rejected at admission (`unconfirmed`) — never confirmed exact and then truncated, which
+/// would emit evidence that is not the line and make the final re-confirmation mark a
+/// still-present line superseded. A short finding in the same reply is unaffected.
+#[test]
+fn an_evidence_quote_over_the_cap_is_unconfirmed_never_truncated() {
+    let fx = Fixture::new("evidence-cap");
+    let host = Arc::new(FakeHost::default());
+    let long = "x".repeat(2048);
+    host.replies.lock().unwrap().insert(
+        "m1".into(),
+        format!(
+            "FINDING {{\"severity\":\"high\",\"path\":\"src/lib.rs\",\"line\":2,\"evidence\":\"{long}\",\"claim\":\"long line\"}}\n\
+             FINDING {{\"severity\":\"high\",\"path\":\"src/lib.rs\",\"line\":1,\"evidence\":\"fn a() {{}}\",\"claim\":\"a is dead\"}}\n\
+             DONE"
+        ),
+    );
+    let (emit, seen) = recorder();
+    let mut core = TeamCore::new(host.clone(), emit.clone(), TeamLimits::default());
+    core.attach(fx.ctx(1, &["claude#2"]));
+    fx.write("src/lib.rs", &format!("fn a() {{}}\n{long}\n"));
+    core.on_event(&checkpoint(1, "edit"));
+    assert_eq!(pump(&mut core, &host, &emit, Instant::now()), 1);
+    let found = findings(&seen);
+    assert_eq!(found.len(), 1, "{found:?}");
+    match &found[0] {
+        CoreEvent::MonitorFinding { line, evidence, .. } => {
+            assert_eq!((*line, evidence.as_str()), (1, "fn a() {}"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let ledger = core
+        .take(fx.ctx(1, &["claude#2"]))
+        .lock()
+        .unwrap()
+        .ledger("completed");
+    assert_eq!(
+        ledger.rejected,
+        Rejected {
+            malformed: 0,
+            below_bar: 0,
+            unconfirmed: 1,
+            duplicate: 0
+        }
+    );
+    assert!(
+        ledger
+            .findings
+            .iter()
+            .all(|f| f.finding.evidence.len() <= 512),
+        "no evidence in the ledger is over the cap"
     );
 }
 
