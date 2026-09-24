@@ -259,6 +259,9 @@ fn load_bus_ttls(db_path: &str) -> (i64, i64) {
 #[derive(Clone)]
 pub struct BusDb {
     conn: Arc<Mutex<Connection>>,
+    /// The path this handle was opened at — so a consumer holding the handle can name its bus
+    /// (e.g. exec mediation's judge publishes over the SAME bus it consumes, with no env lookup).
+    path: Arc<str>,
     /// Default event TTL in hours (`config.ttl_hours`), loaded from the wicked-bus `config.json` at
     /// open time (falls back to [`DEFAULT_TTL_HOURS`]). Threaded into [`emit`] so `expires_at` matches
     /// what JS `emit()` computes under the SAME operator config.
@@ -283,6 +286,7 @@ impl BusDb {
         let (default_ttl_hours, dedup_ttl_hours) = init_bus_connection(&conn, path)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: Arc::from(path),
             default_ttl_hours,
             dedup_ttl_hours,
         })
@@ -317,6 +321,7 @@ impl BusDb {
         };
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: Arc::from(path),
             default_ttl_hours,
             dedup_ttl_hours,
         };
@@ -360,6 +365,11 @@ impl BusDb {
                 }
             }
         }
+    }
+
+    /// The path this handle was opened at.
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -991,8 +1001,11 @@ pub enum BusBridgeState {
     NotArmed { reason: String },
 }
 
-/// Where `Core::spawn*` leaves the armed bridge for the actor to stop + join at its exit. The actor
-/// thread starts FIRST (its store open runs while the bridge arms), so the slot is filled after it.
+/// Where `Core::spawn*` leaves the armed bridge. The actor thread starts FIRST (its store open runs
+/// while the bridge arms), so the slot is filled after it. Both `spawn` and the actor hold it, and
+/// the bridge has ONE owner in the end: whichever drops the last reference drops the
+/// [`ArmedBridge`], which stops and joins it — the actor at its exit, or `spawn` itself when the
+/// actor already returned early (e.g. it could not open its store). No path leaves it running.
 pub(crate) type BridgeSlot = Arc<Mutex<Option<ArmedBridge>>>;
 
 /// The launch bridge as `Core::spawn*` armed it: the thread to stop + join at actor exit, and the
@@ -1001,6 +1014,16 @@ pub(crate) struct ArmedBridge {
     pub(crate) handle: Option<JoinHandle<()>>,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) state: BusBridgeState,
+}
+
+impl Drop for ArmedBridge {
+    /// Stop the bridge thread and join it: dropping the bridge is how its owner ends it.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Arm the launch bridge with a synchronous, BOUNDED handshake (DES-TEAMING-002 T0). Runs on the

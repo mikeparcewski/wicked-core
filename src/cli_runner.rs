@@ -97,11 +97,20 @@ pub const GATE_EVAL_RESPONDED: &str = "wicked.gate.eval.responded";
 /// every engine `WICKED_BUS_DB` now; keyed on that alone, every pinned judge on a default daemon
 /// would publish `wicked.gate.eval.requested` and deny after [`GATE_EVAL_TIMEOUT`] waiting for an
 /// evaluator daemon (`scripts/gate_eval_daemon.py`) that no product runs.
-fn gate_eval_bus_db() -> Option<String> {
-    gate_eval_bus_db_from(
-        std::env::var("WICKED_BUS_EXEC").ok().as_deref(),
-        std::env::var("WICKED_BUS_DB").ok().as_deref(),
-    )
+///
+/// `exec_bus` is the bus exec mediation RESOLVED for this unit — the cli-runner's own bus, or the
+/// actor's armed publisher's — and wins over process env: the env-free exec entry
+/// (`Core::spawn_with_engine_exec`) arms exec over an explicit path with no `WICKED_BUS_*` set.
+fn gate_eval_bus_db(exec_bus: Option<&str>) -> Option<String> {
+    exec_bus
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            gate_eval_bus_db_from(
+                std::env::var("WICKED_BUS_EXEC").ok().as_deref(),
+                std::env::var("WICKED_BUS_DB").ok().as_deref(),
+            )
+        })
 }
 
 /// [`gate_eval_bus_db`]'s rule over explicit values: both set and non-empty.
@@ -703,6 +712,9 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
 /// from every registry record; empty = no intersection (the bus path, tests). `benched` — the
 /// run's BENCHED seat keys (`AgentSession::benched_seats`, F-7R2-006): never a judge.
+///
+/// `exec_bus` — the bus exec mediation resolved for this unit (`None` off exec): the pinned judge
+/// publishes its evaluation request there ([`gate_eval_bus_db`]).
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -710,12 +722,13 @@ pub(crate) fn run_unit_and_judge(
     emit_delta: &DeltaSink,
     run_roster: &[String],
     benched: &[String],
+    exec_bus: Option<&str>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
-    run_unit_and_judge_with_roster(
+    run_unit_and_judge_on(
         runner,
         input,
         agent_review_target,
@@ -723,6 +736,7 @@ pub(crate) fn run_unit_and_judge(
         &crate::registry_roster(),
         run_roster,
         benched,
+        exec_bus,
     )
 }
 
@@ -769,6 +783,7 @@ fn with_floor_heartbeat<R>(
 /// The roster-injectable core of [`run_unit_and_judge`] — split out ONLY so the seat-selection (C1) is
 /// unit-testable with a fabricated roster and no live registry. Production always passes the live
 /// [`crate::registry_roster`].
+#[cfg(test)]
 fn run_unit_and_judge_with_roster(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -777,6 +792,33 @@ fn run_unit_and_judge_with_roster(
     roster: &[crate::AgenticCli],
     run_roster: &[String],
     benched: &[String],
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    run_unit_and_judge_on(
+        runner,
+        input,
+        agent_review_target,
+        emit_delta,
+        roster,
+        run_roster,
+        benched,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_unit_and_judge_on(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    agent_review_target: Option<&str>,
+    emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    benched: &[String],
+    exec_bus: Option<&str>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -939,7 +981,7 @@ fn run_unit_and_judge_with_roster(
             // no TTY). On timeout or any error the function returns a hard DENY (fail-closed
             // governance — a timeout must never silently approve a gate by falling back to
             // deterministic-only).
-            if let Some(bus_path) = gate_eval_bus_db() {
+            if let Some(bus_path) = gate_eval_bus_db(exec_bus) {
                 // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
                 // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
                 let work_author = input.unit.assigned_cli.as_deref();
@@ -1316,6 +1358,12 @@ const PUBLISH_BUDGET: Duration = Duration::from_millis(250);
 /// Disarm exec-mediation on the current thread (actor loop exit).
 pub(crate) fn disarm_exec_publisher() {
     EXEC_PUBLISHER.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// The bus exec mediation is armed over on THIS thread (the actor), if any — handed to the
+/// in-process worker's judge when a publish falls back in-process.
+pub(crate) fn armed_exec_bus() -> Option<String> {
+    EXEC_PUBLISHER.with(|cell| cell.borrow().as_ref().map(|db| db.path().to_string()))
 }
 
 /// Whether exec-mediation is armed on THIS thread (the actor). `dispatch_unit` branches on this.
@@ -2035,6 +2083,8 @@ fn run_cli_runner(
                     // (F-7R2-006): the bus-mediated judge picks from the whole registry roster.
                     &[],
                     &[],
+                    // Exec mediation's judge publishes over the bus this consumer runs on.
+                    Some(db.path()),
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),

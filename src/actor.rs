@@ -3323,16 +3323,13 @@ pub(crate) fn run(
         }
     }
     // Stop + join the bus bridge poller (if any) so it is never leaked past the actor's lifetime.
+    // (`ArmedBridge::drop` sets its stop flag and joins it; an early return above drops this
+    // thread's reference instead, and the last reference — here or in `spawn` — does the same.)
     let armed = bus_bridge
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    if let Some(armed) = armed {
-        armed.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = armed.handle {
-            let _ = h.join();
-        }
-    }
+    drop(armed);
     // Stop + join the exec-mediation threads (cli-runner + task.completed poller) and disarm the
     // actor-thread publisher, so exec mode leaks no thread past the actor's lifetime (DES §5, R1).
     // BOUNDED-join, not unbounded (seam finding #5): the cli-runner may be mid-CLI (an unbounded
@@ -7014,6 +7011,9 @@ fn dispatch_unit(
         .collect();
     let runner = runner.clone();
     let tx = self_tx.clone();
+    // The bus exec mediation is armed over (a publish that fell back in-process): the judge still
+    // publishes there — read HERE, on the actor thread that owns the thread-local publisher.
+    let exec_bus = crate::cli_runner::armed_exec_bus();
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -7050,6 +7050,7 @@ fn dispatch_unit(
             &emit,
             &run_roster_keys,
             &benched_keys,
+            exec_bus.as_deref(),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,
