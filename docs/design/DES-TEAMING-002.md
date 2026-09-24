@@ -1,7 +1,13 @@
 # DES-TEAMING-002 — The team model on the bus: one transport, one grammar, one phase catalog
 
-- **Status:** DRAFT (rev 4). **No `[OPERATOR DECISION]` block remains.** The operator decided all three on 2026-09-23, and each decision is written into the text it governs. **Decision 1:** no pre-canned workflows. One phase catalog; the S4 score sets the minimum phases; plans re-decide mid-run upward only; user-composed plans and named presets go through the same mechanism; every workflow consumer migrates onto the catalog (§8.3–§8.7, §11). **Decision 2:** a plan needs human approval by default; auto mode proceeds without it; high risk always needs it (§8.6). **Decision 3:** the PA owns a member's step (§8.8). One item is a **recommendation awaiting the operator**: the floor-override rule (§8.5).
+- **Status:** DRAFT (rev 5). **No `[OPERATOR DECISION]` block remains.** The operator decided all three on 2026-09-23, and each decision is written into the text it governs. **Decision 1:** no pre-canned workflows. One phase catalog; the S4 score sets the minimum phases; plans re-decide mid-run upward only; user-composed plans and named presets go through the same mechanism; every workflow consumer migrates onto the catalog (§8.3–§8.7, §11). **Decision 2:** a plan needs human approval by default; auto mode proceeds without it; high risk always needs it (§8.6). **Decision 3:** the PA owns a member's step (§8.8). One item is a **recommendation awaiting the operator**: the floor-override rule (§8.5).
 - **Date:** 2026-09-23
+- **Rev 5 (2026-09-23):** review on #612 at `c2443f1` (3 HIGH, each verified at the code), plus a re-sweep of every "as today"/"unchanged" claim against the code.
+  1. A gate-originated `plan.proposed` takes its `source` from the gate's `gate_id`. The interaction id is `deterministic_id(session, "gate", ord)` (`src/interaction.rs:141-144`), which every gate at that ord reuses (§6.1, T3 (i)).
+  2. Supervisor restart is **one mechanism, a startup replay of live runs**, with run-level team state persisted on the session. A restart never resumes an in-flight attempt (the attempt is reported orphaned or redriven at attempt+1, `src/actor.rs:1058-1065`, `:3993-4030`), so the replay's job is plan and gate state plus the prior attempt's findings (§4.7, T6 (k)).
+  3. **[COORDINATOR RECOMMENDATION] Evaluator ≠ creator for team runs.** Never `creator_seat`: a distinct CLI, else a second usable instance of an eligible CLI (`same_cli_instance`), else refuse `NoEligibleSeat`. Today a bench-free roster keeps review on the creator seat (`src/distribute.rs:286-290`, `:417-426`; refusal only when a bench caused it, `:388-409`). Legacy consumers keep today's behaviour until their migration seam (§8.1, §11.3, seam D1).
+
+  The sweep corrected four overclaims (§16.1).
 - **Rev 4 (2026-09-23):** review on #612 at `5ba3a2c` (2 HIGH, 1 MEDIUM, each verified at the code), plus a sweep of every idempotency key against its payload. (1) A plan with a creator step and no declared `touch[]` now scores `no_graph_score` (100, "no declared scope"), S4's fail-closed rule (`src/review_scale.rs:264-265`, `:281`). Only a plan with no creator step may score 0 (§8.2, §8.4, T2 (g)). (2) Gates are keyed by a `gate_id` minted from a per-run gate sequence, so a re-opened `plan_approval` gate is a new row, not a dedup onto the old one (`src/bus.rs:316-345`) (§6, §8.6, T3 (i)). (3) `advice.delivered` is one row per finding (§6, §8.9, T5). The sweep fixed seven more keys (§6.1). The T5–T9 acceptance text that rev 3 cited as "rev 2's" is now inlined.
 - **Rev 3 (2026-09-23):** folds in the operator decisions above and the consumer constraint: every workflow consumer is inventoried (§11.1), mapped onto the catalog (§11.2) and given a before/after behaviour table with named contract tests (§11.3). Migrating them is in scope, one seam per consumer, with no dual path (§14). New: the phase catalog (§8.3), plans and presets (§8.4), the floor and high-risk table (§8.5), the approval matrix and the `plan_approval` gate (§8.6), `plan.revised` with the re-score trigger (§8.7). The event table gains `plan.revised`, and `gate.opened`/`gate.decided` gain `kind` (§6). Citations re-verified at core `main` `fe94ffc`, which now includes S4 (#600).
 - **Rev 2 (2026-09-23):** review on #612 at `06db4cd`: the exact idempotency-key algorithm with test vectors; the explicit `owner` field; the step-boundary dedup keyed on `outcome:"injected"`; an enum sweep.
@@ -90,7 +96,7 @@ Every consumer is a named cursor with a filter, and every consumer is idempotent
 
 | Consumer | Where | Cursor name | Filter | Floor on start | Idempotency |
 |---|---|---|---|---|---|
-| Team supervisor (monitors' host) | core thread (S2's, re-homed) | `team-supervisor-<actor_process_gen>` (`consumer_name` pattern, `src/cli_runner.rs:1407`) | `wicked.team.**` | `tail_event_id()` at spawn (`src/bus.rs:348`): a restart starts at "now"; the attempts it was tracking are re-attached from `step.claimed` **replayed for live runs** (§8.5) | per `(run, ord, attempt)` state keyed by `finding_id`, `step_id`, `checkpoint.seq` |
+| Team supervisor (monitors' host) | core thread (S2's, re-homed) | `team-supervisor-<actor_process_gen>` (`consumer_name` pattern, `src/cli_runner.rs:1407`); no durable floor is needed because start-up replays (§4.7) | `wicked.team.**` | **Replay, then tail** (§4.7): at spawn it snapshots `tail_event_id()` = T (`src/bus.rs:348`), replays `wicked.team.**` for every live run from that run's `stream_floor` up to T, then polls live from T | per `(run, ord, attempt)` state keyed by `finding_id`, `step_id`, `checkpoint.seq` |
 | Steer point (S3) | ACP carrier, per attempt | none persisted — the attempt's floor is the `event_id` of its own `step.claimed` | `wicked.team.finding.raised` | the attempt's `step.claimed` id | a per-attempt `delivered: BTreeSet<finding_id>` (replaces the mailbox `records`) |
 | Step-boundary injector | worker thread, before `run_unit_streaming` (`src/cli_runner.rs:761`) | none — one bounded read per step | `wicked.team.**` for `(run)` | the run's `path.started` id | renders only items for which no `advice.delivered` row with `outcome:"injected"` exists yet, on **any** `channel` (`acp_steering` or `boundary`) |
 | Gate wait (worker thread) | `src/cli_runner.rs:761` after the run returns | none — the `bus_request_agent_verdict` pattern (`:417-440`) | `wicked.team.gate.opened` | the attempt's `step.completed` id | matches `run_id, ord, attempt` |
@@ -113,6 +119,32 @@ One relay, the `interactiveEvent` pattern verbatim (`ws-relay.ts:148-162`): `bus
 ### 4.6 What stays on the engine fan-out, and why that is not "two mechanisms"
 
 The `CoreEvent` fan-out (`src/event_log.rs:492`) remains the engine's telemetry: `unitDispatched`, `unitDistributed`, `gateEvaluated`, `gateDecided`, `awaitingHuman`, the council's ballot-level events (`CouncilConvened`/`Deliberated`/`SeatFailed`/`Voted`), chat, terminals. The rule is **one mechanism per concern**: engine state changes are CoreEvents; team communication is `wicked.team.*`. No concern rides both. The six DES-001 team CoreEvents are deleted, not mirrored (§10).
+
+### 4.7 Restart: replay live runs, then tail (one mechanism)
+
+**What a restart loses and what it cannot lose.** No in-flight attempt survives a daemon restart. Anything still `Executing` without a worker in the new process is reported as orphaned and resumed by `POST /api/v1/runs/:id/resume`, or redriven by armed exec mode with the attempt bumped (`src/actor.rs:1058-1065`, `:3993-4030`). Either way, the unit continues as **attempt n+1**, whose `step.claimed` is published after the restart and reaches the supervisor live. So nothing waits on a gate timeout for the dead attempt. What the supervisor must recover is:
+- (a) each live run's **team state**: the accepted plan, the floor band, the gate sequence, the member targets;
+- (b) the **findings of the attempt that died**, so attempt n+1's advice block and rework context carry them instead of silently dropping them.
+
+**Team state lives in the core store, not the bus.** `AgentSession.team: { plan_rev, plan: steps[], floor_band, high_risk, gate_seq, stream_floor }` is written by the actor in the same batch as each `plan.accepted`, `plan.revised` or pause. It is additive, `#[serde(default)]`. `stream_floor` is the `event_id` of the run's `path.started`: the `TeamPublisher` reports it back with `Command::TeamStreamFloor { run_id, event_id }`, the `self_tx` write-back pattern the bus pollers already use (`src/bus.rs:27-33`). The per-run `WorkflowDef` `"<run>:plan-<rev>"` is re-registered from `team.plan` at boot, because the workflow registry is in-memory (`src/workflow.rs:980-997`).
+
+**Replay procedure (supervisor spawn):**
+1. Snapshot `T = tail_event_id()` on the spawning thread (`src/bus.rs:344-353`, the same "cannot miss an event emitted right after" rule the launch poller uses).
+2. Ask the actor for live runs (`Command::LiveTeamRuns`: status `Executing` or `AwaitingHuman`), with their `team` state.
+3. For each, `poll("wicked.team.**", stream_floor - 1, …)` up to `T`, keep that run's rows, and fold them into the supervisor's state. The previous attempt's unresolved findings become the redriven attempt's carried findings, marked `carried_from_attempt`.
+4. Start the live cursor at `T`.
+
+Because consumers are keyed by entity id (§6.1), a row seen both in replay and live is harmless.
+
+**Why replay and not a stable cursor, against retention.** A stable cursor, resuming from the predecessor's last acknowledged row (the exec seam's `reclaim_predecessor_cursors`, `src/cli_runner.rs:1480`), re-delivers only rows **after** the acknowledgement. The supervisor's in-memory attempt state was built from rows **before** it, so a stable cursor would still need a replay to rebuild that state. Replay alone is sufficient, so it is the one mechanism.
+
+Retention bounds the replay:
+- The bus deletes rows 24 h after emission (`dedup_expires_at`; `reqs/SPEC.md:804-818`).
+- An attempt lasts at most `WICKED_UNIT_TIMEOUT_SECS` (default 7200 s; `src/acp_runner.rs:5911-5914`, `src/execute_wrapped.rs:1185-1189`), so every row of the attempt that died is inside the window.
+- A run that has been live longer than 24 h (e.g. paused at a gate for days) can have lost older rows. What those rows fed is already durable: the plan in `AgentSession.team`, each finished attempt's ledger in its unit's `gate.opened` snapshot (`UnitEvidence.team`, §4.4).
+- When `path.started` itself is gone, the supervisor logs one `stream_gap` line per run and carries nothing from before the gap. The gate of any unit whose attempt rows are missing gets `final_pass:"stream_gap"` and `team_pause:true`: an incomplete team record goes to a human, never auto-approved.
+
+**Cost:** one live-tier scan at spawn, bounded by 24 h of rows.
 
 ## 5. Grammar and envelope
 
@@ -170,7 +202,7 @@ A key must name exactly the entity **one row** describes, at the scope where tha
 
 | Row | Rev 3 key | Mismatch | Rev 4 key and rule |
 |---|---|---|---|
-| `plan.proposed` | `plan_rev` | Two authors (a user edit and a PA `PLAN+`) could each claim rev n+1; the second silently resolved to the first. Only the actor can assign a rev. | `proposal_id` = `"p-" + deterministic_key([run, by, source])`, where `source` is the event or request that produced it (the `understand` step's `step.completed` id, the gate answer's interaction id, the launch's session id). `plan_rev` is assigned by the engine on `plan.revised`/`plan.accepted` only. |
+| `plan.proposed` | `plan_rev` | Two authors (a user edit and a PA `PLAN+`) could each claim rev n+1; the second silently resolved to the first. Only the actor can assign a rev. | `proposal_id` = `"p-" + deterministic_key([run, by, source])`, where `source` is the event or request that produced it (the `understand` step's `step.completed` id, the gate's `gate_id` for a gate-originated proposal — never the interaction id, which every gate at one ord reuses (`src/interaction.rs:141-144`) — and the launch's session id for a launch). `plan_rev` is assigned by the engine on `plan.revised`/`plan.accepted` only. |
 | `plan.revised` | `plan_rev` | Published by the worker thread and the engine alike, but only the actor holds the counter. | Engine-only; the PA and member paths publish `plan.proposed` and the engine revises. |
 | `plan.accepted{refused}` | `plan_rev` | A refusal carried the previous rev and collided with the earlier acceptance row. | A refusal is its own row, `plan.refused`, keyed by `proposal_id`. |
 | `member.joined` / `member.left` | `member_id` | Member ids (`m1`, …) are unique per attempt only: the pool key is `team:<run>:<ord>:<attempt>:<monitorId>` (`src/team.rs:728-731`). | `ord`, `attempt`, `member_id` |
@@ -179,7 +211,7 @@ A key must name exactly the entity **one row** describes, at the scope where tha
 | `advice.delivered` | `finding_id`, `channel` | The payload batched `finding_ids`, and a finding can have more than one outcome on one channel over an attempt. | One row per finding: `ord`, `attempt`, `finding_id`, `channel`, `outcome`. A steer that carried several findings publishes one row each, sharing `steer_id`. |
 | `council.called` / `council.ruled` | `subject_id`, `attempt` | `subject_id` is a finding id or a step id, both unique only within a unit. | `ord`, `attempt`, `subject_id` |
 | `gate.opened` / `gate.decided` | `kind`, `ord`, `attempt` (+ `decision`) | A `plan_approval` gate re-opens at the same ord and attempt for a newer `plan_rev` (approve-with-edit refused, or a second revision before the next unit), and resolved to the old row. The durable interaction id cannot disambiguate: it is `deterministic_id(session, "gate", ord)` (`src/interaction.rs:141-144`) and is reused by every gate at that ord. | `gate_id`. For engine gates (`plan_approval`, `team_dispute`) it is `"g-" + run + "-" + gate_seq`: `AgentSession.gate_seq` is a per-run counter incremented by `pause_for_human` in the same batch that writes the pause (`src/actor.rs:6036-6046`), so a re-publish after a crash reuses it and every new opening gets a new one. For `unit_review` it is `"g-" + run + "-u" + ord + "-" + attempt`: exactly one per attempt, shared by the worker's timeout synthesis and the supervisor's late publish on purpose. `gate.decided` references its `gate_id`, one decision per gate. |
-| Every other gate kind | — | `team_dispute`: an approve-with-amend reruns at attempt n+1, which is a new gate either way; re-opening at the same attempt cannot happen (a refused answer leaves the row open rather than re-opening it, `src/actor.rs:7736`). `unit_review`: one per attempt by construction. | Covered by the `gate_id` rule above. |
+| Every other gate kind | — | `team_dispute`: an approve-with-amend reruns at attempt n+1, which is a new gate either way; re-opening at the same attempt cannot happen (a refused answer leaves the row open rather than re-opening it: `confirm_gate` refuses before resolving, `src/actor.rs:7758`). `unit_review`: one per attempt by construction. | Covered by the `gate_id` rule above. |
 | `help.requested` | `help_id` | `help_id` was not defined. | `help_id` = `"h-" + deterministic_key([run, ord, attempt, by, normalized question])` |
 | `path.started`, `path.scored` (`basis`, `score_seq`), `step.claimed` / `step.completed` (`step_id`, `attempt`, `by`), `step.reviewed` (`step_id`, `attempt`), `help.answered` (`help_id`, `by`), `path.ended` | unchanged | none: each names one entity at the scope where it is unique (`step_id` is unique across every rev of a run's plan, and `compose` refuses a duplicate id). | unchanged |
 
@@ -364,7 +396,15 @@ Exact payloads (envelope fields omitted after the first):
 ### 8.1 Start a path; choose the CLI (operator steps 1–3)
 
 - `LaunchSpec` gains `primary: Option<String>` (`src/lib.rs:193-216`), a seat-instance key from `clis`. `None` means the engine picks uniformly at random among the eligible seats (the `seat_candidates` set S5 computes, `src/distribute.rs:11`) and records `selection:"random"`. Crew's `POST /runs` body gains `primary` (`LaunchSchema`, `packages/crew/src/api/routes.ts:476-500`); studio's composer gains a seat picker with a **Random** option.
-- The PA seat is the run's **creator seat**. `teamed_distribution` (`src/distribute.rs:166`, result at `:174`) pins `winner` to the PA for every creator-role unit whose `owner` is `pa` (§8.8). `enforce_evaluator_distinct` (`src/distribute.rs:387`, fn `:547`) runs unchanged, so evaluator units land on a seat distinct from every creator, and the plan is refused (`NoEligibleSeat`) when none exists. Evaluator ≠ creator holds per step, structurally, exactly as today.
+- The PA seat is the run's **creator seat**. `teamed_distribution` (`src/distribute.rs:166`, result at `:174`) pins `winner` to the PA for every creator-role unit whose `owner` is `pa` (§8.8). `enforce_evaluator_distinct` (`src/distribute.rs:387`, fn `:547`) moves every evaluator unit off the creator seats.
+- **What it does today when it cannot.** A **bench-free** roster with no distinct seat keeps the review/test unit on its creator seat, disclosed as `distinctness_fallback:"creator_seat"` (`src/distribute.rs:286-290`, set at `:417-426`). The plan is refused with `NoEligibleSeat` **only** when a bench caused the shortfall (`:388-409`). A distinct instance of the creator's own CLI (`claude#2` grading `claude#1`) is already accepted and disclosed as `"same_cli_instance"` (`:291-294`).
+- **[COORDINATOR RECOMMENDATION — the operator can override] Team runs never use `creator_seat`.** For a team run, `distribute_units_against_benched` refuses whenever `same_seat` is non-empty, with or without a bench. In order:
+  1. a distinct CLI;
+  2. else a distinct **instance** of an eligible CLI (`same_cli_instance`, core#595/#605 instance seats);
+  3. else `NoEligibleSeat`, naming the unit and the missing instance.
+- **"Can be provisioned" means configured and usable.** The instance must be in the launch roster (`LaunchSpec.clis`) and signed in in its own configuration home. Each instance has its own home (`seat_instance_root_name`, `crates/wicked-apps-core/src/spawn.rs:1295`, tested injective at `:3173`; the ACP carrier looks up instance keys at `src/acp_runner.rs:8461-8468`), and therefore its own login. The engine never mints or signs in an instance itself; crew adds the instances it has configured for the eligible CLIs to a team run's roster.
+- **Non-team runs** (every consumer not yet migrated) keep today's `creator_seat` behaviour until their migration seam, which records the change (§11.3).
+- Built in seam D1.
 - The launch names **either** a phase selection (§8.4: a user-composed plan, or a preset) **or** nothing (the PA composes). The actor publishes `path.started` through the `TeamPublisher` when the launch is admitted.
 
 ### 8.2 The PA scores the path (operator step 4)
@@ -403,7 +443,7 @@ A run's accepted plan is therefore composed into a **per-run `WorkflowDef`** (`s
 | `run` | (per step) | neutral | auto | value | — | (per step) | tool | onboarding/{index, annotate}, domain-extraction/domain-graph, qe-author-tests/verify |
 | `deliver` | build | neutral | auto | execution | — | true | tool | crew's composed deliver phase (`packages/crew/src/core/deliver.ts:789`, appended by `composeDeliverWorkflow` `:859`) |
 
-`EVIDENCE_FLOOR_PIN` is `e2e7af1db9e48454` (`src/builtin_floors.rs:109`). `deliver` keeps the id `deliver` because the engine recognises the deliver unit by it (`src/deliver_lift.rs:54-60`); the deliver gate stays the engine's (`should_pause` `DeliverGate`, `src/actor.rs:6348-6355`, driven by `auto_deliver`, `src/lib.rs:201-205`).
+`EVIDENCE_FLOOR_PIN` is `e2e7af1db9e48454` (`src/builtin_floors.rs:109`). `deliver` keeps the id `deliver` because the engine recognises the deliver unit by it (`src/deliver_lift.rs:54-60`). Its Tool command stays crew-authored: crew supplies `deliverPrScript(intent, opts)` (`packages/crew/src/core/deliver.ts:791`) as the `deliver` step's `executor` at launch, exactly the command its composed phase carries today; the deliver gate stays the engine's (`should_pause` `DeliverGate`, `src/actor.rs:6348-6355`, driven by `auto_deliver`, `src/lib.rs:201-205`).
 
 **What a plan step may change on its entry (and nothing else).** The catalog entry is the floor of that step's controls; a step may only strengthen it.
 - `instructions`: free text, as today (`src/workflow.rs:657`).
@@ -544,7 +584,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
 - **The call is a team event.** `council.called` carries the DES-001 §6.3 input verbatim plus `transcript`: the `event_id`s of the exchange, so the council reads what was said. The supervisor then calls `Core::convene_decision` (`src/lib.rs:1286`) with the non-party roster. The ballots' `CouncilConvened`/`CouncilDeliberated`/`CouncilVoted` CoreEvents stay engine telemetry (§4.6).
 - **The ruling is a team event.** The council thread publishes `council.ruled` from the `DecisionVerdict` (`src/decision.rs:292`).
 - **Three-way, on the record:** the PA's position is `advice.answered` (or `step.reviewed`), the team's is `finding.settled{status:"held"}` (or a member `HOLD`), and the council's is `council.ruled{dissent[]}`. The injector renders the ruling back to the PA at its next boundary.
-- **Continue or pause (DES-001 §6.7, unchanged):** YES continues autonomously; NO or no verdict produces `team_pause`, which becomes `awaitingHuman{gate_kind:"team_dispute"}` and `gate.opened{kind:"team_dispute"}`.
+- **Continue or pause (as DES-001 §6.7 specifies; not yet built on main: `team_dispute` appears nowhere in `src/`, so T6 builds it):** YES continues autonomously; NO or no verdict produces `team_pause`, which becomes `awaitingHuman{gate_kind:"team_dispute"}` and `gate.opened{kind:"team_dispute"}`.
 
 ### 8.11 The gate consumes the stream (operator step 9)
 
@@ -573,7 +613,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
 - **Advice never decides.** It is never binding: `combine_verdict` (`src/validator.rs:2263`) reads no team event, and the fold's inputs are byte-identical with and without a team (DES-001 §6.6).
 - **The floor binds everyone.** The floor is engine data: the PA cannot remove it, and neither can a user in auto mode. A manual-mode override is explicit, recorded and approved (§8.5, recommendation).
 - **Approval is the existing gate.** Plan approval is a `pause_for_human` gate resolved through `confirm_gate`, and nothing but a human (or auto mode below high risk) releases a plan.
-- **Evaluator ≠ creator is per step.** The PA is the run's creator seat, and evaluator ≠ creator is preserved per step by `role` on the catalog entry (never plan-editable) and the existing fence (`src/distribute.rs:387`). The judge excludes every party (`src/cli_runner.rs:937-942`, `:1020-1025`; DES-001 §6.2).
+- **Evaluator ≠ creator is per step.** The PA is the run's creator seat, and evaluator ≠ creator is preserved per step by `role` on the catalog entry (never plan-editable) and the fence (`src/distribute.rs:387`), which for team runs never falls back to the creator seat (§8.1, recommendation). **Today** the judge excludes only the work author (`src/cli_runner.rs:919`, `:937-942`, `:1020-1025`); excluding every ledger author (DES-001 §6.2) is not built on main (no `excluded_seats` in `src/cli_runner.rs`) and is built in T5.
 - **The PA owns a member's step.** It counts only after `step.reviewed{verdict:"accepted"}`, and the gate still judges it with judge ≠ member.
 - **The council's power is narrow.** It rules on one question, and its ruling chooses only between autonomous continue and a human pause (DES-001 §6.7).
 
@@ -654,6 +694,7 @@ Common to every consumer (not repeated per row):
 - The run now publishes `wicked.team.*` events (path, plan, gate) on the bus, and studio renders them.
 - The per-run def id becomes `"<run>:plan-<rev>"`; the launch's `workflow` field on the wire, in `LaunchSpec` (`src/lib.rs:224`) and in the bus payload keeps its name and now names a **preset**.
 - Delivery classification reads the preset's `system` flag (the `is_system` it replaces, `adapter.ts:560`) instead of the def.
+- **Evaluator seat (recommendation, §8.1):** after migration, a consumer launched on a roster with no distinct seat and no usable second instance is **refused** (`NoEligibleSeat`) where today it runs its review/test unit on the creator seat with `creator_seat` disclosed. Where an instance is configured, the unit moves to it (`same_cli_instance`). Each M-seam's contract tests assert this change for its consumer.
 - **Plan approval** applies per §8.6. A launcher that omits `humanConfirm` is auto and pauses only at high risk. A read-only or tool-only plan has no creator step, so its floor is empty and it never scores high risk.
 
 | Consumer | What changes (gates, floors, seat routing, human_confirm, outputs, events, studio) | What must stay identical (named contract tests) |
@@ -693,6 +734,8 @@ Common to every consumer (not repeated per row):
 | **Bus rows expire** | The `gate.opened` snapshot is persisted on the unit. | §4.4 |
 | **No bus** | A local snapshot with `transport:"none"`, never an in-process fallback. | §4.1 |
 | **Actor stall** | The actor never opens the bus. | §4.1 |
+| **Restart mid-step** | The attempt never survives (orphaned or redriven at attempt+1); team state is persisted on the session; the supervisor replays live runs from `stream_floor` before tailing; a gap past retention pauses for a human (`stream_gap`). | §4.7 |
+| **Evaluator on the creator seat** | Team runs refuse rather than fall back (recommendation); a second usable instance is the only fallback. | §8.1, D1 |
 
 ## 13. Where each piece lives
 
@@ -731,6 +774,15 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 **T2 — Floor table + floor fill (core).** `THRESHOLDS.floors` and the high-risk rule; `signals_from_paths`; floor fill with `added_by:"floor"`; the empty floor for a plan with no creator step.
 *Accept:* (a) for scores 10/30/50/80 and for a destructive signal at a score of 10 (with the destructive floor tuned to 0 in the fixture), the floor and `high_risk` equal §8.5's table; (b) **a user plan below the floor gets the floor phases added**, each marked `added_by:"floor"` with its `floor_reason`, and `plan.accepted.steps` shows them; (c) a user plan that already contains the floor is unchanged; (d) a read-only plan (`understand` only) and a tool-only plan have an empty floor; (e) no graph means score 100, so the band 70–100 floor applies; **(g) an auto-mode `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch` omitted, and again with `touch:[]`, scores 100 with reason `"no declared scope"`, gets the 70–100 floor, and pauses `plan_approval` (high risk) before `build` dispatches. The same launch with `touch:["src/x.rs"]` scores from the graph. A read-only plan (`understand` only) with `touch` omitted scores 0 and does not pause;** (f) the table is the only place the values live (a grep test for literal band numbers outside `THRESHOLDS`).
 
+**D1 — Team-run evaluator distinctness (core; coordinator recommendation, §8.1).** For a team run, `creator_seat` is never used.
+*Accept:*
+- (a) a team run on a one-seat roster `[claude]` whose launch also lists a usable `claude#2` puts its review/test units on `claude#2` with `distinctnessFallback:"same_cli_instance"`;
+- (b) the same roster without `claude#2`, bench-free, is refused `NoEligibleSeat` naming the units;
+- (c) the same roster with `claude#2` listed but not signed in (health not usable) is refused too;
+- (d) an all-builder roster behaves like (a) or (b);
+- (e) a **non-team** launch of the same shape still returns `creator_seat` exactly as `src/distribute.rs:417-426` does today (the existing `dead_seat_gate.rs` and `p10_methodology.rs` assertions stay green);
+- (f) a bench-caused shortfall is refused as today (`:388-409`).
+
 **T3 — Plan approval gate (core + crew).** `PauseReason::PlanApproval`, the `plan_approval` arm in `confirm_gate`, the approval matrix, and the `gate.opened`/`gate.decided{kind:"plan_approval"}` events.
 *Accept:* **the approval matrix, row by row, on a PA plan and again on a user-composed plan:*
 - (a) manual mode (`before:1` and `all`): the initial plan pauses `plan_approval` before the first execution unit;
@@ -740,7 +792,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 - (e) approve-with-edit publishes `plan.proposed{by:"human", kind:"edit"}` then `plan.accepted{plan_rev:n+1}`; an edit below the floor gets floor phases added, not refused;
 - (f) reject cancels;
 - (g) a restart while paused keeps the gate open and resumable;
-- (i) **re-open:** approve-with-edit whose edit is refused publishes `plan.refused` and a second `gate.opened{kind:"plan_approval"}` with a **different** `gate_id` (its `event_id` differs from the first). Approving it publishes a `gate.decided` referencing the second `gate_id` and dispatches once. The same holds for a second revision that needs approval at the same ord before the next unit dispatches, and after a restart between the two openings. (h) in manual mode with the §8.5 override: the override is recorded on `plan.accepted.override` and shown in the gate prompt; the same override in auto mode is refused.
+- (i) **re-open:** approve-with-edit whose edit is refused publishes `plan.refused` and a second `gate.opened{kind:"plan_approval"}` with a **different** `gate_id` (its `event_id` differs from the first). **A second human edit on the re-opened gate publishes a new `plan.proposed` with a `proposal_id` distinct from the first edit's (it is derived from the second `gate_id`); both rows exist on the bus (distinct `event_id`s), and neither resolves to the other.** Approving it publishes a `gate.decided` referencing the second `gate_id` and dispatches once. The same holds for a second revision that needs approval at the same ord before the next unit dispatches, and after a restart between the two openings. (h) in manual mode with the §8.5 override: the override is recorded on `plan.accepted.override` and shown in the gate prompt; the same override in auto mode is refused.
 
 **T4 — Re-plan (core).** `plan.revised`, `Command::RevisePlan`, the three triggers, re-score at checkpoints (`RESCORE_MIN_INTERVAL`, `RESCORE_MAX`), the ratchet, and no re-run.
 *Accept:*
@@ -761,7 +813,14 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 - (g) **member step rejected:** `REJECT to:member` produces a rework attempt with the reason as its amendment, and `REJECT to:pa` re-plans it onto the PA seat; the third rejection goes to the PA;
 - (h) a member `HOLD` on a rejection convenes one council (`trigger:"member_step"`): YES counts it, NO keeps the rejection, no verdict produces a `team_dispute` pause;
 - (i) evaluator ≠ creator: the judge of a member step is neither the member nor any ledger author;
-- (j) `grep -rn "TeamCmd\|TeamHandle\|team_finish\|SteerMailbox" src` is empty.
+- (j) `grep -rn "TeamCmd\|TeamHandle\|team_finish\|SteerMailbox" src` is empty;
+- (k) **restart mid-step:** a team run whose attempt 1 has raised one unanswered HIGH is killed after `step.claimed` and before `step.completed`, then the daemon restarts (both paths: orphan plus `POST /runs/:id/resume`, and armed exec redrive). Then:
+  - the supervisor's replay rebuilds the run's state from `stream_floor`;
+  - attempt 2's `step.claimed` attaches live, with no gate timeout;
+  - attempt 2's boundary advice block carries the HIGH with `carried_from_attempt:1`;
+  - the accepted plan and `gate_seq` are those persisted before the kill;
+  - a replayed row also delivered live changes nothing;
+  - with the bus rows deleted (fixture: `path.started` and attempt 1's rows removed), the gate records `final_pass:"stream_gap"` and pauses for a human instead of passing.
 
 **T7 — ACP carrier (core).** `checkpoint.reached`; the steer sourced from the bus; `advice.delivered{acp_steering}`.
 *Accept:* DES-001 S3 acceptance #7–#12 with rows instead of mailbox state: (a) a HIGH row published before a terminal `tool_call_update` produces exactly one `_session/steering` with `idleBehavior:"promptRequired"` and one `advice.delivered{outcome:"injected"}` row per carried finding, sharing one `steer_id`; (b) `promptRequired` ⇒ `turn_ended`, and the boundary injector delivers it on the next step; (c) a non-advertising bridge receives no steer and the finding is `channel:"none"`; (d) a MEDIUM row is never steered; (e) a row for attempt 1 never reaches attempt 2; (f) a finding delivered mid-turn is not re-rendered at the boundary.
@@ -822,3 +881,30 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
 - **Q4. Member seat diversity.** Unchanged from DES-001 §13 Q2: only claude is ACP-admitted.
 - **Q5. migration/cleanup** declares no code work although it edits code (§11.3, M2). Decide `build` vs `produce` before M2 starts.
 - **Q6. Security review skill id.** `security_review`'s `skill_ref` names the garden QE security specialist; the exact skill id is fixed in C1 against garden's catalog.
+
+### 16.1 Rev 5 sweep: every "as today" / "unchanged" claim checked against the code
+
+**Corrected (the claim was wrong):**
+
+| Claim | Where | What the code does | Fix |
+|---|---|---|---|
+| The fence refuses `NoEligibleSeat` "when none exists, exactly as today" | §8.1 | A bench-free roster keeps review on the creator seat, disclosed as `creator_seat` (`src/distribute.rs:286-290`, `:417-426`); refusal only when a bench caused it (`:388-409`) | Rewritten; team-run rule as a coordinator recommendation; seam D1 |
+| "The judge excludes every party" | §9 | Only the work author is excluded today (`src/cli_runner.rs:919`, `:937-942`, `:1020-1025`); no `excluded_seats` exists | Stated as today vs built in T5 |
+| "Continue or pause (DES-001 §6.7, unchanged)" | §8.10 | `team_dispute` appears nowhere in `src/`; DES-001's S6 is not built | Stated as specified-not-built; T6 builds it |
+| The team-dispute re-open argument cited `src/actor.rs:7736` | §6.1 | The refuse-before-resolve rule is at `src/actor.rs:7758` | Cite corrected |
+
+**Verified true (the claim stands):**
+- Plan step fields `instructions`, `skill_ref`, `allowed_skills`, `required_deliverables`, `depends_on` (`src/workflow.rs:657`, `:683-708`).
+- The pause is durable in one batch (`src/actor.rs:6036-6046`).
+- Reject cancels the run (`src/actor.rs:7831-7832`, `cancel_run`).
+- S3's steer carries `idleBehavior:"promptRequired"` (`src/team.rs:1923-1928`) at the `session/update` delivery point (`src/acp_runner.rs:4903`).
+- `plan_from_def` copies `gate` onto the unit (`src/plan.rs:179`) and `role` (`:155`).
+- The repo-checks floor arms for every bound agent unit that changed the tree (`src/cli_runner.rs:868`).
+- The CoreEvent order `GateEvaluated` → `GateDecided` → `UnitDone`/`UnitDenied` (`src/pipeline.rs:1519-1556`).
+- `combine_verdict` reads only the deterministic pass and the agent verdict (`src/validator.rs:2263`).
+- The deliver unit is recognised by its phase id (`src/deliver_lift.rs:54-60`); its command is crew's `deliverPrScript` (`packages/crew/src/core/deliver.ts:791`), now stated in §8.3.
+- The operator inject path and the council ballot events are untouched by this design (§10 "Kept").
+
+**Design statements, not code claims:**
+- "unchanged" references to DES-001 sections (§4.3–§4.6 rules, §5.3 text) mean *this document does not change DES-001's rule*. Of those, S2 (#609) and S3 (#607) are on main; S6 is not.
+
