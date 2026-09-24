@@ -1,0 +1,1107 @@
+//! The team wire contract (DES-TEAMING-002 T1): every `wicked.team.*` event type, its payload,
+//! its idempotency key, and [`fold`], the pure function that turns one attempt's rows into its
+//! [`TeamLedger`].
+//!
+//! **Types only.** Nothing here publishes: `TeamBus::publish` and the `TeamPublisher` are P1's.
+//! [`TeamEvent::bus_emit`] builds the row a publisher would write, so tests (and later P1) use the
+//! one key rule.
+//!
+//! **Payload shape (DES-002 §6).** Every payload carries the envelope ([`Envelope`]: `run_id`,
+//! `ord`, `attempt`, `by`, `at`, `re`) plus its body's fields, all at the top level, keys in
+//! snake_case. Every field is always present: an absent value is `null`, never a missing key.
+//! The one exception is a plan step ([`PlanStep`]), whose optional step fields are omitted when
+//! unset, exactly as a plan names them. The embedded [`TeamLedger`] keeps DES-001 §7's camelCase.
+//! wicked-core's `serde_json` has no `preserve_order`, so fixtures compare parsed values, never
+//! strings.
+//!
+//! **Keys (DES-002 §4.1, §6.1).** Every key is
+//! `deterministic_key(["team", <event type>, <run id>, <parts…>])`: SHA-256 over each part's
+//! UTF-8 bytes followed by one `0x00`, the first 16 bytes as lowercase hex. The parts are
+//! producer-assigned sequences or ids, never content a later distinct request can repeat: the
+//! key builders below take only ids and counters, and a source test fails the build if one takes
+//! a payload text field.
+//!
+//! **Owners (DES-002 §7).** Each type has exactly one publisher ([`owner`]): the engine (E), the
+//! supervisor (S) or the attempt runner (R).
+
+use std::collections::{BTreeMap, HashSet};
+
+use anyhow::{anyhow, bail, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{Dispute, Finding, LedgerFinding, LedgerMonitor, MonitorReply, Severity, TeamLedger};
+use crate::bus::{deterministic_key, BusEmit, CORE_DOMAIN};
+
+/// The bus `subdomain` every team event is published under (DES-002 §4.1).
+pub const TEAM_SUBDOMAIN: &str = "core.team";
+
+// ── Event types (DES-002 §6): `wicked.team.<noun>.<verb>`, four segments ─────────────────────────
+
+pub const PATH_STARTED: &str = "wicked.team.path.started";
+pub const PATH_SCORED: &str = "wicked.team.path.scored";
+pub const PLAN_PROPOSED: &str = "wicked.team.plan.proposed";
+pub const PLAN_REVISED: &str = "wicked.team.plan.revised";
+pub const PLAN_ACCEPTED: &str = "wicked.team.plan.accepted";
+pub const PLAN_REFUSED: &str = "wicked.team.plan.refused";
+pub const MEMBER_JOINED: &str = "wicked.team.member.joined";
+pub const MEMBER_LEFT: &str = "wicked.team.member.left";
+pub const STEP_CLAIMED: &str = "wicked.team.step.claimed";
+pub const CHECKPOINT_REACHED: &str = "wicked.team.checkpoint.reached";
+pub const FINDING_RAISED: &str = "wicked.team.finding.raised";
+pub const ADVICE_DELIVERED: &str = "wicked.team.advice.delivered";
+pub const ADVICE_ANSWERED: &str = "wicked.team.advice.answered";
+pub const HELP_REQUESTED: &str = "wicked.team.help.requested";
+pub const HELP_ANSWERED: &str = "wicked.team.help.answered";
+pub const CHANGE_REQUESTED: &str = "wicked.team.change.requested";
+pub const STEP_COMPLETED: &str = "wicked.team.step.completed";
+pub const STEP_REVIEWED: &str = "wicked.team.step.reviewed";
+pub const FINDING_SETTLED: &str = "wicked.team.finding.settled";
+pub const COUNCIL_CALLED: &str = "wicked.team.council.called";
+pub const COUNCIL_RULED: &str = "wicked.team.council.ruled";
+pub const LEDGER_FOLDED: &str = "wicked.team.ledger.folded";
+pub const GATE_OPENED: &str = "wicked.team.gate.opened";
+pub const GATE_DECIDED: &str = "wicked.team.gate.decided";
+pub const PATH_ENDED: &str = "wicked.team.path.ended";
+
+/// The 25 types, in DES-002 §6 table order.
+pub const ALL_TYPES: [&str; 25] = [
+    PATH_STARTED,
+    PATH_SCORED,
+    PLAN_PROPOSED,
+    PLAN_REVISED,
+    PLAN_ACCEPTED,
+    PLAN_REFUSED,
+    MEMBER_JOINED,
+    MEMBER_LEFT,
+    STEP_CLAIMED,
+    CHECKPOINT_REACHED,
+    FINDING_RAISED,
+    ADVICE_DELIVERED,
+    ADVICE_ANSWERED,
+    HELP_REQUESTED,
+    HELP_ANSWERED,
+    CHANGE_REQUESTED,
+    STEP_COMPLETED,
+    STEP_REVIEWED,
+    FINDING_SETTLED,
+    COUNCIL_CALLED,
+    COUNCIL_RULED,
+    LEDGER_FOLDED,
+    GATE_OPENED,
+    GATE_DECIDED,
+    PATH_ENDED,
+];
+
+/// The one component that publishes a type (DES-002 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Owner {
+    /// The actor, through the `TeamPublisher`.
+    Engine,
+    /// The team supervisor, on its own thread and connection.
+    Supervisor,
+    /// The attempt runner: the attempt's worker thread plus its ACP carrier.
+    Runner,
+}
+
+/// The sole publisher of `event_type` (DES-002 §7), `None` for a type that is not a team event.
+pub fn owner(event_type: &str) -> Option<Owner> {
+    use Owner::{Engine as E, Runner as R, Supervisor as S};
+    Some(match event_type {
+        PATH_STARTED | PATH_SCORED | PLAN_PROPOSED | PLAN_REVISED | PLAN_ACCEPTED
+        | PLAN_REFUSED | GATE_OPENED | GATE_DECIDED | PATH_ENDED => E,
+        MEMBER_JOINED | MEMBER_LEFT | FINDING_RAISED | HELP_ANSWERED | CHANGE_REQUESTED
+        | FINDING_SETTLED | COUNCIL_CALLED | COUNCIL_RULED | LEDGER_FOLDED => S,
+        STEP_CLAIMED | CHECKPOINT_REACHED | ADVICE_DELIVERED | ADVICE_ANSWERED | HELP_REQUESTED
+        | STEP_COMPLETED | STEP_REVIEWED => R,
+        _ => return None,
+    })
+}
+
+// ── Keys (DES-002 §4.1, §6.1) ────────────────────────────────────────────────────────────────────
+
+/// `deterministic_key(["team", event_type, run_id, parts…])`.
+fn team_key(event_type: &str, run_id: &str, parts: &[&str]) -> String {
+    let mut all: Vec<&str> = vec!["team", event_type, run_id];
+    all.extend_from_slice(parts);
+    deterministic_key(&all)
+}
+
+pub fn key_path_started(run_id: &str) -> String {
+    team_key(PATH_STARTED, run_id, &[])
+}
+
+pub fn key_path_scored(run_id: &str, score_source: &str) -> String {
+    team_key(PATH_SCORED, run_id, &[score_source])
+}
+
+pub fn key_plan_proposed(run_id: &str, proposal_id: &str) -> String {
+    team_key(PLAN_PROPOSED, run_id, &[proposal_id])
+}
+
+pub fn key_plan_revised(run_id: &str, plan_rev: u32) -> String {
+    team_key(PLAN_REVISED, run_id, &[&plan_rev.to_string()])
+}
+
+pub fn key_plan_accepted(run_id: &str, plan_rev: u32) -> String {
+    team_key(PLAN_ACCEPTED, run_id, &[&plan_rev.to_string()])
+}
+
+pub fn key_plan_refused(run_id: &str, proposal_id: &str) -> String {
+    team_key(PLAN_REFUSED, run_id, &[proposal_id])
+}
+
+pub fn key_member_joined(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    member_id: &str,
+    open_seq: u32,
+) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), open_seq.to_string());
+    team_key(MEMBER_JOINED, run_id, &[&o, &a, member_id, &s])
+}
+
+pub fn key_member_left(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    member_id: &str,
+    open_seq: u32,
+) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), open_seq.to_string());
+    team_key(MEMBER_LEFT, run_id, &[&o, &a, member_id, &s])
+}
+
+pub fn key_step_claimed(run_id: &str, step_id: &str, attempt: u32, by: &str) -> String {
+    team_key(STEP_CLAIMED, run_id, &[step_id, &attempt.to_string(), by])
+}
+
+pub fn key_checkpoint_reached(run_id: &str, ord: u32, attempt: u32, seq: u64) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), seq.to_string());
+    team_key(CHECKPOINT_REACHED, run_id, &[&o, &a, &s])
+}
+
+pub fn key_finding_raised(run_id: &str, ord: u32, attempt: u32, raise_seq: u32) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), raise_seq.to_string());
+    team_key(FINDING_RAISED, run_id, &[&o, &a, &s])
+}
+
+pub fn key_advice_delivered(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    raise_seq: u32,
+    delivery_id: &str,
+) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), raise_seq.to_string());
+    team_key(ADVICE_DELIVERED, run_id, &[&o, &a, &s, delivery_id])
+}
+
+pub fn key_advice_answered(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    raise_seq: u32,
+    answered_in: &str,
+) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), raise_seq.to_string());
+    team_key(ADVICE_ANSWERED, run_id, &[&o, &a, &s, answered_in])
+}
+
+pub fn key_help_requested(run_id: &str, help_id: &str) -> String {
+    team_key(HELP_REQUESTED, run_id, &[help_id])
+}
+
+pub fn key_help_answered(run_id: &str, help_id: &str, answer_id: &str) -> String {
+    team_key(HELP_ANSWERED, run_id, &[help_id, answer_id])
+}
+
+pub fn key_change_requested(run_id: &str, change_id: &str) -> String {
+    team_key(CHANGE_REQUESTED, run_id, &[change_id])
+}
+
+pub fn key_step_completed(run_id: &str, step_id: &str, attempt: u32, by: &str) -> String {
+    team_key(STEP_COMPLETED, run_id, &[step_id, &attempt.to_string(), by])
+}
+
+pub fn key_step_reviewed(run_id: &str, step_id: &str, attempt: u32) -> String {
+    team_key(STEP_REVIEWED, run_id, &[step_id, &attempt.to_string()])
+}
+
+pub fn key_finding_settled(run_id: &str, ord: u32, attempt: u32, raise_seq: u32) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), raise_seq.to_string());
+    team_key(FINDING_SETTLED, run_id, &[&o, &a, &s])
+}
+
+pub fn key_council_called(run_id: &str, ord: u32, attempt: u32, subject: &str) -> String {
+    let (o, a) = (ord.to_string(), attempt.to_string());
+    team_key(COUNCIL_CALLED, run_id, &[&o, &a, subject])
+}
+
+pub fn key_council_ruled(run_id: &str, ord: u32, attempt: u32, subject: &str) -> String {
+    let (o, a) = (ord.to_string(), attempt.to_string());
+    team_key(COUNCIL_RULED, run_id, &[&o, &a, subject])
+}
+
+pub fn key_ledger_folded(run_id: &str, ord: u32, attempt: u32) -> String {
+    let (o, a) = (ord.to_string(), attempt.to_string());
+    team_key(LEDGER_FOLDED, run_id, &[&o, &a])
+}
+
+pub fn key_gate_opened(run_id: &str, gate_id: &str) -> String {
+    team_key(GATE_OPENED, run_id, &[gate_id])
+}
+
+pub fn key_gate_decided(run_id: &str, gate_id: &str) -> String {
+    team_key(GATE_DECIDED, run_id, &[gate_id])
+}
+
+pub fn key_path_ended(run_id: &str) -> String {
+    team_key(PATH_ENDED, run_id, &[])
+}
+
+// ── Producer-assigned ids that feed the keys (DES-002 §6.1) ──────────────────────────────────────
+
+/// Where a plan proposal came from. Every source is an id the engine received with the command
+/// that carried the plan (DES-002 §6.1 row 3), never the plan's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalSource {
+    /// A user plan or a preset named at launch: the launch's session id.
+    Launch { session_id: String },
+    /// The PA's plan from its `understand` step: that step's `ord:attempt`.
+    Understand { ord: u32, attempt: u32 },
+    /// A `PLAN+` block, numbered by the step-output parser: `ord:attempt:plan_block_seq`.
+    PlanBlock {
+        ord: u32,
+        attempt: u32,
+        plan_block_seq: u32,
+    },
+    /// An accepted member request: its `change_id`.
+    Change { change_id: String },
+    /// An edit at the approval gate: the `gate_id`.
+    Gate { gate_id: String },
+    /// A mid-run human edit through `Core::propose_plan`: crew's per-POST request id.
+    Edit { request_id: String },
+}
+
+impl ProposalSource {
+    /// The source id exactly as DES-002 §6.1 spells it.
+    pub fn source_id(&self) -> String {
+        match self {
+            ProposalSource::Launch { session_id } => session_id.clone(),
+            ProposalSource::Understand { ord, attempt } => format!("{ord}:{attempt}"),
+            ProposalSource::PlanBlock {
+                ord,
+                attempt,
+                plan_block_seq,
+            } => format!("{ord}:{attempt}:{plan_block_seq}"),
+            ProposalSource::Change { change_id } => change_id.clone(),
+            ProposalSource::Gate { gate_id } => gate_id.clone(),
+            ProposalSource::Edit { request_id } => request_id.clone(),
+        }
+    }
+}
+
+/// `"p-" + deterministic_key([run, by, source])`.
+pub fn mint_proposal_id(run_id: &str, by: &str, source: &ProposalSource) -> String {
+    format!(
+        "p-{}",
+        deterministic_key(&[run_id, by, &source.source_id()])
+    )
+}
+
+/// `"h-" + deterministic_key([run, ord, attempt, by, help_seq])`: R's per-attempt counter over
+/// `HELP:` lines, never the question.
+pub fn mint_help_id(run_id: &str, ord: u32, attempt: u32, by: &str, help_seq: u32) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), help_seq.to_string());
+    format!("h-{}", deterministic_key(&[run_id, &o, &a, by, &s]))
+}
+
+/// `"c-" + deterministic_key([run, ord, attempt, member_id, change_seq])`: S's per-attempt
+/// counter, never the request's text.
+pub fn mint_change_id(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    member_id: &str,
+    change_seq: u32,
+) -> String {
+    let (o, a, s) = (ord.to_string(), attempt.to_string(), change_seq.to_string());
+    format!("c-{}", deterministic_key(&[run_id, &o, &a, member_id, &s]))
+}
+
+/// `path.scored`'s key part for the intent score of a proposal.
+pub fn score_source_intent(proposal_id: &str) -> String {
+    format!("intent:{proposal_id}")
+}
+
+/// `path.scored`'s key part for a diff re-score; `rescore_seq` is the supervisor's.
+pub fn score_source_diff(ord: u32, attempt: u32, rescore_seq: u32) -> String {
+    format!("diff:{ord}:{attempt}:{rescore_seq}")
+}
+
+/// `advice.delivered.delivery_id` for a step-boundary delivery.
+pub fn delivery_id_boundary(step_id: &str, attempt: u32) -> String {
+    format!("boundary:{step_id}:{attempt}")
+}
+
+/// `advice.delivered.delivery_id` for the attempt-end not-delivered row.
+pub fn delivery_id_end(attempt: u32) -> String {
+    format!("end:{attempt}")
+}
+
+/// `advice.answered.answered_in`: the `step_id:attempt` whose output carried the line.
+pub fn answered_in(step_id: &str, attempt: u32) -> String {
+    format!("{step_id}:{attempt}")
+}
+
+/// A council subject for a finding.
+pub fn subject_finding(raise_seq: u32) -> String {
+    format!("finding:{raise_seq}")
+}
+
+/// A council subject for a member-step dispute.
+pub fn subject_step(step_id: &str, attempt: u32) -> String {
+    format!("step:{step_id}:{attempt}")
+}
+
+/// `"g-<run>-<gate_seq>"` for every gate kind (`AgentSession.gate_seq`).
+pub fn gate_id(run_id: &str, gate_seq: u32) -> String {
+    format!("g-{run_id}-{gate_seq}")
+}
+
+// ── The envelope and the payload bodies (DES-002 §6) ─────────────────────────────────────────────
+
+/// The fields every team payload carries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub run_id: String,
+    pub ord: Option<u32>,
+    pub attempt: Option<u32>,
+    /// The acting seat instance, `"engine"`, `"human"` or `"council:<task id>"`.
+    pub by: String,
+    /// Epoch milliseconds at the producer.
+    pub at: i64,
+    /// The row this one answers, e.g. `"finding.raised#4"`.
+    pub re: Option<String>,
+}
+
+/// One plan step: a catalog entry plus the step fields a plan may set. Unset fields are omitted
+/// (the plan names only what it overrides); the catalog entry supplies the rest (C1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub catalog: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// `"pa"` (default) | `"team"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    /// A raised gate, as the workflow's externally tagged `GateSpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Value>,
+    /// On a composed plan: `"plan"` | `"floor"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_reason: Option<String>,
+    /// On `plan.revised.added`: the step's catalog position precedes a done step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late: Option<bool>,
+}
+
+/// A manual-mode override of the floor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanOverride {
+    pub remove: Vec<String>,
+    pub reason: String,
+}
+
+/// 1 — `path.started` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathStarted {
+    /// The PA seat instance.
+    pub cli: String,
+    /// `"chosen"` | `"random"`.
+    pub selection: String,
+    pub roster: Vec<String>,
+    /// The problem text, ≤8 KB.
+    pub request: String,
+    /// The preset the launch named.
+    pub workflow: Option<String>,
+    /// The launch carried a user-composed plan.
+    pub plan: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScoreModel {
+    pub add: u8,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScoreSignals {
+    pub changed_symbols: u32,
+    pub dependents: u32,
+    pub products: u32,
+    pub contract_change: bool,
+    pub test_gap: f32,
+    pub critical: bool,
+    pub destructive: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScorePlan {
+    pub monitors: u8,
+    pub depth: String,
+    pub post_hoc_reviewer: bool,
+    pub post_hoc_other_cli: bool,
+}
+
+/// 2 — `path.scored` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathScored {
+    /// [`score_source_intent`] | [`score_source_diff`].
+    pub score_source: String,
+    /// `"intent"` | `"diff"`.
+    pub basis: String,
+    pub score: u8,
+    pub deterministic: u8,
+    pub reasons: Vec<String>,
+    pub model: Option<ScoreModel>,
+    /// `null` when the graph was unusable.
+    pub signals: Option<ScoreSignals>,
+    pub plan: ScorePlan,
+    /// The tree the diff was taken at; `null` for an intent score.
+    pub tree: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitorsAsk {
+    pub asked: u8,
+}
+
+/// 3 — `plan.proposed` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanProposed {
+    /// [`mint_proposal_id`].
+    pub proposal_id: String,
+    pub base_rev: Option<u32>,
+    /// `"initial"` | `"change"` | `"edit"`.
+    pub kind: String,
+    pub preset: Option<String>,
+    pub steps: Vec<PlanStep>,
+    pub monitors: MonitorsAsk,
+    pub asks: Vec<String>,
+    pub touch: Vec<String>,
+    #[serde(rename = "override")]
+    pub override_: Option<PlanOverride>,
+    pub rationale: String,
+}
+
+/// 4 — `plan.revised` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanRevised {
+    pub plan_rev: u32,
+    pub proposal_id: Option<String>,
+    /// `"floor_raised"` | `"pa_added"` | `"member_request"`.
+    pub reason: String,
+    pub from_band: String,
+    pub to_band: String,
+    pub high_risk: bool,
+    pub added: Vec<PlanStep>,
+}
+
+/// 5 — `plan.accepted` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanAccepted {
+    pub plan_rev: u32,
+    pub workflow_id: String,
+    pub band: String,
+    pub high_risk: bool,
+    /// `"auto"` | `"manual"`.
+    pub mode: String,
+    pub steps: Vec<PlanStep>,
+    #[serde(rename = "override")]
+    pub override_: Option<PlanOverride>,
+    pub proposal_id: Option<String>,
+}
+
+/// 6 — `plan.refused` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanRefused {
+    pub proposal_id: String,
+    pub base_rev: Option<u32>,
+    pub reason: String,
+}
+
+/// 7 — `member.joined` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberJoined {
+    pub member_id: String,
+    pub open_seq: u32,
+    pub seat: String,
+    /// `"monitor"`.
+    pub role: String,
+    /// `"attached"` | `"failed"`.
+    pub status: String,
+    pub reason: String,
+    pub error: Option<String>,
+}
+
+/// 8 — `member.left` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberLeft {
+    pub member_id: String,
+    pub open_seq: u32,
+    pub seat: String,
+    /// `"completed"` | `"budget_exhausted"` | `"failed"` | `"timed_out"`.
+    pub status: String,
+    pub batches: u32,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepoRef {
+    pub workdir: String,
+    pub git_dir: String,
+}
+
+/// 9 — `step.claimed` (R).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepClaimed {
+    pub step_id: String,
+    pub role: String,
+    pub kind: String,
+    pub phase: String,
+    pub criterion: String,
+    pub baseline_tree: Option<String>,
+    pub repo: Option<RepoRef>,
+    pub code_graph_db: Option<String>,
+}
+
+/// 10 — `checkpoint.reached` (R, the carrier).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointReached {
+    pub seq: u64,
+    pub tool_call_id: String,
+    pub kind: String,
+    pub title: String,
+    /// `"completed"` | `"failed"`.
+    pub status: String,
+    pub paths: Vec<String>,
+}
+
+/// 11 — `finding.raised` (S; the envelope's `by` is the authoring member's seat).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingRaised {
+    /// S's per-attempt emission counter: the key.
+    pub raise_seq: u32,
+    /// Identity, never a key.
+    pub finding_id: String,
+    pub member_id: String,
+    /// DES-001 §4.6 fields T6 builds; `null` until then.
+    pub line_key: Option<String>,
+    pub anchor: Option<String>,
+    pub anchor_source: Option<String>,
+    /// `"high"` | `"medium"`.
+    pub severity: String,
+    pub path: String,
+    pub line: u32,
+    pub evidence: String,
+    pub claim: String,
+    pub suggestion: Option<String>,
+    pub tree: String,
+    pub in_diff: bool,
+    pub corroborated_by: Vec<String>,
+}
+
+/// 12 — `advice.delivered` (R).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdviceDelivered {
+    pub raise_seq: u32,
+    pub finding_id: String,
+    /// The steer id | [`delivery_id_boundary`] | [`delivery_id_end`].
+    pub delivery_id: String,
+    pub steer_id: Option<String>,
+    /// `"acp_steering"` | `"boundary"` | `"none"`.
+    pub channel: String,
+    /// `"injected"` | `"turn_ended"` | `"refused"` | `"not_delivered"`.
+    pub outcome: String,
+    pub detail: Option<String>,
+}
+
+/// 13 — `advice.answered` (R).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdviceAnswered {
+    pub raise_seq: u32,
+    /// [`answered_in`].
+    pub answered_in: String,
+    pub finding_id: String,
+    /// `"accepted"` | `"declined"`.
+    pub disposition: String,
+    pub reason: String,
+}
+
+/// 14 — `help.requested` (R).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelpRequested {
+    /// [`mint_help_id`].
+    pub help_id: String,
+    pub help_seq: u32,
+    pub question: String,
+    pub context: String,
+}
+
+/// 15 — `help.answered` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelpAnswered {
+    pub help_id: String,
+    /// S's member-turn id.
+    pub answer_id: String,
+    pub answer: String,
+    pub evidence: Vec<String>,
+}
+
+/// 16 — `change.requested` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangeRequested {
+    /// [`mint_change_id`].
+    pub change_id: String,
+    pub change_seq: u32,
+    pub steps: Vec<PlanStep>,
+    pub reason: String,
+}
+
+/// 17 — `step.completed` (R).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepCompleted {
+    pub step_id: String,
+    /// `StepStatus` as `status_to_str` spells it: `"ok"` | `"failed"` | `"cancelled"` |
+    /// `"elicitation_failed"` | `"timed_out"`.
+    pub status: String,
+    pub tree: Option<String>,
+    pub output_bytes: u64,
+    pub output_ref: String,
+}
+
+/// 18 — `step.reviewed` (R).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepReviewed {
+    pub step_id: String,
+    /// `"accepted"` | `"rejected"`.
+    pub verdict: String,
+    /// On `"rejected"`: `"member"` | `"pa"`.
+    pub to: Option<String>,
+    pub reason: String,
+}
+
+/// 19 — `finding.settled` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingSettled {
+    pub raise_seq: u32,
+    pub finding_id: String,
+    /// `"held"` | `"withdrawn"` | `"superseded"`.
+    pub status: String,
+    pub reason: String,
+    pub final_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouncilPosition {
+    pub by: String,
+    pub position: String,
+    pub reason: String,
+}
+
+/// 20 — `council.called` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouncilCalled {
+    /// [`subject_finding`] | [`subject_step`].
+    pub subject: String,
+    pub finding_id: Option<String>,
+    /// `"unresolved_high"` | `"member_step"`.
+    pub trigger: String,
+    pub question: String,
+    pub positions: Vec<CouncilPosition>,
+    pub evidence: String,
+    pub excluded_seats: Vec<String>,
+    /// Event ids of the finding's raised/delivered/answered/settled rows.
+    pub transcript: Vec<i64>,
+}
+
+/// 21 — `council.ruled` (S): `convene_decision`'s `DecisionVerdict`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouncilRuled {
+    pub subject: String,
+    /// `"yes"` | `"no"` | `"no_verdict"`.
+    pub verdict: String,
+    /// On `no_verdict`: `"no_quorum"` | `"seats_benched"` | `"error"` | `"timeout"` | `"cap"`.
+    pub reason: Option<String>,
+    /// `null` when no council was convened (`seats_benched`, `cap`).
+    pub task_id: Option<String>,
+    pub consensus: bool,
+    pub agreement_pct: u8,
+    pub dissent: Vec<String>,
+    pub returned: u32,
+    pub seated: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptRow {
+    pub event_id: i64,
+    pub event_type: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transcript {
+    pub from_event_id: i64,
+    pub to_event_id: i64,
+    pub count: u32,
+    /// The rows were capped (≤256 KB).
+    pub truncated: bool,
+    pub events: Vec<TranscriptRow>,
+}
+
+/// 22 — `ledger.folded` (S).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerFolded {
+    /// `"completed"` | `"timed_out"` | `"skipped"` | `"stream_gap"`.
+    pub final_pass: String,
+    pub ledger: TeamLedger,
+    /// `"bus"` | `"none"`.
+    pub transport: String,
+    pub transcript: Transcript,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanDiff {
+    pub from_rev: Option<u32>,
+    pub added: Vec<String>,
+}
+
+/// `gate.opened`'s kind-specific fields, tagged by `kind`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GateOpenedKind {
+    UnitReview {
+        /// The S row the gate used; `null` for a synthesized or no-bus snapshot.
+        ledger_ref: Option<String>,
+        /// `"folded"` | `"synthesized"` | `"no_bus"`.
+        ledger_source: String,
+    },
+    PlanApproval {
+        reviewing_ord: u32,
+        plan_rev: u32,
+        band: String,
+        high_risk: bool,
+        mode: String,
+        /// `"manual_mode"` | `"high_risk"` | `"into_high_risk"` | `"override"`.
+        reason: String,
+        diff: PlanDiff,
+    },
+    TeamDispute {
+        /// The unresolved HIGHs the pause names (DES-001 §6.7 `TeamPause.finding_ids`).
+        finding_ids: Vec<String>,
+    },
+    TeamTransport {
+        /// The required fact that could not be published (DES-002 §4.1).
+        fact: String,
+        reason: String,
+    },
+}
+
+/// 23 — `gate.opened` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateOpened {
+    /// [`gate_id`].
+    pub gate_id: String,
+    #[serde(flatten)]
+    pub kind: GateOpenedKind,
+}
+
+/// 24 — `gate.decided` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateDecided {
+    pub gate_id: String,
+    /// `"unit_review"` | `"plan_approval"` | `"team_dispute"` | `"team_transport"`.
+    pub kind: String,
+    /// unit_review: `"allow"` | `"deny"` | `"paused"`; a human decision (any kind):
+    /// `"human_approved"` | `"human_amended"` | `"human_rejected"`.
+    pub decision: String,
+    pub combined: Option<bool>,
+    pub team_pause: bool,
+    pub unresolved: Vec<String>,
+}
+
+/// 25 — `path.ended` (E).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathEnded {
+    /// `"completed"` | `"failed"` | `"cancelled"`.
+    pub status: String,
+}
+
+macro_rules! bodies {
+    ($($variant:ident($ty:ident) = $const:ident),* $(,)?) => {
+        /// A team event's body, one variant per type.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum TeamBody {
+            $($variant($ty),)*
+        }
+
+        impl TeamBody {
+            /// The bus `event_type`.
+            pub fn event_type(&self) -> &'static str {
+                match self {
+                    $(TeamBody::$variant(_) => $const,)*
+                }
+            }
+
+            fn to_value(&self) -> Result<Value> {
+                Ok(match self {
+                    $(TeamBody::$variant(b) => serde_json::to_value(b)?,)*
+                })
+            }
+
+            fn from_value(event_type: &str, v: Value) -> Result<Self> {
+                Ok(match event_type {
+                    $($const => TeamBody::$variant(serde_json::from_value(v)?),)*
+                    other => bail!("`{other}` is not a team event type"),
+                })
+            }
+        }
+    };
+}
+
+bodies! {
+    PathStarted(PathStarted) = PATH_STARTED,
+    PathScored(PathScored) = PATH_SCORED,
+    PlanProposed(PlanProposed) = PLAN_PROPOSED,
+    PlanRevised(PlanRevised) = PLAN_REVISED,
+    PlanAccepted(PlanAccepted) = PLAN_ACCEPTED,
+    PlanRefused(PlanRefused) = PLAN_REFUSED,
+    MemberJoined(MemberJoined) = MEMBER_JOINED,
+    MemberLeft(MemberLeft) = MEMBER_LEFT,
+    StepClaimed(StepClaimed) = STEP_CLAIMED,
+    CheckpointReached(CheckpointReached) = CHECKPOINT_REACHED,
+    FindingRaised(FindingRaised) = FINDING_RAISED,
+    AdviceDelivered(AdviceDelivered) = ADVICE_DELIVERED,
+    AdviceAnswered(AdviceAnswered) = ADVICE_ANSWERED,
+    HelpRequested(HelpRequested) = HELP_REQUESTED,
+    HelpAnswered(HelpAnswered) = HELP_ANSWERED,
+    ChangeRequested(ChangeRequested) = CHANGE_REQUESTED,
+    StepCompleted(StepCompleted) = STEP_COMPLETED,
+    StepReviewed(StepReviewed) = STEP_REVIEWED,
+    FindingSettled(FindingSettled) = FINDING_SETTLED,
+    CouncilCalled(CouncilCalled) = COUNCIL_CALLED,
+    CouncilRuled(CouncilRuled) = COUNCIL_RULED,
+    LedgerFolded(LedgerFolded) = LEDGER_FOLDED,
+    GateOpened(GateOpened) = GATE_OPENED,
+    GateDecided(GateDecided) = GATE_DECIDED,
+    PathEnded(PathEnded) = PATH_ENDED,
+}
+
+/// One team event: the envelope plus its body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamEvent {
+    pub env: Envelope,
+    pub body: TeamBody,
+}
+
+impl TeamEvent {
+    pub fn event_type(&self) -> &'static str {
+        self.body.event_type()
+    }
+
+    /// The bus payload: the envelope's fields and the body's, at one level.
+    pub fn to_payload(&self) -> Result<Value> {
+        let Value::Object(mut out) = serde_json::to_value(&self.env)? else {
+            bail!("envelope did not serialize to an object");
+        };
+        let Value::Object(body) = self.body.to_value()? else {
+            bail!("{} body did not serialize to an object", self.event_type());
+        };
+        for (k, v) in body {
+            if out.contains_key(&k) {
+                bail!(
+                    "{} body field `{k}` collides with the envelope",
+                    self.event_type()
+                );
+            }
+            out.insert(k, v);
+        }
+        Ok(Value::Object(out))
+    }
+
+    /// Parse a bus row's payload for `event_type`.
+    pub fn from_payload(event_type: &str, payload: &Value) -> Result<Self> {
+        let env: Envelope = serde_json::from_value(payload.clone())?;
+        let body = TeamBody::from_value(event_type, payload.clone())?;
+        Ok(TeamEvent { env, body })
+    }
+
+    /// The idempotency key (DES-002 §6.1). Errors when a type that is keyed on `ord`/`attempt`
+    /// carries a `null` one.
+    pub fn key(&self) -> Result<String> {
+        key_parts_of(self)
+    }
+
+    /// The bus row a publisher writes for this event: `domain = wicked-core`,
+    /// `subdomain = core.team`, the payload, and the key.
+    pub fn bus_emit(&self) -> Result<BusEmit> {
+        Ok(BusEmit::new(
+            self.event_type(),
+            CORE_DOMAIN,
+            TEAM_SUBDOMAIN,
+            self.to_payload()?,
+        )
+        .with_key(self.key()?))
+    }
+}
+
+/// Dispatch to the key builders. Reads only the ids and counters the builders take.
+fn key_parts_of(ev: &TeamEvent) -> Result<String> {
+    let run = ev.env.run_id.as_str();
+    let by = ev.env.by.as_str();
+    let ord = || {
+        ev.env
+            .ord
+            .ok_or_else(|| anyhow!("{} needs `ord` for its key", ev.event_type()))
+    };
+    let attempt = || {
+        ev.env
+            .attempt
+            .ok_or_else(|| anyhow!("{} needs `attempt` for its key", ev.event_type()))
+    };
+    Ok(match &ev.body {
+        TeamBody::PathStarted(_) => key_path_started(run),
+        TeamBody::PathScored(b) => key_path_scored(run, &b.score_source),
+        TeamBody::PlanProposed(b) => key_plan_proposed(run, &b.proposal_id),
+        TeamBody::PlanRevised(b) => key_plan_revised(run, b.plan_rev),
+        TeamBody::PlanAccepted(b) => key_plan_accepted(run, b.plan_rev),
+        TeamBody::PlanRefused(b) => key_plan_refused(run, &b.proposal_id),
+        TeamBody::MemberJoined(b) => {
+            key_member_joined(run, ord()?, attempt()?, &b.member_id, b.open_seq)
+        }
+        TeamBody::MemberLeft(b) => {
+            key_member_left(run, ord()?, attempt()?, &b.member_id, b.open_seq)
+        }
+        TeamBody::StepClaimed(b) => key_step_claimed(run, &b.step_id, attempt()?, by),
+        TeamBody::CheckpointReached(b) => key_checkpoint_reached(run, ord()?, attempt()?, b.seq),
+        TeamBody::FindingRaised(b) => key_finding_raised(run, ord()?, attempt()?, b.raise_seq),
+        TeamBody::AdviceDelivered(b) => {
+            key_advice_delivered(run, ord()?, attempt()?, b.raise_seq, &b.delivery_id)
+        }
+        TeamBody::AdviceAnswered(b) => {
+            key_advice_answered(run, ord()?, attempt()?, b.raise_seq, &b.answered_in)
+        }
+        TeamBody::HelpRequested(b) => key_help_requested(run, &b.help_id),
+        TeamBody::HelpAnswered(b) => key_help_answered(run, &b.help_id, &b.answer_id),
+        TeamBody::ChangeRequested(b) => key_change_requested(run, &b.change_id),
+        TeamBody::StepCompleted(b) => key_step_completed(run, &b.step_id, attempt()?, by),
+        TeamBody::StepReviewed(b) => key_step_reviewed(run, &b.step_id, attempt()?),
+        TeamBody::FindingSettled(b) => key_finding_settled(run, ord()?, attempt()?, b.raise_seq),
+        TeamBody::CouncilCalled(b) => key_council_called(run, ord()?, attempt()?, &b.subject),
+        TeamBody::CouncilRuled(b) => key_council_ruled(run, ord()?, attempt()?, &b.subject),
+        TeamBody::LedgerFolded(_) => key_ledger_folded(run, ord()?, attempt()?),
+        TeamBody::GateOpened(b) => key_gate_opened(run, &b.gate_id),
+        TeamBody::GateDecided(b) => key_gate_decided(run, &b.gate_id),
+        TeamBody::PathEnded(_) => key_path_ended(run),
+    })
+}
+
+// ── fold (DES-002 §4.4, §8.11; DES-001 §6.3, §6.7) ───────────────────────────────────────────────
+
+/// One bus row of an attempt, as the fold reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamRow {
+    pub event_id: i64,
+    pub event: TeamEvent,
+}
+
+/// A finding the worker has not accepted: `status ∉ {accepted, withdrawn, superseded}`
+/// (DES-001 §6.3 item 2).
+pub fn is_unaccepted(f: &LedgerFinding) -> bool {
+    !matches!(f.status.as_str(), "accepted" | "withdrawn" | "superseded")
+}
+
+/// DES-001 §6.3: HIGH, not accepted, and held by its monitor. A missing hold-round reply counts
+/// as HOLD (a monitor's silence never clears a finding).
+pub fn is_unresolved_high(f: &LedgerFinding) -> bool {
+    f.finding.severity == Severity::High
+        && is_unaccepted(f)
+        && f.monitor_reply.as_ref().is_none_or(|r| r.kind == "hold")
+}
+
+/// The findings a council must rule on (DES-001 §6.3, acceptance #15).
+pub fn unresolved_highs(ledger: &TeamLedger) -> Vec<&LedgerFinding> {
+    ledger
+        .findings
+        .iter()
+        .filter(|f| is_unresolved_high(f))
+        .collect()
+}
+
+/// DES-001 §6.7: an unresolved HIGH whose council did not say YES (no verdict counts as NO).
+pub fn ledger_pauses(ledger: &TeamLedger) -> bool {
+    unresolved_highs(ledger)
+        .iter()
+        .any(|f| f.dispute.as_ref().is_none_or(|d| d.verdict != "yes"))
+}
+
+/// The gate's half of DES-001 §6.7: a unit pauses `team_dispute` only when the gate approved
+/// (`outcome.approved`) and its ledger pauses. A denied unit is denied, never paused.
+pub fn gate_pauses(approved: bool, ledger: &TeamLedger) -> bool {
+    approved && ledger.team_pause
+}
+
+/// Fold one attempt's rows into its [`TeamLedger`]: a pure function of the rows, independent of
+/// their delivery order and of duplicates (rows are ordered by `event_id` and deduplicated by
+/// key, so a re-delivered or re-published row folds once).
+///
+/// What the stream carries, the fold reproduces: monitors (`member.joined`/`member.left`),
+/// findings (`finding.raised`), delivery (`advice.delivered`; `injected` on any channel wins),
+/// the worker's disposition (`advice.answered`; the latest line wins, as S3's parser keeps the
+/// last `ADVICE` line), the hold round and re-confirmation (`finding.settled`), and each
+/// finding's council (`council.ruled` on subject `finding:<raise_seq>`). `final_pass` is
+/// `skipped` when the attempt's `step.completed` did not return `ok`, else `completed`.
+/// `teamPause` is [`ledger_pauses`].
+///
+/// Not on the stream, so not folded: `rejected{}` (a rejected monitor line is never raised) and a
+/// corroboration that arrives after the finding was raised. The supervisor, which owns both,
+/// overlays them on the fold's result before it publishes `ledger.folded`.
+pub fn fold(rows: &[TeamRow]) -> TeamLedger {
+    let _ = rows;
+    todo!("T1 fold")
+}
+
+/// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every unaccepted HIGH
+/// missing a hold-round reply or a council verdict gets `{kind:"hold", reason:"no reply (final
+/// pass timed out)"}` / `{verdict:"no_verdict", reason:"timeout"}`. Recorded results are kept;
+/// MEDIUM and accepted/withdrawn/superseded findings are untouched. `teamPause` is recomputed.
+pub fn synthesize_timeout(ledger: TeamLedger) -> TeamLedger {
+    let _ = ledger;
+    todo!("T1 synthesize_timeout")
+}
+
+#[allow(dead_code)]
+fn unused_imports_until_fold(
+    _: (
+        &BTreeMap<u8, u8>,
+        &HashSet<u8>,
+        Finding,
+        LedgerMonitor,
+        MonitorReply,
+        Dispute,
+    ),
+) {
+}
+
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod tests;

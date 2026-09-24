@@ -1,0 +1,701 @@
+[
+ {
+  "type": "wicked.team.path.started",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "engine",
+   "at": 1758700000000,
+   "re": null,
+   "cli": "claude#1",
+   "selection": "chosen",
+   "roster": [
+    "claude#1",
+    "claude#2",
+    "codex"
+   ],
+   "request": "retire the coverage flow",
+   "workflow": "feature",
+   "plan": false
+  }
+ },
+ {
+  "type": "wicked.team.path.scored",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "engine",
+   "at": 1758700000001,
+   "re": null,
+   "score_source": "intent:p-0123456789abcdef0123456789abcdef",
+   "basis": "intent",
+   "score": 70,
+   "deterministic": 70,
+   "reasons": [
+    "destructive => floor 70",
+    "reach 21-100 dependents: +60"
+   ],
+   "model": {
+    "add": 10,
+    "rationale": "migration touches a shared table"
+   },
+   "signals": {
+    "changed_symbols": 4,
+    "dependents": 37,
+    "products": 1,
+    "contract_change": false,
+    "test_gap": 0.5,
+    "critical": false,
+    "destructive": true,
+    "truncated": false
+   },
+   "plan": {
+    "monitors": 3,
+    "depth": "deep",
+    "post_hoc_reviewer": true,
+    "post_hoc_other_cli": true
+   },
+   "tree": null
+  }
+ },
+ {
+  "type": "wicked.team.plan.proposed",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "claude#1",
+   "at": 1758700000002,
+   "re": null,
+   "proposal_id": "p-0123456789abcdef0123456789abcdef",
+   "base_rev": null,
+   "kind": "initial",
+   "preset": null,
+   "steps": [
+    {
+     "catalog": "understand",
+     "id": "understand"
+    },
+    {
+     "catalog": "design",
+     "id": "design",
+     "instructions": "sketch the retire flow"
+    },
+    {
+     "catalog": "test_plan",
+     "id": "test-plan",
+     "owner": "team"
+    },
+    {
+     "catalog": "build",
+     "id": "build",
+     "depends_on": [
+      "design"
+     ]
+    },
+    {
+     "catalog": "review",
+     "id": "review",
+     "gate": {
+      "human_confirm_if": "verdict_not_pass"
+     }
+    },
+    {
+     "catalog": "deliver",
+     "id": "deliver"
+    }
+   ],
+   "monitors": {
+    "asked": 1
+   },
+   "asks": [
+    "a codex seat to cross-check the migration"
+   ],
+   "touch": [
+    "src/retire.ts",
+    "src/coverage.ts"
+   ],
+   "override": null,
+   "rationale": "the retire flow needs a design first"
+  }
+ },
+ {
+  "type": "wicked.team.plan.revised",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "engine",
+   "at": 1758700000003,
+   "re": null,
+   "plan_rev": 2,
+   "proposal_id": null,
+   "reason": "floor_raised",
+   "from_band": "20-39",
+   "to_band": "40-69",
+   "high_risk": false,
+   "added": [
+    {
+     "catalog": "test_plan",
+     "id": "test-plan",
+     "added_by": "floor",
+     "floor_reason": "band 40-69 requires test_plan",
+     "late": false
+    },
+    {
+     "catalog": "design",
+     "id": "design",
+     "added_by": "floor",
+     "floor_reason": "band 40-69 requires design",
+     "late": true
+    }
+   ]
+  }
+ },
+ {
+  "type": "wicked.team.plan.accepted",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "engine",
+   "at": 1758700000004,
+   "re": null,
+   "plan_rev": 1,
+   "workflow_id": "r1:plan-1",
+   "band": "40-69",
+   "high_risk": false,
+   "mode": "manual",
+   "steps": [
+    {
+     "catalog": "understand",
+     "id": "understand",
+     "added_by": "plan"
+    },
+    {
+     "catalog": "test_plan",
+     "id": "test-plan",
+     "added_by": "floor",
+     "floor_reason": "band 40-69 requires test_plan"
+    }
+   ],
+   "override": {
+    "remove": [
+     "review"
+    ],
+    "reason": "docs-only change"
+   },
+   "proposal_id": "p-0123456789abcdef0123456789abcdef"
+  }
+ },
+ {
+  "type": "wicked.team.plan.refused",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "engine",
+   "at": 1758700000005,
+   "re": null,
+   "proposal_id": "p-fedcba9876543210fedcba9876543210",
+   "base_rev": 1,
+   "reason": "step `review` lowers its entry's gate"
+  }
+ },
+ {
+  "type": "wicked.team.member.joined",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000006,
+   "re": null,
+   "member_id": "m1",
+   "open_seq": 1,
+   "seat": "claude#2",
+   "role": "monitor",
+   "status": "attached",
+   "reason": "path.scored#2 monitors=3",
+   "error": null
+  }
+ },
+ {
+  "type": "wicked.team.member.left",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000007,
+   "re": null,
+   "member_id": "m1",
+   "open_seq": 1,
+   "seat": "claude#2",
+   "status": "budget_exhausted",
+   "batches": 10,
+   "error": null
+  }
+ },
+ {
+  "type": "wicked.team.step.claimed",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000008,
+   "re": null,
+   "step_id": "build",
+   "role": "creator",
+   "kind": "build",
+   "phase": "build",
+   "criterion": "the retire flow cancels its fetch",
+   "baseline_tree": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+   "repo": {
+    "workdir": "/work/r1",
+    "git_dir": "/work/r1/.git"
+   },
+   "code_graph_db": null
+  }
+ },
+ {
+  "type": "wicked.team.checkpoint.reached",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000009,
+   "re": null,
+   "seq": 17,
+   "tool_call_id": "toolu_01",
+   "kind": "edit",
+   "title": "Edit src/retire.ts",
+   "status": "completed",
+   "paths": [
+    "src/retire.ts"
+   ]
+  }
+ },
+ {
+  "type": "wicked.team.finding.raised",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#2",
+   "at": 1758700000010,
+   "re": "checkpoint.reached#17",
+   "raise_seq": 4,
+   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "member_id": "m1",
+   "line_key": null,
+   "anchor": null,
+   "anchor_source": null,
+   "severity": "high",
+   "path": "src/retire.ts",
+   "line": 41,
+   "evidence": "fetchCoverage(scope).then(setCount)",
+   "claim": "the fetch is never cancelled",
+   "suggestion": null,
+   "tree": "t-k",
+   "in_diff": true,
+   "corroborated_by": []
+  }
+ },
+ {
+  "type": "wicked.team.advice.delivered",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000011,
+   "re": "finding.raised#4",
+   "raise_seq": 4,
+   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "delivery_id": "s-1",
+   "steer_id": "s-1",
+   "channel": "acp_steering",
+   "outcome": "injected",
+   "detail": null
+  }
+ },
+ {
+  "type": "wicked.team.advice.answered",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000012,
+   "re": "finding.raised#4",
+   "raise_seq": 4,
+   "answered_in": "build:1",
+   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "disposition": "declined",
+   "reason": "campaign.rs:325 documents the exclusion"
+  }
+ },
+ {
+  "type": "wicked.team.help.requested",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000013,
+   "re": null,
+   "help_id": "h-0123456789abcdef0123456789abcdef",
+   "help_seq": 2,
+   "question": "which table owns coverage?",
+   "context": "retire.ts reads it at :41"
+  }
+ },
+ {
+  "type": "wicked.team.help.answered",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#2",
+   "at": 1758700000014,
+   "re": "help.requested#h-0123456789abcdef0123456789abcdef",
+   "help_id": "h-0123456789abcdef0123456789abcdef",
+   "answer_id": "t-7",
+   "answer": "coverage_rows, created in migration 12",
+   "evidence": [
+    "src/x.rs:41"
+   ]
+  }
+ },
+ {
+  "type": "wicked.team.change.requested",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#2",
+   "at": 1758700000015,
+   "re": null,
+   "change_id": "c-0123456789abcdef0123456789abcdef",
+   "change_seq": 1,
+   "steps": [
+    {
+     "catalog": "test_plan",
+     "id": "test-plan-2"
+    }
+   ],
+   "reason": "the migration has no test plan"
+  }
+ },
+ {
+  "type": "wicked.team.step.completed",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000016,
+   "re": null,
+   "step_id": "build",
+   "status": "ok",
+   "tree": "t-final",
+   "output_bytes": 12345,
+   "output_ref": "unit:r1:3:1"
+  }
+ },
+ {
+  "type": "wicked.team.step.reviewed",
+  "payload": {
+   "run_id": "r1",
+   "ord": 4,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000017,
+   "re": "step.completed#test-plan",
+   "step_id": "test-plan",
+   "verdict": "rejected",
+   "to": "member",
+   "reason": "covers only the happy path"
+  }
+ },
+ {
+  "type": "wicked.team.finding.settled",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#2",
+   "at": 1758700000018,
+   "re": "advice.answered#4",
+   "raise_seq": 4,
+   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "status": "held",
+   "reason": "no reply (counted as hold)",
+   "final_line": 43
+  }
+ },
+ {
+  "type": "wicked.team.council.called",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000019,
+   "re": "finding.settled#4",
+   "subject": "finding:4",
+   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "trigger": "unresolved_high",
+   "question": "Should the run continue autonomously with the worker's refusal standing?",
+   "positions": [
+    {
+     "by": "worker claude#1",
+     "position": "YES — the refusal stands",
+     "reason": "campaign.rs:325 documents the exclusion"
+    },
+    {
+     "by": "monitor claude#2",
+     "position": "NO — the finding stands",
+     "reason": "no reply (counted as hold)"
+    }
+   ],
+   "evidence": "src/retire.ts:43 fetchCoverage(scope).then(setCount)",
+   "excluded_seats": [
+    "claude#1",
+    "claude#2"
+   ],
+   "transcript": [
+    1201,
+    1207,
+    1215,
+    1220
+   ]
+  }
+ },
+ {
+  "type": "wicked.team.council.ruled",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "council:task-9",
+   "at": 1758700000020,
+   "re": "council.called#finding:4",
+   "subject": "finding:4",
+   "verdict": "no",
+   "reason": null,
+   "task_id": "task-9",
+   "consensus": true,
+   "agreement_pct": 67,
+   "dissent": [
+    "continue: the exclusion is documented"
+   ],
+   "returned": 3,
+   "seated": 3
+  }
+ },
+ {
+  "type": "wicked.team.ledger.folded",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000021,
+   "re": null,
+   "final_pass": "completed",
+   "transport": "bus",
+   "ledger": {
+    "finalPass": "completed",
+    "renderedToJudge": false,
+    "teamPause": true,
+    "monitors": [
+     {
+      "monitorId": "m1",
+      "seat": "claude#2",
+      "batches": 4,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "findings": [
+     {
+      "findingId": "f-3fa9c2e1d0b4a7e6",
+      "monitorId": "m1",
+      "seat": "claude#2",
+      "severity": "high",
+      "path": "src/retire.ts",
+      "line": 41,
+      "finalLine": 43,
+      "evidence": "fetchCoverage(scope).then(setCount)",
+      "claim": "the fetch is never cancelled",
+      "suggestion": null,
+      "tree": "t-k",
+      "inDiff": true,
+      "corroboratedBy": [],
+      "delivery": "injected",
+      "status": "declined",
+      "workerReason": "campaign.rs:325 documents the exclusion",
+      "monitorReply": {
+       "kind": "hold",
+       "reason": "no reply (counted as hold)"
+      },
+      "dispute": {
+       "verdict": "no",
+       "agreementPct": 67,
+       "dissent": 1,
+       "seats": [],
+       "reason": null
+      }
+     }
+    ],
+    "rejected": {
+     "malformed": 0,
+     "belowBar": 0,
+     "unconfirmed": 0,
+     "duplicate": 0
+    }
+   },
+   "transcript": {
+    "from_event_id": 1180,
+    "to_event_id": 1290,
+    "count": 1,
+    "truncated": false,
+    "events": [
+     {
+      "event_id": 1201,
+      "event_type": "wicked.team.finding.raised",
+      "payload": {
+       "raise_seq": 4
+      }
+     }
+    ]
+   }
+  }
+ },
+ {
+  "type": "wicked.team.gate.opened",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000022,
+   "re": null,
+   "gate_id": "g-r1-3",
+   "kind": "unit_review",
+   "ledger_ref": "ledger.folded#3:1",
+   "ledger_source": "folded"
+  }
+ },
+ {
+  "type": "wicked.team.gate.opened",
+  "payload": {
+   "run_id": "r1",
+   "ord": 2,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000023,
+   "re": null,
+   "gate_id": "g-r1-4",
+   "kind": "plan_approval",
+   "reviewing_ord": 1,
+   "plan_rev": 1,
+   "band": "70-100",
+   "high_risk": true,
+   "mode": "auto",
+   "reason": "high_risk",
+   "diff": {
+    "from_rev": null,
+    "added": [
+     "architecture",
+     "security_review"
+    ]
+   }
+  }
+ },
+ {
+  "type": "wicked.team.gate.opened",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000026,
+   "re": null,
+   "gate_id": "g-r1-5",
+   "kind": "team_dispute",
+   "finding_ids": [
+    "f-3fa9c2e1d0b4a7e6"
+   ]
+  }
+ },
+ {
+  "type": "wicked.team.gate.opened",
+  "payload": {
+   "run_id": "r1",
+   "ord": 4,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000027,
+   "re": null,
+   "gate_id": "g-r1-6",
+   "kind": "team_transport",
+   "fact": "wicked.team.plan.accepted",
+   "reason": "bus db locked past the 31 s bound"
+  }
+ },
+ {
+  "type": "wicked.team.gate.decided",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "human",
+   "at": 1758700000028,
+   "re": "gate.opened#g-r1-5",
+   "gate_id": "g-r1-5",
+   "kind": "team_dispute",
+   "decision": "human_approved",
+   "combined": null,
+   "team_pause": false,
+   "unresolved": []
+  }
+ },
+ {
+  "type": "wicked.team.gate.decided",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000024,
+   "re": "gate.opened#g-r1-3",
+   "gate_id": "g-r1-3",
+   "kind": "unit_review",
+   "decision": "paused",
+   "combined": true,
+   "team_pause": true,
+   "unresolved": [
+    "f-3fa9c2e1d0b4a7e6"
+   ]
+  }
+ },
+ {
+  "type": "wicked.team.path.ended",
+  "payload": {
+   "run_id": "r1",
+   "ord": null,
+   "attempt": null,
+   "by": "engine",
+   "at": 1758700000025,
+   "re": null,
+   "status": "completed"
+  }
+ }
+]

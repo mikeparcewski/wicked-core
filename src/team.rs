@@ -36,10 +36,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::event::CoreEvent;
+
+pub mod events;
 
 // ── Constants (DES §4.8; env-overridable for rigs only) ──────────────────────────────────────────
 
@@ -302,7 +304,7 @@ pub struct RawFinding {
 
 /// The ledger's `rejected` counters: every `FINDING` line that did not surface, by the first
 /// check it failed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rejected {
     pub malformed: u32,
@@ -431,14 +433,14 @@ pub fn locate(file: Option<&str>, line: u32, evidence: &str) -> Option<u32> {
 }
 
 /// A monitor's answer on a declined finding at the final pass (S3/S6 fill it).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorReply {
     pub kind: String,
     pub reason: String,
 }
 
 /// A one-off council's verdict on a dispute (S6 fills it).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dispute {
     pub verdict: String,
@@ -451,7 +453,7 @@ pub struct Dispute {
 /// One finding in the ledger (DES §7 `teamLedger.findings[]`). S2 fills everything it owns;
 /// `delivery`, `workerReason`, `monitorReply` and `dispute` keep their S2 defaults
 /// (`not_delivered` / `null`) until S3 and S6 write them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerFinding {
     /// The finding as it was confirmed and emitted (`monitorFinding`, DES §7), flattened.
@@ -468,7 +470,7 @@ pub struct LedgerFinding {
 }
 
 /// One monitor in the ledger (DES §7 `teamLedger.monitors[]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerMonitor {
     pub monitor_id: String,
@@ -481,7 +483,7 @@ pub struct LedgerMonitor {
 
 /// The per-attempt team record the final pass returns (DES §6.1 / §7 `teamLedger`, without the
 /// envelope S6 emits it in).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamLedger {
     /// `completed` | `timed_out` | `skipped`.
@@ -491,6 +493,10 @@ pub struct TeamLedger {
     pub monitors: Vec<LedgerMonitor>,
     pub findings: Vec<LedgerFinding>,
     pub rejected: Rejected,
+    /// Whether the ledger holds an unresolved HIGH without a council YES (DES-TEAMING-001 §6.7):
+    /// the run may not continue unattended. [`events::fold`] decides it from the stream.
+    #[serde(default)]
+    pub team_pause: bool,
 }
 
 /// What [`FindingBook::admit`] did with a confirmed, above-bar finding.
@@ -978,6 +984,7 @@ impl UnitTeam {
                 .collect(),
             findings: self.book.findings.clone(),
             rejected: self.book.rejected,
+            team_pause: false,
         }
     }
 }
@@ -1578,6 +1585,14 @@ impl serde::Serialize for Severity {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Severity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Severity::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("severity `{s}` is below the bar")))
+    }
+}
+
 impl Severity {
     /// The bar (DES §4.6 step 2): `high` | `medium`; anything else is below it.
     pub(crate) fn parse(s: &str) -> Option<Self> {
@@ -1598,7 +1613,7 @@ impl Severity {
 
 /// A confirmed monitor finding, as `monitorFinding` shapes it (DES §7): THE one finding type.
 /// S2's confirmation constructs it, the ledger embeds it ([`LedgerFinding`]), and S3 steers it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     /// `"f-" + hex(sha256(path ‖ "\n" ‖ normalized evidence))[..16]` (DES §4.6 step 4).

@@ -128,6 +128,8 @@ pub use gate_hook::{
     ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION,
     GATE_SCOPE_ENV,
 };
+/// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
+pub use team::events as team_events;
 pub use team::{TeamLedger, TeamPlan};
 // Governance evals — the JSON-string seams the core-ts binding wraps 1:1
 // (`core.governanceEvals(argsJson)` / `core.governanceCorpusImport(argsJson)`); the report and
