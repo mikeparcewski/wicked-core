@@ -92,7 +92,6 @@ fn default_boot_serves_commands_while_the_bus_file_is_locked() {
 
     std::env::set_var("WICKED_BUS_DB", &bus_db);
     std::env::remove_var("WICKED_BUS_EXEC");
-    std::env::set_var("WICKED_APPS_EMIT_DEADLETTER", dir.join("outbox.ndjson"));
     let started = Instant::now();
     let core = Core::spawn_with_engine(estate_db, Arc::new(StubDispatcher), Arc::new(FastRunner));
     let sessions = core.sessions();
@@ -247,8 +246,6 @@ fn default_boot_opens_the_bus_once_on_the_bridge_thread() {
 
     std::env::set_var("WICKED_BUS_DB", &bus_db);
     std::env::remove_var("WICKED_BUS_EXEC");
-    // Keep the engine's governance dead letters in the scratch dir, never under HOME.
-    std::env::set_var("WICKED_APPS_EMIT_DEADLETTER", dir.join("outbox.ndjson"));
     let core = Core::spawn_with_engine(
         dir.join("a.db").to_string_lossy().to_string(),
         Arc::new(StubDispatcher),
@@ -295,7 +292,6 @@ fn exec_boot_mediates_over_the_same_single_connection() {
 
     std::env::set_var("WICKED_BUS_DB", &bus_db);
     std::env::set_var("WICKED_BUS_EXEC", "1");
-    std::env::set_var("WICKED_APPS_EMIT_DEADLETTER", dir.join("outbox.ndjson"));
     let core = Core::spawn_with_engine(
         dir.join("e.db").to_string_lossy().to_string(),
         Arc::new(StubDispatcher),
@@ -330,4 +326,17 @@ fn exec_boot_mediates_over_the_same_single_connection() {
         "exec mediation, the bridge, the publisher and the judge share one connection"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
+/// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
+/// race it): the engine paths these tests drive fire `wicked.*` governance emissions, which with no
+/// shared store spool — into a per-process temp file, never the operator's real replay queue.
+/// `harness_hygiene.rs` fails the suite if a test binary lacks this block.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
 }
