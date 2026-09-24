@@ -339,7 +339,7 @@
     "skill_ref": "wicked-garden-domain-extractor"
    },
    {
-    "catalog": "test",
+    "catalog": "domain_coverage",
     "id": "coverage",
     "executes_code": true,
     "required_deliverables": [

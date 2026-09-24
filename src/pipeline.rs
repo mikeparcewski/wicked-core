@@ -239,7 +239,8 @@ fn attach_pinned_validators(
     // floor as authored (registration REFUSES a `verified_evidence` phase with no pin — nothing is
     // armed here), and a composed plan's pins come from the phase catalog (DES-TEAMING-002 §10,
     // seam C1): the `build`, `test`, `review` and `security_review` entries carry the evidence
-    // floor as data (`catalog.rs`), and a step may only add or swap a pin, never remove one.
+    // floor as data and `domain_coverage` the coverage pin (`catalog.rs`); a step may add a pin to
+    // an unpinned entry only, never swap or remove one (`plan::apply_step`).
     // A phase with no pin still leaves the unit's validator `None` (ungated). Operators author
     // phase-specific criteria via `wicked-core provision-validator --criterion "..."` then
     // `wicked-core approve-validator --pin <pin>`, and put the approved pin in a def's `validator_pin`.

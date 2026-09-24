@@ -20,6 +20,8 @@ use wicked_core::{
 };
 
 const EVIDENCE_FLOOR_PIN: &str = "e2e7af1db9e48454";
+/// `COVERAGE_VALIDATOR_PIN`: shipped and APPROVED (the `domain_coverage` entry's pin).
+const COVERAGE_PIN: &str = "bfe4020a365c598b";
 
 /// The acceptance tuple, in the DES's order.
 const FIELDS: [&str; 9] = [
@@ -164,6 +166,46 @@ fn compose_of_every_mapping_equals_todays_def_except_the_bold_cells() {
     assert_eq!(bold_total, 11, "§11.2 has eleven bold cells");
 }
 
+/// domain-extraction's coverage maps onto `domain_coverage`, which carries the coverage pin as
+/// data: the mapping restates it (a no-op), no §11.2 step swaps a pin, and the composed phase is
+/// today's in every acceptance field and still satisfies `BINARY_PINNED_PHASES`.
+#[test]
+fn domain_extraction_coverage_composes_from_its_own_pinned_entry() {
+    let maps = mappings();
+    for consumer in CONSUMERS {
+        for step in maps[consumer]["steps"].as_array().unwrap() {
+            let Some(pin) = step.get("validator_pin") else {
+                continue;
+            };
+            let entry = wicked_core::catalog_entry(step["catalog"].as_str().unwrap()).unwrap();
+            if let Some(own) = entry.validator_pin.as_deref() {
+                assert_eq!(
+                    pin,
+                    &json!(own),
+                    "{consumer}/{}: swaps its entry's pin",
+                    step["id"]
+                );
+            }
+        }
+    }
+    let def = compose(catalog(), &steps_of(&maps["domain-extraction"])).unwrap();
+    let today = today_defs();
+    let before = today["domain-extraction"]
+        .phases
+        .iter()
+        .find(|p| p.id == "coverage")
+        .unwrap();
+    let after = def.phases.iter().find(|p| p.id == "coverage").unwrap();
+    assert_eq!(tuple(after), tuple(before), "coverage is unchanged");
+    assert_eq!(after.verified_evidence, before.verified_evidence);
+    assert_eq!(after.required_deliverables, before.required_deliverables);
+    // `BINARY_PINNED_PHASES` is `[("domain-extraction", "coverage", COVERAGE_VALIDATOR_PIN)]`.
+    assert_eq!(
+        after.validator_pin.as_deref(),
+        Some(wicked_core::COVERAGE_VALIDATOR_PIN)
+    );
+}
+
 /// C1 acceptance (a), the named migration cell: cleanup maps to `build` (rev 10 decision).
 #[test]
 fn migration_cleanup_composes_as_build() {
@@ -274,6 +316,28 @@ fn a_step_that_weakens_its_entry_is_refused_with_a_named_reason() {
     }
 }
 
+/// Operator decision (follow-up to #615): a step may ADD a pin to an unpinned entry, but never
+/// SWAP the pin an entry carries — not even for another APPROVED pin. Here `build`'s evidence
+/// floor is swapped for the shipped, approved coverage pin: refused as `pin_changed`.
+#[test]
+fn a_step_cannot_swap_its_entrys_pin_for_another_approved_pin() {
+    let r = refusal(json!([{"catalog": "build", "id": "b", "validator_pin": COVERAGE_PIN}]));
+    assert_eq!(r.reason(), "pin_changed", "{r}");
+    assert!(r.to_string().starts_with("pin_changed"), "{r}");
+    // Restating the entry's own pin is a no-op, and removal stays `pin_removed`.
+    let same: PlanSteps = serde_json::from_value(json!({ "steps": [
+        {"catalog": "build", "id": "b", "validator_pin": EVIDENCE_FLOOR_PIN}
+    ]}))
+    .unwrap();
+    let def = compose(catalog(), &same).expect("restating the entry's pin is a no-op");
+    assert_eq!(
+        def.phases[0].validator_pin.as_deref(),
+        Some(EVIDENCE_FLOOR_PIN)
+    );
+    let gone = refusal(json!([{"catalog": "build", "id": "b", "validator_pin": null}]));
+    assert_eq!(gone.reason(), "pin_removed", "{gone}");
+}
+
 /// The strengthenings §8.3/§11.2 allow are accepted, and a same-value `role` is not a change.
 #[test]
 fn a_step_that_strengthens_its_entry_is_accepted() {
@@ -282,7 +346,7 @@ fn a_step_that_strengthens_its_entry_is_accepted() {
          "validator_pin": EVIDENCE_FLOOR_PIN, "owner": "team"},
         {"catalog": "produce", "id": "p", "executes_code": true, "validator_pin": EVIDENCE_FLOOR_PIN,
          "depends_on": ["u"], "role": "creator"},
-        {"catalog": "test", "id": "t", "validator_pin": "bfe4020a365c598b", "depends_on": ["p"],
+        {"catalog": "critique", "id": "t", "validator_pin": COVERAGE_PIN, "depends_on": ["p"],
          "gate": {"human_confirm": {"unconditional": false}}},
         {"catalog": "run", "id": "r", "kind": "test", "depends_on": ["t"],
          "executor": {"type": "tool", "cmd": ["true"]}},
@@ -298,7 +362,8 @@ fn a_step_that_strengthens_its_entry_is_accepted() {
         json!({"human_confirm": {"unconditional": true}})
     );
     assert_eq!(v["phases"][1]["executes_code"], json!(true));
-    assert_eq!(v["phases"][2]["validator_pin"], json!("bfe4020a365c598b"));
+    // An ADD on the unpinned `critique` entry (a swap on a pinned entry is `pin_changed`).
+    assert_eq!(v["phases"][2]["validator_pin"], json!(COVERAGE_PIN));
     assert_eq!(v["phases"][3]["kind"], json!("test"));
     assert_eq!(
         v["phases"][3]["executor"],
@@ -451,7 +516,14 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
         (
             "validator_pin",
             (
-                vec![("full", json!({"validator_pin": null}), "pin_removed")],
+                vec![
+                    ("full", json!({"validator_pin": null}), "pin_removed"),
+                    (
+                        "full",
+                        json!({"validator_pin": COVERAGE_PIN}),
+                        "pin_changed",
+                    ),
+                ],
                 ("full", json!({"validator_pin": EVIDENCE_FLOOR_PIN})),
             ),
         ),
@@ -590,10 +662,11 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     let def = compose_one(
         "tool",
         json!({"executor": {"type": "tool", "cmd": ["true"]}, "skill_ref": "s",
-               "instructions": "i", "allowed_skills": ["a"]}),
+               "instructions": "i", "allowed_skills": ["a"], "validator_pin": COVERAGE_PIN}),
     )
     .unwrap();
     assert_eq!(def.phases[0].skill_ref.as_deref(), Some("s"));
+    assert_eq!(def.phases[0].validator_pin.as_deref(), Some(COVERAGE_PIN));
 }
 
 /// C1 acceptance (c): a misspelled step key is refused at parse.
