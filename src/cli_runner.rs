@@ -4001,3 +4001,147 @@ mod floor_heartbeat_tests {
         );
     }
 }
+
+/// DES-TEAMING-002 T0 (amended) — the gate judge's BUS path is exec mediation's, not the bus
+/// handoff's. Crew now hands every engine `WICKED_BUS_DB`; before this seam that variable ALONE
+/// rerouted every pinned judge to `wicked.gate.eval.requested` and a 180 s fail-closed wait for an
+/// evaluator daemon no product runs. The judge must take the bus only when `WICKED_BUS_EXEC` is on.
+#[cfg(test)]
+mod judge_routing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn seat(key: &str, invocation: &str) -> crate::AgenticCli {
+        use wicked_council::{Category, Confidence, InputMode};
+        crate::AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: invocation.into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            health: None,
+        }
+    }
+
+    struct OkRunner;
+    impl StepRunner for OkRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "the work".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn bus_db_without_exec_keeps_the_inline_judge_for_an_evidence_floor_pinned_unit() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-judge-routing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_string_lossy().to_string();
+
+        // The default crew boot after T0: the engine HAS a bus, exec mediation is OFF.
+        std::env::set_var("WICKED_BUS_DB", &bus_path);
+        std::env::remove_var("WICKED_BUS_EXEC");
+
+        // A stand-in evaluator daemon, so the pre-fix bus path fails this test in seconds, not
+        // after the 180 s timeout: it answers every request it sees and counts them.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let responder = {
+            let (requests, stop, bus_path) = (requests.clone(), stop.clone(), bus_path.clone());
+            std::thread::spawn(move || {
+                let db = BusDb::open(&bus_path).unwrap();
+                let mut floor = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    for ev in db.poll(GATE_EVAL_REQUESTED, floor, 20).unwrap_or_default() {
+                        floor = ev.event_id;
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let eval_id = ev.payload["eval_id"].as_str().unwrap_or("").to_string();
+                        let _ = db.emit(&BusEmit::new(
+                            GATE_EVAL_RESPONDED,
+                            "test",
+                            "test.gate",
+                            serde_json::json!({"eval_id": eval_id, "pass": true, "reasoning": "stand-in"}),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        // The built-in Evaluator phases' floor: the approved evidence-floor validator.
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "review the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
+            script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        // claude = the deterministic validator's author, pi = the creator: the inline judge has
+        // no distinct seat and records WHY (judge_skipped) without spawning anything.
+        let roster = vec![seat("claude", "claude -p {PROMPT}"), seat("pi", "pi ask {PROMPT}")];
+        let runner: Arc<dyn StepRunner> = Arc::new(OkRunner);
+        let noop: &DeltaSink = &|_: &str| {};
+        let started = Instant::now();
+        let (_out, _verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        let elapsed = started.elapsed();
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = responder.join();
+        std::env::remove_var("WICKED_BUS_DB");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "WICKED_BUS_DB without WICKED_BUS_EXEC must never publish wicked.gate.eval.requested"
+        );
+        assert!(
+            evidence.judge_skipped.is_some(),
+            "the INLINE judge ran (it records why no distinct seat judged); got {:?}",
+            evidence.judge_skipped
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "no bus wait: the judge returned in {elapsed:?}"
+        );
+    }
+}
