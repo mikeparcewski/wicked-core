@@ -11,12 +11,12 @@
 
 | Constant | Event type | Declared at | In apps-core `EVENT_CATALOG` | Emit seam (non-test) |
 |---|---|---|---|---|
-| `ADVICE_ANSWERED` | `wicked.team.advice.answered` | `src/team/events.rs:53` | no | — |
-| `ADVICE_DELIVERED` | `wicked.team.advice.delivered` | `src/team/events.rs:52` | no | — |
-| `CHANGE_REQUESTED` | `wicked.team.change.requested` | `src/team/events.rs:56` | no | — |
-| `CHECKPOINT_REACHED` | `wicked.team.checkpoint.reached` | `src/team/events.rs:50` | no | — |
-| `COUNCIL_CALLED` | `wicked.team.council.called` | `src/team/events.rs:60` | no | — |
-| `COUNCIL_RULED` | `wicked.team.council.ruled` | `src/team/events.rs:61` | no | — |
+| `ADVICE_ANSWERED` | `wicked.team.advice.answered` | `src/team/events.rs:56` | no | — |
+| `ADVICE_DELIVERED` | `wicked.team.advice.delivered` | `src/team/events.rs:55` | no | — |
+| `CHANGE_REQUESTED` | `wicked.team.change.requested` | `src/team/events.rs:59` | no | — |
+| `CHECKPOINT_REACHED` | `wicked.team.checkpoint.reached` | `src/team/events.rs:53` | no | — |
+| `COUNCIL_CALLED` | `wicked.team.council.called` | `src/team/events.rs:63` | no | — |
+| `COUNCIL_RULED` | `wicked.team.council.ruled` | `src/team/events.rs:64` | no | — |
 | `EV_AGENT_PLAN_CREATED` | `wicked.crew.agent_plan.created` | `crates/wicked-apps-core/src/lib.rs:195` | yes | — |
 | `EV_AGENT_SESSION_COMPLETED` | `wicked.crew.agent_session.completed` | `crates/wicked-apps-core/src/lib.rs:198` | yes | — |
 | `EV_AGENT_SESSION_STARTED` | `wicked.crew.agent_session.started` | `crates/wicked-apps-core/src/lib.rs:194` | yes | — |
@@ -42,31 +42,31 @@
 | `EV_RULE_RETIRED` | `wicked.estate.rule.retired` | `crates/wicked-governance/src/events.rs:53` | no | `crates/wicked-governance/src/events.rs` |
 | `EV_WORKFLOW_COMPLETED` | `wicked.crew.workflow.completed` | `crates/wicked-apps-core/src/lib.rs:173` | yes | — |
 | `EV_WORKFLOW_STARTED` | `wicked.crew.workflow.started` | `crates/wicked-apps-core/src/lib.rs:172` | yes | — |
-| `FINDING_RAISED` | `wicked.team.finding.raised` | `src/team/events.rs:51` | no | — |
-| `FINDING_SETTLED` | `wicked.team.finding.settled` | `src/team/events.rs:59` | no | — |
-| `GATE_DECIDED` | `wicked.team.gate.decided` | `src/team/events.rs:64` | no | — |
+| `FINDING_RAISED` | `wicked.team.finding.raised` | `src/team/events.rs:54` | no | — |
+| `FINDING_SETTLED` | `wicked.team.finding.settled` | `src/team/events.rs:62` | no | — |
+| `GATE_DECIDED` | `wicked.team.gate.decided` | `src/team/events.rs:67` | no | — |
 | `GATE_EVAL_REQUESTED` | `wicked.gate.eval.requested` | `src/cli_runner.rs:92` | no | `src/cli_runner.rs` |
 | `GATE_EVAL_RESPONDED` | `wicked.gate.eval.responded` | `src/cli_runner.rs:93` | no | — |
-| `GATE_OPENED` | `wicked.team.gate.opened` | `src/team/events.rs:63` | no | — |
-| `HELP_ANSWERED` | `wicked.team.help.answered` | `src/team/events.rs:55` | no | — |
-| `HELP_REQUESTED` | `wicked.team.help.requested` | `src/team/events.rs:54` | no | — |
-| `LEDGER_FOLDED` | `wicked.team.ledger.folded` | `src/team/events.rs:62` | no | — |
-| `MEMBER_JOINED` | `wicked.team.member.joined` | `src/team/events.rs:47` | no | — |
-| `MEMBER_LEFT` | `wicked.team.member.left` | `src/team/events.rs:48` | no | — |
-| `PATH_ENDED` | `wicked.team.path.ended` | `src/team/events.rs:65` | no | — |
-| `PATH_SCORED` | `wicked.team.path.scored` | `src/team/events.rs:42` | no | — |
-| `PATH_STARTED` | `wicked.team.path.started` | `src/team/events.rs:41` | no | — |
-| `PLAN_ACCEPTED` | `wicked.team.plan.accepted` | `src/team/events.rs:45` | no | — |
-| `PLAN_PROPOSED` | `wicked.team.plan.proposed` | `src/team/events.rs:43` | no | — |
-| `PLAN_REFUSED` | `wicked.team.plan.refused` | `src/team/events.rs:46` | no | — |
-| `PLAN_REVISED` | `wicked.team.plan.revised` | `src/team/events.rs:44` | no | — |
+| `GATE_OPENED` | `wicked.team.gate.opened` | `src/team/events.rs:66` | no | — |
+| `HELP_ANSWERED` | `wicked.team.help.answered` | `src/team/events.rs:58` | no | — |
+| `HELP_REQUESTED` | `wicked.team.help.requested` | `src/team/events.rs:57` | no | — |
+| `LEDGER_FOLDED` | `wicked.team.ledger.folded` | `src/team/events.rs:65` | no | — |
+| `MEMBER_JOINED` | `wicked.team.member.joined` | `src/team/events.rs:50` | no | — |
+| `MEMBER_LEFT` | `wicked.team.member.left` | `src/team/events.rs:51` | no | — |
+| `PATH_ENDED` | `wicked.team.path.ended` | `src/team/events.rs:68` | no | — |
+| `PATH_SCORED` | `wicked.team.path.scored` | `src/team/events.rs:45` | no | — |
+| `PATH_STARTED` | `wicked.team.path.started` | `src/team/events.rs:44` | no | — |
+| `PLAN_ACCEPTED` | `wicked.team.plan.accepted` | `src/team/events.rs:48` | no | — |
+| `PLAN_PROPOSED` | `wicked.team.plan.proposed` | `src/team/events.rs:46` | no | — |
+| `PLAN_REFUSED` | `wicked.team.plan.refused` | `src/team/events.rs:49` | no | — |
+| `PLAN_REVISED` | `wicked.team.plan.revised` | `src/team/events.rs:47` | no | — |
 | `RUN_LAUNCHED` | `wicked.crew.run.launched` | `src/bus.rs:830` | no | `src/bus.rs` |
 | `RUN_REQUESTED` | `wicked.crew.run.requested` | `src/bus.rs:828` | no | — |
-| `STEP_CLAIMED` | `wicked.team.step.claimed` | `src/team/events.rs:49` | no | — |
-| `STEP_COMPLETED` | `wicked.team.step.completed` | `src/team/events.rs:57` | no | — |
-| `STEP_REVIEWED` | `wicked.team.step.reviewed` | `src/team/events.rs:58` | no | — |
-| `TASK_COMPLETED` | `wicked.crew.task.completed` | `src/cli_runner.rs:85` | no | — |
-| `TASK_DISPATCHED` | `wicked.crew.task.dispatched` | `src/cli_runner.rs:83` | no | — |
+| `STEP_CLAIMED` | `wicked.team.step.claimed` | `src/team/events.rs:52` | no | — |
+| `STEP_COMPLETED` | `wicked.team.step.completed` | `src/team/events.rs:60` | no | — |
+| `STEP_REVIEWED` | `wicked.team.step.reviewed` | `src/team/events.rs:61` | no | — |
+| `TASK_COMPLETED` | `wicked.crew.task.completed` | `src/cli_runner.rs:85` | no | `src/cli_runner.rs` |
+| `TASK_DISPATCHED` | `wicked.crew.task.dispatched` | `src/cli_runner.rs:83` | no | `src/cli_runner.rs` |
 
 An emit seam is a non-test line referencing the constant (or its literal type)
 within 3 lines of `EmitEvent::new(` / `BusEmit::new(` / `.emit(` — the same
@@ -103,6 +103,8 @@ e.g. the requester side of `wicked.crew.run.requested`, is outside this scan).
 - `wicked.estate.rule.retired` (`EV_RULE_RETIRED`) — emitted at `crates/wicked-governance/src/events.rs`
 - `wicked.gate.eval.requested` (`GATE_EVAL_REQUESTED`) — emitted at `src/cli_runner.rs`
 - `wicked.crew.run.launched` (`RUN_LAUNCHED`) — emitted at `src/bus.rs`
+- `wicked.crew.task.completed` (`TASK_COMPLETED`) — emitted at `src/cli_runner.rs`
+- `wicked.crew.task.dispatched` (`TASK_DISPATCHED`) — emitted at `src/cli_runner.rs`
 
 ### Emit-seam-only types (no registry or const declaration anywhere)
 
@@ -122,33 +124,8 @@ e.g. the requester side of `wicked.crew.run.requested`, is outside this scan).
 ### Grammar conformance (seed corpus `event-grammar.md`, POL-1801/POL-1802)
 
 - `wicked.crew.phase.ready-for-gate` — segment(s) outside WB-001 charset [a-z0-9_]: `ready-for-gate`
-- `wicked.gate.eval.requested` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.gate.eval.responded` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.advice.answered` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.advice.delivered` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.change.requested` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.checkpoint.reached` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.council.called` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.council.ruled` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.finding.raised` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.finding.settled` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.gate.decided` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.gate.opened` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.help.answered` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.help.requested` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.ledger.folded` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.member.joined` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.member.left` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.path.ended` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.path.scored` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.path.started` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.plan.accepted` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.plan.proposed` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.plan.refused` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.plan.revised` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.step.claimed` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.step.completed` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.team.step.reviewed` — producer domain `team` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
+- `wicked.gate.eval.requested` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe, team; legacy: test)
+- `wicked.gate.eval.responded` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe, team; legacy: test)
 
 ### Types with seams in more than one repo (shared contract — informational)
 
@@ -205,8 +182,8 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.crew.project.updated` | `crew:packages/crew/src/projects/events.ts` (const) | Crew project updated; `domain` stamp `wicked-crew` | project id + changed fields |
 | `wicked.crew.run.launched` | `core:src/bus.rs` (const)<br>`garden:scripts/_bus.py` (registry) | Launch confirmed by the engine (bus-as-truth handoff); `domain` stamp `wicked-core`; idempotency-keyed on the run id | `run_id`, `workflow`, `problem` |
 | `wicked.crew.run.requested` | `core:src/bus.rs` (const — **no emit seam**)<br>`garden:scripts/_bus.py` (registry) | Governed run intent (human CLI / scheduler / campaign); `domain` stamp = the requester's own — the engine's launch poller matches by event type, not domain | `workflow?`, `problem`, `args?` (payload contract in `wicked-core src/bus.rs`) |
-| `wicked.crew.task.completed` | `core:src/cli_runner.rs` (const — **no emit seam**)<br>`garden:scripts/_bus.py` (registry) | Workflow unit completion (verdict in payload); `domain` stamp `wicked-core` | run/unit ids + verdict |
-| `wicked.crew.task.dispatched` | `core:src/cli_runner.rs` (const — **no emit seam**)<br>`garden:scripts/_bus.py` (registry) | Workflow unit handoff to a governed worker; `domain` stamp `wicked-core` | run/unit ids + dispatch descriptor |
+| `wicked.crew.task.completed` | `core:src/cli_runner.rs` (const)<br>`garden:scripts/_bus.py` (registry) | Workflow unit completion (verdict in payload); `domain` stamp `wicked-core` | run/unit ids + verdict |
+| `wicked.crew.task.dispatched` | `core:src/cli_runner.rs` (const)<br>`garden:scripts/_bus.py` (registry) | Workflow unit handoff to a governed worker; `domain` stamp `wicked-core` | run/unit ids + dispatch descriptor |
 | `wicked.crew.workflow.completed` | `core:crates/wicked-apps-core/src/lib.rs` (const — **no emit seam**) | — | — |
 | `wicked.crew.workflow.started` | `core:crates/wicked-apps-core/src/lib.rs` (const — **no emit seam**) | — | — |
 
