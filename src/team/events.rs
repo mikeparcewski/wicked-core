@@ -521,7 +521,8 @@ pub struct Envelope {
     pub run_id: String,
     pub ord: Option<u32>,
     pub attempt: Option<u32>,
-    /// The acting seat instance, `"engine"`, `"human"` or `"council:<task id>"`.
+    /// Who acted: a seated CLI instance (the PA, a member or the authoring monitor, e.g.
+    /// `claude#1`, `claude#2`, `codex`), `engine`, `human` or `council:<task id>`.
     pub by: String,
     /// Epoch milliseconds at the producer.
     pub at: i64,
