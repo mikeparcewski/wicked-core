@@ -320,6 +320,48 @@ fn a_step_that_strengthens_its_entry_is_accepted() {
     );
 }
 
+/// Review finding on #615 (codex, HIGH): a step replaced a catalog entry's `skill_ref`, so the
+/// phase called `security_review` ran a non-security skill. Every field that could loosen an
+/// entry is refused with a named reason; the same value is a no-op.
+#[test]
+fn a_step_cannot_replace_what_its_entry_already_fixes() {
+    let cases = [
+        // skill_ref: set-only-if-unset.
+        (
+            json!([{"catalog": "security_review", "id": "s", "skill_ref": "wicked-garden-domain"}]),
+            "skill_ref_changed",
+        ),
+        // required_deliverables: tighten-only (the entry's list may only grow).
+        (
+            json!([{"catalog": "understand", "id": "u", "required_deliverables": ["a.json"]},
+                   {"catalog": "understand", "id": "v", "depends_on": ["u"]},
+                   {"catalog": "security_review", "id": "s2", "required_deliverables": []}]),
+            "ok",
+        ),
+    ];
+    for (steps, reason) in cases {
+        let plan: PlanSteps = serde_json::from_value(json!({ "steps": steps })).unwrap();
+        match (compose(catalog(), &plan), reason) {
+            (Ok(_), "ok") => {}
+            (Ok(def), _) => panic!("{steps}: accepted, want {reason}: {def:?}"),
+            (Err(r), want) => assert_eq!(r.reason(), want, "{steps}: {r}"),
+        }
+    }
+    // The same value is a no-op, not a refusal.
+    let same: PlanSteps = serde_json::from_value(json!({ "steps": [
+        {"catalog": "security_review", "id": "s",
+         "skill_ref": "wicked-garden-qe-security-test-engineer", "role": "evaluator",
+         "kind": "review", "validator_pin": EVIDENCE_FLOOR_PIN, "executes_code": false,
+         "gate": "auto"}
+    ]}))
+    .unwrap();
+    let def = compose(catalog(), &same).expect("restating the entry is not a change");
+    assert_eq!(
+        def.phases[0].skill_ref.as_deref(),
+        Some("wicked-garden-qe-security-test-engineer")
+    );
+}
+
 /// C1 acceptance (c): a misspelled step key is refused at parse.
 #[test]
 fn a_misspelled_step_key_is_refused() {
