@@ -94,8 +94,8 @@ pub use applications::{
     Application, SeedKind,
 };
 pub use bus::{
-    deterministic_key, matches_filter, BusBridge, BusDb, BusEmit, BusEvent, CORE_DOMAIN,
-    RUN_LAUNCHED, RUN_REQUESTED,
+    deterministic_key, matches_filter, shared_bus_stats, BusBridge, BusDb, BusEmit, BusEvent,
+    BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD, CORE_DOMAIN, RUN_LAUNCHED, RUN_REQUESTED,
 };
 pub use campaign::{
     all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
@@ -517,8 +517,12 @@ impl Core {
         ));
         let empty_write_reg: crate::acp_runner::WriteReg =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // DES-TEAMING-002 T0: the moment the bus bridge must not miss a request from — taken HERE,
+        // before this call returns, so a `run.requested` emitted after `spawn` is always delivered.
+        let spawned_at_ms = crate::bus::now_ms();
         std::thread::spawn(move || {
             actor::run(
+                spawned_at_ms,
                 path,
                 rx,
                 self_tx,
@@ -588,8 +592,12 @@ impl Core {
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
+        // DES-TEAMING-002 T0: the moment the bus bridge must not miss a request from — taken HERE,
+        // before this call returns, so a `run.requested` emitted after `spawn` is always delivered.
+        let spawned_at_ms = crate::bus::now_ms();
         std::thread::spawn(move || {
             actor::run(
+                spawned_at_ms,
                 path,
                 rx,
                 self_tx,
@@ -633,8 +641,12 @@ impl Core {
         ));
         let spawn_write_reg: crate::acp_runner::WriteReg =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // DES-TEAMING-002 T0: the moment the bus bridge must not miss a request from — taken HERE,
+        // before this call returns, so a `run.requested` emitted after `spawn` is always delivered.
+        let spawned_at_ms = crate::bus::now_ms();
         std::thread::spawn(move || {
             actor::run(
+                spawned_at_ms,
                 path,
                 rx,
                 self_tx,

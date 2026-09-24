@@ -11,15 +11,26 @@
 //!     of the bus file, the F-E2E-021 lock-loss class when another SQLite library shares the file
 //!     in the same process). Every production path takes the process-wide `BusDb::shared` handle.
 //!
+//!  3. `default_boot_opens_the_bus_once_on_the_bridge_thread` — on a default boot the engine's ONE
+//!     bus connection is opened by the launch-bridge thread, a bus event launches a run through it,
+//!     and a second `Core` in the same process reuses it (no close, no second open).
+//!  4. `exec_boot_mediates_over_the_same_single_connection` — with `WICKED_BUS_EXEC` on, exec
+//!     mediation still publishes `task.dispatched` / `task.completed` over the bus (unchanged), on
+//!     the same single connection, opened by a bus thread.
+//!
 //! These tests mutate process env (`WICKED_BUS_DB` / `WICKED_BUS_EXEC`), which the actor reads at
 //! spawn, so they are serialized on one lock and live in their own test binary.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use wicked_core::{
+    shared_bus_stats, BusDb, BusEmit, Core, CoreEvent, StepInput, StepOutput, StepRunner,
+    StepStatus, BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD, RUN_REQUESTED, TASK_COMPLETED,
+    TASK_DISPATCHED,
+};
 use wicked_council::types::{Confidence, Dispatcher, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
-use wicked_core::{Core, StepInput, StepOutput, StepRunner, StepStatus};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -81,6 +92,7 @@ fn default_boot_serves_commands_while_the_bus_file_is_locked() {
 
     std::env::set_var("WICKED_BUS_DB", &bus_db);
     std::env::remove_var("WICKED_BUS_EXEC");
+    std::env::set_var("WICKED_APPS_EMIT_DEADLETTER", dir.join("outbox.ndjson"));
     let started = Instant::now();
     let core = Core::spawn_with_engine(estate_db, Arc::new(StubDispatcher), Arc::new(FastRunner));
     let sessions = core.sessions();
@@ -179,4 +191,143 @@ fn no_production_path_opens_a_private_bus_connection() {
          BusDb::open connection (an open-and-close of the bus file):\n{}",
         offenders.join("\n")
     );
+}
+
+/// Wait (bounded) until the process-wide registry has opened `bus_db`.
+fn wait_for_open(bus_db: &str) -> (usize, String) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(stats) = shared_bus_stats(bus_db) {
+            return stats;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the engine never opened {bus_db}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Emit a `run.requested` for `session` through the process-wide handle and wait for the run to
+/// complete on `events`.
+fn launch_over_the_bus(bus_db: &str, events: &std::sync::mpsc::Receiver<CoreEvent>, session: &str) {
+    BusDb::shared(bus_db)
+        .unwrap()
+        .emit(&BusEmit::new(
+            RUN_REQUESTED,
+            "wicked-cli",
+            "cli.run",
+            serde_json::json!({ "problem": "Do step one", "args": { "session_id": session } }),
+        ))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        match events.recv_timeout(Duration::from_millis(500)) {
+            Ok(CoreEvent::SessionCompleted { session: s }) if s == session => return,
+            Ok(CoreEvent::Error { message, .. }) => panic!("bus launch errored: {message}"),
+            _ => continue,
+        }
+    }
+    panic!("the bus-launched run {session} never completed");
+}
+
+fn count_rows(bus_db: &str, event_type: &str) -> usize {
+    BusDb::shared(bus_db)
+        .unwrap()
+        .poll(event_type, 0, 10_000)
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn default_boot_opens_the_bus_once_on_the_bridge_thread() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmp_dir("once");
+    let bus_db = dir.join("bus.db").to_string_lossy().to_string();
+
+    std::env::set_var("WICKED_BUS_DB", &bus_db);
+    std::env::remove_var("WICKED_BUS_EXEC");
+    // Keep the engine's governance dead letters in the scratch dir, never under HOME.
+    std::env::set_var("WICKED_APPS_EMIT_DEADLETTER", dir.join("outbox.ndjson"));
+    let core = Core::spawn_with_engine(
+        dir.join("a.db").to_string_lossy().to_string(),
+        Arc::new(StubDispatcher),
+        Arc::new(FastRunner),
+    );
+    let events = core.subscribe();
+    let (opens, opener) = wait_for_open(&bus_db);
+    assert_eq!(opens, 1);
+    assert_eq!(
+        opener, BUS_POLLER_THREAD,
+        "opened by the bridge thread, not the actor"
+    );
+    launch_over_the_bus(&bus_db, &events, "handoff-a");
+    assert_eq!(
+        count_rows(&bus_db, TASK_DISPATCHED),
+        0,
+        "exec mediation stays off"
+    );
+    drop(core);
+
+    // A second engine in the same process (a restart, a test harness) reuses the connection.
+    let core = Core::spawn_with_engine(
+        dir.join("b.db").to_string_lossy().to_string(),
+        Arc::new(StubDispatcher),
+        Arc::new(FastRunner),
+    );
+    let events = core.subscribe();
+    launch_over_the_bus(&bus_db, &events, "handoff-b");
+    std::env::remove_var("WICKED_BUS_DB");
+    drop(core);
+    assert_eq!(
+        shared_bus_stats(&bus_db),
+        Some((1, BUS_POLLER_THREAD.to_string())),
+        "one connection for the life of the process: none closed, none reopened"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exec_boot_mediates_over_the_same_single_connection() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmp_dir("exec");
+    let bus_db = dir.join("bus.db").to_string_lossy().to_string();
+
+    std::env::set_var("WICKED_BUS_DB", &bus_db);
+    std::env::set_var("WICKED_BUS_EXEC", "1");
+    std::env::set_var("WICKED_APPS_EMIT_DEADLETTER", dir.join("outbox.ndjson"));
+    let core = Core::spawn_with_engine(
+        dir.join("e.db").to_string_lossy().to_string(),
+        Arc::new(StubDispatcher),
+        Arc::new(FastRunner),
+    );
+    let events = core.subscribe();
+    // Exec mode arms before the actor serves its first command: once it answers, the bus is open,
+    // and it was opened by a bus thread (not the actor, and not this test).
+    core.sessions().unwrap();
+    let (opens, opener) = shared_bus_stats(&bus_db).expect("exec mediation opened the bus");
+    assert_eq!(opens, 1);
+    assert!(
+        opener == BUS_EXEC_INIT_THREAD || opener == BUS_POLLER_THREAD,
+        "opened by a bus thread, got {opener:?}"
+    );
+    launch_over_the_bus(&bus_db, &events, "handoff-exec");
+    std::env::remove_var("WICKED_BUS_EXEC");
+    std::env::remove_var("WICKED_BUS_DB");
+    drop(core);
+
+    assert!(
+        count_rows(&bus_db, TASK_DISPATCHED) >= 1,
+        "exec mediation published task.dispatched"
+    );
+    assert!(
+        count_rows(&bus_db, TASK_COMPLETED) >= 1,
+        "and consumed its task.completed"
+    );
+    assert_eq!(
+        shared_bus_stats(&bus_db).map(|s| s.0),
+        Some(1),
+        "exec mediation, the bridge, the publisher and the judge share one connection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -120,6 +120,14 @@ export declare class Core {
    */
   static registryRoster(): string
   /**
+   * What this process's engine knows about its connection to the bus file at `path`
+   * (DES-TEAMING-002 T0 connection rule: one connection per bus file per process, opened by a bus
+   * thread, never closed): the JSON `{ "opens": <connections opened>, "opener": "<thread name>" }`,
+   * or `null` when the engine in this process never opened that file. An addon without this static
+   * predates the rule — crew's two-library stress suite keys on its presence.
+   */
+  static busConnectionStats(path: string): string | null
+  /**
    * EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
    * governance events to (`WICKED_ESTATE_DB`; wicked-crew#495) — as a JSON number string, over
    * a READ-ONLY connection (never the single-writer actor's handle; the store must already

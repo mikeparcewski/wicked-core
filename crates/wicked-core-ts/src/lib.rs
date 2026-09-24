@@ -728,6 +728,17 @@ impl Core {
         serde_json::to_string(&wicked_core::registry_roster()).map_err(err)
     }
 
+    /// What this process's engine knows about its connection to the bus file at `path`
+    /// (DES-TEAMING-002 T0 connection rule: one connection per bus file per process, opened by a bus
+    /// thread, never closed): the JSON `{ "opens": <connections opened>, "opener": "<thread name>" }`,
+    /// or `null` when the engine in this process never opened that file. An addon without this static
+    /// predates the rule — crew's two-library stress suite keys on its presence.
+    #[napi]
+    pub fn bus_connection_stats(path: String) -> Option<String> {
+        wicked_core::shared_bus_stats(&path)
+            .map(|(opens, opener)| serde_json::json!({ "opens": opens, "opener": opener }).to_string())
+    }
+
     /// EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
     /// governance events to (`WICKED_ESTATE_DB`; wicked-crew#495) — as a JSON number string, over
     /// a READ-ONLY connection (never the single-writer actor's handle; the store must already
