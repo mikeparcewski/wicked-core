@@ -563,6 +563,8 @@ fn key_builder_params(src: &str) -> Vec<(String, Vec<String>)> {
 }
 
 fn forbidden_in(src: &str) -> Vec<String> {
+    // A Windows checkout reads the source with CRLF line endings.
+    let src = &src.replace("\r\n", "\n");
     let mut bad = Vec::new();
     for (name, params) in key_builder_params(src) {
         for p in params {
@@ -600,13 +602,16 @@ fn no_key_builder_takes_a_payload_text_field() {
 fn the_key_builder_guard_catches_a_text_keyed_builder() {
     let bad = "pub fn key_help_requested(run_id: &str, question: &str) -> String { x }\n\
                fn key_parts_of(ev: &TeamEvent) -> Result<String> {\n    y(&b.claim)\n}\n";
-    assert_eq!(
-        forbidden_in(bad),
-        vec![
-            "key_help_requested(question)".to_string(),
-            "key_parts_of reads .claim".to_string()
-        ]
-    );
+    let want = vec![
+        "key_help_requested(question)".to_string(),
+        "key_parts_of reads .claim".to_string(),
+    ];
+    assert_eq!(forbidden_in(bad), want);
+    // The same source as a Windows checkout reads it, and a clean one after the dispatch ends.
+    assert_eq!(forbidden_in(&bad.replace('\n', "\r\n")), want);
+    let clean = "fn key_parts_of(ev: &TeamEvent) -> Result<String> {\r\n    y(&b.help_id)\r\n}\r\n\
+                 fn later() { z(&b.reason) }\r\n";
+    assert_eq!(forbidden_in(clean), Vec::<String>::new());
 }
 
 // ── (c) + (d) fold ────────────────────────────────────────────────────────────────────────────────
