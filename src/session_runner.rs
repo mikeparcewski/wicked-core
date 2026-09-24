@@ -738,6 +738,7 @@ mod tests {
             allowed_skills: Vec::new(),
             gate: GateSpec::default(),
             role: PhaseRole::default(),
+            owner: Default::default(),
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

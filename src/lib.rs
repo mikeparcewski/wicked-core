@@ -19,6 +19,7 @@ pub mod assumptions;
 mod builtin_floors;
 mod bus;
 mod campaign;
+mod catalog;
 mod cli_runner;
 mod clock;
 mod code_graph;
@@ -139,6 +140,7 @@ pub use wicked_governance::{
     EvalReport, EvalSample, ImportReceipt,
 };
 
+pub use catalog::{catalog, catalog_entry, CATALOG_IDS, SECURITY_REVIEW_SKILL};
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,
@@ -150,7 +152,7 @@ pub use interaction::{
 pub use knowledge::RecalledKnowledge;
 pub use memory::{now_secs, validate_scope_path, RecalledMemory};
 pub use pipeline::SessionResult;
-pub use plan::plan_from_def;
+pub use plan::{compose, plan_from_def, PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
@@ -183,7 +185,7 @@ pub use validator_vault::{
 pub use wicked_council::AgenticCli;
 pub use workflow::{
     bug_def, feature_def, migration_def, AmendScope, GateCond, GateSpec, GateType, HumanDecision,
-    PhaseDef, PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner,
+    PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner, StepRunner, StepStatus, StubStepRunner,
     UnitEvidence, Usage, WorkflowDef, WorkflowDefError, WorkflowRegistry,
 };
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};

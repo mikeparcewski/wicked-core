@@ -571,6 +571,28 @@ impl PhaseRole {
     }
 }
 
+/// Who owns a plan step (DES-TEAMING-002 §8.8): the path's PA (the default) or the team. Carried
+/// from [`PhaseDef::owner`] onto [`crate::domain::WorkUnit::owner`] at plan time, like `role`.
+/// Skipped on the wire when it is the default, so every def and unit authored before the field
+/// serializes byte-identically (the shipped workflow files do not gain an `"owner"` key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOwner {
+    /// The path's PA owns the step (a member may advise or support; the PA answers for it).
+    #[default]
+    Pa,
+    /// The team owns the step.
+    Team,
+}
+
+impl StepOwner {
+    /// `true` for the default owner — the `skip_serializing_if` predicate that keeps an
+    /// owner-omitted def byte-identical.
+    pub fn is_pa(&self) -> bool {
+        matches!(self, StepOwner::Pa)
+    }
+}
+
 /// How a phase executes: via a council-routed CLI agent, or a direct tool command.
 /// `Agent` is the default (preserves all existing behaviour); `Tool` bypasses the council
 /// and runs `cmd` as a subprocess with the session's `workdir` as the working directory.
@@ -711,6 +733,11 @@ pub struct PhaseDef {
     /// existing workflow JSON files that omit this field.
     #[serde(default)]
     pub executor: PhaseExecutor,
+    /// Who owns this phase's step (DES-TEAMING-002 §8.8): `pa` (the default) or `team`.
+    /// `plan_from_def` copies it onto the unit exactly as it copies `role`. Skipped when it is the
+    /// default, so an owner-omitted def serializes byte-identically to before the field existed.
+    #[serde(default, skip_serializing_if = "StepOwner::is_pa")]
+    pub owner: StepOwner,
 }
 
 impl PhaseDef {
@@ -732,6 +759,7 @@ impl PhaseDef {
             allowed_skills: Vec::new(),
             validator_pin: None,
             executor: PhaseExecutor::default(),
+            owner: StepOwner::default(),
         }
     }
     fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {

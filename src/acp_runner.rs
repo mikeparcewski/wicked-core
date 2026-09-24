@@ -15554,6 +15554,7 @@ No further next steps — both questions fully answered.";
             allowed_skills: Vec::new(),
             gate: Default::default(),
             role: Default::default(),
+            owner: Default::default(),
             validator: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),

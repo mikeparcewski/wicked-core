@@ -235,10 +235,11 @@ fn attach_pinned_validators(
 ) -> anyhow::Result<()> {
     // NOTE: several shipped built-in phases now carry a real `validator_pin`, so this loop is NOT a
     // no-op for them — it loads + attaches the pinned validator (the built-in evidence floor,
-    // `EVIDENCE_FLOOR_PIN`, which `pre_distribute` seeds so the load resolves). `feature`'s
-    // `adversarial-review` pins it directly (FINDING-025 item 1), and registration arms every
-    // `verified_evidence` phase that names no pin of its own with the same floor (FINDING-055:
-    // `feature`/`test`, `bug`/`verify`, `migration`/`verify`, `domain-extraction`/`coverage`).
+    // `EVIDENCE_FLOOR_PIN`, which `pre_distribute` seeds so the load resolves). Every def pins its
+    // floor as authored (registration REFUSES a `verified_evidence` phase with no pin — nothing is
+    // armed here), and a composed plan's pins come from the phase catalog (DES-TEAMING-002 §10,
+    // seam C1): the `build`, `test`, `review` and `security_review` entries carry the evidence
+    // floor as data (`catalog.rs`), and a step may only add or swap a pin, never remove one.
     // A phase with no pin still leaves the unit's validator `None` (ungated). Operators author
     // phase-specific criteria via `wicked-core provision-validator --criterion "..."` then
     // `wicked-core approve-validator --pin <pin>`, and put the approved pin in a def's `validator_pin`.
@@ -2336,6 +2337,85 @@ mod resolve_tests {
                 "remedy for `{pin}` must name the env fallback, got: {remedy}"
             );
         }
+    }
+
+    /// Seam C1 acceptance (e): a def composed from EVERY catalog entry plans with each entry's pin
+    /// attached (the evidence floor on `build`/`test`/`review`/`security_review`, nothing on the
+    /// rest), and a step that swaps a pin for an UNAPPROVED validator is refused at attach.
+    #[test]
+    fn attach_pinned_validators_attaches_every_catalog_pin() {
+        use crate::validator::DeterministicValidator;
+        use crate::validator_vault::store_validator;
+        use wicked_apps_core::open_store;
+
+        let dir = std::env::temp_dir().join(format!("wicked-pin-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+        crate::builtin_floors::seed_builtin_floors(&mut store).unwrap();
+
+        let steps = |swap: Option<&str>| -> crate::plan::PlanSteps {
+            let mut steps = Vec::new();
+            let mut prev: Option<String> = None;
+            for id in crate::catalog::CATALOG_IDS {
+                let mut step = serde_json::json!({ "catalog": id, "id": id });
+                if matches!(id, "run" | "deliver") {
+                    step["executor"] = serde_json::json!({ "type": "tool", "cmd": ["true"] });
+                }
+                if let (Some(pin), "review") = (swap, id) {
+                    step["validator_pin"] = serde_json::json!(pin);
+                }
+                if let Some(p) = prev.replace(id.to_string()) {
+                    step["depends_on"] = serde_json::json!([p]);
+                }
+                steps.push(step);
+            }
+            serde_json::from_value(serde_json::json!({ "steps": steps })).unwrap()
+        };
+
+        let def = crate::plan::compose(crate::catalog::catalog(), &steps(None)).unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        attach_pinned_validators(&store, &mut units, &def).unwrap();
+        let floor = crate::validator_vault::load_validator(
+            &store,
+            crate::builtin_floors::EVIDENCE_FLOOR_PIN,
+        )
+        .unwrap()
+        .unwrap();
+        let pinned: Vec<&str> = units
+            .iter()
+            .zip(def.phases.iter())
+            .filter(|(u, _)| u.validator.is_some())
+            .map(|(u, p)| {
+                assert_eq!(
+                    u.validator.as_ref(),
+                    Some(&floor),
+                    "{} carries the floor",
+                    p.id
+                );
+                p.id.as_str()
+            })
+            .collect();
+        assert_eq!(pinned, ["build", "test", "review", "security_review"]);
+
+        // A swap to an unapproved (vaulted) validator is refused at attach (pipeline.rs's
+        // UNAPPROVED arm) — the swap rule never bypasses approval.
+        let unapproved = DeterministicValidator {
+            criterion: "README exists".into(),
+            script: "test -f README.md".into(),
+            approved: false,
+        };
+        let p = store_validator(&mut store, &unapproved).unwrap();
+        let def = crate::plan::compose(crate::catalog::catalog(), &steps(Some(&p))).unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        let err = attach_pinned_validators(&store, &mut units, &def)
+            .expect_err("an unapproved swapped pin must be refused")
+            .to_string();
+        assert!(
+            err.contains("UNAPPROVED") && err.contains(&p) && err.contains("`review`"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -180,6 +180,8 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Carry the evaluator≠creator role (§4) so the gate can do real artifact-passing (an
             // Evaluator unit reviews the prior Creator's cold output).
             unit.role = phase.role;
+            // Carry the step OWNER (DES-TEAMING-002 §8.8) the same way: pure data from the def.
+            unit.owner = phase.owner;
             // Carry the DECLARED dependency graph (FINDING-024). The def states which phases this one
             // consumes; the engine honored that for ordering and dropped it for context, so an
             // Evaluator phase declared `.after("build")` still ran blind to the build. Carrying it
@@ -329,6 +331,210 @@ pub fn unbound_repo_tokens(units: &[WorkUnit]) -> Vec<String> {
         }
     }
     out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Plan composition (DES-TEAMING-002 §8.3, seam C1): catalog entries + a plan's steps → the per-run
+// `WorkflowDef`. The ONLY constructor of a per-run def.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The id [`compose`] gives the def it returns. The caller that registers a composed def renames
+/// it to `"<run>:plan-<rev>"` (§8.3); compose itself knows nothing of runs.
+pub const COMPOSED_DEF_ID: &str = "plan";
+
+/// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4). `deny_unknown_fields`
+/// so a misspelled key is refused at parse, never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanSteps {
+    pub steps: Vec<PlanStep>,
+}
+
+/// One plan step: the catalog entry it instantiates, its phase id, and the step fields §8.3 lets
+/// a step set. Every field but `catalog` and `id` is optional; an absent field keeps the entry's
+/// value. `deny_unknown_fields`: a misspelled step key is refused (C1 acceptance (c)).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStep {
+    /// The catalog id (`understand`, `build`, … — `crate::catalog::CATALOG_IDS`).
+    pub catalog: String,
+    /// The phase id in the composed def (unique within the plan; referenced by `depends_on`).
+    pub id: String,
+    /// Free text (§8.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// May only RAISE the entry's gate along `auto` < `human_confirm_if` <
+    /// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<crate::workflow::GateSpec>,
+    /// Free (no production reader). `null` clears it; absent keeps the entry's.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gate_type: Option<Option<crate::workflow::GateType>>,
+    /// May ADD a pin to an unpinned entry or SWAP the entry's pin for another (approval is enforced
+    /// at attach, `pipeline::attach_pinned_validators`). An explicit `null` on a pinned entry is a
+    /// removal and is refused.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub validator_pin: Option<Option<String>>,
+    /// May be raised to `true`; never lowered on an entry that sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executes_code: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_deliverables: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    /// Only on the Tool entries (`run`, `deliver`), where it is REQUIRED (the command).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<crate::workflow::PhaseExecutor>,
+    /// `pa` (the default) or `team` (§8.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::workflow::StepOwner>,
+    /// Only on `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::domain::StageKind>,
+    /// Never changes: accepted only when it equals the entry's role, so a plan cannot move
+    /// evaluator ≠ creator (it stays a property of the catalog).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<crate::workflow::PhaseRole>,
+}
+
+/// Deserialize a PRESENT field (value or `null`) as `Some(..)`, so an absent field (`None`, via
+/// `default`) is distinguishable from an explicit `null` (`Some(None)`).
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(d).map(Some)
+}
+
+/// Why [`compose`] refused a plan. Every variant names the step and a stable
+/// [`reason`](PlanRefusal::reason) token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRefusal {
+    /// The step names a catalog id the catalog does not define.
+    UnknownCatalogEntry { step: String, catalog: String },
+    /// The step sets a `role` other than its entry's.
+    RoleChanged { step: String, catalog: String },
+    /// The step's gate is weaker than its entry's.
+    GateLowered { step: String, catalog: String },
+    /// The step clears the pin of an entry that carries one.
+    PinRemoved { step: String, catalog: String },
+    /// The step sets `executes_code: false` on an entry that sets it.
+    ExecutesCodeLowered { step: String, catalog: String },
+    /// The step sets a `kind` other than its entry's on an entry other than `run`.
+    KindNotAllowed { step: String, catalog: String },
+    /// The step sets an `executor` on an Agent entry.
+    ExecutorNotAllowed { step: String, catalog: String },
+    /// A Tool-entry step (`run`, `deliver`) supplies no non-empty Tool command.
+    ToolCommandMissing { step: String, catalog: String },
+    /// The composed def fails the registry's own validation (empty, duplicate or dangling ids,
+    /// forward dependencies, a code phase whose gate evaluates nothing).
+    InvalidDef(crate::workflow::WorkflowDefError),
+}
+
+impl PlanRefusal {
+    /// The stable reason token (what a caller, the studio, or a test matches on).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            PlanRefusal::UnknownCatalogEntry { .. } => "unknown_catalog_entry",
+            PlanRefusal::RoleChanged { .. } => "role_changed",
+            PlanRefusal::GateLowered { .. } => "gate_lowered",
+            PlanRefusal::PinRemoved { .. } => "pin_removed",
+            PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
+            PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
+            PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
+            PlanRefusal::ToolCommandMissing { .. } => "tool_command_missing",
+            PlanRefusal::InvalidDef(_) => "invalid_def",
+        }
+    }
+}
+
+impl std::fmt::Display for PlanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.reason();
+        match self {
+            PlanRefusal::UnknownCatalogEntry { step, catalog } => {
+                write!(f, "{r}: step {step} names catalog entry {catalog}, which the catalog does not define")
+            }
+            PlanRefusal::RoleChanged { step, catalog } => write!(
+                f,
+                "{r}: step {step} sets a role other than {catalog}'s — a step never changes role \
+                 (evaluator ≠ creator is a property of the catalog)"
+            ),
+            PlanRefusal::GateLowered { step, catalog } => {
+                write!(f, "{r}: step {step} lowers {catalog}'s gate — a step may only raise it")
+            }
+            PlanRefusal::PinRemoved { step, catalog } => write!(
+                f,
+                "{r}: step {step} removes {catalog}'s validator pin — a step may add or swap a pin, \
+                 never remove one"
+            ),
+            PlanRefusal::ExecutesCodeLowered { step, catalog } => write!(
+                f,
+                "{r}: step {step} sets executes_code false on {catalog}, which sets it"
+            ),
+            PlanRefusal::KindNotAllowed { step, catalog } => write!(
+                f,
+                "{r}: step {step} changes {catalog}'s kind — only a run step sets its kind"
+            ),
+            PlanRefusal::ExecutorNotAllowed { step, catalog } => write!(
+                f,
+                "{r}: step {step} sets an executor on {catalog}, an agent entry — only run and \
+                 deliver take one"
+            ),
+            PlanRefusal::ToolCommandMissing { step, catalog } => write!(
+                f,
+                "{r}: step {step} instantiates the tool entry {catalog} without a tool command"
+            ),
+            PlanRefusal::InvalidDef(e) => write!(f, "{r}: {e}"),
+        }
+    }
+}
+impl std::error::Error for PlanRefusal {}
+
+/// A gate's position on the §8.3 ladder: `auto` < `human_confirm_if` <
+/// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}`.
+fn gate_rank(g: crate::workflow::GateSpec) -> u8 {
+    use crate::workflow::GateSpec;
+    match g {
+        GateSpec::Auto => 0,
+        GateSpec::HumanConfirmIf(_) => 1,
+        GateSpec::HumanConfirm {
+            unconditional: false,
+        } => 2,
+        GateSpec::HumanConfirm {
+            unconditional: true,
+        } => 3,
+    }
+}
+
+/// Compose a plan into its per-run [`WorkflowDef`] (DES-TEAMING-002 §8.3): each step instantiates
+/// its catalog entry, and the step's fields are applied under the step rules — a step may only
+/// make its entry stricter. Refused, with a named [`PlanRefusal`], when a step lowers a gate,
+/// removes a pin, lowers `executes_code`, changes `role`, changes `kind` on a non-`run` entry,
+/// sets an `executor` on an agent entry, or names no command on a Tool entry; and when the
+/// composed def fails the registry's own checks. The def's id is [`COMPOSED_DEF_ID`].
+pub fn compose(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+) -> Result<WorkflowDef, PlanRefusal> {
+    // RED: the step rules are not written yet.
+    let _ = (catalog, plan);
+    Err(PlanRefusal::InvalidDef(
+        crate::workflow::WorkflowDefError::Empty,
+    ))
 }
 
 #[cfg(test)]
