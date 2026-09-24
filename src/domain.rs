@@ -449,6 +449,12 @@ pub struct WorkUnit {
     /// own. `Neutral` (default) keeps the generic per-unit second pass. `#[serde(default)]` back-compat.
     #[serde(default)]
     pub role: crate::workflow::PhaseRole,
+    /// Who owns this unit's step (DES-TEAMING-002 §8.8) — carried from the backing phase's
+    /// [`owner`](crate::workflow::PhaseDef::owner) at plan time, like [`Self::role`]. `Pa` (the
+    /// default) is skipped on the wire, so units persisted before the field deserialize and units
+    /// of an owner-omitted def serialize byte-identically.
+    #[serde(default, skip_serializing_if = "crate::workflow::StepOwner::is_pa")]
+    pub owner: crate::workflow::StepOwner,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -770,6 +776,7 @@ impl WorkUnit {
             base_skill_ref: None,
             gate: crate::workflow::GateSpec::default(),
             role: crate::workflow::PhaseRole::default(),
+            owner: crate::workflow::StepOwner::default(),
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

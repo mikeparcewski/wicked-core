@@ -1,0 +1,585 @@
+{
+ "feature": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "clarify",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    }
+   },
+   {
+    "catalog": "design",
+    "id": "design",
+    "depends_on": [
+     "clarify"
+    ]
+   },
+   {
+    "catalog": "build",
+    "id": "build",
+    "depends_on": [
+     "design"
+    ]
+   },
+   {
+    "catalog": "review",
+    "id": "adversarial-review",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    },
+    "depends_on": [
+     "build"
+    ]
+   },
+   {
+    "catalog": "test",
+    "id": "test",
+    "depends_on": [
+     "build"
+    ]
+   },
+   {
+    "catalog": "critique",
+    "id": "review",
+    "depends_on": [
+     "test"
+    ]
+   }
+  ],
+  "bold": {
+   "test.role": "evaluator",
+   "review.role": "evaluator"
+  }
+ },
+ "bug": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "triage"
+   },
+   {
+    "catalog": "test_plan",
+    "id": "reproduce",
+    "depends_on": [
+     "triage"
+    ]
+   },
+   {
+    "catalog": "build",
+    "id": "fix",
+    "instructions": "Update every consumer of behaviour this fix retires or changes: tests, docs, comments.",
+    "depends_on": [
+     "reproduce"
+    ]
+   },
+   {
+    "catalog": "test",
+    "id": "verify",
+    "depends_on": [
+     "fix"
+    ]
+   }
+  ],
+  "bold": {}
+ },
+ "migration": {
+  "steps": [
+   {
+    "catalog": "design",
+    "id": "plan",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    }
+   },
+   {
+    "catalog": "build",
+    "id": "execute",
+    "depends_on": [
+     "plan"
+    ]
+   },
+   {
+    "catalog": "build",
+    "id": "cutover",
+    "gate": {
+     "human_confirm": {
+      "unconditional": true
+     }
+    },
+    "depends_on": [
+     "execute"
+    ]
+   },
+   {
+    "catalog": "test",
+    "id": "verify",
+    "depends_on": [
+     "cutover"
+    ]
+   },
+   {
+    "catalog": "build",
+    "id": "cleanup",
+    "gate_type": null,
+    "depends_on": [
+     "verify"
+    ]
+   }
+  ],
+  "bold": {
+   "cutover.validator_pin": "e2e7af1db9e48454",
+   "cutover.role": "creator",
+   "cleanup.validator_pin": "e2e7af1db9e48454",
+   "cleanup.executes_code": true,
+   "cleanup.role": "creator"
+  }
+ },
+ "deliver": {
+  "steps": [
+   {
+    "catalog": "deliver",
+    "id": "deliver",
+    "instructions": "Pushes the run branch wicked/<run> to origin and opens a pull request; merge stays human. Push identity: GH_ACCOUNT is not set — pushes as whatever login gh holds.",
+    "gate_type": null,
+    "validator_pin": "e2e7af1db9e48454",
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "bash",
+      "-lc",
+      "set -euo pipefail\nexec 2>&1\nL=$(gh api user -q .login 2>/dev/null || true)\nif [ -n \"${GH_ACCOUNT:-}\" ]; then\n  [ \"$L\" = \"$GH_ACCOUNT\" ] || { echo \"deliver: identity mismatch — GH_ACCOUNT is $GH_ACCOUNT but gh's active login is ${L:-unreadable}; nothing was staged, committed or pushed. Fix the daemon's gh login (switch gh's active account, or export GH_TOKEN in the daemon environment) and approve to retry the deliver phase\"; exit 1; }\n  if [ -n \"${GH_TOKEN:-}\" ]; then echo \"deliver: pushing as $L (GH_ACCOUNT pinned by GH_TOKEN)\"; else echo \"deliver: pushing as $L (GH_ACCOUNT from the gh keyring — export GH_TOKEN to pin it)\"; fi\nelif [ -n \"$L\" ]; then echo \"deliver: pushing as $L (GH_ACCOUNT not set — not pinned)\"\nelse echo \"deliver: pushing as an unknown login (gh not authenticated; GH_ACCOUNT not set — not pinned)\"; fi\nPRNUM=''\nTARGET=''\nPRURL=''\nR=$(basename \"$PWD\")\nB=\"wicked/$R\"\ngit rev-parse --verify \"$B\" >/dev/null 2>&1 || B=$(git branch --show-current)\ngit fetch origin\nD=$(git symbolic-ref -q --short refs/remotes/origin/HEAD || true)\nif [ -z \"$D\" ] || ! git rev-parse --verify -q \"$D^{commit}\" >/dev/null; then if git rev-parse --verify -q origin/main^{commit} >/dev/null; then D=origin/main; elif git rev-parse --verify -q origin/master^{commit} >/dev/null; then D=origin/master; else D=origin/main; fi; fi\nDEF=\"${D#origin/}\"\ncase \"$B\" in \"\"|main|master|\"$DEF\") echo \"deliver: refusing to push branch '$B' — the deliver phase only pushes run branches, never the default branch\"; exit 1;; esac\nC=$(git branch --show-current)\n[ \"$C\" = \"$B\" ] || { echo \"deliver: the worktree is on '$C' but the run branch is '$B' — refusing to commit one branch's work onto another; nothing was pushed\"; exit 1; }\nif [ -n \"$TARGET\" ]; then\n  case \"$TARGET\" in \"\"|main|master|\"$DEF\") echo \"deliver: refusing to revise pull request #$PRNUM — its head branch '$TARGET' is the default branch; nothing was staged, committed or pushed\"; exit 1;; esac\n  git ls-remote --exit-code --heads origin \"$TARGET\" >/dev/null 2>&1 && git rev-parse --verify -q \"origin/$TARGET^{commit}\" >/dev/null || { echo \"deliver: pull request #$PRNUM's branch origin/$TARGET no longer exists on the remote; nothing was staged, committed or pushed\"; exit 1; }\n  git merge-base --is-ancestor \"origin/$TARGET\" \"$B\" || { echo \"deliver: pull request #$PRNUM's branch moved since this run based on it (origin/$TARGET is no longer an ancestor of $B); nothing was staged, committed or pushed — launch a new revision on the current head, or rebase $B onto origin/$TARGET by hand and approve to retry\"; echo \"deliver: pull request #$PRNUM's branch moved — refused; nothing was pushed\"; exit 1; }\nfi\nif [ -n \"${WICKED_DELIVER_VERIFIED_BASE:-}\" ] && [ -z \"$TARGET\" ]; then\n  T=$(git rev-parse --verify -q \"$D^{commit}\" || true)\n  [ \"$T\" = \"$WICKED_DELIVER_VERIFIED_BASE\" ] || { echo \"deliver: the engine verified this work against $WICKED_DELIVER_VERIFIED_BASE but $D is now ${T:-unresolvable} — refusing to rebase past the verified base; approve to retry the deliver phase (the engine lifts onto the new tip and re-runs the repository checks before pushing). Nothing was staged, committed or pushed; deliver: BASE MOVED since verification ($D now ${T:-unresolvable}, verified $WICKED_DELIVER_VERIFIED_BASE)\"; exit 1; }\nfi\nS=.wicked-crew-delivery-stranded\nrm -f -- \"$S\"\nTD=$(mktemp -d)\ntrap 'rm -rf \"$TD\"' EXIT\n_urlenc() { local LC_ALL=C s=\"$1\" out=\"\" i c; for ((i=0; i<${#s}; i++)); do c=\"${s:i:1}\"; case \"$c\" in [A-Za-z0-9._~-]) out+=\"$c\";; *) out+=$(printf '%%%02X' \"'$c\");; esac; done; printf '%s' \"$out\"; }\nRUNID=''\n[ -n \"$RUNID\" ] || RUNID=$(_urlenc \"${B#wicked/}\")\n_framed() { [ -s \"$1\" ] && [ -n \"$(sed -n 1p \"$1\")\" ] && [ -z \"$(sed -n 2p \"$1\")\" ] && [ -n \"$(sed -n '3,$p' \"$1\" | tr -d '[:space:]' | head -c 1)\" ]; }\nAPI=''\nif [ -z \"$API\" ]; then\n  echo \"deliver: no daemon origin was known when this run launched — using the launch-time PR text\"\nelif ! command -v curl >/dev/null 2>&1; then\n  echo \"deliver: curl is not available in this shell — using the launch-time PR text\"\nelif curl -fsS -m 20 --noproxy \"*\" -H \"Accept: text/plain\" \"$API/api/v1/runs/$RUNID/deliver-text\" -o \"$TD/text\" 2>/dev/null && _framed \"$TD/text\"; then\n  echo \"deliver: PR text composed from the run record ($API)\"\nelse\n  rm -f \"$TD/text\"\n  echo \"deliver: the daemon at $API did not answer with the run record — using the launch-time PR text\"\nfi\nif [ ! -s \"$TD/text\" ]; then\n  cat > \"$TD/text\" <<'WICKED_CREW_DELIVER_TEXT_EOF'\nfixture intent\n\n## Intent\n\nfixture intent\n\n## Run\n\n- Run: —\n\n## Phases\n\n_From the workflow definition at launch — the daemon could not be asked for the run record when this PR opened, so seats and gate outcomes are not shown. Every phase before `deliver` had passed its gate for the deliver phase to run._\n\n_(no phases recorded)_\n\n## Repo checks\n\n_Not available at composition time — the run record has them._\n\n## Evaluator gate\n\n_Not available at composition time — the run record has it._\n\n---\n\nDelivered by [wicked-crew](https://wc.wickedagile.com) run —. Merge stays human: the phase opens the PR, never merges it.\n\nDelivered-By: wicked-crew run \nWICKED_CREW_DELIVER_TEXT_EOF\nfi\nTITLE=$(sed -n 1p \"$TD/text\")\nsed '1,2d' \"$TD/text\" > \"$TD/body\"\n_tree() { rm -f \"$TD/preidx\"; GIT_INDEX_FILE=\"$TD/preidx\" git read-tree HEAD && GIT_INDEX_FILE=\"$TD/preidx\" git add -A -- . && GIT_INDEX_FILE=\"$TD/preidx\" git write-tree; }\nif [ -f package.json ] && [ -f package-lock.json ] && [ -f packages/crew/package.json ] && [ -f packages/crew-api-types/package.json ]; then\n  T0=$(_tree) || { echo \"deliver: could not snapshot the worktree before the preflight; nothing was staged, committed or pushed\"; exit 1; }\n  npm install --prefer-offline --no-audit --no-fund\n  npm run manifest:endpoints -w packages/crew\n  npm run generate:api-tests -w packages/crew\n  T1=$(_tree) || { echo \"deliver: could not snapshot the worktree after the preflight; nothing was staged, committed or pushed\"; exit 1; }\n  if [ \"$T0\" != \"$T1\" ]; then\n    CH=$(git diff-tree -r --name-only \"$T0\" \"$T1\" | tr \"\\n\" \" \")\n    if [ -z \"${WICKED_DELIVER_POSTHOC:-}\" ]; then echo \"deliver: the crew#426 lockfile/codegen re-sync CHANGED the worktree after the engine verified it — refusing to push a tree the engine did not verify. The regenerated files are left in the worktree (unstaged); approve to retry the deliver phase: the engine re-verifies the changed tree first and this script then delivers it (a second regeneration changes nothing). Nothing was staged, committed or pushed; deliver: PREFLIGHT CHANGED the verified tree: ${CH}\"; exit 1; fi\n    echo \"deliver: preflight regenerated tracked files on a post-hoc lift (no engine verification to protect): $CH\"\n  fi\nfi\ngit add -u\nfor SD in tmp .tmp scratch .cache coverage; do\n  if [ -d \"$SD\" ]; then N=$(git ls-files --others --exclude-standard -- \"$SD\" | wc -l | tr -d \" \"); if [ \"${N:-0}\" -gt 0 ]; then echo \"deliver: EXCLUDED (scratch-dir): $SD/ ($N files)\"; fi; fi\ndone\nwhile IFS= read -r -d \"\" F; do\n  [ -n \"$F\" ] || continue\n  BN=${F##*/}; RN=\"\"\n  LBN=$(printf \"%s\" \"$BN\" | tr \"[:upper:]\" \"[:lower:]\")\n  case \"$LBN\" in\n    *.db|*.db-wal|*.db-shm|*.sqlite|*.sqlite2|*.sqlite3|*.sqlite-wal|*.sqlite-shm|*.sock|*.pid|*.env|*.env.*|.envrc|*.gif|*.webm|*.mp4|*.mov|*.pem|*.key|*.p12|*.pfx|id_rsa*|*credentials*) RN=\"denylisted-name\";;\n  esac\n  case \"$LBN\" in *socket*) [ -n \"$RN\" ] || RN=\"socket-name\";; esac\n  [ \"$BN\" = \".DS_Store\" ] && [ -z \"$RN\" ] && RN=\"ds-store\"\n  case \"/$F\" in */tmp/*|*/.tmp/*|*/scratch/*|*/.cache/*|*/coverage/*) [ -n \"$RN\" ] || RN=\"scratch-dir\";; esac\n  if [ -z \"$RN\" ]; then SZ=$(wc -c < \"$F\" 2>/dev/null || echo 0); [ \"${SZ:-0}\" -gt 1048576 ] && RN=\"oversize-1mib\"; fi\n  if [ -n \"$RN\" ]; then echo \"deliver: EXCLUDED ($RN): $F\"; else git add -- \"$F\"; fi\ndone < <(git ls-files --others --exclude-standard -z -- . ':(exclude)tmp' ':(exclude).tmp' ':(exclude)scratch' ':(exclude).cache' ':(exclude)coverage')\ngit diff --cached --quiet || git commit -q --cleanup=whitespace -F \"$TD/text\"\nif [ -n \"$TARGET\" ]; then A=$(git rev-list --count \"origin/$TARGET..$B\"); [ \"$A\" -ge 1 ] || { echo \"deliver: nothing to deliver — the run added no commit on top of PR #$PRNUM\"; exit 1; }; else\nA=$(git rev-list --count \"$D..$B\")\n[ \"$A\" -ge 1 ] || { echo \"deliver: nothing to deliver — the run produced no committed change ($B is not ahead of $D); nothing was pushed\"; exit 1; }\nfi\n_rebasing() { [ -d \"$(git rev-parse --git-path rebase-merge 2>/dev/null)\" ] || [ -d \"$(git rev-parse --git-path rebase-apply 2>/dev/null)\" ]; }\nif [ -z \"$TARGET\" ]; then\nif ! git rebase \"$D\" \"$B\"; then\n  if ! _rebasing; then echo \"deliver: git rebase of $B onto $D failed before it started (preflight error); nothing was pushed\"; exit 1; fi\n  while _rebasing; do\n    CF=$(git diff --name-only --diff-filter=U || true)\n    [ -n \"$CF\" ] || break\n    if printf \"%s\\n\" \"$CF\" | grep -qvE \"(^|/)CHANGELOG\\.md$\"; then break; fi\n    if ! printf \"%s\\n\" \"$CF\" | while IFS= read -r F; do\n          [ -n \"$F\" ] || continue;\n          TB=$(mktemp); TO=$(mktemp); TT=$(mktemp);\n          git show \":1:$F\" >\"$TB\" 2>/dev/null || : >\"$TB\";\n          git show \":2:$F\" >\"$TO\" 2>/dev/null || { rm -f \"$TB\" \"$TO\" \"$TT\"; exit 1; };\n          git show \":3:$F\" >\"$TT\" 2>/dev/null || { rm -f \"$TB\" \"$TO\" \"$TT\"; exit 1; };\n          _strip='/^## \\[Unreleased\\]/{s=1;next} s&&/^## \\[/{s=0} !s{print}';\n          SO=$(awk \"$_strip\" \"$TO\"); ST=$(awk \"$_strip\" \"$TT\");\n          if [ \"$SO\" != \"$ST\" ]; then rm -f \"$TB\" \"$TO\" \"$TT\"; exit 1; fi;\n          git merge-file -q --union \"$TO\" \"$TB\" \"$TT\" || { rm -f \"$TB\" \"$TO\" \"$TT\"; exit 1; };\n          cat \"$TO\" >\"$F\"; git add -- \"$F\"; rm -f \"$TB\" \"$TO\" \"$TT\";\n        done; then break; fi\n    GIT_EDITOR=true git -c core.editor=true rebase --continue >/dev/null 2>&1 || break;\n  done\n  if _rebasing; then git rebase --abort >/dev/null 2>&1 || true; echo \"deliver: LIFT-CONFLICT — rebase of $B onto $D hit conflicts outside the changelog; resolve on the branch and re-run; nothing was pushed\"; exit 1; fi\nfi\nA=$(git rev-list --count \"$D..$B\")\n[ \"$A\" -ge 1 ] || { echo \"deliver: nothing to deliver — the run produced no committed change (after rebasing onto $D, $B carries no commit of its own); nothing was pushed\"; exit 1; }\nfi\n_push() { if [ -n \"$TARGET\" ]; then git push origin \"$B:refs/heads/$TARGET\"; else git push -u origin \"$B\"; fi; }\nif PUSHOUT=$(_push 2>&1); then echo \"$PUSHOUT\"; else\n  echo \"$PUSHOUT\"\n  case \"$PUSHOUT\" in\n    *non-fast-forward*|*\"fetch first\"*|*\"[rejected]\"*|*\"Updates were rejected\"*) : > \"$S\"; echo \"deliver: LIFT-CONFLICT — push of $B was rejected because the remote branch moved (non-fast-forward); rebase and re-run; nothing was pushed\"; exit 1;;\n    *) : > \"$S\"; PUSHERR=\"${PUSHOUT:0:96} ... ${PUSHOUT: -128}\"; PUSHERR=${PUSHERR//$'\\n'/ }; echo \"deliver: git push of $B failed after commit: $PUSHERR; retry POST /runs/:id/deliver; nothing was pushed; deliver: LIFT-CONFLICT\"; exit 1;;\n  esac\nfi\nif [ -n \"$TARGET\" ]; then\n  git fetch -q origin \"$TARGET\"\n  RT=$(git rev-parse \"origin/$TARGET\"); LT=$(git rev-parse \"$B\")\n  [ \"$RT\" = \"$LT\" ] || { echo \"deliver: origin/$TARGET is at ${RT:0:10} after the push, not at $B (${LT:0:10}) — refusing to report a delivery the remote does not show\"; exit 1; }\n  ST=$(gh pr view \"$PRNUM\" --json state -q .state 2>/dev/null || true)\n  if [ \"$ST\" = \"OPEN\" ]; then echo \"deliver: pull request #$PRNUM is OPEN and its branch $TARGET is at $B\"; else echo \"deliver: warning — pull request #$PRNUM reads ${ST:-unknown} (not OPEN) after the push; the commits landed on origin/$TARGET\"; fi\n  if COUT=$(gh pr comment \"$PRNUM\" --body-file \"$TD/body\" 2>&1); then echo \"deliver: run record commented on pull request #$PRNUM\"; else echo \"$COUT\"; echo \"deliver: could not comment on pull request #$PRNUM — the commits landed; the record is in the commit message\"; fi\n  URL=\"$PRURL\"\nelse\n  if ! OUT=$(gh pr create --head \"$B\" --title \"$TITLE\" --body-file \"$TD/body\" 2>&1); then echo \"$OUT\"; echo \"deliver: gh pr create failed for $B — no PR was opened\"; exit 1; fi\n  echo \"$OUT\"\n  URL=$(printf '%s\\n' \"$OUT\" | grep -Eo 'https://[^[:space:]]+/pull/[0-9]+' | tail -1 || true)\n  [ -n \"$URL\" ] || { echo \"deliver: gh pr create exited 0 but produced no PR URL for $B — refusing to report a delivery nothing can be pointed at\"; exit 1; }\n  P=$(git rev-list --count \"$D..origin/$B\")\n  [ \"$P\" -ge 1 ] || { echo \"deliver: $B is not ahead of $D on the remote after the push — refusing to report a delivery with no commits\"; exit 1; }\nfi\necho \"$URL\""
+     ]
+    }
+   }
+  ],
+  "bold": {}
+ },
+ "chat": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "explore"
+   }
+  ],
+  "bold": {}
+ },
+ "onboarding": {
+  "steps": [
+   {
+    "catalog": "run",
+    "id": "index",
+    "gate_type": null,
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "wicked-estate",
+      "index",
+      "{repo_root}",
+      "--db",
+      "{code_graph_db}"
+     ]
+    }
+   },
+   {
+    "catalog": "run",
+    "id": "annotate",
+    "gate_type": null,
+    "depends_on": [
+     "index"
+    ],
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "wicked-estate",
+      "clusters",
+      "--annotate",
+      "--db",
+      "{code_graph_db}"
+     ]
+    }
+   }
+  ],
+  "bold": {}
+ },
+ "survey-repo": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "structure",
+    "instructions": "Map the repository layout only: top-level directories, entry points, and where source, tests, config, and docs live. Do not analyze languages, dependencies, or conventions — later phases cover those."
+   },
+   {
+    "catalog": "understand",
+    "id": "stack",
+    "instructions": "Identify the technology stack from the manifests (package.json, Cargo.toml, pyproject.toml, ...): languages, frameworks, build tools, key dependencies. Build on the structure summary provided as prior context; do not re-map the layout.",
+    "depends_on": [
+     "structure"
+    ]
+   },
+   {
+    "catalog": "understand",
+    "id": "conventions",
+    "instructions": "Identify the working conventions: naming, module boundaries, test placement and style, lint/format configuration, CI expectations. Build on the prior phases' outputs provided as context; do not re-survey structure or stack.",
+    "depends_on": [
+     "stack"
+    ]
+   },
+   {
+    "catalog": "understand",
+    "id": "synthesize",
+    "instructions": "Do not re-survey the repository. Merge the three prior phase outputs provided as context into one coherent survey — structure, then stack, then conventions — resolving overlaps and flagging any contradictions between them.",
+    "depends_on": [
+     "structure",
+     "stack",
+     "conventions"
+    ]
+   }
+  ],
+  "bold": {}
+ },
+ "capture-learnings": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "churn",
+    "instructions": "Phase 1/3 CHURN: produce a ranked list of this repo's most actively-changed files and directories over the last ~12 months, plus the repo's real name (manifest or git remote) and parent project. Use the skill's bounded/sampled git-churn method — never stream the whole history. Do not read code deeply yet; the next phase targets these areas.",
+    "skill_ref": "wicked-garden-repo-learn"
+   },
+   {
+    "catalog": "understand",
+    "id": "hotspots",
+    "instructions": "Phase 2/3 HOTSPOTS: cross-reference the prior churn ranking with wicked-estate hotspot / blast-radius signals to find the load-bearing code, then READ it through the estate shim (`wicked-garden run scripts/_estate_client.py --readonly call …`, the skill's grounding path) to build a real technical understanding of how the system fits together — not a file listing. Reuse wicked-garden-search for the hotspot signals; follow the skill.",
+    "depends_on": [
+     "churn"
+    ],
+    "skill_ref": "wicked-garden-repo-learn"
+   },
+   {
+    "catalog": "produce",
+    "id": "capture",
+    "instructions": "Phase 3/3 CAPTURE: from the prior churn + hotspot understanding, submit durable learnings as estate proposals through the shim's `propose` per the skill's capture contract — BOTH memories (facts / how-it-works) and policies (enforced conventions), one proposal per item, tagged repo/project. Each is inert until human review; never include secrets or personal data; capturing nothing is acceptable.",
+    "depends_on": [
+     "hotspots"
+    ],
+    "skill_ref": "wicked-garden-repo-learn"
+   }
+  ],
+  "bold": {}
+ },
+ "memories": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "gather"
+   },
+   {
+    "catalog": "produce",
+    "id": "store",
+    "depends_on": [
+     "gather"
+    ]
+   }
+  ],
+  "bold": {}
+ },
+ "domain-graph-slice": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "identify"
+   },
+   {
+    "catalog": "produce",
+    "id": "extract",
+    "depends_on": [
+     "identify"
+    ]
+   },
+   {
+    "catalog": "critique",
+    "id": "validate",
+    "gate_type": "value",
+    "depends_on": [
+     "extract"
+    ]
+   }
+  ],
+  "bold": {}
+ },
+ "domain-extraction": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "survey",
+    "gate_type": null,
+    "skill_ref": "wicked-garden-domain"
+   },
+   {
+    "catalog": "understand",
+    "id": "analyze",
+    "gate_type": null,
+    "depends_on": [
+     "survey"
+    ],
+    "skill_ref": "wicked-garden-domain"
+   },
+   {
+    "catalog": "produce",
+    "id": "extract",
+    "depends_on": [
+     "analyze"
+    ],
+    "skill_ref": "wicked-garden-domain-extractor"
+   },
+   {
+    "catalog": "test",
+    "id": "coverage",
+    "executes_code": true,
+    "required_deliverables": [
+     "coverage-report.json"
+    ],
+    "depends_on": [
+     "extract"
+    ],
+    "skill_ref": "wicked-garden-domain-coverage",
+    "validator_pin": "bfe4020a365c598b"
+   },
+   {
+    "catalog": "run",
+    "id": "domain-graph",
+    "kind": "build",
+    "gate_type": "strategy",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    },
+    "depends_on": [
+     "coverage"
+    ],
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "wicked-core",
+      "domain-graph",
+      "--db",
+      "{code_graph_db}",
+      "--out",
+      "requirements_graph.json"
+     ]
+    }
+   }
+  ],
+  "bold": {
+   "extract.kind": "build"
+  }
+ },
+ "steering-author": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "analyze",
+    "instructions": "Read the operator intent and every file or directory listed in the problem statement. Identify candidate steering rules: durable, prescriptive statements a coding agent must follow, each classified into one steering type (architecture, development, security, testing, operations, compliance, design-ux). For each candidate note the statement, steering type, severity, and the evidence in the source material. Analysis only — do not write any rule to any store, and do not emit final rule JSON yet."
+   },
+   {
+    "catalog": "produce",
+    "id": "propose",
+    "instructions": "From the prior analysis, emit the PROPOSED steering rules as one JSON array. Each entry is a conformance-rule object: id (PAT-<digits> for rule_type \"pattern\", POL-<digits> for \"policy\"), rule_type, statement, severity (info|warn|error|critical), confidence (a NUMBER 0..1), steering_type (default to the type named in the problem statement), provenance {\"source\":\"chat\"}, and — only where the source material supports them — the enforcement fields applies_to (array of phase tokens or globs), excludes, weight, obligations (array of strings), criteria (ONE string, never a list). Omit targets, effect and trigger unless you can express them in the store schema exactly: targets is a {language, layer, framework} facet OBJECT (never a file list — files belong in applies_to), and trigger is a structured condition object (never prose). SAVE that JSON array (bare array, no prose, no code fences) to the absolute proposal file path named in the problem statement (create parent directories if needed, overwrite if present), AND include the same array in your reply for the human reviewer. This output is a PROPOSAL for the human gate: the proposal file is an artifact for review, and rules land in the governance store only after approval, written crew-side — do not write any rule to any store yourself.",
+    "gate": {
+     "human_confirm": {
+      "unconditional": true
+     }
+    },
+    "depends_on": [
+     "analyze"
+    ]
+   }
+  ],
+  "bold": {
+   "propose.kind": "build"
+  }
+ },
+ "collab": {
+  "steps": [
+   {
+    "catalog": "produce",
+    "id": "propose"
+   },
+   {
+    "catalog": "critique",
+    "id": "critique",
+    "gate_type": "value",
+    "depends_on": [
+     "propose"
+    ]
+   },
+   {
+    "catalog": "produce",
+    "id": "revise",
+    "gate_type": "strategy",
+    "depends_on": [
+     "critique"
+    ]
+   },
+   {
+    "catalog": "critique",
+    "id": "verdict",
+    "gate_type": "value",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    },
+    "depends_on": [
+     "revise"
+    ]
+   }
+  ],
+  "bold": {
+   "propose.kind": "build",
+   "revise.kind": "build"
+  }
+ },
+ "interactive-chat": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "understand",
+    "instructions": "Understand the revision ask, do not write anything yet: read the CURRENT document — the absolute HTML file path named in the task — and the user's ask, then produce a concise revision plan as plain text: which sections change, what gets added or removed, and what stays untouched (the default is untouched — this is an iteration on a document the user already accepted, not a rewrite). Never invent facts, numbers, or claims the current document and the ask do not support; where the ask needs material the document lacks, plan honest placeholder copy that says what belongs there. Do NOT write HTML and do NOT create any files in this phase.",
+    "skill_ref": "wicked-garden-draft"
+   },
+   {
+    "catalog": "produce",
+    "id": "revise",
+    "instructions": "Using the plan from the prior phase, write the COMPLETE revised HTML document and SAVE it to the absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish and end your reply with the absolute path you wrote. Contract: start from the CURRENT document (the absolute input path named in the task) and apply the user's ask — change only what the ask touches and keep everything else, including the document's style and structure; produce a full self-contained HTML document (inline CSS, no external network resources, no build step); KEEP every existing data-wid attribute byte-for-byte on elements you keep, and add NO data-wid to elements you create (the wicked-interactive service instruments its own anchors); never fabricate facts or figures; keep the markup semantic and well-formed (balanced tags) so the instrumentation pass lands cleanly.",
+    "gate_type": "execution",
+    "depends_on": [
+     "understand"
+    ],
+    "skill_ref": "wicked-garden-draft"
+   }
+  ],
+  "bold": {}
+ },
+ "interactive-draft": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "outline",
+    "instructions": "Plan the document, do not write it yet: read the brief (and any source files/folders named in the task, expanding ~), then produce a concise outline — the sections in order, the key points each section carries, and the tone/format guidance the draft phase must honor for the requested style (web = rich scrollable page; ppt = fixed landscape slides; brochure = landscape print pages; doc = minimal content-first prose). Never invent facts, numbers, or claims the brief and sources do not support; where material is thin, plan honest placeholder copy that says what belongs there. Output the outline as plain text. Do NOT write HTML and do NOT create any files in this phase.",
+    "skill_ref": "wicked-garden-draft"
+   },
+   {
+    "catalog": "produce",
+    "id": "draft",
+    "instructions": "Using the outline from the prior phase, write the COMPLETE first-draft HTML document and SAVE it to the absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish and end your reply with the absolute path you wrote. Contract: a full self-contained HTML document (inline CSS, no external network resources, no build step); honor the requested style/format and the brief; keep every fact grounded in the brief/sources — never fabricate figures; do NOT add data-wid attributes anywhere (the wicked-interactive service instruments its own anchors); keep the markup semantic and well-formed (balanced tags) so the instrumentation pass lands cleanly.",
+    "gate_type": "execution",
+    "depends_on": [
+     "outline"
+    ],
+    "skill_ref": "wicked-garden-draft"
+   }
+  ],
+  "bold": {}
+ },
+ "interactive-edit": {
+  "steps": [
+   {
+    "catalog": "produce",
+    "id": "edit",
+    "instructions": "Read the handoff JSON file named in the task; for EACH entry of its items array: rewrite that item's \"fragment\" (the current outerHTML of one document element) to fulfil the item's \"instruction\", and SAVE the complete edited fragment — the element's full outerHTML only, no document wrapper, no markdown fences — to the item's exact absolute \"output_path\" (create parent directories if needed, overwrite if present). NON-NEGOTIABLE (INV-2): every data-wid attribute in the input fragment MUST survive in your edited fragment byte-for-byte — never remove, rename, or re-value a data-wid, and keep the root element's own data-wid on the root; elements you ADD must carry no data-wid at all (the wicked-interactive service instruments its own anchors). Keep the markup well-formed (balanced tags), change only what the instruction asks, and never fabricate facts or figures. Write every output file before you finish and end your reply with the absolute paths you wrote.",
+    "gate_type": "execution",
+    "skill_ref": "wicked-garden-draft"
+   }
+  ],
+  "bold": {}
+ },
+ "interactive-demo": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "scenes",
+    "instructions": "Plan the demo — and in this phase USE NO TOOLS AT ALL: no web fetch, no shell, no file reads, no writes. Work from the task text alone (the target application URL and the user's brief); inspecting the app is the NEXT phase's job, and a tool use here breaks that phase's ability to write the spec, which kills the whole demo. Decompose the brief into 3-6 named scenes — each a short capability label stating what the viewer should take away (good: \"Create a document\"; bad: \"Click the New button\"), covering setup/context beats, the main value moments, and the payoff. Merge trivial setup steps, split compound flows — a demo that is one scene for a multi-step brief is not a demo. For each scene note the click-path you EXPECT (navigation, the kind of control to look for, waits) and a one-sentence narration line that states the capability, not the on-screen data; say plainly that the selectors are expectations for the next phase to confirm against the live page. Never invent app features the brief and the URL do not support. Output the scene plan as plain text."
+   },
+   {
+    "catalog": "produce",
+    "id": "spec",
+    "instructions": "FIRST inspect the live target application yourself: curl the HTML of the URL named in the task and of every further page the scene plan visits (use curl — the target is often a plain-HTTP or localhost app a web-fetch tool cannot reach), so every selector you use provably exists on the page; never guess a selector, and correct the scene plan wherever the real page contradicts it. THEN, using the scene plan from the prior phase, write the COMPLETE Playwright demo spec and SAVE it to the absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish. THEN REPORT IN PROSE, in at least 120 words, what you inspected and what you wrote: name the pages you fetched and the selectors they gave you, walk the reader through every step in order (its label, the selectors and waits it uses, and the capability its narration states), call out any scene-plan beat you merged, split, or dropped and why, and end with the absolute path you wrote — a reply that is only the path is an unreviewable phase and will be rejected. Contract (wicked-interactive demo.spec.mjs): a plain, standalone ES module with NO imports that exports const meta = { url, title, and optionally steps, captions, captionHoldMs } and export async function run({ page, step, meta }) — the service supplies page (Playwright) and step; begin run() with await page.goto(meta.url); wrap EVERY meaningful action in await step(label, async () => { ... }, { say, holdMs }) with one step per scene and the scene's capability name as the label; narrate the meaningful beats via say (the capability, not the on-screen data); prefer stable selectors (roles, text, ids) and await your waits (waitForURL, waitForSelector) so the recording captures settled UI; NEVER write credentials or secrets into the spec — read them from process.env at run time.",
+    "gate_type": "execution",
+    "depends_on": [
+     "scenes"
+    ]
+   }
+  ],
+  "bold": {}
+ },
+ "interactive-demo-reauthor": {
+  "steps": [
+   {
+    "catalog": "produce",
+    "id": "respec",
+    "instructions": "Read the current demo spec and the feedback JSON named in the task; re-author the spec so the recorded demo fulfils every feedback item, and SAVE the complete revised spec to the exact absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish. Work from the two files and the current spec's own selectors — do NOT fetch the live application in this phase; if a feedback item needs a control the current spec never touches, choose the most robust selector the item's storyboard fragment supports and say so in your report rather than guessing silently. THEN REPORT IN PROSE, in at least 120 words, what changed: take each feedback item in turn, say which step(s) you altered and how the revised selectors/waits/narration answer it, note anything you deliberately left untouched, and end with the absolute path you wrote — a reply that is only the path is an unreviewable phase and will be rejected. Each feedback item carries the user's instruction plus the storyboard fragment of the step it targets (the step's label appears in the fragment text) — change the matching step(s) and leave unrelated steps untouched unless the instruction asks for a restructure. Keep the same executable contract as the current spec: a plain, standalone ES module with NO imports exporting const meta = { url, title, ... } and export async function run({ page, step, meta }); begin run() with await page.goto(meta.url); wrap every meaningful action in await step(label, fn, { say, holdMs }); narrate capabilities via say; prefer stable selectors and await your waits; NEVER write credentials or secrets into the spec — read them from process.env at run time.",
+    "gate_type": "execution"
+   }
+  ],
+  "bold": {}
+ },
+ "qe-author-tests": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "recon",
+    "instructions": "Phase 1/4 PLAN (qe skill, plan action): read the repository and its existing tests, detect the test harness (vitest/jest/pytest/Playwright/node:test and any loopback e2e fixture), map the operator intent to behaviours, and list the coverage gaps — cite file:line for anything you claim is already covered. Analysis only: write no files.",
+    "gate_type": "strategy",
+    "skill_ref": "wicked-garden-qe"
+   },
+   {
+    "catalog": "build",
+    "id": "author",
+    "instructions": "Phase 2/4 AUTHOR (qe skill, author action): write BEHAVIOUR tests for the planned gaps against the repository's own harness, plus tests/PLAN-<slug>.md recording each test, the exact command that runs it and its observed result. RUN every test you write before claiming it. Never push, never open or edit a pull request — the run's deliver phase does that.",
+    "depends_on": [
+     "recon"
+    ],
+    "skill_ref": "wicked-garden-qe"
+   },
+   {
+    "catalog": "run",
+    "id": "verify",
+    "kind": "test",
+    "gate_type": "execution",
+    "depends_on": [
+     "author"
+    ],
+    "validator_pin": "e2e7af1db9e48454",
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "bash",
+      "-lc",
+      "set -uo pipefail\nexec 2>&1\necho \"QE-VERIFY-BEGIN worktree=$PWD\"\nD=$(git symbolic-ref -q --short refs/remotes/origin/HEAD || true)\nif [ -z \"$D\" ] || ! git rev-parse --verify -q \"$D^{commit}\" >/dev/null; then\n  if git rev-parse --verify -q origin/main^{commit} >/dev/null; then D=origin/main;\n  elif git rev-parse --verify -q origin/master^{commit} >/dev/null; then D=origin/master;\n  elif git rev-parse --verify -q main^{commit} >/dev/null; then D=main;\n  elif git rev-parse --verify -q master^{commit} >/dev/null; then D=master;\n  else D=\"\"; fi\nfi\nif [ -n \"$D\" ]; then BASE=$(git merge-base \"$D\" HEAD 2>/dev/null || git rev-parse HEAD); else BASE=$(git rev-parse HEAD); fi\necho \"QE-VERIFY-BASE ref=${D:-HEAD} commit=$BASE\"\nPRODUCED=$( { git diff --name-only --diff-filter=AMR \"$BASE\" -- . ; git ls-files --others --exclude-standard ; } | sort -u )\nis_test_path() {\n  case \"$1\" in *.md|*.json|*.snap|*.txt|*.yml|*.yaml|*.toml|*.lock|*.html|*.css|*.png|*.svg) return 1;; esac\n  case \"$1\" in *.test.*|*.spec.*|*_test.py|test_*.py|*/test_*.py|__tests__/*|*/__tests__/*) return 0;; esac\n  return 1\n}\npkg_has_dep() { [ -f \"$1/package.json\" ] && grep -Eq \"\\\"$2\\\"[[:space:]]*:\" \"$1/package.json\"; }\nis_pw_dir() { ls \"$1\"/playwright.config.* >/dev/null 2>&1 || pkg_has_dep \"$1\" \"@playwright/test\"; }\nis_vitest_dir() { pkg_has_dep \"$1\" vitest; }\nis_jest_dir() { pkg_has_dep \"$1\" jest; }\nis_py_dir() { [ -f \"$1/pytest.ini\" ] || [ -f \"$1/conftest.py\" ] || [ -f \"$1/tox.ini\" ] || { [ -f \"$1/pyproject.toml\" ] && grep -q \"tool.pytest\" \"$1/pyproject.toml\"; } || { [ -f \"$1/setup.cfg\" ] && grep -q \"tool:pytest\" \"$1/setup.cfg\"; }; }\npkg_has_nodetest() { local f=\"$1/package.json\"; [ -f \"$f\" ] || return 1; grep -q \"node --test\" \"$f\"; }\nis_pkg_dir() { [ -f \"$1/package.json\" ]; }\npkg_has_test_script() { local f=\"$1/package.json\"; [ -f \"$f\" ] || return 1; grep -Eq \"\\\"test\\\"[[:space:]]*:\" \"$f\" || return 1; grep -q \"no test specified\" \"$f\" && return 1; return 0; }\nnearest() { local d; d=$(dirname \"$1\"); while :; do if \"$2\" \"$d\"; then echo \"$d\"; return 0; fi; [ \"$d\" = \".\" ] && break; d=$(dirname \"$d\"); done; echo \"\"; return 1; }\nfind_bin() { local d=\"$1\" up=\"\"; while :; do if [ -x \"$d/node_modules/.bin/$2\" ]; then echo \"${up:-./}node_modules/.bin/$2\"; return 0; fi; [ \"$d\" = \".\" ] && break; d=$(dirname \"$d\"); up=\"../$up\"; done; echo \"\"; return 1; }\nfind_pytest() { local d=\"$1\" up=\"\"; while :; do if [ -x \"$d/.venv/bin/pytest\" ]; then echo \"${up:-./}.venv/bin/pytest\"; return 0; fi; [ \"$d\" = \".\" ] && break; d=$(dirname \"$d\"); up=\"../$up\"; done; if python3 -c \"import pytest\" >/dev/null 2>&1; then echo \"python3 -m pytest\"; return 0; fi; echo \"\"; return 1; }\nresolve() {\n  local d\n  case \"$1\" in\n    *.py)\n      if grep -Eq \"^[[:space:]]*(from|import)[[:space:]]+playwright\" \"$1\" 2>/dev/null; then echo \"playwright-python\t$(dirname \"$1\")\"; return; fi\n      d=$(nearest \"$1\" is_py_dir); [ -n \"$d\" ] || d=\".\"\n      echo \"pytest\t$d\"; return;;\n  esac\n  case \"$1\" in *.spec.*) d=$(nearest \"$1\" is_pw_dir); if [ -n \"$d\" ]; then echo \"playwright\t$d\"; return; fi;; esac\n  d=$(nearest \"$1\" is_vitest_dir); if [ -n \"$d\" ]; then echo \"vitest\t$d\"; return; fi\n  d=$(nearest \"$1\" is_jest_dir); if [ -n \"$d\" ]; then echo \"jest\t$d\"; return; fi\n  d=$(nearest \"$1\" is_pw_dir); if [ -n \"$d\" ]; then echo \"playwright\t$d\"; return; fi\n  # node:test rung: file imports node:test OR nearest package has node --test in scripts.test\n  if grep -q \"node:test\" \"$1\" 2>/dev/null; then d=$(nearest \"$1\" is_pkg_dir); [ -n \"$d\" ] || d=\".\"; printf \"node-test\\t%s\\n\" \"$d\"; return; fi\n  d=$(nearest \"$1\" pkg_has_nodetest); if [ -n \"$d\" ]; then printf \"node-test\\t%s\\n\" \"$d\"; return; fi\n  echo \"unknown\t.\"\n}\nsum_counts() { grep -E \"$2\" \"$1\" | tail -1 | awk '{s=0; for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/ && $(i+1) ~ /^(passed|failed|flaky|skipped|total)/) s+=$i; print s}'; }\ncollected() {\n  local n=\"\" fname=\"${3:-}\"\n  case \"$1\" in\n    pytest) n=$(sum_counts \"$2\" \"[0-9]+ (passed|failed)\"); [ \"${n:-0}\" -gt 0 ] || n=$(grep -Eo \"collected [0-9]+ item\" \"$2\" | tail -1 | grep -Eo \"[0-9]+\");;\n    vitest) n=$(sum_counts \"$2\" \"^[[:space:]]*Tests[[:space:]]\");;\n    jest) n=$(grep -Eo \"[0-9]+ total\" \"$2\" | tail -1 | grep -Eo \"[0-9]+\");;\n    playwright) n=$(sum_counts \"$2\" \"[0-9]+ (passed|failed|flaky)\");;\n    playwright-python) n=$(grep -Eci \"passed|\\bpass\\b|✓|\\\"checks\\\"|\\bok\\b\" \"$2\");;\n    node-test) n=$(grep -Eo \"pass [0-9]+\" \"$2\" | head -1 | grep -Eo \"[0-9]+\");;\n    npm-test) if [ -n \"$fname\" ] && grep -qF \"$fname\" \"$2\" 2>/dev/null; then n=1; else n=0; fi;;\n  esac\n  echo \"${n:-0}\"\n}\nP=0; E=0; PASS=0; FAIL=0; NX=0; PLAN=\"\"; HARNESSES=\"\"\nnot_executed() { NX=$((NX+1)); echo \"QE-VERIFY: file=$1 harness=$2 pkg=$3 cmd=\\\"\\\" exit=- tests=0 status=not-executed reason=\\\"$4\\\"\"; echo \"qe-verify: $1 — $4\"; }\nwhile IFS= read -r f; do\n  [ -n \"$f\" ] || continue\n  case \"$f\" in tests/PLAN-*.md|*/tests/PLAN-*.md) PLAN=\"$f\";; esac\n  is_test_path \"$f\" || continue\n  P=$((P+1))\n  R=$(resolve \"$f\"); H=\"${R%%\t*}\"; PKG=\"${R#*\t}\"\n  rel=\"$f\"; [ \"$PKG\" = \".\" ] || rel=\"${f#$PKG/}\"\n  case \"$H\" in\n    playwright) BIN=$(find_bin \"$PKG\" playwright) || { not_executed \"$f\" \"$H\" \"$PKG\" \"harness not available: playwright (@playwright/test) — no node_modules/.bin/playwright from $PKG up to the worktree root; install the repository dependencies in the worktree (npm ci) in the author phase. The verify path never runs npx\"; continue; }; CMD=(\"$BIN\" test \"$rel\");;\n    vitest) BIN=$(find_bin \"$PKG\" vitest) || { not_executed \"$f\" \"$H\" \"$PKG\" \"harness not available: vitest — no node_modules/.bin/vitest from $PKG up to the worktree root; install the repository dependencies in the worktree (npm ci) in the author phase. The verify path never runs npx\"; continue; }; CMD=(\"$BIN\" run \"$rel\");;\n    jest) BIN=$(find_bin \"$PKG\" jest) || { not_executed \"$f\" \"$H\" \"$PKG\" \"harness not available: jest — no node_modules/.bin/jest from $PKG up to the worktree root; install the repository dependencies in the worktree (npm ci) in the author phase. The verify path never runs npx\"; continue; }; CMD=(\"$BIN\" \"$rel\");;\n    pytest) PT=$(find_pytest \"$PKG\") || { not_executed \"$f\" \"$H\" \"$PKG\" \"harness not available: pytest — no .venv/bin/pytest from $PKG up to the worktree root and python3 cannot import pytest; a test-shaped .py file is NEVER run as a plain script (it would pass with zero assertions). Install pytest in the worktree in the author phase\"; continue; }; if [ \"$PT\" = \"python3 -m pytest\" ]; then CMD=(python3 -m pytest -q \"$rel\"); else CMD=(\"$PT\" -q \"$rel\"); fi;;\n    playwright-python) python3 -c \"import playwright\" >/dev/null 2>&1 || { not_executed \"$f\" \"$H\" \"$PKG\" \"harness not available: playwright (python) — python3 cannot import playwright; pip install playwright && playwright install chromium in the author phase\"; continue; }; CMD=(python3 \"$rel\");;\n    node-test) CMD=(node --test \"$rel\");;\n    unknown)\n      NPM_PKG=$(nearest \"$f\" is_pkg_dir); NPM_PKG=\"${NPM_PKG:-.}\"\n      if pkg_has_test_script \"$NPM_PKG\"; then\n        H=npm-test; PKG=\"$NPM_PKG\"; rel=\"$f\"; [ \"$PKG\" = \".\" ] || rel=\"${f#$PKG/}\"; CMD=(npm test)\n      else\n        not_executed \"$f\" unknown \"$NPM_PKG\" \"no harness recognised — declare one the repository owns (playwright.config.*, vitest/jest/node:test in the nearest package.json, a pytest marker); the repository has no test script to fall back to\"; continue\n      fi;;\n    *) not_executed \"$f\" \"$H\" \"$PKG\" \"unrecognised harness: $H\"; continue;;\n  esac\n  case \" $HARNESSES \" in *\" $H|$PKG \"*) ;; *) HARNESSES=\"$HARNESSES $H|$PKG\";; esac\n  echo \"QE-VERIFY-RUN file=$f harness=$H pkg=$PKG cmd=\\\"${CMD[*]}\\\"\"\n  OUT=$(mktemp \"${TMPDIR:-/tmp}/qe-verify.XXXXXX\") || { echo \"qe-verify: FAIL — cannot create capture file for $f; check that ${TMPDIR:-/tmp} is writable\"; exit 1; }\n  ( cd \"$PKG\" && \"${CMD[@]}\" ) >\"$OUT\" 2>&1; RC=$?\n  head -c 51200 <\"$OUT\"\n  N=$(collected \"$H\" \"$OUT\" \"$rel\"); rm -f \"$OUT\"\n  E=$((E+1))\n  if [ \"$RC\" -ne 0 ]; then FAIL=$((FAIL+1)); ST=failed;\n  elif [ \"${N:-0}\" -lt 1 ]; then NX=$((NX+1)); E=$((E-1)); ST=not-executed; echo \"qe-verify: $f — the $H runner exited 0 but reported 0 tests (nothing was collected or executed)\";\n  else PASS=$((PASS+1)); ST=passed; fi\n  echo \"QE-VERIFY: file=$f harness=$H pkg=$PKG cmd=\\\"${CMD[*]}\\\" exit=$RC tests=${N:-0} status=$ST\"\ndone < <(printf '%s\\n' \"$PRODUCED\")\nC=0; CF=0\nfor HP in $HARNESSES; do\n  H=\"${HP%%|*}\"; PKG=\"${HP#*|}\"\n  case \"$H\" in\n    vitest) BIN=$(find_bin \"$PKG\" vitest); CMD=(\"$BIN\" run);;\n    jest) BIN=$(find_bin \"$PKG\" jest); CMD=(\"$BIN\");;\n    pytest) PT=$(find_pytest \"$PKG\"); if [ \"$PT\" = \"python3 -m pytest\" ]; then CMD=(python3 -m pytest -q); else CMD=(\"$PT\" -q); fi;;\n    node-test) CMD=(npm test);;\n    npm-test|*) echo \"QE-VERIFY-CHECK: harness=$H pkg=$PKG skipped=full-suite (produced files ran individually)\"; continue;;\n  esac\n  C=$((C+1))\n  echo \"QE-VERIFY-CHECK-RUN harness=$H pkg=$PKG cmd=\\\"${CMD[*]}\\\"\"\n  CHECK_OUT=$(mktemp \"${TMPDIR:-/tmp}/qe-check.XXXXXX\") || CHECK_OUT=\"\"\n  ( cd \"$PKG\" && \"${CMD[@]}\" ) >\"${CHECK_OUT:-/dev/null}\" 2>&1; RC=$?\n  [ -n \"$CHECK_OUT\" ] && head -c 51200 <\"$CHECK_OUT\"; rm -f \"$CHECK_OUT\"\n  CLASS=\"\"\n  if [ \"$RC\" -ne 0 ]; then\n    BASE_WT=\"${TMPDIR:-/tmp}/qe-base-$$-$RANDOM\"\n    if git worktree add --detach \"$BASE_WT\" \"$BASE\" >/dev/null 2>&1; then\n      [ -d \"$BASE_WT/$PKG\" ] && [ -d \"$PKG/node_modules\" ] && { NM_ABS=$(cd \"$PKG/node_modules\" 2>/dev/null && pwd -P) && ln -sfn \"$NM_ABS\" \"$BASE_WT/$PKG/node_modules\"; } 2>/dev/null || true\n      BASE_CHECK_OUT=$(mktemp \"${TMPDIR:-/tmp}/qe-base-check.XXXXXX\") 2>/dev/null || BASE_CHECK_OUT=\"\"\n      echo \"QE-VERIFY-CHECK-BASE-RUN harness=$H pkg=$PKG base=$BASE\"\n      ( cd \"$BASE_WT/$PKG\" 2>/dev/null && \"${CMD[@]}\" ) >\"${BASE_CHECK_OUT:-/dev/null}\" 2>&1; BASE_RC=$?\n      [ -n \"$BASE_CHECK_OUT\" ] && head -c 51200 <\"$BASE_CHECK_OUT\"; rm -f \"$BASE_CHECK_OUT\"\n      git worktree remove --force \"$BASE_WT\" >/dev/null 2>&1 || true\n      if [ \"$BASE_RC\" -ne 0 ]; then CLASS=pre-existing-on-base\n      else CLASS=produced-test-failure; CF=$((CF+1)); fi\n    else CLASS=unclassified; CF=$((CF+1)); fi\n  fi\n  echo \"QE-VERIFY-CHECK: harness=$H pkg=$PKG cmd=\\\"${CMD[*]}\\\" exit=$RC${CLASS:+ class=$CLASS}\"\ndone\necho \"QE-VERIFY-SUMMARY: produced=$P executed=$E passed=$PASS failed=$FAIL not_executed=$NX plan=${PLAN:-missing} checks=$C checks_failed=$CF\"\n[ \"$P\" -gt 0 ] || { echo \"qe-verify: FAIL — the author phase produced no test files; nothing was verified, so done cannot be asserted\"; exit 1; }\n[ -n \"$PLAN\" ] || { echo \"qe-verify: FAIL — no tests/PLAN-*.md was produced (the plan records every test, the command that ran it and its result)\"; exit 1; }\n[ \"$NX\" -eq 0 ] || { echo \"qe-verify: FAIL — $NX produced test file(s) were never executed (no available harness, or the runner reported 0 tests); a test that never ran proves nothing\"; exit 1; }\n[ \"$FAIL\" -eq 0 ] || { echo \"qe-verify: FAIL — $FAIL of $E produced test file(s) failed under the repository harness\"; exit 1; }\n[ \"$CF\" -eq 0 ] || { echo \"qe-verify: FAIL — $CF repository check(s) failed with the produced tests in the tree\"; exit 1; }\necho \"qe-verify: PASS — $E produced test file(s) executed and passed under the repository harness; plan $PLAN\""
+     ]
+    }
+   },
+   {
+    "catalog": "review",
+    "id": "review",
+    "instructions": "Phase 4/4 REVIEW (qe skill, review action): judge the produced tests independently — behaviour vs implementation coupling, every claim of existing coverage verified at file:line, no sleeps or flaky waits, the PLAN matches what shipped, and the verify phase's QE-VERIFY report shows every produced test executed. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. Read-only: change nothing.",
+    "gate": {
+     "human_confirm_if": "verdict_not_pass"
+    },
+    "depends_on": [
+     "verify"
+    ],
+    "skill_ref": "wicked-garden-qe"
+   }
+  ],
+  "bold": {}
+ }
+}
