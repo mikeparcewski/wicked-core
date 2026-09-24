@@ -342,7 +342,10 @@ fn a_misspelled_step_key_is_refused() {
 fn an_owner_omitted_def_serializes_byte_identically() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workflows");
     for name in ["feature", "bug", "migration"] {
-        let raw = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+        // Compare the committed bytes: a Windows checkout may turn LF into CRLF (core.autocrlf).
+        let raw = std::fs::read_to_string(dir.join(format!("{name}.json")))
+            .unwrap()
+            .replace("\r\n", "\n");
         let def: WorkflowDef = serde_json::from_str(&raw).unwrap();
         let out = serde_json::to_string_pretty(&def).unwrap();
         assert_eq!(
