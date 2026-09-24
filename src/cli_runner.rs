@@ -13,11 +13,14 @@
 //!
 //! ## Actor-safety (the load-bearing invariant — same posture as the launch bridge)
 //!  * The `cli-runner` subscriber and the `task.completed` poller each run on their OWN `std::thread`
-//!    with their OWN `rusqlite` connection to the bus db (a different file from the estate store the
-//!    actor owns — no writer-lock contention). Neither holds a store handle: the `cli-runner` reads only
-//!    the dispatched event + publishes the result; the actor stays the ONLY writer.
+//!    and use the process-wide shared bus handle ([`BusDb::shared`], one connection per bus file per
+//!    process; the bus is a different file from the estate store the actor owns — no writer-lock
+//!    contention). They are actor-safe because they run off the actor thread. Neither holds a store
+//!    handle: the `cli-runner` reads only the dispatched event + publishes the result; the actor stays
+//!    the ONLY writer.
 //!  * The actor reaches nothing here by a blocking poll. It only *publishes* `task.dispatched`, a single
-//!    bounded local INSERT into a WAL-mode db via an actor-thread-local [`BusDb`] — the reducer's publish
+//!    bounded local INSERT (`BusDb::emit_bounded`) through a clone of that shared handle held
+//!    actor-thread-locally — opened by a bus thread, never by the actor — the reducer's publish
 //!    role (§2.3), analogous to the actor's own store writes, never an unbounded poll or a CLI call.
 //!  * The `task.completed` poller reaches the actor ONLY by sending `Command::ApplyStepResult` over a
 //!    `Sender<Command>` clone — the exact `self_tx` write-back the in-process worker already uses.
@@ -82,7 +85,7 @@ pub const TASK_DISPATCHED: &str = "wicked.crew.task.dispatched";
 pub const TASK_COMPLETED: &str = "wicked.crew.task.completed";
 
 /// Gate evaluation events — wicked-core publishes a request; the governed evaluator daemon responds.
-/// When exec mediation is on ([`gate_eval_bus_db`]: `WICKED_BUS_EXEC` AND `WICKED_BUS_DB`),
+/// When exec mediation is armed for the unit ([`gate_eval_bus_db`]),
 /// `run_unit_and_judge_with_roster` publishes one of these instead of
 /// spawning a raw `claude -p` subprocess, and blocks (up to [`GATE_EVAL_TIMEOUT`]) for the response.
 /// The daemon runs under its OWN governed session (no `--dangerously-skip-permissions`).
@@ -91,34 +94,16 @@ pub const GATE_EVAL_RESPONDED: &str = "wicked.gate.eval.responded";
 
 /// The bus db the gate judge publishes its evaluation request to, or `None` for the inline judge.
 ///
-/// DES-TEAMING-002 T0 (amended): the bus judge belongs to EXEC MEDIATION, so it switches on the exec
-/// setting (`WICKED_BUS_EXEC`, non-empty — the same switch `actor::run` arms exec mediation on, and
-/// the one crew's `--engine-exec` sets), never on the mere presence of `WICKED_BUS_DB`. Crew hands
-/// every engine `WICKED_BUS_DB` now; keyed on that alone, every pinned judge on a default daemon
-/// would publish `wicked.gate.eval.requested` and deny after [`GATE_EVAL_TIMEOUT`] waiting for an
-/// evaluator daemon (`scripts/gate_eval_daemon.py`) that no product runs.
-///
-/// `exec_bus` is the bus exec mediation RESOLVED for this unit — the cli-runner's own bus, or the
-/// actor's armed publisher's — and wins over process env: the env-free exec entry
-/// (`Core::spawn_with_engine_exec`) arms exec over an explicit path with no `WICKED_BUS_*` set.
+/// DES-TEAMING-002 T0: the bus judge belongs to EXEC MEDIATION, so it is used ONLY over a bus exec
+/// mediation actually ARMED for this unit — `exec_bus`, passed by the caller: the cli-runner's own
+/// bus, or the actor's armed publisher's when a publish fell back in-process. Never process env:
+/// `WICKED_BUS_DB` alone is only the bus handoff (crew sets it on every boot), and `WICKED_BUS_EXEC`
+/// with a bus exec could not initialise leaves exec UNARMED — re-reading env there would send the
+/// in-process worker's judge to a bus that is not there and DENY on the infrastructure failure. The
+/// bus round-trip has no in-product responder except under exec (`scripts/gate_eval_daemon.py`),
+/// and denies after [`GATE_EVAL_TIMEOUT`].
 fn gate_eval_bus_db(exec_bus: Option<&str>) -> Option<String> {
-    exec_bus
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            gate_eval_bus_db_from(
-                std::env::var("WICKED_BUS_EXEC").ok().as_deref(),
-                std::env::var("WICKED_BUS_DB").ok().as_deref(),
-            )
-        })
-}
-
-/// [`gate_eval_bus_db`]'s rule over explicit values: both set and non-empty.
-fn gate_eval_bus_db_from(exec: Option<&str>, bus_db: Option<&str>) -> Option<String> {
-    match (exec, bus_db) {
-        (Some(e), Some(db)) if !e.is_empty() && !db.is_empty() => Some(db.to_string()),
-        _ => None,
-    }
+    exec_bus.filter(|p| !p.is_empty()).map(str::to_string)
 }
 
 /// Wall-clock budget for the bus-mediated gate evaluator. On timeout the gate falls back to
@@ -975,8 +960,8 @@ fn run_unit_and_judge_on(
             let Some(v) = input.unit.validator.as_ref().filter(|v| v.approved) else {
                 break 'pinned None;
             };
-            // BUS PATH: under exec mediation (`gate_eval_bus_db`: WICKED_BUS_EXEC + WICKED_BUS_DB,
-            // never WICKED_BUS_DB alone — DES-TEAMING-002 T0), publish a gate-evaluation request and
+            // BUS PATH: only over a bus exec mediation ARMED for this unit (`gate_eval_bus_db`; never
+            // process env — DES-TEAMING-002 T0), publish a gate-evaluation request and
             // wait for the governed evaluator daemon to respond (no subprocess, no dangerous flags,
             // no TTY). On timeout or any error the function returns a hard DENY (fail-closed
             // governance — a timeout must never silently approve a gate by falling back to
@@ -4111,13 +4096,11 @@ mod judge_routing_tests {
     }
 
     #[test]
-    fn the_bus_judge_needs_the_exec_switch_and_a_bus() {
-        assert_eq!(gate_eval_bus_db_from(None, Some("/b/bus.db")), None);
-        assert_eq!(gate_eval_bus_db_from(Some(""), Some("/b/bus.db")), None);
-        assert_eq!(gate_eval_bus_db_from(Some("1"), None), None);
-        assert_eq!(gate_eval_bus_db_from(Some("1"), Some("")), None);
+    fn the_bus_judge_needs_an_armed_exec_bus() {
+        assert_eq!(gate_eval_bus_db(None), None);
+        assert_eq!(gate_eval_bus_db(Some("")), None);
         assert_eq!(
-            gate_eval_bus_db_from(Some("1"), Some("/b/bus.db")),
+            gate_eval_bus_db(Some("/b/bus.db")),
             Some("/b/bus.db".to_string())
         );
     }

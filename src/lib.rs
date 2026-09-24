@@ -738,8 +738,9 @@ impl Core {
     /// bus into a `LaunchRun` on this actor, and emits `wicked.run.launched` back onto the bus when a
     /// run starts. `roster` is the council seats a launched run runs with (a caller passes
     /// [`registry_roster`] in production). The returned [`BusBridge`] owns the thread — drop it (or
-    /// call [`BusBridge::stop`]) to stop polling. The poller runs entirely off the actor thread with
-    /// its own SQLite connection to the bus db, reaching the actor only via commands (actor-safe).
+    /// call [`BusBridge::stop`]) to stop polling. The poller polls through the process-wide shared
+    /// bus handle ([`BusDb::shared`]); it is actor-safe because it runs entirely off the actor thread
+    /// and reaches the actor only via commands.
     pub fn connect_bus(
         &self,
         bus_db_path: impl Into<String>,

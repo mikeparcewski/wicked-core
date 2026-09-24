@@ -23,9 +23,11 @@
 //! nullable, so writing the base NOT NULL columns is sufficient and forward-compatible).
 //!
 //! ## Actor-safety (the load-bearing invariant)
-//! The poll loop NEVER runs on the single-writer actor thread. [`spawn_run_requested_poller`] runs on
-//! its own `std::thread`, opens its OWN `rusqlite` connection to the bus db (a different file from the
-//! estate store — no writer-lock contention with the actor), and reaches the actor ONLY by sending
+//! The poll loop NEVER runs on the single-writer actor thread. The launch bridge runs on its own
+//! `std::thread` and polls through the process-wide shared bus handle ([`BusDb::shared`] — see the
+//! connection rule below; the bus is a different file from the estate store, so there is no
+//! writer-lock contention with the actor). It is actor-safe because it runs off the actor thread and
+//! reaches the actor ONLY by sending
 //! `Command::LaunchRun` over a `Sender<Command>` clone. That is exactly the `self_tx` write-back
 //! pattern the unit workers already use: a blocking SQLite poll on the bus db can never stall the
 //! actor, and the launch itself is applied serially on the actor like any other command.
