@@ -4240,6 +4240,75 @@ mod judge_routing_tests {
         );
     }
 
+    /// Review finding (#613 round 3): with `WICKED_BUS_EXEC=1` and a `WICKED_BUS_DB` exec mediation
+    /// cannot initialise, exec never arms and the unit runs on the in-process worker (no armed exec
+    /// bus). Its judge must stay inline — re-reading process env would take the bus path and DENY on
+    /// the infrastructure failure. The judge uses the bus ONLY when the caller passes an armed one.
+    #[test]
+    fn an_unarmed_exec_env_keeps_the_inline_judge() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore::capture(&["WICKED_BUS_DB", "WICKED_BUS_EXEC"]);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-unarmed-exec-judge-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let not_a_dir = dir.join("not-a-dir");
+        std::fs::write(&not_a_dir, "a file where the bus directory should be").unwrap();
+        std::env::set_var("WICKED_BUS_EXEC", "1");
+        std::env::set_var(
+            "WICKED_BUS_DB",
+            not_a_dir.join("bus.db").to_string_lossy().to_string(),
+        );
+
+        let mut unit = crate::domain::WorkUnit::pending("ua:u1", "ua", 1, "review the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
+            script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "ua".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-ua".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let runner: Arc<dyn StepRunner> = Arc::new(OkRunner);
+        let noop: &DeltaSink = &|_: &str| {};
+        // The in-process worker's call: no armed exec bus (`armed_exec_bus()` is `None`).
+        let (_out, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            verdict
+                .as_ref()
+                .is_none_or(|v| !v.reasoning.contains("bus-path")),
+            "no bus-path verdict for an unarmed exec: {verdict:?}"
+        );
+        assert!(
+            evidence.judge_skipped.is_some(),
+            "the INLINE judge ran (it records why no distinct seat judged)"
+        );
+    }
+
     /// Review finding (#613 round 2): the env-free exec entry (`Core::spawn_with_engine_exec`) arms
     /// exec mediation over an explicit bus path with NO `WICKED_BUS_*` in the process env. Its
     /// cli-runner must judge a pinned unit over THAT bus (`gate.eval.requested`), not inline —
