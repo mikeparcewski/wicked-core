@@ -530,11 +530,93 @@ pub fn compose(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
 ) -> Result<WorkflowDef, PlanRefusal> {
-    // RED: the step rules are not written yet.
-    let _ = (catalog, plan);
-    Err(PlanRefusal::InvalidDef(
-        crate::workflow::WorkflowDefError::Empty,
-    ))
+    use crate::workflow::PhaseExecutor;
+    let mut phases = Vec::with_capacity(plan.steps.len());
+    for step in &plan.steps {
+        let refusal = |make: fn(String, String) -> PlanRefusal| {
+            Err(make(step.id.clone(), step.catalog.clone()))
+        };
+        let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
+            return refusal(|step, catalog| PlanRefusal::UnknownCatalogEntry { step, catalog });
+        };
+        let tool_entry = crate::catalog::is_tool_entry(entry);
+        let mut phase = entry.clone();
+        phase.id = step.id.clone();
+
+        if step.role.is_some_and(|r| r != entry.role) {
+            return refusal(|step, catalog| PlanRefusal::RoleChanged { step, catalog });
+        }
+        if let Some(kind) = step.kind {
+            if kind != entry.kind && step.catalog != "run" {
+                return refusal(|step, catalog| PlanRefusal::KindNotAllowed { step, catalog });
+            }
+            phase.kind = kind;
+        }
+        if let Some(gate) = step.gate {
+            if gate_rank(gate) < gate_rank(entry.gate) {
+                return refusal(|step, catalog| PlanRefusal::GateLowered { step, catalog });
+            }
+            phase.gate = gate;
+        }
+        match &step.validator_pin {
+            None => {}
+            Some(None) if entry.validator_pin.is_some() => {
+                return refusal(|step, catalog| PlanRefusal::PinRemoved { step, catalog });
+            }
+            Some(pin) => phase.validator_pin = pin.clone(),
+        }
+        if let Some(code) = step.executes_code {
+            if !code && entry.executes_code {
+                return refusal(|step, catalog| PlanRefusal::ExecutesCodeLowered { step, catalog });
+            }
+            phase.executes_code = code;
+        }
+        match (&step.executor, tool_entry) {
+            (Some(_), false) => {
+                return refusal(|step, catalog| PlanRefusal::ExecutorNotAllowed { step, catalog });
+            }
+            (Some(PhaseExecutor::Tool { cmd }), true) if !cmd.is_empty() => {
+                phase.executor = PhaseExecutor::Tool { cmd: cmd.clone() };
+            }
+            (_, true) => {
+                return refusal(|step, catalog| PlanRefusal::ToolCommandMissing { step, catalog });
+            }
+            (None, false) => {}
+        }
+        if let Some(gate_type) = step.gate_type {
+            phase.gate_type = gate_type;
+        }
+        if let Some(text) = &step.instructions {
+            phase.instructions = Some(text.clone());
+        }
+        if let Some(skill) = &step.skill_ref {
+            phase.skill_ref = Some(skill.clone());
+        }
+        if let Some(allowed) = &step.allowed_skills {
+            phase.allowed_skills = allowed.clone();
+        }
+        if let Some(deliverables) = &step.required_deliverables {
+            phase.required_deliverables = deliverables.clone();
+        }
+        if let Some(deps) = &step.depends_on {
+            phase.depends_on = deps.clone();
+        }
+        if let Some(owner) = step.owner {
+            phase.owner = owner;
+        }
+        phases.push(phase);
+    }
+    let def = WorkflowDef {
+        id: COMPOSED_DEF_ID.to_string(),
+        phases,
+        base_skill_ref: None,
+    };
+    // The composed def is judged exactly as a registered one is (`WorkflowRegistry::register`).
+    let mut probe = crate::workflow::WorkflowRegistry::default();
+    probe
+        .register(def.clone())
+        .map_err(PlanRefusal::InvalidDef)?;
+    Ok(def)
 }
 
 #[cfg(test)]

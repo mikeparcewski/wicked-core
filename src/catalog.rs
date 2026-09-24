@@ -53,8 +53,7 @@ pub const CATALOG_IDS: [&str; 12] = [
 /// The phase catalog: twelve entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
-    // RED: the entries are not written yet.
-    CATALOG.get_or_init(Vec::new)
+    CATALOG.get_or_init(build_catalog)
 }
 
 /// One catalog entry by id (`None` for an id the catalog does not define).
