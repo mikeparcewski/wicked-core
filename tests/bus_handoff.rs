@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    shared_bus_stats, BusBridgeState, BusDb, BusEmit, Core, CoreEvent, StepInput, StepOutput,
-    StepRunner, StepStatus, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD,
+    live_bus_bridges, shared_bus_stats, BusBridgeState, BusDb, BusEmit, Core, CoreEvent, StepInput,
+    StepOutput, StepRunner, StepStatus, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD,
     RUN_REQUESTED, TASK_COMPLETED, TASK_DISPATCHED,
 };
 use wicked_council::types::{Confidence, Dispatcher, Vote};
@@ -400,6 +400,35 @@ fn a_request_right_after_spawn_is_delivered_and_history_is_never_replayed() {
     assert!(
         !sessions.iter().any(|s| s == "history-run"),
         "a row on the bus before spawn returned must never be launched: {sessions:?}"
+    );
+}
+
+/// Review finding (#613 round 2): an engine whose actor cannot open its estate store returns early.
+/// The launch bridge `spawn` armed for it must not outlive it — no detached poller keeps running.
+#[test]
+fn an_engine_that_cannot_open_its_store_leaves_no_bridge_running() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tmp_dir("nostore");
+    let bus_db = dir.join("bus.db").to_string_lossy().to_string();
+    let not_a_dir = dir.join("not-a-dir");
+    std::fs::write(&not_a_dir, "a file where the store directory should be").unwrap();
+    let estate_db = not_a_dir.join("estate.db").to_string_lossy().to_string();
+
+    let before = live_bus_bridges();
+    std::env::set_var("WICKED_BUS_DB", &bus_db);
+    std::env::remove_var("WICKED_BUS_EXEC");
+    let core = Core::spawn_with_engine(estate_db, Arc::new(StubDispatcher), Arc::new(FastRunner));
+    std::env::remove_var("WICKED_BUS_DB");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_bus_bridges() > before && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let live = live_bus_bridges();
+    drop(core);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        live, before,
+        "the actor returned early (no store); its bridge must have been stopped and joined"
     );
 }
 

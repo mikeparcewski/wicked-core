@@ -4189,4 +4189,141 @@ mod judge_routing_tests {
             "no bus wait: the judge returned in {elapsed:?}"
         );
     }
+
+    /// Review finding (#613 round 2): the env-free exec entry (`Core::spawn_with_engine_exec`) arms
+    /// exec mediation over an explicit bus path with NO `WICKED_BUS_*` in the process env. Its
+    /// cli-runner must judge a pinned unit over THAT bus (`gate.eval.requested`), not inline —
+    /// the judge must follow the resolved exec bus, not only process env.
+    #[test]
+    fn the_env_free_exec_consumer_judges_a_pinned_unit_over_its_own_bus() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvRestore::capture(&["WICKED_BUS_DB", "WICKED_BUS_EXEC"]);
+        std::env::remove_var("WICKED_BUS_DB");
+        std::env::remove_var("WICKED_BUS_EXEC");
+
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-exec-judge-routing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_string_lossy().to_string();
+
+        /// Counts judge turns that reach the runner (the INLINE judge runs through it).
+        struct CountingRunner(AtomicUsize);
+        impl StepRunner for CountingRunner {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                if input.unit.session_id == "validator" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nok".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let gen = uuid::Uuid::new_v4();
+        let mut unit = crate::domain::WorkUnit::pending("xr:u1", "xr", 1, "review the work");
+        unit.assigned_cli = Some("pi".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
+            script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "xr".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-xr".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: Some(gen),
+            launch_seq: 1,
+            required_skills: Vec::new(),
+        };
+        let bus = BusDb::shared(&bus_path).unwrap();
+        arm_exec_publisher(bus.clone());
+        assert!(
+            try_publish_dispatched(&input, None, false),
+            "task.dispatched published"
+        );
+        disarm_exec_publisher();
+
+        // A stand-in evaluator daemon, so the bus judge returns at once when it is used.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let responder = {
+            let (requests, stop, bus_path) = (requests.clone(), stop.clone(), bus_path.clone());
+            std::thread::spawn(move || {
+                let db = BusDb::open(&bus_path).unwrap();
+                let mut floor = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    for ev in db.poll(GATE_EVAL_REQUESTED, floor, 20).unwrap_or_default() {
+                        floor = ev.event_id;
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let eval_id = ev.payload["eval_id"].as_str().unwrap_or("").to_string();
+                        let _ = db.emit(&BusEmit::new(
+                            GATE_EVAL_RESPONDED,
+                            "test",
+                            "test.gate",
+                            serde_json::json!({"eval_id": eval_id, "pass": true, "reasoning": "stand-in"}),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
+
+        let runner = Arc::new(CountingRunner(AtomicUsize::new(0)));
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let runner_stop = Arc::new(AtomicBool::new(false));
+        let consumer = run_cli_runner(
+            bus.clone(),
+            0,
+            runner.clone(),
+            cmd_tx,
+            None,
+            gen,
+            None,
+            consumer_name(gen),
+            completed_consumer_name(gen),
+            Duration::from_millis(50),
+            runner_stop.clone(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while bus
+            .poll(TASK_COMPLETED, 0, 10)
+            .unwrap_or_default()
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        runner_stop.store(true, Ordering::SeqCst);
+        let _ = consumer.join();
+        stop.store(true, Ordering::SeqCst);
+        let _ = responder.join();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the exec consumer judged over its bus (one gate.eval.requested)"
+        );
+        assert_eq!(runner.0.load(Ordering::SeqCst), 0, "and not inline");
+    }
 }

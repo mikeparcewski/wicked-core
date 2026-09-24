@@ -936,6 +936,7 @@ pub fn spawn_run_requested_poller(
     std::thread::Builder::new()
         .name(BUS_POLLER_THREAD.into())
         .spawn(move || {
+            let _live = LiveBridge::enter();
             run_requested_poll_loop(db, floor_init, tx, roster, entity_mode, poll_interval, stop)
         })
         .expect("spawn the bus bridge thread")
@@ -944,6 +945,30 @@ pub fn spawn_run_requested_poller(
 /// The name of the launch-bridge thread (the thread that opens and owns the engine's bus handle on a
 /// default boot). Tests assert the handle was opened here, never on the actor thread.
 pub const BUS_POLLER_THREAD: &str = "wicked-core-bus-poller";
+
+/// Launch-bridge threads alive in this process (test + diagnostic surface: a bridge must never
+/// outlive the engine that armed it).
+static LIVE_BUS_BRIDGES: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one live bridge thread for as long as it is held.
+struct LiveBridge;
+impl LiveBridge {
+    fn enter() -> Self {
+        LIVE_BUS_BRIDGES.fetch_add(1, Ordering::SeqCst);
+        LiveBridge
+    }
+}
+impl Drop for LiveBridge {
+    fn drop(&mut self) {
+        LIVE_BUS_BRIDGES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How many launch-bridge threads are alive in this process.
+#[doc(hidden)]
+pub fn live_bus_bridges() -> usize {
+    LIVE_BUS_BRIDGES.load(Ordering::SeqCst)
+}
 
 /// The name of the thread that opens the bus and runs exec mediation's consumer init at actor start
 /// (DES-TEAMING-002 T0 — never the actor thread).
@@ -1002,6 +1027,7 @@ pub(crate) fn arm_run_requested_bridge(
     let spawned = std::thread::Builder::new()
         .name(BUS_POLLER_THREAD.into())
         .spawn(move || {
+            let _live = LiveBridge::enter();
             let snapshot = BusDb::shared(&path).and_then(|db| db.tail_event_id().map(|t| (db, t)));
             match snapshot {
                 Ok((db, floor)) => {

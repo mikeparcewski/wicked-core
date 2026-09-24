@@ -94,9 +94,9 @@ pub use applications::{
     Application, SeedKind,
 };
 pub use bus::{
-    deterministic_key, matches_filter, shared_bus_stats, BusBridge, BusBridgeState, BusDb, BusEmit,
-    BusEvent, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD, BUS_POLLER_THREAD, CORE_DOMAIN, RUN_LAUNCHED,
-    RUN_REQUESTED,
+    deterministic_key, live_bus_bridges, matches_filter, shared_bus_stats, BusBridge,
+    BusBridgeState, BusDb, BusEmit, BusEvent, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD,
+    BUS_POLLER_THREAD, CORE_DOMAIN, RUN_LAUNCHED, RUN_REQUESTED,
 };
 pub use campaign::{
     all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
