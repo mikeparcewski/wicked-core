@@ -414,7 +414,14 @@ fn an_engine_that_cannot_open_its_store_leaves_no_bridge_running() {
     std::fs::write(&not_a_dir, "a file where the store directory should be").unwrap();
     let estate_db = not_a_dir.join("estate.db").to_string_lossy().to_string();
 
+    // Settle first: a previous test's NOT-armed bridge thread may still be finishing its (bounded,
+    // 5 s busy-timeout) open of a locked bus. Start from zero so the count below means THIS engine.
+    let settle = Instant::now() + Duration::from_secs(15);
+    while live_bus_bridges() > 0 && Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let before = live_bus_bridges();
+    assert_eq!(before, 0, "no bridge thread left over from an earlier test");
     std::env::set_var("WICKED_BUS_DB", &bus_db);
     std::env::remove_var("WICKED_BUS_EXEC");
     let core = Core::spawn_with_engine(estate_db, Arc::new(StubDispatcher), Arc::new(FastRunner));
