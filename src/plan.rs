@@ -374,9 +374,10 @@ pub struct PlanStep {
         skip_serializing_if = "Option::is_none"
     )]
     pub gate_type: Option<Option<crate::workflow::GateType>>,
-    /// May ADD a pin to an unpinned entry or SWAP the entry's pin for another (approval is enforced
-    /// at attach, `pipeline::attach_pinned_validators`). An explicit `null` on a pinned entry is a
-    /// removal and is refused.
+    /// Set only if the entry has none: a step may ADD a pin to an unpinned entry (approval is
+    /// enforced at attach, `pipeline::attach_pinned_validators`). On a pinned entry, restating the
+    /// entry's pin is a no-op, a different pin is refused (`pin_changed`, even an approved one), and
+    /// an explicit `null` is a removal and is refused (`pin_removed`).
     #[serde(
         default,
         deserialize_with = "present",
@@ -431,6 +432,8 @@ pub enum PlanRefusal {
     GateLowered { step: String, catalog: String },
     /// The step clears the pin of an entry that carries one.
     PinRemoved { step: String, catalog: String },
+    /// The step sets a pin other than the one its entry carries (a swap, even to an approved pin).
+    PinChanged { step: String, catalog: String },
     /// The step sets `executes_code: false` on an entry that sets it.
     ExecutesCodeLowered { step: String, catalog: String },
     /// The step sets a `kind` other than its entry's on an entry other than `run`.
@@ -461,6 +464,7 @@ impl PlanRefusal {
             PlanRefusal::RoleChanged { .. } => "role_changed",
             PlanRefusal::GateLowered { .. } => "gate_lowered",
             PlanRefusal::PinRemoved { .. } => "pin_removed",
+            PlanRefusal::PinChanged { .. } => "pin_changed",
             PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
             PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
             PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
@@ -487,12 +491,20 @@ impl std::fmt::Display for PlanRefusal {
                  (evaluator ≠ creator is a property of the catalog)"
             ),
             PlanRefusal::GateLowered { step, catalog } => {
-                write!(f, "{r}: step {step} lowers {catalog}'s gate — a step may only raise it")
+                write!(
+                    f,
+                    "{r}: step {step} lowers {catalog}'s gate — a step may only raise it"
+                )
             }
             PlanRefusal::PinRemoved { step, catalog } => write!(
                 f,
-                "{r}: step {step} removes {catalog}'s validator pin — a step may add or swap a pin, \
-                 never remove one"
+                "{r}: step {step} removes {catalog}'s validator pin — a step may add a pin to an \
+                 unpinned entry, never remove one"
+            ),
+            PlanRefusal::PinChanged { step, catalog } => write!(
+                f,
+                "{r}: step {step} swaps {catalog}'s validator pin — a pinned entry's pin is final; \
+                 a step may add a pin only to an unpinned entry"
             ),
             PlanRefusal::ExecutesCodeLowered { step, catalog } => write!(
                 f,
@@ -547,11 +559,11 @@ pub enum FieldRule {
     /// is the plan's own order, validated by the registry; `owner` is who answers for the step).
     Free,
     /// Only toward stricter: `gate` up the ladder, `executes_code` false → true,
-    /// `required_deliverables` may only grow, `validator_pin` may be added or swapped (approval
-    /// is enforced at attach) and never removed.
+    /// `required_deliverables` may only grow.
     TightenOnly,
     /// Settable only when the entry leaves it unset (`None` / empty); a value the entry carries is
-    /// final. Restating the entry's own value is a no-op.
+    /// final. Restating the entry's own value is a no-op. For `validator_pin` this bans swaps: a
+    /// different pin is `pin_changed` and a `null` is `pin_removed`.
     SetIfUnset,
     /// Only on the Tool entries (`run`, `deliver`), where the entry carries no command and the step
     /// MUST supply one; refused on every agent entry.
@@ -571,7 +583,7 @@ pub const STEP_FIELD_RULES: [(&str, FieldRule); 15] = [
     ("role", FieldRule::Fixed),
     ("kind", FieldRule::RunOnly),
     ("gate", FieldRule::TightenOnly),
-    ("validator_pin", FieldRule::TightenOnly),
+    ("validator_pin", FieldRule::SetIfUnset),
     ("executes_code", FieldRule::TightenOnly),
     ("required_deliverables", FieldRule::TightenOnly),
     ("executor", FieldRule::ToolEntriesOnly),
@@ -661,13 +673,17 @@ fn apply_step(
         }
         phase.gate = gate;
     }
-    // validator_pin — TightenOnly: add, or swap (attach refuses an unapproved one); never remove.
-    match &step.validator_pin {
-        None => {}
-        Some(None) if entry.validator_pin.is_some() => {
+    // validator_pin — SetIfUnset: add to an unpinned entry (attach refuses an unapproved one);
+    // a pinned entry's pin is final — restating it is a no-op, a swap or a removal is refused.
+    match (&step.validator_pin, &entry.validator_pin) {
+        (None, _) => {}
+        (Some(None), Some(_)) => {
             return refuse(|step, catalog| PlanRefusal::PinRemoved { step, catalog });
         }
-        Some(pin) => phase.validator_pin = pin.clone(),
+        (Some(Some(pin)), Some(own)) if pin != own => {
+            return refuse(|step, catalog| PlanRefusal::PinChanged { step, catalog });
+        }
+        (Some(pin), _) => phase.validator_pin = pin.clone(),
     }
     // executes_code — TightenOnly (false → true).
     if let Some(code) = step.executes_code {

@@ -5,12 +5,16 @@
 //! that already enforces it: `plan_from_def` copies `gate` / `role` / `owner` onto the unit,
 //! `attach_pinned_validators` attaches each `validator_pin`, and the fence reads `role`. A plan's
 //! steps are composed onto these entries by [`crate::plan::compose`], which lets a step only make
-//! its entry STRICTER (raise the gate, add or swap a pin, set `executes_code`) and never touch
-//! `role`.
+//! its entry STRICTER (raise the gate, add a pin to an unpinned entry, set `executes_code`) and
+//! never touch `role` or a pin the entry carries.
 //!
 //! The evidence floor lives HERE (DES-TEAMING-002 §10, "moved in seam C1"): the `build`, `test`,
 //! `review` and `security_review` entries carry [`EVIDENCE_FLOOR_PIN`] as data, so a composed
 //! plan's code-writing and code-judging steps are floored by the catalog, not by each def.
+//!
+//! `domain_coverage` carries [`COVERAGE_VALIDATOR_PIN`] as data (the shipped domain-extraction
+//! `coverage` phase's pin). A step may not swap a pin its entry carries, so the coverage judge is
+//! its own entry rather than a pin swap on `test`.
 //!
 //! Deviations from the §8.3 table, each forced by "compose of today's def equals today's def"
 //! (seam C1 acceptance (a)) and recorded in the C1 PR:
@@ -26,6 +30,7 @@ use std::sync::OnceLock;
 
 use crate::builtin_floors::EVIDENCE_FLOOR_PIN;
 use crate::domain::StageKind;
+use crate::domain_extraction::COVERAGE_VALIDATOR_PIN;
 use crate::workflow::{
     GateCond, GateSpec, GateType, PhaseDef, PhaseExecutor, PhaseRole, StepOwner,
 };
@@ -34,8 +39,8 @@ use crate::workflow::{
 /// frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
 pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer";
 
-/// The twelve catalog ids, in the §8.3 table's order.
-pub const CATALOG_IDS: [&str; 12] = [
+/// The thirteen catalog ids, in the §8.3 table's order.
+pub const CATALOG_IDS: [&str; 13] = [
     "understand",
     "test_plan",
     "design",
@@ -46,11 +51,12 @@ pub const CATALOG_IDS: [&str; 12] = [
     "review",
     "critique",
     "security_review",
+    "domain_coverage",
     "run",
     "deliver",
 ];
 
-/// The phase catalog: twelve entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
+/// The phase catalog: thirteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
     CATALOG.get_or_init(build_catalog)
@@ -109,6 +115,20 @@ fn build_catalog() -> Vec<PhaseDef> {
             )
         },
         PhaseDef {
+            // domain-extraction's coverage judge: the `test` shape with the coverage pin as data,
+            // and re-verified evidence like `test` (its pin is what re-verifies it).
+            verified_evidence: true,
+            ..entry(
+                "domain_coverage",
+                Test,
+                Evaluator,
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                Execution,
+                Some(COVERAGE_VALIDATOR_PIN.to_string()),
+                false,
+            )
+        },
+        PhaseDef {
             executor: tool(),
             ..entry("run", Recon, Neutral, auto, Value, None, false)
         },
@@ -153,7 +173,7 @@ mod tests {
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
-    fn the_catalog_is_the_twelve_entries_of_the_table() {
+    fn the_catalog_is_the_thirteen_entries_of_the_table() {
         let got: Vec<_> = catalog()
             .iter()
             .map(|e| {
@@ -181,7 +201,7 @@ mod tests {
             ("architecture", j("recon"), j("neutral"), j("auto"), j("strategy"), None, false, j("agent"), None),
             ("build", j("build"), j("creator"), j("auto"), j("execution"), f, true, j("agent"), None),
             ("produce", j("build"), j("creator"), j("auto"), j("value"), None, false, j("agent"), None),
-            ("test", j("test"), j("evaluator"), hci, j("execution"), f, false, j("agent"), None),
+            ("test", j("test"), j("evaluator"), hci.clone(), j("execution"), f, false, j("agent"), None),
             ("review", j("review"), j("evaluator"), j("auto"), j("execution"), f, false, j("agent"), None),
             ("critique", j("review"), j("evaluator"), j("auto"), j("execution"), None, false, j("agent"), None),
             (
@@ -195,6 +215,7 @@ mod tests {
                 j("agent"),
                 Some("wicked-garden-qe-security-test-engineer"),
             ),
+            ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("bfe4020a365c598b"), false, j("agent"), None),
             ("run", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
             ("deliver", j("build"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
         ];
@@ -214,9 +235,14 @@ mod tests {
             .map(|e| e.id.as_str())
             .collect();
         assert_eq!(floored, ["build", "test", "review", "security_review"]);
-        assert!(catalog()
+        // The only other pin is domain_coverage's coverage pin.
+        let other: Vec<_> = catalog()
             .iter()
-            .all(|e| e.validator_pin.is_none()
-                || e.validator_pin.as_deref() == Some(EVIDENCE_FLOOR_PIN)));
+            .filter_map(|e| match e.validator_pin.as_deref() {
+                None | Some(EVIDENCE_FLOOR_PIN) => None,
+                Some(pin) => Some((e.id.as_str(), pin)),
+            })
+            .collect();
+        assert_eq!(other, [("domain_coverage", COVERAGE_VALIDATOR_PIN)]);
     }
 }
