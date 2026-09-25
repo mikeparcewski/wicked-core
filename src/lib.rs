@@ -156,8 +156,8 @@ pub use knowledge::RecalledKnowledge;
 pub use memory::{now_secs, validate_scope_path, RecalledMemory};
 pub use pipeline::SessionResult;
 pub use plan::{
-    compose, plan_from_def, FieldRule, PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID,
-    STEP_FIELD_RULES,
+    compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
+    PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{

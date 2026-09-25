@@ -367,12 +367,50 @@ pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
     per_run_def_run_id(def_id) == Some(session_id)
 }
 
-/// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4). `deny_unknown_fields`
-/// so a misspelled key is refused at parse, never silently dropped.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4) — with the launch
+/// plan's optional `touch` and `override` (`plan: {steps, touch?, override?}`). `deny_unknown_fields`
+/// so a misspelled key is refused at parse, never silently dropped. [`compose`] reads `steps`
+/// only; [`floor_fill`] reads all three.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanSteps {
     pub steps: Vec<PlanStep>,
+    /// The predicted touch set (§8.2), the intent score's input. Absent and `[]` are the same:
+    /// no declared scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touch: Option<Vec<String>>,
+    /// A floor override (§8.5): manual mode only, refused in auto mode.
+    #[serde(default, rename = "override", skip_serializing_if = "Option::is_none")]
+    pub floor_override: Option<FloorOverride>,
+}
+
+impl PlanSteps {
+    /// The plan has a creator step (`build` or `produce`, §8.5): the steps that change something.
+    pub fn has_creator(&self) -> bool {
+        self.steps.iter().any(|s| is_creator_catalog(&s.catalog))
+    }
+}
+
+/// `build` and `produce`: the catalog's creator entries (§8.5 "a plan with no creator step").
+fn is_creator_catalog(catalog: &str) -> bool {
+    matches!(catalog, "build" | "produce")
+}
+
+/// A floor override (§8.5): the floor phase types the plan runs without, and why. Recorded on
+/// `plan.accepted.override`; refused in auto mode; never removes a pinned phase in a high-risk band.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FloorOverride {
+    pub remove: Vec<String>,
+    pub reason: String,
+}
+
+/// Who put a step in the plan (`plan.accepted.steps[].added_by`, §6): its author, or floor fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddedBy {
+    Plan,
+    Floor,
 }
 
 /// One plan step: the catalog entry it instantiates, its phase id, and the step fields §8.3 lets
@@ -433,6 +471,12 @@ pub struct PlanStep {
     /// evaluator ≠ creator (it stays a property of the catalog).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<crate::workflow::PhaseRole>,
+    /// The record of who added the step ([`floor_fill`] sets it); `compose` ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<AddedBy>,
+    /// Why floor fill added the step (`"band 40-69 requires design"`); `compose` ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_reason: Option<String>,
 }
 
 /// Deserialize a PRESENT field (value or `null`) as `Some(..)`, so an absent field (`None`, via
@@ -479,6 +523,17 @@ pub enum PlanRefusal {
     /// The composed def fails the registry's own validation (empty, duplicate or dangling ids,
     /// forward dependencies, a code phase whose gate evaluates nothing).
     InvalidDef(crate::workflow::WorkflowDefError),
+    /// The plan carries a floor override in auto mode (§8.5: an auto run never goes below the
+    /// floor).
+    OverrideInAutoMode,
+    /// The override removes a floor phase whose entry carries a validator pin, in a high-risk
+    /// band (§8.5).
+    OverrideRemovesPinned { catalog: String },
+    /// The override names a catalog id the catalog does not define.
+    OverrideUnknownEntry { catalog: String },
+    /// A floor phase sits before a floor phase that precedes it in catalog order (§8.5: no step
+    /// may reorder a floor phase before its catalog-order predecessors).
+    FloorReordered { step: String, catalog: String },
 }
 
 impl PlanRefusal {
@@ -499,6 +554,10 @@ impl PlanRefusal {
             PlanRefusal::AllowedSkillsChanged { .. } => "allowed_skills_changed",
             PlanRefusal::DeliverableRemoved { .. } => "deliverable_removed",
             PlanRefusal::InvalidDef(_) => "invalid_def",
+            PlanRefusal::OverrideInAutoMode => "override_in_auto_mode",
+            PlanRefusal::OverrideRemovesPinned { .. } => "override_removes_pinned",
+            PlanRefusal::OverrideUnknownEntry { .. } => "override_unknown_entry",
+            PlanRefusal::FloorReordered { .. } => "floor_reordered",
         }
     }
 }
@@ -569,6 +628,23 @@ impl std::fmt::Display for PlanRefusal {
                  deliverables"
             ),
             PlanRefusal::InvalidDef(e) => write!(f, "{r}: {e}"),
+            PlanRefusal::OverrideInAutoMode => write!(
+                f,
+                "{r}: override in auto mode — an auto-mode run never goes below the floor"
+            ),
+            PlanRefusal::OverrideRemovesPinned { catalog } => write!(
+                f,
+                "{r}: the override removes {catalog}, a pinned floor phase, in a high-risk band"
+            ),
+            PlanRefusal::OverrideUnknownEntry { catalog } => write!(
+                f,
+                "{r}: the override names {catalog}, which the catalog does not define"
+            ),
+            PlanRefusal::FloorReordered { step, catalog } => write!(
+                f,
+                "{r}: step {step} puts the floor phase {catalog} before a floor phase that \
+                 precedes it in catalog order"
+            ),
         }
     }
 }
@@ -597,12 +673,15 @@ pub enum FieldRule {
     RunOnly,
     /// Never changes; the entry's own value is a no-op.
     Fixed,
+    /// A record of how the step entered the plan (`added_by`, `floor_reason`); constrains
+    /// nothing, and `compose` ignores it.
+    Record,
 }
 
 /// Every [`PlanStep`] field and its [`FieldRule`] — the one table `compose` applies
 /// ([`apply_step`] has one arm per row, in this order). A test pins that the table covers every
 /// `PlanStep` field and that each rule refuses what it forbids.
-pub const STEP_FIELD_RULES: [(&str, FieldRule); 15] = [
+pub const STEP_FIELD_RULES: [(&str, FieldRule); 17] = [
     ("catalog", FieldRule::Identity),
     ("id", FieldRule::Identity),
     ("role", FieldRule::Fixed),
@@ -618,6 +697,8 @@ pub const STEP_FIELD_RULES: [(&str, FieldRule); 15] = [
     ("gate_type", FieldRule::Free),
     ("depends_on", FieldRule::Free),
     ("owner", FieldRule::Free),
+    ("added_by", FieldRule::Record),
+    ("floor_reason", FieldRule::Record),
 ];
 
 /// A gate's position on the §8.3 ladder: `auto` < `human_confirm_if` <
@@ -776,7 +857,65 @@ fn apply_step(
     if let Some(owner) = step.owner {
         phase.owner = owner;
     }
+    // added_by, floor_reason — Record: nothing to apply.
     Ok(phase)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Floor fill (DES-TEAMING-002 §8.5, seam T2): the score's floor → the floor phases a plan is
+// missing, inserted and composed. Never removes a phase.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What floor fill needs besides the plan: the run's score (the ratcheted maximum, §8.5), the
+/// destructive signal, the run's autonomy, and — for a run that delivers — the deliver command.
+#[derive(Debug, Clone, Copy)]
+pub struct FloorInput<'a> {
+    /// The S4 score the floor band is read from.
+    pub score: u8,
+    /// `ChangeSignals.destructive` / `ImpactSignals.destructive`: high risk in any band.
+    pub destructive: bool,
+    /// The run's autonomy (§8.6: auto mode ⇔ `HumanConfirm::None`).
+    pub human_confirm: &'a crate::domain::HumanConfirm,
+    /// `Some(cmd)` for a run that delivers (`deliver: "pr"`): the command a floor-added `deliver`
+    /// step runs (the catalog's `deliver` entry carries none). `None`: the floor has no `deliver`.
+    pub deliver: Option<&'a [String]>,
+}
+
+/// A floor-filled, composed plan (the body of `plan.accepted`, §6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloorFilled {
+    /// The plan's steps with the floor phases inserted; every step carries `added_by`.
+    pub steps: PlanSteps,
+    /// `compose` of `steps`.
+    pub def: WorkflowDef,
+    /// The band the score lands in (`"40-69"`).
+    pub band: String,
+    /// The floor phase types the plan owed, in order (empty for a plan with no creator step).
+    pub floor: Vec<String>,
+    /// §8.5's high-risk rule (never for a plan with no creator step).
+    pub high_risk: bool,
+    /// The override as recorded (`plan.accepted.override`); manual mode only.
+    pub floor_override: Option<FloorOverride>,
+}
+
+/// Floor-fill a plan and compose it (DES-TEAMING-002 §8.5): every floor phase type missing from
+/// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
+/// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
+pub fn floor_fill(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+    input: FloorInput<'_>,
+) -> Result<FloorFilled, PlanRefusal> {
+    let _ = input;
+    let def = compose(catalog, plan)?;
+    Ok(FloorFilled {
+        steps: plan.clone(),
+        def,
+        band: String::new(),
+        floor: Vec::new(),
+        high_risk: false,
+        floor_override: None,
+    })
 }
 
 #[cfg(test)]
@@ -1596,5 +1735,368 @@ mod tests {
                 ][..]
             )
         );
+    }
+
+    // ── T2 (DES-TEAMING-002 §8.5): floor fill ─────────────────────────────────────────────
+
+    mod floor_fill_t2 {
+        use super::super::*;
+        use crate::domain::HumanConfirm;
+        use serde_json::json;
+
+        const AUTO: HumanConfirm = HumanConfirm::None;
+        const MANUAL: HumanConfirm = HumanConfirm::All;
+
+        fn plan(v: serde_json::Value) -> PlanSteps {
+            serde_json::from_value(v).expect("plan parses")
+        }
+
+        fn deliver_cmd() -> Vec<String> {
+            vec!["wicked-deliver".to_string(), "--pr".to_string()]
+        }
+
+        fn fill(
+            p: &PlanSteps,
+            score: u8,
+            hc: &HumanConfirm,
+            deliver: Option<&[String]>,
+        ) -> Result<FloorFilled, PlanRefusal> {
+            floor_fill(
+                crate::catalog::catalog(),
+                p,
+                FloorInput {
+                    score,
+                    destructive: false,
+                    human_confirm: hc,
+                    deliver,
+                },
+            )
+        }
+
+        /// `(catalog, id, added_by, floor_reason)` per step.
+        fn rows(f: &FloorFilled) -> Vec<(String, String, Option<AddedBy>, Option<String>)> {
+            f.steps
+                .steps
+                .iter()
+                .map(|s| {
+                    (
+                        s.catalog.clone(),
+                        s.id.clone(),
+                        s.added_by,
+                        s.floor_reason.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        fn row(
+            catalog: &str,
+            id: &str,
+            by: AddedBy,
+            reason: Option<&str>,
+        ) -> (String, String, Option<AddedBy>, Option<String>) {
+            (
+                catalog.to_string(),
+                id.to_string(),
+                Some(by),
+                reason.map(str::to_string),
+            )
+        }
+
+        fn phase_ids(f: &FloorFilled) -> Vec<&str> {
+            f.def.phases.iter().map(|p| p.id.as_str()).collect()
+        }
+
+        /// T2 (b): a user plan below the floor gets the floor phases added, each marked
+        /// `added_by: floor` with its reason, and the accepted steps show them.
+        #[test]
+        fn t2_b_a_plan_below_the_floor_gets_the_floor_phases_added() {
+            let cmd = deliver_cmd();
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = fill(&p, 50, &AUTO, Some(&cmd)).expect("filled, not refused");
+            use AddedBy::{Floor, Plan};
+            assert_eq!(
+                rows(&f),
+                [
+                    row(
+                        "test_plan",
+                        "test_plan",
+                        Floor,
+                        Some("band 40-69 requires test_plan")
+                    ),
+                    row(
+                        "design",
+                        "design",
+                        Floor,
+                        Some("band 40-69 requires design")
+                    ),
+                    row("build", "build", Plan, None),
+                    row(
+                        "review",
+                        "review",
+                        Floor,
+                        Some("band 40-69 requires review")
+                    ),
+                    row(
+                        "deliver",
+                        "deliver",
+                        Floor,
+                        Some("band 40-69 requires deliver")
+                    ),
+                ]
+            );
+            assert_eq!(
+                phase_ids(&f),
+                ["test_plan", "design", "build", "review", "deliver"]
+            );
+            assert_eq!(
+                f.def.phases[4].executor,
+                crate::workflow::PhaseExecutor::Tool { cmd: cmd.clone() }
+            );
+            assert_eq!((f.band.as_str(), f.high_risk), ("40-69", false));
+            assert_eq!(
+                f.floor,
+                ["test_plan", "design", "build", "review", "deliver"]
+            );
+            // plan.accepted.steps: the wire shape of a floor-added step.
+            let wire = serde_json::to_value(&f.steps).unwrap();
+            assert_eq!(
+                wire["steps"][0],
+                json!({"catalog": "test_plan", "id": "test_plan", "added_by": "floor",
+                       "floor_reason": "band 40-69 requires test_plan"})
+            );
+            assert_eq!(
+                wire["steps"][2],
+                json!({"catalog": "build", "id": "build", "added_by": "plan"})
+            );
+        }
+
+        /// A run that does not deliver has no `deliver` in its floor; a floor phase lands at its
+        /// catalog-order position (after `test`, which precedes `review` in the catalog).
+        #[test]
+        fn t2_b_floor_phases_land_at_their_catalog_position() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "test", "id": "test"}
+            ]}));
+            let f = fill(&p, 30, &AUTO, None).unwrap();
+            use AddedBy::{Floor, Plan};
+            assert_eq!(
+                rows(&f),
+                [
+                    row("build", "build", Plan, None),
+                    row("test", "test", Plan, None),
+                    row(
+                        "review",
+                        "review",
+                        Floor,
+                        Some("band 20-39 requires review")
+                    ),
+                ]
+            );
+            assert_eq!(f.floor, ["build", "review"]);
+        }
+
+        /// T2 (c): a plan that already contains the floor is unchanged (bar the `added_by`
+        /// record); duplicates are kept.
+        #[test]
+        fn t2_c_a_plan_that_contains_the_floor_is_unchanged() {
+            let cmd = deliver_cmd();
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review"},
+                {"catalog": "review", "id": "review-2"},
+                {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": cmd}}
+            ]}));
+            let f = fill(&p, 30, &AUTO, Some(&cmd)).unwrap();
+            let mut want = p.clone();
+            for s in &mut want.steps {
+                s.added_by = Some(AddedBy::Plan);
+            }
+            assert_eq!(f.steps, want);
+            assert_eq!(phase_ids(&f), ["build", "review", "review-2", "ship"]);
+            assert_eq!(f.def, compose(crate::catalog::catalog(), &p).unwrap());
+        }
+
+        /// T2 (d): a read-only plan and a tool-only plan have an empty floor and are never high
+        /// risk, even at score 100.
+        #[test]
+        fn t2_d_read_only_and_tool_only_plans_have_an_empty_floor() {
+            let cmd = deliver_cmd();
+            for p in [
+                plan(json!({"steps": [{"catalog": "understand", "id": "understand"}]})),
+                plan(json!({"steps": [{"catalog": "run", "id": "onboard",
+                                        "executor": {"type": "tool", "cmd": ["wicked-onboard"]}}]})),
+            ] {
+                let f = fill(&p, 100, &AUTO, Some(&cmd)).unwrap();
+                assert!(f.floor.is_empty(), "{f:?}");
+                assert!(!f.high_risk);
+                assert_eq!(f.band, "70-100");
+                assert_eq!(f.steps.steps.len(), 1);
+                assert_eq!(f.steps.steps[0].added_by, Some(AddedBy::Plan));
+            }
+        }
+
+        /// T2 (e): no graph means score 100, so the 70-100 floor applies and the plan is high risk.
+        #[test]
+        fn t2_e_score_100_gets_the_full_floor() {
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = fill(&p, 100, &AUTO, None).unwrap();
+            assert_eq!(
+                phase_ids(&f),
+                [
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "build",
+                    "review",
+                    "security_review"
+                ]
+            );
+            assert!(f.high_risk);
+            assert_eq!(f.band, "70-100");
+        }
+
+        /// The destructive signal makes any band high risk.
+        #[test]
+        fn t2_destructive_is_high_risk_in_any_band() {
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = floor_fill(
+                crate::catalog::catalog(),
+                &p,
+                FloorInput {
+                    score: 10,
+                    destructive: true,
+                    human_confirm: &AUTO,
+                    deliver: None,
+                },
+            )
+            .unwrap();
+            assert_eq!((f.band.as_str(), f.high_risk), ("0-19", true));
+            assert_eq!(phase_ids(&f), ["build"]);
+        }
+
+        /// §8.5 non-code runs: with no step that executes code, `produce` fills the build slot and
+        /// `critique` the review slot.
+        #[test]
+        fn t2_a_non_code_run_is_floored_by_produce_and_critique() {
+            let p = plan(json!({"steps": [{"catalog": "produce", "id": "draft"}]}));
+            let f = fill(&p, 30, &AUTO, None).unwrap();
+            use AddedBy::{Floor, Plan};
+            assert_eq!(
+                rows(&f),
+                [
+                    row("produce", "draft", Plan, None),
+                    row(
+                        "critique",
+                        "critique",
+                        Floor,
+                        Some("band 20-39 requires critique")
+                    ),
+                ]
+            );
+            assert_eq!(f.floor, ["produce", "critique"]);
+        }
+
+        /// A floor-added step whose natural id is taken gets a distinct one.
+        #[test]
+        fn t2_a_floor_step_never_reuses_a_taken_id() {
+            let p = plan(json!({"steps": [
+                {"catalog": "understand", "id": "review"},
+                {"catalog": "build", "id": "build"}
+            ]}));
+            let f = fill(&p, 30, &AUTO, None).unwrap();
+            assert_eq!(phase_ids(&f), ["review", "build", "review-floor"]);
+        }
+
+        /// §8.5: no step may put a floor phase before its catalog-order predecessors.
+        #[test]
+        fn t2_a_floor_phase_before_its_predecessor_is_refused() {
+            let p = plan(json!({"steps": [
+                {"catalog": "review", "id": "review"},
+                {"catalog": "build", "id": "build"}
+            ]}));
+            let r = fill(&p, 30, &AUTO, None).unwrap_err();
+            assert_eq!(r.reason(), "floor_reordered", "{r}");
+        }
+
+        /// §8.5 floor override: refused in auto mode, recorded in manual mode.
+        #[test]
+        fn t2_the_floor_override_is_refused_in_auto_and_recorded_in_manual() {
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                "override": {"remove": ["design"], "reason": "spike"}}));
+            let r = fill(&p, 50, &AUTO, None).unwrap_err();
+            assert_eq!(r.reason(), "override_in_auto_mode");
+            assert!(r.to_string().contains("override in auto mode"), "{r}");
+
+            let f = fill(&p, 50, &MANUAL, None).unwrap();
+            assert_eq!(phase_ids(&f), ["test_plan", "build", "review"]);
+            assert_eq!(
+                f.floor_override,
+                Some(FloorOverride {
+                    remove: vec!["design".to_string()],
+                    reason: "spike".to_string()
+                })
+            );
+        }
+
+        /// §8.5: an override never removes a pinned phase in a high-risk band; an unpinned one it
+        /// may. Floor fill never removes a step the author wrote, override or not.
+        #[test]
+        fn t2_the_override_never_removes_a_pinned_phase_in_a_high_risk_band() {
+            let pinned = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                     "override": {"remove": ["review"], "reason": "r"}}));
+            let r = fill(&pinned, 80, &MANUAL, None).unwrap_err();
+            assert_eq!(r.reason(), "override_removes_pinned", "{r}");
+            // Not high risk: the same override is allowed.
+            let f = fill(&pinned, 30, &MANUAL, None).unwrap();
+            assert_eq!(phase_ids(&f), ["build"]);
+
+            let unpinned = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                       "override": {"remove": ["architecture"], "reason": "r"}}));
+            let f = fill(&unpinned, 80, &MANUAL, None).unwrap();
+            assert_eq!(
+                phase_ids(&f),
+                ["test_plan", "design", "build", "review", "security_review"]
+            );
+
+            let authored = plan(json!({"steps": [
+                {"catalog": "design", "id": "design"},
+                {"catalog": "build", "id": "build"}
+            ], "override": {"remove": ["design"], "reason": "r"}}));
+            let f = fill(&authored, 50, &MANUAL, None).unwrap();
+            assert_eq!(phase_ids(&f), ["test_plan", "design", "build", "review"]);
+
+            let unknown = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                      "override": {"remove": ["lint"], "reason": "r"}}));
+            let r = fill(&unknown, 50, &MANUAL, None).unwrap_err();
+            assert_eq!(r.reason(), "override_unknown_entry");
+        }
+
+        /// T2 (g), the plan half: `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch`
+        /// omitted or `[]` parses, has a creator, and at the no-scope score (100) gets the 70-100
+        /// floor and high risk; `understand` alone has no creator.
+        #[test]
+        fn t2_g_touch_omitted_empty_declared_and_read_only() {
+            for body in [
+                json!({"steps": [{"catalog": "build", "id": "build"}]}),
+                json!({"steps": [{"catalog": "build", "id": "build"}], "touch": []}),
+            ] {
+                let p = plan(body);
+                assert!(p.has_creator());
+                assert!(p.touch.as_deref().unwrap_or_default().is_empty());
+                let f = fill(&p, 100, &AUTO, None).unwrap();
+                assert!(f.high_risk);
+                assert_eq!(f.floor.len(), 6);
+            }
+            let declared = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                       "touch": ["src/x.rs"]}));
+            assert_eq!(
+                declared.touch.as_deref(),
+                Some(&["src/x.rs".to_string()][..])
+            );
+            let read_only = plan(json!({"steps": [{"catalog": "understand", "id": "u"}]}));
+            assert!(!read_only.has_creator());
+        }
     }
 }
