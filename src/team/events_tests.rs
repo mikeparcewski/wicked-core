@@ -1682,3 +1682,67 @@ fn c6_an_empty_stream_is_a_gap() {
     let l = fold(&[]);
     assert_eq!((l.final_pass, l.team_pause), (FinalPass::StreamGap, true));
 }
+
+/// `team_pause` assignments in `src`: every `team_pause: <literal>` / `team_pause = <literal>`.
+fn literal_team_pause(src: &str) -> Vec<String> {
+    let src = src.replace("\r\n", "\n");
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        let mut rest = code;
+        while let Some(at) = rest.find("team_pause") {
+            let after = rest[at + "team_pause".len()..].trim_start();
+            let value = after
+                .strip_prefix(':')
+                .or_else(|| after.strip_prefix('=').filter(|v| !v.starts_with('=')))
+                .map(str::trim_start);
+            if value.is_some_and(|v| v.starts_with("true") || v.starts_with("false")) {
+                out.push(format!("{}: {}", i + 1, line.trim()));
+            }
+            rest = &rest[at + "team_pause".len()..];
+        }
+    }
+    out
+}
+
+/// codex round 4 (#616): `teamPause` is computed in one place ([`ledger_pauses`], through
+/// `TeamLedger::new` / `refresh_pause`). No production path may assign it a literal: a hard-coded
+/// `false` is how the live ledger shipped unpaused.
+#[test]
+fn no_production_code_assigns_team_pause_a_literal() {
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![src_dir];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for hit in literal_team_pause(&src) {
+                offenders.push(format!("{}:{hit}", path.display()));
+            }
+        }
+    }
+    assert_eq!(offenders, Vec::<String>::new());
+}
+
+#[test]
+fn the_team_pause_guard_catches_literals_and_passes_computed_values() {
+    let src = "a { team_pause: false, }\nx.team_pause = true;\ny.team_pause == false\n\
+               z.team_pause = ledger_pauses(&l);\n// team_pause: false in a comment\n\
+               pub team_pause: bool,\n";
+    assert_eq!(
+        literal_team_pause(src),
+        vec![
+            "1: a { team_pause: false, }".to_string(),
+            "2: x.team_pause = true;".to_string()
+        ]
+    );
+}

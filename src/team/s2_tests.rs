@@ -866,3 +866,39 @@ fn a_failed_unit_skips_the_final_pass() {
     assert_eq!(ledger.final_pass, FinalPass::Skipped);
     assert_eq!(host.turns.load(Ordering::Relaxed), 0);
 }
+
+/// codex round 4 (#616): the LIVE final-pass ledger computes `teamPause` like the fold does. A
+/// live attempt holding an unaccepted HIGH (no ADVICE answer, no hold-round reply) serializes
+/// paused; the same ledger with only a MEDIUM does not.
+#[test]
+fn a_live_ledger_with_an_unaccepted_high_is_paused() {
+    let live = |severity: &str| {
+        let fx = Fixture::new(&format!("live-pause-{severity}"));
+        let host = Arc::new(FakeHost::default());
+        host.replies.lock().unwrap().insert(
+            "m1".into(),
+            format!(
+                "FINDING {{\"severity\":\"{severity}\",\"path\":\"src/lib.rs\",\"line\":3,\"evidence\":\"    let x = 2;\",\"claim\":\"x is never read\",\"suggestion\":null}}\nDONE"
+            ),
+        );
+        let (emit, seen) = recorder();
+        let mut core = TeamCore::new(host.clone(), emit.clone(), TeamLimits::default());
+        core.attach(fx.ctx(1, &["claude#2"]));
+        fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+        core.on_event(&checkpoint(7, "edit"));
+        pump(&mut core, &host, &emit, Instant::now());
+        assert_eq!(findings(&seen).len(), 1, "{severity}: one finding raised");
+        let unit = core.take(fx.ctx(1, &["claude#2"]));
+        let ledger = unit.lock().unwrap().ledger(FinalPass::Completed);
+        ledger
+    };
+    let high = live("high");
+    assert_eq!(high.findings[0].status, FindingStatus::Unanswered);
+    assert!(high.team_pause, "an unaccepted HIGH pauses the live ledger");
+    assert_eq!(
+        serde_json::to_value(&high).unwrap()["teamPause"],
+        json!(true),
+        "and it serializes paused"
+    );
+    assert!(!live("medium").team_pause, "a MEDIUM alone does not pause");
+}
