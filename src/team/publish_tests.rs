@@ -226,6 +226,8 @@ fn p1_a_a_spooled_fact_writes_a_deadletter_marker_on_stderr() {
         return;
     }
     let exe = std::env::current_exe().unwrap();
+    // spawn-audit: test-only — re-runs this test binary to read the spool's stderr; the child
+    // reads no engine state (its bus and outbox are its own temp files).
     let out = std::process::Command::new(exe)
         .args([
             "--exact",

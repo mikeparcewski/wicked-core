@@ -557,22 +557,39 @@ fn p1_c_the_actor_answers_while_the_bus_is_locked() {
     let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
         .with_schedule(vec![Duration::from_millis(300); 4])
         .with_attempt_wait(Duration::from_millis(250));
-    let hold = cfg.bound() * 2;
+    // Held for at least twice the bound AND until the run has fallen back (so the lock outlives
+    // every retry however slow the runner), capped generously.
+    let min_hold = cfg.bound() * 2;
     let e = engine(&rig, cfg);
     let holder = rusqlite::Connection::open(&rig.bus).unwrap();
     holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
     launch_team(&e, "rc");
     let start = Instant::now();
     let mut worst = Duration::ZERO;
-    while start.elapsed() < hold {
+    let mut rounds = 0u32;
+    loop {
         let t = Instant::now();
         e.core.ping();
         let _sub = e.core.subscribe();
         e.core.sessions().unwrap();
+        let fell_back = e
+            .core
+            .run_team("rc")
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.transport == "none");
         worst = worst.max(t.elapsed());
+        rounds += 1;
+        if (start.elapsed() >= min_hold && fell_back) || start.elapsed() > Duration::from_secs(60) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
     holder.execute_batch("COMMIT;").unwrap();
+    assert!(
+        rounds > 10,
+        "the actor was probed throughout ({rounds} rounds)"
+    );
     assert!(
         worst < Duration::from_secs(2),
         "an actor round-trip took {worst:?} while the bus was locked"
