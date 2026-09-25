@@ -424,6 +424,11 @@ pub(crate) fn distribute_units_against_benched(
     // the units and the instance that would satisfy them. The engine never mints or signs in an
     // instance; the launcher adds the ones it has configured to the roster.
     if !same_seat.is_empty() && team_run {
+        // Reached only BENCH-FREE (the bench arm above returned otherwise), so every configured
+        // seat is usable: an instance the roster already holds is a builder or refused by the
+        // unit's skills, and the remedy is a FRESH key. An unusable configured instance is named
+        // by the bench arm instead (codex round 5 on #618).
+        debug_assert!(benched.is_empty());
         let blocked: Vec<&WorkUnit> = units
             .iter()
             .filter(|u| u.tool_cmd.is_none() && same_seat.contains(&u.ord))
@@ -2190,5 +2195,37 @@ mod tests {
             );
             assert_eq!(dists[1].distinctness_fallback, None, "team={team}");
         }
+    }
+    /// D1 (codex round 5 on #618): roster `[claude, claude#2]` with `claude#2` configured but NOT
+    /// usable. The remedy must name `claude#2` — signing it in satisfies the run — and never send
+    /// the operator to add a `claude#3`. An unusable seat is benched (`launcher_benched`), so this
+    /// refusal is the BENCH arm's: it names `claude#2` and its reason. The team arm (and its
+    /// `next_instance_key` remedy) is reached only on a bench-free roster, where every configured
+    /// instance is usable.
+    #[test]
+    fn d1_an_unusable_configured_instance_is_named_not_a_fresh_one() {
+        let err = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude"), unusable(seat("claude#2"))],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("refused");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(
+            refusal.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: distinct seat(s) benched; \
+             1 of 2 seats benched: claude#2 (not signed in (launcher health probe) \u{2014} launcher)"
+        );
+        assert!(!refusal.benched.contains("claude#3"), "{}", refusal.benched);
+        assert_eq!(
+            err.to_string(),
+            "no eligible seat for r1: evaluator\u{2260}creator unsatisfiable for unit(s) [2]: \
+             distinct seat(s) benched; 1 of 2 seats benched: claude#2 (not signed in (launcher \
+             health probe) \u{2014} launcher) \u{2014} sign a seat in, or add one, before launching"
+        );
     }
 }
