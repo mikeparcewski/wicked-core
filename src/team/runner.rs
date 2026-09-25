@@ -627,6 +627,9 @@ fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> Uni
             floor = floor.max(id);
             if let Ok(rows) = db.poll(tev::LEDGER_FOLDED, floor, 50) {
                 for ev in rows {
+                    // Past every row inspected: `poll` is strictly-after, so a cursor that stays
+                    // put re-reads the same batch forever behind other attempts' folds.
+                    floor = floor.max(ev.event_id);
                     let Ok(te) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
                         continue;
                     };

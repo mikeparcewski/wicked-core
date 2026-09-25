@@ -124,8 +124,9 @@ struct GateEvalRequest {
     /// The governed evaluator daemon MUST exclude this seat from its selection so the author
     /// cannot self-grade — this is the bus-path equivalent of the inline path's
     /// `let excluded = [DETERMINISTIC_VALIDATOR_SEAT, work_author]` guard (cli_runner.rs ~499).
-    /// `None` means the work author is unknown; the daemon should apply maximum exclusion
-    /// (exclude every seat, fail-closed) rather than proceeding without the guard.
+    /// Core never publishes a request without it (core#625: a unit with no work author is a DENY
+    /// before any request); `None` only arrives from an older producer, and the daemon then
+    /// applies maximum exclusion (judges nothing, fail-closed).
     #[serde(default)]
     work_author: Option<String>,
     /// (DES-TEAMING-001 §6.2, T5) The team monitors that authored or corroborated a finding in
@@ -151,6 +152,20 @@ struct GateEvalResponse {
 /// The fail-closed DENY a bus judge gets when it cannot prove it excluded the team's monitors.
 pub(crate) const MONITOR_EXCLUSION_DENY: &str =
     "gate eval bus-path DENY (fail-closed): evaluator did not prove monitor exclusion";
+
+/// (core#625) The DENY for a pinned unit with no work author: evaluator≠creator cannot be proven,
+/// so no request is published at all.
+pub(crate) const WORK_AUTHOR_UNKNOWN_DENY: &str =
+    "gate eval bus-path DENY (fail-closed): the work author is unknown, so evaluator≠creator \
+     cannot be proven";
+
+/// (core#625) The DENY for a response that names no judge seat: exclusion cannot be verified.
+pub(crate) const JUDGE_UNNAMED_DENY: &str =
+    "gate eval bus-path DENY (fail-closed): evaluator did not name its judge seat";
+
+/// (core#625) The DENY for a response judged by the work author (instance or cli key).
+pub(crate) const CREATOR_JUDGE_DENY: &str =
+    "gate eval bus-path DENY (fail-closed): the evaluator judged as the work author";
 
 /// The `wicked.task.dispatched` payload. Carries what the `cli-runner` needs to reconstruct the
 /// [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with
@@ -403,6 +418,13 @@ fn bus_request_agent_verdict(
         };
     }
 
+    // core#625: the work author is part of every request's exclusion set; with none there is
+    // nothing to prove evaluator≠creator against, so no request is published at all.
+    let Some(author) = work_author.map(str::trim).filter(|a| !a.is_empty()) else {
+        bus_deny!(WORK_AUTHOR_UNKNOWN_DENY.to_string());
+    };
+    let author_set = [author.to_string()];
+
     let db = match BusDb::shared(bus_db_path) {
         Ok(d) => d,
         Err(e) => bus_deny!(format!(
@@ -424,7 +446,7 @@ fn bus_request_agent_verdict(
         run_id: run_id.to_string(),
         unit_ix,
         attempt,
-        work_author: work_author.map(str::to_string),
+        work_author: Some(author.to_string()),
         excluded_seats: excluded_seats.to_vec(),
     };
     let payload = match serde_json::to_value(&request) {
@@ -465,15 +487,23 @@ fn bus_request_agent_verdict(
                         "wicked-core: gate eval response received — pass={} reasoning={:?}",
                         resp.pass, resp.reasoning
                     );
-                    // T5: with monitors to exclude, only a response that NAMES a judge outside
-                    // them is honoured; a missing or excluded judge is a DENY (DES-001 §6.2).
-                    if !excluded_seats.is_empty()
-                        && resp
-                            .judge_cli
-                            .as_deref()
-                            .is_none_or(|j| crate::team::runner::is_excluded(j, excluded_seats))
-                    {
-                        bus_deny!(MONITOR_EXCLUSION_DENY.to_string());
+                    // T5 + core#625: only a response that NAMES a judge outside
+                    // `work_author ∪ excluded_seats` (instance or cli key) is honoured; a missing
+                    // or excluded judge is a DENY — an empty `excluded_seats` never bypasses the
+                    // evaluator≠creator check (DES-001 §6.2).
+                    let monitors = !excluded_seats.is_empty();
+                    match resp.judge_cli.as_deref() {
+                        None if monitors => bus_deny!(MONITOR_EXCLUSION_DENY.to_string()),
+                        None => bus_deny!(JUDGE_UNNAMED_DENY.to_string()),
+                        Some(j)
+                            if monitors && crate::team::runner::is_excluded(j, excluded_seats) =>
+                        {
+                            bus_deny!(MONITOR_EXCLUSION_DENY.to_string())
+                        }
+                        Some(j) if crate::team::runner::is_excluded(j, &author_set) => {
+                            bus_deny!(CREATOR_JUDGE_DENY.to_string())
+                        }
+                        Some(_) => {}
                     }
                     return crate::validator::AgentVerdict {
                         judge_cli: resp.judge_cli,
