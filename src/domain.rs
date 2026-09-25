@@ -528,6 +528,18 @@ pub struct WorkUnit {
     /// serialize byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pre_build_scope: bool,
+    /// TRUE when this unit was planned from the run's catalog-composed per-run def
+    /// (`"<run>:plan-<rev>"`, DES-TEAMING-002 §8.3, [`crate::plan::is_per_run_def_id`]) — a
+    /// TEAM RUN. Stamped at plan time by [`crate::plan::plan_from_def`] from the def id alone, so
+    /// it is no second launch knob: the composed def IS the team marker. It rides the unit (not
+    /// the session, which records only a synthetic `wf-<session>` id) so a re-route of a
+    /// persisted plan still knows it is a team run. Read by the evaluator≠creator fence: a team
+    /// run never grades on its creator seat (§8.1, seam D1).
+    ///
+    /// `#[serde(default)]` + skip-if-false: pre-existing units deserialize, and non-team units
+    /// serialize byte-identical to before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub team_run: bool,
     /// Operator-visible WARNINGS the completion path recorded WITHOUT denying (core#283): today,
     /// a pre-build phase whose worktree contribution touches non-documentation files — the
     /// design-before-build ladder collapsing into implementation. Advisory gate evidence on the
@@ -784,6 +796,7 @@ impl WorkUnit {
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             pre_build_scope: false,
+            team_run: false,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
             worktree_baseline: None,

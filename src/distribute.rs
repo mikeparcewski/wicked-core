@@ -383,8 +383,18 @@ pub(crate) fn distribute_units_against_benched(
         })
         .collect();
     let still_eligible: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
-    let (same_seat, same_cli_instance) =
-        enforce_evaluator_distinct(units, &mut dists, &still_eligible, clis, &candidates);
+    // (DES-TEAMING-002 §8.1, seam D1) A TEAM RUN — units of the run's composed per-run def,
+    // stamped `team_run` at plan time — never grades on its creator seat and prefers a distinct
+    // CLI over a second instance of the creator's.
+    let team_run = units.iter().any(|u| u.team_run);
+    let (same_seat, same_cli_instance) = enforce_evaluator_distinct(
+        units,
+        &mut dists,
+        &still_eligible,
+        clis,
+        &candidates,
+        team_run,
+    );
     // (AC-3 / core#537, core#560) When a benched seat — from ANY source (launcher health probe,
     // or a worker transcript persisted on the session) — made evaluator≠creator unsatisfiable,
     // fail CLOSED: the operator must relaunch once the seat recovers. A silent creator_seat
@@ -404,6 +414,42 @@ pub(crate) fn distribute_units_against_benched(
                  benched; {}",
                 blocked,
                 crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default()
+            ),
+            benched_seats: benched.clone(),
+        }
+        .into());
+    }
+    // (DES-TEAMING-002 §8.1, seam D1) A team run refuses the creator-seat fallback even on a
+    // BENCH-FREE roster: no distinct CLI and no usable second instance ⇒ `NoEligibleSeat`, naming
+    // the units and the instance that would satisfy them. The engine never mints or signs in an
+    // instance; the launcher adds the ones it has configured to the roster.
+    if !same_seat.is_empty() && team_run {
+        // Reached only BENCH-FREE (the bench arm above returned otherwise), so every configured
+        // seat is usable: an instance the roster already holds is a builder or refused by the
+        // unit's skills, and the remedy is a FRESH key. An unusable configured instance is named
+        // by the bench arm instead (codex round 5 on #618).
+        debug_assert!(benched.is_empty());
+        let blocked: Vec<&WorkUnit> = units
+            .iter()
+            .filter(|u| u.tool_cmd.is_none() && same_seat.contains(&u.ord))
+            .collect();
+        let ords: Vec<u32> = blocked.iter().map(|u| u.ord).collect();
+        let mut missing: Vec<String> = Vec::new();
+        for (u, d) in units.iter().zip(dists.iter()) {
+            if blocked.iter().any(|b| b.ord == u.ord) {
+                let key = next_instance_key(configured, model_of(&d.assigned_cli));
+                if !missing.contains(&key) {
+                    missing.push(key);
+                }
+            }
+        }
+        return Err(crate::NoEligibleSeat {
+            run_id: session_id.to_string(),
+            benched: format!(
+                "evaluator\u{2260}creator unsatisfiable for unit(s) {ords:?}: team run \u{2014} no \
+                 seat distinct from the creator and no usable second instance (add a signed-in \
+                 {} to the roster); a team run never grades on its creator seat",
+                missing.join(" or ")
             ),
             benched_seats: benched.clone(),
         }
@@ -433,6 +479,15 @@ pub(crate) fn distribute_units_against_benched(
         };
     }
     Ok(dists)
+}
+
+/// The first seat-instance key of `cli` (`<cli>#2`, `<cli>#3`, …) the roster does not already
+/// hold: the instance a refused team run names as its remedy (DES-TEAMING-002 §8.1).
+fn next_instance_key(configured: &[AgenticCli], cli: &str) -> String {
+    (2u32..)
+        .map(|n| format!("{cli}#{n}"))
+        .find(|k| !configured.iter().any(|c| &c.key == k))
+        .expect("an unbounded range always yields a free key")
 }
 
 /// The candidate seats of every unit (positionally aligned), narrowed by what its skills admit
@@ -550,13 +605,21 @@ fn enforce_evaluator_distinct(
     roster_keys: &[String],
     clis: &[AgenticCli],
     candidates: &[Candidates],
+    // (DES-TEAMING-002 §8.1) A team run takes a MODEL-distinct seat first and a second instance
+    // of a builder's cli only when no model-distinct seat admits the unit. `false` keeps today's
+    // roster-order pick.
+    prefer_model_distinct: bool,
 ) -> (Vec<u32>, Vec<u32>) {
     use crate::domain::StageKind;
     let mut same_seat: Vec<u32> = Vec::new();
     let builder_clis: std::collections::HashSet<String> = units
         .iter()
         .zip(dists.iter())
-        .filter(|(u, _)| matches!(u.stage, StageKind::Build | StageKind::Recon))
+        // A TOOL unit is no creator seat: its `assigned_cli` is its own program token
+        // (`tool_distribution`), which may spell a seat key (`claude --version`) — D1 review.
+        .filter(|(u, _)| {
+            u.tool_cmd.is_none() && matches!(u.stage, StageKind::Build | StageKind::Recon)
+        })
         .map(|(_, d)| d.assigned_cli.clone())
         .collect();
     // The MODELS behind those seats — `{claude}` for builders on `claude#1` and `claude#2` alike.
@@ -595,10 +658,16 @@ fn enforce_evaluator_distinct(
                 Some((eligible, _)) => eligible.iter().any(|c| &c.key == k),
                 None => true,
             };
-            match roster_keys
-                .iter()
-                .find(|k| !builder_clis.contains(*k) && admits(k))
-            {
+            let distinct = |k: &&String| !builder_clis.contains(*k) && admits(k);
+            let model_distinct = prefer_model_distinct
+                .then(|| {
+                    roster_keys
+                        .iter()
+                        .filter(distinct)
+                        .find(|k| !builder_models.contains(model_of(k)))
+                })
+                .flatten();
+            match model_distinct.or_else(|| roster_keys.iter().find(distinct)) {
                 Some(alt) => {
                     let was = std::mem::replace(&mut d.assigned_cli, alt.clone());
                     d.assigned_invocation = invocation_of(clis, alt);
@@ -1445,8 +1514,14 @@ mod tests {
         ];
         let clis = [seat("claude"), seat("claude#2")];
         let roster_keys = vec!["claude".to_string(), "claude#2".to_string()];
-        let (same, same_cli) =
-            enforce_evaluator_distinct(&units, &mut dists, &roster_keys, &clis, &[None, None]);
+        let (same, same_cli) = enforce_evaluator_distinct(
+            &units,
+            &mut dists,
+            &roster_keys,
+            &clis,
+            &[None, None],
+            false,
+        );
         assert_eq!(
             same,
             Vec::<u32>::new(),
@@ -1840,6 +1915,317 @@ mod tests {
             err.to_string()
                 .contains("evaluator\u{2260}creator unsatisfiable for unit(s) [2]"),
             "{err}"
+        );
+    }
+    // ── DES-TEAMING-002 D1: a team run never grades on its creator seat ─────────────────────
+
+    /// `build_and_review` as a TEAM RUN (units of the run's composed def, `team_run` stamped).
+    fn team_build_and_review() -> [WorkUnit; 2] {
+        let mut units = build_and_review();
+        for u in &mut units {
+            u.team_run = true;
+        }
+        units
+    }
+
+    fn unusable(mut c: AgenticCli) -> AgenticCli {
+        c.health = Some(wicked_council::types::SeatHealth::unusable(
+            "not signed in (launcher health probe)",
+        ));
+        c
+    }
+
+    /// D1 (a): roster `[claude]` plus a usable `claude#2` — the review lands on `claude#2`,
+    /// disclosed `same_cli_instance`.
+    #[test]
+    fn d1_a_team_review_moves_to_a_usable_second_instance() {
+        let dists = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude"), seat("claude#2")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("a usable second instance satisfies a team run");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert_eq!(dists[0].distinctness_fallback, None);
+        assert_eq!(dists[1].assigned_cli, "claude#2");
+        assert_eq!(
+            dists[1].routing,
+            RoutingInfo::EvaluatorDistinct {
+                winner: "claude#2".into(),
+                was: "claude".into()
+            }
+        );
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+
+    /// D1 (b): roster `[claude]`, bench-free — refused `NoEligibleSeat`, naming the unit and the
+    /// missing instance. Never `creator_seat`.
+    #[test]
+    fn d1_b_team_run_without_a_second_instance_is_refused_bench_free() {
+        let err = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("a team run never falls back to the creator seat");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(refusal.run_id, "r1");
+        assert!(refusal.benched_seats.is_empty(), "no bench caused it");
+        assert_eq!(
+            refusal.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: team run \u{2014} no seat \
+             distinct from the creator and no usable second instance (add a signed-in claude#2 \
+             to the roster); a team run never grades on its creator seat"
+        );
+    }
+
+    /// D1 (c): `claude#2` listed but not signed in (health not usable) — refused too. The bench
+    /// names it.
+    #[test]
+    fn d1_c_team_run_with_an_unusable_second_instance_is_refused() {
+        let err = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude"), unusable(seat("claude#2"))],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("an instance that is not signed in cannot grade");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(refusal.benched_seats.len(), 1);
+        assert_eq!(refusal.benched_seats[0].cli, "claude#2");
+        assert!(
+            refusal
+                .benched
+                .starts_with("evaluator\u{2260}creator unsatisfiable for unit(s) [2]"),
+            "{}",
+            refusal.benched
+        );
+    }
+
+    /// The all-builder shape: roster `[codex, claude(, claude#2)]`, a Claude-only build on claude,
+    /// an unconstrained build on codex (first seat), and an unconstrained review that routes to
+    /// codex — every roster seat but `claude#2` built.
+    fn all_builder_units(team: bool) -> Vec<WorkUnit> {
+        let mut b1 = skilled(1, "wicked-garden-repo-learn");
+        b1.stage = StageKind::Build;
+        let mut b2 = WorkUnit::pending("u2", "r1", 2, "Build the other thing");
+        b2.stage = StageKind::Build;
+        let mut review = WorkUnit::pending("u3", "r1", 3, "Review the things");
+        review.stage = StageKind::Review;
+        let mut units = vec![b1, b2, review];
+        for u in &mut units {
+            u.team_run = team;
+        }
+        units
+    }
+
+    /// D1 (d): an all-builder roster behaves like (a) with a second instance, like (b) without;
+    /// and (e) the NON-team run of the same shape keeps today's `creator_seat`.
+    #[test]
+    fn d1_d_an_all_builder_roster_behaves_like_a_or_b() {
+        let (_home, _env, _) = hermetic_home("d1-all-builder-home");
+        let snapshot = published("d1-all-builder");
+        let without = [seat_running("codex", "codex"), claude_seat("claude")];
+
+        // (e) twin: non-team, today's behaviour — the review stays on a builder seat, disclosed.
+        let dists =
+            distribute_units_against(&all_builder_units(false), &without, "r1", Some(&snapshot))
+                .expect("non-team routes");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert_eq!(dists[1].assigned_cli, "codex");
+        assert_eq!(dists[2].assigned_cli, "codex");
+        assert_eq!(
+            dists[2].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+
+        // (b) shape: team, no second instance ⇒ refused, naming the unit.
+        let err =
+            distribute_units_against(&all_builder_units(true), &without, "r1", Some(&snapshot))
+                .expect_err("team run on an all-builder roster is refused");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(
+            refusal.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [3]: team run \u{2014} no seat \
+             distinct from the creator and no usable second instance (add a signed-in codex#2 \
+             to the roster); a team run never grades on its creator seat"
+        );
+
+        // (a) shape: team, a usable claude#2 ⇒ the review moves there, `same_cli_instance`.
+        let with = [
+            seat_running("codex", "codex"),
+            claude_seat("claude"),
+            claude_seat("claude#2"),
+        ];
+        let dists =
+            distribute_units_against(&all_builder_units(true), &with, "r1", Some(&snapshot))
+                .expect("a usable instance satisfies it");
+        assert_eq!(dists[2].assigned_cli, "claude#2");
+        assert_eq!(
+            dists[2].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+
+    /// D1 (e): the NON-team launch of the (a)/(b) shape is byte-for-byte today's routing.
+    #[test]
+    fn d1_e_a_non_team_run_keeps_the_creator_seat_fallback() {
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("a non-team run is not refused");
+        assert_eq!(dists[1].assigned_cli, "claude");
+        assert_eq!(
+            dists[1].routing,
+            RoutingInfo::Teamed {
+                winner: "claude".into()
+            }
+        );
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+        // …and with a second instance, the non-team run takes it exactly as today.
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &[seat("claude"), seat("claude#2")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("routes");
+        assert_eq!(dists[1].assigned_cli, "claude#2");
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+
+    /// D1 (f): a bench-caused shortfall on a team run is refused exactly as today (the bench
+    /// message, the bench as data).
+    #[test]
+    fn d1_f_a_bench_caused_team_shortfall_is_refused_as_today() {
+        let roster = [seat("claude"), unusable(seat("codex"))];
+        let team =
+            distribute_units_against_benched(&team_build_and_review(), &roster, "r1", None, &[])
+                .expect_err("refused");
+        let legacy =
+            distribute_units_against_benched(&build_and_review(), &roster, "r1", None, &[])
+                .expect_err("refused");
+        let (t, l) = (
+            team.downcast_ref::<crate::NoEligibleSeat>().expect("typed"),
+            legacy
+                .downcast_ref::<crate::NoEligibleSeat>()
+                .expect("typed"),
+        );
+        assert_eq!(t.benched, l.benched);
+        assert_eq!(t.benched_seats, l.benched_seats);
+        assert_eq!(
+            t.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: distinct seat(s) benched; \
+             1 of 2 seats benched: codex (not signed in (launcher health probe) \u{2014} launcher)"
+        );
+    }
+
+    /// §8.1 order for a team run: a distinct CLI before a second instance of the creator's CLI.
+    /// A non-team run keeps today's roster-order pick (the instance, listed first).
+    #[test]
+    fn d1_a_team_run_prefers_a_distinct_cli_over_a_second_instance() {
+        let roster = [seat("claude"), seat("claude#2"), seat("codex")];
+        let team =
+            distribute_units_against_benched(&team_build_and_review(), &roster, "r1", None, &[])
+                .expect("routes");
+        assert_eq!(team[1].assigned_cli, "codex");
+        assert_eq!(team[1].distinctness_fallback, None);
+        let legacy =
+            distribute_units_against_benched(&build_and_review(), &roster, "r1", None, &[])
+                .expect("routes");
+        assert_eq!(legacy[1].assigned_cli, "claude#2");
+        assert_eq!(
+            legacy[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+    /// D1 (codex on #618): a TOOL build unit is no creator seat. Its `assigned_cli` is its own
+    /// program token (`tool_distribution`), which here equals the only seat key (`claude`); a
+    /// team run must not read that as "the review grades its creator" and refuse the plan.
+    #[test]
+    fn d1_a_tool_build_whose_program_is_a_seat_key_is_no_creator_seat() {
+        for team in [true, false] {
+            let mut build = WorkUnit::pending("u1", "r1", 1, "Build the thing");
+            build.stage = StageKind::Build;
+            build.tool_cmd = Some(vec!["claude".into(), "--version".into()]);
+            let mut review = WorkUnit::pending("u2", "r1", 2, "Review the thing");
+            review.stage = StageKind::Review;
+            let mut units = [build, review];
+            for u in &mut units {
+                u.team_run = team;
+            }
+            let dists =
+                distribute_units_against_benched(&units, &[seat("claude")], "r1", None, &[])
+                    .unwrap_or_else(|e| {
+                        panic!("team={team}: no seated creator, nothing to refuse: {e}")
+                    });
+            assert_eq!(dists[0].routing, RoutingInfo::Tool);
+            assert_eq!(dists[0].assigned_cli, "claude");
+            assert_eq!(dists[1].assigned_cli, "claude");
+            assert_eq!(
+                dists[1].routing,
+                RoutingInfo::Teamed {
+                    winner: "claude".into()
+                }
+            );
+            assert_eq!(dists[1].distinctness_fallback, None, "team={team}");
+        }
+    }
+    /// D1 (codex round 5 on #618): roster `[claude, claude#2]` with `claude#2` configured but NOT
+    /// usable. The remedy must name `claude#2` — signing it in satisfies the run — and never send
+    /// the operator to add a `claude#3`. An unusable seat is benched (`launcher_benched`), so this
+    /// refusal is the BENCH arm's: it names `claude#2` and its reason. The team arm (and its
+    /// `next_instance_key` remedy) is reached only on a bench-free roster, where every configured
+    /// instance is usable.
+    #[test]
+    fn d1_an_unusable_configured_instance_is_named_not_a_fresh_one() {
+        let err = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude"), unusable(seat("claude#2"))],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("refused");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(
+            refusal.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: distinct seat(s) benched; \
+             1 of 2 seats benched: claude#2 (not signed in (launcher health probe) \u{2014} launcher)"
+        );
+        assert!(!refusal.benched.contains("claude#3"), "{}", refusal.benched);
+        assert_eq!(
+            err.to_string(),
+            "no eligible seat for r1: evaluator\u{2260}creator unsatisfiable for unit(s) [2]: \
+             distinct seat(s) benched; 1 of 2 seats benched: claude#2 (not signed in (launcher \
+             health probe) \u{2014} launcher) \u{2014} sign a seat in, or add one, before launching"
         );
     }
 }

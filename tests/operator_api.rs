@@ -84,6 +84,7 @@ mod tests {
             executes_code: false,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            team_run: false,
             depends_on: Vec::new(),
             status: UnitStatus::Pending,
             pre_build_scope: false,

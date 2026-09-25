@@ -182,6 +182,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             unit.role = phase.role;
             // Carry the step OWNER (DES-TEAMING-002 §8.8) the same way: pure data from the def.
             unit.owner = phase.owner;
+            // A unit of the run's catalog-composed per-run def belongs to a TEAM RUN (seam D1):
+            // the def id is the marker, so no launch knob is needed.
+            unit.team_run = is_per_run_def_id(&def.id, session_id);
             // Carry the DECLARED dependency graph (FINDING-024). The def states which phases this one
             // consumes; the engine honored that for ordering and dropped it for context, so an
             // Evaluator phase declared `.after("build")` still ran blind to the build. Carrying it
@@ -341,6 +344,28 @@ pub fn unbound_repo_tokens(units: &[WorkUnit]) -> Vec<String> {
 /// The id [`compose`] gives the def it returns. The caller that registers a composed def renames
 /// it to `"<run>:plan-<rev>"` (§8.3); compose itself knows nothing of runs.
 pub const COMPOSED_DEF_ID: &str = "plan";
+
+/// THE per-run composed def shape (DES-TEAMING-002 §8.3, §11.3, seam D1):
+/// `"<run>:plan-<rev>"` — a non-empty `<run>` prefix, then `:plan-`, then `rev` a positive
+/// decimal with no leading zero. Returns the `<run>` prefix when `def_id` has the shape. The ONE
+/// predicate: the team-run detector ([`is_per_run_def_id`]) and the registry's reservation
+/// (`workflow::refuse_reserved_id`) both call it, so exactly the ids that could be read as a
+/// team run are the ids no user workflow may register.
+pub fn per_run_def_run_id(def_id: &str) -> Option<&str> {
+    let (run, rev) = def_id.rsplit_once(":plan-")?;
+    let positive_decimal =
+        !rev.is_empty() && !rev.starts_with('0') && rev.bytes().all(|b| b.is_ascii_digit());
+    (!run.is_empty() && positive_decimal).then_some(run)
+}
+
+/// Whether `def_id` is `session_id`'s per-run composed def id ([`per_run_def_run_id`] names
+/// `session_id`). A run planned from such a def is a TEAM RUN (seam D1): the composed def is the
+/// one marker, read at plan time. The shape is RESERVED — `WorkflowRegistry::register` and
+/// `def_from_file` refuse it — so only the engine's own `register_composed` can put such a def in
+/// front of the planner.
+pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
+    per_run_def_run_id(def_id) == Some(session_id)
+}
 
 /// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4). `deny_unknown_fields`
 /// so a misspelled key is refused at parse, never silently dropped.
@@ -812,6 +837,81 @@ mod tests {
 
     // ---- plan_from_def: the data-driven planner (Law 2) ----
     use crate::workflow::{bug_def, feature_def, migration_def};
+
+    /// DES-TEAMING-002 D1: the per-run composed def id `"<run>:plan-<rev>"` is the team-run
+    /// marker. Fixed ids, both directions: only THIS run's id with a positive decimal revision.
+    /// D1 (codex round 3): ONE predicate recognizes the per-run shape — the team-run detector
+    /// and the registry's reservation both call it. Fixed values, both directions.
+    #[test]
+    fn one_predicate_recognizes_the_per_run_def_shape() {
+        assert_eq!(per_run_def_run_id("r1:plan-1"), Some("r1"));
+        assert_eq!(per_run_def_run_id("abc:plan-12"), Some("abc"));
+        assert_eq!(per_run_def_run_id("a:b:plan-3"), Some("a:b"));
+        for id in [
+            "x:plan-a",
+            "team:plan-review",
+            "r1:plan-0",
+            "r1:plan-01",
+            ":plan-1",
+            "plan-1",
+            "r1:plan-",
+            "r1:plan-+1",
+        ] {
+            assert_eq!(per_run_def_run_id(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn the_per_run_def_id_is_the_team_run_marker() {
+        assert!(is_per_run_def_id("r1:plan-1", "r1"));
+        assert!(is_per_run_def_id("r1:plan-12", "r1"));
+        for (id, sid) in [
+            ("feature", "r1"),
+            ("plan", "r1"),
+            ("r1:plan-", "r1"),
+            ("r1:plan-0", "r1"),
+            ("r1:plan-01", "r1"),
+            ("r1:plan-1x", "r1"),
+            ("r1:plan--1", "r1"),
+            ("r1:plan-+1", "r1"),
+            ("r2:plan-1", "r1"),
+            ("xr1:plan-1", "r1"),
+            ("r1:plan-1", ""),
+        ] {
+            assert!(!is_per_run_def_id(id, sid), "{id:?} for {sid:?}");
+        }
+    }
+
+    /// D1: `plan_from_def` stamps `team_run` on every unit of the run's composed def, and on no
+    /// unit of a shared (legacy) def — the same phases, only the def id differs.
+    #[test]
+    fn plan_from_def_stamps_team_run_from_the_composed_def_id() {
+        let legacy = feature_def();
+        assert!(plan_from_def(&legacy, "x", "r1")
+            .iter()
+            .all(|u| !u.team_run));
+        let composed = WorkflowDef {
+            id: "r1:plan-1".to_string(),
+            ..feature_def()
+        };
+        let units = plan_from_def(&composed, "x", "r1");
+        assert_eq!(units.len(), legacy.phases.len());
+        assert!(units.iter().all(|u| u.team_run));
+        // Another run's composed def is not THIS run's team plan.
+        assert!(plan_from_def(&composed, "x", "r2")
+            .iter()
+            .all(|u| !u.team_run));
+        // The wire: skipped when false, so non-team units serialize as before.
+        let legacy_unit = &plan_from_def(&legacy, "x", "r1")[0];
+        assert!(serde_json::to_value(legacy_unit)
+            .unwrap()
+            .get("team_run")
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(&units[0]).unwrap()["team_run"],
+            serde_json::json!(true)
+        );
+    }
 
     #[test]
     fn plan_from_def_yields_one_unit_per_phase_in_order() {
