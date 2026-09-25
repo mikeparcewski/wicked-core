@@ -1124,6 +1124,14 @@ pub(crate) fn run(
     let mut last_wal_checkpoint = std::time::Instant::now();
 
     loop {
+        // (DES-TEAMING-002 P1, review of #623 round 4) A held `confirm_gate` reply never outlives
+        // its run. At the top of every iteration — so after EVERY command, whichever arm ran and
+        // however it left the match (`continue` included) — each held reply whose run ended (any
+        // terminal path) or whose answer no longer waits on the publisher is answered from the
+        // run's durable status. The one call site.
+        if !team_replies.is_empty() {
+            team_gate::settle_held_replies(&store, &mut team_replies);
+        }
         // Loop-mode selection: the knob decides ONCE, at actor start, whether this loop ever
         // wakes on its own. Disabled (`None`) means disabled — the plain blocking `recv()` of
         // the pre-checkpoint loop, zero periodic wakeups — not a 5s tick that skips the work.
@@ -3378,7 +3386,7 @@ pub(crate) fn run(
                     is_acp,
                 };
                 let res = team_gate::on_published(&mut cx, &token, event_id);
-                team_gate::settle_reply(&store, &mut team_replies, &token.run_id, res);
+                team_gate::fail_held_reply(&mut team_replies, &token.run_id, res);
             }
             Command::TeamTransportFailed { token, reason } => {
                 let mut cx = team_gate::Ctx {
@@ -3393,7 +3401,7 @@ pub(crate) fn run(
                     is_acp,
                 };
                 let res = team_gate::on_failed(&mut cx, &token, &reason);
-                team_gate::settle_reply(&store, &mut team_replies, &token.run_id, res);
+                team_gate::fail_held_reply(&mut team_replies, &token.run_id, res);
             }
             Command::TeamSuperseded { token } => {
                 let mut cx = team_gate::Ctx {
@@ -3408,7 +3416,7 @@ pub(crate) fn run(
                     is_acp,
                 };
                 let res = team_gate::on_superseded(&mut cx, &token);
-                team_gate::settle_reply(&store, &mut team_replies, &token.run_id, res);
+                team_gate::fail_held_reply(&mut team_replies, &token.run_id, res);
             }
             Command::RunTeam { run_id, reply } => {
                 let res = crate::domain::get_session(&store, &run_id).and_then(|s| {

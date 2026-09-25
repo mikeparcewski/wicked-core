@@ -968,30 +968,57 @@ pub(super) fn answer_in_flight(store: &dyn GraphStore, run_id: &str) -> bool {
         })
 }
 
-/// Answer a held `confirm_gate` reply once the run's step ran — unless the run is waiting on a
-/// further fact (the reply then keeps waiting for that one).
-pub(super) fn settle_reply(
-    store: &dyn GraphStore,
+/// An acknowledgement handler that FAILED answers its run's held reply with the error (the one
+/// outcome the durable status cannot carry). Every other outcome is settled by
+/// [`settle_held_replies`] from the run's status.
+pub(super) fn fail_held_reply(
     replies: &mut HashMap<String, Sender<anyhow::Result<SessionStatus>>>,
     run_id: &str,
     res: anyhow::Result<Option<SessionStatus>>,
 ) {
-    match res {
-        Ok(None) => {}
-        Ok(Some(status)) => {
-            if !answer_in_flight(store, run_id) {
-                if let Some(reply) = replies.remove(run_id) {
-                    let _ = reply.send(Ok(status));
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("wicked-core: team acknowledgement for {run_id} failed: {e:#}");
-            if let Some(reply) = replies.remove(run_id) {
-                let _ = reply.send(Err(e));
-            }
+    if let Err(e) = res {
+        eprintln!("wicked-core: team acknowledgement for {run_id} failed: {e:#}");
+        if let Some(reply) = replies.remove(run_id) {
+            let _ = reply.send(Err(e));
         }
     }
+}
+
+/// Settle every held `confirm_gate` reply from its run's DURABLE status (review of #623 round
+/// 4): a run that ended — cancelled, failed, completed, by whatever path — or whose answer is no
+/// longer waiting on the publisher is answered with its current status; an unknown run with an
+/// error. Called by the actor after every command, so no held sender outlives its run.
+pub(super) fn settle_held_replies(
+    store: &dyn GraphStore,
+    replies: &mut HashMap<String, Sender<anyhow::Result<SessionStatus>>>,
+) {
+    replies.retain(|run_id, reply| {
+        let session = match crate::domain::get_session(store, run_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                let _ = reply.send(Err(anyhow::anyhow!("run not found: {run_id}")));
+                return false;
+            }
+            // A store read fault: keep waiting; the next command retries.
+            Err(_) => return true,
+        };
+        let waiting = path_status(session.status).is_none()
+            && session
+                .team
+                .as_ref()
+                .and_then(|t| t.pending.as_ref())
+                .is_some_and(|p| {
+                    matches!(
+                        p.stage,
+                        PendingStage::Publishing | PendingStage::Superseding
+                    )
+                });
+        if waiting {
+            return true;
+        }
+        let _ = reply.send(Ok(session.status));
+        false
+    });
 }
 
 #[cfg(test)]
