@@ -352,6 +352,11 @@ pub enum HumanDecision {
     RequestChanges { note: Option<String> },
     /// Stop the run here (treated as a cancellation). Unchanged (D-2).
     Reject,
+    /// (DES-TEAMING-002 §8.6, T3) Approve a `plan_approval` gate WITH AN EDIT: the edited plan is
+    /// proposed (`plan.proposed{by:"human", kind:"edit"}`), floor-filled and composed, and
+    /// accepted directly as the next rev — the human who edited it approved it. A refused edit
+    /// re-opens the gate with a new `gate_id`. Refused at any other gate.
+    EditPlan { plan: crate::plan::PlanSteps },
 }
 
 /// Produces a unit's work output **off the actor thread**. The stub returns deterministic text;

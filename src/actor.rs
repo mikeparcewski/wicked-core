@@ -1202,17 +1202,31 @@ pub(crate) fn run(
                     // Legacy path has no repo and therefore no project graph to bind; it also
                     // never reaches the governed dispatch that would read one.
                     project_graph: _,
+                    plan,
                 } = spec;
+                // (DES-TEAMING-002 T3) A user-composed plan must reach its approval gate; this
+                // straight-through path honours no gate, so it refuses a plan outright rather
+                // than running one unapproved. `launch_run` is the path that carries a plan.
+                let res = if plan.is_some() {
+                    Err(anyhow::anyhow!(
+                        "a launch that carries a plan must use launch_run (its plan_approval \
+                         gate cannot be honoured on the straight-through path)"
+                    ))
+                } else {
+                    Ok(())
+                };
                 // Legacy straight-through path: runs to completion on this thread (stub = fast).
-                let res = pipeline::run_session(
-                    &mut store,
-                    clis,
-                    &problem,
-                    entity_mode,
-                    &session_id,
-                    workflow.as_deref(),
-                    &mut |ev| emit(&mut subscribers, ev),
-                );
+                let res = res.and_then(|()| {
+                    pipeline::run_session(
+                        &mut store,
+                        clis,
+                        &problem,
+                        entity_mode,
+                        &session_id,
+                        workflow.as_deref(),
+                        &mut |ev| emit(&mut subscribers, ev),
+                    )
+                });
                 if let Err(e) = res {
                     emit(
                         &mut subscribers,
@@ -1418,6 +1432,7 @@ pub(crate) fn run(
                         finished_at: None,
                         benched_seats: Vec::new(),
                         team: None,
+                        team_plan: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -8045,6 +8060,10 @@ pub(crate) fn confirm_gate(
                 serde_json::json!({ "approve": false, "action": "reject", "amend": null })
                     .to_string()
             }
+            crate::workflow::HumanDecision::EditPlan { plan } => serde_json::json!({
+                "approve": true, "action": "edit_plan", "amend": null, "plan": plan,
+            })
+            .to_string(),
         };
         crate::interaction::resolve_open_for_session(
             store,
@@ -8090,6 +8109,9 @@ pub(crate) fn confirm_gate(
         }
         crate::workflow::HumanDecision::RequestChanges { note } => {
             (None, crate::workflow::AmendScope::Cursor, Some(note))
+        }
+        crate::workflow::HumanDecision::EditPlan { .. } => {
+            anyhow::bail!("run {run_id} has no plan_approval gate open")
         }
     };
     {
@@ -9012,6 +9034,7 @@ mod gate_pause_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -9263,6 +9286,7 @@ mod terminal_gate_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -9408,6 +9432,7 @@ retry the deliver phase";
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -9733,6 +9758,7 @@ mod substance_gate_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -10626,6 +10652,7 @@ mod request_changes_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -10700,6 +10727,7 @@ mod request_changes_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -11291,6 +11319,7 @@ mod code_evidence_floor_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -11659,6 +11688,7 @@ mod deliverable_floor_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -12070,6 +12100,7 @@ mod seat_failover_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -12713,6 +12744,7 @@ mod def_gate_disclosure_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -12819,6 +12851,7 @@ mod def_gate_disclosure_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -12914,6 +12947,7 @@ mod def_gate_disclosure_tests {
             finished_at: None,
             benched_seats: bench,
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -13232,6 +13266,7 @@ mod terminal_worktree_reap_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -13705,6 +13740,7 @@ mod terminal_worktree_reap_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -13876,6 +13912,7 @@ mod worker_code_graph_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         }
     }
 
@@ -14199,6 +14236,7 @@ mod project_graph_binding_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         }
     }
 
@@ -14946,6 +14984,7 @@ mod phase_boundary_governance_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -15403,6 +15442,7 @@ mod turn_timeout_vs_cancel_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -15598,6 +15638,7 @@ mod turn_timeout_vs_cancel_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -15657,6 +15698,7 @@ mod turn_timeout_vs_cancel_tests {
             finished_at: Some(now - 60_000),
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -15734,6 +15776,7 @@ mod turn_timeout_vs_cancel_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -16282,6 +16325,7 @@ mod dead_seat_park_tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -16323,5 +16367,217 @@ mod dead_seat_park_tests {
         let units = crate::domain::session_units(&store, &run_id).unwrap();
         assert_eq!(units[0].status, UnitStatus::Pending);
         assert!(units[0].denial.is_none() && units[0].assigned_cli.is_none());
+    }
+}
+
+/// Seam T3 (DES-TEAMING-002 §8.6) — the `plan_approval` arm of `confirm_gate` on a MID-RUN
+/// fixture: the gate reviews unit 1's output (a PA plan's shape: `understand` is `Done`) and the
+/// cursor is unit 2, `Pending`. Approve dispatches exactly that unit once and never bumps the
+/// attempt; a cursor that already ran is refused with the gate left open.
+#[cfg(test)]
+mod plan_gate_confirm_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::plan_gate::{PendingPlan, TeamPlanState};
+    use crate::scope::EntityMode;
+    use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    fn pending() -> PendingPlan {
+        PendingPlan {
+            rev: 1,
+            proposal_id: "p-fixture".into(),
+            reviewing_ord: Some(1),
+            steps: serde_json::from_value(serde_json::json!({"steps": [
+                {"catalog": "understand", "id": "understand", "added_by": "plan"},
+                {"catalog": "build", "id": "build", "added_by": "plan"}
+            ]}))
+            .unwrap(),
+            band: "70-100".into(),
+            high_risk: true,
+            floor_override: None,
+            reason: "high_risk".into(),
+            floor_added: Vec::new(),
+            gate_id: Some("g-r-1".into()),
+            refusal: None,
+        }
+    }
+
+    /// `r` paused at `plan_approval` before unit 2, unit 1 `Done`; `cursor_status` is unit 2's.
+    fn fixture(store: &mut dyn GraphStore, cursor_status: UnitStatus) {
+        let session = AgentSession {
+            id: "r".into(),
+            workflow_id: "wf-r".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 1,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            gate_seq: 1,
+            team_plan: Some(TeamPlanState {
+                rev: 1,
+                max_score: 100,
+                pending: Some(pending()),
+                ..TeamPlanState::default()
+            }),
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u1 = WorkUnit::pending("r:understand", "r", 1, "understand the problem");
+        u1.status = UnitStatus::Done;
+        u1.assigned_cli = Some("claude".into());
+        put_node(store, u1.to_node()).unwrap();
+        let mut u2 = WorkUnit::pending("r:build", "r", 2, "build it");
+        u2.status = cursor_status;
+        u2.assigned_cli = Some("claude".into());
+        put_node(store, u2.to_node()).unwrap();
+        let gate =
+            crate::interaction::open_gate("r", 2, Some(1), "approve the plan", "plan_approval", 1);
+        put_node(store, gate.to_node()).unwrap();
+    }
+
+    fn approve() -> crate::workflow::HumanDecision {
+        crate::workflow::HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        }
+    }
+
+    #[test]
+    fn plan_gate_approve_dispatches_the_pending_cursor_once_after_a_done_predecessor() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        fixture(&mut store, UnitStatus::Distributed);
+        let mut subs = crate::event_log::EventSink::default();
+        let (etx, erx) = channel::<CoreEvent>();
+        subs.push(etx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let status = confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r",
+            approve(),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+        let seen: Vec<CoreEvent> = erx.try_iter().collect();
+        let dispatched: Vec<(u32, u32)> = seen
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::UnitDispatched { ord, attempt, .. } => Some((*ord, *attempt)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dispatched,
+            [(2, 0)],
+            "exactly the cursor unit, once, at attempt 0"
+        );
+        let facts: Vec<(String, serde_json::Value)> = seen
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::TeamFact {
+                    event_type,
+                    payload,
+                    ..
+                } => Some((event_type.clone(), payload.clone())),
+                _ => None,
+            })
+            .collect();
+        let types: Vec<&str> = facts.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            types,
+            ["wicked.team.gate.decided", "wicked.team.plan.accepted"]
+        );
+        assert_eq!(facts[0].1["gate_id"], "g-r-1");
+        assert_eq!(facts[0].1["decision"], "human_approved");
+        assert_eq!(facts[1].1["by"], "human");
+        assert_eq!(facts[1].1["plan_rev"], 1);
+        let s = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(
+            (s.attempt, s.unit_ix),
+            (0, 1),
+            "attempt unchanged, cursor unchanged"
+        );
+        let t = s.team_plan.unwrap();
+        assert_eq!((t.accepted_rev, t.pending.is_none()), (1, true));
+    }
+
+    #[test]
+    fn plan_gate_refuses_a_cursor_that_already_ran_and_keeps_the_gate_open() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        fixture(&mut store, UnitStatus::Done);
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let err = confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r",
+            approve(),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .expect_err("a finished cursor unit is never re-dispatched");
+        assert!(err.to_string().contains("not pending"), "{err}");
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some("r"),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1, "the gate stays open");
+        let s = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::AwaitingHuman);
     }
 }

@@ -530,6 +530,7 @@ fn main() {
                 extra_read_roots: Vec::new(),
                 // Stub self-test path — no worker, so nothing would read a graph anyway.
                 project_graph: None,
+                plan: None,
             });
             println!(
                 "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
@@ -845,6 +846,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         // engine does not own. A run launched here gets its own repo's graph; launch through
         // crew's API to get the project's.
         project_graph: None,
+        plan: None,
     }) {
         Ok(id) => id,
         Err(e) => {

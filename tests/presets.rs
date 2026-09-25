@@ -134,6 +134,7 @@ fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
     }
 }
 

@@ -85,6 +85,7 @@ impl RunSpec {
             // Unfiled (above) ⇒ no project graph. A campaign node's workers see their own repo,
             // which is what a campaign fans out over anyway.
             project_graph: None,
+            plan: None,
         }
     }
 }
@@ -382,7 +383,9 @@ impl Campaign {
             .map(|(k, d)| {
                 let amend = match d {
                     HumanDecision::Approve { amend, .. } => amend.clone(),
-                    HumanDecision::RequestChanges { .. } | HumanDecision::Reject => None,
+                    HumanDecision::RequestChanges { .. }
+                    | HumanDecision::Reject
+                    | HumanDecision::EditPlan { .. } => None,
                 };
                 (k.clone(), amend)
             })
@@ -2294,6 +2297,7 @@ mod tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         put_node(
@@ -2457,6 +2461,7 @@ mod tests {
                 finished_at: None,
                 benched_seats: Vec::new(),
                 team: None,
+                team_plan: None,
             };
             put_node(&mut store, session.to_node()).unwrap();
             put_node(

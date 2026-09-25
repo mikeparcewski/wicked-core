@@ -49,6 +49,7 @@ mod outstanding_work;
 pub mod path_policy;
 mod pipeline;
 mod plan;
+mod plan_gate;
 mod preset;
 mod project;
 mod remote_write_fence;
@@ -163,6 +164,7 @@ pub use plan::{
     compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
+pub use plan_gate::{PendingPlan, TeamPlanState};
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
@@ -268,6 +270,13 @@ pub struct LaunchSpec {
     /// hostile value degrades the run's tools instead of widening its blast radius. `None` ⇒ the
     /// per-repo graph, unchanged.
     pub project_graph: Option<crate::project::ProjectGraphBinding>,
+    /// A USER-COMPOSED plan (DES-TEAMING-002 §8.4, seam T3): the launch's `steps[]` with its
+    /// optional `touch` and `override`. The engine publishes `plan.proposed{by:"human",
+    /// kind:"initial"}`, scores it from `touch`, floor-fills and composes it into the per-run def
+    /// `<run>:plan-1` (a TEAM run), and holds it at a `plan_approval` gate when the approval
+    /// matrix (§8.6) says so. Mutually exclusive with [`Self::workflow`] (a plan or a preset,
+    /// never both). `None` ⇒ planned from `workflow` as before.
+    pub plan: Option<crate::plan::PlanSteps>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's

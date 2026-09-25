@@ -203,6 +203,13 @@ pub struct AgentSession {
     /// and non-team sessions serialize byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<RunTeamState>,
+    /// (DES-TEAMING-002 §8.4-§8.6, T3) The run's plan state when it was launched from a plan or
+    /// a preset: the accepted rev, the plan awaiting approval, and the ratcheted score. `None`
+    /// for a run planned any other way (a registered def, the prose planner). Durable, so a
+    /// restart keeps a `plan_approval` gate open and answerable. The gate counter is
+    /// [`RunTeamState::gate_seq`] (one counter for every team gate). `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_plan: Option<crate::plan_gate::TeamPlanState>,
 }
 
 /// A team run's durable team state ([`AgentSession::team`], DES-TEAMING-002 §4.7). Written by the
@@ -1235,6 +1242,7 @@ mod tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         }
     }
 

@@ -11028,6 +11028,7 @@ mod project_graph_end_to_end_tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: pg,
+            plan: None,
         };
 
         // 1. BOUND.

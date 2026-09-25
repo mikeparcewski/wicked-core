@@ -179,6 +179,7 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
     })
     .expect("launch");
 
