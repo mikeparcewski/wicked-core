@@ -892,3 +892,57 @@ fn boot_publishes_one_path_ended_for_a_completed_teamed_run() {
 fn boot_publishes_one_path_ended_for_a_failed_teamed_run() {
     boot_ends_a_teamed_terminal_run("bootfail", SessionStatus::Failed, "failed");
 }
+
+// ── A held confirm_gate reply never outlives its run (#623 review round 4) ───────────────────────
+
+/// Answer approve on `run`'s `team_transport` pause from another thread while the test holds
+/// the publisher off the outbox (its lock): the reply is HELD waiting on the ack.
+fn hold_reply(e: &Engine, run: &str) -> std::sync::mpsc::Receiver<anyhow::Result<SessionStatus>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let core = e.core.clone();
+    let run = run.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(core.confirm_gate(&run, approve(None)));
+    });
+    wait_for("the reply to be held", || e.core.held_team_replies() == 1);
+    rx
+}
+
+/// Cancelled while a team_transport approve waits on the publisher: the held reply is settled
+/// from the run's durable status at once (Ok(Cancelled)), never left to hang, and the actor holds
+/// no reply afterwards.
+#[test]
+fn a_held_reply_is_settled_when_the_run_is_cancelled_before_the_ack() {
+    let (rig, e) = paused_on_plan("held-c");
+    let m = crate::team::publish::outbox_mutex(&rig.outbox);
+    let lock = m.lock().unwrap();
+    let rx = hold_reply(&e, "held-c");
+    assert_eq!(
+        e.core.cancel_run("held-c").unwrap(),
+        SessionStatus::Cancelled
+    );
+    let got = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the held reply is answered promptly");
+    assert_eq!(got.unwrap(), SessionStatus::Cancelled);
+    assert_eq!(e.core.held_team_replies(), 0);
+    drop(lock);
+}
+
+/// The same when the run reaches Failed by any other path: the durable status settles the reply
+/// on the actor's next command.
+#[test]
+fn a_held_reply_is_settled_when_the_run_fails_before_the_ack() {
+    let (rig, e) = paused_on_plan("held-f");
+    let m = crate::team::publish::outbox_mutex(&rig.outbox);
+    let lock = m.lock().unwrap();
+    let rx = hold_reply(&e, "held-f");
+    set_status(&e.db, "held-f", SessionStatus::Failed);
+    e.core.ping();
+    let got = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the held reply is answered promptly");
+    assert_eq!(got.unwrap(), SessionStatus::Failed);
+    assert_eq!(e.core.held_team_replies(), 0);
+    drop(lock);
+}

@@ -471,6 +471,9 @@ pub(crate) enum Command {
     LiveTeamRuns {
         reply: Sender<anyhow::Result<Vec<crate::LiveTeamRun>>>,
     },
+    /// TEST-ONLY: how many `confirm_gate` replies the actor holds for the team publisher.
+    #[cfg(test)]
+    HeldTeamReplies { reply: Sender<usize> },
     /// Register the engine's own composed per-run def (`"<run>:plan-<rev>"`).
     RegisterComposed {
         def: Box<crate::workflow::WorkflowDef>,

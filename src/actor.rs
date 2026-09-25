@@ -3439,6 +3439,10 @@ pub(crate) fn run(
                 });
                 let _ = reply.send(res);
             }
+            #[cfg(test)]
+            Command::HeldTeamReplies { reply } => {
+                let _ = reply.send(team_replies.len());
+            }
             Command::RegisterComposed { def, reply } => {
                 let _ = reply.send(
                     registry

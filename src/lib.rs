@@ -1379,6 +1379,14 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// TEST-ONLY: how many `confirm_gate` replies the actor holds for the team publisher.
+    #[cfg(test)]
+    pub(crate) fn held_team_replies(&self) -> usize {
+        let (reply, rx) = channel();
+        let _ = self.tx.send(Command::HeldTeamReplies { reply });
+        rx.recv().unwrap_or(usize::MAX)
+    }
+
     /// Register the engine's own composed per-run def (`"<run>:plan-<rev>"`); a run launched on it
     /// is a team run. Crate-internal: only the engine composes per-run defs.
     #[allow(dead_code)]

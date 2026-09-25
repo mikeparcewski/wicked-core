@@ -378,7 +378,7 @@ fn guard(m: &Mutex<()>) -> MutexGuard<'_, ()> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn outbox_mutex(path: &Path) -> Arc<Mutex<()>> {
+pub(crate) fn outbox_mutex(path: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     let mut map = LOCKS
         .get_or_init(Default::default)
