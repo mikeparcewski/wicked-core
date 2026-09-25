@@ -2535,7 +2535,8 @@ mod workflow_def_tests {
     #[test]
     fn a_user_workflow_cannot_claim_the_per_run_plan_namespace() {
         let mut reg = WorkflowRegistry::default();
-        for id in ["r1:plan-1", "x:plan-a", ":plan-"] {
+        // Exactly the ids the team-run detector could match (`plan::per_run_def_run_id`).
+        for id in ["r1:plan-1", "abc:plan-12"] {
             assert_eq!(
                 reg.register(def_with_id(id)),
                 Err(WorkflowDefError::ReservedId { id: id.to_string() }),
@@ -2548,11 +2549,23 @@ mod workflow_def_tests {
                 id: "r1:plan-1".into()
             }
             .to_string(),
-            "reserved workflow id: r1:plan-1 \u{2014} ids containing \":plan-\" name an \
-             engine-composed per-run plan (\"<run>:plan-<rev>\") and cannot be supplied by a user \
-             workflow; rename it"
+            "reserved workflow id: r1:plan-1 \u{2014} the shape \"<run>:plan-<rev>\" names an \
+             engine-composed per-run plan and cannot be supplied by a user workflow; rename it"
         );
-        for id in ["plan-1", "plan", "r1-plan-1", "r1:planx-1"] {
+        // Everything the detector can never match registers — including `:plan-1`, whose empty
+        // run prefix the predicate rejects.
+        assert_eq!(crate::plan::per_run_def_run_id(":plan-1"), None);
+        for id in [
+            "x:plan-a",
+            "team:plan-review",
+            "r1:plan-0",
+            "r1:plan-01",
+            ":plan-1",
+            "plan-1",
+            "plan",
+            "r1-plan-1",
+            "r1:planx-1",
+        ] {
             reg.register(def_with_id(id))
                 .unwrap_or_else(|e| panic!("{id} is no reserved id: {e}"));
         }

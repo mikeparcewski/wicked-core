@@ -351,6 +351,11 @@ pub const COMPOSED_DEF_ID: &str = "plan";
 /// RESERVED: `WorkflowRegistry::register` and `def_from_file` refuse any user id containing
 /// `":plan-"` ([`crate::workflow::RESERVED_PLAN_ID_MARKER`]), so only the engine's own
 /// `register_composed` can put such a def in front of the planner.
+pub fn per_run_def_run_id(def_id: &str) -> Option<&str> {
+    let _ = def_id;
+    None // D1 red: stub
+}
+
 pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
     if session_id.is_empty() {
         return false;
@@ -836,6 +841,27 @@ mod tests {
 
     /// DES-TEAMING-002 D1: the per-run composed def id `"<run>:plan-<rev>"` is the team-run
     /// marker. Fixed ids, both directions: only THIS run's id with a positive decimal revision.
+    /// D1 (codex round 3): ONE predicate recognizes the per-run shape — the team-run detector
+    /// and the registry's reservation both call it. Fixed values, both directions.
+    #[test]
+    fn one_predicate_recognizes_the_per_run_def_shape() {
+        assert_eq!(per_run_def_run_id("r1:plan-1"), Some("r1"));
+        assert_eq!(per_run_def_run_id("abc:plan-12"), Some("abc"));
+        assert_eq!(per_run_def_run_id("a:b:plan-3"), Some("a:b"));
+        for id in [
+            "x:plan-a",
+            "team:plan-review",
+            "r1:plan-0",
+            "r1:plan-01",
+            ":plan-1",
+            "plan-1",
+            "r1:plan-",
+            "r1:plan-+1",
+        ] {
+            assert_eq!(per_run_def_run_id(id), None, "{id:?}");
+        }
+    }
+
     #[test]
     fn the_per_run_def_id_is_the_team_run_marker() {
         assert!(is_per_run_def_id("r1:plan-1", "r1"));
