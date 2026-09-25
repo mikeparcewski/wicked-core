@@ -359,6 +359,27 @@ export declare class Core {
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
   /**
+   * Save a preset: a named phase selection over the catalog. `stepsJson` is a JSON array of
+   * plan steps (`{catalog, id, …step fields}`); `projectId` null ⇒ global, else that project's
+   * scope; `createdBy` defaults to `api`. Resolves to the stored `Preset` JSON object
+   * (`{ name, scope, steps, created_by, updated_at }`). Rejects with a message led by the
+   * reason token: `preset_invalid_name`, `preset_builtin_readonly`, `preset_reserved_created_by`,
+   * `preset_unknown_project`, `preset_invalid_steps` (then the catalog's step refusal).
+   */
+  putPreset(name: string, stepsJson: string, projectId?: string | undefined | null, createdBy?: string | undefined | null): Promise<string>
+  /**
+   * Delete a preset in its scope (`projectId` null ⇒ global). Resolves to the JSON literal
+   * `true`, or `false` when no such live preset exists there. Rejects `preset_builtin_readonly`
+   * for a built-in.
+   */
+  deletePreset(name: string, projectId?: string | undefined | null): Promise<string>
+  /**
+   * The presets a launch in `projectId` sees (null ⇒ the global set), sorted by name, as a JSON
+   * array of `Preset` objects: every global preset (built-ins included, `created_by: "builtin"`),
+   * with a project row replacing the global row of the same name.
+   */
+  listPresets(projectId?: string | undefined | null): Promise<string>
+  /**
    * Create a project. Resolves to the persisted `Project` as a JSON object
    * (`{ id, name, description, status, scope, created_at, updated_at }`). Rejects on an
    * empty/overlong name or a name already used by an ACTIVE project (the API's 409).

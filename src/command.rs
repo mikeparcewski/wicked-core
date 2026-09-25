@@ -127,6 +127,22 @@ pub(crate) enum Command {
         member_id: String,
         reply: Sender<anyhow::Result<bool>>,
     },
+    /// Save a preset (DES-TEAMING-002 §8.4, seam C2). Refused for a built-in's global name.
+    PutPreset {
+        spec: crate::preset::PresetSpec,
+        reply: Sender<anyhow::Result<crate::preset::Preset>>,
+    },
+    /// Delete a preset in its scope. `false` = no such live preset. Refused for a built-in.
+    DeletePreset {
+        name: String,
+        project_id: Option<String>,
+        reply: Sender<anyhow::Result<bool>>,
+    },
+    /// The presets a launch in `project_id` sees (project rows shadow global ones by name).
+    ListPresets {
+        project_id: Option<String>,
+        reply: Sender<anyhow::Result<Vec<crate::preset::Preset>>>,
+    },
     /// Register a deny policy (real governance) on the shared store — single-writer, through the
     /// actor (not a shelled binary). Blocks any tool-call in `phase` whose context contains `trigger`.
     RegisterDenyPolicy {

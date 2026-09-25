@@ -49,6 +49,7 @@ mod outstanding_work;
 pub mod path_policy;
 mod pipeline;
 mod plan;
+mod preset;
 mod project;
 mod remote_write_fence;
 mod repo;
@@ -142,7 +143,7 @@ pub use wicked_governance::{
     EvalReport, EvalSample, ImportReceipt,
 };
 
-pub use catalog::{catalog, catalog_entry, CATALOG_IDS, SECURITY_REVIEW_SKILL};
+pub use catalog::{builtin_presets, catalog, catalog_entry, CATALOG_IDS, SECURITY_REVIEW_SKILL};
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,
@@ -158,6 +159,7 @@ pub use plan::{
     compose, plan_from_def, FieldRule, PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID,
     STEP_FIELD_RULES,
 };
+pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
@@ -951,6 +953,49 @@ impl Core {
             .send(Command::ProjectMemberDetach {
                 project_id: project_id.to_string(),
                 member_id: member_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    // ── Presets (DES-TEAMING-002 §8.4, seam C2) ─────────────────────────────────
+    // Commands through the actor (the single writer), like every other store write (§4.0).
+
+    /// Save a preset: a named phase selection, global (`project_id: None`) or project-scoped.
+    /// Refused (a [`PresetError`] reason leads the message) for an invalid name, steps that do
+    /// not compose over the catalog, an unknown project, or a global write to a built-in's name.
+    pub fn put_preset(&self, spec: PresetSpec) -> anyhow::Result<Preset> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::PutPreset { spec, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Delete a preset in its scope. `Ok(false)` = no such live preset. A built-in is refused.
+    pub fn delete_preset(&self, name: &str, project_id: Option<&str>) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::DeletePreset {
+                name: name.to_string(),
+                project_id: project_id.map(str::to_string),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// The presets a launch in `project_id` sees, sorted by name: every global preset (built-ins
+    /// included), with a project row replacing the global row of the same name.
+    pub fn list_presets(&self, project_id: Option<&str>) -> anyhow::Result<Vec<Preset>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ListPresets {
+                project_id: project_id.map(str::to_string),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
