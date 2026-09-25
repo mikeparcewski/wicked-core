@@ -116,6 +116,10 @@ fn engine_on(db: &str, cfg: TeamConfig) -> Engine {
 
 /// Launch a two-unit TEAM run: its def is the engine's composed per-run def (D1's marker).
 fn launch_team(e: &Engine, run: &str) {
+    launch_team_with(e, run, HumanConfirm::None);
+}
+
+fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
     let def: crate::workflow::WorkflowDef = serde_json::from_value(serde_json::json!({
         "id": format!("{run}:plan-1"),
         "phases": [
@@ -135,7 +139,7 @@ fn launch_team(e: &Engine, run: &str) {
             clis: vec![cli("a"), cli("b")],
             entity_mode: crate::EntityMode::Shared,
             session_id: run.into(),
-            human_confirm: HumanConfirm::None,
+            human_confirm,
             auto_deliver: false,
             repo_ref: None,
             workflow: Some(format!("{run}:plan-1")),
@@ -1087,4 +1091,88 @@ fn the_boot_drain_skips_lines_of_runs_it_did_not_reconcile() {
     // The operator's explicit replay still publishes it.
     e.core.replay_team_outbox().unwrap();
     assert_eq!(rig.types("ghost-run"), vec![tev::PATH_STARTED]);
+}
+
+// ── Bus present at launch, absent now (#623 review round 6) ──────────────────────────────────────
+
+/// A TEAMED run left live with no pending fact: path.started and plan.accepted acknowledged,
+/// then paused at an ordinary run-level gate before unit 0. Returns the rig and its db.
+fn live_teamed(name: &str) -> (Rig, String) {
+    let rig = rig(name);
+    let e = engine(&rig, fast(&rig));
+    launch_team_with(&e, name, HumanConfirm::All);
+    wait_status(&e, name, SessionStatus::AwaitingHuman);
+    let view = e.core.run_team(name).unwrap().unwrap();
+    assert_eq!(view.transport, "bus");
+    assert_eq!(view.pending, None);
+    assert_eq!(e.core.live_team_runs().unwrap().len(), 1);
+    assert_eq!(rig.types(name), vec![tev::PATH_STARTED, tev::PLAN_ACCEPTED]);
+    let db = e.db.clone();
+    drop(e);
+    (rig, db)
+}
+
+/// Restart with NO bus while a teamed run is live: this process cannot publish its required
+/// facts, so boot pauses it `team_transport` (the team handler's gate) — never left listed as
+/// live-teamed; continue-without-team then writes the tombstone before `transport: none`, and
+/// the bus's return publishes nothing more for the run.
+#[test]
+fn nobus_restart_pauses_a_live_teamed_run_and_continue_unteams_it() {
+    let (rig, db) = live_teamed("lt-c");
+    let e = engine_on(&db, no_bus(&rig));
+    assert_eq!(status(&e, "lt-c"), Some(SessionStatus::AwaitingHuman));
+    assert!(
+        e.core.live_team_runs().unwrap().is_empty(),
+        "never armed without a publisher"
+    );
+    let view = e.core.run_team("lt-c").unwrap().unwrap();
+    assert_ne!(view.transport, "bus", "not reported live-teamed: {view:?}");
+    assert!(view.pending.is_some(), "{view:?}");
+    assert!(
+        e.core
+            .confirm_gate("lt-c", HumanDecision::RequestChanges { note: None })
+            .is_err(),
+        "the team handler owns the pause"
+    );
+    e.core
+        .confirm_gate("lt-c", approve(Some(CONTINUE_WITHOUT_TEAM)))
+        .unwrap();
+    assert!(outbox_has_run_tombstone(&rig, "lt-c"));
+    assert_eq!(e.core.run_team("lt-c").unwrap().unwrap().transport, "none");
+    rig.team_bus().drain_all();
+    assert_eq!(
+        rig.types("lt-c"),
+        vec![tev::PATH_STARTED, tev::PLAN_ACCEPTED]
+    );
+}
+
+/// The same pause answered reject: cancelled, and only `path.ended` joins once the bus returns.
+#[test]
+fn nobus_restart_pauses_a_live_teamed_run_and_reject_cancels_it() {
+    let (rig, db) = live_teamed("lt-r");
+    let e = engine_on(&db, no_bus(&rig));
+    assert_eq!(status(&e, "lt-r"), Some(SessionStatus::AwaitingHuman));
+    assert_eq!(
+        e.core.confirm_gate("lt-r", HumanDecision::Reject).unwrap(),
+        SessionStatus::Cancelled
+    );
+    assert!(outbox_has_run_tombstone(&rig, "lt-r"));
+    rig.team_bus().drain_all();
+    assert_eq!(
+        rig.types("lt-r"),
+        vec![tev::PATH_STARTED, tev::PLAN_ACCEPTED, tev::PATH_ENDED]
+    );
+}
+
+/// No regression: restart WITH a bus leaves the teamed run live, listed and at its own gate.
+#[test]
+fn bus_restart_leaves_a_live_teamed_run_live() {
+    let (rig, db) = live_teamed("lt-b");
+    let e = engine_on(&db, fast(&rig));
+    assert_eq!(status(&e, "lt-b"), Some(SessionStatus::AwaitingHuman));
+    let view = e.core.run_team("lt-b").unwrap().unwrap();
+    assert_eq!(view.transport, "bus");
+    assert_eq!(view.pending, None);
+    assert_eq!(e.core.live_team_runs().unwrap().len(), 1);
+    assert!(!outbox_has_run_tombstone(&rig, "lt-b"));
 }
