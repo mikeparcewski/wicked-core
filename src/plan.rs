@@ -347,7 +347,10 @@ pub const COMPOSED_DEF_ID: &str = "plan";
 
 /// Whether `def_id` is `session_id`'s per-run composed def id, `"<run>:plan-<rev>"` with `rev`
 /// a positive decimal revision (DES-TEAMING-002 §8.3, §11.3). A run planned from such a def is a
-/// TEAM RUN (seam D1): the composed def is the one marker, read at plan time.
+/// TEAM RUN (seam D1): the composed def is the one marker, read at plan time. The namespace is
+/// RESERVED: `WorkflowRegistry::register` and `def_from_file` refuse any user id containing
+/// `":plan-"` ([`crate::workflow::RESERVED_PLAN_ID_MARKER`]), so only the engine's own
+/// `register_composed` can put such a def in front of the planner.
 pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
     if session_id.is_empty() {
         return false;

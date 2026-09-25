@@ -1048,6 +1048,13 @@ impl WorkflowRegistry {
     /// phase with no pin, is refused (see [`refuse_ungated_code_phases`] and
     /// [`refuse_unpinned_verified_evidence`]); nothing is injected or restored on the way in.
     pub fn register(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
+        refuse_reserved_id(&def)?;
+        self.register_judged(def)
+    }
+
+    /// Every registration rule but the reserved-namespace one: shared by [`register`](Self::register)
+    /// and [`register_composed`](Self::register_composed).
+    fn register_judged(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
         def.validate()?;
         // A def is judged AS AUTHORED (codex review on #414): nothing is injected or restored
         // at load. A same-id replacement that drops a shipped pin, or a `verified_evidence` phase
@@ -1066,7 +1073,7 @@ impl WorkflowRegistry {
     /// `plan.accepted`); until that lands only the tests call it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn register_composed(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
-        self.register(def) // D1 red: stub
+        self.register_judged(def)
     }
 
     /// Overwrite one phase's `validator_pin` on a registered def. Returns false when the workflow or
@@ -1155,10 +1162,20 @@ impl WorkflowRegistry {
             .with_context(|| format!("reading workflow file {}", path.display()))?;
         let def: WorkflowDef = serde_json::from_str(&raw)
             .with_context(|| format!("parsing workflow file {}", path.display()))?;
-        def.validate()
+        refuse_reserved_id(&def)
+            .and_then(|()| def.validate())
             .map_err(|e| anyhow::anyhow!("invalid workflow in {}: {e}", path.display()))?;
         Ok(def)
     }
+}
+
+/// A user-supplied workflow id may not enter the reserved per-run plan namespace
+/// ([`RESERVED_PLAN_ID_MARKER`], DES-TEAMING-002 D1).
+fn refuse_reserved_id(def: &WorkflowDef) -> Result<(), WorkflowDefError> {
+    if def.id.contains(RESERVED_PLAN_ID_MARKER) {
+        return Err(WorkflowDefError::ReservedId { id: def.id.clone() });
+    }
+    Ok(())
 }
 
 /// An `executes_code` AGENT phase must have a gate that evaluates SOMETHING (F-039).
