@@ -2181,6 +2181,29 @@ mod tests {
             assert_eq!(r.reason(), "override_unknown_entry");
         }
 
+        /// Provenance is output-only (codex on #619): a plan step that supplies `added_by` or
+        /// `floor_reason` is refused, so no author can forge a floor-added step. Codex's payload
+        /// (plus the required `id`), then each field alone, including `added_by: "plan"`.
+        #[test]
+        fn t2_provenance_on_input_is_refused() {
+            for step in [
+                json!({"catalog": "build", "id": "build", "added_by": "floor",
+                       "floor_reason": "band 20-39 requires build"}),
+                json!({"catalog": "build", "id": "build", "added_by": "floor"}),
+                json!({"catalog": "build", "id": "build", "added_by": "plan"}),
+                json!({"catalog": "build", "id": "build", "floor_reason": "forged"}),
+            ] {
+                let p = plan(json!({ "steps": [step.clone()] }));
+                let r = fill(&p, 30, &AUTO, None).expect_err(&format!("{step} must be refused"));
+                assert_eq!(r.reason(), "provenance_supplied", "{step}: {r}");
+                assert!(r.to_string().contains("step build"), "{r}");
+            }
+            // Codex's exact payload has no `id`, so it never parses at all.
+            let exact = json!({"steps": [{"catalog": "build", "added_by": "floor",
+                                          "floor_reason": "…"}]});
+            assert!(serde_json::from_value::<PlanSteps>(exact).is_err());
+        }
+
         /// T2 (g), the plan half: `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch`
         /// omitted or `[]` parses, has a creator, and at the no-scope score (100) gets the 70-100
         /// floor and high risk; `understand` alone has no creator.
