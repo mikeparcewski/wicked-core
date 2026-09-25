@@ -1080,6 +1080,7 @@ pub(crate) fn run(
                 process_gen,
                 interval,
                 exec_stop.clone(),
+                team_gate::team_runner(),
             );
             // RESTART RECOVERY (seam finding #1): re-drive any session persisted `Executing` — a
             // dispatch lost across a crash/restart (task.dispatched never completed, or its result
@@ -5498,6 +5499,16 @@ fn apply_step_result(
     // A's criterion pass, so the gate would get easier the more repos a project has. The worker's
     // read tools widen (`run_code_graph_db` at the dispatch site); the measurement must not.
     let coverage_db = repo_code_graph_db(store, session.repo_ref.as_deref());
+    // DES-TEAMING-002 T5 (§8.11): the unit's team snapshot joins the unit BEFORE the fold (which
+    // persists it) — the dispatch stamp merged with the worker's snapshot — and a teamed attempt's
+    // unit-review gate opens on it (`gate.opened{kind:"unit_review"}`).
+    let mut evidence = evidence;
+    let unit_ord = unit.ord;
+    let team_review =
+        team_gate::open_unit_review(&mut session, unit, output.attempt, evidence.team.take());
+    if team_review.is_some() {
+        put_node(store, session.to_node())?;
+    }
     let outcome = pipeline::apply_and_finish_unit(
         store,
         unit,
@@ -5518,6 +5529,11 @@ fn apply_step_result(
         &mut |ev| emit(subscribers, ev),
         coverage_db.as_deref(),
     )?;
+    // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
+    // approved a teamed unit whose ledger does not let the run continue unattended.
+    let team_dispute = team_review.as_deref().and_then(|gid| {
+        team_gate::decide_unit_review(&mut session, unit, output.attempt, gid, outcome.approved)
+    });
 
     // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit never advances past its rejection into a
     // silent `Completed` (`apply_and_finish_unit` already emitted UnitDenied + persisted the
@@ -5582,6 +5598,27 @@ fn apply_step_result(
     session.unit_ix = output.unit_ix + 1;
     session.attempt = units.get(session.unit_ix).map(next_attempt).unwrap_or(0);
     put_node(store, session.to_node())?;
+
+    // T5 (c): a teamed unit's ledger holds an unresolved HIGH (or an incomplete record) without a
+    // council YES — the work stands, but the run pauses for a human BEFORE anything else runs
+    // (DES-001 §6.7). Approve continues at the cursor; reject cancels.
+    if let Some(prompt) = team_dispute {
+        let next_ord = units
+            .get(session.unit_ix)
+            .map(|u| u.ord)
+            .unwrap_or(unit_ord);
+        pause_for_human(
+            store,
+            subscribers,
+            self_tx,
+            &mut session,
+            next_ord,
+            Some(unit_ord),
+            team_gate::TEAM_DISPUTE_GATE,
+            prompt,
+        )?;
+        return Ok(StepApplied::Paused);
+    }
 
     // Advance: dispatch the next unit, pause at its human-confirm gate, or finalize.
     match advance_or_pause(
@@ -6874,6 +6911,29 @@ fn dispatch_unit(
             prior_outputs.push(PriorUnitOutput { label, output });
         }
     }
+    // DES-TEAMING-002 T5 / DES-001 §6.2 item 2: an evaluator reviewing a teamed creator's work
+    // reads the team's record of that work too — the ledger's outcomes and its comms, from the
+    // creator unit's persisted snapshot (never from a worker).
+    if unit.role == crate::workflow::PhaseRole::Evaluator {
+        if let Some(creator) = pipeline::most_recent_prior_creator(&units, unit.ord) {
+            if let Some(text) = creator
+                .team
+                .as_ref()
+                .and_then(crate::team::runner::render_for_gate)
+            {
+                let label = format!("[team findings — unit {}]", creator.ord);
+                context_items.push(crate::event::InjectedContext {
+                    ord: creator.ord,
+                    label: label.clone(),
+                    output_bytes: text.len(),
+                });
+                prior_outputs.push(PriorUnitOutput {
+                    label,
+                    output: text,
+                });
+            }
+        }
+    }
     // (EVT-007) Emit UnitContextInjected when prior outputs are being injected — a cross-CLI carry-over
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
@@ -7192,6 +7252,9 @@ fn dispatch_unit(
                     judge_skipped: None,
                     judge_auth_refusals: Vec::new(),
                     judge_refusals: Vec::new(),
+                    // A Tool unit is the engine's own command, never a team step: its dispatch
+                    // stamp is `transport: none` (`team_gate::unit_snapshot`), merged locally.
+                    team: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -7230,6 +7293,10 @@ fn dispatch_unit(
     // The bus exec mediation is armed over (a publish that fell back in-process): the judge still
     // publishes there — read HERE, on the actor thread that owns the thread-local publisher.
     let exec_bus = crate::cli_runner::armed_exec_bus();
+    // DES-TEAMING-002 T5: the attempt runner's handle on the team bus — read HERE, on the actor
+    // thread that owns the team link; the worker publishes `step.claimed`/`step.completed` and
+    // waits for the fold through it.
+    let team_runner = team_gate::team_runner();
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -7267,6 +7334,7 @@ fn dispatch_unit(
             &run_roster_keys,
             &benched_keys,
             exec_bus.as_deref(),
+            team_runner.as_ref(),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,

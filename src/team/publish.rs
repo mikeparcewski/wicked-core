@@ -109,6 +109,11 @@ pub struct TeamConfig {
     pub schedule: Vec<Duration>,
     /// One bus write's bound ([`ATTEMPT_WAIT`]).
     pub attempt_wait: Duration,
+    /// (T5) How long the worker thread waits for S's `ledger.folded` before it synthesizes the
+    /// fail-closed ledger (`FINAL_PASS_BUDGET`, env-overridable; tests shorten it).
+    pub final_pass_budget: Duration,
+    /// (T5) The gate wait's poll interval ([`super::runner::GATE_POLL`]).
+    pub gate_poll: Duration,
 }
 
 impl TeamConfig {
@@ -123,17 +128,33 @@ impl TeamConfig {
                 .map(|home| home.join(TEAM_OUTBOX_FILE)),
             schedule: RETRY_SCHEDULE.to_vec(),
             attempt_wait: ATTEMPT_WAIT,
+            final_pass_budget: crate::team::TeamLimits::from_env().final_pass_budget,
+            gate_poll: super::runner::GATE_POLL,
         }
     }
 
-    /// An explicit config with the production schedule.
+    /// An explicit config with the production schedule and budget.
     pub fn new(bus_db: Option<String>, outbox: Option<PathBuf>) -> Self {
         Self {
             bus_db,
             outbox,
             schedule: RETRY_SCHEDULE.to_vec(),
             attempt_wait: ATTEMPT_WAIT,
+            final_pass_budget: crate::team::FINAL_PASS_BUDGET,
+            gate_poll: super::runner::GATE_POLL,
         }
+    }
+
+    /// Replace the final-pass budget the gate wait honours (tests shorten it; T5 (c)).
+    pub fn with_final_pass_budget(mut self, budget: Duration) -> Self {
+        self.final_pass_budget = budget;
+        self
+    }
+
+    /// Replace the gate wait's poll interval.
+    pub fn with_gate_poll(mut self, poll: Duration) -> Self {
+        self.gate_poll = poll;
+        self
     }
 
     /// Replace the retry schedule (tests scale the 31 s bound down).
@@ -796,10 +817,12 @@ pub enum PublisherReq {
 /// The actor's link to team publishing.
 #[derive(Debug, Clone)]
 pub enum TeamLink {
-    /// A publisher thread and the outbox it owns.
+    /// A publisher thread and the outbox it owns, plus the attempt runner's handle on the same
+    /// bus and outbox (T5), which the actor hands to every worker thread it starts.
     Publisher {
         tx: Sender<PublisherReq>,
         outbox: PathBuf,
+        runner: Box<super::runner::TeamRunner>,
     },
     /// No publisher (no bus, or it did not start): every NEW team run is un-teamed, with this
     /// reason. The outbox is the state home's whatever the bus: a run tombstone the engine owes
@@ -833,8 +856,18 @@ impl TeamLink {
         let spawned = std::thread::Builder::new()
             .name(TEAM_PUBLISHER_THREAD.into())
             .spawn(move || publisher_loop(bus, schedule, rx, self_tx));
+        let Some(runner) = super::runner::TeamRunner::from_config(cfg) else {
+            return TeamLink::Unavailable {
+                reason: "no team runner for this config".into(),
+                outbox: cfg.outbox.clone(),
+            };
+        };
         match spawned {
-            Ok(_) => TeamLink::Publisher { tx, outbox },
+            Ok(_) => TeamLink::Publisher {
+                tx,
+                outbox,
+                runner: Box::new(runner),
+            },
             Err(e) => TeamLink::Unavailable {
                 reason: format!("team publisher did not start: {e}"),
                 outbox: cfg.outbox.clone(),
@@ -1057,6 +1090,14 @@ pub struct UnitTeamView {
     pub transport: Option<String>,
     pub reason: Option<String>,
     pub ledger_source: Option<String>,
+    /// (T5) The S row the gate read; `None` for a synthesized or local snapshot.
+    pub ledger_ref: Option<String>,
+    /// (T5) The attempt ledger's `final_pass`, once the unit folded.
+    pub final_pass: Option<String>,
+    /// (T5) Whether the attempt's ledger pauses the run (DES-001 §6.7).
+    pub team_pause: Option<bool>,
+    /// (T5) How many findings the attempt's ledger holds.
+    pub findings: Option<usize>,
 }
 
 /// A live teamed run and its team state (§4.7 replay step 2).
@@ -1105,6 +1146,22 @@ pub(crate) fn run_team_view(
                     .as_ref()
                     .and_then(|t| t.ledger_source)
                     .map(|l| l.as_str().to_string()),
+                ledger_ref: u.team.as_ref().and_then(|t| t.ledger_ref.clone()),
+                final_pass: u
+                    .team
+                    .as_ref()
+                    .and_then(|t| t.ledger.as_ref())
+                    .map(|l| l.final_pass.as_str().to_string()),
+                team_pause: u
+                    .team
+                    .as_ref()
+                    .and_then(|t| t.ledger.as_ref())
+                    .map(|l| l.team_pause),
+                findings: u
+                    .team
+                    .as_ref()
+                    .and_then(|t| t.ledger.as_ref())
+                    .map(|l| l.findings.len()),
             })
             .collect(),
     })

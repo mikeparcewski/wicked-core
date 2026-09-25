@@ -128,6 +128,12 @@ struct GateEvalRequest {
     /// (exclude every seat, fail-closed) rather than proceeding without the guard.
     #[serde(default)]
     work_author: Option<String>,
+    /// (DES-TEAMING-001 §6.2, T5) The team monitors that authored or corroborated a finding in
+    /// the unit's ledger — computed from the ledger, never supplied. The daemon MUST select no
+    /// seat whose instance or cli key is here or is `work_author`. Always serialized (`[]` for
+    /// an un-teamed unit), so an old payload reads as `[]`.
+    #[serde(default)]
+    excluded_seats: Vec<String>,
 }
 
 /// Payload the governed evaluator daemon publishes back.
@@ -136,7 +142,15 @@ struct GateEvalResponse {
     eval_id: String,
     pass: bool,
     reasoning: String,
+    /// (T5) The seat that judged. Required to PROVE monitor exclusion when `excluded_seats` was
+    /// non-empty; `None` from an older daemon.
+    #[serde(default)]
+    judge_cli: Option<String>,
 }
+
+/// The fail-closed DENY a bus judge gets when it cannot prove it excluded the team's monitors.
+pub(crate) const MONITOR_EXCLUSION_DENY: &str =
+    "gate eval bus-path DENY (fail-closed): evaluator did not prove monitor exclusion";
 
 /// The `wicked.task.dispatched` payload. Carries what the `cli-runner` needs to reconstruct the
 /// [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with
@@ -374,6 +388,7 @@ fn bus_request_agent_verdict(
     attempt: u32,
     bus_db_path: &str,
     work_author: Option<&str>,
+    excluded_seats: &[String],
 ) -> crate::validator::AgentVerdict {
     // Fail-closed helper: any error on the bus path is a governance deny, never a silent pass.
     macro_rules! bus_deny {
@@ -409,6 +424,7 @@ fn bus_request_agent_verdict(
         unit_ix,
         attempt,
         work_author: work_author.map(str::to_string),
+        excluded_seats: excluded_seats.to_vec(),
     };
     let payload = match serde_json::to_value(&request) {
         Ok(p) => p,
@@ -448,8 +464,18 @@ fn bus_request_agent_verdict(
                         "wicked-core: gate eval response received — pass={} reasoning={:?}",
                         resp.pass, resp.reasoning
                     );
+                    // T5: with monitors to exclude, only a response that NAMES a judge outside
+                    // them is honoured; a missing or excluded judge is a DENY (DES-001 §6.2).
+                    if !excluded_seats.is_empty()
+                        && resp
+                            .judge_cli
+                            .as_deref()
+                            .is_none_or(|j| crate::team::runner::is_excluded(j, excluded_seats))
+                    {
+                        bus_deny!(MONITOR_EXCLUSION_DENY.to_string());
+                    }
                     return crate::validator::AgentVerdict {
-                        judge_cli: None,
+                        judge_cli: resp.judge_cli,
                         judge_distinct: None,
                         pass: resp.pass,
                         reasoning: resp.reasoning,
@@ -700,6 +726,7 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 ///
 /// `exec_bus` — the bus exec mediation resolved for this unit (`None` off exec): the pinned judge
 /// publishes its evaluation request there ([`gate_eval_bus_db`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -708,6 +735,7 @@ pub(crate) fn run_unit_and_judge(
     run_roster: &[String],
     benched: &[String],
     exec_bus: Option<&str>,
+    team: Option<&crate::team::runner::TeamRunner>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -722,6 +750,7 @@ pub(crate) fn run_unit_and_judge(
         run_roster,
         benched,
         exec_bus,
+        team,
     )
 }
 
@@ -791,6 +820,36 @@ fn run_unit_and_judge_with_roster(
         run_roster,
         benched,
         None,
+        None,
+    )
+}
+
+/// [`run_unit_and_judge_with_roster`] with a team runner (T5 tests): the worker-thread seam's
+/// `step.claimed` / injector / gate wait around the same judge paths.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_unit_and_judge_with_team(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+    exec_bus: Option<&str>,
+    team: Option<&crate::team::runner::TeamRunner>,
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    run_unit_and_judge_on(
+        runner,
+        input,
+        None,
+        emit_delta,
+        roster,
+        &[],
+        &[],
+        exec_bus,
+        team,
     )
 }
 
@@ -804,17 +863,104 @@ fn run_unit_and_judge_on(
     run_roster: &[String],
     benched: &[String],
     exec_bus: Option<&str>,
+    team: Option<&crate::team::runner::TeamRunner>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
-    let output = runner.run_unit_streaming(input, emit_delta);
-    // DES-TEAMING-001 §4.7 (S2, #601): a teamed unit's final pass runs here, on the settled tree,
-    // before the guard's first look. The ledger is ADVISORY and S2 stops at producing it: S6
-    // (#603) carries it into `UnitEvidence.team` and the judge's WORK payload. `None` for every
-    // non-teamed unit (the trait default).
+    // DES-TEAMING-002 T5 — the worker-thread seam, shared by the in-process worker and the bus
+    // worker. `step.claimed` goes out BEFORE the turn starts (so it precedes every row of the
+    // turn, §4.3); a claim that failed AND could not be tombstoned fails the step here, before
+    // any work (fail closed, §4.8 row 5).
+    let attempt_team = match crate::team::runner::claim(team, input) {
+        Ok(a) => a,
+        Err(why) => {
+            eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
+            let snap = input
+                .unit
+                .team
+                .as_ref()
+                .map(|s| crate::team::runner::local_snapshot(s, Some(why.clone())));
+            return (
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: why,
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                },
+                None,
+                crate::workflow::UnitEvidence {
+                    team: snap,
+                    ..Default::default()
+                },
+            );
+        }
+    };
+    // The step-boundary injector (§8.9): the advice every carrier receives, as prior context.
+    let advised: Option<StepInput> = match &attempt_team {
+        crate::team::runner::Attempt::Claimed(c) => {
+            let b = crate::team::runner::boundary(c);
+            if let Some(why) = &b.unread {
+                eprintln!(
+                    "wicked-core: unit {}: team advice unavailable at the step boundary ({why}); \
+                     undelivered findings reach the gate as not delivered",
+                    input.unit.ord
+                );
+            } else if !b.rendered.is_empty() {
+                eprintln!(
+                    "wicked-core: unit {}: {} team finding(s) rendered at the step boundary",
+                    input.unit.ord,
+                    b.rendered.len()
+                );
+            }
+            b.block.map(|block| {
+                let mut i = input.clone();
+                i.prior_outputs.push(block);
+                i
+            })
+        }
+        _ => None,
+    };
+    let output = runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta);
+    // DES-TEAMING-001 §4.7 (S2, #601): the ACP-only in-process final pass, kept until T6 re-homes
+    // the supervisor on the bus and deletes it; its ledger is not the gate's (T5 reads S's
+    // `ledger.folded` below). `None` for every non-teamed unit (the trait default).
     let _team_ledger = runner.team_finish(input, &output);
+    // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
+    // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
+    let mut team_snapshot: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
+        crate::team::runner::Attempt::NotTeam => None,
+        crate::team::runner::Attempt::Local(s) => Some(s.clone()),
+        crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete(c, &output)),
+    };
+    // The seats the team's ledger names as authors/corroborators of a finding (DES-001 §6.2): a
+    // monitor never grades its own finding. Computed from the ledger alone, never supplied.
+    let team_authors: Vec<String> = team_snapshot
+        .as_ref()
+        .filter(|t| t.transport == crate::team::events::Transport::Bus)
+        .and_then(|t| t.ledger.as_ref())
+        .map(crate::team::runner::ledger_authors)
+        .unwrap_or_default();
+    // Instance AND cli key: excluding `claude#2` excludes a `claude` seat too.
+    let mut team_excluded: Vec<String> = Vec::new();
+    for a in &team_authors {
+        for k in [a.as_str(), crate::team::runner::seat_key(a)] {
+            if !team_excluded.iter().any(|e| e == k) {
+                team_excluded.push(k.to_string());
+            }
+        }
+    }
+    let monitors_note = if team_authors.is_empty() {
+        String::new()
+    } else {
+        format!(" and the team monitors [{}]", team_authors.join(", "))
+    };
     // (F-7R2-006 / review RT-1) The seats a JUDGE may run under: the registry seats the RUN
     // configured (`run_roster`, when the caller knows it), minus the run's bench, minus every
     // seat the launcher's health probe declared unusable — a signed-out seat cannot render a
@@ -949,6 +1095,24 @@ fn run_unit_and_judge_on(
         Some(evidence) => std::borrow::Cow::Owned(format!("{work_owned}{evidence}")),
         None => work_owned,
     };
+    // T5 / DES-001 §6.2: the judge sees the team's outcomes AND its comms — the rendered ledger
+    // and compact transcript ride INSIDE the WORK fence (untrusted data, never instructions).
+    let work_owned = match will_judge
+        .then(|| {
+            team_snapshot
+                .as_ref()
+                .and_then(crate::team::runner::render_for_gate)
+        })
+        .flatten()
+    {
+        Some(team) => {
+            if let Some(l) = team_snapshot.as_mut().and_then(|t| t.ledger.as_mut()) {
+                l.rendered_to_judge = true;
+            }
+            std::borrow::Cow::Owned(format!("{work_owned}{team}"))
+        }
+        None => work_owned,
+    };
     let work_for_agent: &str = &work_owned;
     // (F-7R2-005) WHY no judge ran for a unit that WANTED one — rides to `gateEvaluated.
     // ungatedReason` so the studio says "UNGATED — no eligible judge seat" instead of "pass".
@@ -980,6 +1144,7 @@ fn run_unit_and_judge_on(
                     input.attempt,
                     &bus_path,
                     work_author,
+                    &team_authors,
                 ));
             }
             // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
@@ -992,7 +1157,9 @@ fn run_unit_and_judge_on(
                 .assigned_cli
                 .as_deref()
                 .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
-            let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
+            let mut excluded: Vec<&str> =
+                vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
+            excluded.extend(team_excluded.iter().map(String::as_str));
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
@@ -1022,7 +1189,7 @@ fn run_unit_and_judge_on(
                     .collect();
                 let why = format!(
                     "no eligible judge seat distinct from creator '{work_author}' and validator \
-                     author '{}' (seats: {}; benched: {})",
+                     author '{}'{monitors_note} (seats: {}; benched: {})",
                     crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
                     if seat_outcomes.is_empty() {
                         "none".to_string()
@@ -1075,7 +1242,8 @@ fn run_unit_and_judge_on(
                 .assigned_cli
                 .as_deref()
                 .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
-            let excluded = [work_author];
+            let mut excluded: Vec<&str> = vec![work_author];
+            excluded.extend(team_excluded.iter().map(String::as_str));
             if crate::validator::distinct_judge_available(&excluded, roster) {
                 let criterion = crate::validator::default_judge_criterion(&input.unit);
                 eprintln!(
@@ -1118,8 +1286,8 @@ fn run_unit_and_judge_on(
                     })
                     .collect();
                 let why = format!(
-                    "no eligible judge seat distinct from creator '{work_author}' (seats: {}; \
-                     benched: {})",
+                    "no eligible judge seat distinct from creator '{work_author}'{monitors_note} \
+                     (seats: {}; benched: {})",
                     if seat_outcomes.is_empty() {
                         "none".to_string()
                     } else {
@@ -1313,6 +1481,7 @@ fn run_unit_and_judge_on(
         judge_skipped,
         judge_auth_refusals,
         judge_refusals,
+        team: team_snapshot,
     };
     (output, agent_verdict, evidence)
 }
@@ -1686,6 +1855,7 @@ pub(crate) fn spawn_exec_consumers(
     actor_process_gen: uuid::Uuid,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
+    team: Option<crate::team::runner::TeamRunner>,
 ) -> Vec<JoinHandle<()>> {
     let ExecConsumers {
         cli_runner_db,
@@ -1709,6 +1879,7 @@ pub(crate) fn spawn_exec_consumers(
             completed_consumer_name.clone(),
             poll_interval,
             stop.clone(),
+            team,
         ),
         run_task_completed_poller(
             completed_db,
@@ -1784,6 +1955,7 @@ fn run_cli_runner(
     completed_consumer_name: String,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
+    team: Option<crate::team::runner::TeamRunner>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut floor = floor_init;
@@ -2070,6 +2242,8 @@ fn run_cli_runner(
                     &[],
                     // Exec mediation's judge publishes over the bus this consumer runs on.
                     Some(db.path()),
+                    // T5: the SAME attempt-runner seam as the in-process worker.
+                    team.as_ref(),
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),
@@ -3090,6 +3264,7 @@ mod tests {
             unit_ix: 1,
             attempt: 0,
             work_author: Some("claude".into()),
+            excluded_seats: Vec::new(),
         };
         let json = serde_json::to_value(&req).unwrap();
 
@@ -3138,6 +3313,7 @@ mod tests {
             unit_ix: 0,
             attempt: 0,
             work_author: Some("agy".into()),
+            excluded_seats: Vec::new(),
         };
         let v = serde_json::to_value(&with_author).unwrap();
         assert_eq!(
@@ -3154,6 +3330,7 @@ mod tests {
             unit_ix: 0,
             attempt: 0,
             work_author: None,
+            excluded_seats: Vec::new(),
         };
         let v2 = serde_json::to_value(&without_author).unwrap();
         assert!(
@@ -3627,6 +3804,7 @@ mod tests {
                     cc_name_clone,
                     std::time::Duration::from_millis(50),
                     stop_a2,
+                    None,
                 )
             });
             let inner = handle.join().unwrap();
@@ -3730,6 +3908,7 @@ mod tests {
                     cc_name_clone,
                     std::time::Duration::from_millis(50),
                     stop_b2,
+                    None,
                 )
             });
             let inner = handle.join().unwrap();
@@ -4405,6 +4584,7 @@ mod judge_routing_tests {
             completed_consumer_name(gen),
             Duration::from_millis(50),
             runner_stop.clone(),
+            None,
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         while bus
@@ -4427,5 +4607,138 @@ mod judge_routing_tests {
             "the exec consumer judged over its bus (one gate.eval.requested)"
         );
         assert_eq!(runner.0.load(Ordering::SeqCst), 0, "and not inline");
+    }
+}
+
+/// DES-TEAMING-002 T5 (a), the BUS-WORKER path (`task.dispatched` → the cli-runner consumer →
+/// the same worker-thread seam): `step.claimed` precedes every `checkpoint.reached` of the attempt.
+#[cfg(test)]
+mod t5_bus_worker_tests {
+    use super::*;
+    use crate::team::events as tev;
+    use crate::team::publish::tests::{fixture, fixture_with, rig};
+    use crate::team::publish::{PublishOutcome, TeamConfig};
+    use crate::team::runner::TeamRunner;
+    use std::time::Instant;
+
+    /// Publishes two checkpoints of its own attempt during the turn, as the ACP carrier would.
+    struct Carrier(crate::team::publish::TeamBus);
+    impl StepRunner for Carrier {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            for seq in 1..=2u64 {
+                let cp = fixture_with(tev::CHECKPOINT_REACHED, 0, &i.run_id, |p| {
+                    p["ord"] = serde_json::json!(i.unit.ord);
+                    p["attempt"] = serde_json::json!(i.attempt);
+                    p["seq"] = serde_json::json!(seq);
+                });
+                self.0.publish(&cp).unwrap();
+            }
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "done".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn t5_a_step_claimed_precedes_every_checkpoint_on_the_bus_worker_path() {
+        let rig = rig("t5a-bus");
+        let run = "t5a-bus";
+        let floor = match rig
+            .team_bus()
+            .publish(&fixture(tev::PATH_STARTED, 0, run))
+            .unwrap()
+        {
+            PublishOutcome::Published(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let gen = uuid::Uuid::new_v4();
+        let mut unit = crate::domain::WorkUnit::pending(format!("{run}:u1"), run, 1, "step 1");
+        unit.assigned_cli = Some("claude#1".into());
+        unit.team_run = true;
+        let mut stamp = crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
+        stamp.stream_floor = Some(floor);
+        unit.team = Some(stamp);
+        let input = StepInput {
+            run_id: run.into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: format!("{run}:plan-1"),
+            entity_mode: EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: Some(gen),
+            launch_seq: 1,
+            required_skills: Vec::new(),
+        };
+        let bus = BusDb::shared(&rig.bus).unwrap();
+        arm_exec_publisher(bus.clone());
+        assert!(try_publish_dispatched(&input, None, false));
+        disarm_exec_publisher();
+
+        let team = TeamRunner::from_config(
+            &TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+                .with_schedule(vec![Duration::from_millis(20); 3])
+                .with_final_pass_budget(Duration::from_millis(300))
+                .with_gate_poll(Duration::from_millis(20)),
+        );
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let consumer = run_cli_runner(
+            bus.clone(),
+            0,
+            Arc::new(Carrier(rig.team_bus())),
+            cmd_tx,
+            None,
+            gen,
+            None,
+            consumer_name(gen),
+            completed_consumer_name(gen),
+            Duration::from_millis(20),
+            stop.clone(),
+            team,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while bus
+            .poll(TASK_COMPLETED, 0, 10)
+            .unwrap_or_default()
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = consumer.join();
+        let rows = rig.rows(run);
+        let claimed: Vec<i64> = rows
+            .iter()
+            .filter(|(_, t, _)| t == tev::STEP_CLAIMED)
+            .map(|(id, _, _)| *id)
+            .collect();
+        let checkpoints: Vec<i64> = rows
+            .iter()
+            .filter(|(_, t, _)| t == tev::CHECKPOINT_REACHED)
+            .map(|(id, _, _)| *id)
+            .collect();
+        assert_eq!(claimed.len(), 1, "{rows:?}");
+        assert_eq!(checkpoints.len(), 2, "{rows:?}");
+        assert!(checkpoints.iter().all(|c| *c > claimed[0]), "{rows:?}");
+        let completed = bus.poll(TASK_COMPLETED, 0, 10).unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].payload["evidence"]["team"]["claimed_event_id"],
+            serde_json::json!(claimed[0]),
+            "the snapshot rides task.completed to the actor"
+        );
     }
 }

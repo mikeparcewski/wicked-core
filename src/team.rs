@@ -64,6 +64,7 @@ macro_rules! wire_enum {
 
 pub mod events;
 pub mod publish;
+pub mod runner;
 
 // ── Constants (DES §4.8; env-overridable for rigs only) ──────────────────────────────────────────
 

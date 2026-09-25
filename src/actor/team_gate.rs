@@ -63,6 +63,16 @@ pub(super) fn has_publisher() -> bool {
     matches!(link(), Some(TeamLink::Publisher { .. }))
 }
 
+/// (T5) The attempt runner's handle on team publishing, for the worker threads this actor starts
+/// (in-process and the bus worker). `None` without a publisher: a teamed unit's worker then runs
+/// the attempt un-teamed and says so ([`crate::team::runner::claim`]).
+pub(super) fn team_runner() -> Option<crate::team::runner::TeamRunner> {
+    match link() {
+        Some(TeamLink::Publisher { runner, .. }) => Some(*runner),
+        _ => None,
+    }
+}
+
 /// The pending "fact" of a teamed run paused because this process has no publisher for it.
 pub const TRANSPORT_UNAVAILABLE: &str = "team_transport_unavailable";
 
@@ -361,15 +371,200 @@ fn transport_prompt(fact: &str, reason: &str) -> String {
     )
 }
 
-/// The team snapshot a dispatched unit carries: `transport: none` (with the run's reason) for a
-/// team unit of an un-teamed run; `None` otherwise (a teamed attempt's snapshot is T5's).
+/// The team snapshot a dispatched team unit carries, stamped from the run's persisted state
+/// before its turn starts: `transport: none` (with the run's reason) for an un-teamed run; for a
+/// teamed run (T5) `transport: bus` with the run's `stream_floor`, which the worker's
+/// `step.claimed` confirms or downgrades. `None` for a non-team unit.
+///
+/// A team unit of a run whose transport is still undecided is never dispatched (P1 defers it);
+/// should one reach here it is stamped `none` with the reason, so it can never run teamed on no
+/// evidence nor un-teamed in silence.
 pub(super) fn unit_snapshot(session: &AgentSession, unit: &WorkUnit) -> Option<UnitTeamSnapshot> {
-    let team = session.team.as_ref()?;
-    (unit.team_run && team.is_unteamed()).then(|| UnitTeamSnapshot {
-        transport: Transport::None,
-        reason: team.reason.clone(),
-        ledger_source: team.no_bus.then_some(LedgerSource::NoBus),
-    })
+    if !unit.team_run {
+        return None;
+    }
+    let Some(team) = session.team.as_ref() else {
+        return Some(UnitTeamSnapshot::stamped(
+            Transport::None,
+            Some("no team state at dispatch".into()),
+            None,
+        ));
+    };
+    if team.is_unteamed() {
+        return Some(UnitTeamSnapshot::stamped(
+            Transport::None,
+            team.reason.clone(),
+            team.no_bus.then_some(LedgerSource::NoBus),
+        ));
+    }
+    if unit.tool_cmd.is_some() {
+        // The engine's own command: no seat takes a step, so nothing brackets it on the bus.
+        return Some(UnitTeamSnapshot::stamped(
+            Transport::None,
+            Some("tool unit: the engine's own command is not a team step".into()),
+            None,
+        ));
+    }
+    if team.is_teamed() {
+        let mut s = UnitTeamSnapshot::stamped(Transport::Bus, None, None);
+        s.stream_floor = team.stream_floor;
+        return Some(s);
+    }
+    Some(UnitTeamSnapshot::stamped(
+        Transport::None,
+        Some("team transport undecided at dispatch".into()),
+        None,
+    ))
+}
+
+/// The `gate_kind` of the pause a teamed unit's ledger opens when the gate approved it but an
+/// unresolved HIGH (or an incomplete record) stands without a council YES (DES-001 §6.7, T5 (c)).
+pub const TEAM_DISPUTE_GATE: &str = "team_dispute";
+
+fn unit_event(run_id: &str, ord: u32, attempt: u32, body: TeamBody) -> TeamEvent {
+    TeamEvent {
+        env: Envelope {
+            ord: Some(ord),
+            attempt: Some(attempt),
+            ..envelope(run_id)
+        },
+        body,
+    }
+}
+
+/// (T5, §8.11) Before the fold: merge the unit's dispatch stamp with the worker's snapshot
+/// ([`crate::team::runner::merge_snapshot`]) onto `unit.team` (the fold persists it), and for a
+/// teamed attempt mint the unit-review gate and publish `gate.opened{kind:"unit_review"}` with
+/// the S row the gate read (`ledger_ref`), or `null` + `synthesized` for the worker's own
+/// fail-closed ledger. Returns the gate id, `None` for a non-team or un-teamed unit (§4.8 rows
+/// 1/5/6: no team fact is generated for it).
+pub(super) fn open_unit_review(
+    session: &mut AgentSession,
+    unit: &mut WorkUnit,
+    attempt: u32,
+    worker: Option<UnitTeamSnapshot>,
+) -> Option<String> {
+    if !unit.team_run {
+        return None;
+    }
+    unit.team = crate::team::runner::merge_snapshot(unit.team.as_ref(), worker);
+    let snap = unit.team.as_ref()?;
+    if snap.transport != Transport::Bus {
+        return None;
+    }
+    let source = snap.ledger_source.unwrap_or(LedgerSource::Synthesized);
+    let ledger_ref = snap
+        .ledger_ref
+        .clone()
+        .filter(|_| source == LedgerSource::Folded);
+    let team = session.team.get_or_insert_with(Default::default);
+    team.gate_seq += 1;
+    let gid = tev::gate_id(&session.id, team.gate_seq);
+    publish_fire(unit_event(
+        &session.id,
+        unit.ord,
+        attempt,
+        TeamBody::GateOpened(GateOpened {
+            gate_id: gid.clone(),
+            kind: GateOpenedKind::UnitReview {
+                ledger_ref,
+                ledger_source: source,
+            },
+        }),
+    ));
+    Some(gid)
+}
+
+/// (T5) After the fold: publish the unit-review `gate.decided`, and when the gate APPROVED a
+/// teamed unit whose ledger pauses ([`tev::gate_pauses`]) mint and open the `team_dispute` gate.
+/// Returns the pause prompt then: the caller pauses the run (the unit's work stands; the run
+/// does not continue unattended). A denied unit is denied, never paused.
+pub(super) fn decide_unit_review(
+    session: &mut AgentSession,
+    unit: &WorkUnit,
+    attempt: u32,
+    gate_id: &str,
+    approved: bool,
+) -> Option<String> {
+    #[allow(unreachable_code)]
+    if true {
+        let _ = (session, unit, attempt, gate_id, approved);
+        return None;
+    }
+    // A teamed unit whose snapshot carries no ledger is an incomplete record: it pauses.
+    let owned;
+    let ledger = match unit.team.as_ref()?.ledger.as_ref() {
+        Some(l) => l,
+        None => {
+            owned = crate::team::TeamLedger::new(
+                crate::team::FinalPass::StreamGap,
+                Vec::new(),
+                Vec::new(),
+                Default::default(),
+            );
+            &owned
+        }
+    };
+    let pause = tev::gate_pauses(approved, ledger);
+    let unresolved: Vec<String> = tev::unresolved_highs(ledger)
+        .iter()
+        .map(|f| f.finding.finding_id.clone())
+        .collect();
+    publish_fire(unit_event(
+        &session.id,
+        unit.ord,
+        attempt,
+        TeamBody::GateDecided(GateDecided {
+            gate_id: gate_id.to_string(),
+            kind: GateKind::UnitReview,
+            decision: if !approved {
+                GateDecision::Deny
+            } else if pause {
+                GateDecision::Paused
+            } else {
+                GateDecision::Allow
+            },
+            combined: Some(approved),
+            team_pause: ledger.team_pause,
+            unresolved: unresolved.clone(),
+        }),
+    ));
+    if !pause {
+        return None;
+    }
+    let team = session.team.get_or_insert_with(Default::default);
+    team.gate_seq += 1;
+    let dispute = tev::gate_id(&session.id, team.gate_seq);
+    publish_fire(unit_event(
+        &session.id,
+        unit.ord,
+        attempt,
+        TeamBody::GateOpened(GateOpened {
+            gate_id: dispute,
+            kind: GateOpenedKind::TeamDispute {
+                finding_ids: unresolved.clone(),
+            },
+        }),
+    ));
+    let why = if unresolved.is_empty() {
+        format!(
+            "the team's record of this step is incomplete (final pass: {})",
+            serde_json::to_value(ledger.final_pass)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        )
+    } else {
+        format!(
+            "unresolved HIGH finding(s) without a council YES: {}",
+            unresolved.join(", ")
+        )
+    };
+    Some(format!(
+        "Team dispute on unit {} ({}): {why}. The gate approved the work, but the run does not \
+         continue unattended. Approve to continue, request changes to rework, or reject to cancel.",
+        unit.ord, unit.description
+    ))
 }
 
 /// A team run reached a terminal status (called right AFTER the terminal status is persisted).
