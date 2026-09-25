@@ -556,10 +556,6 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
 /// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
 /// than its own claim) — a claim after the row means that step's boundary read it.
 fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
-    // T6 RED: the team's answers are not rendered yet.
-    if !claimed.run_id.is_empty() {
-        return String::new();
-    }
     let later_claim = |event_id: i64| {
         rows.iter().any(|r| {
             r.event_id > event_id
@@ -721,8 +717,7 @@ fn snapshot(
 /// unanswered (the council path), a missing question is simply not answered, and a missing review
 /// is read from the same output by the engine.
 fn publish_turn_lines(claimed: &Claimed, output: &StepOutput) {
-    // T6 RED: the PA's lines are not published yet.
-    if !claimed.run_id.is_empty() || output.status != StepStatus::Ok {
+    if output.status != StepStatus::Ok {
         return;
     }
     let publish = |ev: TeamEvent| {

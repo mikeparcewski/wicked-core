@@ -1452,9 +1452,10 @@ fn t5_row5_a_failed_step_claimed_unteams_the_attempt_through_the_engine() {
 use crate::team::supervisor::tests::{FakeCouncil, FakeHost};
 use crate::team::supervisor::{Council, CouncilOutcome};
 
-/// A T6 bound: the supervisor folds long before it; the worker returns as soon as the fold lands.
+/// A T6 bound: the supervisor folds long before it; the worker returns as soon as the fold lands
+/// (generous for slow CI hosts: only a stuck fold waits it out).
 fn t6_cfg(rig: &Rig) -> TeamConfig {
-    fast(rig).with_final_pass_budget(Duration::from_secs(20))
+    fast(rig).with_final_pass_budget(Duration::from_secs(90))
 }
 
 /// An engine with the team supervisor on the bus (injected host and council).
@@ -2377,4 +2378,128 @@ fn t6_an_amend_with_no_creator_to_rerun_is_refused_and_the_dispute_stays_open() 
     assert_eq!(status(&e, "t6anc"), Some(SessionStatus::AwaitingHuman));
     e.core.confirm_gate("t6anc", approve(None)).unwrap();
     wait_status(&e, "t6anc", SessionStatus::Completed);
+}
+
+/// Edit a stopped engine's store: `f` over the run's session and its units.
+fn edit_store(
+    db: &str,
+    run: &str,
+    f: impl FnOnce(&mut crate::domain::AgentSession, &mut Vec<crate::domain::WorkUnit>),
+) {
+    let mut store = wicked_apps_core::open_store_any(Some(db)).expect("store opens");
+    let mut s = crate::domain::get_session(&store, run).unwrap().unwrap();
+    let mut units = crate::domain::session_units(&store, run).unwrap();
+    f(&mut s, &mut units);
+    crate::domain::put_node(&mut store, s.to_node()).unwrap();
+    for u in &units {
+        crate::domain::put_node(&mut store, u.to_node()).unwrap();
+    }
+}
+
+/// Restart between the fold and the `team_dispute` pause (the unit is done, its ledger pauses, and
+/// no gate was opened): the resumed run opens the dispute instead of passing the unit.
+#[test]
+fn t6_restart_between_the_fold_and_the_dispute_pause_reopens_the_dispute() {
+    let rig = rig("t6-owed-d");
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    {
+        let core = Core::spawn_with_engine_team(
+            db.clone(),
+            Arc::new(StubDispatcher),
+            Arc::new(RaisingRunner {
+                bus: rig.team_bus(),
+                on_ix: 0,
+            }),
+            fast(&rig),
+        );
+        let e = Engine {
+            events: core.subscribe(),
+            core,
+            runner: Arc::new(CountingRunner::default()),
+            db: db.clone(),
+        };
+        launch_team(&e, "t6od");
+        wait_status(&e, "t6od", SessionStatus::AwaitingHuman);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // The state a crash between the fold's unit write and the pause leaves behind.
+    edit_store(&db, "t6od", |s, _| {
+        s.status = SessionStatus::Executing;
+        if let Some(t) = s.team.as_mut() {
+            t.dispute = None;
+        }
+    });
+    let e = engine_on(&db, fast(&rig));
+    e.core.resume_run("t6od").unwrap();
+    wait_status(&e, "t6od", SessionStatus::AwaitingHuman);
+    assert!(awaiting_kinds(&drain_events(&e), "t6od")
+        .iter()
+        .any(|k| k == "team_dispute"));
+    assert_eq!(
+        e.runner.0.load(AtomicOrdering::SeqCst),
+        0,
+        "the unit is not re-run"
+    );
+    e.core.confirm_gate("t6od", approve(None)).unwrap();
+    wait_status(&e, "t6od", SessionStatus::Completed);
+}
+
+/// Restart between a member's fold and the PA's review (the unit is done, not counted, and no
+/// review is under way): the resumed run dispatches the PA's review — the member's work is not
+/// re-run and the step does not count on its own.
+#[test]
+fn t6_restart_between_a_members_fold_and_the_review_dispatches_the_review() {
+    let (rig, e, _worker, _) = member_engine(
+        "t6-owed-r",
+        |_| "STEP write: ACCEPT — ok".into(),
+        |_, _| Ok("DONE".into()),
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6or");
+    wait_status(&e, "t6or", SessionStatus::Completed);
+    let db = e.db.clone();
+    drop(e);
+    std::thread::sleep(Duration::from_millis(300));
+    // The run never ended in the state being reconstructed: no `path.ended` on the bus or record.
+    rig.conn()
+        .execute(
+            "DELETE FROM events WHERE event_type = ?1",
+            [tev::PATH_ENDED],
+        )
+        .unwrap();
+    edit_store(&db, "t6or", |s, units| {
+        s.status = SessionStatus::Executing;
+        s.finished_at = None;
+        if let Some(t) = s.team.as_mut() {
+            t.ended = false;
+        }
+        let ix = units.iter().position(|u| u.ord == WRITE).unwrap();
+        s.unit_ix = ix;
+        let ms = units[ix].member_step.as_mut().unwrap();
+        ms.counted = false;
+        ms.reviewing = None;
+        ms.reviews.clear();
+        for u in units.iter_mut().skip(ix + 1) {
+            u.status = crate::domain::UnitStatus::Pending;
+        }
+    });
+    let worker = MemberRunner::new(|_| "STEP write: ACCEPT — ok".into());
+    let e2 = supervised(
+        &rig,
+        &db,
+        worker.clone(),
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        false,
+    );
+    e2.core.resume_run("t6or").unwrap();
+    wait_status(&e2, "t6or", SessionStatus::Completed);
+    let runs = worker.inputs(WRITE);
+    assert_eq!(runs.len(), 1, "only the PA's review ran");
+    assert!(runs[0]
+        .unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some()));
+    assert!(unit_view(&e2, "t6or", WRITE).member_step.unwrap().counted);
 }

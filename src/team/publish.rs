@@ -1134,6 +1134,9 @@ pub struct LiveTeamRun {
     pub run_id: String,
     pub status: crate::domain::SessionStatus,
     pub team: crate::domain::RunTeamState,
+    /// (T6) The run's seats (`AgentSession::clis`; the first is the PA): the supervisor's member
+    /// candidates even when the run's `path.started` has aged off the bus.
+    pub roster: Vec<String>,
 }
 
 /// Build the read view for a team run (`None` for a run that is not a team run).

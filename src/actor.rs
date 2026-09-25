@@ -3453,6 +3453,7 @@ pub(crate) fn run(
                                 run_id: s.id,
                                 status: s.status,
                                 team,
+                                roster: s.clis,
                             })
                         })
                         .collect()
@@ -4263,11 +4264,44 @@ fn redrive_executing_sessions(
         let mut advanced = false;
         while units
             .get(sess.unit_ix)
-            .map(|u| u.status == crate::domain::UnitStatus::Done)
+            .map(|u| {
+                u.status == crate::domain::UnitStatus::Done
+                    // (T6) a done unit that still owes its review or its team_dispute pause is
+                    // not skipped: it gets that step below.
+                    && team_gate::owed_team_step(&sess, u).is_none()
+            })
             .unwrap_or(false)
         {
             sess.unit_ix += 1;
             advanced = true;
+        }
+        if let Some(step) = units
+            .get(sess.unit_ix)
+            .and_then(|u| team_gate::owed_team_step(&sess, u))
+        {
+            if let Err(e) = put_node(store, sess.to_node()) {
+                emit_run_error(subscribers, &run_id, e);
+                continue;
+            }
+            let ix = sess.unit_ix;
+            let mut act = team_gate::Act {
+                store: &mut *store,
+                subscribers: &mut *subscribers,
+                runner,
+                self_tx,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            };
+            match team_gate::run_owed_step(&mut act, sess, ix, step) {
+                Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
+                    in_flight.insert(run_id);
+                }
+                Ok(_) => {}
+                Err(e) => emit_run_error(subscribers, &run_id, e),
+            }
+            continue;
         }
         // Mint a fresh idempotency key (findings #1 + #2/#3) and persist BEFORE dispatch (dispatch
         // reads `attempt` from the store). (DES-L1 PR-1B) Keyed on the cursor unit's OWN history
@@ -5537,9 +5571,7 @@ fn apply_step_result(
     // (T6, DES-001 #13) The fold withholds `gateDecided{allow:true}` + `unitDone` for a unit that
     // may not count yet: a teamed unit whose ledger pauses (its `team_dispute` answer emits them),
     // and a member's work (the PA's review, or a council, counts it). A DENY is emitted as ever.
-    // T6 RED: nothing is withheld yet.
-    let withhold = run_id.is_empty()
-        && team_review.is_some()
+    let withhold = team_review.is_some()
         && unit
             .team
             .as_ref()
@@ -6415,6 +6447,23 @@ fn advance_or_pause(
         }
         return Ok(Progress::Done);
     };
+
+    // DES-TEAMING-002 T6: a DONE cursor unit that still owes a team step (a restart between the
+    // fold's unit write and the review / pause that follows it) gets that step — never a
+    // re-dispatch of its work, never a silent pass.
+    if let Some(step) = team_gate::owed_team_step(&session, unit) {
+        let mut act = team_gate::Act {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        return team_gate::run_owed_step(&mut act, session, unit_ix, step);
+    }
 
     // DES-TEAMING-002 P1: a team run's required transitions come first — `path.started` before
     // its first dispatch, `plan.accepted` before the plan's first unit — ahead of any human gate,

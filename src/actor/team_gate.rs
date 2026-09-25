@@ -1473,10 +1473,6 @@ pub(super) fn answer_dispute_gate(
     decision: crate::workflow::HumanDecision,
 ) -> anyhow::Result<SessionStatus> {
     let run_id = session.id.clone();
-    // T6 RED: the team_dispute answer is not built yet.
-    if !run_id.is_empty() {
-        anyhow::bail!("T6: the team_dispute answer is not built");
-    }
     let Some(d) = session.team.as_ref().and_then(|t| t.dispute.clone()) else {
         anyhow::bail!("run {run_id} is not paused team_dispute");
     };
@@ -1554,13 +1550,20 @@ fn resume_dispute(act: &mut Act<'_>, mut session: AgentSession) -> anyhow::Resul
     let Some(d) = session.team.as_mut().and_then(|t| t.dispute.take()) else {
         anyhow::bail!("run {run_id}: no team_dispute gate on record to resume");
     };
-    session.status = SessionStatus::Executing;
-    put_node(act.store, session.to_node())?;
     let units = crate::domain::session_units(act.store, &run_id)?;
     let ix = units
         .iter()
         .position(|u| u.ord == d.ord)
         .ok_or_else(|| anyhow::anyhow!("run {run_id}: no unit {} to resume", d.ord))?;
+    session.status = SessionStatus::Executing;
+    let counts_now = d.kind == crate::domain::DisputeKind::Finding && !is_member_work(&units[ix]);
+    if counts_now {
+        // The unit counts: the cursor leaves it in the SAME write that clears the dispute, so a
+        // restart never finds a done unit with a pausing ledger at the cursor and no gate open.
+        session.unit_ix = ix + 1;
+        session.attempt = units.get(ix + 1).map(next_attempt).unwrap_or(0);
+    }
+    put_node(act.store, session.to_node())?;
     emit(
         act.subscribers,
         CoreEvent::Resumed {
@@ -1570,11 +1573,22 @@ fn resume_dispute(act: &mut Act<'_>, mut session: AgentSession) -> anyhow::Resul
     );
     match d.kind {
         crate::domain::DisputeKind::Finding => {
-            if is_member_work(&units[ix]) {
+            if !counts_now {
                 return enter_review(act, &run_id, ix, d.attempt);
             }
             emit_counted(act, &run_id, d.ord);
-            advance_past(act, &run_id, ix)
+            advance_or_pause(
+                act.store,
+                act.subscribers,
+                act.runner,
+                act.self_tx,
+                &run_id,
+                ix + 1,
+                act.lifecycle_maps,
+                act.actor_maps,
+                act.process_gen,
+                act.is_acp,
+            )
         }
         crate::domain::DisputeKind::MemberStep => {
             accept_member_step(act, &run_id, ix, Some("a human approved it".into()))
@@ -1708,7 +1722,78 @@ pub(super) fn is_member_work(u: &WorkUnit) -> bool {
         && u.owner == crate::workflow::StepOwner::Team
         && u.member_step
             .as_ref()
-            .is_some_and(|m| !m.replanned && m.reviewing.is_none())
+            .is_some_and(|m| !m.replanned && !m.counted && m.reviewing.is_none())
+}
+
+/// The team step a DONE cursor unit still owes (a restart between the fold's unit write and the
+/// step that follows it): the PA's review of a member's work, or the `team_dispute` pause its
+/// ledger calls for. Never skipped as "done": a restart can neither count a member's step nor
+/// continue past an unresolved HIGH. `None` for every other unit.
+pub(super) fn owed_team_step(session: &AgentSession, u: &WorkUnit) -> Option<OwedStep> {
+    if u.status != crate::domain::UnitStatus::Done || !u.team_run {
+        return None;
+    }
+    let ledger_pauses = u
+        .team
+        .as_ref()
+        .filter(|t| t.transport == Transport::Bus)
+        .map(|t| t.ledger.as_ref().is_none_or(|l| l.team_pause));
+    let open = session.team.as_ref().is_some_and(|t| t.dispute.is_some());
+    let counted = u.member_step.as_ref().is_some_and(|m| m.counted);
+    if ledger_pauses == Some(true) && !open && !counted {
+        return Some(OwedStep::Dispute);
+    }
+    is_member_work(u).then_some(OwedStep::Review)
+}
+
+/// See [`owed_team_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwedStep {
+    Review,
+    Dispute,
+}
+
+/// Perform the team step a done cursor unit owes ([`owed_team_step`]).
+pub(super) fn run_owed_step(
+    act: &mut Act<'_>,
+    mut session: AgentSession,
+    ix: usize,
+    step: OwedStep,
+) -> anyhow::Result<Progress> {
+    let run_id = session.id.clone();
+    let units = crate::domain::session_units(act.store, &run_id)?;
+    let unit = units[ix].clone();
+    let attempt = unit.last_attempt.unwrap_or(session.attempt);
+    match step {
+        OwedStep::Review => enter_review(act, &run_id, ix, attempt),
+        OwedStep::Dispute => {
+            let finding_ids: Vec<String> = unit
+                .team
+                .as_ref()
+                .and_then(|t| t.ledger.as_ref())
+                .map(|l| {
+                    tev::unresolved_highs(l)
+                        .iter()
+                        .map(|f| f.finding.finding_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            open_dispute(
+                act,
+                &mut session,
+                unit.ord,
+                attempt,
+                crate::domain::DisputeKind::Finding,
+                format!(
+                    "Team dispute on unit {} ({}): the gate approved the work, but its team \
+                     record does not let the run continue unattended (restored after a restart). \
+                     Approve to continue, request changes to rework, or reject to cancel.",
+                    unit.ord, unit.description
+                ),
+                finding_ids,
+            )
+        }
+    }
 }
 
 /// Whether `u`'s current attempt is the PA's review of a member's step.
@@ -1758,11 +1843,6 @@ pub(super) fn enter_review(
     ix: usize,
     member_attempt: u32,
 ) -> anyhow::Result<Progress> {
-    // T6 RED: the PA's review is not built yet: the member's work counts as it stands.
-    if !run_id.is_empty() {
-        let _ = member_attempt;
-        return advance_past(act, run_id, ix);
-    }
     let mut session = crate::domain::get_session(act.store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let mut units = crate::domain::session_units(act.store, run_id)?;
@@ -1808,6 +1888,7 @@ fn accept_member_step(
     let ord = unit.ord;
     if let Some(ms) = unit.member_step.as_mut() {
         ms.reviewing = None;
+        ms.counted = true;
         if let Some(t) = ms.work_team.take() {
             unit.team = Some(t);
         }

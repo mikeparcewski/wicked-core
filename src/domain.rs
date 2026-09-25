@@ -357,6 +357,11 @@ pub struct MemberStepState {
     /// Every review of this step, in order (the durable record beside the bus rows).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviews: Vec<crate::team::StepReviewRecord>,
+    /// The step COUNTS (the PA accepted it, a council said YES, or a human approved it) — set in
+    /// the same write that marks the unit done, so a restart between that write and the cursor's
+    /// advance never sends a counted step back to review.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counted: bool,
 }
 
 /// A unit's team snapshot (DES-TEAMING-002 §4.4, §4.8 rows 1/5/6/7, §8.11): what the unit's team

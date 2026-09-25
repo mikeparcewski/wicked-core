@@ -2780,7 +2780,11 @@ mod tests {
             ["monitor", "Finding"],
         ] {
             let quoted = format!("\"{}\"", tag.concat());
-            assert_eq!(src.matches(&quoted).count(), 0, "{quoted} still in event.rs");
+            assert_eq!(
+                src.matches(&quoted).count(),
+                0,
+                "{quoted} still in event.rs"
+            );
         }
     }
 }

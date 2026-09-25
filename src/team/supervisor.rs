@@ -998,7 +998,7 @@ pub enum Job {
 
 /// The supervisor's state over every armed run.
 pub struct SupervisorCore {
-    cfg: SupervisorConfig,
+    pub(crate) cfg: SupervisorConfig,
     runs: HashMap<String, RunState>,
     units: HashMap<UnitKey, Arc<Mutex<UnitTeam>>>,
     host: Arc<dyn MonitorHost>,
@@ -1006,8 +1006,6 @@ pub struct SupervisorCore {
     pub_: Publisher,
     /// Runs whose rows arrived while they were not armed, and when the engine was last asked.
     unknown: HashMap<String, Option<Instant>>,
-    /// Runs the engine does not list as live (ignored until they end).
-    ignored: HashSet<String>,
     /// Runs whose `path.ended` was seen.
     ended: HashSet<String>,
     /// Help questions already taken (`help_id`).
@@ -1029,7 +1027,6 @@ impl SupervisorCore {
             council,
             pub_,
             unknown: HashMap::new(),
-            ignored: HashSet::new(),
             ended: HashSet::new(),
             helped: HashSet::new(),
         }
@@ -1040,19 +1037,17 @@ impl SupervisorCore {
         let Some(floor) = run.team.stream_floor else {
             return;
         };
-        self.ignored.remove(&run.run_id);
         self.unknown.remove(&run.run_id);
         self.runs.entry(run.run_id.clone()).or_insert(RunState {
             floor,
+            // The engine's own record of the seats (the PA first): the members' candidates even
+            // when `path.started` has aged off the bus. `path.started`, when read, restates them.
+            pa: run.roster.first().cloned().unwrap_or_default(),
+            roster: run.roster.clone(),
             // Unknown until `path.started` is read: a missing one is the gap (§4.7).
             gap: true,
             ..Default::default()
         });
-    }
-
-    /// Whether `run_id` is armed.
-    pub fn armed(&self, run_id: &str) -> bool {
-        self.runs.contains_key(run_id)
     }
 
     /// The runs armed but not yet read from their floor, with their floors.
@@ -1067,17 +1062,12 @@ impl SupervisorCore {
     /// it). Returns the jobs the row makes due. Idempotent: rows are applied by entity id, so a
     /// row seen both in replay and live changes nothing the second time.
     pub fn on_row(&mut self, row: &TeamRow, replay: bool) -> Vec<Job> {
-        // T6 RED: the supervisor on the bus is not built yet.
-        if !row.event.env.run_id.is_empty() {
-            return Vec::new();
-        }
         let run_id = row.event.env.run_id.clone();
         let env = row.event.env.clone();
         if let TeamBody::PathStarted(b) = &row.event.body {
             if self.ended.contains(&run_id) {
                 return Vec::new();
             }
-            self.ignored.remove(&run_id);
             self.unknown.remove(&run_id);
             let st = self.runs.entry(run_id.clone()).or_default();
             if st.floor == 0 || row.event_id <= st.floor {
@@ -1089,7 +1079,9 @@ impl SupervisorCore {
             return Vec::new();
         }
         if !self.runs.contains_key(&run_id) {
-            if !self.ignored.contains(&run_id) && !self.ended.contains(&run_id) {
+            // Asked about (rate-limited, `ARM_RETRY`) until the engine lists it or it ends: a
+            // run resumed from a pause starts publishing again and is armed then.
+            if !self.ended.contains(&run_id) {
                 self.unknown.entry(run_id).or_insert(None);
             }
             return Vec::new();
@@ -1116,7 +1108,10 @@ impl SupervisorCore {
                     return Vec::new();
                 };
                 let st = self.runs.get_mut(&run_id).expect("armed");
-                let live = !replay || env.at >= boot_ms;
+                // Live = claimed by THIS process (its runner is alive to wait for a fold): the
+                // claim's own time against this boot, never whether the row was read in replay —
+                // a claim from before the boot is dead however late the tail was read.
+                let live = env.at >= boot_ms;
                 let seen = st.attempts.entry(k).or_default();
                 if seen.claimed_id != 0 {
                     return Vec::new();
@@ -1201,16 +1196,37 @@ impl SupervisorCore {
                     return Vec::new();
                 }
                 seen.completed = true;
-                if !seen.live {
+                // An attempt of this process whose claim the supervisor never read (it cannot
+                // happen with a whole stream) still gets a fold — `stream_gap`, which pauses —
+                // rather than none, so its runner is not left to its timeout.
+                let unseen = seen.claimed_id == 0 && env.at >= boot_ms;
+                if !seen.live && !unseen {
                     return Vec::new();
                 }
                 let claimed_id = seen.claimed_id;
                 let uk = (run_id.clone(), k.0, k.1);
-                let Some(unit) = self.units.remove(&uk) else {
-                    return Vec::new();
+                let unit = match self.units.remove(&uk) {
+                    Some(u) => u,
+                    None if unseen => Arc::new(Mutex::new(UnitTeam::new(
+                        AttachCtx {
+                            run_id: run_id.clone(),
+                            ord: k.0,
+                            attempt: k.1,
+                            creator: env.by.clone(),
+                            plan: TeamPlan::default(),
+                            repo: None,
+                            baseline_tree: None,
+                            criterion: String::new(),
+                            phase: String::new(),
+                            step_id: b.step_id.clone(),
+                            code_graph_db: None,
+                        },
+                        self.pub_.clone(),
+                    ))),
+                    None => return Vec::new(),
                 };
-                let gap =
-                    st.gap && k.1 > 0 && !st.attempts.keys().any(|(o, a)| *o == k.0 && *a < k.1);
+                let gap = unseen
+                    || st.gap && k.1 > 0 && !st.attempts.keys().any(|(o, a)| *o == k.0 && *a < k.1);
                 return vec![Job::FinalPass(Box::new(FinalPassJob {
                     unit,
                     ok: b.status == StepCompletion::Ok,
@@ -1279,7 +1295,9 @@ impl SupervisorCore {
         let carried: Vec<(u32, Envelope, FindingRaised)> = st
             .attempts
             .iter()
-            .filter(|((o, a), s)| *o == k.0 && *a < k.1 && !s.live && !s.folded)
+            // Any dead earlier attempt of the unit, folded or not: a fold the dead process
+            // published may never have reached its gate.
+            .filter(|((o, a), s)| *o == k.0 && *a < k.1 && !s.live)
             .flat_map(|((_, a), s)| s.unresolved().into_iter().map(move |(e, f)| (*a, e, f)))
             .collect();
         let _ = claimed_id;
@@ -2466,10 +2484,18 @@ pub fn spawn(
             .ok();
     }
     let stop_t = Arc::clone(&stop);
-    let thread = std::thread::Builder::new()
+    let thread = match std::thread::Builder::new()
         .name(SUPERVISOR_THREAD.into())
         .spawn(move || run(cfg, host, council, live, stop_t))
-        .ok();
+    {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // Loud: without a supervisor no attempt is folded; every teamed gate waits out its
+            // budget and synthesizes its fail-closed ledger (T5).
+            eprintln!("wicked-core: the team supervisor did not start ({e})");
+            None
+        }
+    };
     SupervisorHandle { stop, thread }
 }
 
@@ -2498,7 +2524,7 @@ fn run(
             eprintln!("wicked-core: team supervisor: the live runs could not be read ({e:#})")
         }
     }
-    let mut cursor = replay(&mut core, &bus_db, tail, None);
+    let (mut cursor, replayed) = replay(&mut core, &bus_db, tail, None);
     let spawn_job = |job: Job, core: &SupervisorCore, back: &Sender<Back>| match job {
         Job::Batch(b) => {
             let (host, back) = (core.host(), back.clone());
@@ -2521,6 +2547,9 @@ fn run(
                 .spawn(move || run_help(&h, &*host, &bus));
         }
     };
+    for job in replayed {
+        spawn_job(job, &core, &back_tx);
+    }
     while !stop.load(Ordering::SeqCst) {
         // The live tail: every row read advances the cursor, whatever run it belongs to.
         match BusDb::shared(&bus_db).and_then(|db| db.poll(TEAM_FILTER, cursor, READ_BATCH)) {
@@ -2552,12 +2581,6 @@ fn run(
                         spawn_job(job, &core, &back_tx);
                     }
                 }
-                for r in &due {
-                    if !core.armed(r) {
-                        core.ignored.insert(r.clone());
-                        core.unknown.remove(r);
-                    }
-                }
             }
         }
         core.retry_spooled();
@@ -2576,8 +2599,26 @@ fn run(
 }
 
 /// §4.7 step 3: read every armed run's rows from the lowest floor up to `tail`, as history.
-/// Returns the cursor to tail from.
-fn replay(core: &mut SupervisorCore, bus_db: &str, tail: i64, only: Option<&str>) -> i64 {
+/// Returns the cursor to tail from, and the jobs a row of THIS process's own attempts made due
+/// (a claim or a completion that landed before the tail was read).
+fn replay(
+    core: &mut SupervisorCore,
+    bus_db: &str,
+    tail: i64,
+    only: Option<&str>,
+) -> (i64, Vec<Job>) {
+    let mut jobs = Vec::new();
+    let cursor = replay_into(core, bus_db, tail, only, &mut jobs);
+    (cursor, jobs)
+}
+
+fn replay_into(
+    core: &mut SupervisorCore,
+    bus_db: &str,
+    tail: i64,
+    only: Option<&str>,
+    jobs: &mut Vec<Job>,
+) -> i64 {
     let floors = core.floors();
     let Some(from) = floors
         .iter()
@@ -2619,8 +2660,9 @@ fn replay(core: &mut SupervisorCore, bus_db: &str, tail: i64, only: Option<&str>
                 event_id: ev.event_id,
                 event,
             };
-            // Replay starts nothing for history (no batches, no final passes, no help turns).
-            let _ = core.on_row(&row, true);
+            // History starts nothing (a dead attempt is neither monitored nor folded); a row of
+            // this process's own attempt is live however it was read.
+            jobs.extend(core.on_row(&row, true));
         }
         if n < READ_BATCH {
             break;

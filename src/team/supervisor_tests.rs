@@ -234,9 +234,11 @@ pub(crate) fn sup_cfg(rig: &Rig) -> SupervisorConfig {
             max_batches: MAX_BATCHES_FOR_TESTS,
             diff_cap: super::super::DIFF_CAP,
             monitor_turn_budget: Duration::from_secs(20),
-            final_pass_budget: Duration::from_secs(30),
+            final_pass_budget: Duration::from_secs(120),
         },
-        final_pass_budget: Duration::from_secs(30),
+        // Generous: a pass returns as soon as it is done; only a stuck one waits this long
+        // (slow CI hosts spawn git slowly). Tests of the deadline itself set their own.
+        final_pass_budget: Duration::from_secs(120),
         poll: Duration::from_millis(20),
         max_disputes: MAX_DISPUTES,
         boot_ms: 0,
@@ -865,9 +867,11 @@ fn t6_b_a_restart_between_two_batches_loses_no_finding() {
             stream_floor: Some(floor),
             ..Default::default()
         },
+        roster: vec!["claude#1".into(), "claude#2".into()],
     });
     let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
-    let cursor = replay(&mut b, &h.rig.bus, tail, None);
+    let (cursor, jobs) = replay(&mut b, &h.rig.bus, tail, None);
+    assert!(jobs.is_empty(), "history starts nothing");
     h.core = b;
     h.host = host_b;
     h.cursor = cursor;
@@ -1517,6 +1521,7 @@ fn t6_the_thread_replays_a_live_run_then_folds_a_live_attempt() {
                 stream_floor: Some(floor_c),
                 ..Default::default()
             },
+            roster: vec!["claude#1".into(), "claude#2".into()],
         }])
     });
     let mut cfg = sup_cfg(&rig);
@@ -1559,4 +1564,63 @@ fn t6_the_thread_replays_a_live_run_then_folds_a_live_attempt() {
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(handle);
+}
+
+// ── Absence branches (the PR's absence table) ────────────────────────────────────────────────────
+
+/// A claim from before this boot is dead however it is read — here LIVE (as when the spawn's tail
+/// snapshot could not be taken): it is not monitored, and its unaccepted finding is carried into
+/// the unit's next attempt, even though the dead attempt folded (its fold may never have reached
+/// its gate).
+#[test]
+fn liveness_is_the_claims_time_against_boot_never_the_read_mode() {
+    let mut h = Harness::with(
+        "t6-live",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.boot_ms = crate::interaction::now_millis() + 60_000;
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.publish(&fixture_with(tev::FINDING_RAISED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(1);
+        p["raise_seq"] = json!(1);
+    }));
+    h.publish(&fixture_with(tev::LEDGER_FOLDED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(1);
+    }));
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    assert!(h.core.units.is_empty(), "a dead attempt is not watched");
+    assert_eq!(h.host.turn_count(), 0);
+    // The next attempt, claimed by this process.
+    h.core.cfg.boot_ms = 0;
+    h.claim(3, 2, "claude#1");
+    h.pump();
+    let carried: Vec<Value> = h
+        .rows(tev::FINDING_RAISED)
+        .into_iter()
+        .filter(|r| r["attempt"] == 2)
+        .collect();
+    assert_eq!(carried.len(), 1, "{carried:#?}");
+    assert_eq!(carried[0]["carried_from_attempt"], 1);
+}
+
+/// A completion of this process's attempt whose claim the supervisor never read still folds —
+/// `stream_gap`, which pauses — instead of leaving its runner to the timeout.
+#[test]
+fn a_completion_without_a_seen_claim_folds_stream_gap() {
+    let mut h = Harness::new("t6-unseen");
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let l = h.folded(3, 1);
+    assert_eq!(l.final_pass, FinalPass::StreamGap, "{l:?}");
+    assert!(l.team_pause);
 }

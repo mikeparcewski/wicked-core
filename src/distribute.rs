@@ -459,8 +459,7 @@ pub(crate) fn distribute_units_against_benched(
     // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
     // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
     // refused, never quietly handed back to the PA (team runs never fall back to one seat).
-    // T6 RED: member steps are not placed yet.
-    if team_run && session_id.is_empty() {
+    if team_run {
         let pa = clis.first().map(|c| c.key.clone());
         let mut stranded: Vec<u32> = Vec::new();
         for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
