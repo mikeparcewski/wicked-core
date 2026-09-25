@@ -588,6 +588,33 @@ pub struct TeamLedger {
     pub team_pause: bool,
 }
 
+impl TeamLedger {
+    /// The one constructor: `teamPause` is computed from the ledger's own contents
+    /// ([`events::pauses`]), never passed in, so no path can build an unpaused ledger that
+    /// holds an unresolved HIGH. `renderedToJudge` starts false (S6 sets it when it renders).
+    pub fn new(
+        final_pass: FinalPass,
+        monitors: Vec<LedgerMonitor>,
+        findings: Vec<LedgerFinding>,
+        rejected: Rejected,
+    ) -> Self {
+        let team_pause = events::pauses(final_pass, &findings);
+        TeamLedger {
+            final_pass,
+            rendered_to_judge: false,
+            monitors,
+            findings,
+            rejected,
+            team_pause,
+        }
+    }
+
+    /// Recompute `teamPause` after the findings or `finalPass` changed.
+    pub fn refresh_pause(&mut self) {
+        self.team_pause = events::ledger_pauses(self);
+    }
+}
+
 /// What [`FindingBook::admit`] did with a confirmed, above-bar finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admit {
@@ -1048,32 +1075,31 @@ impl UnitTeam {
 
     /// The ledger as it stands.
     pub fn ledger(&self, final_pass: FinalPass) -> TeamLedger {
-        TeamLedger {
+        let monitors = self
+            .monitors
+            .iter()
+            .map(|m| LedgerMonitor {
+                monitor_id: m.id.clone(),
+                seat: m.seat.clone(),
+                batches: m.batches,
+                status: if m.state == SlotState::Failed {
+                    MonitorStatus::Failed
+                } else if m.budget_exhausted {
+                    MonitorStatus::BudgetExhausted
+                } else if m.timed_out {
+                    MonitorStatus::TimedOut
+                } else {
+                    MonitorStatus::Completed
+                },
+                error: m.error.clone(),
+            })
+            .collect();
+        TeamLedger::new(
             final_pass,
-            rendered_to_judge: false,
-            monitors: self
-                .monitors
-                .iter()
-                .map(|m| LedgerMonitor {
-                    monitor_id: m.id.clone(),
-                    seat: m.seat.clone(),
-                    batches: m.batches,
-                    status: if m.state == SlotState::Failed {
-                        MonitorStatus::Failed
-                    } else if m.budget_exhausted {
-                        MonitorStatus::BudgetExhausted
-                    } else if m.timed_out {
-                        MonitorStatus::TimedOut
-                    } else {
-                        MonitorStatus::Completed
-                    },
-                    error: m.error.clone(),
-                })
-                .collect(),
-            findings: self.book.findings.clone(),
-            rejected: self.book.rejected,
-            team_pause: false,
-        }
+            monitors,
+            self.book.findings.clone(),
+            self.book.rejected,
+        )
     }
 }
 

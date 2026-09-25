@@ -1178,9 +1178,16 @@ pub fn unresolved_highs(ledger: &TeamLedger) -> Vec<&LedgerFinding> {
 /// An incomplete record (`stream_gap`) pauses too: it goes to a human, never auto-approved
 /// (DES-002 §4.7).
 pub fn ledger_pauses(ledger: &TeamLedger) -> bool {
-    ledger.final_pass == FinalPass::StreamGap
-        || unresolved_highs(ledger)
+    pauses(ledger.final_pass, &ledger.findings)
+}
+
+/// [`ledger_pauses`] over a ledger's parts: THE one place the rule lives. `TeamLedger::new` and
+/// `TeamLedger::refresh_pause` are its only writers of `teamPause`.
+pub fn pauses(final_pass: FinalPass, findings: &[LedgerFinding]) -> bool {
+    final_pass == FinalPass::StreamGap
+        || findings
             .iter()
+            .filter(|f| is_unresolved_high(f))
             .any(|f| f.dispute.as_ref().is_none_or(|d| d.verdict != Verdict::Yes))
 }
 
@@ -1371,16 +1378,12 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
     } else {
         FinalPass::Completed
     };
-    let mut ledger = TeamLedger {
+    TeamLedger::new(
         final_pass,
-        rendered_to_judge: false,
-        monitors: monitors.into_iter().map(MonitorAcc::into_ledger).collect(),
-        findings: findings.into_iter().map(FindingAcc::into_ledger).collect(),
-        rejected: Default::default(),
-        team_pause: false,
-    };
-    ledger.team_pause = ledger_pauses(&ledger);
-    ledger
+        monitors.into_iter().map(MonitorAcc::into_ledger).collect(),
+        findings.into_iter().map(FindingAcc::into_ledger).collect(),
+        Default::default(),
+    )
 }
 
 /// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every unaccepted HIGH
@@ -1403,7 +1406,7 @@ pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
             f.dispute = Some(no_verdict(NoVerdictReason::Timeout));
         }
     }
-    ledger.team_pause = ledger_pauses(&ledger);
+    ledger.refresh_pause();
     ledger
 }
 
