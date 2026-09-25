@@ -367,10 +367,11 @@ pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
     per_run_def_run_id(def_id) == Some(session_id)
 }
 
-/// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4) — with the launch
-/// plan's optional `touch` and `override` (`plan: {steps, touch?, override?}`). `deny_unknown_fields`
-/// so a misspelled key is refused at parse, never silently dropped. [`compose`] reads `steps`
-/// only; [`floor_fill`] reads all three.
+/// A plan's ordered steps (§8.4's `steps[]`) with its optional `touch` and `override`: the
+/// library contract [`compose`] and [`floor_fill`] consume. No launch path carries it yet —
+/// `LaunchSpec` and the napi launch options name only a `workflow`; wiring a plan into a launch
+/// is seam T3. `deny_unknown_fields` so a misspelled key is refused at parse, never silently
+/// dropped. [`compose`] reads `steps` only; [`floor_fill`] reads all three.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanSteps {
@@ -1960,6 +1961,54 @@ mod tests {
         );
     }
 
+    /// codex on #619 round 5 (HIGH): an evaluator with no explicit `depends_on`, no creator
+    /// before it and a creator after it would run blind before the work it evaluates; compose
+    /// refuses it by name and never reorders. No creator anywhere stays legal (a review of
+    /// existing code), and an explicit `depends_on` still wins.
+    #[test]
+    fn compose_refuses_an_evaluator_before_its_creator() {
+        let c = |v: serde_json::Value| {
+            let plan: PlanSteps = serde_json::from_value(v).unwrap();
+            compose(crate::catalog::catalog(), &plan)
+        };
+        let r = c(serde_json::json!({"steps": [
+            {"catalog": "test", "id": "test"},
+            {"catalog": "build", "id": "build"}
+        ]}))
+        .unwrap_err();
+        assert_eq!(r.reason(), "evaluator_precedes_creator", "{r}");
+        assert_eq!(
+            r.to_string(),
+            "evaluator_precedes_creator: test evaluates work that is produced later (build); \
+             move it after the creator"
+        );
+        // A produce creator later trips it the same way, naming the first later creator.
+        let r = c(serde_json::json!({"steps": [
+            {"catalog": "critique", "id": "crit"},
+            {"catalog": "produce", "id": "draft"},
+            {"catalog": "produce", "id": "draft-2"}
+        ]}))
+        .unwrap_err();
+        assert!(r.to_string().contains("(draft)"), "{r}");
+        // No creator anywhere: legal, with no inputs.
+        let def = c(serde_json::json!({"steps": [{"catalog": "review", "id": "review"}]})).unwrap();
+        assert!(def.phases[0].depends_on.is_empty());
+        // An explicit depends_on wins, even [].
+        c(serde_json::json!({"steps": [
+            {"catalog": "test", "id": "test", "depends_on": []},
+            {"catalog": "build", "id": "build"}
+        ]}))
+        .unwrap();
+        // A creator before AND after: the evaluator depends on the earlier one, as before.
+        let def = c(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "a"},
+            {"catalog": "review", "id": "review"},
+            {"catalog": "build", "id": "b"}
+        ]}))
+        .unwrap();
+        assert_eq!(def.phases[1].depends_on, ["a"]);
+    }
+
     // ── T2 (DES-TEAMING-002 §8.5): floor fill ─────────────────────────────────────────────
 
     mod floor_fill_t2 {
@@ -2386,9 +2435,10 @@ mod tests {
             assert_eq!(r.reason(), "override_removes_pinned", "{r}");
         }
 
-        /// T2 (g), the plan half: `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch`
-        /// omitted or `[]` parses, has a creator, and at the no-scope score (100) gets the 70-100
-        /// floor and high risk; `understand` alone has no creator.
+        /// T2 (g), the library half: a `PlanSteps` of `[{catalog:"build"}]` with `touch` omitted
+        /// or `[]` parses, has a creator, and at the no-scope score (100) gets the 70-100 floor and
+        /// high risk; `understand` alone has no creator. The `POST /runs {plan}` launch and its
+        /// `plan_approval` pause are seam T3.
         #[test]
         fn t2_g_touch_omitted_empty_declared_and_read_only() {
             for body in [
