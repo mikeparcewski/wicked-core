@@ -200,6 +200,9 @@ pub(crate) struct Thresholds {
     pub model_bonus_max: u8,
     /// `(min score, plan)`, ascending.
     pub bands: &'static [(u8, ReviewPlan)],
+    /// The floor of each band (DES-TEAMING-002 §8.5): one row per [`Thresholds::bands`] row, in
+    /// the same order, so the monitor count, the floor and the high-risk rule are tuned together.
+    pub floors: &'static [FloorRow],
     /// File extensions that are prose.
     pub docs_exts: &'static [&'static str],
     /// File extensions that are configuration.
@@ -218,6 +221,28 @@ pub(crate) struct Thresholds {
     /// A symbol whose name starts with one of these is a test, wherever it lives.
     pub test_name_prefixes: &'static [&'static str],
 }
+
+/// One band's floor (DES-TEAMING-002 §8.5): the minimum phase types, in order, and whether the
+/// band is high risk. The phase types are catalog ids (`crate::catalog::CATALOG_IDS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FloorRow {
+    pub phases: &'static [&'static str],
+    pub high_risk: bool,
+}
+
+/// A score's floor, read from [`THRESHOLDS`]: the band it lands in (`"40-69"`), the band's
+/// minimum phase types, and the high-risk rule (§8.5: the band's row says so, OR the change is
+/// destructive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Floor {
+    pub band: String,
+    pub phases: Vec<&'static str>,
+    pub high_risk: bool,
+}
+
+/// The reason an intent score gives a creator plan that declares no touch set (§8.2, §8.4): it
+/// scores `no_graph_score`, S4's fail-closed rule.
+pub(crate) const NO_DECLARED_SCOPE: &str = "no declared scope";
 
 const PLAN_NONE: ReviewPlan = ReviewPlan {
     monitors: 0,
@@ -287,6 +312,32 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
         (20, PLAN_STANDARD),
         (40, PLAN_DEEP),
         (70, PLAN_MOST),
+    ],
+    floors: &[
+        FloorRow {
+            phases: &["build", "deliver"],
+            high_risk: false,
+        },
+        FloorRow {
+            phases: &["build", "review", "deliver"],
+            high_risk: false,
+        },
+        FloorRow {
+            phases: &["test_plan", "design", "build", "review", "deliver"],
+            high_risk: false,
+        },
+        FloorRow {
+            phases: &[
+                "test_plan",
+                "design",
+                "architecture",
+                "build",
+                "review",
+                "security_review",
+                "deliver",
+            ],
+            high_risk: true,
+        },
     ],
     docs_exts: &["md", "mdx", "markdown", "rst", "adoc", "txt"],
     config_exts: &["toml", "json", "yaml", "yml", "lock", "ini", "cfg", "env"],
@@ -363,6 +414,9 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
     ],
     test_name_prefixes: &["test"],
 };
+
+// One floor row per band: a length mismatch is a build error, not a silent missing floor.
+const _: () = assert!(THRESHOLDS.bands.len() == THRESHOLDS.floors.len());
 
 /// Whether the graph at `store` speaks for `base_commit`: ONE rule, the indexed commit IS the base
 /// commit. The diff's old side is the base (`repo::create_worktree_based` checks the run tree out
@@ -487,7 +541,11 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
 
 /// The deterministic score from the table.
 pub(crate) fn impact_score(s: &ImpactSignals) -> Score {
-    let t = &THRESHOLDS;
+    impact_score_in(&THRESHOLDS, s)
+}
+
+/// [`impact_score`] against a given table (a test tunes one value of [`THRESHOLDS`]).
+pub(crate) fn impact_score_in(t: &Thresholds, s: &ImpactSignals) -> Score {
     let mut reasons = Vec::new();
     let mut score: u32 = 0;
     if s.changed_symbols == 0 {
@@ -556,6 +614,60 @@ pub(crate) fn plan_for(score: u8) -> ReviewPlan {
         .rev()
         .find(|(min, _)| score >= *min)
         .map_or(PLAN_NONE, |(_, p)| *p)
+}
+
+/// The floor a score lands in (DES-TEAMING-002 §8.5), from [`THRESHOLDS`].
+pub(crate) fn floor_for(score: u8, destructive: bool) -> Floor {
+    floor_in(&THRESHOLDS, score, destructive)
+}
+
+/// [`floor_for`] against a given table. High risk is stated once, here: the band's row says so,
+/// or the change is destructive.
+pub(crate) fn floor_in(t: &Thresholds, score: u8, destructive: bool) -> Floor {
+    let i = t
+        .bands
+        .iter()
+        .rposition(|(min, _)| score >= *min)
+        .unwrap_or(0);
+    let lo = t.bands[i].0;
+    let hi = t.bands.get(i + 1).map_or(100, |(next, _)| next - 1);
+    let row = t.floors[i];
+    Floor {
+        band: format!("{lo}-{hi}"),
+        phases: row.phases.to_vec(),
+        high_risk: row.high_risk || destructive,
+    }
+}
+
+/// The intent score of a plan (DES-TEAMING-002 §8.2, §8.4), before anything has run: the plan's
+/// declared touch set, read as [`signals_from_paths`], through [`assess`]. One rule for every
+/// author: a plan with a creator step (`build` or `produce`) and a missing or empty `touch`
+/// scores `no_graph_score` with the reason [`NO_DECLARED_SCOPE`]; a plan with no creator step
+/// and no `touch` scores 0.
+pub(crate) fn assess_intent(
+    creator: bool,
+    touch: Option<&[&str]>,
+    graph: Graph<'_>,
+    hook: Option<&dyn ModelAssessment>,
+) -> Assessment {
+    let t = &THRESHOLDS;
+    let fixed = |score: u8, reason: &str, signals: Option<ImpactSignals>| Assessment {
+        deterministic: score,
+        score,
+        reasons: vec![reason.to_string()],
+        model: None,
+        signals,
+        plan: plan_for(score),
+    };
+    match touch {
+        Some(paths) if !paths.is_empty() => assess(&signals_from_paths(paths), graph, hook),
+        _ if creator => fixed(t.no_graph_score, NO_DECLARED_SCOPE, None),
+        _ => fixed(
+            0,
+            "no creator step and no declared scope",
+            Some(ImpactSignals::default()),
+        ),
+    }
 }
 
 /// The one policy entry point: signals -> score -> optional model bonus -> plan. Fails closed on
@@ -650,6 +762,35 @@ pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
     }
     for block in &blocks {
         file_block(block, &mut s);
+    }
+    s
+}
+
+/// Derive [`ChangeSignals`] from a predicted touch set (DES-TEAMING-002 §8.2): the paths a plan
+/// declares it will change, with no diff yet. Each path is classified as [`signals_from_diff`]
+/// classifies a header path; a non-docs path is touched as a whole file (no lines, so its file
+/// node stands for it and its importers count), and the critical and destructive PATH markers
+/// apply. No line markers: there are no lines.
+pub(crate) fn signals_from_paths(paths: &[&str]) -> ChangeSignals {
+    let t = &THRESHOLDS;
+    let mut s = ChangeSignals::default();
+    for p in paths {
+        match classify(p) {
+            Kind::Docs => {
+                s.docs_files += 1;
+                continue;
+            }
+            Kind::Test => s.test_files += 1,
+            Kind::Config => s.config_files += 1,
+            Kind::Code => s.code_files += 1,
+        }
+        s.critical |= has_token(p, t.critical_path_markers);
+        s.destructive |= has_token(p, t.destructive_path_markers);
+        s.touched.push(TouchedFile {
+            path: p.to_string(),
+            old_path: p.to_string(),
+            old_lines: BTreeSet::new(),
+        });
     }
     s
 }

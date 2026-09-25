@@ -934,3 +934,212 @@ fn guard_change_around_context_line_destructive_call_is_destructive() {
     let store = graph(&[], &[]);
     assert_eq!(assess(&s, ready(&store), None).plan, PLAN_MOST);
 }
+
+// ── T2 (DES-TEAMING-002 §8.5): the floor table, the high-risk rule, the intent score ─────────
+
+/// T2 (a): scores 10/30/50/80 land in §8.5's four rows, each with its floor and high-risk flag.
+#[test]
+fn t2_a_each_band_has_the_section_8_5_floor_and_high_risk() {
+    let row = |f: Floor| (f.band, f.phases, f.high_risk);
+    assert_eq!(
+        row(floor_for(10, false)),
+        ("0-19".to_string(), vec!["build", "deliver"], false)
+    );
+    assert_eq!(
+        row(floor_for(30, false)),
+        (
+            "20-39".to_string(),
+            vec!["build", "review", "deliver"],
+            false
+        )
+    );
+    assert_eq!(
+        row(floor_for(50, false)),
+        (
+            "40-69".to_string(),
+            vec!["test_plan", "design", "build", "review", "deliver"],
+            false
+        )
+    );
+    assert_eq!(
+        row(floor_for(80, false)),
+        (
+            "70-100".to_string(),
+            vec![
+                "test_plan",
+                "design",
+                "architecture",
+                "build",
+                "review",
+                "security_review",
+                "deliver"
+            ],
+            true
+        )
+    );
+}
+
+/// T2 (a): with the destructive floor tuned to 0, a destructive change can score 10; it keeps
+/// the 0-19 floor and is still high risk (the second rule of §8.5's high-risk definition).
+#[test]
+fn t2_a_a_destructive_signal_at_score_10_is_high_risk_on_the_band_floor() {
+    let tuned = Thresholds {
+        destructive_floor: 0,
+        ..THRESHOLDS
+    };
+    let signals = ImpactSignals {
+        changed_symbols: 0,
+        products: 2,
+        destructive: true,
+        ..Default::default()
+    };
+    let score = impact_score_in(&tuned, &signals).score;
+    assert_eq!(score, 10);
+    let f = floor_in(&tuned, score, true);
+    assert_eq!(
+        (f.band.as_str(), f.phases, f.high_risk),
+        ("0-19", vec!["build", "deliver"], true)
+    );
+    // The same score without the signal is not high risk.
+    assert!(!floor_in(&tuned, score, false).high_risk);
+}
+
+/// Every band edge reads the right row (the floor table follows the bands table exactly).
+#[test]
+fn t2_floor_band_edges() {
+    for (score, band) in [
+        (0, "0-19"),
+        (19, "0-19"),
+        (20, "20-39"),
+        (39, "20-39"),
+        (40, "40-69"),
+        (69, "40-69"),
+        (70, "70-100"),
+        (100, "70-100"),
+    ] {
+        assert_eq!(floor_for(score, false).band, band, "score {score}");
+    }
+}
+
+/// `signals_from_paths`: each declared path classified as a diff header path would be, touched as
+/// a whole file (no lines), with the critical and destructive path markers applied.
+#[test]
+fn t2_signals_from_paths_classifies_each_declared_path() {
+    let s = signals_from_paths(&["src/x.rs", "README.md", "tests/a.rs", "Cargo.toml"]);
+    assert_eq!(
+        (s.code_files, s.docs_files, s.test_files, s.config_files),
+        (1, 1, 1, 1)
+    );
+    assert_eq!((s.lines_added, s.lines_removed), (0, 0));
+    assert!(!s.critical && !s.destructive, "{s:?}");
+    let touched: Vec<_> = s
+        .touched
+        .iter()
+        .map(|f| (f.path.as_str(), f.old_path.as_str(), f.old_lines.len()))
+        .collect();
+    assert_eq!(
+        touched,
+        [
+            ("src/x.rs", "src/x.rs", 0),
+            ("tests/a.rs", "tests/a.rs", 0),
+            ("Cargo.toml", "Cargo.toml", 0)
+        ]
+    );
+    let critical = signals_from_paths(&["src/memory.rs"]);
+    assert!(critical.critical && !critical.destructive, "{critical:?}");
+    let destructive = signals_from_paths(&["db/migrations/001_init.sql"]);
+    assert!(destructive.destructive, "{destructive:?}");
+    assert!(!signals_from_paths(&["docs/guide.md"]).behavioural());
+}
+
+/// T2 (g), the scoring half: a creator plan with `touch` omitted, and again with `touch: []`,
+/// scores `no_graph_score` (100) with the reason "no declared scope", so it lands in 70-100.
+#[test]
+fn t2_g_a_creator_plan_with_no_declared_scope_scores_100() {
+    let store = imported_file_graph("src/x.rs");
+    for touch in [None, Some(&[][..])] {
+        let a = assess_intent(true, touch, ready(&store), None);
+        assert_eq!((a.deterministic, a.score), (100, 100), "{touch:?}: {a:?}");
+        assert_eq!(a.reasons, ["no declared scope"], "{touch:?}");
+        assert_eq!(a.plan, PLAN_MOST);
+        assert!(a.signals.is_none());
+        assert!(floor_for(a.score, false).high_risk);
+    }
+}
+
+/// T2 (g): the same plan with `touch: ["src/x.rs"]` scores from the graph (40 importers: reach 60,
+/// test gap +20), not from the no-scope rule.
+#[test]
+fn t2_g_a_declared_touch_set_scores_from_the_graph() {
+    let store = imported_file_graph("src/x.rs");
+    let a = assess_intent(true, Some(&["src/x.rs"]), ready(&store), None);
+    assert_eq!(a.score, 80, "{a:?}");
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!((s.changed_symbols, s.dependents), (1, 40), "{s:?}");
+    assert!(a.reasons[0].starts_with("reach 60:"), "{:?}", a.reasons);
+    assert!(!a.reasons.iter().any(|r| r == NO_DECLARED_SCOPE));
+    // No usable graph still fails closed, with the graph's reason, not "no declared scope".
+    let closed = assess_intent(
+        true,
+        Some(&["src/x.rs"]),
+        Graph::Unavailable("no repo".into()),
+        None,
+    );
+    assert_eq!(closed.score, 100);
+    assert_eq!(closed.reasons, ["fail closed at 100: no repo"]);
+}
+
+/// T2 (g), (d): a plan with no creator step and no touch set scores 0.
+#[test]
+fn t2_g_a_plan_with_no_creator_and_no_touch_scores_0() {
+    for touch in [None, Some(&[][..])] {
+        let a = assess_intent(false, touch, Graph::Unavailable("none".into()), None);
+        assert_eq!((a.deterministic, a.score), (0, 0), "{a:?}");
+        assert_eq!(a.plan, PLAN_NONE);
+        assert_eq!(a.reasons, ["no creator step and no declared scope"]);
+    }
+}
+
+/// T2 (f): the band numbers live in `THRESHOLDS` only. No code line (comments and tests aside)
+/// outside the `THRESHOLDS` table, in this module or in plan floor fill, spells a band edge.
+#[test]
+fn t2_f_band_numbers_live_only_in_thresholds() {
+    let edges = ["19", "20", "39", "40", "69", "70"];
+    let strip = |src: &'static str| -> Vec<(usize, String)> {
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut out = Vec::new();
+        let mut in_table = false;
+        for (n, line) in body.lines().enumerate() {
+            if line.starts_with("pub(crate) const THRESHOLDS") {
+                in_table = true;
+            }
+            if in_table {
+                if line == "};" {
+                    in_table = false;
+                }
+                continue;
+            }
+            let code = line.split("//").next().unwrap_or("");
+            out.push((n + 1, code.to_string()));
+        }
+        out
+    };
+    let mut hits = Vec::new();
+    for (file, src) in [
+        ("src/review_scale.rs", include_str!("../review_scale.rs")),
+        ("src/plan.rs", include_str!("../plan.rs")),
+    ] {
+        for (n, code) in strip(src) {
+            let tokens = code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+            for tok in tokens {
+                if edges.contains(&tok) {
+                    hits.push(format!("{file}:{n}: {}", code.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "band numbers outside THRESHOLDS: {hits:#?}"
+    );
+}
