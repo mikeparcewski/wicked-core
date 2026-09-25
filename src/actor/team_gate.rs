@@ -57,6 +57,27 @@ fn send(req: PublisherReq) -> Result<(), String> {
     }
 }
 
+/// Whether THIS process can publish team facts (a publisher thread is linked). A teamed run is
+/// live-teamed only while this holds (bus present at launch, absent now = not teamed here).
+pub(super) fn has_publisher() -> bool {
+    matches!(link(), Some(TeamLink::Publisher { .. }))
+}
+
+/// The pending "fact" of a teamed run paused because this process has no publisher for it.
+pub const TRANSPORT_UNAVAILABLE: &str = "team_transport_unavailable";
+
+/// The paused pending fact for a teamed run this process cannot publish for: answered by the
+/// team handler like any `team_transport` pause (continue → tombstone, then `transport: none`;
+/// reject → tombstone, cancel; approve → retry through the gate's `gate.decided`).
+fn unavailable_pending() -> PendingTeamFact {
+    PendingTeamFact {
+        event_type: TRANSPORT_UNAVAILABLE.to_string(),
+        key: String::new(),
+        stage: PendingStage::Paused,
+        then: TeamBlocked::Continue,
+    }
+}
+
 /// The team outbox — a property of the STATE HOME, not of bus availability (review of #623
 /// round 5): a daemon with no bus still owes the tombstones of runs it finishes.
 fn outbox_path() -> Option<PathBuf> {
@@ -284,6 +305,19 @@ pub(super) fn gate_before_dispatch(
         set_unteamed(team, "no acknowledged path.started for the run".to_string());
         put_node(store, session.to_node())?;
         return Ok(TeamGate::Proceed);
+    }
+    if !has_publisher() {
+        // Teamed, but this process cannot publish its required facts (bus present at launch,
+        // absent now): a required-transport failure — pause, never dispatch as if teamed.
+        team.gate_seq += 1;
+        team.open_gate = Some(tev::gate_id(&session.id, team.gate_seq));
+        team.pending = Some(unavailable_pending());
+        return Ok(TeamGate::Pause {
+            prompt: transport_prompt(
+                TRANSPORT_UNAVAILABLE,
+                "this daemon has no team publisher (no bus)",
+            ),
+        });
     }
     if team.plan_rev == Some(PLAN_REV) {
         return Ok(TeamGate::Proceed);
@@ -792,7 +826,7 @@ fn run_blocked(
                 cx.lifecycle_maps,
             )
         }
-        TeamBlocked::FirstDispatch | TeamBlocked::PlanDispatch { .. } => {
+        TeamBlocked::FirstDispatch | TeamBlocked::PlanDispatch { .. } | TeamBlocked::Continue => {
             if session.status == SessionStatus::AwaitingHuman {
                 // The team_transport gate was answered and its step can now run: resume.
                 session.status = SessionStatus::Executing;
@@ -911,6 +945,13 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> BootPlan {
             plan.drain.push(run_id);
             continue;
         }
+        if team.is_teamed() && team.pending.is_none() && !has_publisher() {
+            // Bus present at launch, absent now: this process cannot publish the run's required
+            // facts, so the run is paused `team_transport` (the team handler's gate) — never left
+            // live-teamed, never drained, never listed for arming.
+            reopen_transport_gate(store, &mut session, &units, unavailable_pending());
+            continue;
+        }
         let Some(pending) = team.pending.clone() else {
             plan.drain.push(run_id);
             continue;
@@ -1003,11 +1044,18 @@ fn reopen_transport_gate(
     });
     let ord = units.get(session.unit_ix).map(|u| u.ord).unwrap_or(0);
     session.status = SessionStatus::AwaitingHuman;
-    let prompt = format!(
-        "Team transport: the daemon restarted while `{}` was in flight. Approve to retry, \
-         approve with amend \"{CONTINUE_WITHOUT_TEAM}\" to run un-teamed, or reject to cancel.",
-        pending.event_type
-    );
+    let prompt = if pending.event_type == TRANSPORT_UNAVAILABLE {
+        transport_prompt(
+            TRANSPORT_UNAVAILABLE,
+            "the daemon restarted with no team publisher (no bus) for this teamed run",
+        )
+    } else {
+        format!(
+            "Team transport: the daemon restarted while `{}` was in flight. Approve to retry, \
+             approve with amend \"{CONTINUE_WITHOUT_TEAM}\" to run un-teamed, or reject to cancel.",
+            pending.event_type
+        )
+    };
     let request = crate::interaction::open_gate(
         &run_id,
         ord,

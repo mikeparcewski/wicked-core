@@ -3423,7 +3423,11 @@ pub(crate) fn run(
                 let res = crate::domain::get_session(&store, &run_id).and_then(|s| {
                     let s = s.ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
                     let units = crate::domain::session_units(&store, &run_id)?;
-                    Ok(crate::team::publish::run_team_view(&s, &units))
+                    Ok(crate::team::publish::run_team_view(
+                        &s,
+                        &units,
+                        team_gate::has_publisher(),
+                    ))
                 });
                 let _ = reply.send(res);
             }
@@ -3436,8 +3440,14 @@ pub(crate) fn run(
                                 SessionStatus::Executing | SessionStatus::AwaitingHuman
                             )
                         })
+                        // Live-teamed only with a publisher in this process and no team fact
+                        // pending (a run paused team_transport is not armed).
+                        .filter(|_| team_gate::has_publisher())
                         .filter_map(|s| {
-                            let team = s.team.clone().filter(|t| t.is_teamed())?;
+                            let team = s
+                                .team
+                                .clone()
+                                .filter(|t| t.is_teamed() && t.pending.is_none())?;
                             Some(crate::team::publish::LiveTeamRun {
                                 run_id: s.id,
                                 status: s.status,

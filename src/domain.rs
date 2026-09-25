@@ -289,6 +289,9 @@ pub enum TeamBlocked {
     /// The plan's first dispatch (gated by `plan.accepted`, and — once the run paused
     /// `team_transport` over it — by that gate's `gate.decided`).
     PlanDispatch { plan_rev: u32 },
+    /// Resume the run at its cursor: a teamed run paused because THIS process has no publisher
+    /// for its required facts (bus present at launch, absent now).
+    Continue,
     /// The operator rejected a `team_transport` pause: cancel once the tombstone is written.
     Cancel,
 }

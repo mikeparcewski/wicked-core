@@ -1071,13 +1071,18 @@ pub struct LiveTeamRun {
 pub(crate) fn run_team_view(
     session: &crate::domain::AgentSession,
     units: &[crate::domain::WorkUnit],
+    has_publisher: bool,
 ) -> Option<RunTeamView> {
     if session.team.is_none() && !units.iter().any(|u| u.team_run) {
         return None;
     }
     let team = session.team.clone().unwrap_or_default();
+    // A run is reported teamed only while THIS process can publish its facts: with no publisher
+    // (bus present at launch, absent now) a teamed run is `unavailable`, never live-teamed.
     let transport = match team.transport {
-        Some(t) if t == events::Transport::None || team.is_teamed() => t.as_str().to_string(),
+        Some(events::Transport::None) => "none".to_string(),
+        Some(_) if team.is_teamed() && has_publisher => "bus".to_string(),
+        Some(_) if team.is_teamed() => "unavailable".to_string(),
         _ => "pending".to_string(),
     };
     Some(RunTeamView {
