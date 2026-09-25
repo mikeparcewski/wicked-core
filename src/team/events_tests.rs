@@ -194,11 +194,11 @@ fn every_fixture_keys_to_its_fixed_value() {
         ),
         (
             "wicked.team.help.requested",
-            "f8cd6dff40853156099bcea2130ea3ce",
+            "db018ea3f7b6cdba96216480d387476d",
         ),
         (
             "wicked.team.help.answered",
-            "453dd2cb14b57a48509ab0f5bb58383a",
+            "1e8ac0805c2ec87a8d1a0a74309aacb9",
         ),
         (
             "wicked.team.change.requested",
@@ -1745,4 +1745,139 @@ fn the_team_pause_guard_catches_literals_and_passes_computed_values() {
             "2: x.team_pause = true;".to_string()
         ]
     );
+}
+
+// ── Computed fields are never read from input (review of #616, round 5) ──────────────────────────
+//
+// A field derived from other fields is recomputed at parse; whatever the payload says for it is
+// ignored. The list (the rest of every payload is a recorded fact):
+//   TeamLedger.teamPause               ⇐ events::pauses(finalPass, findings)
+//   Finding.findingId (ledger, raised) ⇐ team::finding_id(path, evidence)
+//   path.scored.score                  ⇐ min(100, deterministic + model.add)
+//   path.scored.plan                   ⇐ S4's plan_for(score)
+//   ledger.folded.final_pass           ⇐ the embedded ledger's finalPass
+//   transcript.count                   ⇐ events.len() when not truncated
+//   help.requested.help_id             ⇐ mint_help_id(run, ord, attempt, by, help_seq)
+
+/// codex's exact payload: a `ledger.folded` whose ledger holds an unresolved HIGH (declined,
+/// held, council NO) but says `teamPause: false`, or omits it. It deserializes paused, and the
+/// gate pauses on it.
+#[test]
+fn a_folded_ledger_claiming_unpaused_deserializes_paused() {
+    for claim in [Some(json!(false)), None] {
+        let mut p = fixture(LEDGER_FOLDED);
+        match &claim {
+            Some(v) => p["ledger"]["teamPause"] = v.clone(),
+            None => {
+                p["ledger"].as_object_mut().unwrap().remove("teamPause");
+            }
+        }
+        let ev = TeamEvent::from_payload(LEDGER_FOLDED, &p).unwrap();
+        let TeamBody::LedgerFolded(b) = ev.body else {
+            unreachable!()
+        };
+        assert!(b.ledger.team_pause, "claim {claim:?}: recomputed paused");
+        assert!(
+            gate_pauses(true, &b.ledger),
+            "claim {claim:?}: the gate pauses"
+        );
+    }
+    // Recomputed both ways: nothing unresolved and `teamPause: true` claimed is not paused.
+    let mut p = fixture(LEDGER_FOLDED);
+    p["ledger"]["findings"][0]["dispute"]["verdict"] = json!("yes");
+    p["ledger"]["teamPause"] = json!(true);
+    let ev = TeamEvent::from_payload(LEDGER_FOLDED, &p).unwrap();
+    let TeamBody::LedgerFolded(b) = ev.body else {
+        unreachable!()
+    };
+    assert!(!b.ledger.team_pause);
+}
+
+#[test]
+fn a_forged_finding_id_is_recomputed_from_path_and_evidence() {
+    let real = crate::team::finding_id("src/retire.ts", "fetchCoverage(scope).then(setCount)");
+    assert_eq!(real, "f-7bf84000911d564c");
+    let mut p = fixture(FINDING_RAISED);
+    p["finding_id"] = json!("f-forged");
+    let ev = TeamEvent::from_payload(FINDING_RAISED, &p).unwrap();
+    let TeamBody::FindingRaised(b) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(b.finding_id, real);
+
+    let mut p = fixture(LEDGER_FOLDED);
+    p["ledger"]["findings"][0]["findingId"] = json!("f-forged");
+    let ev = TeamEvent::from_payload(LEDGER_FOLDED, &p).unwrap();
+    let TeamBody::LedgerFolded(b) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(b.ledger.findings[0].finding.finding_id, real);
+}
+
+#[test]
+fn a_forged_score_or_plan_is_recomputed_from_the_deterministic_score() {
+    let mut p = fixture(PATH_SCORED);
+    p["score"] = json!(5);
+    p["plan"] = json!({"monitors": 0, "depth": "none", "post_hoc_reviewer": false, "post_hoc_other_cli": false});
+    let ev = TeamEvent::from_payload(PATH_SCORED, &p).unwrap();
+    let TeamBody::PathScored(b) = ev.body else {
+        unreachable!()
+    };
+    // deterministic 70 + model 10.
+    assert_eq!(b.score, 80);
+    assert_eq!(
+        serde_json::to_value(&b.plan).unwrap(),
+        json!({"monitors": 3, "depth": "deep", "post_hoc_reviewer": true, "post_hoc_other_cli": true})
+    );
+    // Capped at 100; no model bonus is the deterministic score alone.
+    p["deterministic"] = json!(95);
+    let ev = TeamEvent::from_payload(PATH_SCORED, &p).unwrap();
+    let TeamBody::PathScored(b) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(b.score, 100);
+    p["deterministic"] = json!(10);
+    p["model"] = Value::Null;
+    let ev = TeamEvent::from_payload(PATH_SCORED, &p).unwrap();
+    let TeamBody::PathScored(b) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!((b.score, b.plan.monitors), (10, 0));
+}
+
+#[test]
+fn the_folded_final_pass_and_transcript_count_are_recomputed() {
+    let mut p = fixture(LEDGER_FOLDED);
+    p["final_pass"] = json!("completed");
+    p["ledger"]["finalPass"] = json!("timed_out");
+    p["transcript"]["count"] = json!(999);
+    let ev = TeamEvent::from_payload(LEDGER_FOLDED, &p).unwrap();
+    let TeamBody::LedgerFolded(b) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        b.final_pass,
+        FinalPass::TimedOut,
+        "the ledger's finalPass wins"
+    );
+    assert_eq!(b.transcript.count, 1, "not truncated: the rows it carries");
+    // Truncated: the count is the attempt's total, a fact the capped list cannot recompute.
+    p["transcript"]["truncated"] = json!(true);
+    let ev = TeamEvent::from_payload(LEDGER_FOLDED, &p).unwrap();
+    let TeamBody::LedgerFolded(b) = ev.body else {
+        unreachable!()
+    };
+    assert_eq!(b.transcript.count, 999);
+}
+
+#[test]
+fn a_forged_help_id_is_re_minted_from_help_seq() {
+    let mut p = fixture(HELP_REQUESTED);
+    p["help_id"] = json!("h-forged");
+    let ev = TeamEvent::from_payload(HELP_REQUESTED, &p).unwrap();
+    let TeamBody::HelpRequested(b) = &ev.body else {
+        unreachable!()
+    };
+    assert_eq!(b.help_id, mint_help_id("r1", 3, 1, "claude#1", 2));
+    assert_eq!(ev.key().unwrap(), "db018ea3f7b6cdba96216480d387476d");
 }

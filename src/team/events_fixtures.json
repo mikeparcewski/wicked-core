@@ -31,7 +31,7 @@
    "re": null,
    "score_source": "intent:p-0123456789abcdef0123456789abcdef",
    "basis": "intent",
-   "score": 70,
+   "score": 80,
    "deterministic": 70,
    "reasons": [
     "destructive => floor 70",
@@ -290,7 +290,7 @@
    "at": 1758700000010,
    "re": "checkpoint.reached#17",
    "raise_seq": 4,
-   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "finding_id": "f-7bf84000911d564c",
    "member_id": "m1",
    "line_key": null,
    "anchor": null,
@@ -316,7 +316,7 @@
    "at": 1758700000011,
    "re": "finding.raised#4",
    "raise_seq": 4,
-   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "finding_id": "f-7bf84000911d564c",
    "delivery_id": "s-1",
    "steer_id": "s-1",
    "channel": "acp_steering",
@@ -335,7 +335,7 @@
    "re": "finding.raised#4",
    "raise_seq": 4,
    "answered_in": "build:1",
-   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "finding_id": "f-7bf84000911d564c",
    "disposition": "declined",
    "reason": "campaign.rs:325 documents the exclusion"
   }
@@ -349,7 +349,7 @@
    "by": "claude#1",
    "at": 1758700000013,
    "re": null,
-   "help_id": "h-0123456789abcdef0123456789abcdef",
+   "help_id": "h-173a7b6f9ad38fce2f578afd2aa1be38",
    "help_seq": 2,
    "question": "which table owns coverage?",
    "context": "retire.ts reads it at :41"
@@ -363,8 +363,8 @@
    "attempt": 1,
    "by": "claude#2",
    "at": 1758700000014,
-   "re": "help.requested#h-0123456789abcdef0123456789abcdef",
-   "help_id": "h-0123456789abcdef0123456789abcdef",
+   "re": "help.requested#h-173a7b6f9ad38fce2f578afd2aa1be38",
+   "help_id": "h-173a7b6f9ad38fce2f578afd2aa1be38",
    "answer_id": "t-7",
    "answer": "coverage_rows, created in migration 12",
    "evidence": [
@@ -433,7 +433,7 @@
    "at": 1758700000018,
    "re": "advice.answered#4",
    "raise_seq": 4,
-   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "finding_id": "f-7bf84000911d564c",
    "status": "held",
    "reason": "no reply (counted as hold)",
    "final_line": 43
@@ -449,7 +449,7 @@
    "at": 1758700000019,
    "re": "finding.settled#4",
    "subject": "finding:4",
-   "finding_id": "f-3fa9c2e1d0b4a7e6",
+   "finding_id": "f-7bf84000911d564c",
    "trigger": "unresolved_high",
    "question": "Should the run continue autonomously with the worker's refusal standing?",
    "positions": [
@@ -525,7 +525,7 @@
     ],
     "findings": [
      {
-      "findingId": "f-3fa9c2e1d0b4a7e6",
+      "findingId": "f-7bf84000911d564c",
       "monitorId": "m1",
       "seat": "claude#2",
       "severity": "high",
@@ -631,7 +631,7 @@
    "gate_id": "g-r1-5",
    "kind": "team_dispute",
    "finding_ids": [
-    "f-3fa9c2e1d0b4a7e6"
+    "f-7bf84000911d564c"
    ]
   }
  },
@@ -682,7 +682,7 @@
    "combined": true,
    "team_pause": true,
    "unresolved": [
-    "f-3fa9c2e1d0b4a7e6"
+    "f-7bf84000911d564c"
    ]
   }
  },
