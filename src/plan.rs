@@ -906,15 +906,123 @@ pub fn floor_fill(
     plan: &PlanSteps,
     input: FloorInput<'_>,
 ) -> Result<FloorFilled, PlanRefusal> {
-    let _ = input;
-    let def = compose(catalog, plan)?;
+    let row = crate::review_scale::floor_for(input.score, input.destructive);
+    let entry = |c: &str| catalog.iter().find(|e| e.id == c);
+    // §8.5: a plan with no creator step has an empty floor and is never high risk.
+    let creator = plan.has_creator();
+    let high_risk = creator && row.high_risk;
+    // §8.5 non-code runs: no step executes code ⇒ `produce` fills the build slot, `critique` the
+    // review slot. `deliver` is in the floor only for a run that delivers.
+    let code_run = plan.steps.iter().any(|s| {
+        s.executes_code == Some(true) || entry(&s.catalog).is_some_and(|e| e.executes_code)
+    });
+    let floor: Vec<String> = if !creator {
+        Vec::new()
+    } else {
+        row.phases
+            .iter()
+            .filter(|p| **p != "deliver" || input.deliver.is_some())
+            .map(|p| match (*p, code_run) {
+                ("build", false) => "produce",
+                ("review", false) => "critique",
+                (p, _) => p,
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned phase
+    // in a high-risk band. It exempts floor types from the fill; it removes no authored step.
+    let mut exempt: Vec<&str> = Vec::new();
+    if let Some(ov) = &plan.floor_override {
+        if matches!(input.human_confirm, crate::domain::HumanConfirm::None) {
+            return Err(PlanRefusal::OverrideInAutoMode);
+        }
+        for c in &ov.remove {
+            let Some(e) = entry(c) else {
+                return Err(PlanRefusal::OverrideUnknownEntry { catalog: c.clone() });
+            };
+            if high_risk && e.validator_pin.is_some() {
+                return Err(PlanRefusal::OverrideRemovesPinned { catalog: c.clone() });
+            }
+            exempt.push(c);
+        }
+    }
+    let order = |c: &str| catalog.iter().position(|e| e.id == c);
+    let mut steps: Vec<PlanStep> = plan.steps.clone();
+    for s in &mut steps {
+        s.added_by.get_or_insert(AddedBy::Plan);
+    }
+    for (k, ty) in floor.iter().enumerate() {
+        if exempt.contains(&ty.as_str()) || steps.iter().any(|s| &s.catalog == ty) {
+            continue;
+        }
+        // After every floor predecessor, before the first floor successor, and within that
+        // window at its catalog-order position.
+        let (preds, succs) = (&floor[..k], &floor[k + 1..]);
+        let lo = steps
+            .iter()
+            .rposition(|s| preds.contains(&s.catalog))
+            .map_or(0, |i| i + 1);
+        let hi = steps[lo..]
+            .iter()
+            .position(|s| succs.contains(&s.catalog))
+            .map_or(steps.len(), |i| lo + i);
+        let at = steps[lo..hi]
+            .iter()
+            .rposition(|s| order(&s.catalog) < order(ty))
+            .map_or(lo, |i| lo + i + 1);
+        let mut id = ty.clone();
+        let mut n = 1;
+        while steps.iter().any(|s| s.id == id) {
+            id = match n {
+                1 => format!("{ty}-floor"),
+                n => format!("{ty}-floor-{n}"),
+            };
+            n += 1;
+        }
+        let executor = (ty == "deliver")
+            .then(|| {
+                input
+                    .deliver
+                    .map(|cmd| crate::workflow::PhaseExecutor::Tool { cmd: cmd.to_vec() })
+            })
+            .flatten();
+        steps.insert(
+            at,
+            PlanStep {
+                catalog: ty.clone(),
+                id,
+                executor,
+                added_by: Some(AddedBy::Floor),
+                floor_reason: Some(format!("band {} requires {ty}", row.band)),
+                ..PlanStep::default()
+            },
+        );
+    }
+    // §8.5: no floor phase before a floor phase that precedes it in catalog order.
+    let first = |ty: &String| steps.iter().position(|s| &s.catalog == ty);
+    for (k, ty) in floor.iter().enumerate() {
+        let Some(at) = first(ty) else { continue };
+        if floor[..k].iter().filter_map(first).any(|pred| pred > at) {
+            return Err(PlanRefusal::FloorReordered {
+                step: steps[at].id.clone(),
+                catalog: ty.clone(),
+            });
+        }
+    }
+    let filled = PlanSteps {
+        steps,
+        touch: plan.touch.clone(),
+        floor_override: plan.floor_override.clone(),
+    };
+    let def = compose(catalog, &filled)?;
     Ok(FloorFilled {
-        steps: plan.clone(),
+        steps: filled,
         def,
-        band: String::new(),
-        floor: Vec::new(),
-        high_risk: false,
-        floor_override: None,
+        band: row.band,
+        floor,
+        high_risk,
+        floor_override: plan.floor_override.clone(),
     })
 }
 

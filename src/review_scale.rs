@@ -624,14 +624,18 @@ pub(crate) fn floor_for(score: u8, destructive: bool) -> Floor {
 /// [`floor_for`] against a given table. High risk is stated once, here: the band's row says so,
 /// or the change is destructive.
 pub(crate) fn floor_in(t: &Thresholds, score: u8, destructive: bool) -> Floor {
-    todo_floor(t, score, destructive)
-}
-
-fn todo_floor(_t: &Thresholds, _score: u8, _destructive: bool) -> Floor {
+    let i = t
+        .bands
+        .iter()
+        .rposition(|(min, _)| score >= *min)
+        .unwrap_or(0);
+    let lo = t.bands[i].0;
+    let hi = t.bands.get(i + 1).map_or(100, |(next, _)| next - 1);
+    let row = t.floors[i];
     Floor {
-        band: String::new(),
-        phases: Vec::new(),
-        high_risk: false,
+        band: format!("{lo}-{hi}"),
+        phases: row.phases.to_vec(),
+        high_risk: row.high_risk || destructive,
     }
 }
 
@@ -646,8 +650,24 @@ pub(crate) fn assess_intent(
     graph: Graph<'_>,
     hook: Option<&dyn ModelAssessment>,
 ) -> Assessment {
-    let _ = (creator, touch);
-    assess(&ChangeSignals::default(), graph, hook)
+    let t = &THRESHOLDS;
+    let fixed = |score: u8, reason: &str, signals: Option<ImpactSignals>| Assessment {
+        deterministic: score,
+        score,
+        reasons: vec![reason.to_string()],
+        model: None,
+        signals,
+        plan: plan_for(score),
+    };
+    match touch {
+        Some(paths) if !paths.is_empty() => assess(&signals_from_paths(paths), graph, hook),
+        _ if creator => fixed(t.no_graph_score, NO_DECLARED_SCOPE, None),
+        _ => fixed(
+            0,
+            "no creator step and no declared scope",
+            Some(ImpactSignals::default()),
+        ),
+    }
 }
 
 /// The one policy entry point: signals -> score -> optional model bonus -> plan. Fails closed on
@@ -752,8 +772,27 @@ pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
 /// node stands for it and its importers count), and the critical and destructive PATH markers
 /// apply. No line markers: there are no lines.
 pub(crate) fn signals_from_paths(paths: &[&str]) -> ChangeSignals {
-    let _ = paths;
-    ChangeSignals::default()
+    let t = &THRESHOLDS;
+    let mut s = ChangeSignals::default();
+    for p in paths {
+        match classify(p) {
+            Kind::Docs => {
+                s.docs_files += 1;
+                continue;
+            }
+            Kind::Test => s.test_files += 1,
+            Kind::Config => s.config_files += 1,
+            Kind::Code => s.code_files += 1,
+        }
+        s.critical |= has_token(p, t.critical_path_markers);
+        s.destructive |= has_token(p, t.destructive_path_markers);
+        s.touched.push(TouchedFile {
+            path: p.to_string(),
+            old_path: p.to_string(),
+            old_lines: BTreeSet::new(),
+        });
+    }
+    s
 }
 
 /// One file's header lines and hunks.
