@@ -75,6 +75,7 @@ fn unavailable_pending() -> PendingTeamFact {
         key: String::new(),
         stage: PendingStage::Paused,
         then: TeamBlocked::Continue,
+        staged: None,
     }
 }
 
@@ -291,6 +292,7 @@ pub(super) fn gate_before_dispatch(
                     key: token.key,
                     stage: PendingStage::Publishing,
                     then: TeamBlocked::FirstDispatch,
+                    staged: None,
                 });
                 put_node(store, session.to_node())?;
                 return Ok(TeamGate::Deferred);
@@ -366,6 +368,7 @@ pub(super) fn gate_before_dispatch(
                 key: token.key,
                 stage: PendingStage::Publishing,
                 then,
+                staged: None,
             });
             put_node(store, session.to_node())?;
             Ok(TeamGate::Deferred)
@@ -378,6 +381,7 @@ pub(super) fn gate_before_dispatch(
                 key,
                 stage: PendingStage::Paused,
                 then,
+                staged: None,
             });
             Ok(TeamGate::Pause {
                 prompt: transport_prompt(tev::PLAN_ACCEPTED, &reason),
@@ -455,6 +459,7 @@ pub(super) fn release_plan_gate(
                     key: token.key,
                     stage: PendingStage::Publishing,
                     then,
+                    staged: None,
                 });
                 put_node(cx.store, session.to_node())?;
                 cx.in_flight.insert(run_id);
@@ -466,6 +471,7 @@ pub(super) fn release_plan_gate(
                     key,
                     stage: PendingStage::Paused,
                     then,
+                    staged: None,
                 };
                 return pause_team_transport(cx, session, pending, &reason);
             }
@@ -1080,6 +1086,8 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> BootPlan {
         };
         match pending.stage {
             PendingStage::Paused => plan.drain.push(run_id),
+            // RED STUB (round 9): the staged answer is not applied at boot yet.
+            PendingStage::Acknowledged => plan.drain.push(run_id),
             PendingStage::Superseding => {
                 // The operator ANSWERED before the crash (continue without team, or reject); only
                 // the publisher's acknowledgement was lost. Finish that answer — never ask again:

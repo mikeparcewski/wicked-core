@@ -109,6 +109,64 @@ pub struct QueuedFact {
     pub payload: Value,
 }
 
+/// (codex round 9 on #622) A plan-gate answer decided and proven — every synchronous check ran
+/// on it (round 4) — but NOT applied: P1's required `gate.decided` comes first. It is held on the
+/// pending fact ([`crate::domain::PendingTeamFact::staged`]) and applied only on that fact's
+/// acknowledgement, or when the operator continues the run without team; a reject drops it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedRelease {
+    /// The plan state the answer commits (the accepted rev, or the re-opened held plan).
+    pub state: TeamPlanState,
+    /// The facts that follow `gate.decided` (an edit's `plan.proposed` / `path.scored`, a
+    /// refused edit's `plan.refused`): queued on the plan state when the answer applies, so they
+    /// publish once, ahead of the next `plan.accepted` / `gate.opened`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<QueuedFact>,
+    /// An accepted edit: the proven def the run re-plans onto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def: Option<StagedDef>,
+    /// A refused edit: the gate re-opens (a fresh gate) instead of releasing the run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reopen: bool,
+}
+
+/// The proven def of an accepted edit, durable. [`crate::workflow::PhaseDef::catalog`] is
+/// `serde(skip)` (no def FILE may claim a catalog id), so the engine keeps the ids it computed
+/// beside the def and restores them — the def that runs is the def that was checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedDef {
+    pub def: WorkflowDef,
+    pub catalogs: Vec<Option<String>>,
+}
+
+impl StagedDef {
+    pub(crate) fn new(def: WorkflowDef) -> Self {
+        let catalogs = def.phases.iter().map(|p| p.catalog.clone()).collect();
+        StagedDef { def, catalogs }
+    }
+
+    pub(crate) fn into_def(self) -> WorkflowDef {
+        let mut def = self.def;
+        for (phase, catalog) in def.phases.iter_mut().zip(self.catalogs) {
+            phase.catalog = catalog;
+        }
+        def
+    }
+}
+
+/// Build facts as durable queued lines (the shape [`queue`] writes).
+pub(crate) fn queued_facts(facts: &[TeamEvent]) -> anyhow::Result<Vec<QueuedFact>> {
+    facts
+        .iter()
+        .map(|f| {
+            Ok(QueuedFact {
+                event_type: f.event_type().to_string(),
+                payload: f.to_payload()?,
+            })
+        })
+        .collect()
+}
+
 /// Queue `facts` on the plan state (they follow `path.started`).
 pub(crate) fn queue(state: &mut TeamPlanState, facts: &[TeamEvent]) -> anyhow::Result<()> {
     for f in facts {

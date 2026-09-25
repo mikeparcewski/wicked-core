@@ -273,6 +273,12 @@ pub struct PendingTeamFact {
     pub stage: PendingStage,
     /// What runs once the fact is acknowledged (or the run falls back to un-teamed).
     pub then: TeamBlocked,
+    /// (DES-TEAMING-002 T3, codex round 9 on #622) The plan-gate answer this fact's
+    /// acknowledgement COMMITS: decided and proven when the gate was answered, applied only once
+    /// the gate's required `gate.decided` is acknowledged (or the run continues un-teamed). Held
+    /// here, durably, so a restart finishes it; `None` for every other pending fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<Box<crate::plan_gate::StagedRelease>>,
 }
 
 /// Where a pending fact stands.
@@ -285,6 +291,10 @@ pub enum PendingStage {
     Paused,
     /// The operator chose continue-without-team or reject: the run tombstone is being written.
     Superseding,
+    /// (T3, codex round 9) The fact is acknowledged (or the run continues un-teamed) and the
+    /// staged plan-gate answer it gates is being applied. A restart finds this and applies it
+    /// once (idempotent: the state is absolute, the units are keyed by phase id).
+    Acknowledged,
 }
 
 /// The step a pending fact gates.
