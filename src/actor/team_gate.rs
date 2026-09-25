@@ -713,11 +713,15 @@ fn run_blocked(
 
 /// Boot reconcile (§4.1 "crash between tombstone and store write", §4.8 row 12): a LIVE team run
 /// with no acknowledged `path.started` is un-teamed — its run tombstone is written FIRST, then
-/// the store — and a run caught mid-fact re-opens its `team_transport` pause so a human decides
-/// again. Runs before the publisher is asked to drain, so no drain can race the tombstone.
-pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) {
+/// the store. A run caught while a required fact was publishing re-opens its `team_transport`
+/// pause with the fact kept pending and paused (the team handler answers it). A run whose
+/// operator had ANSWERED (`Superseding`) has that answer finished, never re-asked: tombstone
+/// first, then un-teamed (continue) or returned for cancellation (reject). Runs before the
+/// publisher is asked to drain, so no drain can race a tombstone. Returns the runs to cancel.
+pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> Vec<String> {
+    let mut to_cancel = Vec::new();
     let Ok(sessions) = crate::domain::all_sessions(store) else {
-        return;
+        return to_cancel;
     };
     let outbox = match link() {
         Some(TeamLink::Publisher { outbox, .. }) => Some(outbox),
@@ -769,53 +773,96 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) {
         };
         match pending.stage {
             PendingStage::Paused => {}
-            PendingStage::Publishing | PendingStage::Superseding => {
-                if pending.stage == PendingStage::Superseding {
-                    // The answer was recorded; its tombstone may not be. Write it, then leave
-                    // the decision to a human again: the run is un-teamed from here.
-                    if let Some(outbox) = &outbox {
-                        let _ = crate::team::publish::supersede_run_at(
-                            outbox,
-                            &run_id,
-                            &pending.event_type,
-                            "boot: an answer was being applied at restart",
-                        );
-                    }
-                    let t = session.team.get_or_insert_with(RunTeamState::default);
+            PendingStage::Superseding => {
+                // The operator ANSWERED before the crash (continue without team, or reject); only
+                // the publisher's acknowledgement was lost. Finish that answer — never ask again:
+                // an open team_transport gate without its paused pending fact would be answered
+                // by the generic confirm path (an amendment / a rework, not a transport answer).
+                // The tombstone is the durable fact, so it is re-issued first (idempotent).
+                let written = match &outbox {
+                    Some(outbox) => crate::team::publish::supersede_run_at(
+                        outbox,
+                        &run_id,
+                        &pending.event_type,
+                        "boot: finishing a team_transport answer recorded before the restart",
+                    )
+                    .map_err(|e| e.to_string()),
+                    None => Ok(()),
+                };
+                let t = session.team.get_or_insert_with(RunTeamState::default);
+                if let Err(e) = written {
+                    // The answer cannot be finished safely: keep the fact pending and PAUSED, so
+                    // the team handler (`answer_transport_gate`) takes the next reply.
+                    eprintln!(
+                        "wicked-core: boot could not tombstone team run {run_id} ({e}); its \
+                         team_transport pause re-opens"
+                    );
+                    reopen_transport_gate(store, &mut session, &units, pending);
+                    continue;
+                }
+                if pending.then == TeamBlocked::Cancel {
+                    // Rejected: the run stays teamed so its `path.ended` is published (the one
+                    // fact the tombstone lets through); the actor cancels it once it is up.
+                    t.pending = None;
+                    t.open_gate = None;
+                    let _ = put_node(store, session.to_node());
+                    to_cancel.push(run_id);
+                } else {
+                    // Continue without team: un-teamed from here. The run is Executing with no
+                    // worker in this process — reported orphaned and resumed like every run a
+                    // restart interrupts (`resume_run`), dispatching un-teamed.
                     set_unteamed(
                         t,
-                        "the daemon restarted while a team_transport answer was applied"
+                        "the operator chose to continue without team (applied at restart)"
                             .to_string(),
                     );
-                } else {
-                    let t = session.team.get_or_insert_with(RunTeamState::default);
-                    t.gate_seq += 1;
-                    t.open_gate = Some(tev::gate_id(&run_id, t.gate_seq));
-                    t.pending = Some(PendingTeamFact {
-                        stage: PendingStage::Paused,
-                        ..pending.clone()
-                    });
+                    session.status = SessionStatus::Executing;
+                    let _ = put_node(store, session.to_node());
                 }
-                let ord = units.get(session.unit_ix).map(|u| u.ord).unwrap_or(0);
-                session.status = SessionStatus::AwaitingHuman;
-                let prompt = format!(
-                    "Team transport: the daemon restarted while `{}` was in flight. Approve to \
-                     continue, approve with amend \"{CONTINUE_WITHOUT_TEAM}\" to run un-teamed, \
-                     or reject to cancel.",
-                    pending.event_type
-                );
-                let request = crate::interaction::open_gate(
-                    &run_id,
-                    ord,
-                    None,
-                    &prompt,
-                    TEAM_TRANSPORT_GATE,
-                    crate::interaction::now_millis(),
-                );
-                let _ = crate::domain::put_nodes(store, &[session.to_node(), request.to_node()]);
+            }
+            PendingStage::Publishing => {
+                // No answer was recorded: a required fact was still publishing. Re-open the
+                // pause WITH the fact kept pending and paused, so the team handler answers it.
+                reopen_transport_gate(store, &mut session, &units, pending);
             }
         }
     }
+    to_cancel
+}
+
+/// Re-open a run's `team_transport` pause at boot over `pending`, kept PAUSED so
+/// `transport_gate_open` holds and `answer_transport_gate` — never the generic confirm path —
+/// takes the reply.
+fn reopen_transport_gate(
+    store: &mut dyn GraphStore,
+    session: &mut AgentSession,
+    units: &[WorkUnit],
+    pending: PendingTeamFact,
+) {
+    let run_id = session.id.clone();
+    let t = session.team.get_or_insert_with(RunTeamState::default);
+    t.gate_seq += 1;
+    t.open_gate = Some(tev::gate_id(&run_id, t.gate_seq));
+    t.pending = Some(PendingTeamFact {
+        stage: PendingStage::Paused,
+        ..pending.clone()
+    });
+    let ord = units.get(session.unit_ix).map(|u| u.ord).unwrap_or(0);
+    session.status = SessionStatus::AwaitingHuman;
+    let prompt = format!(
+        "Team transport: the daemon restarted while `{}` was in flight. Approve to retry, \
+         approve with amend \"{CONTINUE_WITHOUT_TEAM}\" to run un-teamed, or reject to cancel.",
+        pending.event_type
+    );
+    let request = crate::interaction::open_gate(
+        &run_id,
+        ord,
+        None,
+        &prompt,
+        TEAM_TRANSPORT_GATE,
+        crate::interaction::now_millis(),
+    );
+    let _ = crate::domain::put_nodes(store, &[session.to_node(), request.to_node()]);
 }
 
 /// Tell the publisher to drain the outbox once (after the boot reconcile).

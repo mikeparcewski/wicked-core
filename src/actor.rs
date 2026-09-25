@@ -896,7 +896,7 @@ pub(crate) fn run(
     // with no acknowledged `path.started` is tombstoned and then set `transport: none`; a run
     // caught mid-fact re-opens its `team_transport` pause. Only then does the publisher drain the
     // outbox, so no drain can race a boot tombstone.
-    team_gate::reconcile_at_boot(&mut store);
+    let team_boot_cancels = team_gate::reconcile_at_boot(&mut store);
     team_gate::drain_at_boot();
     let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = pipeline::workflow_overlay_dir() {
@@ -953,6 +953,21 @@ pub(crate) fn run(
     // so bus consumers can discard completions from a prior daemon restart (stale-result guard).
     // NOT a global singleton: each actor lifetime gets a fresh token.
     let process_gen: uuid::Uuid = uuid::Uuid::new_v4();
+    // (DES-TEAMING-002 P1) A `team_transport` reject recorded before the restart is finished here,
+    // now that the actor's seams exist: the run tombstone is already written (boot reconcile), so
+    // the cancel publishes only `path.ended`.
+    for run_id in team_boot_cancels {
+        if let Err(e) = cancel_run(
+            &mut store,
+            &mut subscribers,
+            &runner,
+            &self_tx,
+            &run_id,
+            &lifecycle_maps,
+        ) {
+            eprintln!("wicked-core: boot could not cancel rejected team run {run_id}: {e:#}");
+        }
+    }
 
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
     // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC

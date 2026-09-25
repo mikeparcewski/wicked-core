@@ -15,12 +15,12 @@ use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 use super::CONTINUE_WITHOUT_TEAM;
-use wicked_apps_core::ToNode;
 use crate::team::events as tev;
 use crate::team::publish::tests::{rig, Rig};
 use crate::team::publish::{TeamConfig, TEAM_OUTBOX_FILE};
 use crate::workflow::{HumanDecision, StepInput, StepOutput, StepRunner, StepStatus};
 use crate::{Core, CoreEvent, HumanConfirm, LaunchSpec, SessionStatus};
+use wicked_apps_core::ToNode;
 
 struct StubDispatcher;
 impl Dispatcher for StubDispatcher {
