@@ -82,7 +82,36 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// Seeded here: `feature`, the one C2's acceptance names. Every other consumer's preset is added
 /// by its migration seam (§14 M1–M10), which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
-    Vec::new()
+    vec![("feature", feature_preset())]
+}
+
+/// `feature` (§11.2): clarify → `understand` (gate raised to `human_confirm`); design → `design`;
+/// build → `build`; adversarial-review → `review` (gate raised); test → `test`; review →
+/// `critique`. The two bold cells (test and review on the evaluator role) come from the entries.
+fn feature_preset() -> Vec<PlanStep> {
+    let confirm = Some(GateSpec::HumanConfirm {
+        unconditional: false,
+    });
+    let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
+        catalog: catalog.to_string(),
+        id: id.to_string(),
+        depends_on: after.map(|a| vec![a.to_string()]),
+        ..PlanStep::default()
+    };
+    vec![
+        PlanStep {
+            gate: confirm,
+            ..step("understand", "clarify", None)
+        },
+        step("design", "design", Some("clarify")),
+        step("build", "build", Some("design")),
+        PlanStep {
+            gate: confirm,
+            ..step("review", "adversarial-review", Some("build"))
+        },
+        step("test", "test", Some("build")),
+        step("critique", "review", Some("test")),
+    ]
 }
 
 fn build_catalog() -> Vec<PhaseDef> {

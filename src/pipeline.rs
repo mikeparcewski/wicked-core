@@ -171,7 +171,17 @@ pub(crate) struct PreDistributed {
 /// `$HOME/.config/wicked-core/workflows`, best-effort). `None` (no selection) ⇒ `Ok(None)` and the
 /// caller uses the free-text planner; a requested-but-**unknown** id ⇒ `Err` (never a silent
 /// fallback).
+///
+/// **Presets first (DES-TEAMING-002 §8.4, seam C2).** The id is resolved as a PRESET name before
+/// any registered def: the launch's project row, then the global row (built-ins are global rows
+/// seeded at boot), composed over the phase catalog (`crate::preset::compose_preset`). A name with
+/// no preset falls through to the registered defs below, so every workflow id that has not yet
+/// become a preset keeps launching its def. Every launcher — `Core::launch_run`, the campaign
+/// driver, the bus launch bridge — reaches this one resolver on the actor, so none resolves a
+/// preset itself.
 pub(crate) fn resolve_workflow_def(
+    store: &dyn wicked_apps_core::GraphRead,
+    project_id: Option<&str>,
     workflow: Option<&str>,
     extra: Option<&crate::workflow::WorkflowRegistry>,
 ) -> anyhow::Result<Option<crate::workflow::WorkflowDef>> {
@@ -179,6 +189,18 @@ pub(crate) fn resolve_workflow_def(
     let Some(id) = workflow else {
         return Ok(None);
     };
+    if let Some(preset) = crate::preset::resolve(store, project_id, id)? {
+        // A preset saved under an older catalog may no longer compose: refuse the launch naming
+        // the preset and the step rule, never a silent fall-through to a same-named def.
+        return crate::preset::compose_preset(&preset)
+            .map(Some)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "preset `{id}` ({}) does not compose over the phase catalog: {e}",
+                    preset.scope
+                )
+            });
+    }
     // When the caller provides an actor-owned registry (the interactive LaunchRun path), use it
     // as the sole authoritative source: it already contains built-ins (seeded at actor startup
     // via `with_defaults()`), the overlay directory (loaded at startup), and any runtime-registered
@@ -388,7 +410,8 @@ pub(crate) fn pre_distribute(
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
 
-    let selected_def = resolve_workflow_def(workflow, workflow_registry)?;
+    let selected_def =
+        resolve_workflow_def(&*store, project_id.as_deref(), workflow, workflow_registry)?;
     // core#120: a Tool-executor phase with an unresolvable binary must refuse the launch here —
     // before anything is planned or persisted — never degrade to agent improvisation.
     if let Some(def) = &selected_def {
@@ -1864,20 +1887,27 @@ mod denial_message_tests {
 mod resolve_tests {
     use super::*;
 
+    /// A store with no preset rows: resolution falls through to the registered defs.
+    fn empty() -> wicked_apps_core::SqliteStore {
+        wicked_apps_core::open_store(Some(":memory:")).unwrap()
+    }
+
     #[test]
     fn workflow_selection_resolves_none_known_and_rejects_unknown() {
         // No selection ⇒ None (the caller uses the free-text planner).
-        assert!(resolve_workflow_def(None, None).unwrap().is_none());
+        assert!(resolve_workflow_def(&empty(), None, None, None)
+            .unwrap()
+            .is_none());
         // A known built-in resolves to its def.
         assert_eq!(
-            resolve_workflow_def(Some("feature"), None)
+            resolve_workflow_def(&empty(), None, Some("feature"), None)
                 .unwrap()
                 .unwrap()
                 .id,
             "feature"
         );
         // A requested-but-unknown id is a LOUD error (never a silent fall-through to prose planning).
-        let err = resolve_workflow_def(Some("feaure-typo-xyz"), None)
+        let err = resolve_workflow_def(&empty(), None, Some("feaure-typo-xyz"), None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1893,16 +1923,18 @@ mod resolve_tests {
 
         // Known id in actor registry resolves to def.
         assert_eq!(
-            resolve_workflow_def(Some("feature"), Some(&reg))
+            resolve_workflow_def(&empty(), None, Some("feature"), Some(&reg))
                 .unwrap()
                 .unwrap()
                 .id,
             "feature"
         );
         // No selection (None) with actor registry still returns None.
-        assert!(resolve_workflow_def(None, Some(&reg)).unwrap().is_none());
+        assert!(resolve_workflow_def(&empty(), None, None, Some(&reg))
+            .unwrap()
+            .is_none());
         // Unknown id with actor registry returns Err (not silent Ok(None)).
-        let err = resolve_workflow_def(Some("feaure-typo"), Some(&reg))
+        let err = resolve_workflow_def(&empty(), None, Some("feaure-typo"), Some(&reg))
             .unwrap_err()
             .to_string();
         assert!(
@@ -2733,5 +2765,44 @@ mod resolve_tests {
             ("codex", "launcher")
         );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&sid));
+    }
+
+    /// DES-TEAMING-002 C2: a preset row resolves BEFORE a registered def of the same name, and the
+    /// composed def is named after the preset.
+    #[test]
+    fn a_preset_resolves_before_a_registered_def() {
+        use crate::workflow::WorkflowRegistry;
+        let reg = WorkflowRegistry::with_defaults();
+        let mut store = empty();
+        crate::preset::seed_builtins(&mut store, 1).unwrap();
+        let def = resolve_workflow_def(&store, None, Some("feature"), Some(&reg))
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.id, "feature");
+        let roles: Vec<_> = def
+            .phases
+            .iter()
+            .map(|p| serde_json::to_value(p.role).unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                "neutral",
+                "neutral",
+                "creator",
+                "evaluator",
+                "evaluator",
+                "evaluator"
+            ],
+            "the preset's composition (test and review on the evaluator role), not feature_def's"
+        );
+        // A name with no preset still resolves its def.
+        assert_eq!(
+            resolve_workflow_def(&store, None, Some("bug"), Some(&reg))
+                .unwrap()
+                .unwrap()
+                .id,
+            "bug"
+        );
     }
 }

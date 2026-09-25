@@ -157,44 +157,329 @@ impl FromNode for Preset {
     }
 }
 
-/// Write the built-in presets to the store (boot). Idempotent by name: an unchanged row is not
-/// rewritten. Returns the names written.
-pub fn seed_builtins(_store: &mut dyn GraphStore, _now_ms: i64) -> anyhow::Result<Vec<String>> {
-    anyhow::bail!("seam C2: seed_builtins not built")
+/// `[A-Za-z0-9._-]{1,64}` — every workflow id in use today fits, and `:` (per-run def ids) and
+/// `/` (the row id separator) cannot appear.
+fn valid_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Save a preset (create or replace in its scope).
+fn is_builtin_name(name: &str) -> bool {
+    crate::catalog::builtin_presets()
+        .iter()
+        .any(|(n, _)| *n == name)
+}
+
+/// The live row at `(scope, name)`, if any.
+fn get_row(store: &dyn GraphRead, scope: &str, name: &str) -> anyhow::Result<Option<Preset>> {
+    let Some(node) = store.get_node(&synthetic_symbol(PLAN_PRESET, &row_id(scope, name)))? else {
+        return Ok(None);
+    };
+    let preset = Preset::from_node(&node)?;
+    Ok((preset.deleted_at.is_none()).then_some(preset))
+}
+
+/// Compose a preset's steps over the catalog into the def a launch runs. The def is named after
+/// the preset, so the run reports the name it launched.
+pub fn compose_preset(
+    preset: &Preset,
+) -> Result<crate::workflow::WorkflowDef, crate::plan::PlanRefusal> {
+    let plan = crate::plan::PlanSteps {
+        steps: preset.steps.clone(),
+    };
+    let mut def = crate::plan::compose(crate::catalog::catalog(), &plan)?;
+    def.id = preset.name.clone();
+    Ok(def)
+}
+
+/// Write the built-in presets to the store (boot). Idempotent by name: a row that already holds
+/// the built-in's steps is not rewritten. Returns the names written.
+pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<Vec<String>> {
+    let mut rows = Vec::new();
+    for (name, steps) in crate::catalog::builtin_presets() {
+        let current = get_row(store, GLOBAL_SCOPE, name)?;
+        if current
+            .as_ref()
+            .is_some_and(|p| p.created_by == BUILTIN_CREATED_BY && p.steps == steps)
+        {
+            continue;
+        }
+        rows.push(Preset {
+            name: name.to_string(),
+            scope: GLOBAL_SCOPE.to_string(),
+            steps,
+            created_by: BUILTIN_CREATED_BY.to_string(),
+            updated_at: now_ms,
+            deleted_at: None,
+        });
+    }
+    if !rows.is_empty() {
+        let nodes: Vec<Node> = rows.iter().map(ToNode::to_node).collect();
+        crate::domain::put_nodes(store, &nodes)?;
+    }
+    Ok(rows.into_iter().map(|p| p.name).collect())
+}
+
+/// Save a preset (create or replace in its scope). Refused for a bad name, the reserved
+/// `created_by`, an unknown project, steps that do not compose, and a global write to a built-in's
+/// name (a project-scoped one shadows it instead).
 pub fn put_preset(
-    _store: &mut dyn GraphStore,
-    _spec: PresetSpec,
-    _now_ms: i64,
+    store: &mut dyn GraphStore,
+    spec: PresetSpec,
+    now_ms: i64,
 ) -> anyhow::Result<Preset> {
-    anyhow::bail!("seam C2: put_preset not built")
+    if !valid_name(&spec.name) {
+        return Err(PresetError::InvalidName(spec.name).into());
+    }
+    if spec.created_by == BUILTIN_CREATED_BY {
+        return Err(PresetError::ReservedCreatedBy.into());
+    }
+    match spec.project_id.as_deref() {
+        None if is_builtin_name(&spec.name) => {
+            return Err(PresetError::BuiltinReadonly(spec.name).into());
+        }
+        None => {}
+        Some(p) if p == crate::project::DEFAULT_PROJECT_ID => {}
+        Some(p) if crate::project::get_project(store, p)?.is_none() => {
+            return Err(PresetError::UnknownProject(p.to_string()).into());
+        }
+        Some(_) => {}
+    }
+    let preset = Preset {
+        name: spec.name,
+        scope: scope_for(spec.project_id.as_deref()),
+        steps: spec.steps,
+        created_by: spec.created_by,
+        updated_at: now_ms,
+        deleted_at: None,
+    };
+    compose_preset(&preset).map_err(|e| PresetError::InvalidSteps(e.to_string()))?;
+    crate::domain::put_node(store, preset.to_node())?;
+    Ok(preset)
 }
 
-/// Delete a preset in its scope. `Ok(false)` = no such live preset there.
+/// Delete a preset in its scope (a tombstone: the store has no node deletion). `Ok(false)` = no
+/// such live preset there. A built-in is refused.
 pub fn delete_preset(
-    _store: &mut dyn GraphStore,
-    _name: &str,
-    _project_id: Option<&str>,
-    _now_ms: i64,
+    store: &mut dyn GraphStore,
+    name: &str,
+    project_id: Option<&str>,
+    now_ms: i64,
 ) -> anyhow::Result<bool> {
-    anyhow::bail!("seam C2: delete_preset not built")
+    let scope = scope_for(project_id);
+    let Some(mut preset) = get_row(store, &scope, name)? else {
+        return Ok(false);
+    };
+    if preset.created_by == BUILTIN_CREATED_BY {
+        return Err(PresetError::BuiltinReadonly(name.to_string()).into());
+    }
+    preset.deleted_at = Some(now_ms);
+    preset.updated_at = now_ms;
+    crate::domain::put_node(store, preset.to_node())?;
+    Ok(true)
 }
 
-/// The presets a launch in `project_id` sees, by name.
+/// The presets a launch in `project_id` sees, sorted by name: every live global preset, with the
+/// project's row replacing the global row of the same name. `None` ⇒ the global set.
 pub fn list_presets(
-    _store: &dyn GraphRead,
-    _project_id: Option<&str>,
+    store: &dyn GraphRead,
+    project_id: Option<&str>,
 ) -> anyhow::Result<Vec<Preset>> {
-    anyhow::bail!("seam C2: list_presets not built")
+    let query = wicked_estate_core::SymbolQuery {
+        kinds: vec![NodeKind::Other(PLAN_PRESET.to_string())],
+        ..Default::default()
+    };
+    let project_scope = project_id.map(|p| scope_for(Some(p)));
+    let mut by_name: std::collections::BTreeMap<String, Preset> = Default::default();
+    let mut rows: Vec<Preset> = store
+        .find_symbols(&query)?
+        .iter()
+        .filter_map(|n| Preset::from_node(n).ok())
+        .filter(|p| p.deleted_at.is_none())
+        .filter(|p| p.scope == GLOBAL_SCOPE || Some(&p.scope) == project_scope.as_ref())
+        .collect();
+    // Global first, so the project's row overwrites it by name.
+    rows.sort_by_key(|p| p.scope != GLOBAL_SCOPE);
+    for p in rows {
+        by_name.insert(p.name.clone(), p);
+    }
+    Ok(by_name.into_values().collect())
 }
 
-/// The preset a launch naming `name` in `project_id` runs: the project's row, else the global one.
+/// The preset a launch naming `name` in `project_id` runs: the project's live row, else the
+/// global one. `None` ⇒ no preset of that name (the caller falls back to the registered defs).
 pub fn resolve(
-    _store: &dyn GraphRead,
-    _project_id: Option<&str>,
-    _name: &str,
+    store: &dyn GraphRead,
+    project_id: Option<&str>,
+    name: &str,
 ) -> anyhow::Result<Option<Preset>> {
-    Ok(None)
+    if let Some(p) = project_id {
+        if let Some(preset) = get_row(store, &scope_for(Some(p)), name)? {
+            return Ok(Some(preset));
+        }
+    }
+    get_row(store, GLOBAL_SCOPE, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wicked_apps_core::open_store;
+
+    fn mem_store() -> wicked_apps_core::SqliteStore {
+        open_store(Some(":memory:")).unwrap()
+    }
+
+    fn understand_only() -> Vec<PlanStep> {
+        vec![PlanStep {
+            catalog: "understand".into(),
+            id: "u".into(),
+            ..Default::default()
+        }]
+    }
+
+    fn user(name: &str, project: Option<&str>) -> PresetSpec {
+        PresetSpec {
+            name: name.into(),
+            project_id: project.map(str::to_string),
+            steps: understand_only(),
+            created_by: "api".into(),
+        }
+    }
+
+    #[test]
+    fn a_preset_round_trips_through_its_node() {
+        let p = Preset {
+            name: "my-flow".into(),
+            scope: "project:proj_1".into(),
+            steps: understand_only(),
+            created_by: "studio".into(),
+            updated_at: 7,
+            deleted_at: None,
+        };
+        let node = p.to_node();
+        assert_eq!(node.kind, NodeKind::Other("plan_preset".into()));
+        assert_eq!(Preset::from_node(&node).unwrap(), p);
+    }
+
+    #[test]
+    fn seeding_is_idempotent_by_name() {
+        let mut store = mem_store();
+        assert_eq!(seed_builtins(&mut store, 10).unwrap(), ["feature"]);
+        assert!(seed_builtins(&mut store, 20).unwrap().is_empty());
+        let f = resolve(&store, None, "feature").unwrap().unwrap();
+        assert_eq!((f.created_by.as_str(), f.updated_at), ("builtin", 10));
+    }
+
+    #[test]
+    fn seeding_repairs_a_stale_builtin_row() {
+        let mut store = mem_store();
+        let stale = Preset {
+            name: "feature".into(),
+            scope: GLOBAL_SCOPE.into(),
+            steps: understand_only(),
+            created_by: BUILTIN_CREATED_BY.into(),
+            updated_at: 1,
+            deleted_at: None,
+        };
+        crate::domain::put_node(&mut store, stale.to_node()).unwrap();
+        assert_eq!(seed_builtins(&mut store, 5).unwrap(), ["feature"]);
+        let f = resolve(&store, None, "feature").unwrap().unwrap();
+        assert_eq!(f.steps.len(), 6);
+    }
+
+    #[test]
+    fn names_are_checked() {
+        for ok in [
+            "feature",
+            "domain-graph-slice",
+            "qe.author_tests",
+            &"a".repeat(64),
+        ] {
+            assert!(valid_name(ok), "{ok}");
+        }
+        for bad in ["", "a b", "run:plan-1", "a/b", &"a".repeat(65)] {
+            assert!(!valid_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_reserved_created_by_is_refused() {
+        let mut store = mem_store();
+        let mut spec = user("x", None);
+        spec.created_by = BUILTIN_CREATED_BY.into();
+        let err = put_preset(&mut store, spec, 1).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<PresetError>(),
+            Some(&PresetError::ReservedCreatedBy)
+        );
+    }
+
+    #[test]
+    fn a_put_after_a_delete_revives_the_name() {
+        let mut store = mem_store();
+        put_preset(&mut store, user("x", None), 1).unwrap();
+        assert!(delete_preset(&mut store, "x", None, 2).unwrap());
+        assert!(resolve(&store, None, "x").unwrap().is_none());
+        put_preset(&mut store, user("x", None), 3).unwrap();
+        let x = resolve(&store, None, "x").unwrap().unwrap();
+        assert_eq!((x.updated_at, x.deleted_at), (3, None));
+    }
+
+    #[test]
+    fn a_project_row_shadows_only_its_project() {
+        let mut store = mem_store();
+        seed_builtins(&mut store, 1).unwrap();
+        put_preset(&mut store, user("feature", Some("default")), 2).unwrap();
+        assert_eq!(
+            resolve(&store, Some("default"), "feature")
+                .unwrap()
+                .unwrap()
+                .steps
+                .len(),
+            1
+        );
+        assert_eq!(
+            resolve(&store, None, "feature")
+                .unwrap()
+                .unwrap()
+                .steps
+                .len(),
+            6
+        );
+        assert_eq!(
+            resolve(&store, Some("other"), "feature")
+                .unwrap()
+                .unwrap()
+                .steps
+                .len(),
+            6
+        );
+        let listed: Vec<_> = list_presets(&store, Some("default"))
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.name, p.scope))
+            .collect();
+        assert_eq!(
+            listed,
+            [("feature".to_string(), "project:default".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_composed_def_is_named_after_the_preset() {
+        let p = Preset {
+            name: "my-flow".into(),
+            scope: GLOBAL_SCOPE.into(),
+            steps: understand_only(),
+            created_by: "api".into(),
+            updated_at: 0,
+            deleted_at: None,
+        };
+        let def = compose_preset(&p).unwrap();
+        assert_eq!(def.id, "my-flow");
+        assert_eq!(def.phases.len(), 1);
+    }
 }
