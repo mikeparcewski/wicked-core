@@ -899,6 +899,7 @@ pub(crate) fn run(
     let team_boot = team_gate::reconcile_at_boot(&mut store);
     team_gate::drain_at_boot(team_boot.drain);
     let team_boot_cancels = team_boot.cancels;
+    let team_boot_applies = team_boot.applies;
     let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = pipeline::workflow_overlay_dir() {
         if let Err(e) = registry.load_dir(&dir) {
@@ -967,6 +968,23 @@ pub(crate) fn run(
             &lifecycle_maps,
         ) {
             eprintln!("wicked-core: boot could not cancel rejected team run {run_id}: {e:#}");
+        }
+    }
+    // (DES-TEAMING-002 T3, codex round 9) A plan-gate answer whose `gate.decided` was
+    // acknowledged before the restart is applied here, once (the apply is idempotent).
+    for run_id in team_boot_applies {
+        if let Err(e) = team_gate::finish_release_at_boot(
+            &mut store,
+            &mut subscribers,
+            &runner,
+            &self_tx,
+            &lifecycle_maps,
+            &actor_maps,
+            process_gen,
+            is_acp,
+            &run_id,
+        ) {
+            eprintln!("wicked-core: boot could not apply the plan-gate answer of {run_id}: {e:#}");
         }
     }
 
@@ -8481,87 +8499,68 @@ fn confirm_plan_gate(
         }
         return result;
     }
-    let mut s = session;
-    let decided_ev = match plan {
+    // (codex round 9 on #622) P1's REQUIRED FACT FIRST: the answer is decided and proven above
+    // (round 4: nothing durable changed), and is now STAGED — never applied here. The gate's
+    // `gate.decided` is published as a required transition with the staged answer held durably
+    // on its pending fact; only its acknowledgement (or "continue without team") applies it: the
+    // plan state, the edit's facts (queued behind `gate.decided`), the unit swap, the release or
+    // the re-opened gate. A failure past the bound pauses `team_transport` with the old plan and
+    // units untouched; a reject there drops the staged answer. No bus: it applies at once,
+    // through the same step (`team_gate::release_plan_gate`).
+    let amended = || decided_fact(crate::team_events::GateDecision::HumanAmended);
+    let (decided_ev, release) = match plan {
         None => {
             let (next, decided) = crate::plan_gate::approve_pending(
                 run_id,
                 &state,
-                &s.human_confirm,
+                &session.human_confirm,
                 ord,
-                s.attempt,
+                session.attempt,
                 now,
             )?;
-            s.team_plan = Some(next);
-            decided
-        }
-        Some(staged) => {
-            let amended = decided_fact(crate::team_events::GateDecision::HumanAmended)?;
-            match staged {
-                StagedEdit::Accepted {
+            (
+                decided,
+                crate::plan_gate::StagedRelease {
                     state: next,
-                    events,
-                    def,
-                } => {
-                    // Every check passed on this exact def: only now do the facts go out, the
-                    // rev is recorded and the units are swapped (the old ones removed only after
-                    // the new set is written).
-                    team_gate::publish_plan_facts(&s, events);
-                    s.team_plan = Some(*next);
-                    put_node(store, s.to_node())?;
-                    replan_for_accepted_edit(store, subscribers, &s, def)?;
-                    s = crate::domain::get_session(&*store, run_id)?
-                        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
-                    amended
-                }
-                StagedEdit::Refused { reason, events } => {
-                    // The first gate's answer stays on record; the edit's refusal follows it.
-                    let mut facts = vec![amended];
-                    facts.extend(events);
-                    team_gate::publish_plan_facts(&s, facts);
-                    // Re-open (§8.6): the same plan stays held; the gate is new (a fresh
-                    // gate sequence, so a new `gate_id` and a new `gate.opened` row).
-                    let mut reopened = state.clone();
-                    if let Some(p) = reopened.pending.as_mut() {
-                        p.gate_id = None;
-                        p.refusal = Some(reason);
-                    }
-                    s.team_plan = Some(reopened);
-                    if let Some(team) = s.team.as_mut() {
-                        team.open_gate = None;
-                    }
-                    put_node(store, s.to_node())?;
-                    let unit_ix = s.unit_ix;
-                    return match advance_or_pause(
-                        store,
-                        subscribers,
-                        runner,
-                        self_tx,
-                        run_id,
-                        unit_ix,
-                        lifecycle_maps,
-                        actor_maps,
-                        process_gen,
-                        is_acp,
-                    )? {
-                        Progress::Paused => Ok(SessionStatus::AwaitingHuman),
-                        Progress::Dispatched | Progress::Done | Progress::Deferred => {
-                            anyhow::bail!("run {run_id}: a refused plan edit must re-open its gate")
-                        }
-                    };
-                }
+                    facts: Vec::new(),
+                    def: None,
+                    reopen: false,
+                },
+            )
+        }
+        Some(StagedEdit::Accepted {
+            state: next,
+            events,
+            def,
+        }) => (
+            amended()?,
+            crate::plan_gate::StagedRelease {
+                state: *next,
+                facts: crate::plan_gate::queued_facts(&events)?,
+                def: Some(crate::plan_gate::StagedDef::new(def)),
+                reopen: false,
+            },
+        ),
+        Some(StagedEdit::Refused { reason, events }) => {
+            // Re-open (§8.6): the same plan stays held; the gate is new (a fresh gate sequence,
+            // so a new `gate_id` and a new `gate.opened` row). The first gate's answer stays on
+            // record; the edit's refusal follows its `gate.decided`.
+            let mut reopened = state.clone();
+            if let Some(p) = reopened.pending.as_mut() {
+                p.gate_id = None;
+                p.refusal = Some(reason);
             }
+            (
+                amended()?,
+                crate::plan_gate::StagedRelease {
+                    state: reopened,
+                    facts: crate::plan_gate::queued_facts(&events)?,
+                    def: None,
+                    reopen: true,
+                },
+            )
         }
     };
-    // Release (§8.6): the cursor unit — which never ran — is released once, at its current
-    // attempt. The gate's `gate.decided` is P1's required resume fact, then `plan.accepted` gates
-    // the dispatch; an un-teamed run resumes directly. One path either way (`advance_or_pause`).
-    let cursor_ord = crate::domain::session_units(store, run_id)?
-        .get(s.unit_ix)
-        .map(|u| u.ord);
-    if let Some(tp) = s.team_plan.as_mut() {
-        tp.released_ord = cursor_ord;
-    }
     let mut cx = team_gate::Ctx {
         store,
         subscribers,
@@ -8573,7 +8572,7 @@ fn confirm_plan_gate(
         process_gen,
         is_acp,
     };
-    team_gate::release_plan_gate(&mut cx, s, decided_ev)
+    team_gate::release_plan_gate(&mut cx, session, decided_ev, release)
 }
 
 /// An edit decided and checked, not yet committed ([`stage_edit`]).
