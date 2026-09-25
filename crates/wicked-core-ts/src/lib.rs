@@ -1402,7 +1402,15 @@ impl Core {
 
     /// A team run's transport and its units' team snapshots — the persisted state behind crew's
     /// `GET /api/v1/runs/:id/team` — as JSON `{ runId, transport, reason, streamFloor, planRev,
-    /// pending, units: [{ ord, transport, reason, ledgerSource }] }`. `transport` is `"bus"`,
+    /// pending, units: [{ ord, transport, reason, ledgerSource, ledgerRef, finalPass, teamPause,
+    /// findings }] }`. Per unit (the last four `null` until the unit's attempt folded):
+    /// `ledgerSource` is where its ledger came from (`"folded"` by the supervisor, `"synthesized"`
+    /// by the worker on the final-pass timeout, `"no_bus"`); `ledgerRef` is the supervisor row the
+    /// gate read (`"ledger.folded#<ord>:<attempt>"`, `null` for a synthesized or local ledger);
+    /// `finalPass` is the ledger's `final_pass` (`"completed"`, `"timed_out"`, `"skipped"`,
+    /// `"stream_gap"`); `teamPause` true means an unresolved HIGH (or an incomplete record) stands
+    /// without a council YES, so the run pauses `team_dispute` before the next dispatch;
+    /// `findings` is how many findings the ledger holds. The run's `transport` is `"bus"`,
     /// `"none"` (un-teamed: render the "team transport unavailable" banner with `reason`),
     /// `"pending"` (not decided yet) or `"unavailable"` (teamed, but this daemon has no bus: the run
     /// is paused `team_transport` until the operator answers or a restart brings the bus back).
