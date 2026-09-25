@@ -35,13 +35,37 @@ EVAL_TIMEOUT_S = 90.0
 MAX_IDLE_S = 600.0
 MAX_WORK_CHARS = 32_000  # truncate oversized work to avoid prompt limits
 
+# The one seat this daemon judges with (`claude -p`). Reported as `judge_cli` on every verdict
+# so core can verify monitor exclusion (DES-TEAMING-001 §6.2, DES-TEAMING-002 T5).
+JUDGE_CLI = "claude"
+
 
 def _eval_response_key(eval_id: str) -> str:
     return hashlib.sha256(f"gate-eval-resp:{eval_id}".encode()).hexdigest()[:32]
 
 
-def _emit_response(bus_db: str, eval_id: str, pass_: bool, reasoning: str) -> None:
-    payload = json.dumps({"eval_id": eval_id, "pass": pass_, "reasoning": reasoning})
+def _seat_key(seat: str) -> str:
+    """The cli key of a seat instance (`claude#2` -> `claude`)."""
+    return seat.split("#", 1)[0]
+
+
+def _judge_excluded(payload: dict, judge: str = JUDGE_CLI) -> bool:
+    """Whether the request's `excluded_seats` (the team monitors that authored or corroborated a
+    finding in the unit's ledger) exclude this daemon's only judge seat, by instance or cli key.
+
+    The daemon must select no seat in `excluded_seats` (DES-TEAMING-001 §6.2); with one seat it
+    then has none, so it refuses without a model call and core folds the refusal as a DENY.
+    """
+    excluded = payload.get("excluded_seats") or []
+    return any(str(s) == judge or _seat_key(str(s)) == judge for s in excluded)
+
+
+def _emit_response(
+    bus_db: str, eval_id: str, pass_: bool, reasoning: str, judge_cli: "str | None" = None
+) -> None:
+    payload = json.dumps(
+        {"eval_id": eval_id, "pass": pass_, "reasoning": reasoning, "judge_cli": judge_cli}
+    )
     key = _eval_response_key(eval_id)
     now_ms = int(time.time() * 1000)
     ttl_ms = now_ms + 72 * 3_600_000
@@ -202,7 +226,18 @@ def run(bus_db: str, once: bool = False) -> None:
                 f"(run={run_id} unit={unit_ix})",
                 flush=True,
             )
-            pass_, reasoning = _evaluate(criterion, work)
+            if _judge_excluded(payload):
+                # No eligible seat: a monitor never grades its own finding. Refuse, naming no
+                # judge — core treats a missing judge_cli with exclusions as a DENY.
+                pass_, reasoning, judge_cli = (
+                    False,
+                    f"gate-eval daemon: its only judge seat ({JUDGE_CLI}) is excluded by "
+                    f"excluded_seats {payload.get('excluded_seats')} (fail-closed)",
+                    None,
+                )
+            else:
+                pass_, reasoning = _evaluate(criterion, work)
+                judge_cli = JUDGE_CLI
             verdict_str = "PASS" if pass_ else "REJECT"
             print(
                 f"[gate-eval-daemon] verdict={verdict_str} reasoning={reasoning[:100]!r}",
@@ -210,7 +245,7 @@ def run(bus_db: str, once: bool = False) -> None:
             )
 
             try:
-                _emit_response(bus_db, eval_id, pass_, reasoning)
+                _emit_response(bus_db, eval_id, pass_, reasoning, judge_cli)
             except Exception as exc:
                 print(f"[gate-eval-daemon] emit error: {exc}", file=sys.stderr, flush=True)
 

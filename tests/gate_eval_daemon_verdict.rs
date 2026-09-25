@@ -171,6 +171,27 @@ fn the_bus_path_daemon_prompt_asks_for_the_closing_verdict_it_requires() {
     );
 }
 
+/// DES-TEAMING-002 T5 / DES-001 §6.2: the daemon's only judge seat is `claude`, so a request
+/// whose `excluded_seats` name a claude instance (or `claude` itself) leaves it no eligible seat.
+/// It refuses without a model call; other monitors, or none, leave it free to judge.
+#[test]
+fn the_bus_path_daemon_never_judges_as_an_excluded_monitor() {
+    let out = probe(
+        "print(json.dumps([\n\
+           mod._judge_excluded({'excluded_seats': ['claude#2', 'claude#3']}),\n\
+           mod._judge_excluded({'excluded_seats': ['claude']}),\n\
+           mod._judge_excluded({'excluded_seats': ['codex#2']}),\n\
+           mod._judge_excluded({'excluded_seats': []}),\n\
+           mod._judge_excluded({}),\n\
+           mod.JUDGE_CLI]))\n",
+    );
+    assert_eq!(
+        out.trim(),
+        r#"[true, true, false, false, false, "claude"]"#,
+        "{out}"
+    );
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
 /// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
