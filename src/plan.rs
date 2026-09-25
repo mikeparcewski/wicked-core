@@ -2108,6 +2108,24 @@ mod tests {
     /// codex round 6 on #622: the engine's deliver protections (the human deliver gate, the
     /// lift + re-verify) key on the phase id `deliver`, so compose reserves it: a `deliver` step
     /// MUST be id `deliver`, at most one exists, and no other step may take the id.
+    /// T3 (codex round 7): a unit planned from a catalog-composed def carries its catalog id; a
+    /// unit of a registered def carries none.
+    #[test]
+    fn composed_units_carry_their_catalog_id() {
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "make"}, {"catalog": "review", "id": "check"}
+        ]}))
+        .unwrap();
+        let def = compose(crate::catalog::catalog(), &plan).unwrap();
+        let units = plan_from_def(&def, "p", "s");
+        let cats: Vec<_> = units.iter().map(|u| u.catalog.as_deref()).collect();
+        assert_eq!(cats, [Some("build"), Some("review")]);
+        let bug = crate::workflow::bug_def();
+        assert!(plan_from_def(&bug, "p", "s")
+            .iter()
+            .all(|u| u.catalog.is_none()));
+    }
+
     mod deliver_id_reserved {
         use super::*;
         use serde_json::json;

@@ -15577,6 +15577,7 @@ No further next steps — both questions fully answered.";
             rework_of: None,
             rework_amendment: None,
             status: crate::domain::UnitStatus::Pending,
+            catalog: None,
         }
     }
 

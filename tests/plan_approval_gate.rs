@@ -156,6 +156,38 @@ fn spawn(db: &str) -> Rig {
     }
 }
 
+/// A rig with NO bus (`transport: none`): the plan gate must work the same.
+fn spawn_no_bus(db: &str) -> Rig {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let calls: Calls = Arc::default();
+    let dir = std::path::Path::new(db)
+        .parent()
+        .expect("db dir")
+        .to_path_buf();
+    let bus = dir.join("bus.db").to_string_lossy().into_owned();
+    BusDb::shared(&bus).expect("bus db");
+    BUS.with(|b| *b.borrow_mut() = Some(bus));
+    let core = Core::spawn_with_engine_team(
+        db.to_string(),
+        Arc::new(StubDispatcher),
+        Arc::new(RecordAndHold {
+            calls: calls.clone(),
+            gate: gate.clone(),
+        }),
+        TeamConfig::new(None, Some(dir.join(TEAM_OUTBOX_FILE))),
+    );
+    let tap = Tap {
+        rx: core.subscribe(),
+        seen: Vec::new(),
+    };
+    Rig {
+        core,
+        calls,
+        gate,
+        tap,
+    }
+}
+
 /// A restart: drop the rig (its actor exits once the last handle drops), then a fresh one over the
 /// same store.
 fn restart(rig: Rig, db: &str) -> Rig {
@@ -1365,6 +1397,119 @@ fn a_renamed_deliver_step_is_refused_as_a_gate_edit() {
     );
     assert!(of_type(&rig.tap.seen, "rse", ACCEPTED).is_empty());
     assert!(unit_ids(&rig.core, "rse").iter().all(|u| u != "ship"));
+}
+
+// ── codex round 7: durable gate rows, true path.started metadata ────────────────────────────────
+
+/// The run's interaction rows, as the store holds them.
+fn interaction_rows(db: &str, run: &str) -> Vec<wicked_core::InteractionRequest> {
+    let store = wicked_apps_core::open_store_ro(Some(db)).expect("store");
+    wicked_core::list_interactions(&store, Some(run), None).expect("rows")
+}
+
+fn refused_edit_keeps_the_answered_row(with_bus: bool) {
+    let name = if with_bus { "rowsbus" } else { "rowsnobus" };
+    let dir = tmp_dir(name);
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = if with_bus {
+        spawn(&db)
+    } else {
+        spawn_no_bus(&db)
+    };
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    rig.core
+        .launch_run(spec(name, HumanConfirm::None, Some(p)))
+        .unwrap();
+    rig.tap.until("the plan_approval pause", |s| {
+        paused_on_plan(s, name).is_some()
+    });
+    let status = rig
+        .core
+        .confirm_gate(
+            name,
+            HumanDecision::EditPlan {
+                plan: refused_edit(),
+            },
+        )
+        .unwrap();
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    rig.tap.settle();
+    let rows: Vec<_> = interaction_rows(&db, name)
+        .into_iter()
+        .filter(|r| r.gate_kind.as_deref() == Some("plan_approval"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "each opening is its own durable row: {rows:?}"
+    );
+    let answered: Vec<_> = rows
+        .iter()
+        .filter(|r| r.status == wicked_core::InteractionStatus::Answered)
+        .collect();
+    let open: Vec<_> = rows
+        .iter()
+        .filter(|r| r.status == wicked_core::InteractionStatus::Open)
+        .collect();
+    assert_eq!((answered.len(), open.len()), (1, 1), "{rows:?}");
+    assert!(
+        answered[0]
+            .answer
+            .as_deref()
+            .unwrap_or("")
+            .contains("edit_plan"),
+        "the first row keeps its answer: {:?}",
+        answered[0].answer
+    );
+    assert_ne!(answered[0].id, open[0].id);
+}
+
+/// A refused edit re-opens the gate as a NEW interaction row: the first stays `answered` with
+/// its answer (the audit record), the second is `open` — with a bus and without one.
+#[test]
+fn a_refused_edit_keeps_the_first_gates_answered_row() {
+    refused_edit_keeps_the_answered_row(true);
+    refused_edit_keeps_the_answered_row(false);
+}
+
+/// `path.started` says what the launch named: the preset (`workflow`), or a user-composed plan
+/// (`plan: true`).
+#[test]
+fn path_started_names_the_preset_or_the_user_plan() {
+    let dir = tmp_dir("pstart");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    rig.core
+        .put_preset(PresetSpec {
+            name: "my-flow".into(),
+            project_id: None,
+            steps: plan(json!({"steps": [{"catalog": "understand", "id": "scope"}]})).steps,
+            created_by: "api".into(),
+        })
+        .unwrap();
+    let mut preset = spec("rps", HumanConfirm::None, None);
+    preset.workflow = Some("my-flow".into());
+    rig.core.launch_run(preset).unwrap();
+    rig.core
+        .launch_run(spec(
+            "rpu",
+            HumanConfirm::None,
+            Some(plan(json!({"steps": [{"catalog": "understand"}]}))),
+        ))
+        .unwrap();
+    rig.tap.until("both path.started rows", |s| {
+        !of_type(s, "rps", STARTED).is_empty() && !of_type(s, "rpu", STARTED).is_empty()
+    });
+    let ps = &of_type(&rig.tap.seen, "rps", STARTED)[0];
+    assert_eq!(
+        (ps["workflow"].clone(), ps["plan"].clone()),
+        (json!("my-flow"), json!(false))
+    );
+    let pu = &of_type(&rig.tap.seen, "rpu", STARTED)[0];
+    assert_eq!(
+        (pu["workflow"].clone(), pu["plan"].clone()),
+        (Value::Null, json!(true))
+    );
 }
 
 /// The straight-through `Core::launch` honours no gate, so it refuses a preset (and a plan)

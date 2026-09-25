@@ -1178,3 +1178,26 @@ fn bus_restart_leaves_a_live_teamed_run_live() {
     assert_eq!(e.core.live_team_runs().unwrap().len(), 1);
     assert!(!outbox_has_run_tombstone(&rig, "lt-b"));
 }
+
+/// T3 (codex round 7): a team run launched on a bare composed def (no plan, no preset) says so:
+/// `path.started{workflow: null, plan: false}`.
+#[test]
+fn path_started_of_a_bare_def_names_neither_a_preset_nor_a_plan() {
+    let rig = rig("psbare");
+    let e = engine(&rig, fast(&rig));
+    launch_team(&e, "psbare");
+    wait_for("path.started", || {
+        rig.types("psbare").contains(&tev::PATH_STARTED.to_string())
+    });
+    let c = rig.conn();
+    let payload: String = c
+        .query_row(
+            "SELECT payload FROM events WHERE event_type = ?1",
+            [tev::PATH_STARTED],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(v["workflow"], serde_json::Value::Null);
+    assert_eq!(v["plan"], false);
+}

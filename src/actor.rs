@@ -17339,3 +17339,139 @@ mod plan_gate_confirm_tests {
         assert_eq!(s.status, SessionStatus::AwaitingHuman);
     }
 }
+
+/// T3 (codex round 7): governance selects a policy on the unit's CATALOG id too — a plan's step
+/// ids are the author's, so `applies_to: ["review"]` must reach a review step authored as
+/// `check`. Absence never widens: a unit with no catalog id keeps today's two aliases, and the
+/// existing phase-id match is unchanged.
+#[cfg(test)]
+mod catalog_alias_governance_tests {
+    use super::*;
+    use crate::domain::{put_node, AgentSession, HumanConfirm, SessionStatus, WorkUnit};
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+    use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// Paused before unit 1 (`r:<phase_id>`, catalog `catalog`), with a deny policy on `review`.
+    fn approve_under_review_policy(phase_id: &str, catalog: Option<&str>) -> SessionStatus {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let session = AgentSession {
+            id: "r".into(),
+            workflow_id: "wf-r".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::All,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(format!("r:{phase_id}"), "r", 1, "a unit");
+        u.gate = GateSpec::HumanConfirm {
+            unconditional: true,
+        };
+        u.catalog = catalog.map(str::to_string);
+        put_node(&mut store, u.to_node()).unwrap();
+        register_policy(
+            &mut store,
+            &Policy {
+                id: "pol-review".to_string(),
+                kind: "test".to_string(),
+                applies_to: vec!["review".to_string()],
+                effect: Effect::Deny,
+                trigger: Trigger {
+                    contains: Some("phase-boundary".to_string()),
+                },
+                obligations: vec![],
+                criteria: "deny review phases".to_string(),
+                severity: Severity::High,
+                rule: "Test: deny at every review phase boundary.".to_string(),
+                retired: false,
+            },
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r",
+            crate::workflow::HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_review_step_authored_under_another_id_is_selected_by_its_catalog() {
+        assert_eq!(
+            approve_under_review_policy("check", Some("review")),
+            SessionStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn the_catalog_alias_never_widens_to_another_entry_or_to_its_absence() {
+        assert_ne!(
+            approve_under_review_policy("review-notes", Some("build")),
+            SessionStatus::Cancelled
+        );
+        assert_ne!(
+            approve_under_review_policy("check", None),
+            SessionStatus::Cancelled
+        );
+        // The existing phase-id match is kept as is.
+        assert_eq!(
+            approve_under_review_policy("review", None),
+            SessionStatus::Cancelled
+        );
+    }
+}

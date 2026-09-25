@@ -658,6 +658,13 @@ pub struct WorkUnit {
     /// serialize byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub team_run: bool,
+    /// (DES-TEAMING-002 T3) The phase-catalog entry this unit instantiates (`review`, `build`, …)
+    /// when it was planned from a catalog-composed def — a plan's step ids are the author's, so
+    /// governance selects on the catalog id too (a third `applies_to` alias, `scope::
+    /// phase_aliases`). `None` for every other unit, which keeps today's two aliases.
+    /// `#[serde(default)]` + skip-if-none: older rows deserialize and serialize byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     /// (DES-TEAMING-002 P1) The unit's team snapshot, stamped by the actor at dispatch for a team
     /// run ([`UnitTeamSnapshot`]). `None` for a non-team unit. Skip-if-none: non-team units
     /// serialize byte-identical.
@@ -920,6 +927,7 @@ impl WorkUnit {
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,
+            catalog: None,
             team: None,
             scope_warnings: Vec::new(),
             worktree_guarded: false,

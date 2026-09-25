@@ -101,6 +101,7 @@ mod tests {
             last_attempt: None,
             rework_of: None,
             rework_amendment: None,
+            catalog: None,
         }
     }
 
