@@ -318,7 +318,10 @@ fn producer_assigned_ids_mint_to_fixed_values() {
 fn a_keyed_type_with_a_null_ord_has_no_key() {
     let mut p = fixture(FINDING_RAISED);
     p["ord"] = Value::Null;
-    let ev = TeamEvent::from_payload(FINDING_RAISED, &p).unwrap();
+    // Refused at parse (it has no key); a hand-built one has no key either.
+    assert!(TeamEvent::from_payload(FINDING_RAISED, &p).is_err());
+    let mut ev = TeamEvent::from_payload(FINDING_RAISED, &fixture(FINDING_RAISED)).unwrap();
+    ev.env.ord = None;
     assert!(ev.key().is_err());
 }
 
@@ -1416,21 +1419,25 @@ fn a_high_never_disappears_and_an_orphan_row_is_a_stream_gap() {
 /// finding's is a stream gap, and the HIGH keeps the ledger paused.
 #[test]
 fn a_row_naming_another_finding_id_is_not_applied_and_is_a_gap() {
-    let base = || {
+    // The honest stream; for `settled` it carries no settle of its own, so the forged row is the
+    // finding's only one (a same-key settle would be deduplicated, first row wins).
+    let base = |settle: bool| {
         let mut s = Stream::new();
         s.joined("m1", "claude#2")
             .raised(1, "high")
             .injected(1)
-            .answered(1, "build", "declined", "documented")
-            .settled(1, "held", "the finding stands", Some(41));
+            .answered(1, "build", "declined", "documented");
+        if settle {
+            s.settled(1, "held", "the finding stands", Some(41));
+        }
         s
     };
-    let honest = base().fold();
-    assert!(honest.team_pause, "the real HIGH is unresolved");
+    assert!(base(true).fold().team_pause, "the real HIGH is unresolved");
+    assert!(base(false).fold().team_pause, "held by silence");
 
     // The same stream plus a row that claims raise_seq 1 but names another finding.
     for kind in ["answered", "delivered", "settled"] {
-        let mut s = base();
+        let mut s = base(kind != "settled");
         match kind {
             "answered" => s.answered(1, "review", "accepted", "fixed"),
             "delivered" => s.delivered(1, "s-other", "acp_steering", "injected"),
@@ -1497,6 +1504,30 @@ fn a_keyless_row_is_refused_at_parse_and_never_applied_by_the_fold() {
         (l.findings[0].status, l.findings[0].worker_reason.as_deref()),
         (FindingStatus::Declined, Some("documented")),
         "the keyless row is not applied"
+    );
+    assert_eq!(l.final_pass, FinalPass::StreamGap);
+    assert!(l.team_pause);
+}
+
+/// `finding_id` is a content hash, so attempt 2's copy of a finding has the same id: a row of
+/// another attempt that reuses the `raise_seq` is not about this attempt's finding.
+#[test]
+fn a_row_from_another_attempt_is_not_applied_and_is_a_gap() {
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2")
+        .raised(1, "high")
+        .injected(1)
+        .answered(1, "build", "declined", "documented")
+        .settled(1, "held", "the finding stands", Some(41))
+        .ruled(1, "no", None)
+        .ruled(1, "yes", None);
+    // The YES belongs to attempt 2 (same subject, same finding id).
+    s.rows.last_mut().unwrap().event.env.attempt = Some(2);
+    let l = s.fold();
+    assert_eq!(
+        l.findings[0].dispute.as_ref().map(|d| d.verdict),
+        Some(crate::team::Verdict::No),
+        "attempt 2's ruling is not applied"
     );
     assert_eq!(l.final_pass, FinalPass::StreamGap);
     assert!(l.team_pause);

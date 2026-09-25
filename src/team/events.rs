@@ -1060,7 +1060,11 @@ impl TeamEvent {
     pub fn from_payload(event_type: &str, payload: &Value) -> Result<Self> {
         let env: Envelope = serde_json::from_value(payload.clone())?;
         let body = TeamBody::from_value(event_type, payload.clone())?;
-        Ok(TeamEvent { env, body })
+        let ev = TeamEvent { env, body };
+        // A row whose key cannot be built (a keyed type with a null `ord`/`attempt`) is refused:
+        // it could be neither deduplicated nor attributed to its attempt.
+        ev.key()?;
+        Ok(ev)
     }
 
     /// The idempotency key (DES-002 §6.1). Errors when a type that is keyed on `ord`/`attempt`
@@ -1198,11 +1202,15 @@ pub fn gate_pauses(approved: bool, ledger: &TeamLedger) -> bool {
 /// `skipped` when the attempt's `step.completed` did not return `ok`, else `completed`.
 /// `teamPause` is [`ledger_pauses`].
 ///
-/// **No row is dropped silently.** Every payload enum is a closed set, so a malformed row never
-/// parses into a [`TeamRow`]. A row that names a finding this stream never raised (an
-/// `advice.*`, `finding.settled` or `council.ruled{finding:<n>}` with no `finding.raised` for
-/// `<n>`) means the record is incomplete: `final_pass` becomes `stream_gap` and the ledger
-/// pauses.
+/// **No row is dropped silently, and none is misapplied.** Every payload enum is a closed set and
+/// every row must carry its key, so a malformed row never parses into a [`TeamRow`]. Each of these
+/// means the record is incomplete, so `final_pass` becomes `stream_gap`, the row is not applied,
+/// and the ledger pauses:
+/// - a row that reaches the fold without a key;
+/// - a row that names a finding this stream never raised (an `advice.*`, `finding.settled` or
+///   `council.ruled{finding:<n>}` with no `finding.raised` for `<n>`);
+/// - a row that claims a raised finding's `raise_seq` but names another `finding_id`, or comes
+///   from another attempt.
 ///
 /// Not on the stream, so not folded: `rejected{}` (a rejected monitor line is never raised) and a
 /// corroboration that arrives after the finding was raised. The supervisor, which owns both,
@@ -1211,10 +1219,14 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
     let mut ordered: Vec<&TeamRow> = rows.iter().collect();
     ordered.sort_by_key(|r| r.event_id);
     let mut keys = HashSet::new();
-    let mut ids = HashSet::new();
+    // A row without a key (built past `from_payload`) is never applied: it is a gap.
+    let mut gap = false;
     ordered.retain(|r| match r.event.key() {
         Ok(k) => keys.insert(k),
-        Err(_) => ids.insert(r.event_id),
+        Err(_) => {
+            gap = true;
+            false
+        }
     });
 
     let mut monitors: Vec<MonitorAcc> = Vec::new();
@@ -1241,6 +1253,7 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
             // Keys are (ord, attempt, raise_seq): after the key dedup one raise per raise_seq.
             TeamBody::FindingRaised(b) => findings.push(FindingAcc {
                 raise_seq: b.raise_seq,
+                at: (env.ord, env.attempt),
                 finding: Finding {
                     finding_id: b.finding_id.clone(),
                     monitor_id: b.member_id.clone(),
@@ -1270,7 +1283,6 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
         }
     }
 
-    let mut gap = false;
     for row in about {
         let seq = match &row.event.body {
             TeamBody::AdviceDelivered(b) => b.raise_seq,
@@ -1293,6 +1305,19 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
             gap = true;
             continue;
         };
+        // The row must be about THIS finding: the same attempt and, where it names one, the
+        // same `finding_id`. A row matched by `raise_seq` alone could answer another finding.
+        let named = match &row.event.body {
+            TeamBody::AdviceDelivered(b) => Some(&b.finding_id),
+            TeamBody::AdviceAnswered(b) => Some(&b.finding_id),
+            TeamBody::FindingSettled(b) => Some(&b.finding_id),
+            _ => None,
+        };
+        let env = &row.event.env;
+        if (env.ord, env.attempt) != f.at || named.is_some_and(|id| *id != f.finding.finding_id) {
+            gap = true;
+            continue;
+        }
         match &row.event.body {
             TeamBody::AdviceDelivered(b) => f.injected |= b.outcome == DeliveryOutcome::Injected,
             TeamBody::AdviceAnswered(b) => f.answer = Some(b.clone()),
@@ -1412,6 +1437,8 @@ fn monitor_entry<'a>(
 /// One finding's rows, keyed by the supervisor's `raise_seq`.
 struct FindingAcc {
     raise_seq: u32,
+    /// The raise's `(ord, attempt)`: rows of another attempt are not about this finding.
+    at: (Option<u32>, Option<u32>),
     finding: Finding,
     corroborated_by: Vec<String>,
     /// Some delivery answered `injected` (any channel).
