@@ -383,8 +383,18 @@ pub(crate) fn distribute_units_against_benched(
         })
         .collect();
     let still_eligible: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
-    let (same_seat, same_cli_instance) =
-        enforce_evaluator_distinct(units, &mut dists, &still_eligible, clis, &candidates);
+    // (DES-TEAMING-002 §8.1, seam D1) A TEAM RUN — units of the run's composed per-run def,
+    // stamped `team_run` at plan time — never grades on its creator seat and prefers a distinct
+    // CLI over a second instance of the creator's.
+    let team_run = units.iter().any(|u| u.team_run);
+    let (same_seat, same_cli_instance) = enforce_evaluator_distinct(
+        units,
+        &mut dists,
+        &still_eligible,
+        clis,
+        &candidates,
+        team_run,
+    );
     // (AC-3 / core#537, core#560) When a benched seat — from ANY source (launcher health probe,
     // or a worker transcript persisted on the session) — made evaluator≠creator unsatisfiable,
     // fail CLOSED: the operator must relaunch once the seat recovers. A silent creator_seat
@@ -404,6 +414,37 @@ pub(crate) fn distribute_units_against_benched(
                  benched; {}",
                 blocked,
                 crate::domain::benched_summary(&benched, configured.len()).unwrap_or_default()
+            ),
+            benched_seats: benched.clone(),
+        }
+        .into());
+    }
+    // (DES-TEAMING-002 §8.1, seam D1) A team run refuses the creator-seat fallback even on a
+    // BENCH-FREE roster: no distinct CLI and no usable second instance ⇒ `NoEligibleSeat`, naming
+    // the units and the instance that would satisfy them. The engine never mints or signs in an
+    // instance; the launcher adds the ones it has configured to the roster.
+    if !same_seat.is_empty() && team_run {
+        let blocked: Vec<&WorkUnit> = units
+            .iter()
+            .filter(|u| u.tool_cmd.is_none() && same_seat.contains(&u.ord))
+            .collect();
+        let ords: Vec<u32> = blocked.iter().map(|u| u.ord).collect();
+        let mut missing: Vec<String> = Vec::new();
+        for (u, d) in units.iter().zip(dists.iter()) {
+            if blocked.iter().any(|b| b.ord == u.ord) {
+                let key = next_instance_key(configured, model_of(&d.assigned_cli));
+                if !missing.contains(&key) {
+                    missing.push(key);
+                }
+            }
+        }
+        return Err(crate::NoEligibleSeat {
+            run_id: session_id.to_string(),
+            benched: format!(
+                "evaluator\u{2260}creator unsatisfiable for unit(s) {ords:?}: team run \u{2014} no \
+                 seat distinct from the creator and no usable second instance (add a signed-in \
+                 {} to the roster); a team run never grades on its creator seat",
+                missing.join(" or ")
             ),
             benched_seats: benched.clone(),
         }
@@ -433,6 +474,15 @@ pub(crate) fn distribute_units_against_benched(
         };
     }
     Ok(dists)
+}
+
+/// The first seat-instance key of `cli` (`<cli>#2`, `<cli>#3`, …) the roster does not already
+/// hold: the instance a refused team run names as its remedy (DES-TEAMING-002 §8.1).
+fn next_instance_key(configured: &[AgenticCli], cli: &str) -> String {
+    (2u32..)
+        .map(|n| format!("{cli}#{n}"))
+        .find(|k| !configured.iter().any(|c| &c.key == k))
+        .expect("an unbounded range always yields a free key")
 }
 
 /// The candidate seats of every unit (positionally aligned), narrowed by what its skills admit
@@ -550,6 +600,10 @@ fn enforce_evaluator_distinct(
     roster_keys: &[String],
     clis: &[AgenticCli],
     candidates: &[Candidates],
+    // (DES-TEAMING-002 §8.1) A team run takes a MODEL-distinct seat first and a second instance
+    // of a builder's cli only when no model-distinct seat admits the unit. `false` keeps today's
+    // roster-order pick.
+    prefer_model_distinct: bool,
 ) -> (Vec<u32>, Vec<u32>) {
     use crate::domain::StageKind;
     let mut same_seat: Vec<u32> = Vec::new();
@@ -595,10 +649,16 @@ fn enforce_evaluator_distinct(
                 Some((eligible, _)) => eligible.iter().any(|c| &c.key == k),
                 None => true,
             };
-            match roster_keys
-                .iter()
-                .find(|k| !builder_clis.contains(*k) && admits(k))
-            {
+            let distinct = |k: &&String| !builder_clis.contains(*k) && admits(k);
+            let model_distinct = prefer_model_distinct
+                .then(|| {
+                    roster_keys
+                        .iter()
+                        .filter(distinct)
+                        .find(|k| !builder_models.contains(model_of(k)))
+                })
+                .flatten();
+            match model_distinct.or_else(|| roster_keys.iter().find(distinct)) {
                 Some(alt) => {
                     let was = std::mem::replace(&mut d.assigned_cli, alt.clone());
                     d.assigned_invocation = invocation_of(clis, alt);
@@ -1445,8 +1505,14 @@ mod tests {
         ];
         let clis = [seat("claude"), seat("claude#2")];
         let roster_keys = vec!["claude".to_string(), "claude#2".to_string()];
-        let (same, same_cli) =
-            enforce_evaluator_distinct(&units, &mut dists, &roster_keys, &clis, &[None, None]);
+        let (same, same_cli) = enforce_evaluator_distinct(
+            &units,
+            &mut dists,
+            &roster_keys,
+            &clis,
+            &[None, None],
+            false,
+        );
         assert_eq!(
             same,
             Vec::<u32>::new(),

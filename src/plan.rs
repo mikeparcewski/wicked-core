@@ -349,8 +349,15 @@ pub const COMPOSED_DEF_ID: &str = "plan";
 /// a positive decimal revision (DES-TEAMING-002 §8.3, §11.3). A run planned from such a def is a
 /// TEAM RUN (seam D1): the composed def is the one marker, read at plan time.
 pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
-    let _ = (def_id, session_id);
-    false // D1 red: stub
+    if session_id.is_empty() {
+        return false;
+    }
+    def_id
+        .strip_prefix(session_id)
+        .and_then(|rest| rest.strip_prefix(":plan-"))
+        .is_some_and(|rev| {
+            !rev.is_empty() && !rev.starts_with('0') && rev.bytes().all(|b| b.is_ascii_digit())
+        })
 }
 
 /// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4). `deny_unknown_fields`
