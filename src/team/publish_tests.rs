@@ -671,3 +671,41 @@ fn a_required_fact_drained_by_a_later_publish_is_acknowledged_published() {
     }
     assert_eq!(rig.types(run), vec![tev::PATH_STARTED, tev::PLAN_ACCEPTED]);
 }
+
+// ── Absence never skips the safe step (#623 review round 5) ─────────────────────────────────────
+
+/// An outbox that exists but cannot be read may hold tombstones: publishing refuses (fails
+/// closed) rather than read it as empty and publish a superseded fact.
+#[test]
+fn an_unreadable_outbox_refuses_to_publish() {
+    let rig = rig("unread");
+    std::fs::create_dir_all(&rig.outbox).unwrap();
+    let r = rig
+        .team_bus()
+        .publish(&fixture(tev::PATH_STARTED, 0, "run-u"));
+    assert!(r.is_err(), "{r:?}");
+    assert!(rig.types("run-u").is_empty());
+    let d = rig.team_bus().drain_all();
+    assert!(d.published.is_empty() && !d.failures.is_empty(), "{d:?}");
+}
+
+/// A torn tombstone line (a crash mid-append) still supersedes what it names: the run's line is
+/// not drained. A tombstone naming an unknown owner covers every owner.
+#[test]
+fn a_torn_or_odd_tombstone_still_supersedes() {
+    let rig = rig("torn");
+    let tb = rig.team_bus();
+    rig.refuse(&[]);
+    tb.publish(&fixture(tev::PATH_STARTED, 0, "run-t7"))
+        .unwrap();
+    tb.publish(&fixture(tev::PATH_STARTED, 0, "run-t8"))
+        .unwrap();
+    let mut text = std::fs::read_to_string(&rig.outbox).unwrap();
+    text.push_str("{\"superseded_run\":\"run-t7\",\"from_event\":\"wicked.team.path.star\n");
+    text.push_str("{\"superseded_run\":\"run-t8\",\"owner\":\"nobody\",\"ts\":1}\n");
+    std::fs::write(&rig.outbox, text).unwrap();
+    rig.allow();
+    tb.drain_all();
+    assert!(rig.types("run-t7").is_empty(), "{:?}", rig.types("run-t7"));
+    assert!(rig.types("run-t8").is_empty(), "{:?}", rig.types("run-t8"));
+}

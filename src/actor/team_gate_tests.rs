@@ -946,3 +946,145 @@ fn a_held_reply_is_settled_when_the_run_fails_before_the_ack() {
     assert_eq!(e.core.held_team_replies(), 0);
     drop(lock);
 }
+
+// ── Absence never skips a tombstone (#623 review round 5): the outbox belongs to the state home ──
+
+/// A config with NO bus (WICKED_BUS_DB unset) but the same state-home outbox.
+fn no_bus(rig: &Rig) -> TeamConfig {
+    TeamConfig::new(None, Some(rig.outbox.clone()))
+}
+
+/// Replace the outbox file with a directory (every write to it fails), keeping the file aside.
+fn break_outbox(rig: &Rig) -> std::path::PathBuf {
+    let aside = rig.outbox.with_extension("aside");
+    let _ = std::fs::rename(&rig.outbox, &aside);
+    std::fs::create_dir_all(&rig.outbox).unwrap();
+    aside
+}
+
+fn mend_outbox(rig: &Rig, aside: &std::path::Path) {
+    std::fs::remove_dir_all(&rig.outbox).unwrap();
+    let _ = std::fs::rename(aside, &rig.outbox);
+}
+
+/// Recorded continue-without-team, restart with NO bus: the tombstone is still written (the
+/// outbox is the state home's), so when the bus returns a drain publishes nothing more.
+#[test]
+fn nobus_boot_writes_the_tombstone_for_a_recorded_continue() {
+    let (rig, db) = crashed_mid_answer("nbc", false);
+    let e = engine_on(&db, no_bus(&rig));
+    assert!(outbox_has_run_tombstone(&rig, "nbc"));
+    assert_eq!(e.core.run_team("nbc").unwrap().unwrap().transport, "none");
+    rig.allow();
+    rig.team_bus().drain_all();
+    assert_eq!(rig.types("nbc"), vec![tev::PATH_STARTED]);
+}
+
+/// Recorded reject, restart with NO bus: tombstone, cancel, and the run's `path.ended` spooled,
+/// so when the bus returns only `path.ended` joins `path.started`.
+#[test]
+fn nobus_boot_writes_the_tombstone_for_a_recorded_reject() {
+    let (rig, db) = crashed_mid_answer("nbr", true);
+    let e = engine_on(&db, no_bus(&rig));
+    assert!(outbox_has_run_tombstone(&rig, "nbr"));
+    assert_eq!(status(&e, "nbr"), Some(SessionStatus::Cancelled));
+    rig.allow();
+    rig.team_bus().drain_all();
+    assert_eq!(rig.types("nbr"), vec![tev::PATH_STARTED, tev::PATH_ENDED]);
+}
+
+/// The tombstone cannot be written at boot (the outbox path is unwritable): the recorded answer
+/// is NOT finished; the pause stays open and the team handler answers it.
+#[test]
+fn boot_keeps_the_pause_when_the_tombstone_cannot_be_written() {
+    let (rig, db) = crashed_mid_answer("nbx", false);
+    let aside = break_outbox(&rig);
+    let e = engine_on(&db, no_bus(&rig));
+    assert_eq!(status(&e, "nbx"), Some(SessionStatus::AwaitingHuman));
+    let view = e.core.run_team("nbx").unwrap().unwrap();
+    assert_eq!(
+        view.pending.as_deref(),
+        Some(tev::PLAN_ACCEPTED),
+        "{view:?}"
+    );
+    assert_ne!(view.transport, "none");
+    assert!(
+        e.core
+            .confirm_gate("nbx", HumanDecision::RequestChanges { note: None })
+            .is_err(),
+        "the team handler owns the reopened pause"
+    );
+    drop(e);
+    mend_outbox(&rig, &aside);
+}
+
+/// Paused, restart with NO bus, answered continue-without-team: the actor writes the tombstone
+/// itself (there is no publisher), then runs un-teamed; the bus's return publishes nothing more.
+#[test]
+fn nobus_answer_writes_the_tombstone_before_continuing() {
+    let (rig, e) = paused_on_plan("nba");
+    let db = e.db.clone();
+    drop(e);
+    let e = engine_on(&db, no_bus(&rig));
+    let s = e
+        .core
+        .confirm_gate("nba", approve(Some(CONTINUE_WITHOUT_TEAM)))
+        .unwrap();
+    assert_eq!(s, SessionStatus::Executing);
+    assert!(outbox_has_run_tombstone(&rig, "nba"));
+    wait_status(&e, "nba", SessionStatus::Completed);
+    rig.allow();
+    rig.team_bus().drain_all();
+    assert_eq!(rig.types("nba"), vec![tev::PATH_STARTED]);
+}
+
+/// The same answer when the tombstone cannot be written: the run stays paused `team_transport`
+/// (the team handler's pause), never continues without its tombstone.
+#[test]
+fn nobus_answer_keeps_the_pause_when_the_tombstone_cannot_be_written() {
+    let (rig, e) = paused_on_plan("nbw");
+    let db = e.db.clone();
+    drop(e);
+    let aside = break_outbox(&rig);
+    let e = engine_on(&db, no_bus(&rig));
+    let s = e
+        .core
+        .confirm_gate("nbw", approve(Some(CONTINUE_WITHOUT_TEAM)))
+        .unwrap();
+    assert_eq!(s, SessionStatus::AwaitingHuman);
+    assert_eq!(status(&e, "nbw"), Some(SessionStatus::AwaitingHuman));
+    let view = e.core.run_team("nbw").unwrap().unwrap();
+    assert_ne!(view.transport, "none", "{view:?}");
+    assert!(view.pending.is_some());
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+    drop(e);
+    mend_outbox(&rig, &aside);
+}
+
+/// The boot drain publishes only lines of runs the boot reconcile READ: a line of a run the store
+/// does not know (or could not read) stays for an explicit replay, never goes out unreconciled.
+#[test]
+fn the_boot_drain_skips_lines_of_runs_it_did_not_reconcile() {
+    let rig = rig("ghost");
+    rig.refuse(&[]);
+    rig.team_bus()
+        .publish(&crate::team::publish::tests::fixture(
+            tev::PATH_STARTED,
+            0,
+            "ghost-run",
+        ))
+        .unwrap();
+    rig.allow();
+    let e = engine(&rig, fast(&rig));
+    e.core.ping();
+    std::thread::sleep(Duration::from_millis(500));
+    e.core.ping();
+    assert!(
+        rig.types("ghost-run").is_empty(),
+        "{:?}",
+        rig.types("ghost-run")
+    );
+    // The operator's explicit replay still publishes it.
+    e.core.replay_team_outbox().unwrap();
+    assert_eq!(rig.types("ghost-run"), vec![tev::PATH_STARTED]);
+}
