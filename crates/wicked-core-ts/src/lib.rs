@@ -1403,8 +1403,10 @@ impl Core {
     /// A team run's transport and its units' team snapshots — the persisted state behind crew's
     /// `GET /api/v1/runs/:id/team` — as JSON `{ runId, transport, reason, streamFloor, planRev,
     /// pending, units: [{ ord, transport, reason, ledgerSource }] }`. `transport` is `"bus"`,
-    /// `"none"` (un-teamed: render the "team transport unavailable" banner with `reason`) or
-    /// `"pending"` (not decided yet). Resolves to `"null"` for a run that is not a team run;
+    /// `"none"` (un-teamed: render the "team transport unavailable" banner with `reason`),
+    /// `"pending"` (not decided yet) or `"unavailable"` (teamed, but this daemon has no bus: the run
+    /// is paused `team_transport` until the operator answers or a restart brings the bus back).
+    /// Resolves to `"null"` for a run that is not a team run;
     /// rejects for an unknown run.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn run_team(&self, run_id: String) -> AsyncTask<CoreTask> {
