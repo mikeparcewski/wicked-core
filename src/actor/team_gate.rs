@@ -139,8 +139,13 @@ fn path_started(session: &AgentSession) -> TeamEvent {
             selection: Selection::Chosen,
             roster: session.clis.clone(),
             request: crate::team::cap_utf8(&session.problem, 8 * 1024),
-            workflow: None,
-            plan: false,
+            // (T3, codex round 7) What the launch named, from its durable plan state: the preset,
+            // or a user-composed plan. A run on a bare composed def names neither.
+            workflow: session.team_plan.as_ref().and_then(|t| t.preset.clone()),
+            plan: session
+                .team_plan
+                .as_ref()
+                .is_some_and(|t| t.preset.is_none()),
         }),
     )
 }

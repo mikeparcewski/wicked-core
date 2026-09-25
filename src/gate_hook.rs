@@ -62,6 +62,22 @@ pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
 /// synthetic token alone, which is the pre-fix behaviour.
 pub const GATE_PHASE_ID_ENV: &str = "WICKED_GATE_PHASE_ID";
 
+/// (DES-TEAMING-002 T3) Environment variable carrying the unit's phase-CATALOG id (`review`, …)
+/// to the gate-hook subprocess — the third `applies_to` alias for a catalog-composed unit, whose
+/// phase id is the plan author's. Unset ⇒ no catalog alias (absence never widens).
+pub const GATE_CATALOG_ENV: &str = "WICKED_GATE_CATALOG";
+
+/// The catalog alias the SUBPROCESS hook carrier was armed with ([`GATE_CATALOG_ENV`]). The
+/// in-process carrier (`boundary: Some`) never reads the daemon's env.
+fn hook_catalog_alias(in_process: bool) -> Option<String> {
+    if in_process {
+        return None;
+    }
+    std::env::var(GATE_CATALOG_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Environment variable carrying the operational store path to the gate-hook subprocess (the injected
 /// command drops `--db`). One exported const so the launcher setter + the bin resolver never drift on
 /// the name.
@@ -2648,7 +2664,8 @@ pub(crate) fn evaluate_tool_call(
         }
     };
 
-    let phases = crate::scope::phase_aliases(phase, phase_alias);
+    let catalog_alias = hook_catalog_alias(boundary.is_some());
+    let phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias.as_deref());
     let selected = match select_any(&store, scope, &phases, context) {
         Ok(s) => s,
         Err(e) => {
@@ -3983,7 +4000,8 @@ pub fn run_output_gate_hook(
             return 2;
         }
     };
-    let phases = crate::scope::phase_aliases(phase, phase_alias);
+    let catalog_alias = hook_catalog_alias(false);
+    let phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias.as_deref());
     let selected = match select_any(&store, scope, &phases, &context) {
         Ok(s) => s,
         Err(e) => {

@@ -6452,16 +6452,44 @@ fn pause_for_human(
     gate_kind: &str,
     prompt: String,
 ) -> anyhow::Result<()> {
+    pause_for_human_keyed(
+        store,
+        subscribers,
+        self_tx,
+        session,
+        ord,
+        reviewing_ord,
+        gate_kind,
+        None,
+        prompt,
+    )
+}
+
+/// [`pause_for_human`] for a gate with its own id (T3: a `plan_approval` gate's `gate_id`), so
+/// each opening is its own durable interaction row ([`crate::interaction::open_gate_keyed`]).
+#[allow(clippy::too_many_arguments)]
+fn pause_for_human_keyed(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    self_tx: &Sender<Command>,
+    session: &mut crate::domain::AgentSession,
+    ord: u32,
+    reviewing_ord: Option<u32>,
+    gate_kind: &str,
+    gate_key: Option<&str>,
+    prompt: String,
+) -> anyhow::Result<()> {
     session.status = SessionStatus::AwaitingHuman;
     // DES-PROJECT-001 §5.3: the prompt is DURABLE STATE, not just an event — the session's
     // AwaitingHuman write and the open interaction_request commit in ONE batch, so a skin that
     // was not connected when this fired (or a daemon restarted after it) still finds the prompt.
-    let request = crate::interaction::open_gate(
+    let request = crate::interaction::open_gate_keyed(
         &session.id,
         ord,
         reviewing_ord,
         &prompt,
         gate_kind,
+        gate_key,
         crate::interaction::now_millis(),
     );
     crate::domain::put_nodes(store, &[session.to_node(), request.to_node()])?;
@@ -6696,7 +6724,18 @@ fn advance_or_pause(
             }
         };
         let ord = unit.ord;
-        pause_for_human(
+        // (T3, codex round 7) A plan gate's row is keyed by its gate id: a re-opened gate is a new
+        // durable row, and the answered one keeps its answer.
+        let plan_gate_key = (reason == PauseReason::PlanApproval)
+            .then(|| {
+                session
+                    .team_plan
+                    .as_ref()
+                    .and_then(|t| t.pending.as_ref())
+                    .and_then(|p| p.gate_id.clone())
+            })
+            .flatten();
+        pause_for_human_keyed(
             store,
             subscribers,
             self_tx,
@@ -6704,6 +6743,7 @@ fn advance_or_pause(
             ord,
             reviewing_ord,
             gate_kind,
+            plan_gate_key.as_deref(),
             prompt,
         )?;
         if let Some((gate_id, pending, from_rev)) = plan_gate_opened {
@@ -8288,7 +8328,11 @@ fn phase_boundary_claim(
     // Match the synthetic execution phase AND the workflow phase id the operator sees in the
     // API — an `applies_to: ["review"]` must select here, not silently never fire (FINDING-021).
     // The claim still records the canonical `unit-<ord>`.
-    let phases = crate::scope::phase_aliases(&phase_name, unit.and_then(|u| u.phase_id()));
+    let phases = crate::scope::phase_aliases(
+        &phase_name,
+        unit.and_then(|u| u.phase_id()),
+        unit.and_then(|u| u.catalog.as_deref()),
+    );
     let selected = select_any(store, scope, &phases, &context)?;
     Ok(decide(
         &selected,

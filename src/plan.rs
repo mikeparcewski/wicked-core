@@ -185,6 +185,8 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // A unit of the run's catalog-composed per-run def belongs to a TEAM RUN (seam D1):
             // the def id is the marker, so no launch knob is needed.
             unit.team_run = is_per_run_def_id(&def.id, session_id);
+            // The catalog entry a composed phase instantiates: governance's third alias (T3).
+            unit.catalog = phase.catalog.clone();
             // Carry the DECLARED dependency graph (FINDING-024). The def states which phases this one
             // consumes; the engine honored that for ordering and dropped it for context, so an
             // Evaluator phase declared `.after("build")` still ran blind to the build. Carrying it
@@ -807,6 +809,7 @@ pub fn compose(
             });
         };
         let mut phase = apply_step(entry, step)?;
+        phase.catalog = Some(entry.id.clone());
         let (before, after) = (&plan.steps[..i], &plan.steps[i + 1..]);
         if step.depends_on.is_none()
             && entry.role == crate::workflow::PhaseRole::Evaluator

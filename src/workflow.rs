@@ -669,6 +669,12 @@ pub struct PhaseDef {
     /// Phase id, unique within the workflow (referenced by `depends_on`). The ONLY required field
     /// in a drop-in JSON file — everything below defaults, so the minimal phase is `{"id":"x"}`.
     pub id: String,
+    /// (DES-TEAMING-002 T3) The phase-catalog entry a COMPOSED phase instantiates — set only by
+    /// `plan::compose`, carried onto the unit (`WorkUnit::catalog`) as a governance alias.
+    /// `#[serde(skip)]`: never read from or written to a def file, so the JSON contract (and every
+    /// drop-in) is unchanged and no author can claim a catalog id for a hand-written phase.
+    #[serde(skip)]
+    pub catalog: Option<String>,
     /// The methodology badge (demoted from the classifier — declared, not guessed). Default: `build`.
     #[serde(default)]
     pub kind: StageKind,
@@ -765,6 +771,7 @@ impl PhaseDef {
             validator_pin: None,
             executor: PhaseExecutor::default(),
             owner: StepOwner::default(),
+            catalog: None,
         }
     }
     fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {

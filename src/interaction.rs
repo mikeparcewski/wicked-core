@@ -138,10 +138,42 @@ pub fn open_gate(
     gate_kind: &str,
     now_ms: i64,
 ) -> InteractionRequest {
-    let id = format!(
-        "ir_{}",
-        crate::pipeline::deterministic_id(&[session_id, "gate", &ord.to_string()])
-    );
+    open_gate_keyed(
+        session_id,
+        ord,
+        reviewing_ord,
+        prompt,
+        gate_kind,
+        None,
+        now_ms,
+    )
+}
+
+/// [`open_gate`] for a gate that carries its OWN id (DES-TEAMING-002 T3: a `plan_approval` gate's
+/// `gate_id`, minted from the run's gate counter): the id joins the row's derivation, so each
+/// opening at the same ord is its own durable row — a re-opened gate never overwrites the answered
+/// one (the audit record). `None` is exactly [`open_gate`]'s row: a re-pause of an unkeyed gate
+/// still reopens the same row.
+pub fn open_gate_keyed(
+    session_id: &str,
+    ord: u32,
+    reviewing_ord: Option<u32>,
+    prompt: &str,
+    gate_kind: &str,
+    gate_key: Option<&str>,
+    now_ms: i64,
+) -> InteractionRequest {
+    let ord_s = ord.to_string();
+    let id = match gate_key {
+        None => format!(
+            "ir_{}",
+            crate::pipeline::deterministic_id(&[session_id, "gate", &ord_s])
+        ),
+        Some(key) => format!(
+            "ir_{}",
+            crate::pipeline::deterministic_id(&[session_id, "gate", &ord_s, key])
+        ),
+    };
     InteractionRequest {
         id,
         session_id: session_id.to_string(),
