@@ -246,11 +246,6 @@ fn publish_bounded(runner: &TeamRunner, ev: &TeamEvent) -> Result<Option<i64>, S
 /// and its tombstone could not be written, so the spooled fact could still land for an attempt
 /// that ran un-teamed.
 pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, String> {
-    #[allow(unreachable_code)]
-    if true {
-        let _ = (runner, input);
-        return Ok(Attempt::NotTeam);
-    }
     let Some(stamped) = input.unit.team.as_ref() else {
         return Ok(Attempt::NotTeam);
     };
@@ -377,11 +372,6 @@ pub struct Boundary {
 /// outcome:"injected"}` per rendered finding. A finding that did not fit gets no row and is
 /// picked up at the next boundary.
 pub fn boundary(claimed: &Claimed) -> Boundary {
-    #[allow(unreachable_code)]
-    if true {
-        let _ = claimed;
-        return Boundary::default();
-    }
     let stream = match claimed
         .runner
         .read_run(&claimed.run_id, claimed.stream_floor.saturating_sub(1))
@@ -699,11 +689,6 @@ fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> Uni
 /// The seats that authored or corroborated any finding of the ledger (any status), in first-seen
 /// order, deduplicated (DES-001 §6.2 `ledger_authors`). Computed from the ledger, never supplied.
 pub fn ledger_authors(ledger: &TeamLedger) -> Vec<String> {
-    #[allow(unreachable_code)]
-    if true {
-        let _ = ledger;
-        return Vec::new();
-    }
     let mut out: Vec<String> = Vec::new();
     for f in &ledger.findings {
         for s in std::iter::once(&f.finding.seat).chain(f.corroborated_by.iter()) {
@@ -738,11 +723,6 @@ fn token<T: serde::Serialize>(v: &T) -> String {
 /// and a compact transcript of the team's comms (≤16 KB). `None` for an un-teamed attempt. Goes
 /// into the judge's WORK fence (untrusted data), the evaluator's prior context and the rework.
 pub fn render_for_gate(snap: &UnitTeamSnapshot) -> Option<String> {
-    #[allow(unreachable_code)]
-    if true {
-        let _ = snap;
-        return None;
-    }
     if snap.transport != Transport::Bus {
         return None;
     }
@@ -846,11 +826,6 @@ pub fn merge_snapshot(
     stamped: Option<&UnitTeamSnapshot>,
     worker: Option<UnitTeamSnapshot>,
 ) -> Option<UnitTeamSnapshot> {
-    #[allow(unreachable_code)]
-    if true {
-        let _ = worker;
-        return stamped.cloned();
-    }
     let stamped = stamped?;
     if stamped.transport == Transport::None {
         return Some(local_snapshot(stamped, None));

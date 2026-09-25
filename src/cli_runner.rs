@@ -380,6 +380,7 @@ fn task_key(
 // `work_author`: the CLI key that authored the work — carried in `GateEvalRequest` so the
 // evaluator daemon can enforce evaluator≠creator on the bus path (same guarantee the inline
 // path enforces via `excluded = [DETERMINISTIC_VALIDATOR_SEAT, work_author]` at ~499).
+#[allow(clippy::too_many_arguments)]
 fn bus_request_agent_verdict(
     criterion: &str,
     work: &str,
@@ -1847,6 +1848,7 @@ pub(crate) fn init_exec_consumers(
 
 /// Spawn both off-actor consumer threads from a pre-initialized [`ExecConsumers`]. Called ONLY after the
 /// publisher is armed, so arm+consumers land together (finding #4).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_exec_consumers(
     consumers: ExecConsumers,
     runner: Arc<dyn StepRunner>,

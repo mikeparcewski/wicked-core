@@ -486,11 +486,6 @@ pub(super) fn decide_unit_review(
     gate_id: &str,
     approved: bool,
 ) -> Option<String> {
-    #[allow(unreachable_code)]
-    if true {
-        let _ = (session, unit, attempt, gate_id, approved);
-        return None;
-    }
     // A teamed unit whose snapshot carries no ledger is an incomplete record: it pauses.
     let owned;
     let ledger = match unit.team.as_ref()?.ledger.as_ref() {

@@ -346,15 +346,32 @@ fn row2_plan_accepted_fails_past_the_bound_the_run_pauses_team_transport() {
     wait_for("path.ended", || {
         rig.types("row2").last().map(String::as_str) == Some(tev::PATH_ENDED)
     });
+    // The engine's facts in FIFO order (the team_transport gate, then T5's unit-review gate of
+    // each unit); each unit's own R facts (T5) ride the attempt's lane beside them.
+    let types = rig.types("row2");
+    let engine_facts: Vec<&str> = types
+        .iter()
+        .map(String::as_str)
+        .filter(|t| *t != tev::STEP_CLAIMED && *t != tev::STEP_COMPLETED)
+        .collect();
     assert_eq!(
-        rig.types("row2"),
+        engine_facts,
         vec![
             tev::PATH_STARTED,
             tev::PLAN_ACCEPTED,
             tev::GATE_OPENED,
             tev::GATE_DECIDED,
+            tev::GATE_OPENED,
+            tev::GATE_DECIDED,
+            tev::GATE_OPENED,
+            tev::GATE_DECIDED,
             tev::PATH_ENDED
         ]
+    );
+    assert_eq!(
+        types.iter().filter(|t| *t == tev::STEP_CLAIMED).count(),
+        2,
+        "one step.claimed per unit: {types:?}"
     );
     assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(e.core.run_team("row2").unwrap().unwrap().transport, "bus");
@@ -506,6 +523,7 @@ fn row6_bus_absent_at_boot_the_run_is_unteamed_and_nothing_spools() {
 fn crashed_mid_path_started(rig: &Rig, run: &str) -> String {
     rig.refuse(&[]);
     let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_secs(600)])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(rig, slow);
@@ -565,6 +583,7 @@ fn p1_f_crash_before_the_tombstone_boot_writes_it_first() {
 fn p1_c_the_actor_answers_while_the_bus_is_locked() {
     let rig = rig("c");
     let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_millis(300); 4])
         .with_attempt_wait(Duration::from_millis(250));
     // Held for at least twice the bound AND until the run has fallen back (so the lock outlives
@@ -625,6 +644,7 @@ fn a_run_cancelled_while_its_fact_is_in_flight_dispatches_nothing() {
     let rig = rig("cancelled");
     rig.refuse(&[]);
     let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_millis(200); 3])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(&rig, cfg);
@@ -770,6 +790,7 @@ fn boot_reopens_a_publishing_fact_as_a_transport_gate_the_team_handler_answers()
     let rig = rig("bootp");
     rig.refuse(&[tev::PLAN_ACCEPTED]);
     let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_secs(600)])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(&rig, slow);
@@ -856,6 +877,7 @@ fn boot_ends_a_teamed_terminal_run(name: &str, status: SessionStatus, want: &str
     rig.refuse(&[tev::PATH_ENDED]);
     // A retry schedule this engine never reaches: its publisher cannot land path.ended later.
     let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_secs(600)])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(&rig, slow);

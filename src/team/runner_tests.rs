@@ -481,7 +481,7 @@ fn t5_b_boundary_renders_each_undelivered_finding_once_with_one_row_each() {
     for (_, p) in &rows {
         assert_eq!(p["channel"], "boundary");
         assert_eq!(p["outcome"], "injected");
-        assert_eq!(p["delivery_id"], "boundary:unit-2:0");
+        assert_eq!(p["delivery_id"], "boundary:u2:0");
         assert_eq!(p["ord"], 1, "the row is about the finding's own attempt");
     }
     // The next step: an `injected` row exists for each, so nothing is rendered again.
