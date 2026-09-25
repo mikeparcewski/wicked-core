@@ -1362,18 +1362,14 @@ pub(crate) fn run(
                              neither, so its delivery would be dropped"
                         );
                     }
-                    if let Some((plan, preset)) = &launch_plan {
+                    if let Some((plan, _preset)) = &launch_plan {
                         if let Err(refusal) = crate::plan_gate::precheck(
-                            &run_id,
                             plan,
-                            preset.as_deref(),
                             spec.deliver_step.as_ref(),
                             &spec.human_confirm,
-                            crate::interaction::now_millis(),
                         ) {
-                            for fact in &refusal.events {
-                                crate::plan_gate::publish(&mut subscribers, fact);
-                            }
+                            // No run exists (nothing persisted), so no path carries its facts:
+                            // the refusal is the synchronous error.
                             anyhow::bail!("the launch's plan is refused: {}", refusal.reason);
                         }
                     }
@@ -1740,7 +1736,6 @@ pub(crate) fn run(
                     .map(|r| std::path::PathBuf::from(r.root_path));
                 let team = team_plan_at_launch(
                     &mut store,
-                    &mut subscribers,
                     &registry,
                     &spec,
                     repo_root.as_deref(),
@@ -3750,7 +3745,6 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
 #[allow(clippy::type_complexity)]
 fn team_plan_at_launch(
     store: &mut dyn GraphStore,
-    subscribers: &mut crate::event_log::EventSink,
     registry: &crate::workflow::WorkflowRegistry,
     spec: &LaunchSpec,
     repo_root: Option<&std::path::Path>,
@@ -3807,9 +3801,10 @@ fn team_plan_at_launch(
         &scored,
         crate::interaction::now_millis(),
     )?;
-    for fact in &decided.events {
-        crate::plan_gate::publish(subscribers, fact);
-    }
+    // The facts follow the run's `path.started` onto the bus (P1): queued on the plan state and
+    // published by the team gate once the path lands; an un-teamed run publishes none.
+    let mut decided = decided;
+    crate::plan_gate::queue(&mut decided.state, &decided.events)?;
     let def = match decided.verdict {
         crate::plan_gate::Verdict::Refused { reason } => {
             anyhow::bail!("the launch's plan is refused: {reason}")
@@ -3888,15 +3883,7 @@ pub(crate) fn launch_run_inner(
         .as_deref()
         .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
         .map(|r| std::path::PathBuf::from(r.root_path));
-    let team = team_plan_at_launch(
-        store,
-        subscribers,
-        registry,
-        &spec,
-        repo_root.as_deref(),
-        None,
-        false,
-    )?;
+    let team = team_plan_at_launch(store, registry, &spec, repo_root.as_deref(), None, false)?;
     let workflow = match &team {
         Some((_, id, _)) => Some(id.clone()),
         None => spec.workflow.clone(),
@@ -6539,7 +6526,22 @@ fn advance_or_pause(
         }
     }
 
-    if let Some(reason) = should_pause(&session, &units, unit_ix) {
+    // (DES-TEAMING-002 T3) A unit a `plan_approval` gate just released skips the human gates that
+    // approval answered — once (the confirm path's bypass of `should_pause`, which P1's
+    // acknowledgement-driven resume now reaches through here).
+    let released = session.team_plan.as_ref().and_then(|t| t.released_ord) == Some(unit.ord);
+    if released {
+        if let Some(tp) = session.team_plan.as_mut() {
+            tp.released_ord = None;
+        }
+        put_node(store, session.to_node())?;
+    }
+    let pause = if released {
+        None
+    } else {
+        should_pause(&session, &units, unit_ix)
+    };
+    if let Some(reason) = pause {
         // Describe the decision the operator is actually being asked to make. A DEF-declared gate
         // fires AFTER the preceding phase's work, so the artifact under review is that phase's
         // output — naming the upcoming phase instead (FINDING-032) pointed the operator at work
@@ -6556,19 +6558,21 @@ fn advance_or_pause(
         let mut plan_gate_opened: Option<(String, crate::plan_gate::PendingPlan, Option<u32>)> =
             None;
         if reason == PauseReason::PlanApproval {
-            let next_seq = session.gate_seq + 1;
-            if let Some(tp) = session.team_plan.as_mut() {
-                let from_rev = (tp.accepted_rev > 0).then_some(tp.accepted_rev);
-                if let Some(p) = tp.pending.as_mut() {
-                    if p.gate_id.is_none() {
-                        p.gate_id = Some(crate::team_events::gate_id(run_id, next_seq));
-                        plan_gate_opened =
-                            Some((p.gate_id.clone().unwrap_or_default(), p.clone(), from_rev));
+            let unopened = session
+                .team_plan
+                .as_ref()
+                .and_then(|t| t.pending.as_ref())
+                .is_some_and(|p| p.gate_id.is_none());
+            if unopened {
+                // The run's ONE gate counter (P1's `RunTeamState::gate_seq`), in the pause's batch.
+                let gate_id = team_gate::mint_gate_id(&mut session);
+                if let Some(tp) = session.team_plan.as_mut() {
+                    let from_rev = (tp.accepted_rev > 0).then_some(tp.accepted_rev);
+                    if let Some(p) = tp.pending.as_mut() {
+                        p.gate_id = Some(gate_id.clone());
+                        plan_gate_opened = Some((gate_id, p.clone(), from_rev));
                     }
                 }
-            }
-            if plan_gate_opened.is_some() {
-                session.gate_seq = next_seq;
             }
         }
         let (reviewing_ord, prompt) = match reason {
@@ -6682,7 +6686,7 @@ fn advance_or_pause(
                 from_rev,
                 crate::interaction::now_millis(),
             ) {
-                Ok(fact) => crate::plan_gate::publish(subscribers, &fact),
+                Ok(fact) => team_gate::plan_gate_opened(store, &mut session, &gate_id, fact)?,
                 Err(e) => emit_run_error(subscribers, run_id, e),
             }
         }
@@ -8362,9 +8366,11 @@ fn confirm_plan_gate(
     };
     let plan = match decision {
         HumanDecision::Reject => {
-            crate::plan_gate::publish(
-                subscribers,
-                &decided_fact(crate::team_events::GateDecision::HumanRejected)?,
+            team_gate::publish_plan_facts(
+                &session,
+                vec![decided_fact(
+                    crate::team_events::GateDecision::HumanRejected,
+                )?],
             );
             let s = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps)?;
             in_flight.remove(run_id);
@@ -8384,9 +8390,9 @@ fn confirm_plan_gate(
         return result;
     }
     let mut s = session;
-    match plan {
+    let decided_ev = match plan {
         None => {
-            let (next, facts) = crate::plan_gate::approve_pending(
+            let (next, decided) = crate::plan_gate::approve_pending(
                 run_id,
                 &state,
                 &s.human_confirm,
@@ -8394,16 +8400,11 @@ fn confirm_plan_gate(
                 s.attempt,
                 now,
             )?;
-            for f in &facts {
-                crate::plan_gate::publish(subscribers, f);
-            }
             s.team_plan = Some(next);
+            decided
         }
         Some(edit) => {
-            crate::plan_gate::publish(
-                subscribers,
-                &decided_fact(crate::team_events::GateDecision::HumanAmended)?,
-            );
+            let amended = decided_fact(crate::team_events::GateDecision::HumanAmended)?;
             let repo_root = s
                 .repo_ref
                 .as_deref()
@@ -8432,26 +8433,34 @@ fn confirm_plan_gate(
                 &scored,
                 now,
             )?;
-            for f in &decided.events {
-                crate::plan_gate::publish(subscribers, f);
-            }
             match decided.verdict {
                 crate::plan_gate::Verdict::Accepted { def, .. } => {
+                    // The edit's `plan.proposed` / `path.scored` ride the FIFO; the gate's
+                    // `gate.decided{human_amended}` is the required resume fact (below).
+                    team_gate::publish_plan_facts(&s, decided.events);
                     s.team_plan = Some(decided.state);
                     put_node(store, s.to_node())?;
                     replan_for_accepted_edit(store, subscribers, &s, def)?;
                     s = crate::domain::get_session(&*store, run_id)?
                         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+                    amended
                 }
                 crate::plan_gate::Verdict::Refused { reason } => {
+                    // The first gate's answer stays on record; the edit's refusal follows it.
+                    let mut facts = vec![amended];
+                    facts.extend(decided.events);
+                    team_gate::publish_plan_facts(&s, facts);
                     // Re-open (§8.6): the same plan stays held; the gate is new (a fresh
-                    // `gate_seq`, so a new `gate_id` and a new `gate.opened` row).
+                    // gate sequence, so a new `gate_id` and a new `gate.opened` row).
                     let mut reopened = state.clone();
                     if let Some(p) = reopened.pending.as_mut() {
                         p.gate_id = None;
                         p.refusal = Some(reason);
                     }
                     s.team_plan = Some(reopened);
+                    if let Some(team) = s.team.as_mut() {
+                        team.open_gate = None;
+                    }
                     put_node(store, s.to_node())?;
                     let unit_ix = s.unit_ix;
                     return match advance_or_pause(
@@ -8467,7 +8476,7 @@ fn confirm_plan_gate(
                         is_acp,
                     )? {
                         Progress::Paused => Ok(SessionStatus::AwaitingHuman),
-                        Progress::Dispatched | Progress::Done => {
+                        Progress::Dispatched | Progress::Done | Progress::Deferred => {
                             anyhow::bail!("run {run_id}: a refused plan edit must re-open its gate")
                         }
                     };
@@ -8477,43 +8486,28 @@ fn confirm_plan_gate(
                 }
             }
         }
+    };
+    // Release (§8.6): the cursor unit — which never ran — is released once, at its current
+    // attempt. The gate's `gate.decided` is P1's required resume fact, then `plan.accepted` gates
+    // the dispatch; an un-teamed run resumes directly. One path either way (`advance_or_pause`).
+    let cursor_ord = crate::domain::session_units(store, run_id)?
+        .get(s.unit_ix)
+        .map(|u| u.ord);
+    if let Some(tp) = s.team_plan.as_mut() {
+        tp.released_ord = cursor_ord;
     }
-    // Release: Executing, then dispatch EXACTLY the cursor unit — no attempt bump (it never ran).
-    s.status = SessionStatus::Executing;
-    put_node(store, s.to_node())?;
-    let units = crate::domain::session_units(store, run_id)?;
-    let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
-    emit(
-        subscribers,
-        CoreEvent::Resumed {
-            session: run_id.to_string(),
-            ord,
-        },
-    );
-    in_flight.insert(run_id.to_string());
-    match dispatch_unit(
+    let mut cx = team_gate::Ctx {
         store,
         subscribers,
         runner,
         self_tx,
-        run_id,
-        s.unit_ix,
+        in_flight,
         lifecycle_maps,
         actor_maps,
         process_gen,
         is_acp,
-    ) {
-        Ok(true) => Ok(SessionStatus::Executing),
-        Ok(false) => {
-            in_flight.remove(run_id);
-            finalize_run(store, subscribers, runner, self_tx, run_id)?;
-            Ok(SessionStatus::Completed)
-        }
-        Err(e) => {
-            in_flight.remove(run_id);
-            Err(e)
-        }
-    }
+    };
+    team_gate::release_plan_gate(&mut cx, s, decided_ev)
 }
 
 /// (T3) Re-plan a run whose every unit is still unrun onto an edit accepted at its plan gate:
@@ -8600,6 +8594,9 @@ pub(crate) fn confirm_gate(
             session.status
         );
     }
+    // (DES-TEAMING-002 P1) A team fact still in flight, or a `team_transport` pause answered with
+    // anything but its three answers, is refused here — before the gate row resolves.
+    team_gate::refuse_answer(&session, &decision)?;
     // (DES-TEAMING-002 §8.6, T3) DES-001 §6.7's rule: read the OPEN row's `gate_kind` BEFORE it is
     // resolved. A plan_approval gate has its own arm; an edited plan answers no other gate.
     let open_plan_gate = crate::interaction::list_interactions(
@@ -8632,10 +8629,6 @@ pub(crate) fn confirm_gate(
              approval gate"
         );
     }
-
-    // (DES-TEAMING-002 P1) A team fact still in flight, or a `team_transport` pause answered with
-    // anything but its three answers, is refused here — before the gate row resolves.
-    team_gate::refuse_answer(&session, &decision)?;
 
     // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
     // are checked here, before the durable prompt below is marked `answered` — a refused answer
@@ -17059,7 +17052,11 @@ mod plan_gate_confirm_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
-            gate_seq: 1,
+            // The gate was minted from the run's one gate counter (P1's `RunTeamState`).
+            team: Some(crate::domain::RunTeamState {
+                gate_seq: 1,
+                ..Default::default()
+            }),
             team_plan: Some(TeamPlanState {
                 rev: 1,
                 max_score: 100,
@@ -17126,26 +17123,7 @@ mod plan_gate_confirm_tests {
             [(2, 0)],
             "exactly the cursor unit, once, at attempt 0"
         );
-        let facts: Vec<(String, serde_json::Value)> = seen
-            .iter()
-            .filter_map(|e| match e {
-                CoreEvent::TeamFact {
-                    event_type,
-                    payload,
-                    ..
-                } => Some((event_type.clone(), payload.clone())),
-                _ => None,
-            })
-            .collect();
-        let types: Vec<&str> = facts.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(
-            types,
-            ["wicked.team.gate.decided", "wicked.team.plan.accepted"]
-        );
-        assert_eq!(facts[0].1["gate_id"], "g-r-1");
-        assert_eq!(facts[0].1["decision"], "human_approved");
-        assert_eq!(facts[1].1["by"], "human");
-        assert_eq!(facts[1].1["plan_rev"], 1);
+        // No bus in this fixture (un-teamed): no fact is published, and the gate works the same.
         let s = crate::domain::get_session(&store, "r").unwrap().unwrap();
         assert_eq!(
             (s.attempt, s.unit_ix),
@@ -17154,6 +17132,9 @@ mod plan_gate_confirm_tests {
         );
         let t = s.team_plan.unwrap();
         assert_eq!((t.accepted_rev, t.pending.is_none()), (1, true));
+        let a = t.accepted.expect("the accepted plan record");
+        assert_eq!((a.rev, a.by.as_str(), a.high_risk), (1, "human", true));
+        assert_eq!(t.released_ord, None, "the release is spent by the dispatch");
     }
 
     #[test]

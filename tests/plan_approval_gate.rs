@@ -4,9 +4,9 @@
 //!
 //! The runner RECORDS every dispatch and then holds it, so "nothing dispatched before approval"
 //! and "approve dispatches the cursor unit exactly once" are read off the runner itself, not only
-//! off the event stream. The team facts are read off `CoreEvent::TeamFact` — the one hand-off the
-//! engine uses until P1's `TeamBus::publish` lands — and replayed into a real `BusDb` where the
-//! acceptance talks about bus rows, so key distinctness is proven through the bus's own dedup.
+//! off the event stream. The team facts are read off a REAL bus: every rig publishes through P1's
+//! `TeamBus::publish` (a bus db and a team outbox in the rig's dir), so "both rows exist on the
+//! bus with distinct `event_id`s" is read off the bus itself.
 //!
 //! Expected values are fixed literals from DES-TEAMING-002 §8.5's table, never re-derived from the
 //! code under test. Waits use generous deadlines that return as soon as the condition holds.
@@ -19,8 +19,9 @@ use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 use wicked_core::{
-    BusDb, BusEmit, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec,
-    PlanSteps, PresetSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
+    BusDb, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PlanSteps,
+    PresetSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus, TeamConfig,
+    TEAM_OUTBOX_FILE,
 };
 
 /// Generous: a loaded CI host (and Windows) must never flake on a slow actor.
@@ -118,16 +119,30 @@ impl Drop for Rig {
     }
 }
 
+thread_local! {
+    /// This test thread's bus (each test runs on its own thread): the facts helpers read it.
+    static BUS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 fn spawn(db: &str) -> Rig {
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let calls: Calls = Arc::default();
-    let core = Core::spawn_with_engine(
+    let dir = std::path::Path::new(db)
+        .parent()
+        .expect("db dir")
+        .to_path_buf();
+    let bus = dir.join("bus.db").to_string_lossy().into_owned();
+    // One long-lived connection per bus file per process (T0): the shared handle, never closed.
+    BusDb::shared(&bus).expect("bus db");
+    BUS.with(|b| *b.borrow_mut() = Some(bus.clone()));
+    let core = Core::spawn_with_engine_team(
         db.to_string(),
         Arc::new(StubDispatcher),
         Arc::new(RecordAndHold {
             calls: calls.clone(),
             gate: gate.clone(),
         }),
+        TeamConfig::new(Some(bus), Some(dir.join(TEAM_OUTBOX_FILE))),
     );
     let tap = Tap {
         rx: core.subscribe(),
@@ -214,18 +229,17 @@ impl Tap {
     }
 }
 
-/// One published team fact: `(event_type, key, payload)`.
-fn facts(seen: &[CoreEvent], run: &str) -> Vec<(String, String, Value)> {
-    seen.iter()
-        .filter_map(|e| match e {
-            CoreEvent::TeamFact {
-                session,
-                event_type,
-                key,
-                payload,
-            } if session == run => Some((event_type.clone(), key.clone(), payload.clone())),
-            _ => None,
-        })
+/// The run's team facts ON THE BUS, in `event_id` order: `(event_type, event_id, payload)`. Reads
+/// the thread's bus fresh on every call (so a wait over it sees new rows); `_seen` is unused.
+fn facts(_seen: &[CoreEvent], run: &str) -> Vec<(String, i64, Value)> {
+    let bus = BUS.with(|b| b.borrow().clone()).expect("a rig bus");
+    BusDb::shared(&bus)
+        .expect("bus")
+        .poll("*", 0, 100_000)
+        .expect("poll")
+        .into_iter()
+        .filter(|e| e.event_type.starts_with("wicked.team.") && e.payload["run_id"] == run)
+        .map(|e| (e.event_type, e.event_id, e.payload))
         .collect()
 }
 
@@ -241,6 +255,7 @@ fn fact_types(seen: &[CoreEvent], run: &str) -> Vec<String> {
     facts(seen, run).into_iter().map(|(t, _, _)| t).collect()
 }
 
+const STARTED: &str = "wicked.team.path.started";
 const PROPOSED: &str = "wicked.team.plan.proposed";
 const SCORED: &str = "wicked.team.path.scored";
 const ACCEPTED: &str = "wicked.team.plan.accepted";
@@ -400,8 +415,8 @@ fn t2_g_c_a_build_plan_with_no_declared_scope_pauses_before_build() {
             "nothing accepted yet"
         );
 
-        // The facts, in order: proposed → scored → gate opened.
-        assert_eq!(fact_types(seen, &run), [PROPOSED, SCORED, OPENED]);
+        // The facts, in order: the path first (P1), then proposed → scored → gate opened.
+        assert_eq!(fact_types(seen, &run), [STARTED, PROPOSED, SCORED, OPENED]);
 
         // Paused BEFORE the first unit: nothing dispatched, the cursor has not moved.
         assert_eq!(unit_ids(&rig.core, &run), FLOOR_70_AROUND_BUILD);
@@ -414,7 +429,10 @@ fn t2_g_c_a_build_plan_with_no_declared_scope_pauses_before_build() {
         );
         let s = session(&rig.core, &run);
         assert_eq!(s.status, SessionStatus::AwaitingHuman);
-        assert_eq!((s.unit_ix, s.gate_seq), (0, 1));
+        assert_eq!(
+            (s.unit_ix, s.team.as_ref().map_or(0, |t| t.gate_seq)),
+            (0, 1)
+        );
         // A launched plan is a team run: its units come from `<run>:plan-1`.
         let views = rig.core.sessions_detail().unwrap();
         let v = views.iter().find(|v| v.session.id == run).unwrap();
@@ -483,7 +501,10 @@ fn t2_g_b_an_understand_only_plan_scores_0_and_proceeds_in_auto_mode() {
     assert_eq!(a["band"], "0-19");
     assert_eq!(a["workflow_id"], "rgu:plan-1");
     assert_eq!(catalogs(&a["steps"]), ["understand"]);
-    assert_eq!(fact_types(seen, "rgu"), [PROPOSED, SCORED, ACCEPTED]);
+    assert_eq!(
+        fact_types(seen, "rgu"),
+        [STARTED, PROPOSED, SCORED, ACCEPTED]
+    );
     assert!(of_type(seen, "rgu", OPENED).is_empty());
     assert_eq!(plan_pauses(seen, "rgu"), 0, "no plan_approval pause");
     assert_eq!(dispatched_ords(seen, "rgu"), [(1, 0)]);
@@ -575,7 +596,7 @@ fn d_approve_dispatches_the_cursor_unit_once_and_keeps_the_attempt() {
     assert_eq!(catalogs(&accepted[0]["steps"]), FLOOR_70_AROUND_BUILD);
     assert_eq!(
         fact_types(seen, "rd"),
-        [PROPOSED, SCORED, OPENED, DECIDED, ACCEPTED]
+        [STARTED, PROPOSED, SCORED, OPENED, DECIDED, ACCEPTED]
     );
     assert_eq!(
         dispatched_ords(seen, "rd"),
@@ -748,7 +769,7 @@ fn g_a_restart_while_paused_keeps_the_gate_open_and_resumable() {
     let mut rig = restart(rig, &db);
     let s = session(&rig.core, "rr");
     assert_eq!(s.status, SessionStatus::AwaitingHuman);
-    assert_eq!(s.gate_seq, 1);
+    assert_eq!(s.team.as_ref().map_or(0, |t| t.gate_seq), 1);
     let pending = s
         .team_plan
         .as_ref()
@@ -766,27 +787,14 @@ fn g_a_restart_while_paused_keeps_the_gate_open_and_resumable() {
         decided[0]["gate_id"], "g-rr-1",
         "the gate opened before the restart"
     );
-    assert!(
-        of_type(&rig.tap.seen, "rr", OPENED).is_empty(),
-        "no second opening"
-    );
+    // The bus outlives the restart: exactly one opening, the one made before it.
+    let opened = of_type(&rig.tap.seen, "rr", OPENED);
+    assert_eq!(opened.len(), 1, "no second opening");
+    assert_eq!(opened[0]["gate_id"], "g-rr-1");
     assert_eq!(dispatched_ords(&rig.tap.seen, "rr"), [(1, 0)]);
 }
 
 // ── T3 (i) re-open ───────────────────────────────────────────────────────────────────────────────
-
-/// Replay facts into a real bus: `(event_type, key) -> event_id`, through `BusDb::emit`'s own
-/// key dedup.
-fn bus_ids(dir: &std::path::Path, facts: &[(String, String, Value)]) -> Vec<i64> {
-    let bus = BusDb::open(dir.join("bus.db").to_str().unwrap()).unwrap();
-    facts
-        .iter()
-        .map(|(t, k, p)| {
-            bus.emit(&BusEmit::new(t.clone(), "wicked-core", "core.team", p.clone()).with_key(k))
-                .unwrap()
-        })
-        .collect()
-}
 
 /// An edit the engine refuses in auto mode: it carries a floor override (§8.5, refused in auto
 /// mode whatever the steps).
@@ -843,7 +851,10 @@ fn run_reopen(restart_between: bool) {
         all.append(&mut rig.tap.seen);
         rig = restart(rig, &db);
         let s = session(&rig.core, run);
-        assert_eq!((s.status, s.gate_seq), (SessionStatus::AwaitingHuman, 2));
+        assert_eq!(
+            (s.status, s.team.as_ref().map_or(0, |t| t.gate_seq)),
+            (SessionStatus::AwaitingHuman, 2)
+        );
     }
 
     // Second edit on the re-opened gate: a NEW proposal (its id derives from the second gate_id).
@@ -885,13 +896,12 @@ fn run_reopen(restart_between: bool) {
     // Both edit rows exist on the bus: distinct keys, so distinct event ids; neither resolves to
     // the other. Same for the two gate openings.
     let fs = facts(&all, run);
-    let ids = bus_ids(&dir, &fs);
+    let ids: Vec<i64> = fs.iter().map(|(_, id, _)| *id).collect();
     let id_of = |ty: &str, nth: usize| {
         fs.iter()
-            .zip(&ids)
-            .filter(|((t, _, _), _)| t == ty)
+            .filter(|(t, _, _)| t == ty)
             .nth(nth)
-            .map(|(_, id)| *id)
+            .map(|(_, id, _)| *id)
             .unwrap()
     };
     assert_ne!(id_of(PROPOSED, 1), id_of(PROPOSED, 2));
@@ -918,8 +928,8 @@ fn i_the_reopened_gate_survives_a_restart_between_the_openings() {
 // ── T3 (h) override ──────────────────────────────────────────────────────────────────────────────
 
 /// T3 (h): in manual mode a floor override is recorded on `plan.accepted.override` and shown in
-/// the gate prompt; the same override in auto mode is refused (`plan.refused`, "override in auto
-/// mode") and the launch fails with no run.
+/// the gate prompt; the same override in auto mode is refused ("override in auto mode") and the
+/// launch fails with no run and no team row.
 #[test]
 fn h_a_manual_override_is_recorded_and_an_auto_override_is_refused() {
     let dir = tmp_dir("h");
@@ -960,9 +970,9 @@ fn h_a_manual_override_is_recorded_and_an_auto_override_is_refused() {
         .expect_err("an override in auto mode is refused");
     assert!(err.to_string().contains("override in auto mode"), "{err}");
     rig.tap.settle();
-    let refused = of_type(&rig.tap.seen, "rha", REFUSED);
-    assert_eq!(refused.len(), 1);
-    assert_eq!(refused[0]["reason"], "override in auto mode");
+    // No run exists, so no path carries a fact (P1: nothing precedes a run's `path.started`):
+    // the refusal is the launch's synchronous error, and the bus holds nothing for it.
+    assert!(facts(&rig.tap.seen, "rha").is_empty());
     assert!(
         rig.core
             .sessions_detail()

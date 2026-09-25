@@ -319,13 +319,41 @@ pub(super) fn gate_before_dispatch(
             ),
         });
     }
-    if team.plan_rev == Some(PLAN_REV) {
+    // DES-TEAMING-002 T3: the facts the plan pipeline built before the path landed (the launch's
+    // `plan.proposed` / `path.scored`) follow `path.started` onto the bus — never ahead of it.
+    if let Some(tp) = session.team_plan.as_mut() {
+        if !tp.queued.is_empty() {
+            for fact in crate::plan_gate::take_queued(tp) {
+                publish_fire(fact);
+            }
+            put_node(store, session.to_node())?;
+        }
+    }
+    // T3: a plan still held for approval has no accepted rev: nothing to accept yet — the
+    // `plan_approval` pause (`should_pause`) comes next, and its answer accepts the rev.
+    let accepted = match session.team_plan.as_ref() {
+        Some(tp) => match tp.accepted.clone() {
+            Some(a) => Some(a),
+            None => return Ok(TeamGate::Proceed),
+        },
+        None => None,
+    };
+    let plan_rev = accepted.as_ref().map_or(PLAN_REV, |a| a.rev);
+    let team = session.team.get_or_insert_with(RunTeamState::default);
+    if team.plan_rev == Some(plan_rev) {
         return Ok(TeamGate::Proceed);
     }
-    let ev = plan_accepted(session, units, PLAN_REV);
+    // T3 fills `plan.accepted` from the accepted plan (band, high_risk, steps, by, override); a
+    // team run launched on a bare composed def (no plan state) keeps P1's unit-derived body.
+    let ev = match &accepted {
+        Some(a) => {
+            crate::plan_gate::plan_accepted(&session.id, a, crate::interaction::now_millis())?
+        }
+        None => plan_accepted(session, units, PLAN_REV),
+    };
     let key = ev.key()?;
     let team = session.team.get_or_insert_with(RunTeamState::default);
-    let then = TeamBlocked::PlanDispatch { plan_rev: PLAN_REV };
+    let then = TeamBlocked::PlanDispatch { plan_rev };
     match publish_required(ev, Exhausted::Keep) {
         Ok(token) => {
             team.pending = Some(PendingTeamFact {
@@ -351,6 +379,95 @@ pub(super) fn gate_before_dispatch(
             })
         }
     }
+}
+
+// ── T3: the plan_approval gate on P1's path (DES-TEAMING-002 §8.6) ─────────────────────────────
+
+/// Whether this run's team facts go on the bus: teamed (acknowledged `path.started`) with a
+/// publisher in this process. An un-teamed run publishes nothing; its plan gate works the same.
+pub(super) fn publishes(session: &AgentSession) -> bool {
+    session.team.as_ref().is_some_and(RunTeamState::is_teamed) && has_publisher()
+}
+
+/// Publish plan-gate facts nobody waits on (`gate.opened{plan_approval}`, a refused edit's
+/// `plan.proposed` / `path.scored` / `plan.refused`, a reject's `gate.decided`) — FIFO, outbox.
+pub(super) fn publish_plan_facts(session: &AgentSession, facts: Vec<TeamEvent>) {
+    if publishes(session) {
+        for f in facts {
+            publish_fire(f);
+        }
+    }
+}
+
+/// The plan gate's gate id, minted from the run's ONE gate counter ([`RunTeamState::gate_seq`]) in
+/// the same batch as the pause (the caller persists `session`).
+pub(super) fn mint_gate_id(session: &mut AgentSession) -> String {
+    let run_id = session.id.clone();
+    let team = session.team.get_or_insert_with(RunTeamState::default);
+    team.gate_seq += 1;
+    tev::gate_id(&run_id, team.gate_seq)
+}
+
+/// A `plan_approval` gate opened: `gate.opened` rides the FIFO behind the pause, and the gate is
+/// the run's open team gate until its `gate.decided` lands (P1 `open_gate`).
+pub(super) fn plan_gate_opened(
+    store: &mut dyn GraphStore,
+    session: &mut AgentSession,
+    gate_id: &str,
+    opened: TeamEvent,
+) -> anyhow::Result<()> {
+    if !publishes(session) {
+        return Ok(());
+    }
+    if let Some(team) = session.team.as_mut() {
+        team.open_gate = Some(gate_id.to_string());
+    }
+    put_node(store, session.to_node())?;
+    publish_fire(opened);
+    Ok(())
+}
+
+/// Release the run past an answered `plan_approval` gate (approve, or an edit accepted as the
+/// next rev). Teamed: the gate's `gate.decided` is a REQUIRED transition — the resume waits for
+/// its acknowledgement ([`on_published`] → [`run_blocked`]), then `plan.accepted` gates the
+/// dispatch, and a failure past the bound pauses `team_transport` (P1). Un-teamed: resume now.
+/// Either way the run advances through `advance_or_pause`, so the cursor unit is dispatched once,
+/// at its current attempt.
+pub(super) fn release_plan_gate(
+    cx: &mut Ctx<'_>,
+    mut session: AgentSession,
+    decided: TeamEvent,
+) -> anyhow::Result<SessionStatus> {
+    let run_id = session.id.clone();
+    if publishes(&session) {
+        let then = TeamBlocked::Continue;
+        let key = decided.key()?;
+        match publish_required(decided, Exhausted::Keep) {
+            Ok(token) => {
+                let team = session.team.get_or_insert_with(RunTeamState::default);
+                team.pending = Some(PendingTeamFact {
+                    event_type: token.event_type,
+                    key: token.key,
+                    stage: PendingStage::Publishing,
+                    then,
+                });
+                put_node(cx.store, session.to_node())?;
+                cx.in_flight.insert(run_id);
+                return Ok(SessionStatus::AwaitingHuman);
+            }
+            Err(reason) => {
+                let pending = PendingTeamFact {
+                    event_type: tev::GATE_DECIDED.to_string(),
+                    key,
+                    stage: PendingStage::Paused,
+                    then,
+                };
+                return pause_team_transport(cx, session, pending, &reason);
+            }
+        }
+    }
+    put_node(cx.store, session.to_node())?;
+    run_blocked(cx, session, TeamBlocked::Continue)
 }
 
 fn transport_prompt(fact: &str, reason: &str) -> String {

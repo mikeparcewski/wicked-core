@@ -3436,17 +3436,6 @@ mod tests {
                 "checkpointSeq",
             ],
         );
-        // DES-TEAMING-002 T3: one engine-published team fact, exactly its bus row.
-        check(
-            CoreEvent::TeamFact {
-                session: s(),
-                event_type: "wicked.team.plan.proposed".to_string(),
-                key: s(),
-                payload: serde_json::json!({}),
-            },
-            "teamFact",
-            &["type", "session", "eventType", "key", "payload"],
-        );
         // Review of #456 (F4/F6): the seat's write containment at distribution; a kept worktree.
         check(
             CoreEvent::SandboxPosture {

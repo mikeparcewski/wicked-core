@@ -1255,17 +1255,6 @@ pub enum CoreEvent {
         in_diff: bool,
         checkpoint_seq: u64,
     },
-    /// (DES-TEAMING-002 T3) One engine-published `wicked.team.*` fact — `plan.proposed`,
-    /// `path.scored`, `plan.accepted`, `plan.refused`, `gate.opened`, `gate.decided` — exactly
-    /// the bus row a publisher writes: its `event_type`, idempotency `key` (§6.1) and `payload`
-    /// (`TeamEvent::bus_emit`). The interim hand-off until P1's `TeamBus::publish`; `session` is
-    /// the run id.
-    TeamFact {
-        session: String,
-        event_type: String,
-        key: String,
-        payload: serde_json::Value,
-    },
 }
 
 /// Render a [`crate::domain::UnitDenial`] in the events wire's camelCase convention (the persisted
@@ -2518,18 +2507,6 @@ impl CoreEvent {
                 "tree": tree,
                 "inDiff": in_diff,
                 "checkpointSeq": checkpoint_seq,
-            }),
-            CoreEvent::TeamFact {
-                session,
-                event_type,
-                key,
-                payload,
-            } => json!({
-                "type": "teamFact",
-                "session": session,
-                "eventType": event_type,
-                "key": key,
-                "payload": payload,
             }),
         }
     }

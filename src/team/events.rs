@@ -369,7 +369,7 @@ pub fn subject_step(step_id: &str, attempt: u32) -> String {
     format!("step:{step_id}:{attempt}")
 }
 
-/// `"g-<run>-<gate_seq>"` for every gate kind (`AgentSession.gate_seq`).
+/// `"g-<run>-<gate_seq>"` for every gate kind (`RunTeamState.gate_seq`, one counter per run).
 pub fn gate_id(run_id: &str, gate_seq: u32) -> String {
     format!("g-{run_id}-{gate_seq}")
 }

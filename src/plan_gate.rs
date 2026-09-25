@@ -13,9 +13,12 @@
 //! score cannot be computed scores `no_graph_score` (100), so a missing graph, repo or base commit
 //! lands in the high-risk band and pauses: positive evidence only.
 //!
-//! **Publishing.** Every fact goes through [`publish`], the ONE call site: the thinnest hand-off
-//! to the engine's existing emit path (`CoreEvent::TeamFact`, carrying exactly the bus row
-//! `TeamEvent::bus_emit` builds). It rebases onto P1's `TeamBus::publish`.
+//! **Publishing.** This module is pure: it BUILDS the facts. The actor publishes them through
+//! P1's one path (`TeamBus::publish` via the actor's publisher link, `actor::team_gate`): the
+//! launch's `plan.proposed` / `path.scored` are queued on the plan state and follow the run's
+//! `path.started` onto the bus; `plan.accepted` (from [`AcceptedPlan`]) and the plan gate's
+//! `gate.decided` are P1 required transitions; `gate.opened` and `plan.refused` ride the FIFO. An
+//! un-teamed run (no bus, `transport: none`) publishes none of them and its gate works the same.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -71,6 +74,58 @@ pub struct TeamPlanState {
     /// floor (§8.5). `None` for a run that does not deliver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_step: Option<PlanStep>,
+    /// The accepted rev's `plan.accepted` body (a P1 required transition published before the
+    /// rev's first dispatch). `None` while nothing is accepted (a plan held for approval).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<AcceptedPlan>,
+    /// Facts built before the run's `path.started` landed (the launch's `plan.proposed`,
+    /// `path.scored`): published, in order, right after it — never ahead of the run's path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<QueuedFact>,
+    /// The unit a `plan_approval` gate released: its next dispatch skips the human gates the
+    /// approval already answered (the confirm path's "bypass `should_pause`"), once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_ord: Option<u32>,
+}
+
+/// An accepted plan rev: the body of its `plan.accepted` (§6 row 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedPlan {
+    pub rev: u32,
+    /// `"engine"` (auto release) or `"human"` (approved or edited at the gate).
+    pub by: String,
+    pub band: String,
+    pub high_risk: bool,
+    pub auto: bool,
+    pub steps: PlanSteps,
+    pub floor_override: Option<FloorOverride>,
+    pub proposal_id: String,
+}
+
+/// A built fact waiting for the run's path (its `bus_emit` event type and payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedFact {
+    pub event_type: String,
+    pub payload: Value,
+}
+
+/// Queue `facts` on the plan state (they follow `path.started`).
+pub(crate) fn queue(state: &mut TeamPlanState, facts: &[TeamEvent]) -> anyhow::Result<()> {
+    for f in facts {
+        state.queued.push(QueuedFact {
+            event_type: f.event_type().to_string(),
+            payload: f.to_payload()?,
+        });
+    }
+    Ok(())
+}
+
+/// Take the queued facts, in order (re-parsed through the T1 contract).
+pub(crate) fn take_queued(state: &mut TeamPlanState) -> Vec<TeamEvent> {
+    std::mem::take(&mut state.queued)
+        .into_iter()
+        .filter_map(|q| TeamEvent::from_payload(&q.event_type, &q.payload).ok())
+        .collect()
 }
 
 /// A composed, floor-filled plan held at a `plan_approval` gate.
@@ -341,7 +396,7 @@ pub(crate) fn decide(
     let deliver = deliver_cmd(prior.deliver_step.as_ref());
     let proposal_id = ev::mint_proposal_id(run_id, &proposal.by, &proposal.source);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
-    let mut events = vec![
+    let events = vec![
         plan_proposed(
             run_id,
             &proposal.by,
@@ -415,18 +470,18 @@ pub(crate) fn decide(
             } else {
                 "engine"
             };
-            events.push(plan_accepted(
-                run_id,
-                by,
+            // `plan.accepted` is P1's required transition, published before the rev's first
+            // dispatch from this record (`actor::team_gate`).
+            state.accepted = Some(AcceptedPlan {
                 rev,
-                &filled.band,
-                filled.high_risk,
+                by: by.to_string(),
+                band: filled.band.clone(),
+                high_risk: filled.high_risk,
                 auto,
-                &filled.steps,
-                filled.floor_override.as_ref(),
-                &proposal_id,
-                now,
-            )?);
+                steps: filled.steps.clone(),
+                floor_override: filled.floor_override.clone(),
+                proposal_id: proposal_id.clone(),
+            });
             state.accepted_rev = rev;
             state.accepted_high_risk = filled.high_risk;
             state.approved_high_risk |= proposal.approved_by_human && filled.high_risk;
@@ -493,10 +548,10 @@ pub(crate) fn launch_plan(
     }
 }
 
-/// A launch plan refused before the run exists, with the facts that say so.
+/// A launch plan refused before the run exists. No run exists, so no path carries a fact: the
+/// refusal is the launch's synchronous error.
 pub(crate) struct Refusal {
     pub reason: String,
-    pub events: Vec<TeamEvent>,
 }
 
 /// The launch-time checks that do not depend on the score (§8.4-§8.5): supplied provenance, a
@@ -504,12 +559,9 @@ pub(crate) struct Refusal {
 /// a synchronous launch error with `plan.proposed` + `plan.refused` published; everything that
 /// depends on the score is judged once the worktree's base commit is known ([`decide`]).
 pub(crate) fn precheck(
-    run_id: &str,
     plan: &PlanSteps,
-    preset: Option<&str>,
     deliver_step: Option<&PlanStep>,
     human_confirm: &HumanConfirm,
-    now: i64,
 ) -> Result<(), Refusal> {
     let plan = with_default_ids(&with_deliver(plan, deliver_step));
     let reason = if let Some(Err(why)) = deliver_step.map(check_deliver_step) {
@@ -530,33 +582,10 @@ pub(crate) fn precheck(
             .err()
             .map(|r| refusal_text(&r))
     };
-    let Some(reason) = reason else {
-        return Ok(());
-    };
-    let proposal_id = ev::mint_proposal_id(
-        run_id,
-        "human",
-        &ProposalSource::Launch {
-            session_id: run_id.to_string(),
-        },
-    );
-    let events = [
-        plan_proposed(
-            run_id,
-            "human",
-            &proposal_id,
-            None,
-            ProposalKind::Initial,
-            preset,
-            &plan,
-            now,
-        ),
-        plan_refused(run_id, &proposal_id, None, &reason, now),
-    ]
-    .into_iter()
-    .filter_map(Result::ok)
-    .collect();
-    Err(Refusal { reason, events })
+    match reason {
+        Some(reason) => Err(Refusal { reason }),
+        None => Ok(()),
+    }
 }
 
 /// The launch plan's AUTHORED steps composed as rev 1 (`<run>:plan-1`), for the launch-time
@@ -573,8 +602,9 @@ pub(crate) fn authored_def(
     Ok(def)
 }
 
-/// Approve the held plan as-is at its gate (§8.6): `gate.decided{human_approved}` then
-/// `plan.accepted{by:"human"}`, and the state with the rev accepted.
+/// Approve the held plan as-is at its gate (§8.6): the gate's `gate.decided{human_approved}` (P1
+/// required: it gates the resume) and the state with the rev accepted — its `plan.accepted{by:
+/// "human"}` follows before the first dispatch.
 pub(crate) fn approve_pending(
     run_id: &str,
     state: &TeamPlanState,
@@ -582,7 +612,7 @@ pub(crate) fn approve_pending(
     ord: u32,
     attempt: u32,
     now: i64,
-) -> anyhow::Result<(TeamPlanState, Vec<TeamEvent>)> {
+) -> anyhow::Result<(TeamPlanState, TeamEvent)> {
     let p = state
         .pending
         .as_ref()
@@ -591,34 +621,30 @@ pub(crate) fn approve_pending(
         .gate_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("run {run_id}'s plan gate never opened"))?;
-    let events = vec![
-        gate_decided(
-            run_id,
-            &gate_id,
-            ord,
-            attempt,
-            GateDecision::HumanApproved,
-            now,
-        )?,
-        plan_accepted(
-            run_id,
-            "human",
-            p.rev,
-            &p.band,
-            p.high_risk,
-            is_auto(human_confirm),
-            &p.steps,
-            p.floor_override.as_ref(),
-            &p.proposal_id,
-            now,
-        )?,
-    ];
+    let decided = gate_decided(
+        run_id,
+        &gate_id,
+        ord,
+        attempt,
+        GateDecision::HumanApproved,
+        now,
+    )?;
     let mut next = state.clone();
+    next.accepted = Some(AcceptedPlan {
+        rev: p.rev,
+        by: "human".to_string(),
+        band: p.band.clone(),
+        high_risk: p.high_risk,
+        auto: is_auto(human_confirm),
+        steps: p.steps.clone(),
+        floor_override: p.floor_override.clone(),
+        proposal_id: p.proposal_id.clone(),
+    });
     next.accepted_rev = p.rev;
     next.accepted_high_risk = p.high_risk;
     next.approved_high_risk |= p.high_risk;
     next.pending = None;
-    Ok((next, events))
+    Ok((next, decided))
 }
 
 /// The prompt a `plan_approval` gate shows (§8.5: the override is shown at the gate).
@@ -768,31 +794,21 @@ fn path_scored(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn plan_accepted(
-    run_id: &str,
-    by: &str,
-    rev: u32,
-    band: &str,
-    high_risk: bool,
-    auto: bool,
-    steps: &PlanSteps,
-    floor_override: Option<&FloorOverride>,
-    proposal_id: &str,
-    now: i64,
-) -> anyhow::Result<TeamEvent> {
+/// `plan.accepted` for an accepted rev (§6 row 5): the composed steps with their provenance, the
+/// band, `high_risk`, the mode and the recorded override — all engine-computed.
+pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow::Result<TeamEvent> {
     build(
         ev::PLAN_ACCEPTED,
-        envelope(run_id, by, None, None, now),
+        envelope(run_id, &a.by, None, None, now),
         json!({
-            "plan_rev": rev,
-            "workflow_id": per_run_def_id(run_id, rev),
-            "band": band,
-            "high_risk": high_risk,
-            "mode": if auto { "auto" } else { "manual" },
-            "steps": wire_steps(steps),
-            "override": floor_override,
-            "proposal_id": proposal_id,
+            "plan_rev": a.rev,
+            "workflow_id": per_run_def_id(run_id, a.rev),
+            "band": a.band,
+            "high_risk": a.high_risk,
+            "mode": if a.auto { "auto" } else { "manual" },
+            "steps": wire_steps(&a.steps),
+            "override": a.floor_override,
+            "proposal_id": a.proposal_id,
         }),
     )
 }
@@ -864,25 +880,6 @@ pub(crate) fn gate_decided(
             "unresolved": [],
         }),
     )
-}
-
-/// THE one call site every T3 fact goes through: the thinnest hand-off to the engine's existing
-/// emit path. The fact rides `CoreEvent::TeamFact` as exactly the bus row `TeamEvent::bus_emit`
-/// builds (type, key, payload). Rebases onto P1's `TeamBus::publish`.
-pub(crate) fn publish(sink: &mut crate::event_log::EventSink, fact: &TeamEvent) {
-    let run = fact.env.run_id.clone();
-    match fact.bus_emit() {
-        Ok(row) => sink.emit(crate::CoreEvent::TeamFact {
-            session: run,
-            event_type: row.event_type,
-            key: row.idempotency_key.unwrap_or_default(),
-            payload: row.payload,
-        }),
-        Err(e) => sink.emit(crate::CoreEvent::Error {
-            session: Some(run),
-            message: format!("team fact {} could not be built: {e}", fact.event_type()),
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -1020,19 +1017,19 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(d.verdict, Verdict::Accepted { .. }), "{by}");
-            assert_eq!(
-                body_types(&d),
-                [PLAN_PROPOSED, PATH_SCORED, PLAN_ACCEPTED],
-                "{by}"
-            );
-            let TeamBody::PlanAccepted(a) = &d.events[2].body else {
+            // plan.accepted is P1's required transition: built from the accepted record.
+            assert_eq!(body_types(&d), [PLAN_PROPOSED, PATH_SCORED], "{by}");
+            let acc = d.state.accepted.as_ref().expect("accepted");
+            let ev = plan_accepted("r1", acc, 1).unwrap();
+            let TeamBody::PlanAccepted(a) = &ev.body else {
                 panic!()
             };
             assert_eq!(
-                (d.events[2].env.by.as_str(), a.plan_rev, a.high_risk),
-                ("engine", 1, false)
+                (ev.env.by.as_str(), a.plan_rev, a.high_risk, a.band.as_str()),
+                ("engine", 1, false, "0-19")
             );
             assert_eq!(a.workflow_id, "r1:plan-1");
+            assert_eq!(ev.event_type(), PLAN_ACCEPTED);
             let TeamBody::PlanProposed(p) = &d.events[0].body else {
                 panic!()
             };
@@ -1114,9 +1111,9 @@ mod tests {
         assert!(d.state.pending.unwrap().high_risk);
     }
 
-    /// `publish` hands the sink exactly the bus row `TeamEvent::bus_emit` builds.
+    /// Facts queued before the run's path come back in order, through the T1 contract.
     #[test]
-    fn publish_hands_over_the_bus_row() {
+    fn queued_facts_round_trip_in_order() {
         let p = plan(json!({"steps": [{"catalog": "understand", "id": "u"}]}));
         let d = decide(
             "r",
@@ -1137,24 +1134,10 @@ mod tests {
             1,
         )
         .unwrap();
-        let mut sink = crate::event_log::EventSink::default();
-        let (tx, rx) = std::sync::mpsc::channel();
-        sink.push(tx);
-        publish(&mut sink, &d.events[0]);
-        let row = d.events[0].bus_emit().unwrap();
-        match rx.try_recv().unwrap() {
-            crate::CoreEvent::TeamFact {
-                session,
-                event_type,
-                key,
-                payload,
-            } => {
-                assert_eq!(session, "r");
-                assert_eq!(event_type, row.event_type);
-                assert_eq!(Some(key), row.idempotency_key);
-                assert_eq!(payload, row.payload);
-            }
-            other => panic!("{other:?}"),
-        }
+        let mut state = d.state.clone();
+        queue(&mut state, &d.events).unwrap();
+        let back = take_queued(&mut state);
+        assert_eq!(back, d.events);
+        assert!(state.queued.is_empty());
     }
 }

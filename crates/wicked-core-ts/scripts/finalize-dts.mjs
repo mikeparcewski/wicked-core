@@ -113,9 +113,6 @@ const HAND_AUTHORED = `${BEGIN}
  * findingId, monitorId, seat, severity: 'high' | 'medium', path, line, evidence, claim,
  * suggestion: string | null, tree, inDiff, checkpointSeq} (a read-only monitor's finding whose
  * \`evidence\` IS line \`line\` of \`path\` in snapshot tree \`tree\` — advisory, never a verdict).
- * teamFact {session, eventType, key, payload} (DES-TEAMING-002 T3: one engine-published
- * \`wicked.team.*\` fact — \`plan.proposed\`, \`path.scored\`, \`plan.accepted\`, \`plan.refused\`,
- * \`gate.opened\`, \`gate.decided\` — exactly the bus row: its type, idempotency key and payload).
  */
 export interface CoreEventJson {
   type: string
