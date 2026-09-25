@@ -543,6 +543,9 @@ pub enum PlanRefusal {
     /// The step supplies `added_by` or `floor_reason`: provenance is engine-written only, so an
     /// author cannot forge a floor-added step.
     ProvenanceSupplied { step: String, catalog: String },
+    /// An evaluator with no explicit `depends_on` has no creator before it but one after it: it
+    /// would run before the work it evaluates. Refused, never reordered.
+    EvaluatorPrecedesCreator { step: String, creator: String },
 }
 
 impl PlanRefusal {
@@ -569,6 +572,7 @@ impl PlanRefusal {
             PlanRefusal::OverrideNotInFloor { .. } => "override_not_in_floor",
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
             PlanRefusal::ProvenanceSupplied { .. } => "provenance_supplied",
+            PlanRefusal::EvaluatorPrecedesCreator { .. } => "evaluator_precedes_creator",
         }
     }
 }
@@ -665,6 +669,11 @@ impl std::fmt::Display for PlanRefusal {
                 "{r}: step {step} ({catalog}) supplies added_by or floor_reason — provenance is \
                  written by floor fill only"
             ),
+            PlanRefusal::EvaluatorPrecedesCreator { step, creator } => write!(
+                f,
+                "{r}: {step} evaluates work that is produced later ({creator}); move it after \
+                 the creator"
+            ),
         }
     }
 }
@@ -755,6 +764,19 @@ pub fn compose(
             });
         };
         let mut phase = apply_step(entry, step)?;
+        let (before, after) = (&plan.steps[..i], &plan.steps[i + 1..]);
+        if step.depends_on.is_none()
+            && entry.role == crate::workflow::PhaseRole::Evaluator
+            && !before.iter().any(|s| is_creator_catalog(&s.catalog))
+        {
+            // Fail closed: an evaluator whose creator comes later would run blind before it.
+            if let Some(creator) = after.iter().find(|s| is_creator_catalog(&s.catalog)) {
+                return Err(PlanRefusal::EvaluatorPrecedesCreator {
+                    step: step.id.clone(),
+                    creator: creator.id.clone(),
+                });
+            }
+        }
         if step.depends_on.is_none() && phase.depends_on.is_empty() {
             phase.depends_on = implicit_inputs(entry, &plan.steps[..i]);
         }
