@@ -950,26 +950,45 @@ fn run_unit_and_judge_on(
                     b.rendered.len()
                 );
             }
-            b.block.map(|block| {
-                let mut i = input.clone();
+            // The carrier learns the attempt is claimed from its own snapshot: its `step.claimed`
+            // event id is the steer point's floor and its checkpoints' licence (DES-002 §4.2).
+            let mut i = input.clone();
+            if let Some(t) = i.unit.team.as_mut() {
+                t.claimed_event_id = Some(c.claimed_id);
+            }
+            if let Some(block) = b.block {
                 i.prior_outputs.push(block);
-                i
-            })
+            }
+            Some(i)
         }
         _ => None,
     };
     let output = runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta);
-    // DES-TEAMING-001 §4.7 (S2, #601): the ACP-only in-process final pass, kept until T6 re-homes
-    // the supervisor on the bus and deletes it; its ledger is not the gate's (T5 reads S's
-    // `ledger.folded` below). `None` for every non-teamed unit (the trait default).
-    let _team_ledger = runner.team_finish(input, &output);
     // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
     // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
     let mut team_snapshot: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
         crate::team::runner::Attempt::NotTeam => None,
-        crate::team::runner::Attempt::Local(s) => Some(s.clone()),
+        crate::team::runner::Attempt::Local(s) => Some((**s).clone()),
         crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete(c, &output)),
     };
+    // DES-002 §8.8: the PA's review of a member's step is team evidence, never the gate — the
+    // member's step already had its gate (its creator, the member, excluded). No judge, no floor:
+    // the engine reads the `STEP` verdict and the attempt's ledger from this result.
+    if input
+        .unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some())
+    {
+        return (
+            output,
+            None,
+            crate::workflow::UnitEvidence {
+                team: team_snapshot,
+                ..Default::default()
+            },
+        );
+    }
     // The seats the team's ledger names as authors/corroborators of a finding (DES-001 §6.2): a
     // monitor never grades its own finding. Computed from the ledger alone, never supplied.
     let team_authors: Vec<String> = team_snapshot

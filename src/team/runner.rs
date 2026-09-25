@@ -92,6 +92,11 @@ impl TeamRunner {
         })
     }
 
+    /// The one publish wrapper this runner writes through.
+    pub fn bus(&self) -> &TeamBus {
+        &self.bus
+    }
+
     /// Every `wicked.team.*` row of `run_id` after `after`, in `event_id` order. Rows of the run
     /// that do not parse are counted, never applied (`malformed`).
     pub fn read_run(&self, run_id: &str, after: i64) -> anyhow::Result<RunStream> {
@@ -129,6 +134,27 @@ pub struct RunStream {
     pub malformed: usize,
 }
 
+/// The finding a `finding.raised` row describes (the one construction, for the steer point, the
+/// boundary and the supervisor's carry).
+pub(crate) fn finding_of(env: &Envelope, b: &tev::FindingRaised) -> Finding {
+    Finding {
+        finding_id: b.finding_id.clone(),
+        monitor_id: b.member_id.clone(),
+        seat: env.by.clone(),
+        severity: b.severity,
+        path: b.path.clone(),
+        line: b.line,
+        evidence: b.evidence.clone(),
+        claim: b.claim.clone(),
+        suggestion: b.suggestion.clone(),
+        tree: b.tree.clone(),
+        in_diff: b.in_diff,
+        checkpoint_seq: 0,
+        anchor: b.anchor.clone().unwrap_or_default(),
+        carried_from_attempt: b.carried_from_attempt,
+    }
+}
+
 /// What the worker thread knows about its attempt's team, after [`claim`].
 #[derive(Debug, Clone)]
 pub enum Attempt {
@@ -137,7 +163,7 @@ pub enum Attempt {
     /// A team unit that runs un-teamed: the run is `transport: none` (no bus, a failed
     /// `path.started`), or this attempt's `step.claimed` failed. The snapshot is built locally and
     /// never published (§4.1, §4.8 rows 1/5/6).
-    Local(UnitTeamSnapshot),
+    Local(Box<UnitTeamSnapshot>),
     /// The attempt's `step.claimed` is on the bus.
     Claimed(Box<Claimed>),
 }
@@ -155,10 +181,15 @@ pub struct Claimed {
     pub stream_floor: i64,
     /// This attempt's `step.claimed` id (the attempt's floor).
     pub claimed_id: i64,
+    /// (T6) The member attempt this attempt reviews, when it is the PA's review of a member's
+    /// step (§8.8): its `STEP` line becomes `step.reviewed`.
+    pub reviewing: Option<u32>,
+    /// The step's criterion (the `HELP:` context).
+    pub criterion: String,
 }
 
 /// The seat instance a step runs under (`by` on R rows): the unit's assigned seat.
-fn seat_of(input: &StepInput) -> String {
+pub(crate) fn seat_of(input: &StepInput) -> String {
     input
         .unit
         .assigned_cli
@@ -255,30 +286,37 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
         return Ok(Attempt::NotTeam);
     };
     if stamped.transport == Transport::None {
-        return Ok(Attempt::Local(local_snapshot(stamped, None)));
+        return Ok(Attempt::Local(Box::new(local_snapshot(stamped, None))));
     }
     // Stamped `bus` at dispatch, but this worker has no runner: the bus was present at launch and
     // is absent now. Nothing of the attempt was generated, so nothing needs a tombstone.
     let Some(runner) = runner else {
-        return Ok(Attempt::Local(local_snapshot(
+        return Ok(Attempt::Local(Box::new(local_snapshot(
             stamped,
             Some(
                 "step.claimed not published: this worker has no team transport (the bus was \
                  present at dispatch and is absent now)"
                     .into(),
             ),
-        )));
+        ))));
     };
     let Some(stream_floor) = stamped.stream_floor else {
-        return Ok(Attempt::Local(local_snapshot(
+        return Ok(Attempt::Local(Box::new(local_snapshot(
             stamped,
             Some("step.claimed not published: the dispatch stamped no stream floor".into()),
-        )));
+        ))));
     };
     let (run_id, ord, attempt) = (input.run_id.clone(), input.unit.ord, input.attempt);
     let by = seat_of(input);
     let step_id = step_id_of(input);
     let baseline = input.unit.worktree_baseline.as_ref();
+    let reviewing = input.unit.member_step.as_ref().and_then(|m| m.reviewing);
+    let criterion = input
+        .unit
+        .validator
+        .as_ref()
+        .map(|v| v.criterion.clone())
+        .unwrap_or_else(|| input.unit.description.clone());
     let ev = TeamEvent {
         env: envelope(&run_id, ord, attempt, &by, None),
         body: TeamBody::StepClaimed(StepClaimed {
@@ -327,6 +365,8 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                 step_id,
                 stream_floor,
                 claimed_id: id,
+                reviewing,
+                criterion,
             })))
         }
         Ok(None) => "step.claimed superseded: the run or attempt moved past it".to_string(),
@@ -349,10 +389,10 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                  not be written ({e}); the step does not start (fail closed)"
             )
         })?;
-    Ok(Attempt::Local(local_snapshot(
+    Ok(Attempt::Local(Box::new(local_snapshot(
         stamped,
         Some(format!("un-teamed attempt: {why}")),
-    )))
+    ))))
 }
 
 /// The key of a raised finding: `(ord, attempt, raise_seq)` — each raise is one item.
@@ -371,11 +411,19 @@ pub struct Boundary {
     pub unread: Option<String>,
 }
 
-/// The step-boundary injector (§8.9): one bounded read of the run's stream from `path.started`;
-/// render every `finding.raised` that has no `advice.delivered{outcome:"injected"}` yet on ANY
-/// channel, within the 8 KB cap; publish one `advice.delivered{channel:"boundary",
-/// outcome:"injected"}` per rendered finding. A finding that did not fit gets no row and is
-/// picked up at the next boundary.
+/// The step-boundary injector (§8.9): one bounded read of the run's stream from `path.started`,
+/// rendered into one `[team advice]` prior-context block:
+///
+/// - every raised finding whose latest raise for its unit (`(ord, finding_id)`, the redriven
+///   attempt's carried raise over the dead attempt's) has no `advice.delivered{outcome:
+///   "injected"}` on ANY channel — HIGH and MEDIUM, within the 8 KB cap; a finding raised by an
+///   earlier attempt of this unit is labelled `carried_from_attempt:<n>`. One
+///   `advice.delivered{channel:"boundary", outcome:"injected"}` is published per rendered finding;
+///   one that did not fit gets no row and is picked up at the next boundary;
+/// - every `help.answered`, `council.ruled` and `change.requested` of the run that no LATER step of
+///   this seat was already shown (no `step.claimed` by the same seat after the row, other than
+///   this attempt's own): stateless, and a row that lands after a boundary read is shown at the
+///   next one.
 pub fn boundary(claimed: &Claimed) -> Boundary {
     let stream = match claimed
         .runner
@@ -405,45 +453,53 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
             }
         }
     }
-    let mut pending: Vec<(RaiseKey, Finding)> = Vec::new();
+    // The latest raise per (ord, finding_id): the attempt a carried finding now lives on.
+    let mut latest: Vec<(RaiseKey, Finding)> = Vec::new();
     for row in &stream.rows {
         let TeamBody::FindingRaised(b) = &row.event.body else {
             continue;
         };
         let env = &row.event.env;
         let key = (env.ord, env.attempt, b.raise_seq);
-        if injected.contains(&(key, b.finding_id.clone())) {
-            continue;
+        let mut f = finding_of(env, b);
+        if f.carried_from_attempt.is_none()
+            && env.ord == Some(claimed.ord)
+            && env.attempt.is_some_and(|a| a < claimed.attempt)
+        {
+            f.carried_from_attempt = env.attempt;
         }
-        if pending.iter().any(|(k, _)| *k == key) {
-            continue;
+        match latest
+            .iter_mut()
+            .find(|(k, lf)| k.0 == key.0 && lf.finding_id == f.finding_id)
+        {
+            Some(slot) if slot.0 .1 < key.1 || (slot.0 .1 == key.1 && slot.0 .2 < key.2) => {
+                *slot = (key, f)
+            }
+            Some(_) => {}
+            None => latest.push((key, f)),
         }
-        pending.push((
-            key,
-            Finding {
-                finding_id: b.finding_id.clone(),
-                monitor_id: b.member_id.clone(),
-                seat: env.by.clone(),
-                severity: b.severity,
-                path: b.path.clone(),
-                line: b.line,
-                evidence: b.evidence.clone(),
-                claim: b.claim.clone(),
-                suggestion: b.suggestion.clone(),
-                tree: b.tree.clone(),
-                in_diff: b.in_diff,
-                checkpoint_seq: 0,
-            },
-        ));
     }
-    if pending.is_empty() {
+    let pending: Vec<(RaiseKey, Finding)> = latest
+        .into_iter()
+        .filter(|(k, f)| !injected.contains(&(*k, f.finding_id.clone())))
+        .collect();
+    let answers = team_answers(&stream.rows, claimed);
+    if pending.is_empty() && answers.is_empty() {
         return Boundary::default();
     }
     let advice: Vec<super::Advice> = pending
         .iter()
         .map(|(_, f)| super::Advice { finding: f.clone() })
         .collect();
-    let (text, sent, _rest) = super::advice_block(advice);
+    let (mut text, sent, _rest) = if advice.is_empty() {
+        (String::new(), Vec::new(), Vec::new())
+    } else {
+        super::advice_block(advice)
+    };
+    if !answers.is_empty() {
+        let room = super::ADVICE_TEXT_CAP.saturating_sub(text.len());
+        text.push_str(&cap_utf8(&answers, room));
+    }
     let delivery_id = tev::delivery_id_boundary(&claimed.step_id, claimed.attempt);
     let mut rendered = Vec::new();
     for a in &sent {
@@ -496,6 +552,84 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
     }
 }
 
+/// The team's answers the PA has not been shown yet (§8.9): `help.answered`, `council.ruled` and
+/// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
+/// than its own claim) — a claim after the row means that step's boundary read it.
+fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
+    // T6 RED: the team's answers are not rendered yet.
+    if !claimed.run_id.is_empty() {
+        return String::new();
+    }
+    let later_claim = |event_id: i64| {
+        rows.iter().any(|r| {
+            r.event_id > event_id
+                && r.event_id != claimed.claimed_id
+                && r.event.env.by == claimed.by
+                && matches!(r.event.body, TeamBody::StepClaimed(_))
+        })
+    };
+    let question = |help_id: &str| {
+        rows.iter().find_map(|r| match &r.event.body {
+            TeamBody::HelpRequested(h) if h.help_id == help_id => Some(h.question.clone()),
+            _ => None,
+        })
+    };
+    let mut out = String::new();
+    for r in rows {
+        if later_claim(r.event_id) {
+            continue;
+        }
+        match &r.event.body {
+            TeamBody::HelpAnswered(b) => out.push_str(&format!(
+                "- help {} — you asked: {}\n  {} answers: {}{}\n",
+                b.help_id,
+                cap_utf8(&question(&b.help_id).unwrap_or_default(), 512),
+                r.event.env.by,
+                cap_utf8(&b.answer, 2 * 1024),
+                if b.evidence.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (evidence: {})", b.evidence.join(", "))
+                }
+            )),
+            TeamBody::CouncilRuled(b) => out.push_str(&format!(
+                "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
+                b.subject,
+                r.event.env.ord.unwrap_or_default(),
+                r.event.env.attempt.unwrap_or_default(),
+                token(&b.verdict).to_ascii_uppercase(),
+                b.reason
+                    .map(|x| format!(" ({})", token(&x)))
+                    .unwrap_or_default(),
+                if b.dissent.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — dissent: {}", cap_utf8(&b.dissent.join(" | "), 512))
+                }
+            )),
+            TeamBody::ChangeRequested(b) => out.push_str(&format!(
+                "- change requested {} by {}: steps [{}] — {}. Answer `PLAN {}: ACCEPT` with a \
+                 `PLAN+` block, or `PLAN {}: DECLINE — <why>`.\n",
+                b.change_id,
+                r.event.env.by,
+                b.steps
+                    .iter()
+                    .map(|s| format!("{}:{}", s.catalog, s.id))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                cap_utf8(&b.reason, 512),
+                b.change_id,
+                b.change_id
+            )),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!("\n[team answers · ADVISORY: the team's replies since your last step]\n{out}")
+}
+
 fn completion(status: StepStatus) -> StepCompletion {
     match status {
         StepStatus::Ok => StepCompletion::Ok,
@@ -507,7 +641,7 @@ fn completion(status: StepStatus) -> StepCompletion {
 }
 
 /// The attempt's rows from its `step.claimed` on, as a capped transcript.
-fn transcript_of(rows: &[TeamRow], cap: usize) -> Transcript {
+pub(crate) fn transcript_of(rows: &[TeamRow], cap: usize) -> Transcript {
     let mut events = Vec::new();
     let mut size = 0usize;
     let mut truncated = false;
@@ -579,7 +713,142 @@ fn snapshot(
     }
 }
 
+/// The PA's lines at the end of its turn (§8.8, §8.9), published BEFORE `step.completed` on the
+/// same runner lane, so the supervisor's final pass reads them in order: one `advice.answered` per
+/// `ADVICE` line naming a raised finding, one `help.requested` per `HELP:` line, and — on the PA's
+/// review of a member's step — one `step.reviewed` from its `STEP` line. A failed turn has no final
+/// answer to read. A line that cannot be published is logged: a missing answer leaves its finding
+/// unanswered (the council path), a missing question is simply not answered, and a missing review
+/// is read from the same output by the engine.
+fn publish_turn_lines(claimed: &Claimed, output: &StepOutput) {
+    // T6 RED: the PA's lines are not published yet.
+    if !claimed.run_id.is_empty() || output.status != StepStatus::Ok {
+        return;
+    }
+    let publish = |ev: TeamEvent| {
+        if let Err(e) = claimed.runner.bus.publish(&ev) {
+            eprintln!(
+                "wicked-core: {} of {}:{}:{} not written ({e:#})",
+                ev.event_type(),
+                claimed.run_id,
+                claimed.ord,
+                claimed.attempt
+            );
+        }
+    };
+    let answers = super::parse_advice_lines(&output.output);
+    if !answers.is_empty() {
+        match claimed
+            .runner
+            .read_run(&claimed.run_id, claimed.stream_floor.saturating_sub(1))
+        {
+            Ok(stream) => {
+                for (finding_id, resp) in &answers {
+                    // This attempt's raise of it first, else the latest raise of this unit.
+                    let raise = stream
+                        .rows
+                        .iter()
+                        .filter_map(|r| match &r.event.body {
+                            TeamBody::FindingRaised(b)
+                                if b.finding_id == *finding_id
+                                    && r.event.env.ord == Some(claimed.ord) =>
+                            {
+                                Some((r.event.env.attempt.unwrap_or_default(), b.raise_seq))
+                            }
+                            _ => None,
+                        })
+                        .max_by_key(|(a, seq)| ((*a == claimed.attempt), *a, *seq));
+                    let Some((attempt, raise_seq)) = raise else {
+                        continue;
+                    };
+                    publish(TeamEvent {
+                        env: envelope(
+                            &claimed.run_id,
+                            claimed.ord,
+                            attempt,
+                            &claimed.by,
+                            Some(format!("finding.raised#{raise_seq}")),
+                        ),
+                        body: TeamBody::AdviceAnswered(tev::AdviceAnswered {
+                            raise_seq,
+                            answered_in: tev::answered_in(&claimed.step_id, claimed.attempt),
+                            finding_id: finding_id.clone(),
+                            disposition: match resp.disposition {
+                                super::Disposition::Accepted => tev::AdviceDisposition::Accepted,
+                                super::Disposition::Declined => tev::AdviceDisposition::Declined,
+                            },
+                            reason: resp.reason.clone(),
+                        }),
+                    });
+                }
+            }
+            Err(e) => eprintln!(
+                "wicked-core: unit {} attempt {}: ADVICE lines not recorded, the stream could not \
+                 be read ({e:#}); the findings stay unanswered (the council path)",
+                claimed.ord, claimed.attempt
+            ),
+        }
+    }
+    for (i, question) in super::parse_help_lines(&output.output)
+        .into_iter()
+        .enumerate()
+    {
+        let help_seq = i as u32 + 1;
+        publish(TeamEvent {
+            env: envelope(
+                &claimed.run_id,
+                claimed.ord,
+                claimed.attempt,
+                &claimed.by,
+                None,
+            ),
+            body: TeamBody::HelpRequested(tev::HelpRequested {
+                help_id: tev::mint_help_id(
+                    &claimed.run_id,
+                    claimed.ord,
+                    claimed.attempt,
+                    &claimed.by,
+                    help_seq,
+                ),
+                help_seq,
+                question,
+                context: cap_utf8(
+                    &format!("step {}: {}", claimed.step_id, claimed.criterion),
+                    super::HELP_CAP,
+                ),
+            }),
+        });
+    }
+    if let Some(reviewed_attempt) = claimed.reviewing {
+        if let Some(line) = super::parse_step_lines(&output.output)
+            .into_iter()
+            .find(|l| l.step_id == claimed.step_id)
+        {
+            publish(TeamEvent {
+                env: envelope(
+                    &claimed.run_id,
+                    claimed.ord,
+                    claimed.attempt,
+                    &claimed.by,
+                    Some(format!(
+                        "step.completed#{}:{reviewed_attempt}",
+                        claimed.step_id
+                    )),
+                ),
+                body: TeamBody::StepReviewed(tev::StepReviewed {
+                    step_id: line.step_id,
+                    verdict: line.verdict,
+                    to: line.to,
+                    reason: line.reason,
+                    reviewed_attempt: Some(reviewed_attempt),
+                }),
+            });
+        }
+    }
+}
+
 fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> UnitTeamSnapshot {
+    publish_turn_lines(claimed, output);
     let completed = TeamEvent {
         env: envelope(
             &claimed.run_id,
@@ -668,10 +937,14 @@ fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> Uni
             }
         }
     }
+    // A fact of this run still waiting in the outbox (S's `finding.raised` among them) is not in
+    // the rows the synthesis folds: the record is incomplete, so it is `stream_gap` (pauses) —
+    // never a timed-out ledger missing a finding the bus has not seen.
+    let spooled = claimed.runner.bus.run_has_pending(&claimed.run_id);
     let (ledger, transcript) = match attempt_rows(claimed) {
         Ok((rows, malformed)) => {
             let folded = tev::fold(&rows);
-            let ledger = if malformed > 0 || folded.final_pass == FinalPass::StreamGap {
+            let ledger = if spooled || malformed > 0 || folded.final_pass == FinalPass::StreamGap {
                 // An incomplete record stays `stream_gap`: it pauses, never auto-approves.
                 let mut l = folded;
                 l.final_pass = FinalPass::StreamGap;

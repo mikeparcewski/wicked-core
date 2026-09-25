@@ -292,7 +292,7 @@
    "raise_seq": 4,
    "finding_id": "f-7bf84000911d564c",
    "member_id": "m1",
-   "line_key": null,
+   "line_key": "l-7bf84000911d564c",
    "anchor": null,
    "anchor_source": null,
    "severity": "high",
@@ -303,7 +303,8 @@
    "suggestion": null,
    "tree": "t-k",
    "in_diff": true,
-   "corroborated_by": []
+   "corroborated_by": [],
+   "carried_from_attempt": null
   }
  },
  {
@@ -420,7 +421,8 @@
    "step_id": "test-plan",
    "verdict": "rejected",
    "to": "member",
-   "reason": "covers only the happy path"
+   "reason": "covers only the happy path",
+   "reviewed_attempt": null
   }
  },
  {

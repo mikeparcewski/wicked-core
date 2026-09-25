@@ -475,17 +475,24 @@ pub(super) fn open_unit_review(
     Some(gid)
 }
 
+/// A `team_dispute` the fold decided the unit opens: the prompt and the unresolved HIGHs it names.
+#[derive(Debug, Clone)]
+pub(super) struct DisputeOpen {
+    pub prompt: String,
+    pub finding_ids: Vec<String>,
+}
+
 /// (T5) After the fold: publish the unit-review `gate.decided`, and when the gate APPROVED a
-/// teamed unit whose ledger pauses ([`tev::gate_pauses`]) mint and open the `team_dispute` gate.
-/// Returns the pause prompt then: the caller pauses the run (the unit's work stands; the run
-/// does not continue unattended). A denied unit is denied, never paused.
+/// teamed unit whose ledger pauses ([`tev::gate_pauses`]) return the `team_dispute` the caller
+/// opens ([`open_dispute`]): the unit's work stands, the run does not continue unattended. A
+/// denied unit is denied, never paused.
 pub(super) fn decide_unit_review(
     session: &mut AgentSession,
     unit: &WorkUnit,
     attempt: u32,
     gate_id: &str,
     approved: bool,
-) -> Option<String> {
+) -> Option<DisputeOpen> {
     // A teamed unit whose snapshot carries no ledger is an incomplete record: it pauses.
     let owned;
     let ledger = match unit.team.as_ref()?.ledger.as_ref() {
@@ -527,20 +534,6 @@ pub(super) fn decide_unit_review(
     if !pause {
         return None;
     }
-    let team = session.team.get_or_insert_with(Default::default);
-    team.gate_seq += 1;
-    let dispute = tev::gate_id(&session.id, team.gate_seq);
-    publish_fire(unit_event(
-        &session.id,
-        unit.ord,
-        attempt,
-        TeamBody::GateOpened(GateOpened {
-            gate_id: dispute,
-            kind: GateOpenedKind::TeamDispute {
-                finding_ids: unresolved.clone(),
-            },
-        }),
-    ));
     let why = if unresolved.is_empty() {
         format!(
             "the team's record of this step is incomplete (final pass: {})",
@@ -555,11 +548,15 @@ pub(super) fn decide_unit_review(
             unresolved.join(", ")
         )
     };
-    Some(format!(
-        "Team dispute on unit {} ({}): {why}. The gate approved the work, but the run does not \
-         continue unattended. Approve to continue, request changes to rework, or reject to cancel.",
-        unit.ord, unit.description
-    ))
+    Some(DisputeOpen {
+        prompt: format!(
+            "Team dispute on unit {} ({}): {why}. The gate approved the work, but the run does \
+             not continue unattended. Approve to continue, request changes to rework, or reject \
+             to cancel.",
+            unit.ord, unit.description
+        ),
+        finding_ids: unresolved,
+    })
 }
 
 /// A team run reached a terminal status (called right AFTER the terminal status is persisted).
@@ -1016,6 +1013,20 @@ fn run_blocked(
                 cx.lifecycle_maps,
             )
         }
+        TeamBlocked::DisputeApproved => {
+            let progress = resume_dispute(&mut cx.act(), session);
+            settle(cx, &run_id, progress)
+        }
+        TeamBlocked::DisputeAmended { note } => {
+            let progress = amend_dispute(cx, session, note);
+            match progress {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    cx.in_flight.remove(&run_id);
+                    Err(e)
+                }
+            }
+        }
         TeamBlocked::FirstDispatch | TeamBlocked::PlanDispatch { .. } | TeamBlocked::Continue => {
             if session.status == SessionStatus::AwaitingHuman {
                 // The team_transport gate was answered and its step can now run: resume.
@@ -1332,6 +1343,693 @@ pub(super) fn settle_held_replies(
         let _ = reply.send(Ok(session.status));
         false
     });
+}
+
+// ── DES-TEAMING-002 T6: the team_dispute gate and member steps (§8.8, §8.10; DES-001 §6.7) ──────
+
+/// A member step is rejected at most this many times before the next rejection goes to the PA
+/// (DES-002 §8.8 `MAX_STEP_REWORK`).
+pub(super) const MAX_STEP_REWORK: u32 = 2;
+
+/// The actor handles a team step needs, from `apply_step_result` or an acknowledgement handler.
+pub(super) struct Act<'a> {
+    pub store: &'a mut dyn GraphStore,
+    pub subscribers: &'a mut crate::event_log::EventSink,
+    pub runner: &'a Arc<dyn StepRunner>,
+    pub self_tx: &'a Sender<Command>,
+    pub lifecycle_maps: &'a Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    pub actor_maps: &'a Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    pub process_gen: uuid::Uuid,
+    pub is_acp: bool,
+}
+
+impl Ctx<'_> {
+    fn act(&mut self) -> Act<'_> {
+        Act {
+            store: &mut *self.store,
+            subscribers: &mut *self.subscribers,
+            runner: self.runner,
+            self_tx: self.self_tx,
+            lifecycle_maps: self.lifecycle_maps,
+            actor_maps: self.actor_maps,
+            process_gen: self.process_gen,
+            is_acp: self.is_acp,
+        }
+    }
+}
+
+/// Map a team step's progress onto the run's status and its in-flight marker.
+fn settle(
+    cx: &mut Ctx<'_>,
+    run_id: &str,
+    progress: anyhow::Result<Progress>,
+) -> anyhow::Result<SessionStatus> {
+    match progress {
+        Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
+            cx.in_flight.insert(run_id.to_string());
+            Ok(SessionStatus::Executing)
+        }
+        Ok(Progress::Paused) => {
+            cx.in_flight.remove(run_id);
+            Ok(SessionStatus::AwaitingHuman)
+        }
+        Ok(Progress::Done) => {
+            cx.in_flight.remove(run_id);
+            finalize_run(cx.store, cx.subscribers, cx.runner, cx.self_tx, run_id)?;
+            Ok(SessionStatus::Completed)
+        }
+        Err(e) => {
+            cx.in_flight.remove(run_id);
+            fail_run_by_id(
+                cx.store,
+                cx.subscribers,
+                cx.runner,
+                cx.self_tx,
+                run_id,
+                anyhow::anyhow!("{e:#}"),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Whether `session` is paused on a `team_dispute` gate (its answer is the team handler's).
+pub(super) fn dispute_gate_open(session: &AgentSession) -> bool {
+    session.status == SessionStatus::AwaitingHuman
+        && session.team.as_ref().is_some_and(|t| t.dispute.is_some())
+}
+
+/// Open a `team_dispute` pause over unit `ord` (DES-001 §6.7): mint the gate, publish
+/// `gate.opened{kind:"team_dispute"}` (its pause is durable in the store either way, P1 row 3),
+/// record the gate on the run, and pause. The run's cursor stays on the unit.
+pub(super) fn open_dispute(
+    act: &mut Act<'_>,
+    session: &mut AgentSession,
+    ord: u32,
+    attempt: u32,
+    kind: crate::domain::DisputeKind,
+    prompt: String,
+    finding_ids: Vec<String>,
+) -> anyhow::Result<Progress> {
+    let run_id = session.id.clone();
+    let team = session.team.get_or_insert_with(Default::default);
+    team.gate_seq += 1;
+    let gid = tev::gate_id(&run_id, team.gate_seq);
+    team.dispute = Some(crate::domain::DisputeGate {
+        gate_id: gid.clone(),
+        ord,
+        attempt,
+        kind,
+        finding_ids: finding_ids.clone(),
+    });
+    publish_fire(unit_event(
+        &run_id,
+        ord,
+        attempt,
+        TeamBody::GateOpened(GateOpened {
+            gate_id: gid,
+            kind: GateOpenedKind::TeamDispute { finding_ids },
+        }),
+    ));
+    pause_for_human(
+        act.store,
+        act.subscribers,
+        act.self_tx,
+        session,
+        ord,
+        None,
+        TEAM_DISPUTE_GATE,
+        prompt,
+    )?;
+    Ok(Progress::Paused)
+}
+
+/// Answer a `team_dispute` pause (the row is already resolved). Every answer first publishes the
+/// gate's `gate.decided{by:"human"}` — a REQUIRED fact (§4.1): the run resumes, reworks or
+/// cancels only on its acknowledgement; past the bound it stays paused `team_transport`.
+pub(super) fn answer_dispute_gate(
+    cx: &mut Ctx<'_>,
+    mut session: AgentSession,
+    decision: crate::workflow::HumanDecision,
+) -> anyhow::Result<SessionStatus> {
+    let run_id = session.id.clone();
+    // T6 RED: the team_dispute answer is not built yet.
+    if !run_id.is_empty() {
+        anyhow::bail!("T6: the team_dispute answer is not built");
+    }
+    let Some(d) = session.team.as_ref().and_then(|t| t.dispute.clone()) else {
+        anyhow::bail!("run {run_id} is not paused team_dispute");
+    };
+    let (decision_token, then) = match decision {
+        crate::workflow::HumanDecision::Reject => {
+            (GateDecision::HumanRejected, TeamBlocked::Cancel)
+        }
+        crate::workflow::HumanDecision::RequestChanges { note } => (
+            GateDecision::HumanAmended,
+            TeamBlocked::DisputeAmended {
+                note: note.unwrap_or_default(),
+            },
+        ),
+        crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if !a.trim().is_empty() => (
+            GateDecision::HumanAmended,
+            TeamBlocked::DisputeAmended { note: a },
+        ),
+        crate::workflow::HumanDecision::Approve { .. } => {
+            (GateDecision::HumanApproved, TeamBlocked::DisputeApproved)
+        }
+    };
+    let ev = TeamEvent {
+        env: Envelope {
+            ord: Some(d.ord),
+            attempt: Some(d.attempt),
+            by: "human".to_string(),
+            re: Some(format!("gate.opened#{}", d.gate_id)),
+            ..envelope(&run_id)
+        },
+        body: TeamBody::GateDecided(GateDecided {
+            gate_id: d.gate_id.clone(),
+            kind: GateKind::TeamDispute,
+            decision: decision_token,
+            combined: None,
+            team_pause: d.kind == crate::domain::DisputeKind::Finding,
+            unresolved: d.finding_ids.clone(),
+        }),
+    };
+    let key = ev.key()?;
+    match publish_required(ev, Exhausted::Keep) {
+        Ok(token) => {
+            let team = session.team.get_or_insert_with(RunTeamState::default);
+            team.open_gate = Some(d.gate_id.clone());
+            team.pending = Some(PendingTeamFact {
+                event_type: token.event_type,
+                key: token.key,
+                stage: PendingStage::Publishing,
+                then,
+            });
+            put_node(cx.store, session.to_node())?;
+            cx.in_flight.insert(run_id);
+            Ok(SessionStatus::AwaitingHuman)
+        }
+        Err(reason) => {
+            // No publisher to take the required fact: the run stays paused, now `team_transport`
+            // over the decision (its answer carries the step on; nothing resumes unacknowledged).
+            let pending = PendingTeamFact {
+                event_type: tev::GATE_DECIDED.to_string(),
+                key,
+                stage: PendingStage::Paused,
+                then,
+            };
+            pause_team_transport(cx, session, pending, &reason)
+        }
+    }
+}
+
+/// `DisputeApproved`, once the human's `gate.decided` landed: `resumed`, then — for a finding
+/// dispute — the `gateDecided{allow:true}` and `unitDone` the fold withheld (DES-001 #13, #16 g),
+/// and the run advances past the unit. Never a re-dispatch, never an attempt bump. A member's step
+/// counts (a human approved it), or — a finding dispute on a member's work — goes to the PA's
+/// review.
+fn resume_dispute(act: &mut Act<'_>, mut session: AgentSession) -> anyhow::Result<Progress> {
+    let run_id = session.id.clone();
+    let Some(d) = session.team.as_mut().and_then(|t| t.dispute.take()) else {
+        anyhow::bail!("run {run_id}: no team_dispute gate on record to resume");
+    };
+    session.status = SessionStatus::Executing;
+    put_node(act.store, session.to_node())?;
+    let units = crate::domain::session_units(act.store, &run_id)?;
+    let ix = units
+        .iter()
+        .position(|u| u.ord == d.ord)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id}: no unit {} to resume", d.ord))?;
+    emit(
+        act.subscribers,
+        CoreEvent::Resumed {
+            session: run_id.clone(),
+            ord: d.ord,
+        },
+    );
+    match d.kind {
+        crate::domain::DisputeKind::Finding => {
+            if is_member_work(&units[ix]) {
+                return enter_review(act, &run_id, ix, d.attempt);
+            }
+            emit_counted(act, &run_id, d.ord);
+            advance_past(act, &run_id, ix)
+        }
+        crate::domain::DisputeKind::MemberStep => {
+            accept_member_step(act, &run_id, ix, Some("a human approved it".into()))
+        }
+    }
+}
+
+/// `DisputeAmended`, once the human's `gate.decided` landed: a finding dispute reruns the creator
+/// with the note (`rewind_to_creator`, DES-001 #16 k); a member-step dispute goes back to the
+/// member with the note as its rework amendment.
+fn amend_dispute(
+    cx: &mut Ctx<'_>,
+    mut session: AgentSession,
+    note: String,
+) -> anyhow::Result<SessionStatus> {
+    let run_id = session.id.clone();
+    let Some(d) = session.team.as_mut().and_then(|t| t.dispute.take()) else {
+        anyhow::bail!("run {run_id}: no team_dispute gate on record to amend");
+    };
+    put_node(cx.store, session.to_node())?;
+    match d.kind {
+        crate::domain::DisputeKind::Finding => {
+            let reopen = session.clone();
+            match rewind_to_creator(
+                cx.store,
+                cx.subscribers,
+                cx.runner,
+                cx.self_tx,
+                cx.in_flight,
+                session,
+                &run_id,
+                Some(note),
+                cx.lifecycle_maps,
+                cx.actor_maps,
+                cx.process_gen,
+                cx.is_acp,
+            ) {
+                Ok(s) => Ok(s),
+                // The rework could not start (refused before the answer resolved in the normal
+                // case): the dispute re-opens, still answerable — never a run paused on nothing.
+                Err(e) => {
+                    let mut reopen = reopen;
+                    open_dispute(
+                        &mut cx.act(),
+                        &mut reopen,
+                        d.ord,
+                        d.attempt,
+                        d.kind,
+                        format!("Team dispute on unit {}: the rework could not start ({e:#}). Approve to count the work, or reject to cancel.", d.ord),
+                        d.finding_ids.clone(),
+                    )?;
+                    cx.in_flight.remove(&run_id);
+                    Ok(SessionStatus::AwaitingHuman)
+                }
+            }
+        }
+        crate::domain::DisputeKind::MemberStep => {
+            let units = crate::domain::session_units(cx.store, &run_id)?;
+            let ix = units
+                .iter()
+                .position(|u| u.ord == d.ord)
+                .ok_or_else(|| anyhow::anyhow!("run {run_id}: no unit {}", d.ord))?;
+            let progress = rework_member_step(
+                &mut cx.act(),
+                &run_id,
+                ix,
+                crate::team::events::ReworkBy::Member,
+                format!("operator: {note}"),
+                false,
+            );
+            settle(cx, &run_id, progress)
+        }
+    }
+}
+
+/// The `gateDecided{allow:true}` + `unitDone` a withheld fold owes, now that the unit counts.
+fn emit_counted(act: &mut Act<'_>, run_id: &str, ord: u32) {
+    emit(
+        act.subscribers,
+        CoreEvent::GateDecided {
+            session: run_id.to_string(),
+            ord,
+            allow: true,
+        },
+    );
+    emit(
+        act.subscribers,
+        CoreEvent::UnitDone {
+            session: run_id.to_string(),
+            ord,
+        },
+    );
+}
+
+/// Move the cursor past unit `ix` and advance (dispatch, pause at the next gate, or finish).
+pub(super) fn advance_past(act: &mut Act<'_>, run_id: &str, ix: usize) -> anyhow::Result<Progress> {
+    let mut session = crate::domain::get_session(act.store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let units = crate::domain::session_units(act.store, run_id)?;
+    session.unit_ix = ix + 1;
+    session.attempt = units.get(ix + 1).map(next_attempt).unwrap_or(0);
+    session.status = SessionStatus::Executing;
+    put_node(act.store, session.to_node())?;
+    advance_or_pause(
+        act.store,
+        act.subscribers,
+        act.runner,
+        act.self_tx,
+        run_id,
+        ix + 1,
+        act.lifecycle_maps,
+        act.actor_maps,
+        act.process_gen,
+        act.is_acp,
+    )
+}
+
+/// The PA seat instance (`path.started.cli`): the first of the run's seats.
+fn pa_seat(session: &AgentSession) -> String {
+    session
+        .clis
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// Whether `u` is a member's work that has not been reviewed yet (its next step is the PA's
+/// review, not the gate's count).
+pub(super) fn is_member_work(u: &WorkUnit) -> bool {
+    u.team_run
+        && u.owner == crate::workflow::StepOwner::Team
+        && u.member_step
+            .as_ref()
+            .is_some_and(|m| !m.replanned && m.reviewing.is_none())
+}
+
+/// Whether `u`'s current attempt is the PA's review of a member's step.
+pub(super) fn is_review(u: &WorkUnit) -> bool {
+    u.member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some())
+}
+
+/// A team unit's member step state at dispatch (DES-002 §8.8): an `owner: team` step of a team
+/// run belongs to the member seat distribution put it on. A member step that landed on the PA's
+/// own seat is not a member's step: it is the PA's, gated as any other (distribution refuses a
+/// team run with no seat distinct from the PA, so this is a disclosed corner, never a bypass).
+pub(super) fn stamp_member_step(session: &AgentSession, unit: &mut WorkUnit) -> bool {
+    if !unit.team_run
+        || unit.owner != crate::workflow::StepOwner::Team
+        || unit.tool_cmd.is_some()
+        || unit.member_step.is_some()
+    {
+        return false;
+    }
+    let member = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    let replanned = member == pa_seat(session);
+    if replanned {
+        eprintln!(
+            "wicked-core: run {} unit {}: the member step landed on the PA's seat {member}; it runs \
+             as the PA's own step",
+            session.id, unit.ord
+        );
+    }
+    unit.member_step = Some(crate::domain::MemberStepState {
+        member,
+        replanned,
+        ..Default::default()
+    });
+    true
+}
+
+/// The member's work passed its gate: hold the count and dispatch the PA's review of it on the PA
+/// seat (the unit's next attempt). The member attempt's snapshot is kept for the count.
+pub(super) fn enter_review(
+    act: &mut Act<'_>,
+    run_id: &str,
+    ix: usize,
+    member_attempt: u32,
+) -> anyhow::Result<Progress> {
+    // T6 RED: the PA's review is not built yet: the member's work counts as it stands.
+    if !run_id.is_empty() {
+        let _ = member_attempt;
+        return advance_past(act, run_id, ix);
+    }
+    let mut session = crate::domain::get_session(act.store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let mut units = crate::domain::session_units(act.store, run_id)?;
+    let unit = &mut units[ix];
+    let pa = pa_seat(&session);
+    let work_team = unit.team.clone();
+    let ms = unit.member_step.get_or_insert_with(Default::default);
+    ms.reviewing = Some(member_attempt);
+    ms.work_team = work_team;
+    unit.assigned_cli = Some(pa);
+    unit.status = crate::domain::UnitStatus::Pending;
+    put_node(act.store, unit.to_node())?;
+    session.unit_ix = ix;
+    session.attempt = next_attempt(unit);
+    session.status = SessionStatus::Executing;
+    put_node(act.store, session.to_node())?;
+    dispatch_unit(
+        act.store,
+        act.subscribers,
+        act.runner,
+        act.self_tx,
+        run_id,
+        ix,
+        act.lifecycle_maps,
+        act.actor_maps,
+        act.process_gen,
+        act.is_acp,
+    )?;
+    Ok(Progress::Dispatched)
+}
+
+/// The member's step counts (the PA accepted it, a council said YES, or a human approved it): the
+/// unit is done with the member's output as its work output, its member attempt's snapshot is its
+/// evidence again, the withheld `gateDecided` + `unitDone` are emitted, and the run advances.
+fn accept_member_step(
+    act: &mut Act<'_>,
+    run_id: &str,
+    ix: usize,
+    dissent: Option<String>,
+) -> anyhow::Result<Progress> {
+    let mut units = crate::domain::session_units(act.store, run_id)?;
+    let unit = &mut units[ix];
+    let ord = unit.ord;
+    if let Some(ms) = unit.member_step.as_mut() {
+        ms.reviewing = None;
+        if let Some(t) = ms.work_team.take() {
+            unit.team = Some(t);
+        }
+        unit.assigned_cli = Some(ms.member.clone());
+        if let (Some(why), Some(last)) = (dissent, ms.reviews.last_mut()) {
+            last.member_reason.get_or_insert(why);
+        }
+    }
+    unit.status = crate::domain::UnitStatus::Done;
+    put_node(act.store, unit.to_node())?;
+    emit_counted(act, run_id, ord);
+    advance_past(act, run_id, ix)
+}
+
+/// The PA's rejection stands: rework the step — back to the member with the reason as its
+/// amendment, or re-planned onto the PA (`to:pa`, or past `MAX_STEP_REWORK` rejections).
+fn rework_member_step(
+    act: &mut Act<'_>,
+    run_id: &str,
+    ix: usize,
+    to: crate::team::events::ReworkBy,
+    reason: String,
+    count: bool,
+) -> anyhow::Result<Progress> {
+    let mut session = crate::domain::get_session(act.store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let mut units = crate::domain::session_units(act.store, run_id)?;
+    let pa = pa_seat(&session);
+    let unit = &mut units[ix];
+    let ord = unit.ord;
+    let ms = unit.member_step.get_or_insert_with(Default::default);
+    if count {
+        ms.rejections += 1;
+    }
+    ms.reviewing = None;
+    ms.work_team = None;
+    let to_pa = to == crate::team::events::ReworkBy::Pa || ms.rejections > MAX_STEP_REWORK;
+    if to_pa {
+        ms.replanned = true;
+        unit.owner = crate::workflow::StepOwner::Pa;
+        unit.assigned_cli = Some(pa);
+    } else {
+        unit.assigned_cli = Some(ms.member.clone());
+    }
+    let amendment = format!(
+        "{} — {reason}",
+        if to_pa {
+            "The PA rejected the member's output; the step is re-planned onto the PA"
+        } else {
+            "The PA rejected your output for this step; rework it"
+        }
+    );
+    unit.status = crate::domain::UnitStatus::Distributed;
+    unit.rework_of = Some(ord);
+    unit.rework_amendment = Some(amendment.clone());
+    unit.worktree_baseline = None;
+    unit.worktree_mutation = None;
+    unit.denial = None;
+    unit.denial_reason = None;
+    put_node(act.store, unit.to_node())?;
+    session.unit_ix = ix;
+    session.attempt = next_attempt(unit);
+    session.status = SessionStatus::Executing;
+    put_node(act.store, session.to_node())?;
+    emit(
+        act.subscribers,
+        CoreEvent::UnitReworkAmended {
+            session: run_id.to_string(),
+            ord,
+            amendment,
+            updated_description: unit.description.clone(),
+            scope: "member_step".to_string(),
+        },
+    );
+    dispatch_unit(
+        act.store,
+        act.subscribers,
+        act.runner,
+        act.self_tx,
+        run_id,
+        ix,
+        act.lifecycle_maps,
+        act.actor_maps,
+        act.process_gen,
+        act.is_acp,
+    )?;
+    Ok(Progress::Dispatched)
+}
+
+/// Apply the PA's review attempt of a member's step (DES-002 §8.8). The engine reads the `STEP`
+/// verdict from the output it was handed (the same line R published as `step.reviewed`) and the
+/// member's answer and any council ruling from the attempt's ledger (S's fold):
+///
+/// - ACCEPT → the step counts;
+/// - REJECT, the member held, council YES → the step counts (the rejection is dissent);
+/// - REJECT, the member took the rejection, or the council said NO → the rejection stands;
+/// - anything not on record — no `STEP` line, a failed review turn, an incomplete team record, no
+///   member answer to a rejection, a council with no verdict → a `team_dispute` pause. Nothing
+///   absent ever counts the step.
+pub(super) fn apply_review(
+    act: &mut Act<'_>,
+    mut session: AgentSession,
+    ix: usize,
+    output: &crate::workflow::StepOutput,
+    worker: Option<UnitTeamSnapshot>,
+) -> anyhow::Result<Progress> {
+    let run_id = session.id.clone();
+    let mut units = crate::domain::session_units(act.store, &run_id)?;
+    let unit = units[ix].clone();
+    let ms = unit.member_step.clone().unwrap_or_default();
+    let reviewed = ms.reviewing.unwrap_or_default();
+    let step_id = unit
+        .phase_id()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("unit-{}", unit.ord));
+    let snap = crate::team::runner::merge_snapshot(unit.team.as_ref(), worker);
+    let ledger = snap.as_ref().and_then(|s| s.ledger.clone());
+    let line = (output.status == crate::workflow::StepStatus::Ok)
+        .then(|| {
+            crate::team::parse_step_lines(&output.output)
+                .into_iter()
+                .find(|l| l.step_id == step_id)
+        })
+        .flatten();
+    let record = ledger.as_ref().and_then(|l| {
+        l.step_reviews
+            .iter()
+            .find(|r| r.step_id == step_id)
+            .cloned()
+    });
+    // The durable record of this review, whatever it comes to.
+    if let Some(l) = &line {
+        let mut rec = record.clone().unwrap_or(crate::team::StepReviewRecord {
+            step_id: step_id.clone(),
+            reviewed_attempt: reviewed,
+            verdict: l.verdict,
+            to: l.to,
+            reason: l.reason.clone(),
+            held: None,
+            member_reason: None,
+            dispute: None,
+        });
+        rec.verdict = l.verdict;
+        rec.to = l.to;
+        rec.reason = l.reason.clone();
+        let u = &mut units[ix];
+        u.member_step
+            .get_or_insert_with(Default::default)
+            .reviews
+            .push(rec);
+        put_node(act.store, u.to_node())?;
+    }
+    let pause = |act: &mut Act<'_>, session: &mut AgentSession, why: String| {
+        open_dispute(
+            act,
+            session,
+            unit.ord,
+            output.attempt,
+            crate::domain::DisputeKind::MemberStep,
+            format!(
+                "Team dispute on member step `{step_id}` (unit {}, by {}): {why}. Approve to \
+                 count the member's output, request changes to send it back to the member, or \
+                 reject to cancel.",
+                unit.ord, ms.member
+            ),
+            Vec::new(),
+        )
+    };
+    let Some(line) = line else {
+        return pause(
+            act,
+            &mut session,
+            format!(
+                "the PA's review turn gave no `STEP {step_id}: ACCEPT|REJECT` verdict (status {:?})",
+                output.status
+            ),
+        );
+    };
+    if ledger.as_ref().is_none_or(|l| l.team_pause) {
+        return pause(
+            act,
+            &mut session,
+            "the team's record of the review is incomplete".to_string(),
+        );
+    }
+    if line.verdict == crate::team::events::StepVerdict::Accepted {
+        return accept_member_step(act, &run_id, ix, None);
+    }
+    let held = record.as_ref().and_then(|r| r.held);
+    let verdict = record
+        .as_ref()
+        .and_then(|r| r.dispute.as_ref())
+        .map(|d| d.verdict);
+    match (held, verdict) {
+        (Some(true), Some(crate::team::Verdict::Yes)) => accept_member_step(
+            act,
+            &run_id,
+            ix,
+            Some(format!(
+                "council YES over the PA's rejection: {}",
+                line.reason
+            )),
+        ),
+        (Some(true), Some(crate::team::Verdict::No)) | (Some(false), _) => rework_member_step(
+            act,
+            &run_id,
+            ix,
+            line.to.unwrap_or(crate::team::events::ReworkBy::Member),
+            line.reason.clone(),
+            true,
+        ),
+        (Some(true), _) => pause(
+            act,
+            &mut session,
+            "the member held its output and the council gave no verdict".to_string(),
+        ),
+        (None, _) => pause(
+            act,
+            &mut session,
+            "the PA rejected it and the member's answer is not on record".to_string(),
+        ),
+    }
 }
 
 #[cfg(test)]

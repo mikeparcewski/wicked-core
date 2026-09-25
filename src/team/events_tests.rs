@@ -691,7 +691,7 @@ impl Stream {
                 raise_seq: seq,
                 finding_id: fid(seq),
                 member_id: "m1".into(),
-                line_key: None,
+                line_key: Some(crate::team::line_key("src/retire.ts", EVIDENCE)),
                 anchor: None,
                 anchor_source: None,
                 severity: tok(severity),
@@ -703,6 +703,7 @@ impl Stream {
                 tree: "t1".into(),
                 in_diff: true,
                 corroborated_by: vec![],
+                carried_from_attempt: None,
             }),
         )
     }
@@ -1278,6 +1279,7 @@ fn fold_is_idempotent_under_duplicates_and_order() {
             findings: vec![],
             rejected: Default::default(),
             team_pause: true,
+            step_reviews: vec![],
         }
     );
 }
@@ -1797,7 +1799,11 @@ fn a_folded_ledger_claiming_unpaused_deserializes_paused() {
 
 #[test]
 fn a_forged_finding_id_is_recomputed_from_path_and_evidence() {
-    let real = crate::team::finding_id("src/retire.ts", "fetchCoverage(scope).then(setCount)");
+    let real = crate::team::finding_id_anchored(
+        "src/retire.ts",
+        "",
+        "fetchCoverage(scope).then(setCount)",
+    );
     assert_eq!(real, "f-7bf84000911d564c");
     let mut p = fixture(FINDING_RAISED);
     p["finding_id"] = json!("f-forged");

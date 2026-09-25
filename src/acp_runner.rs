@@ -3919,22 +3919,17 @@ fn exec_turn_acp_posture(
     tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
     posture: Option<&AcpWritePosture>,
-    // DES-TEAMING-001 §4.2/§5.2: the unit's team context — `Some` for a worker unit turn (its S3
-    // steer mailbox and re-confirmation root); a TEAMED one also emits `unitCheckpoint` at each
-    // terminal tool call. Chat turns, monitor turns and the engine's own sessions pass `None`.
+    // DES-TEAMING-002 §4.2/§8.9: the unit's team context — `Some` for a worker unit turn (its
+    // steer point and re-confirmation root); a TEAMED one also publishes `checkpoint.reached` at
+    // each terminal tool call. Chat turns, member turns and the engine's own sessions pass `None`.
     team: Option<&crate::team::TeamTurn>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
 
-    // DES-TEAMING-001 §5.2 (S3): a teamed turn on a steering-capable process can take HIGH
-    // advice at each terminal `tool_call_update`. Say so on the attempt's record, so advice still
-    // queued when the turn ends is disclosed as "turn ended before a boundary", not "no channel".
-    if let Some(t) = team.filter(|_| proc.steering_supported) {
-        t.mailbox.mark_steering_channel(&t.key);
-    }
-    // Steering requests in flight: request id → the finding ids it carried.
-    let mut pending_steers: HashMap<u64, Vec<String>> = HashMap::new();
+    // Steering requests in flight: request id → the steer id and the `(raise_seq, finding_id)`s
+    // it carried (DES-002 §8.9).
+    let mut pending_steers: HashMap<u64, Steer> = HashMap::new();
 
     // Clone the write_lock Arc so we can hold it around each proc.stdin write without
     // borrowing proc for the whole function. shared_run_terminal's try_lock() must see
@@ -4447,24 +4442,24 @@ fn exec_turn_acp_posture(
                                 MAX_OUT,
                                 &mut answer_from,
                             );
-                            // DES-TEAMING-001 S2: a teamed unit's terminal tool call is a
-                            // semantic checkpoint — the monitor supervisor paces its batches on it.
-                            if let Some(ev) = team.and_then(|t| t.observe(&v)) {
-                                let _ = tx.send(Command::EmitEvent(ev));
+                            // DES-TEAMING-002 §6 #10: a teamed unit's terminal tool call is a
+                            // semantic checkpoint (`checkpoint.reached`, R) — the supervisor paces
+                            // its members' batches on it.
+                            if let Some(t) = team {
+                                if let Some(ev) = t.observe(&v) {
+                                    t.publish(&ev);
+                                }
                             }
                             // DES-TEAMING-001 §5.2: the delivery point — the same boundary the
                             // checkpoint is emitted at. ONLY this main arm drains — the `'elicit`
                             // sub-loop's does not, so advice waits while the worker waits on a
                             // human.
                             if let Some(t) = team {
-                                if proc.steering_supported && is_terminal_tool_call_update(&v) {
-                                    steer_at_boundary(
-                                        proc,
-                                        &write_lock,
-                                        t,
-                                        tx,
-                                        &mut pending_steers,
-                                    );
+                                if proc.steering_supported
+                                    && t.teamed()
+                                    && is_terminal_tool_call_update(&v)
+                                {
+                                    steer_at_boundary(proc, &write_lock, t, &mut pending_steers);
                                 }
                             }
                         }
@@ -4544,13 +4539,13 @@ fn exec_turn_acp_posture(
                 }
                 // A response to some OTHER outbound id. The one kind this loop waits on is the
                 // answer to a steering request it sent (DES-TEAMING-001 §5.2).
-                if let (Some(t), Some(ids)) = (
+                if let (Some(t), Some(steer)) = (
                     team,
                     v.get("id")
                         .and_then(Value::as_u64)
                         .and_then(|rid| pending_steers.remove(&rid)),
                 ) {
-                    resolve_steer(t, &v, ids, tx);
+                    resolve_steer(t, &v, steer);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'exec,
@@ -4561,7 +4556,7 @@ fn exec_turn_acp_posture(
     // A steer still unanswered when the turn ended: give the adapter a short grace to answer it
     // (a clean end only — a dead or timed-out bridge will not), then disclose what is left.
     if let Some(t) = team {
-        settle_pending_steers(proc, t, tx, &mut pending_steers, found);
+        settle_pending_steers(proc, t, &mut pending_steers, found);
     }
 
     // No `stopReason` and no timeout means the bridge stopped answering — it died mid-turn. Its
@@ -4896,65 +4891,59 @@ fn is_terminal_tool_call_update(v: &Value) -> bool {
         && matches!(update["status"].as_str(), Some("completed" | "failed"))
 }
 
-/// The delivery point (DES-TEAMING-001 §5.2). Drains ALL advice queued for this attempt, drops any
-/// finding whose evidence text is gone from a fresh snapshot (`superseded`), and sends what is
-/// left as ONE `_session/steering` request carrying `idleBehavior: "promptRequired"`. The caller
-/// has checked `proc.steering_supported`; a process that never advertised steering never gets here.
+/// One steering request in flight: its steer id and what it carried.
+struct Steer {
+    steer_id: String,
+    carried: Vec<(u32, String)>,
+}
+
+/// The delivery point (DES-TEAMING-002 §8.9; DES-001 §5.2's request, unchanged). Its source is a
+/// poll of this attempt's `finding.raised{severity:"high"}` rows after its own `step.claimed`,
+/// minus what this turn already offered. A finding whose evidence text is gone from a fresh
+/// snapshot is not sent (the supervisor's final pass supersedes it); what is left rides ONE
+/// `_session/steering` request carrying `idleBehavior: "promptRequired"`. The caller has checked
+/// `proc.steering_supported`; a process that never advertised steering never gets here.
 fn steer_at_boundary(
     proc: &mut AcpProcess,
     write_lock: &Arc<Mutex<()>>,
     team: &crate::team::TeamTurn,
-    tx: &std::sync::mpsc::Sender<Command>,
-    pending: &mut HashMap<u64, Vec<String>>,
+    pending: &mut HashMap<u64, Steer>,
 ) {
-    use crate::team::{Delivery, Severity, SteerOutcome, CARRIER_ACP_STEERING};
-    let key = &team.key;
-    let emit = |ev: CoreEvent| {
-        let _ = tx.send(Command::EmitEvent(ev));
-    };
-    // Only HIGH is ever steered (the mailbox already refuses the rest; this is the second lock).
-    let advice: Vec<crate::team::Advice> = team
-        .mailbox
-        .take_queued(key)
-        .into_iter()
-        .filter(|a| a.finding.severity == Severity::High)
-        .collect();
+    use crate::team::events::DeliveryOutcome;
+    let advice: Vec<(u32, crate::team::Finding)> = team.pending_high();
     if advice.is_empty() {
         return;
     }
-    let not_delivered = |ids: Vec<String>, detail: String| {
-        for id in &ids {
-            team.mailbox.record(
-                key,
-                id,
-                Delivery::NotDelivered {
-                    detail: detail.clone(),
-                },
-            );
-        }
-        emit(crate::team::advice_delivered(
-            key,
-            ids,
-            CARRIER_ACP_STEERING,
-            SteerOutcome::NotDelivered,
+    for (seq, _) in &advice {
+        team.mark_offered(*seq);
+    }
+    let not_delivered = |carried: Vec<(u32, String)>, detail: String| {
+        let steer_id = team.next_steer_id();
+        team.steered(
+            &steer_id,
+            &carried,
+            DeliveryOutcome::NotDelivered,
             Some(detail),
-        ));
+        );
+    };
+    let ids = |a: &[(u32, crate::team::Finding)]| -> Vec<(u32, String)> {
+        a.iter().map(|(s, f)| (*s, f.finding_id.clone())).collect()
     };
     // Re-confirm against a FRESH snapshot: the premature-finding guard at the moment of delivery.
     let Some((worktree, git_dir)) = team.confirm_root.as_ref() else {
         not_delivered(
-            advice.into_iter().map(|a| a.finding.finding_id).collect(),
+            ids(&advice),
             "no worktree baseline to re-confirm the finding against; the finding goes to the gate"
                 .to_string(),
         );
         return;
     };
-    let refs: Vec<&crate::team::Finding> = advice.iter().map(|a| &a.finding).collect();
+    let refs: Vec<&crate::team::Finding> = advice.iter().map(|(_, f)| f).collect();
     let present = match crate::team::evidence_still_present(worktree, git_dir, &refs) {
         Ok(p) => p,
         Err(e) => {
             not_delivered(
-                advice.into_iter().map(|a| a.finding.finding_id).collect(),
+                ids(&advice),
                 crate::team::cap_utf8(
                     &format!(
                         "could not re-confirm against a fresh snapshot ({e}); the finding goes \
@@ -4966,21 +4955,36 @@ fn steer_at_boundary(
             return;
         }
     };
-    let mut live = Vec::new();
-    for (a, ok) in advice.into_iter().zip(present) {
-        if ok {
-            live.push(a);
-        } else {
-            team.mailbox
-                .record(key, &a.finding.finding_id, Delivery::Superseded);
-        }
-    }
+    let live: Vec<(u32, crate::team::Finding)> = advice
+        .into_iter()
+        .zip(present)
+        .filter_map(|(a, ok)| ok.then_some(a))
+        .collect();
     if live.is_empty() {
         return;
     }
-    let (text, sent, rest) = crate::team::advice_block(live);
-    team.mailbox.requeue_front(key, rest);
-    let ids: Vec<String> = sent.into_iter().map(|a| a.finding.finding_id).collect();
+    let (text, sent, rest) = crate::team::advice_block(
+        live.iter()
+            .map(|(_, f)| crate::team::Advice { finding: f.clone() })
+            .collect(),
+    );
+    // What did not fit the 8 KB block is offered again at the next boundary.
+    for a in &rest {
+        if let Some((seq, _)) = live
+            .iter()
+            .find(|(_, f)| f.finding_id == a.finding.finding_id)
+        {
+            team.unmark_offered(*seq);
+        }
+    }
+    let carried: Vec<(u32, String)> = sent
+        .iter()
+        .filter_map(|a| {
+            live.iter()
+                .find(|(_, f)| f.finding_id == a.finding.finding_id)
+                .map(|(seq, f)| (*seq, f.finding_id.clone()))
+        })
+        .collect();
     let rid = proc.next_id;
     proc.next_id += 1;
     let written = {
@@ -4994,10 +4998,16 @@ fn steer_at_boundary(
     };
     match written {
         Ok(()) => {
-            pending.insert(rid, ids);
+            pending.insert(
+                rid,
+                Steer {
+                    steer_id: team.next_steer_id(),
+                    carried,
+                },
+            );
         }
         Err(e) => not_delivered(
-            ids,
+            carried,
             crate::team::cap_utf8(
                 &format!("the steering request could not be written ({e})"),
                 crate::team::DETAIL_CAP,
@@ -5006,40 +5016,11 @@ fn steer_at_boundary(
     }
 }
 
-/// The adapter answered a steering request (DES-TEAMING-001 §5.2): one `adviceDelivered`, and the
-/// findings it carried recorded `injected` or not delivered. A refusal never ends the turn.
-fn resolve_steer(
-    team: &crate::team::TeamTurn,
-    v: &Value,
-    ids: Vec<String>,
-    tx: &std::sync::mpsc::Sender<Command>,
-) {
-    use crate::team::{Delivery, SteerOutcome};
+/// The adapter answered a steering request (DES-001 §5.2): one `advice.delivered` row per
+/// finding it carried, sharing the steer's id. A refusal never ends the turn.
+fn resolve_steer(team: &crate::team::TeamTurn, v: &Value, steer: Steer) {
     let (outcome, detail) = crate::team::classify_steer_answer(v);
-    for id in &ids {
-        let delivery = if outcome == SteerOutcome::Injected {
-            Delivery::Injected
-        } else {
-            Delivery::NotDelivered {
-                detail: format!(
-                    "steer {}{}",
-                    outcome.as_str(),
-                    detail
-                        .as_deref()
-                        .map(|d| format!(": {d}"))
-                        .unwrap_or_default()
-                ),
-            }
-        };
-        team.mailbox.record(&team.key, id, delivery);
-    }
-    let _ = tx.send(Command::EmitEvent(crate::team::advice_delivered(
-        &team.key,
-        ids,
-        crate::team::CARRIER_ACP_STEERING,
-        outcome,
-        detail,
-    )));
+    team.steered(&steer.steer_id, &steer.carried, outcome, detail);
 }
 
 /// Steering requests still unanswered when the turn loop ended. After a CLEAN end the adapter is
@@ -5049,8 +5030,7 @@ fn resolve_steer(
 fn settle_pending_steers(
     proc: &mut AcpProcess,
     team: &crate::team::TeamTurn,
-    tx: &std::sync::mpsc::Sender<Command>,
-    pending: &mut HashMap<u64, Vec<String>>,
+    pending: &mut HashMap<u64, Steer>,
     clean_end: bool,
 ) {
     if clean_end {
@@ -5068,34 +5048,24 @@ fn settle_pending_steers(
             if agent_method(&v).is_some() {
                 continue;
             }
-            if let Some(ids) = v
+            if let Some(steer) = v
                 .get("id")
                 .and_then(Value::as_u64)
                 .and_then(|rid| pending.remove(&rid))
             {
-                resolve_steer(team, &v, ids, tx);
+                resolve_steer(team, &v, steer);
             }
         }
     }
     let detail =
         "the turn ended with the steering request unanswered; the finding goes to the gate";
-    for (_, ids) in pending.drain() {
-        for id in &ids {
-            team.mailbox.record(
-                &team.key,
-                id,
-                crate::team::Delivery::NotDelivered {
-                    detail: detail.to_string(),
-                },
-            );
-        }
-        let _ = tx.send(Command::EmitEvent(crate::team::advice_delivered(
-            &team.key,
-            ids,
-            crate::team::CARRIER_ACP_STEERING,
-            crate::team::SteerOutcome::TurnEnded,
+    for (_, steer) in pending.drain() {
+        team.steered(
+            &steer.steer_id,
+            &steer.carried,
+            crate::team::events::DeliveryOutcome::TurnEnded,
             Some(detail.to_string()),
-        )));
+        );
     }
 }
 
@@ -5546,10 +5516,6 @@ pub struct AcpStepRunner {
     /// (the ACP inject path — there is no PTY to write into mid-turn). Keyed by run_id;
     /// drained in [`AcpStepRunner::exec_turn`], pruned with the run's sessions.
     pending_injects: InjectQueue,
-    /// HIGH monitor advice waiting for the next tool-call boundary of its attempt
-    /// (DES-TEAMING-001 §5.2). Written by the team supervisor (S2, #601), drained by the ACP turn
-    /// loop, swept at the end of every attempt's turn ([`crate::team::finish_attempt`]).
-    steer_mailbox: crate::team::SteerMailbox,
     /// (F-7R2-019) Session keys whose startup failed on authentication — see [`AuthFailedSessions`].
     auth_failed: AuthFailedSessions,
     /// Last activity per CHAT id — set on open, on every ensure, and on every turn.
@@ -5583,11 +5549,10 @@ pub struct AcpStepRunner {
     /// `team:<run>:<ord>:<attempt>:<monitorId>`. Kept apart from `sessions` so no chat surface
     /// (enumerate, reaper, `ChatDelta`) ever sees a monitor.
     monitors: Arc<Mutex<HashMap<String, Arc<Mutex<AcpProcess>>>>>,
-    /// The team supervisor, installed by `spawn_with_acp_sessions`; `None` elsewhere (no unit is
-    /// teamed without it).
-    team: std::sync::OnceLock<crate::team::TeamHandle>,
-    /// Per-`(run, ord)` team plans — the plain parameter S4/S5 replace (DES §8).
-    team_plans: Arc<Mutex<HashMap<(String, u32), crate::team::TeamPlan>>>,
+    /// (DES-TEAMING-002 T6) The carrier's handle on team publishing — the engine's bus and team
+    /// outbox — installed by `spawn_with_acp_sessions`. A teamed attempt's turn publishes its
+    /// `checkpoint.reached` and steer rows through it; `None` = no turn is teamed on this runner.
+    team_runner: std::sync::OnceLock<crate::team::runner::TeamRunner>,
 }
 
 /// Why a chat's warm sessions were released — carried on `ChatClosed` so an operator can tell a
@@ -5919,7 +5884,6 @@ impl AcpStepRunner {
             tx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
-            steer_mailbox: crate::team::SteerMailbox::default(),
             auth_failed: Arc::new(Mutex::new(HashSet::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             chat_scopes: Arc::new(Mutex::new(HashMap::new())),
@@ -5929,8 +5893,7 @@ impl AcpStepRunner {
             elicitation_maps,
             write_reg,
             monitors: Arc::new(Mutex::new(HashMap::new())),
-            team: std::sync::OnceLock::new(),
-            team_plans: Arc::new(Mutex::new(HashMap::new())),
+            team_runner: std::sync::OnceLock::new(),
         }
     }
 
@@ -5942,15 +5905,6 @@ impl AcpStepRunner {
 
     fn emit_event(&self, ev: CoreEvent) {
         let _ = self.tx.send(Command::EmitEvent(ev));
-    }
-
-    /// The steer mailbox handle the team supervisor writes HIGH advice into (DES-TEAMING-001
-    /// §5.2). Cloning shares the one mailbox.
-    // Taken by S2's supervisor in `spawn_with_acp_sessions` (#601); until it lands only the unix
-    // carrier tests do.
-    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
-    pub(crate) fn steer_mailbox(&self) -> crate::team::SteerMailbox {
-        self.steer_mailbox.clone()
     }
 
     // ── Chat sessions (crew#165 / core#13) ──────────────────────────────────────
@@ -6880,21 +6834,9 @@ impl AcpStepRunner {
             in_flight_reason: None,
         });
 
+        // DES-TEAMING-002: the worker's `ADVICE` / `HELP:` / `STEP` lines are read by the worker
+        // thread's seam (`team::runner::complete`), on every carrier, after this returns.
         let output = self.exec_turn_inner(input, emit);
-
-        // DES-TEAMING-001 §5.1/§5.3 (S3): on EVERY carrier this unit may have landed on — ACP,
-        // or the wrapped fallback — advice still queued did not reach the worker mid-turn and is
-        // disclosed as such; a successful turn's `ADVICE` lines answer the delivered findings.
-        // The engine's own judge/triage sessions share the unit's key but are not the worker.
-        if !crate::execute_wrapped::is_engine_internal(&input.unit) {
-            for ev in crate::team::finish_attempt(
-                &self.steer_mailbox,
-                &(input.run_id.clone(), input.unit.ord, input.attempt),
-                (output.status == StepStatus::Ok).then_some(output.output.as_str()),
-            ) {
-                self.emit_event(ev);
-            }
-        }
 
         // On a normal bus-worker return, publication owns the in-flight marker until
         // `task.completed` is durable. A panic never reaches this assignment, so Drop
@@ -7800,9 +7742,8 @@ impl AcpStepRunner {
                 ),
             }
         }
-        // DES-TEAMING-001 §4.2/§5.2: the turn's team context; a teamed unit's supervisor attaches
-        // at turn start.
-        let team_turn = self.team_attach(input, &cli_key);
+        // DES-TEAMING-002 §4.2: the turn's team context (a claimed attempt publishes its checkpoints).
+        let team_turn = self.team_attach(input);
         let turn = exec_turn_acp_posture(
             &mut proc,
             &prompt,
@@ -7997,12 +7938,12 @@ impl AcpStepRunner {
     }
 }
 
-// ── DES-TEAMING-001 S2 (#601): the monitor subscription's carrier half ───────────────────────────
+// ── DES-TEAMING-002 T6: the team's carrier half ──────────────────────────────────────────────────
 //
-// `team_attach` (turn start) and `team_finish` (the worker thread, after the turn) are the two
-// seams the supervisor is driven through; `monitor_ensure`/`monitor_turn` run a monitor as a warm,
-// READ-ONLY ACP session beside the chat machinery, judged by the chat boundary, emitting no chat
-// events. Nothing here injects into the worker (S3) or reaches the gate (S6).
+// `team_attach` (turn start) gives a claimed attempt its checkpoint and steer point; the
+// supervisor (`team::supervisor`, on the bus) runs its members through `monitor_ensure` /
+// `monitor_turn`: warm, READ-ONLY ACP sessions beside the chat machinery, judged by the chat
+// boundary, emitting no chat events.
 
 /// Why `seat` cannot be a monitor, or its launch facts (DES §4.1 (b)): the seat must have an ACP
 /// adapter on stdio that is ADMITTED to input governance — the read-only boundary is enforced by
@@ -8057,75 +7998,18 @@ fn chat_scope_of(scope: &crate::team::MonitorScope) -> ChatScope {
 }
 
 impl AcpStepRunner {
-    /// Install the team supervisor (`spawn_with_acp_sessions`). Once.
-    pub(crate) fn install_team(&self, handle: crate::team::TeamHandle) {
-        let _ = self.team.set(handle);
+    /// Install the carrier's team publishing handle (`spawn_with_acp_sessions`). Once.
+    pub(crate) fn install_team_runner(&self, runner: crate::team::runner::TeamRunner) {
+        let _ = self.team_runner.set(runner);
     }
 
-    /// Team unit `ord` of `run_id` with `plan` (DES §8). A PLAIN PARAMETER: S4's policy (the
-    /// monitor count) and S5's `RoutingInfo::Teamed` (the candidates) replace this caller, not the
-    /// supervisor. A unit with no plan is not teamed: it emits no checkpoint and gets no monitor.
-    pub fn set_team_plan(&self, run_id: &str, ord: u32, plan: crate::team::TeamPlan) {
-        self.team_plans
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert((run_id.to_string(), ord), plan);
-    }
-
-    /// The attempt's `TeamCmd::Attach` context, when the unit is teamed and a supervisor runs.
-    fn team_ctx(&self, input: &StepInput, creator: &str) -> Option<crate::team::AttachCtx> {
-        self.team.get()?;
-        let plan = self
-            .team_plans
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&(input.run_id.clone(), input.unit.ord))
-            .cloned()?;
-        let baseline = input.unit.worktree_baseline.as_ref();
-        let repo = match (
-            input.workdir.as_ref(),
-            baseline.and_then(|b| b.git_dir.as_deref()),
-        ) {
-            (Some(w), Some(g)) => Some(crate::team::Repo {
-                workdir: w.clone(),
-                git_dir: std::path::PathBuf::from(g),
-            }),
-            _ => None,
-        };
-        Some(crate::team::AttachCtx {
-            run_id: input.run_id.clone(),
-            ord: input.unit.ord,
-            attempt: input.attempt,
-            creator: creator.to_string(),
-            plan,
-            repo,
-            baseline_tree: baseline.map(|b| b.tree.clone()),
-            criterion: input.unit.description.clone(),
-            phase: input.unit.phase_id().unwrap_or("?").to_string(),
-            code_graph_db: input
-                .governance
-                .as_ref()
-                .and_then(|g| g.code_graph_db.clone()),
-        })
-    }
-
-    /// Turn start (DES §4.2, §5.2): the turn's team context. For a TEAMED unit (a plan names
-    /// monitors and a supervisor runs) `TeamCmd::Attach` is sent first and the context is
-    /// `teamed`, so the carrier emits `unitCheckpoint`; every other worker unit still gets its
-    /// context — the S3 mailbox and re-confirmation root — but checkpoints nothing. `None` for the
+    /// Turn start (DES-002 §4.2, §8.9): the turn's team context. A TEAMED attempt (its
+    /// `step.claimed` is on the bus: the worker thread stamped its event id on the unit's
+    /// snapshot) publishes `checkpoint.reached` and takes steers; every other worker unit still
+    /// gets a context (and the re-confirmation root) but checkpoints nothing. `None` for the
     /// engine's own judge/triage sessions: they share the unit's key but are not the worker.
-    fn team_attach(&self, input: &StepInput, creator: &str) -> Option<crate::team::TeamTurn> {
-        if crate::execute_wrapped::is_engine_internal(&input.unit) {
-            return None;
-        }
-        let teamed = match (self.team_ctx(input, creator), self.team.get()) {
-            (Some(ctx), Some(team)) => {
-                team.send(crate::team::TeamCmd::Attach(ctx));
-                true
-            }
-            _ => false,
-        };
-        crate::team::TeamTurn::for_unit(input, &self.steer_mailbox, teamed)
+    fn team_attach(&self, input: &StepInput) -> Option<crate::team::TeamTurn> {
+        crate::team::TeamTurn::for_unit(input, self.team_runner.get())
     }
 
     /// Warm (or return) monitor session `pool_key` on seat instance `seat`, READ-ONLY over
@@ -8345,20 +8229,6 @@ impl StepRunner for AcpStepRunner {
         self.exec_turn(input, &noop)
     }
 
-    /// DES-TEAMING-001 §4.7: the attempt's final pass, bounded by `FINAL_PASS_BUDGET`. `None` for
-    /// a unit that is not teamed.
-    fn team_finish(
-        &self,
-        input: &StepInput,
-        output: &StepOutput,
-    ) -> Option<crate::team::TeamLedger> {
-        let creator = input.unit.assigned_cli.as_deref().unwrap_or("claude");
-        let ctx = self.team_ctx(input, creator)?;
-        self.team
-            .get()?
-            .finish(ctx, output.status == StepStatus::Ok)
-    }
-
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec_turn(input, emit)
     }
@@ -8370,16 +8240,9 @@ impl StepRunner for AcpStepRunner {
     /// `wait()` on the child process, which blocks. Doing that on the actor thread would stall
     /// the entire actor while waiting for the subprocess to exit.
     fn on_run_complete(&self, run_id: &str) {
-        self.steer_mailbox.prune_run(run_id);
-        // DES-TEAMING-001 S2: the run's monitors close with it (off this thread).
-        if let Some(team) = self.team.get() {
-            team.send(crate::team::TeamCmd::RunComplete(run_id.to_string()));
-        }
+        // DES-TEAMING-002: the run's member sessions close with it (off this thread); the
+        // supervisor forgets the run on its `path.ended` row.
         self.monitors_close_run(run_id);
-        self.team_plans
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|(r, _), _| r != run_id);
         // crew#277: in-flight WRAPPED workers (the fallback path every non-ACP CLI takes) must
         // die with the run too — a canceled run's hung `copilot -p` survived ~90 minutes because
         // only ACP sessions had kill handles.
@@ -15564,6 +15427,7 @@ No further next steps — both questions fully answered.";
             pre_build_scope: false,
             team_run: false,
             team: None,
+            member_step: None,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
             worktree_baseline: None,
@@ -21038,50 +20902,84 @@ while True:
         .expect("turn runs")
     }
 
-    fn checkpoints(rx: &std::sync::mpsc::Receiver<Command>) -> Vec<CoreEvent> {
-        rx.try_iter()
-            .filter_map(|c| match c {
-                Command::EmitEvent(ev @ CoreEvent::UnitCheckpoint { .. }) => Some(ev),
-                _ => None,
+    /// The `checkpoint.reached` rows of `run-1` on `rig`: `(seq, tool_call_id, kind, title,
+    /// status, paths)`.
+    fn checkpoints(
+        rig: &crate::team::publish::tests::Rig,
+    ) -> Vec<(u64, String, String, String, String, Vec<String>)> {
+        crate::bus::BusDb::shared(&rig.bus)
+            .unwrap()
+            .poll(crate::team::events::CHECKPOINT_REACHED, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| {
+                let p = e.payload;
+                let s = |k: &str| p[k].as_str().unwrap_or_default().to_string();
+                (
+                    p["seq"].as_u64().unwrap(),
+                    s("tool_call_id"),
+                    s("kind"),
+                    s("title"),
+                    s("status"),
+                    p["paths"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect(),
+                )
             })
             .collect()
     }
 
-    /// DES §12-1: a teamed unit whose bridge sends `tool_call` (kind `edit`), a non-terminal
-    /// update, three message chunks and the terminal `completed` update emits EXACTLY ONE
-    /// `unitCheckpoint` with that kind, title and (repo-relative) path. The same turn on a
-    /// non-teamed unit emits none.
+    /// DES-002 §6 #10 (DES-001 §12-1 on rows): a CLAIMED attempt whose bridge sends `tool_call`
+    /// (kind `edit`), a non-terminal update, three message chunks and the terminal `completed`
+    /// update publishes EXACTLY ONE `checkpoint.reached` with that kind, title and (repo-relative)
+    /// path. The same turn on an unclaimed unit publishes none.
     #[test]
-    fn a_teamed_acp_unit_emits_one_checkpoint_per_terminal_tool_call_and_a_plain_one_none() {
+    fn a_claimed_acp_unit_publishes_one_checkpoint_per_terminal_tool_call_and_a_plain_one_none() {
         let dir = scratch("checkpoint");
+        let rig = crate::team::publish::tests::rig("acp-checkpoint");
         let target = dir.join("src").join("a.rs");
         let config = bridge(&dir, "tool_edit", &[&target.to_string_lossy()]);
         let mut proc = start(&config, &dir);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = crate::team::runner::TeamRunner::from_config(
+            &crate::team::publish::TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+                .with_attempt_wait(Duration::from_millis(30)),
+        )
+        .unwrap();
         let team = crate::team::TeamTurn::new(
             ("run-1".into(), 3, 1),
-            crate::team::SteerMailbox::default(),
+            Some(crate::team::TurnClaim {
+                runner,
+                claimed_id: 1,
+                by: "claude#1".into(),
+            }),
             None,
             Some(dir.clone()),
-            true,
         );
         let _ = turn(&mut proc, &tx, Some(&team));
         assert_eq!(
-            checkpoints(&rx),
-            vec![CoreEvent::UnitCheckpoint {
-                session: "run-1".into(),
-                ord: 3,
-                attempt: 1,
-                seq: 1,
-                tool_call_id: "toolu_A".into(),
-                kind: "edit".into(),
-                title: "Edit src/a.rs".into(),
-                status: "completed".into(),
-                paths: vec!["src/a.rs".into()],
-            }]
+            checkpoints(&rig),
+            vec![(
+                1,
+                "toolu_A".to_string(),
+                "edit".to_string(),
+                "Edit src/a.rs".to_string(),
+                "completed".to_string(),
+                vec!["src/a.rs".to_string()]
+            )]
         );
+        let unclaimed =
+            crate::team::TeamTurn::new(("run-1".into(), 3, 2), None, None, Some(dir.clone()));
+        let _ = turn(&mut proc, &tx, Some(&unclaimed));
         let _ = turn(&mut proc, &tx, None);
-        assert_eq!(checkpoints(&rx), vec![], "a non-teamed unit emits none");
+        assert_eq!(
+            checkpoints(&rig).len(),
+            1,
+            "an unclaimed unit publishes none"
+        );
         drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
     }

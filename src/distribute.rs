@@ -455,6 +455,60 @@ pub(crate) fn distribute_units_against_benched(
         }
         .into());
     }
+    // (DES-TEAMING-002 §8.8, seam T6) A member's step (`owner: team`) of a team run runs on a
+    // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
+    // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
+    // refused, never quietly handed back to the PA (team runs never fall back to one seat).
+    // T6 RED: member steps are not placed yet.
+    if team_run && session_id.is_empty() {
+        let pa = clis.first().map(|c| c.key.clone());
+        let mut stranded: Vec<u32> = Vec::new();
+        for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
+            let Some(pa) = pa.as_deref() else {
+                break;
+            };
+            if u.tool_cmd.is_some()
+                || u.owner != crate::workflow::StepOwner::Team
+                || d.assigned_cli != pa
+            {
+                continue;
+            }
+            let admits = |k: &&String| {
+                k.as_str() != pa
+                    && match cands {
+                        Some((eligible, _)) => eligible.iter().any(|c| &c.key == *k),
+                        None => true,
+                    }
+            };
+            let pick = still_eligible
+                .iter()
+                .filter(admits)
+                .find(|k| model_of(k) != model_of(pa))
+                .or_else(|| still_eligible.iter().find(admits))
+                .cloned();
+            match pick {
+                Some(k) => {
+                    d.assigned_invocation = invocation_of(clis, &k);
+                    d.routing = RoutingInfo::Teamed { winner: k.clone() };
+                    d.assigned_cli = k;
+                }
+                None => stranded.push(u.ord),
+            }
+        }
+        if !stranded.is_empty() {
+            return Err(crate::NoEligibleSeat {
+                run_id: session_id.to_string(),
+                benched: format!(
+                    "member step(s) {stranded:?} of a team run need a seat distinct from the PA \
+                     ({}); add a signed-in {} to the roster",
+                    pa.clone().unwrap_or_default(),
+                    next_instance_key(configured, model_of(pa.as_deref().unwrap_or("claude")))
+                ),
+                benched_seats: benched.clone(),
+            }
+            .into());
+        }
+    }
     // (F-7R2-006 rule 4) `degradedReason` on EVERY unit whenever eligible < configured. The
     // evaluator≠creator fallback is a FIELD (core#461, core#591): `creator_seat` for a
     // review/test unit left on a seat that built what it checks (necessarily on a BENCH-FREE
