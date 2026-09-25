@@ -549,7 +549,17 @@ pub enum PlanRefusal {
     /// An evaluator with no explicit `depends_on` has no creator before it but one after it: it
     /// would run before the work it evaluates. Refused, never reordered.
     EvaluatorPrecedesCreator { step: String, creator: String },
+    /// The id `deliver` is RESERVED for the one `deliver` step (codex round 6 on #622): the
+    /// engine's deliver protections — the human deliver gate and the lift + re-verify
+    /// (`deliver_lift::is_deliver_unit`) — key on the phase id, so a `deliver` step under another
+    /// id, or another step under `deliver`, would push or skip them unseen.
+    DeliverIdReserved { step: String, catalog: String },
+    /// More than one `deliver` step: a plan delivers once.
+    DeliverDuplicate { step: String },
 }
+
+/// The phase id the engine's deliver protections key on (`deliver_lift::DELIVER_PHASE_ID`).
+const DELIVER_ID: &str = "deliver";
 
 impl PlanRefusal {
     /// The stable reason token (what a caller, the studio, or a test matches on).
@@ -576,6 +586,8 @@ impl PlanRefusal {
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
             PlanRefusal::ProvenanceSupplied { .. } => "provenance_supplied",
             PlanRefusal::EvaluatorPrecedesCreator { .. } => "evaluator_precedes_creator",
+            PlanRefusal::DeliverIdReserved { .. } => "deliver_id_reserved",
+            PlanRefusal::DeliverDuplicate { .. } => "deliver_duplicate",
         }
     }
 }
@@ -677,6 +689,16 @@ impl std::fmt::Display for PlanRefusal {
                 "{r}: {step} evaluates work that is produced later ({creator}); move it after \
                  the creator"
             ),
+            PlanRefusal::DeliverIdReserved { step, catalog } => write!(
+                f,
+                "{r}: step {step} ({catalog}) — the id `deliver` belongs to the one `deliver` \
+                 step (the deliver gate and the lift key on it): name the deliver step \
+                 `deliver`, and no other step `deliver`"
+            ),
+            PlanRefusal::DeliverDuplicate { step } => write!(
+                f,
+                "{r}: step {step} is a second `deliver` step — a plan delivers once"
+            ),
         }
     }
 }
@@ -758,6 +780,24 @@ pub fn compose(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
 ) -> Result<WorkflowDef, PlanRefusal> {
+    // The reserved deliver id, one rule for every plan (user, preset, gate edit, re-plan):
+    // at most one `deliver` step, it is id `deliver`, and no other step takes the id.
+    let mut delivers = plan.steps.iter().filter(|s| s.catalog == DELIVER_ID);
+    if let (Some(_), Some(second)) = (delivers.next(), delivers.next()) {
+        return Err(PlanRefusal::DeliverDuplicate {
+            step: second.id.clone(),
+        });
+    }
+    if let Some(s) = plan
+        .steps
+        .iter()
+        .find(|s| (s.catalog == DELIVER_ID) != (s.id == DELIVER_ID))
+    {
+        return Err(PlanRefusal::DeliverIdReserved {
+            step: s.id.clone(),
+            catalog: s.catalog.clone(),
+        });
+    }
     let mut phases = Vec::with_capacity(plan.steps.len());
     for (i, step) in plan.steps.iter().enumerate() {
         let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
@@ -1981,7 +2021,7 @@ mod tests {
                 {"catalog": "produce", "id": "b"},
                 {"catalog": "test", "id": "test"},
                 {"catalog": "security_review", "id": "sec"},
-                {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": ["d"]}}
+                {"catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["d"]}}
             ]})),
             [
                 ("design".to_string(), s(&[])),
@@ -1989,7 +2029,7 @@ mod tests {
                 ("b".to_string(), s(&[])),
                 ("test".to_string(), s(&["a", "b"])),
                 ("sec".to_string(), s(&["a", "b"])),
-                ("ship".to_string(), s(&["sec"])),
+                ("deliver".to_string(), s(&["sec"])),
             ]
         );
         // domain_coverage is an evaluator: it depends on the produce step before it.
@@ -2285,7 +2325,7 @@ mod tests {
                 {"catalog": "build", "id": "build"},
                 {"catalog": "review", "id": "review"},
                 {"catalog": "review", "id": "review-2"},
-                {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": cmd}}
+                {"catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": cmd}}
             ]}));
             let f = fill(&p, 30, &AUTO, Some(&cmd)).unwrap();
             let mut want = p.clone();
@@ -2293,7 +2333,7 @@ mod tests {
                 s.added_by = Some(AddedBy::Plan);
             }
             assert_eq!(f.steps, want);
-            assert_eq!(phase_ids(&f), ["build", "review", "review-2", "ship"]);
+            assert_eq!(phase_ids(&f), ["build", "review", "review-2", "deliver"]);
             assert_eq!(f.def, compose(crate::catalog::catalog(), &p).unwrap());
         }
 

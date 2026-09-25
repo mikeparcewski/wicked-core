@@ -251,15 +251,31 @@ pub(crate) fn check_deliver_step(step: &PlanStep) -> Result<(), String> {
     }
 }
 
-/// `plan` with the run's `deliver` step appended when it has no `deliver` step of its own.
-fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> PlanSteps {
+/// `plan` with the run's `deliver` step appended (codex round 6 on #622): ONE source of the
+/// deliver step. A delivering launch whose plan also authors a `deliver` step is refused, never
+/// silently resolved to one of them.
+fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanSteps, String> {
     let mut out = plan.clone();
     if let Some(d) = deliver {
-        if !out.steps.iter().any(|s| s.catalog == "deliver") {
-            out.steps.push(d.clone());
+        if let Some(own) = out.steps.iter().find(|s| s.catalog == "deliver") {
+            return Err(format!(
+                "the launch delivers (it carries its deliver step) and the plan authors its own \
+                 deliver step `{}` — one source of the deliver step: drop one",
+                own.id
+            ));
         }
+        out.steps.push(d.clone());
     }
-    out
+    Ok(out)
+}
+
+/// Every `deliver` step of a composed-to-be plan — authored or the launch's — passes the same
+/// [`check_deliver_step`] (a step whose id is not `deliver` is compose's `deliver_id_reserved`).
+fn check_deliver_steps(plan: &PlanSteps) -> Result<(), String> {
+    plan.steps
+        .iter()
+        .filter(|s| s.catalog == "deliver" && s.id == "deliver")
+        .try_for_each(check_deliver_step)
 }
 
 /// The deliver step's command: what `FloorInput.deliver` puts in the floor.
@@ -392,7 +408,10 @@ pub(crate) fn decide(
     now: i64,
 ) -> anyhow::Result<Decided> {
     let auto = is_auto(human_confirm);
-    let plan = with_default_ids(&with_deliver(&proposal.plan, prior.deliver_step.as_ref()));
+    let (plan, deliver_refusal) = match with_deliver(&proposal.plan, prior.deliver_step.as_ref()) {
+        Ok(p) => (with_default_ids(&p), None),
+        Err(why) => (with_default_ids(&proposal.plan), Some(why)),
+    };
     let deliver = deliver_cmd(prior.deliver_step.as_ref());
     let proposal_id = ev::mint_proposal_id(run_id, &proposal.by, &proposal.source);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
@@ -417,6 +436,9 @@ pub(crate) fn decide(
             verdict: Verdict::Refused { reason },
         })
     };
+    if let Some(why) = deliver_refusal {
+        return refuse(events, why);
+    }
     // §8.5 ratchet: the floor band is the maximum any score of the run has reached.
     let max_score = prior.max_score.max(scored.assessment.score);
     let destructive = prior.destructive || scored.destructive;
@@ -433,6 +455,9 @@ pub(crate) fn decide(
         Ok(f) => f,
         Err(r) => return refuse(events, refusal_text(&r)),
     };
+    if let Err(why) = check_deliver_steps(&filled.steps) {
+        return refuse(events, why);
+    }
     let rev = prior.rev + 1;
     let mut def = filled.def.clone();
     def.id = per_run_def_id(run_id, rev);
@@ -563,9 +588,14 @@ pub(crate) fn precheck(
     deliver_step: Option<&PlanStep>,
     human_confirm: &HumanConfirm,
 ) -> Result<(), Refusal> {
-    let plan = with_default_ids(&with_deliver(plan, deliver_step));
+    let (plan, one_source) = match with_deliver(plan, deliver_step) {
+        Ok(p) => (with_default_ids(&p), None),
+        Err(why) => (with_default_ids(plan), Some(why)),
+    };
     let reason = if let Some(Err(why)) = deliver_step.map(check_deliver_step) {
         Some(why)
+    } else if one_source.is_some() {
+        one_source
     } else if let Some(s) = plan
         .steps
         .iter()
@@ -581,6 +611,7 @@ pub(crate) fn precheck(
         crate::plan::compose(crate::catalog::catalog(), &plan)
             .err()
             .map(|r| refusal_text(&r))
+            .or_else(|| check_deliver_steps(&plan).err())
     };
     match reason {
         Some(reason) => Err(Refusal { reason }),
@@ -594,7 +625,8 @@ pub(crate) fn worst_case_floor_additions(
     plan: &PlanSteps,
     deliver_step: Option<&PlanStep>,
 ) -> Vec<String> {
-    let plan = with_default_ids(&with_deliver(plan, deliver_step));
+    // A plan the launch refuses for two deliver sources is counted as authored (it never runs).
+    let plan = with_default_ids(&with_deliver(plan, deliver_step).unwrap_or_else(|_| plan.clone()));
     crate::plan::worst_case_floor_additions(
         crate::catalog::catalog(),
         &plan,
@@ -609,7 +641,7 @@ pub(crate) fn authored_def(
     plan: &PlanSteps,
     deliver_step: Option<&PlanStep>,
 ) -> anyhow::Result<WorkflowDef> {
-    let plan = with_default_ids(&with_deliver(plan, deliver_step));
+    let plan = with_default_ids(&with_deliver(plan, deliver_step).map_err(anyhow::Error::msg)?);
     let mut def = crate::plan::compose(crate::catalog::catalog(), &plan)
         .map_err(|r| anyhow::anyhow!("{r}"))?;
     def.id = per_run_def_id(run_id, 1);
