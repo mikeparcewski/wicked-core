@@ -917,7 +917,19 @@ pub enum WorkflowDefError {
     UnverifiedEvidence {
         phase: String,
     },
+    /// The id is in the RESERVED per-run plan namespace: it contains [`RESERVED_PLAN_ID_MARKER`]
+    /// (`":plan-"`), which names an engine-composed per-run def `"<run>:plan-<rev>"`
+    /// (DES-TEAMING-002 §8.3) — the team-run marker the planner reads (seam D1). A user
+    /// workflow (registered, or a drop-in file) may not claim it, or a same-named session would
+    /// be stamped a team run. Only [`WorkflowRegistry::register_composed`] registers such ids.
+    ReservedId {
+        id: String,
+    },
 }
+
+/// The substring that marks the reserved per-run plan namespace `"<run>:plan-<rev>"`
+/// (DES-TEAMING-002 §8.3, seam D1). User-supplied workflow ids containing it are refused.
+pub const RESERVED_PLAN_ID_MARKER: &str = ":plan-";
 
 impl std::fmt::Display for WorkflowDefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -948,6 +960,12 @@ impl std::fmt::Display for WorkflowDefError {
                  built-in evidence floor (validator_pin \"{}\"), pin a phase-specific validator, or \
                  drop the flag",
                 crate::builtin_floors::EVIDENCE_FLOOR_PIN
+            ),
+            WorkflowDefError::ReservedId { id } => write!(
+                f,
+                "reserved workflow id: {id} — ids containing \"{RESERVED_PLAN_ID_MARKER}\" name an \
+                 engine-composed per-run plan (\"<run>:plan-<rev>\") and cannot be supplied by a \
+                 user workflow; rename it"
             ),
         }
     }
@@ -1039,6 +1057,16 @@ impl WorkflowRegistry {
         refuse_unpinned_verified_evidence(&def)?;
         self.defs.insert(def.id.clone(), def);
         Ok(())
+    }
+
+    /// Register the engine's OWN composed per-run def (`"<run>:plan-<rev>"`, DES-TEAMING-002
+    /// §8.3) — the one path allowed into the reserved namespace [`register`](Self::register)
+    /// refuses. Judged by every other registration rule. Crate-private: no launcher can call it.
+    /// Its production caller is the plan-registration seam (the per-run def registered from
+    /// `plan.accepted`); until that lands only the tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn register_composed(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
+        self.register(def) // D1 red: stub
     }
 
     /// Overwrite one phase's `validator_pin` on a registered def. Returns false when the workflow or
@@ -2474,6 +2502,82 @@ mod workflow_def_tests {
                     def.phases[i].id, def.phases[j].id
                 );
             }
+        }
+    }
+    // ---- DES-TEAMING-002 D1: the per-run plan namespace is reserved ----
+
+    fn def_with_id(id: &str) -> WorkflowDef {
+        WorkflowDef {
+            id: id.to_string(),
+            ..feature_def()
+        }
+    }
+
+    /// A user workflow may not claim a `"<run>:plan-<rev>"` id (nor anything containing
+    /// `":plan-"`): refused with the named reason. Look-alikes without the marker register.
+    #[test]
+    fn a_user_workflow_cannot_claim_the_per_run_plan_namespace() {
+        let mut reg = WorkflowRegistry::default();
+        for id in ["r1:plan-1", "x:plan-a", ":plan-"] {
+            assert_eq!(
+                reg.register(def_with_id(id)),
+                Err(WorkflowDefError::ReservedId { id: id.to_string() }),
+                "{id}"
+            );
+            assert!(reg.get(id).is_none(), "{id} must not be registered");
+        }
+        assert_eq!(
+            WorkflowDefError::ReservedId {
+                id: "r1:plan-1".into()
+            }
+            .to_string(),
+            "reserved workflow id: r1:plan-1 \u{2014} ids containing \":plan-\" name an \
+             engine-composed per-run plan (\"<run>:plan-<rev>\") and cannot be supplied by a user \
+             workflow; rename it"
+        );
+        for id in ["plan-1", "plan", "r1-plan-1", "r1:planx-1"] {
+            reg.register(def_with_id(id))
+                .unwrap_or_else(|e| panic!("{id} is no reserved id: {e}"));
+        }
+    }
+
+    /// The drop-in path refuses it too, so an overlay file cannot smuggle it in.
+    #[test]
+    fn a_drop_in_file_cannot_claim_the_per_run_plan_namespace() {
+        let dir = ScratchDir::new("d1-reserved");
+        dir.write(
+            "sneaky.json",
+            &serde_json::to_string(&def_with_id("r1:plan-1")).unwrap(),
+        );
+        let err = WorkflowRegistry::def_from_file(dir.0.join("sneaky.json"))
+            .expect_err("reserved id in a drop-in is refused");
+        assert!(
+            err.to_string().contains("reserved workflow id: r1:plan-1"),
+            "{err}"
+        );
+        let mut reg = WorkflowRegistry::default();
+        assert_eq!(reg.load_dir(&dir.0).unwrap(), Vec::<String>::new());
+        assert!(reg.get("r1:plan-1").is_none());
+    }
+
+    /// Only the engine's composed-def path registers it — and that def plans as a TEAM run, while
+    /// look-alike ids planned under a matching session stay non-team.
+    #[test]
+    fn only_the_engine_registers_a_per_run_plan_and_look_alikes_stay_non_team() {
+        let mut reg = WorkflowRegistry::default();
+        reg.register_composed(def_with_id("r1:plan-1"))
+            .expect("the engine's own composed def registers");
+        let def = reg.get("r1:plan-1").expect("registered").clone();
+        assert!(crate::plan::plan_from_def(&def, "x", "r1")
+            .iter()
+            .all(|u| u.team_run));
+        for (id, sid) in [("plan-1", "plan"), ("x:plan-a", "x"), ("plan-1", "x")] {
+            assert!(
+                crate::plan::plan_from_def(&def_with_id(id), "i", sid)
+                    .iter()
+                    .all(|u| !u.team_run),
+                "{id} under {sid}"
+            );
         }
     }
 }
