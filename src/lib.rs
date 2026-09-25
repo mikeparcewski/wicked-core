@@ -128,8 +128,8 @@ pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, parse_protocol_version, protocol_version_line,
     run_gate_hook, run_output_gate_hook, HookDrainSummary, COVERAGE_DB_ENV, DECISIONS_PATH_ENV,
-    ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION,
-    GATE_SCOPE_ENV,
+    ESTATE_DB_ENV, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV,
+    GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
 };
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;

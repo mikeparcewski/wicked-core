@@ -7710,13 +7710,17 @@ impl AcpStepRunner {
                 reason,
             });
         }
+        // (#627) The unit's own aliases — the phase id and the catalog id — as data, exactly the
+        // pair the wrapped path arms for its hook: the ACP carrier selects on all three tokens.
+        let (unit_phase_alias, unit_catalog_alias) =
+            crate::acp_permission::unit_aliases(&input.unit);
         let gate = gate_ctx.as_ref().filter(|_| proc.governance_verified).map(
             |(scope, phase, decisions_path, db, boundary)| {
                 crate::acp_permission::AcpGate {
                     scope,
                     phase,
-                    phase_alias: None,
-                    catalog_alias: None,
+                    phase_alias: unit_phase_alias,
+                    catalog_alias: unit_catalog_alias,
                     db: Some(db.as_str()),
                     decisions_path,
                     // Clone rather than borrow: BoundaryCtx owns its PathBufs and the gate is

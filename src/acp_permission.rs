@@ -52,10 +52,11 @@ pub(crate) struct AcpGate<'a> {
     pub boundary: Option<crate::gate_hook::BoundaryCtx>,
 }
 
-/// The two policy aliases a unit contributes to an ACP gate: its workflow phase id and its
-/// phase-catalog id (#627). RED STUB.
-pub(crate) fn unit_aliases(_unit: &crate::domain::WorkUnit) -> (Option<&str>, Option<&str>) {
-    (None, None)
+/// The two policy aliases a unit contributes to an ACP gate (#627): its workflow phase id and its
+/// phase-catalog id — the same pair the wrapped path arms as `WICKED_GATE_PHASE_ID` /
+/// `WICKED_GATE_CATALOG` and every in-process gate passes to `scope::phase_aliases`.
+pub(crate) fn unit_aliases(unit: &crate::domain::WorkUnit) -> (Option<&str>, Option<&str>) {
+    (unit.phase_id(), unit.catalog.as_deref())
 }
 
 /// ACP permission option kinds, per the protocol's `PermissionOption.kind`.
@@ -401,6 +402,7 @@ pub(crate) fn permission_result(gate: &AcpGate<'_>, params: &Value) -> (Value, b
         gate.scope,
         gate.phase,
         gate.phase_alias,
+        gate.catalog_alias,
         gate.db,
         gate.decisions_path,
         &context,
