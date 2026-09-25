@@ -1901,6 +1901,63 @@ mod tests {
         );
     }
 
+    /// compose's implicit inputs (coordinator decision on #619): a step with no `depends_on`
+    /// gets one rule, authored or floor-inserted. An evaluator (incl. `domain_coverage`) depends on
+    /// every build/produce step before it, `deliver` on the step just before it, anything else on
+    /// nothing; an explicit `depends_on` (even `[]`) always wins.
+    #[test]
+    fn compose_gives_a_step_without_depends_on_its_implicit_inputs() {
+        let deps = |v: serde_json::Value| -> Vec<(String, Vec<String>)> {
+            let plan: PlanSteps = serde_json::from_value(v).unwrap();
+            compose(crate::catalog::catalog(), &plan)
+                .unwrap()
+                .phases
+                .into_iter()
+                .map(|p| (p.id, p.depends_on))
+                .collect()
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            deps(serde_json::json!({"steps": [
+                {"catalog": "design", "id": "design"},
+                {"catalog": "build", "id": "a"},
+                {"catalog": "produce", "id": "b"},
+                {"catalog": "test", "id": "test"},
+                {"catalog": "security_review", "id": "sec"},
+                {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": ["d"]}}
+            ]})),
+            [
+                ("design".to_string(), s(&[])),
+                ("a".to_string(), s(&[])),
+                ("b".to_string(), s(&[])),
+                ("test".to_string(), s(&["a", "b"])),
+                ("sec".to_string(), s(&["a", "b"])),
+                ("ship".to_string(), s(&["sec"])),
+            ]
+        );
+        // domain_coverage is an evaluator: it depends on the produce step before it.
+        assert_eq!(
+            deps(serde_json::json!({"steps": [
+                {"catalog": "produce", "id": "extract"},
+                {"catalog": "domain_coverage", "id": "coverage"}
+            ]}))[1],
+            ("coverage".to_string(), s(&["extract"]))
+        );
+        // An explicit depends_on wins, including an explicit empty one.
+        assert_eq!(
+            deps(serde_json::json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "r1", "depends_on": []},
+                {"catalog": "review", "id": "r2", "depends_on": ["r1"]}
+            ]})),
+            [
+                ("build".to_string(), s(&[])),
+                ("r1".to_string(), s(&[])),
+                ("r2".to_string(), s(&["r1"])),
+            ]
+        );
+    }
+
     // ── T2 (DES-TEAMING-002 §8.5): floor fill ─────────────────────────────────────────────
 
     mod floor_fill_t2 {

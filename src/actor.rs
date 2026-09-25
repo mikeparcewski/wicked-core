@@ -14984,18 +14984,21 @@ mod prior_context_tests {
         assert!(label.contains("depends_on `build`"), "{label}");
     }
 
-    /// Authored semantics are unchanged (C1): an AUTHORED review with no `depends_on` after an
-    /// authored build declares nothing, so on a single CLI it gets no prior context, as today.
+    /// One mechanism for every step (coordinator decision on #619): `compose` gives an AUTHORED
+    /// evaluator with no `depends_on` the creators before it, so an authored `[build, review]`
+    /// hands the review the build on a single CLI, exactly like a floor-inserted one.
     #[test]
-    fn an_authored_step_without_depends_on_still_declares_nothing() {
+    fn an_authored_evaluator_without_depends_on_is_handed_the_build() {
         let plan: crate::plan::PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
             {"catalog": "build", "id": "build"}, {"catalog": "review", "id": "review"}
         ]}))
         .unwrap();
         let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
         let units = crate::plan::plan_from_def(&def, "intent", "s");
-        assert!(units[1].depends_on.is_empty());
-        assert!(prior_context_label(&units[1], &units[0], "claude").is_none());
+        assert_eq!(units[1].depends_on, ["build"]);
+        let label = prior_context_label(&units[1], &units[0], "claude")
+            .expect("the authored review is handed the build");
+        assert!(label.contains("depends_on `build`"), "{label}");
     }
 
     /// Prose-planned units carry `u<ord>` ids and no declarations; nothing is invented for them. The
