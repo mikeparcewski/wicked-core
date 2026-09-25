@@ -896,8 +896,9 @@ pub(crate) fn run(
     // with no acknowledged `path.started` is tombstoned and then set `transport: none`; a run
     // caught mid-fact re-opens its `team_transport` pause. Only then does the publisher drain the
     // outbox, so no drain can race a boot tombstone.
-    let team_boot_cancels = team_gate::reconcile_at_boot(&mut store);
-    team_gate::drain_at_boot();
+    let team_boot = team_gate::reconcile_at_boot(&mut store);
+    team_gate::drain_at_boot(team_boot.drain);
+    let team_boot_cancels = team_boot.cancels;
     let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = pipeline::workflow_overlay_dir() {
         if let Err(e) = registry.load_dir(&dir) {

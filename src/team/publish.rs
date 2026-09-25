@@ -267,10 +267,36 @@ enum Line {
     Invalid(String),
 }
 
+/// The string value after `"<field>":"` in a line that is not valid JSON (a torn append), if the
+/// value is complete.
+fn torn_field(raw: &str, field: &str) -> Option<String> {
+    let at = raw.find(&format!("\"{field}\":\""))? + field.len() + 4;
+    let end = raw[at..].find('"')?;
+    Some(raw[at..at + end].to_string()).filter(|v| !v.is_empty())
+}
+
 fn parse_line(raw: &str) -> Line {
     let v: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
-        Err(e) => return Line::Invalid(format!("not JSON: {e}")),
+        Err(e) => {
+            // A torn line (a crash mid-append) that names a tombstone still supersedes what it
+            // names — fail closed: a tombstone is never lost to a partial write. Its `ts` is
+            // unknown, so it never ages out.
+            if let Some(run) = torn_field(raw, "superseded_run") {
+                return Line::SupersededRun {
+                    scope: RunTombstone {
+                        run_id: run,
+                        owner: None,
+                        attempt: None,
+                    },
+                    ts: i64::MAX,
+                };
+            }
+            if let Some(key) = torn_field(raw, "superseded") {
+                return Line::Superseded { key, ts: i64::MAX };
+            }
+            return Line::Invalid(format!("not JSON: {e}"));
+        }
     };
     let ts = v.get("ts").and_then(Value::as_i64).unwrap_or(0);
     if let Some(key) = v.get("superseded").and_then(Value::as_str) {
@@ -282,10 +308,8 @@ fn parse_line(raw: &str) -> Line {
     if let Some(run) = v.get("superseded_run").and_then(Value::as_str) {
         let owner = match v.get("owner") {
             None | Some(Value::Null) => None,
-            Some(o) => match o.as_str().and_then(owner_from_token) {
-                Some(o) => Some(LaneOwner::from(o)),
-                None => return Line::Invalid(format!("tombstone owner {o} is not an owner")),
-            },
+            // An owner this build cannot read covers EVERY owner (the broader tombstone).
+            Some(o) => o.as_str().and_then(owner_from_token).map(LaneOwner::from),
         };
         let attempt = match (
             v.get("ord").and_then(Value::as_u64),
@@ -443,15 +467,21 @@ impl TeamBus {
         outbox_mutex(&self.outbox)
     }
 
-    fn read(&self) -> Snapshot {
-        let text = std::fs::read_to_string(&self.outbox).unwrap_or_default();
-        Snapshot {
+    /// The outbox, parsed. A missing file is an empty outbox; any OTHER read failure is an error —
+    /// an unreadable outbox may hold tombstones, so it is never read as empty (fail closed).
+    fn read(&self) -> std::io::Result<Snapshot> {
+        let text = match std::fs::read_to_string(&self.outbox) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
+        Ok(Snapshot {
             lines: text
                 .lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| (l.to_string(), parse_line(l)))
                 .collect(),
-        }
+        })
     }
 
     /// One bounded bus write.
@@ -487,7 +517,9 @@ impl TeamBus {
         let fact = Fact::of(ev)?;
         let m = self.mutex();
         let _g = guard(&m);
-        let snap = self.read();
+        let snap = self
+            .read()
+            .map_err(|e| anyhow::anyhow!("the team outbox cannot be read ({e}); not publishing"))?;
         if snap.superseded(&fact, None) {
             return Ok(PublishOutcome::Superseded);
         }
@@ -519,6 +551,34 @@ impl TeamBus {
         self.drain_locked(Some(lane))
     }
 
+    /// Drain only the lanes of `runs` — the boot drain, limited to the runs the boot reconcile
+    /// read and reconciled: a line of a run it could not read stays for an explicit replay.
+    pub fn drain_runs(&self, runs: &[String]) -> DrainReport {
+        let m = self.mutex();
+        let _g = guard(&m);
+        self.drain_filtered(|lane| runs.contains(&lane.run_id))
+    }
+
+    /// Spool `ev` into the outbox WITHOUT trying the bus — for a fact the engine must not lose
+    /// while it has no publisher (a terminal run's `path.ended` on a daemon with no bus). Obeys
+    /// the supersede rule; a fact already waiting is not spooled twice.
+    pub(crate) fn spool_only(&self, ev: &TeamEvent, reason: &str) -> Result<()> {
+        let fact = Fact::of(ev)?;
+        let m = self.mutex();
+        let _g = guard(&m);
+        let snap = self.read()?;
+        if snap.superseded(&fact, None)
+            || snap
+                .pending(&fact.lane)
+                .iter()
+                .any(|(_, f)| f.key == fact.key)
+        {
+            return Ok(());
+        }
+        self.spool(&fact, reason)?;
+        Ok(())
+    }
+
     /// Drain every lane in order — [`Core::replay_team_outbox`](crate::Core::replay_team_outbox).
     /// Idempotent: a line replayed twice lands once (the key resolves to the existing row).
     pub fn drain_all(&self) -> DrainReport {
@@ -528,12 +588,22 @@ impl TeamBus {
     }
 
     fn drain_locked(&self, only: Option<&Lane>) -> DrainReport {
-        let snap = self.read();
-        let lanes = match only {
-            Some(l) => vec![l.clone()],
-            None => snap.lanes(),
-        };
+        self.drain_filtered(|lane| only.is_none_or(|l| l == lane))
+    }
+
+    /// Drain the lanes `keep` selects, in order. An unreadable outbox drains nothing.
+    fn drain_filtered(&self, keep: impl Fn(&Lane) -> bool) -> DrainReport {
         let mut report = DrainReport::default();
+        let snap = match self.read() {
+            Ok(s) => s,
+            Err(e) => {
+                report
+                    .failures
+                    .push(("*".into(), format!("the team outbox cannot be read: {e}")));
+                return report;
+            }
+        };
+        let lanes: Vec<Lane> = snap.lanes().into_iter().filter(|l| keep(l)).collect();
         let mut published_ix: Vec<usize> = Vec::new();
         for lane in lanes {
             for (ix, fact) in snap.pending(&lane) {
@@ -650,7 +720,10 @@ impl TeamBus {
     pub fn is_pending(&self, key: &str) -> bool {
         let m = self.mutex();
         let _g = guard(&m);
-        let snap = self.read();
+        // Unreadable: assume it is still there (never report a fact gone that may not be).
+        let Ok(snap) = self.read() else {
+            return true;
+        };
         snap.lines.iter().enumerate().any(|(i, (_, l))| {
             matches!(l, Line::Fact(f) if f.key == key && !snap.superseded(f, Some(i)))
         })
@@ -716,8 +789,8 @@ pub enum PublisherReq {
         reason: String,
         ack: Option<TeamToken>,
     },
-    /// Drain every lane once (sent by the actor after its boot reconcile).
-    DrainAll,
+    /// Drain the lanes of these runs once (the actor's boot drain: only runs it reconciled).
+    DrainRuns(Vec<String>),
 }
 
 /// The actor's link to team publishing.
@@ -728,19 +801,27 @@ pub enum TeamLink {
         tx: Sender<PublisherReq>,
         outbox: PathBuf,
     },
-    /// No publishing: every team run is un-teamed, with this reason.
-    Unavailable(String),
+    /// No publisher (no bus, or it did not start): every NEW team run is un-teamed, with this
+    /// reason. The outbox is the state home's whatever the bus: a run tombstone the engine owes
+    /// (a finished answer, an ended run) is still written there.
+    Unavailable {
+        reason: String,
+        outbox: Option<PathBuf>,
+    },
 }
 
 impl TeamLink {
     /// Spawn the engine's publisher for `cfg`, acknowledging to the actor through `self_tx`.
     pub(crate) fn spawn(cfg: &TeamConfig, self_tx: Sender<Command>) -> TeamLink {
         let (Some(bus_db), Some(outbox)) = (cfg.bus_db.clone(), cfg.outbox.clone()) else {
-            return TeamLink::Unavailable(if cfg.bus_db.is_none() {
-                "no bus (WICKED_BUS_DB unset)".into()
-            } else {
-                "no state home for the team outbox".into()
-            });
+            return TeamLink::Unavailable {
+                reason: if cfg.bus_db.is_none() {
+                    "no bus (WICKED_BUS_DB unset)".into()
+                } else {
+                    "no state home for the team outbox".into()
+                },
+                outbox: cfg.outbox.clone(),
+            };
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let bus = TeamBus::new(bus_db, outbox.clone(), cfg.attempt_wait);
@@ -754,7 +835,10 @@ impl TeamLink {
             .spawn(move || publisher_loop(bus, schedule, rx, self_tx));
         match spawned {
             Ok(_) => TeamLink::Publisher { tx, outbox },
-            Err(e) => TeamLink::Unavailable(format!("team publisher did not start: {e}")),
+            Err(e) => TeamLink::Unavailable {
+                reason: format!("team publisher did not start: {e}"),
+                outbox: cfg.outbox.clone(),
+            },
         }
     }
 }
@@ -858,8 +942,8 @@ fn handle_req(
                 let _ = self_tx.send(Command::TeamSuperseded { token });
             }
         }
-        PublisherReq::DrainAll => {
-            let r = bus.drain_all();
+        PublisherReq::DrainRuns(runs) => {
+            let r = bus.drain_runs(&runs);
             if !r.published.is_empty() || r.remaining > 0 {
                 eprintln!(
                     "wicked-core: team outbox drained at boot: {} published, {} superseded, {} \

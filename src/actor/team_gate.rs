@@ -20,7 +20,7 @@
 //! each unit's snapshot) and the `team_transport` pause (§4.6).
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::PathBuf;
 
 use super::*;
 use crate::domain::{
@@ -31,7 +31,7 @@ use crate::team::events::{
     LedgerSource, PathEnded, PathStarted, PathStatus, PlanAccepted, PlanMode, PlanStep, Selection,
     TeamBody, TeamEvent, Transport,
 };
-use crate::team::publish::{Exhausted, PublisherReq, TeamLink, TeamToken};
+use crate::team::publish::{Exhausted, PublisherReq, TeamBus, TeamLink, TeamToken};
 
 thread_local! {
     /// The actor thread's link to the team publisher, installed once by [`install`].
@@ -52,9 +52,29 @@ fn send(req: PublisherReq) -> Result<(), String> {
         Some(TeamLink::Publisher { tx, .. }) => tx
             .send(req)
             .map_err(|_| "the team publisher stopped".to_string()),
-        Some(TeamLink::Unavailable(reason)) => Err(reason),
+        Some(TeamLink::Unavailable { reason, .. }) => Err(reason),
         None => Err("no team publisher on this engine".to_string()),
     }
+}
+
+/// The team outbox — a property of the STATE HOME, not of bus availability (review of #623
+/// round 5): a daemon with no bus still owes the tombstones of runs it finishes.
+fn outbox_path() -> Option<PathBuf> {
+    match link() {
+        Some(TeamLink::Publisher { outbox, .. }) => Some(outbox),
+        Some(TeamLink::Unavailable { outbox, .. }) => outbox,
+        None => None,
+    }
+}
+
+/// Write `run_id`'s run tombstone into the outbox synchronously — for the paths that have no
+/// publisher to write it (no bus; the publisher stopped) and for the boot reconcile, which runs
+/// before any drain. `Err` when there is no outbox path or the write fails: the caller then
+/// FAILS CLOSED (keeps the pause), never proceeds as if the tombstone existed.
+fn write_tombstone(run_id: &str, from_event: &str, reason: &str) -> Result<(), String> {
+    let outbox = outbox_path().ok_or_else(|| "no team outbox (no state home)".to_string())?;
+    crate::team::publish::supersede_run_at(&outbox, run_id, from_event, reason)
+        .map_err(|e| format!("the run tombstone could not be written: {e}"))
 }
 
 /// The plan rev P1 accepts: the launch's composed plan. Re-plans (`plan.revised`) are T4's.
@@ -235,7 +255,7 @@ pub(super) fn gate_before_dispatch(
         return Ok(TeamGate::Proceed);
     }
     if team.transport.is_none() {
-        let no_bus = matches!(link(), Some(TeamLink::Unavailable(_)) | None);
+        let no_bus = matches!(link(), Some(TeamLink::Unavailable { .. }) | None);
         let ev = path_started(session);
         let team = session.team.get_or_insert_with(RunTeamState::default);
         match publish_required(ev, Exhausted::SupersedeRun) {
@@ -337,23 +357,45 @@ fn request_end(run_id: &str, team: &RunTeamState, status: PathStatus) {
     if team.ended || team.is_unteamed() {
         return;
     }
+    // With no publisher to take the request, the end is written into the outbox directly (the
+    // actor has no publisher to contend with). If even that fails, `ended` stays unset and the
+    // next boot re-issues the end — never skipped silently.
     if team.is_teamed() {
         let ev = event(run_id, TeamBody::PathEnded(PathEnded { status }));
-        let _ = publish_required(ev, Exhausted::Keep);
+        if let Err(why) = publish_required(ev.clone(), Exhausted::Keep) {
+            let spooled = outbox_path()
+                .ok_or_else(|| "no team outbox (no state home)".to_string())
+                .and_then(|o| {
+                    TeamBus::new("", o, crate::team::publish::ATTEMPT_WAIT)
+                        .spool_only(&ev, &format!("no publisher: {why}"))
+                        .map_err(|e| format!("{e:#}"))
+                });
+            if let Err(e) = spooled {
+                eprintln!("wicked-core: path.ended for {run_id} not recorded ({e}); boot retries");
+            }
+        }
     } else {
-        let _ = send(PublisherReq::SupersedeRun {
+        let reason = format!(
+            "the run ended ({}) before its path.started landed",
+            status.as_str()
+        );
+        let sent = send(PublisherReq::SupersedeRun {
             run_id: run_id.to_string(),
             from_event: tev::PATH_STARTED.to_string(),
-            reason: format!(
-                "the run ended ({}) before its path.started landed",
-                status.as_str()
-            ),
+            reason: reason.clone(),
             ack: Some(TeamToken {
                 run_id: run_id.to_string(),
                 event_type: tev::PATH_STARTED.to_string(),
                 key: String::new(),
             }),
         });
+        if sent.is_err() {
+            if let Err(e) = write_tombstone(run_id, tev::PATH_STARTED, &reason) {
+                eprintln!(
+                    "wicked-core: tombstone for ended run {run_id} not written ({e}); boot retries"
+                );
+            }
+        }
     }
 }
 
@@ -389,34 +431,38 @@ fn mark_ended(store: &mut dyn GraphStore, run_id: &str) -> anyhow::Result<()> {
 /// before the boot drain (so the drain cannot publish its spooled `path.started`), and marked
 /// ended; a teamed run's `path.ended` is re-requested (same key, so a line already spooled or a
 /// row already on the bus is not duplicated) and marked ended by its acknowledgement.
-fn end_terminal_run(store: &mut dyn GraphStore, session: &mut AgentSession, outbox: Option<&Path>) {
+fn end_terminal_run(store: &mut dyn GraphStore, session: &mut AgentSession) -> bool {
     let Some(status) = path_status(session.status) else {
-        return;
+        return true;
     };
     let run_id = session.id.clone();
     let Some(team) = session.team.as_mut() else {
-        return;
+        return true;
     };
     if team.ended || team.is_unteamed() {
-        return;
+        return true;
     }
     if team.is_teamed() {
         request_end(&run_id, team, status);
-        return;
+        return true;
     }
-    if let Some(outbox) = outbox {
-        if let Err(e) = crate::team::publish::supersede_run_at(
-            outbox,
-            &run_id,
-            tev::PATH_STARTED,
-            "boot: the run ended before its path.started landed",
-        ) {
-            eprintln!("wicked-core: boot could not tombstone ended team run {run_id}: {e}");
-            return;
-        }
+    // The tombstone is a precondition of "ended": no outbox path or a failed write leaves the
+    // run un-ended and out of the boot drain (fail closed); the next boot retries.
+    if let Err(e) = write_tombstone(
+        &run_id,
+        tev::PATH_STARTED,
+        "boot: the run ended before its path.started landed",
+    ) {
+        eprintln!("wicked-core: boot could not tombstone ended team run {run_id}: {e}");
+        return false;
     }
     team.ended = true;
-    let _ = put_node(store, session.to_node());
+    if let Err(e) = put_node(store, session.to_node()) {
+        // The tombstone is written (the durable fact); only the marker is lost — the next boot
+        // writes the same tombstone again and marks it then.
+        eprintln!("wicked-core: boot could not mark team run {run_id} ended: {e}");
+    }
+    true
 }
 
 /// Everything an acknowledgement handler needs from the actor loop.
@@ -620,6 +666,8 @@ pub(super) fn answer_transport_gate(
         _ => None,
     };
     if let Some(reason) = supersede {
+        // The pause as it stands, to re-open unchanged if the tombstone cannot be written.
+        let paused = team.pending.clone().unwrap_or_else(|| pending.clone());
         let token = TeamToken {
             run_id: run_id.clone(),
             event_type: pending.event_type.clone(),
@@ -635,18 +683,22 @@ pub(super) fn answer_transport_gate(
             reason: reason.to_string(),
             ack: Some(token.clone()),
         }) {
-            // No publisher to write the tombstone: write it here (the actor never contends —
-            // there is no publisher draining), then fall back.
-            if let Some(TeamLink::Publisher { outbox, .. }) = link() {
-                crate::team::publish::supersede_run_at(
-                    &outbox,
-                    &run_id,
-                    &pending.event_type,
-                    reason,
-                )?;
+            // No publisher to write the tombstone: the actor writes it (there is no publisher
+            // draining to contend with). The tombstone is a PRECONDITION of the fallback: if it
+            // cannot be written, the answer is not applied — the pause re-opens, still the team
+            // handler's (review of #623 round 5).
+            match write_tombstone(&run_id, &pending.event_type, reason) {
+                Ok(()) => {
+                    return on_superseded(cx, &token)
+                        .map(|s| s.unwrap_or(SessionStatus::AwaitingHuman));
+                }
+                Err(why) => {
+                    cx.in_flight.remove(&run_id);
+                    let session = crate::domain::get_session(cx.store, &run_id)?
+                        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+                    return pause_team_transport(cx, session, paused, &format!("{e}; {why}"));
+                }
             }
-            eprintln!("wicked-core: team tombstone for {run_id} written without a publisher: {e}");
-            return on_superseded(cx, &token).map(|s| s.unwrap_or(SessionStatus::AwaitingHuman));
         }
         return Ok(SessionStatus::AwaitingHuman);
     }
@@ -805,77 +857,82 @@ fn run_blocked(
 /// operator had ANSWERED (`Superseding`) has that answer finished, never re-asked: tombstone
 /// first, then un-teamed (continue) or returned for cancellation (reject). Runs before the
 /// publisher is asked to drain, so no drain can race a tombstone. Returns the runs to cancel.
-pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> Vec<String> {
-    let mut to_cancel = Vec::new();
-    let Ok(sessions) = crate::domain::all_sessions(store) else {
-        return to_cancel;
-    };
-    let outbox = match link() {
-        Some(TeamLink::Publisher { outbox, .. }) => Some(outbox),
-        _ => None,
+pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> BootPlan {
+    let mut plan = BootPlan::default();
+    // No sessions read = nothing reconciled = nothing drained (fail closed): a drain before the
+    // reconcile could publish a spooled fact of a run that needed its tombstone first.
+    let sessions = match crate::domain::all_sessions(store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-core: boot team reconcile could not read sessions ({e}); the team outbox is not drained at boot");
+            return plan;
+        }
     };
     for mut session in sessions {
+        let run_id = session.id.clone();
         if path_status(session.status).is_some() {
             // Terminal: the durable status drives the end, exactly as `run_ended` would have.
-            end_terminal_run(store, &mut session, outbox.as_deref());
+            if end_terminal_run(store, &mut session) {
+                plan.drain.push(run_id);
+            }
             continue;
         }
-        let units = crate::domain::session_units(store, &session.id).unwrap_or_default();
+        let units = match crate::domain::session_units(store, &run_id) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("wicked-core: boot could not read the units of {run_id} ({e}); its team lines are not drained");
+                continue;
+            }
+        };
         if !is_team_run(&session, &units) {
             continue;
         }
-        let run_id = session.id.clone();
         let team = session.team.clone().unwrap_or_default();
-        let unteamed_already = team.is_unteamed();
-        if !unteamed_already && team.stream_floor.is_none() {
-            // Tombstone first (whatever the outbox holds for the run), then the store.
-            if let Some(outbox) = &outbox {
-                if let Err(e) = crate::team::publish::supersede_run_at(
-                    outbox,
-                    &run_id,
-                    tev::PATH_STARTED,
-                    "boot: no acknowledged path.started",
-                ) {
-                    eprintln!(
-                        "wicked-core: boot could not tombstone team run {run_id} ({e}); leaving \
-                         it undecided"
-                    );
-                    continue;
-                }
+        if !team.is_unteamed() && team.stream_floor.is_none() {
+            // Tombstone first (whatever the outbox holds for the run), then the store. No
+            // tombstone = the run stays undecided and out of the boot drain.
+            if let Err(e) = write_tombstone(
+                &run_id,
+                tev::PATH_STARTED,
+                "boot: no acknowledged path.started",
+            ) {
+                eprintln!("wicked-core: boot could not tombstone team run {run_id} ({e}); leaving it undecided");
+                continue;
             }
             let t = session.team.get_or_insert_with(RunTeamState::default);
             set_unteamed(
                 t,
                 "the daemon restarted before the run's path.started was acknowledged".to_string(),
             );
-            let _ = put_node(store, session.to_node());
+            if let Err(e) = put_node(store, session.to_node()) {
+                // Tombstone-first holds: the next boot finds the same run undecided and repeats.
+                eprintln!("wicked-core: boot could not persist un-teamed {run_id}: {e}");
+            }
+            plan.drain.push(run_id);
             continue;
         }
         let Some(pending) = team.pending.clone() else {
+            plan.drain.push(run_id);
             continue;
         };
         match pending.stage {
-            PendingStage::Paused => {}
+            PendingStage::Paused => plan.drain.push(run_id),
             PendingStage::Superseding => {
                 // The operator ANSWERED before the crash (continue without team, or reject); only
                 // the publisher's acknowledgement was lost. Finish that answer — never ask again:
                 // an open team_transport gate without its paused pending fact would be answered
                 // by the generic confirm path (an amendment / a rework, not a transport answer).
-                // The tombstone is the durable fact, so it is re-issued first (idempotent).
-                let written = match &outbox {
-                    Some(outbox) => crate::team::publish::supersede_run_at(
-                        outbox,
-                        &run_id,
-                        &pending.event_type,
-                        "boot: finishing a team_transport answer recorded before the restart",
-                    )
-                    .map_err(|e| e.to_string()),
-                    None => Ok(()),
-                };
-                let t = session.team.get_or_insert_with(RunTeamState::default);
+                // The tombstone is the durable fact and a PRECONDITION: re-issued first
+                // (idempotent), into the state home's outbox whether or not there is a bus.
+                let written = write_tombstone(
+                    &run_id,
+                    &pending.event_type,
+                    "boot: finishing a team_transport answer recorded before the restart",
+                );
                 if let Err(e) = written {
                     // The answer cannot be finished safely: keep the fact pending and PAUSED, so
-                    // the team handler (`answer_transport_gate`) takes the next reply.
+                    // the team handler (`answer_transport_gate`) takes the next reply. Its lines
+                    // stay out of the boot drain.
                     eprintln!(
                         "wicked-core: boot could not tombstone team run {run_id} ({e}); its \
                          team_transport pause re-opens"
@@ -883,13 +940,13 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> Vec<String> {
                     reopen_transport_gate(store, &mut session, &units, pending);
                     continue;
                 }
+                let t = session.team.get_or_insert_with(RunTeamState::default);
                 if pending.then == TeamBlocked::Cancel {
                     // Rejected: the run stays teamed so its `path.ended` is published (the one
                     // fact the tombstone lets through); the actor cancels it once it is up.
                     t.pending = None;
                     t.open_gate = None;
-                    let _ = put_node(store, session.to_node());
-                    to_cancel.push(run_id);
+                    plan.cancels.push(run_id.clone());
                 } else {
                     // Continue without team: un-teamed from here. The run is Executing with no
                     // worker in this process — reported orphaned and resumed like every run a
@@ -900,17 +957,31 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> Vec<String> {
                             .to_string(),
                     );
                     session.status = SessionStatus::Executing;
-                    let _ = put_node(store, session.to_node());
                 }
+                if let Err(e) = put_node(store, session.to_node()) {
+                    eprintln!(
+                        "wicked-core: boot could not persist the finished answer of {run_id}: {e}"
+                    );
+                }
+                plan.drain.push(run_id);
             }
             PendingStage::Publishing => {
                 // No answer was recorded: a required fact was still publishing. Re-open the
                 // pause WITH the fact kept pending and paused, so the team handler answers it.
                 reopen_transport_gate(store, &mut session, &units, pending);
+                plan.drain.push(run_id);
             }
         }
     }
-    to_cancel
+    plan
+}
+
+/// What the boot reconcile leaves for the actor: the rejected runs to cancel once it is up, and
+/// the runs whose team lines the boot drain may publish — only runs it READ and reconciled.
+#[derive(Debug, Default)]
+pub(super) struct BootPlan {
+    pub cancels: Vec<String>,
+    pub drain: Vec<String>,
 }
 
 /// Re-open a run's `team_transport` pause at boot over `pending`, kept PAUSED so
@@ -945,12 +1016,16 @@ fn reopen_transport_gate(
         TEAM_TRANSPORT_GATE,
         crate::interaction::now_millis(),
     );
-    let _ = crate::domain::put_nodes(store, &[session.to_node(), request.to_node()]);
+    if let Err(e) = crate::domain::put_nodes(store, &[session.to_node(), request.to_node()]) {
+        // The run keeps its previous durable state; the next boot re-opens the pause again.
+        eprintln!("wicked-core: boot could not re-open the team_transport pause of {run_id}: {e}");
+    }
 }
 
-/// Tell the publisher to drain the outbox once (after the boot reconcile).
-pub(super) fn drain_at_boot() {
-    let _ = send(PublisherReq::DrainAll);
+/// Tell the publisher to drain the outbox once, for the runs the boot reconcile reconciled. No
+/// publisher (no bus) = nothing to drain onto; the lines stay for the bus's return.
+pub(super) fn drain_at_boot(runs: Vec<String>) {
+    let _ = send(PublisherReq::DrainRuns(runs));
 }
 
 /// Whether `run_id`'s last answer is still waiting on the publisher (a held `confirm_gate` reply).
