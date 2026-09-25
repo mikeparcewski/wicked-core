@@ -4091,6 +4091,7 @@ pub(crate) fn resume_run_inner(
         session.status = SessionStatus::Failed;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
+        team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Failed);
         reap_terminal_worktree(&*store, &session);
         emit(
             subscribers,
@@ -4663,6 +4664,7 @@ fn apply_step_result(
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
+        team_gate::run_ended(&*store, &run_id, crate::team::events::PathStatus::Cancelled);
         emit(
             subscribers,
             CoreEvent::RunCancelled {

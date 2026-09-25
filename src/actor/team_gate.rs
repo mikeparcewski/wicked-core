@@ -20,6 +20,7 @@
 //! each unit's snapshot) and the `team_transport` pause (§4.6).
 
 use std::cell::RefCell;
+use std::path::Path;
 
 use super::*;
 use crate::domain::{
@@ -317,20 +318,29 @@ pub(super) fn unit_snapshot(session: &AgentSession, unit: &WorkUnit) -> Option<U
     })
 }
 
-/// A team run reached a terminal status. Teamed: publish `path.ended` (not required: a later
-/// drain lets consumers forget the run). Still deciding (its `path.started` in flight): tombstone
-/// the run's lines, so a late landing never opens a path that will not end. Un-teamed: nothing
-/// (§4.8 row 1).
+/// A team run reached a terminal status (called right AFTER the terminal status is persisted).
+/// Teamed: publish `path.ended` so consumers forget the run. Still deciding (its `path.started`
+/// in flight): tombstone the run's lines, so a late landing never opens a path that will not end.
+/// Un-teamed: nothing (§4.8 row 1). Both requests are acknowledged, and the acknowledgement marks
+/// the end on record (`RunTeamState.ended`); until it does, boot reconcile re-issues the same end
+/// ([`end_terminal_run`]) — the durable status drives it, and the actor never waits on the bus.
 pub(super) fn run_ended(store: &dyn GraphStore, run_id: &str, status: PathStatus) {
     let Ok(Some(session)) = crate::domain::get_session(store, run_id) else {
         return;
     };
-    let Some(team) = session.team.as_ref() else {
+    if let Some(team) = session.team.as_ref() {
+        request_end(run_id, team, status);
+    }
+}
+
+fn request_end(run_id: &str, team: &RunTeamState, status: PathStatus) {
+    if team.ended || team.is_unteamed() {
         return;
-    };
+    }
     if team.is_teamed() {
-        publish_fire(event(run_id, TeamBody::PathEnded(PathEnded { status })));
-    } else if team.transport.is_none() {
+        let ev = event(run_id, TeamBody::PathEnded(PathEnded { status }));
+        let _ = publish_required(ev, Exhausted::Keep);
+    } else {
         let _ = send(PublisherReq::SupersedeRun {
             run_id: run_id.to_string(),
             from_event: tev::PATH_STARTED.to_string(),
@@ -338,9 +348,75 @@ pub(super) fn run_ended(store: &dyn GraphStore, run_id: &str, status: PathStatus
                 "the run ended ({}) before its path.started landed",
                 status.as_str()
             ),
-            ack: None,
+            ack: Some(TeamToken {
+                run_id: run_id.to_string(),
+                event_type: tev::PATH_STARTED.to_string(),
+                key: String::new(),
+            }),
         });
     }
+}
+
+fn path_status(s: SessionStatus) -> Option<PathStatus> {
+    Some(match s {
+        SessionStatus::Completed => PathStatus::Completed,
+        SessionStatus::Cancelled => PathStatus::Cancelled,
+        SessionStatus::Failed => PathStatus::Failed,
+        _ => return None,
+    })
+}
+
+/// Record a terminal run's end as acknowledged (`path.ended` landed, or its tombstone written).
+fn mark_ended(store: &mut dyn GraphStore, run_id: &str) -> anyhow::Result<()> {
+    let Some(mut session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(());
+    };
+    if path_status(session.status).is_none() {
+        return Ok(());
+    }
+    if let Some(team) = session.team.as_mut() {
+        if !team.ended {
+            team.ended = true;
+            put_node(store, session.to_node())?;
+        }
+    }
+    Ok(())
+}
+
+/// Boot reconcile for a TERMINAL team run whose end is not on record (a crash between the
+/// terminal `put_node` and the publisher handling `run_ended`'s request): re-issue exactly that
+/// end. A run that never acknowledged its `path.started` is tombstoned HERE, synchronously and
+/// before the boot drain (so the drain cannot publish its spooled `path.started`), and marked
+/// ended; a teamed run's `path.ended` is re-requested (same key, so a line already spooled or a
+/// row already on the bus is not duplicated) and marked ended by its acknowledgement.
+fn end_terminal_run(store: &mut dyn GraphStore, session: &mut AgentSession, outbox: Option<&Path>) {
+    let Some(status) = path_status(session.status) else {
+        return;
+    };
+    let run_id = session.id.clone();
+    let Some(team) = session.team.as_mut() else {
+        return;
+    };
+    if team.ended || team.is_unteamed() {
+        return;
+    }
+    if team.is_teamed() {
+        request_end(&run_id, team, status);
+        return;
+    }
+    if let Some(outbox) = outbox {
+        if let Err(e) = crate::team::publish::supersede_run_at(
+            outbox,
+            &run_id,
+            tev::PATH_STARTED,
+            "boot: the run ended before its path.started landed",
+        ) {
+            eprintln!("wicked-core: boot could not tombstone ended team run {run_id}: {e}");
+            return;
+        }
+    }
+    team.ended = true;
+    let _ = put_node(store, session.to_node());
 }
 
 /// Everything an acknowledgement handler needs from the actor loop.
@@ -384,6 +460,10 @@ pub(super) fn on_published(
     token: &TeamToken,
     event_id: i64,
 ) -> anyhow::Result<Option<SessionStatus>> {
+    if token.event_type == tev::PATH_ENDED {
+        mark_ended(cx.store, &token.run_id)?;
+        return Ok(None);
+    }
     let Some((mut session, pending)) = pending_for(cx.store, token)? else {
         return Ok(None);
     };
@@ -600,6 +680,13 @@ pub(super) fn on_superseded(
     cx: &mut Ctx<'_>,
     token: &TeamToken,
 ) -> anyhow::Result<Option<SessionStatus>> {
+    // A terminal run's tombstone (`run_ended`): its end is now on record.
+    if crate::domain::get_session(cx.store, &token.run_id)?
+        .is_some_and(|s| path_status(s.status).is_some())
+    {
+        mark_ended(cx.store, &token.run_id)?;
+        return Ok(None);
+    }
     let Some((mut session, pending)) = pending_for(cx.store, token)? else {
         return Ok(None);
     };
@@ -728,13 +815,9 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> Vec<String> {
         _ => None,
     };
     for mut session in sessions {
-        if !matches!(
-            session.status,
-            SessionStatus::Planning
-                | SessionStatus::Distributing
-                | SessionStatus::Executing
-                | SessionStatus::AwaitingHuman
-        ) {
+        if path_status(session.status).is_some() {
+            // Terminal: the durable status drives the end, exactly as `run_ended` would have.
+            end_terminal_run(store, &mut session, outbox.as_deref());
             continue;
         }
         let units = crate::domain::session_units(store, &session.id).unwrap_or_default();
