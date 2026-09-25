@@ -610,7 +610,11 @@ fn enforce_evaluator_distinct(
     let builder_clis: std::collections::HashSet<String> = units
         .iter()
         .zip(dists.iter())
-        .filter(|(u, _)| matches!(u.stage, StageKind::Build | StageKind::Recon))
+        // A TOOL unit is no creator seat: its `assigned_cli` is its own program token
+        // (`tool_distribution`), which may spell a seat key (`claude --version`) — D1 review.
+        .filter(|(u, _)| {
+            u.tool_cmd.is_none() && matches!(u.stage, StageKind::Build | StageKind::Recon)
+        })
         .map(|(_, d)| d.assigned_cli.clone())
         .collect();
     // The MODELS behind those seats — `{claude}` for builders on `claude#1` and `claude#2` alike.
