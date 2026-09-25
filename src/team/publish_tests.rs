@@ -44,7 +44,7 @@ impl Rig {
         )
     }
 
-    fn conn(&self) -> rusqlite::Connection {
+    pub fn conn(&self) -> rusqlite::Connection {
         let c = rusqlite::Connection::open(&self.bus).unwrap();
         c.busy_timeout(Duration::from_secs(5)).unwrap();
         c

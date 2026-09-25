@@ -239,6 +239,11 @@ pub struct RunTeamState {
     /// locally with `ledger_source: no_bus`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_bus: bool,
+    /// The run is terminal and its end is ON RECORD: its `path.ended` was acknowledged, or its run
+    /// tombstone was written (a run that never published its path). Until then boot reconcile
+    /// re-issues the end (DES-TEAMING-002 §4.1, review of #623 round 3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ended: bool,
 }
 
 impl RunTeamState {

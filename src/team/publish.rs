@@ -958,6 +958,9 @@ pub struct RunTeamView {
     pub plan_rev: Option<u32>,
     /// The required fact the run waits on, if any (its event type).
     pub pending: Option<String>,
+    /// The run is terminal and its end is on record: `path.ended` acknowledged, or the run
+    /// tombstone written for a run that never published its path.
+    pub ended: bool,
     /// Every unit's team snapshot, in plan order (`None` transport = not dispatched yet).
     pub units: Vec<UnitTeamView>,
 }
@@ -1000,6 +1003,7 @@ pub(crate) fn run_team_view(
         stream_floor: team.stream_floor,
         plan_rev: team.plan_rev,
         pending: team.pending.as_ref().map(|p| p.event_type.clone()),
+        ended: team.ended,
         units: units
             .iter()
             .filter(|u| u.team_run)

@@ -796,3 +796,99 @@ fn boot_reopens_a_publishing_fact_as_a_transport_gate_the_team_handler_answers()
     assert_eq!(amended_units(&e, "bootp"), 0);
     assert_eq!(e.core.run_team("bootp").unwrap().unwrap().transport, "none");
 }
+
+// ── Boot reconcile covers TERMINAL team runs too (#623 review round 3) ───────────────────────────
+
+/// Set `run`'s persisted status, as a terminal transition's `put_node` leaves it.
+fn set_status(db: &str, run: &str, to: SessionStatus) {
+    let mut store = wicked_apps_core::open_store_any(Some(db)).expect("store opens");
+    let mut s = crate::domain::get_session(&store, run).unwrap().unwrap();
+    s.status = to;
+    crate::domain::put_node(&mut store, s.to_node()).unwrap();
+}
+
+fn path_ended_statuses(rig: &Rig, run: &str) -> Vec<String> {
+    let c = rig.conn();
+    let mut st = c
+        .prepare("SELECT payload FROM events WHERE event_type = ?1 ORDER BY event_id")
+        .unwrap();
+    st.query_map([tev::PATH_ENDED], |r| r.get::<_, String>(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .map(|p| serde_json::from_str::<serde_json::Value>(&p).unwrap())
+        .filter(|p| p["run_id"] == run)
+        .map(|p| p["status"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// Crash between a terminal `put_node(Cancelled)` and the publisher writing the run tombstone,
+/// while the run's `path.started` is still spooled: boot tombstones the terminal run BEFORE the
+/// boot drain, so neither the drain nor a replay opens a path that never ends.
+#[test]
+fn boot_tombstones_a_run_cancelled_before_its_tombstone_was_written() {
+    let rig = rig("bootx");
+    let db = crashed_mid_path_started(&rig, "bootx");
+    set_status(&db, "bootx", SessionStatus::Cancelled);
+    assert!(!outbox_has_run_tombstone(&rig, "bootx"));
+    rig.allow();
+    let e = engine_on(&db, fast(&rig));
+    assert!(outbox_has_run_tombstone(&rig, "bootx"));
+    e.core.ping();
+    e.core.replay_team_outbox().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(rig.types("bootx").is_empty(), "{:?}", rig.types("bootx"));
+    assert!(e.core.run_team("bootx").unwrap().unwrap().ended);
+}
+
+/// A teamed run reached `status` and the crash came before its `path.started` was followed by
+/// `path.ended` (nothing spooled): boot publishes exactly ONE `path.ended` with that status, and
+/// marks the run ended so a later boot publishes nothing more.
+fn boot_ends_a_teamed_terminal_run(name: &str, status: SessionStatus, want: &str) {
+    let rig = rig(name);
+    rig.refuse(&[tev::PATH_ENDED]);
+    // A retry schedule this engine never reaches: its publisher cannot land path.ended later.
+    let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_schedule(vec![Duration::from_secs(600)])
+        .with_attempt_wait(Duration::from_millis(30));
+    let e = engine(&rig, slow);
+    launch_team(&e, name);
+    wait_status(&e, name, SessionStatus::Completed);
+    wait_for("path.ended spooled", || {
+        rig.outbox_lines()
+            .iter()
+            .any(|l| l["type"] == tev::PATH_ENDED)
+    });
+    let db = e.db.clone();
+    drop(e);
+    if status != SessionStatus::Completed {
+        set_status(&db, name, status);
+    }
+    // The crash came before path.ended was even spooled.
+    let _ = std::fs::remove_file(&rig.outbox);
+    rig.allow();
+    assert!(path_ended_statuses(&rig, name).is_empty());
+    let e = engine_on(&db, fast(&rig));
+    wait_for("path.ended", || !path_ended_statuses(&rig, name).is_empty());
+    wait_for("the run marked ended", || {
+        e.core.run_team(name).unwrap().unwrap().ended
+    });
+    drop(e);
+    let e = engine_on(&db, fast(&rig));
+    e.core.ping();
+    e.core.replay_team_outbox().unwrap();
+    assert_eq!(path_ended_statuses(&rig, name), vec![want.to_string()]);
+    assert!(
+        rig.outbox_lines().is_empty(),
+        "a later boot spools nothing more"
+    );
+}
+
+#[test]
+fn boot_publishes_one_path_ended_for_a_completed_teamed_run() {
+    boot_ends_a_teamed_terminal_run("bootok", SessionStatus::Completed, "completed");
+}
+
+#[test]
+fn boot_publishes_one_path_ended_for_a_failed_teamed_run() {
+    boot_ends_a_teamed_terminal_run("bootfail", SessionStatus::Failed, "failed");
+}
