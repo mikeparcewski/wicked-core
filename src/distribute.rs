@@ -2155,4 +2155,36 @@ mod tests {
             Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
         );
     }
+    /// D1 (codex on #618): a TOOL build unit is no creator seat. Its `assigned_cli` is its own
+    /// program token (`tool_distribution`), which here equals the only seat key (`claude`); a
+    /// team run must not read that as "the review grades its creator" and refuse the plan.
+    #[test]
+    fn d1_a_tool_build_whose_program_is_a_seat_key_is_no_creator_seat() {
+        for team in [true, false] {
+            let mut build = WorkUnit::pending("u1", "r1", 1, "Build the thing");
+            build.stage = StageKind::Build;
+            build.tool_cmd = Some(vec!["claude".into(), "--version".into()]);
+            let mut review = WorkUnit::pending("u2", "r1", 2, "Review the thing");
+            review.stage = StageKind::Review;
+            let mut units = [build, review];
+            for u in &mut units {
+                u.team_run = team;
+            }
+            let dists =
+                distribute_units_against_benched(&units, &[seat("claude")], "r1", None, &[])
+                    .unwrap_or_else(|e| {
+                        panic!("team={team}: no seated creator, nothing to refuse: {e}")
+                    });
+            assert_eq!(dists[0].routing, RoutingInfo::Tool);
+            assert_eq!(dists[0].assigned_cli, "claude");
+            assert_eq!(dists[1].assigned_cli, "claude");
+            assert_eq!(
+                dists[1].routing,
+                RoutingInfo::Teamed {
+                    winner: "claude".into()
+                }
+            );
+            assert_eq!(dists[1].distinctness_fallback, None, "team={team}");
+        }
+    }
 }
