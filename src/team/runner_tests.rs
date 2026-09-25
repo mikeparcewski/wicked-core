@@ -792,6 +792,19 @@ fn eval_daemon(
 }
 
 fn bus_judge(rig: &Rig, run: &str, ledger: TeamLedger, judge_cli: Value) -> (Value, Value) {
+    let (req, verdict) = bus_judge_by(rig, run, ledger, judge_cli, Some("claude"));
+    (req.expect("a request"), verdict)
+}
+
+/// [`bus_judge`] for a unit authored by `author` (`None` = no `assigned_cli`); the request is
+/// `None` when none reached the daemon.
+fn bus_judge_by(
+    rig: &Rig,
+    run: &str,
+    ledger: TeamLedger,
+    judge_cli: Value,
+    author: Option<&str>,
+) -> (Option<Value>, Value) {
     let floor = start(rig, run);
     let _s = supervise(rig, run, ledger);
     let wd = workdir(run);
@@ -799,18 +812,14 @@ fn bus_judge(rig: &Rig, run: &str, ledger: TeamLedger, judge_cli: Value) -> (Val
     let worker = Seat::new(|_| {});
     let r: Arc<dyn StepRunner> = worker.clone();
     let tr = runner(rig);
-    let (_, verdict, _) = run_unit_and_judge_with_team(
-        &r,
-        &judged_input(run, floor, &wd),
-        NOOP,
-        &[],
-        Some(&rig.bus),
-        Some(&tr),
-    );
+    let mut i = judged_input(run, floor, &wd);
+    i.unit.assigned_cli = author.map(str::to_string);
+    let (_, verdict, _) =
+        run_unit_and_judge_with_team(&r, &i, NOOP, &[], Some(&rig.bus), Some(&tr));
     stop.store(true, Ordering::SeqCst);
     let _ = h.join();
     let _ = std::fs::remove_dir_all(&wd);
-    let req = seen.lock().unwrap().first().cloned().expect("a request");
+    let req = seen.lock().unwrap().first().cloned();
     let v = verdict.expect("a verdict");
     (req, json!({"pass": v.pass, "reasoning": v.reasoning}))
 }
@@ -844,19 +853,108 @@ fn t5_d_bus_judge_must_prove_monitor_exclusion() {
     }
 }
 
-/// DES-001 #14 (d): an empty ledger sends `excluded_seats: []`, and a `judge_cli: null` response
-/// is honoured exactly as before.
+/// DES-001 #14 (d), tightened (core#625): an empty ledger sends `excluded_seats: []`, but the
+/// WORK AUTHOR is always excluded: a response whose `judge_cli` is the author (by instance or cli
+/// key), or that names no judge at all, is a DENY; a distinct judge is honoured. An empty
+/// `excluded_seats` never bypasses the evaluator≠creator check.
 #[test]
-fn t5_d_bus_judge_with_an_empty_ledger_is_unchanged() {
+fn t5_d_bus_judge_with_an_empty_ledger_still_excludes_the_work_author() {
     let rig = rig("t5d5");
-    let (req, verdict) = bus_judge(
+    for (run, judge, pass) in [
+        ("t5d5-a", json!("claude"), false),
+        ("t5d5-b", json!("claude#4"), false),
+        ("t5d5-c", Value::Null, false),
+        ("t5d5-d", json!("codex"), true),
+    ] {
+        let (req, verdict) =
+            bus_judge(&rig, run, empty_ledger(FinalPass::Completed), judge.clone());
+        assert_eq!(req["excluded_seats"], json!([]), "{run}");
+        assert_eq!(req["work_author"], "claude", "{run}");
+        assert_eq!(verdict["pass"], pass, "{run}: judge {judge} → {verdict}");
+        if !pass {
+            assert!(
+                verdict["reasoning"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("gate eval bus-path DENY (fail-closed)"),
+                "{run}: {verdict}"
+            );
+        }
+    }
+}
+
+/// core#625: a pinned unit with NO work author cannot prove evaluator≠creator on the bus path:
+/// it is a DENY, and no request is published for a daemon to judge.
+#[test]
+fn t5_d_bus_judge_denies_a_unit_with_no_work_author() {
+    let rig = rig("t5d6");
+    let (req, verdict) = bus_judge_by(
         &rig,
-        "t5d5",
+        "t5d6",
         empty_ledger(FinalPass::Completed),
-        Value::Null,
+        json!("codex"),
+        None,
     );
-    assert_eq!(req["excluded_seats"], json!([]));
-    assert_eq!(verdict["pass"], true, "{verdict}");
+    assert!(req.is_none(), "no request is published: {req:?}");
+    assert_eq!(verdict["pass"], false, "{verdict}");
+    assert!(
+        verdict["reasoning"]
+            .as_str()
+            .unwrap()
+            .contains("work author"),
+        "{verdict}"
+    );
+}
+
+/// The gate wait's cursor advances past every row it inspected: a unit whose fold sits behind
+/// more than one poll batch of OTHER attempts' folds still finds it (review of #624 round 2).
+#[test]
+fn the_gate_wait_finds_its_fold_behind_more_than_a_batch_of_unrelated_folds() {
+    let rig = rig("t5batch");
+    let run = "t5batch";
+    let floor = start(&rig, run);
+    let tr = TeamRunner::from_config(&cfg(&rig).with_final_pass_budget(Duration::from_secs(20)))
+        .unwrap();
+    let i = input(run, 1, 0, Some(bus_stamp(floor)));
+    let c = claimed(claim(Some(&tr), &i).unwrap());
+    // S, for this attempt: 60 folds of other runs land after its step.completed, then ours.
+    let stop = Arc::new(AtomicBool::new(false));
+    let h = {
+        let (bus, outbox, stop) = (rig.bus.clone(), rig.outbox.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let tb = TeamBus::new(bus.clone(), outbox, Duration::from_millis(30));
+            let db = BusDb::shared(&bus).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                if !db
+                    .poll(tev::STEP_COMPLETED, 0, 10)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    let fold = |run: &str| {
+                        fixture_with(tev::LEDGER_FOLDED, 0, run, |p| {
+                            p["ord"] = json!(1);
+                            p["attempt"] = json!(0);
+                        })
+                    };
+                    for n in 0..60 {
+                        tb.publish(&fold(&format!("other-{n}"))).unwrap();
+                    }
+                    tb.publish(&fold("t5batch")).unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    let snap = complete(&c, &ok_output(&i));
+    stop.store(true, Ordering::SeqCst);
+    let _ = h.join();
+    assert_eq!(
+        snap.ledger_source,
+        Some(LedgerSource::Folded),
+        "S's fold was published in time: {snap:?}"
+    );
+    assert_eq!(snap.ledger_ref.as_deref(), Some("ledger.folded#1:0"));
 }
 
 // ── T5 (e) and the absence axes ──────────────────────────────────────────────────────────────────

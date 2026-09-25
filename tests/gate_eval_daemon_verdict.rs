@@ -171,24 +171,62 @@ fn the_bus_path_daemon_prompt_asks_for_the_closing_verdict_it_requires() {
     );
 }
 
-/// DES-TEAMING-002 T5 / DES-001 §6.2: the daemon's only judge seat is `claude`, so a request
-/// whose `excluded_seats` name a claude instance (or `claude` itself) leaves it no eligible seat.
-/// It refuses without a model call; other monitors, or none, leave it free to judge.
+/// DES-TEAMING-002 T5 / DES-001 §6.2 / core#625: the daemon's only judge seat is `claude`, and
+/// its exclusion set is `work_author ∪ excluded_seats`, by instance or cli key. A request with no
+/// `work_author` gets maximum exclusion (the author is unknown, so no seat is provably distinct).
 #[test]
-fn the_bus_path_daemon_never_judges_as_an_excluded_monitor() {
+fn the_bus_path_daemon_never_judges_as_an_excluded_seat() {
     let out = probe(
         "print(json.dumps([\n\
-           mod._judge_excluded({'excluded_seats': ['claude#2', 'claude#3']}),\n\
-           mod._judge_excluded({'excluded_seats': ['claude']}),\n\
-           mod._judge_excluded({'excluded_seats': ['codex#2']}),\n\
+           mod._judge_excluded({'work_author': 'codex', 'excluded_seats': ['claude#2', 'claude#3']}),\n\
+           mod._judge_excluded({'work_author': 'codex', 'excluded_seats': ['claude']}),\n\
+           mod._judge_excluded({'work_author': 'codex', 'excluded_seats': ['codex#2']}),\n\
+           mod._judge_excluded({'work_author': 'codex', 'excluded_seats': []}),\n\
+           mod._judge_excluded({'work_author': 'claude', 'excluded_seats': []}),\n\
+           mod._judge_excluded({'work_author': 'claude#1'}),\n\
            mod._judge_excluded({'excluded_seats': []}),\n\
            mod._judge_excluded({}),\n\
            mod.JUDGE_CLI]))\n",
     );
     assert_eq!(
         out.trim(),
-        r#"[true, true, false, false, false, "claude"]"#,
+        r#"[true, true, false, false, true, true, true, true, "claude"]"#,
         "{out}"
+    );
+}
+
+/// core#625: a claude-authored request is never judged by claude — the daemon refuses with a
+/// named reason and NEVER invokes the model; a request whose author and monitors leave claude
+/// eligible is judged and reports `judge_cli: "claude"`.
+#[test]
+fn the_bus_path_daemon_never_invokes_claude_on_a_claude_authored_request() {
+    let out = probe(
+        "calls = []\n\
+         mod._evaluate = lambda c, w: (calls.append(1), (True, 'judged'))[1]\n\
+         r = [mod._handle({'work_author': 'claude', 'excluded_seats': [], 'criterion': 'c', 'work': 'w'}),\n\
+              mod._handle({'work_author': 'codex', 'excluded_seats': ['claude#2'], 'criterion': 'c', 'work': 'w'}),\n\
+              mod._handle({'excluded_seats': [], 'criterion': 'c', 'work': 'w'}),\n\
+              mod._handle({'work_author': 'codex', 'excluded_seats': [], 'criterion': 'c', 'work': 'w'})]\n\
+         print(json.dumps({'calls': len(calls), 'verdicts': [[p, j] for p, _, j in r], 'why': r[0][1]}))\n",
+    );
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect(&out);
+    assert_eq!(
+        v["calls"], 1,
+        "claude ran only for the codex-authored request: {v}"
+    );
+    assert_eq!(
+        v["verdicts"],
+        serde_json::json!([
+            [false, null],
+            [false, null],
+            [false, null],
+            [true, "claude"]
+        ]),
+        "{v}"
+    );
+    assert!(
+        v["why"].as_str().unwrap().contains("work author"),
+        "the refusal names why: {v}"
     );
 }
 
