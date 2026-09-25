@@ -345,27 +345,26 @@ pub fn unbound_repo_tokens(units: &[WorkUnit]) -> Vec<String> {
 /// it to `"<run>:plan-<rev>"` (§8.3); compose itself knows nothing of runs.
 pub const COMPOSED_DEF_ID: &str = "plan";
 
-/// Whether `def_id` is `session_id`'s per-run composed def id, `"<run>:plan-<rev>"` with `rev`
-/// a positive decimal revision (DES-TEAMING-002 §8.3, §11.3). A run planned from such a def is a
-/// TEAM RUN (seam D1): the composed def is the one marker, read at plan time. The namespace is
-/// RESERVED: `WorkflowRegistry::register` and `def_from_file` refuse any user id containing
-/// `":plan-"` ([`crate::workflow::RESERVED_PLAN_ID_MARKER`]), so only the engine's own
-/// `register_composed` can put such a def in front of the planner.
+/// THE per-run composed def shape (DES-TEAMING-002 §8.3, §11.3, seam D1):
+/// `"<run>:plan-<rev>"` — a non-empty `<run>` prefix, then `:plan-`, then `rev` a positive
+/// decimal with no leading zero. Returns the `<run>` prefix when `def_id` has the shape. The ONE
+/// predicate: the team-run detector ([`is_per_run_def_id`]) and the registry's reservation
+/// (`workflow::refuse_reserved_id`) both call it, so exactly the ids that could be read as a
+/// team run are the ids no user workflow may register.
 pub fn per_run_def_run_id(def_id: &str) -> Option<&str> {
-    let _ = def_id;
-    None // D1 red: stub
+    let (run, rev) = def_id.rsplit_once(":plan-")?;
+    let positive_decimal =
+        !rev.is_empty() && !rev.starts_with('0') && rev.bytes().all(|b| b.is_ascii_digit());
+    (!run.is_empty() && positive_decimal).then_some(run)
 }
 
+/// Whether `def_id` is `session_id`'s per-run composed def id ([`per_run_def_run_id`] names
+/// `session_id`). A run planned from such a def is a TEAM RUN (seam D1): the composed def is the
+/// one marker, read at plan time. The shape is RESERVED — `WorkflowRegistry::register` and
+/// `def_from_file` refuse it — so only the engine's own `register_composed` can put such a def in
+/// front of the planner.
 pub fn is_per_run_def_id(def_id: &str, session_id: &str) -> bool {
-    if session_id.is_empty() {
-        return false;
-    }
-    def_id
-        .strip_prefix(session_id)
-        .and_then(|rest| rest.strip_prefix(":plan-"))
-        .is_some_and(|rev| {
-            !rev.is_empty() && !rev.starts_with('0') && rev.bytes().all(|b| b.is_ascii_digit())
-        })
+    per_run_def_run_id(def_id) == Some(session_id)
 }
 
 /// A plan's ordered steps — the `steps[]` of a `plan.proposed` payload (§8.4). `deny_unknown_fields`

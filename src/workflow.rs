@@ -917,8 +917,8 @@ pub enum WorkflowDefError {
     UnverifiedEvidence {
         phase: String,
     },
-    /// The id is in the RESERVED per-run plan namespace: it contains [`RESERVED_PLAN_ID_MARKER`]
-    /// (`":plan-"`), which names an engine-composed per-run def `"<run>:plan-<rev>"`
+    /// The id has the RESERVED per-run plan shape `"<run>:plan-<rev>"`
+    /// ([`crate::plan::per_run_def_run_id`]), which names an engine-composed per-run def
     /// (DES-TEAMING-002 §8.3) — the team-run marker the planner reads (seam D1). A user
     /// workflow (registered, or a drop-in file) may not claim it, or a same-named session would
     /// be stamped a team run. Only [`WorkflowRegistry::register_composed`] registers such ids.
@@ -926,10 +926,6 @@ pub enum WorkflowDefError {
         id: String,
     },
 }
-
-/// The substring that marks the reserved per-run plan namespace `"<run>:plan-<rev>"`
-/// (DES-TEAMING-002 §8.3, seam D1). User-supplied workflow ids containing it are refused.
-pub const RESERVED_PLAN_ID_MARKER: &str = ":plan-";
 
 impl std::fmt::Display for WorkflowDefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -963,9 +959,8 @@ impl std::fmt::Display for WorkflowDefError {
             ),
             WorkflowDefError::ReservedId { id } => write!(
                 f,
-                "reserved workflow id: {id} — ids containing \"{RESERVED_PLAN_ID_MARKER}\" name an \
-                 engine-composed per-run plan (\"<run>:plan-<rev>\") and cannot be supplied by a \
-                 user workflow; rename it"
+                "reserved workflow id: {id} \u{2014} the shape \"<run>:plan-<rev>\" names an \
+                 engine-composed per-run plan and cannot be supplied by a user workflow; rename it"
             ),
         }
     }
@@ -1169,10 +1164,10 @@ impl WorkflowRegistry {
     }
 }
 
-/// A user-supplied workflow id may not enter the reserved per-run plan namespace
-/// ([`RESERVED_PLAN_ID_MARKER`], DES-TEAMING-002 D1).
+/// A user-supplied workflow id may not take the reserved per-run plan shape — decided by the SAME
+/// predicate the team-run detector uses ([`crate::plan::per_run_def_run_id`], DES-TEAMING-002 D1).
 fn refuse_reserved_id(def: &WorkflowDef) -> Result<(), WorkflowDefError> {
-    if def.id.contains(RESERVED_PLAN_ID_MARKER) {
+    if crate::plan::per_run_def_run_id(&def.id).is_some() {
         return Err(WorkflowDefError::ReservedId { id: def.id.clone() });
     }
     Ok(())
