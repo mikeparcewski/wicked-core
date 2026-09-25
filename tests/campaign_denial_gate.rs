@@ -143,7 +143,9 @@ fn node_status(core: &Core, id: &str, node: &str) -> Option<NodeStatus> {
 }
 
 fn wait_node(core: &Core, id: &str, node: &str, want: NodeStatus) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Generous: the wait returns the moment the state is reached, and a loaded Windows runner
+    // has been seen to land the node just past a 10 s deadline (core main b186c2f).
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if node_status(core, id, node) == Some(want) {
             return true;
