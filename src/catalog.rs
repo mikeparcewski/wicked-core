@@ -31,6 +31,7 @@ use std::sync::OnceLock;
 use crate::builtin_floors::EVIDENCE_FLOOR_PIN;
 use crate::domain::StageKind;
 use crate::domain_extraction::COVERAGE_VALIDATOR_PIN;
+use crate::plan::PlanStep;
 use crate::workflow::{
     GateCond, GateSpec, GateType, PhaseDef, PhaseExecutor, PhaseRole, StepOwner,
 };
@@ -71,6 +72,17 @@ pub fn catalog_entry(id: &str) -> Option<&'static PhaseDef> {
 /// hand an `executor`.
 pub fn is_tool_entry(entry: &PhaseDef) -> bool {
     matches!(entry.executor, PhaseExecutor::Tool { .. })
+}
+
+/// The built-in presets (DES-TEAMING-002 §8.4, seam C2): code data beside the catalog, written
+/// to the store at boot by `crate::preset::seed_builtins` (`created_by: "builtin"`). Each is named
+/// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
+/// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
+///
+/// Seeded here: `feature`, the one C2's acceptance names. Every other consumer's preset is added
+/// by its migration seam (§14 M1–M10), which also deletes the def it replaces.
+pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
+    Vec::new()
 }
 
 fn build_catalog() -> Vec<PhaseDef> {

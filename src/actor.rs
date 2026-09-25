@@ -2548,6 +2548,27 @@ pub(crate) fn run(
                     let _ = reply.send(result);
                 });
             }
+            // ── Presets (DES-TEAMING-002 §8.4, seam C2) ──
+            Command::PutPreset { spec, reply } => {
+                let now = crate::interaction::now_millis();
+                let _ = reply.send(crate::preset::put_preset(&mut store, spec, now));
+            }
+            Command::DeletePreset {
+                name,
+                project_id,
+                reply,
+            } => {
+                let now = crate::interaction::now_millis();
+                let _ = reply.send(crate::preset::delete_preset(
+                    &mut store,
+                    &name,
+                    project_id.as_deref(),
+                    now,
+                ));
+            }
+            Command::ListPresets { project_id, reply } => {
+                let _ = reply.send(crate::preset::list_presets(&store, project_id.as_deref()));
+            }
             Command::RegisterWorkflow { json, reply } => {
                 let result = serde_json::from_str::<crate::workflow::WorkflowDef>(&json)
                     .map_err(|e| anyhow::anyhow!("invalid workflow JSON: {e}"))
