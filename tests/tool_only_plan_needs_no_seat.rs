@@ -169,6 +169,7 @@ fn spec(session_id: &str, workflow: &str, repo_ref: Option<String>) -> LaunchSpe
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
+        deliver_step: None,
     }
 }
 

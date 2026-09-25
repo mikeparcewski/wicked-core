@@ -97,6 +97,23 @@ export interface LaunchOptions {
    * cost tools, not the run. Omit for the per-repo behaviour, unchanged.
    */
   projectGraph?: ProjectGraphOptions
+  /**
+   * (DES-TEAMING-002 T3; wicked-core-ts ≥ the release carrying seam T3) A USER-COMPOSED plan,
+   * as JSON: `{"steps":[{"catalog":"build"}, …], "touch"?: ["src/x.rs"], "override"?: {…}}`.
+   * The engine publishes `plan.proposed{by:"human"}`, scores it from `touch` (a creator plan
+   * with no `touch` scores 100, "no declared scope"), floor-fills and composes it into the run's
+   * `<run>:plan-1`, and pauses at a `plan_approval` gate when the approval matrix requires it —
+   * in manual mode always, in auto mode (`humanConfirm` omitted / `none`) when high risk.
+   * Mutually exclusive with `workflow` (a plan or a preset). A refused plan REJECTS the launch.
+   */
+  planJson?: string
+  /**
+   * (DES-TEAMING-002 §8.5, T3) The run DELIVERS: the launcher's `deliver` step as JSON — catalog
+   * `deliver`, id `deliver`, `executor: {type: "tool", cmd: [...]}` (crew's push-and-PR script).
+   * Only with `planJson` or a preset `workflow`: appended to the plan (unless it has its own
+   * `deliver` step) and put in the floor. Without a plan or preset the launch is REJECTED.
+   */
+  deliverStepJson?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -119,6 +136,13 @@ export declare class Core {
    * as a JSON array of `AgenticCli` — pass straight into `launchRun`'s `clisJson`.
    */
   static registryRoster(): string
+  /**
+   * Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
+   * `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
+   * so a launcher keys on this static's presence before it sends a plan — an older addon would
+   * drop the plan and run the launch unplanned and ungated.
+   */
+  static supportsPlanLaunch(): boolean
   /**
    * What this process's engine knows about its connection to the bus file at `path`
    * (DES-TEAMING-002 T0 connection rule: one connection per bus file per process, opened by a bus
@@ -253,8 +277,13 @@ export declare class Core {
    * the cursor unit (default) or the first creator phase at/after it. A disagreement
    * (`action=request_changes` with `approve=true`, `action=approve` with `approve=false`, an
    * unknown token) rejects before the engine is asked.
+   *
+   * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
+   * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
+   * as the next plan rev (floor phases added, never refused for being below the floor) or, if it
+   * refuses it, re-opens the gate with a new gate id.
    */
-  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null): Promise<string>
+  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.
@@ -829,6 +858,9 @@ export declare class Subscription {
  * findingId, monitorId, seat, severity: 'high' | 'medium', path, line, evidence, claim,
  * suggestion: string | null, tree, inDiff, checkpointSeq} (a read-only monitor's finding whose
  * `evidence` IS line `line` of `path` in snapshot tree `tree` — advisory, never a verdict).
+ * teamFact {session, eventType, key, payload} (DES-TEAMING-002 T3: one engine-published
+ * `wicked.team.*` fact — `plan.proposed`, `path.scored`, `plan.accepted`, `plan.refused`,
+ * `gate.opened`, `gate.decided` — exactly the bus row: its type, idempotency key and payload).
  */
 export interface CoreEventJson {
   type: string

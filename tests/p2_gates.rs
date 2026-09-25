@@ -93,6 +93,7 @@ fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
+        deliver_step: None,
     }
 }
 

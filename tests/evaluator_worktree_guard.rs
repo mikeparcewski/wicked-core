@@ -334,6 +334,7 @@ fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
+        deliver_step: None,
     }
 }
 

@@ -277,6 +277,12 @@ pub struct LaunchSpec {
     /// matrix (§8.6) says so. Mutually exclusive with [`Self::workflow`] (a plan or a preset,
     /// never both). `None` ⇒ planned from `workflow` as before.
     pub plan: Option<crate::plan::PlanSteps>,
+    /// (DES-TEAMING-002 §8.5, T3) The run DELIVERS: the launcher's `deliver` step (catalog
+    /// `deliver`, id `deliver`, a Tool command — crew's hardened push-and-PR script). Only with a
+    /// [`Self::plan`] or a preset `workflow`: it is appended to the plan's steps when the plan has
+    /// no `deliver` step of its own, and its command is what puts `deliver` in the floor. A launch
+    /// carrying it without a plan or preset is refused (never a silently dropped delivery).
+    pub deliver_step: Option<crate::plan::PlanStep>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's

@@ -1251,6 +1251,7 @@ fn launch_from_event(
         // here, and the label rule belongs to whoever owns the project graph — not the bus bridge.
         project_graph: None,
         plan: None,
+        deliver_step: None,
     };
 
     let (reply, rx) = channel();

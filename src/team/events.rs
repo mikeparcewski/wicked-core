@@ -926,7 +926,8 @@ pub enum GateOpenedKind {
         ledger_source: LedgerSource,
     },
     PlanApproval {
-        reviewing_ord: u32,
+        /// The unit whose output produced the plan; `null` for a plan the launch carried (T3).
+        reviewing_ord: Option<u32>,
         plan_rev: u32,
         band: String,
         high_risk: bool,

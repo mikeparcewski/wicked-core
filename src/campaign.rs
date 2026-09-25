@@ -86,6 +86,7 @@ impl RunSpec {
             // which is what a campaign fans out over anyway.
             project_graph: None,
             plan: None,
+            deliver_step: None,
         }
     }
 }

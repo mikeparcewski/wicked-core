@@ -531,6 +531,7 @@ fn main() {
                 // Stub self-test path — no worker, so nothing would read a graph anyway.
                 project_graph: None,
                 plan: None,
+                deliver_step: None,
             });
             println!(
                 "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
@@ -847,6 +848,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         // crew's API to get the project's.
         project_graph: None,
         plan: None,
+        deliver_step: None,
     }) {
         Ok(id) => id,
         Err(e) => {

@@ -169,6 +169,7 @@ fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> Laun
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan,
+        deliver_step: None,
     }
 }
 
@@ -201,9 +202,8 @@ impl Tap {
                         .collect::<Vec<_>>()
                 );
             }
-            match self.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(ev) => self.seen.push(ev),
-                Err(_) => {}
+            if let Ok(ev) = self.rx.recv_timeout(Duration::from_millis(50)) {
+                self.seen.push(ev);
             }
         }
     }
@@ -934,9 +934,10 @@ fn h_a_manual_override_is_recorded_and_an_auto_override_is_refused() {
     rig.core
         .launch_run(spec("rhm", HumanConfirm::Before(1), Some(with_override())))
         .unwrap();
-    rig.tap.until("the plan_approval pause", |s| {
-        paused_on_plan(s, "rhm").is_some()
-    });
+    rig.tap
+        .until("the plan_approval pause and its gate.opened", |s| {
+            paused_on_plan(s, "rhm").is_some() && !of_type(s, "rhm", OPENED).is_empty()
+        });
     let (_, _, prompt) = paused_on_plan(&rig.tap.seen, "rhm").unwrap();
     assert!(prompt.contains("override"), "{prompt}");
     assert!(prompt.contains("architecture"), "{prompt}");
@@ -1044,6 +1045,78 @@ fn a_launch_with_both_a_plan_and_a_workflow_is_refused() {
     s.workflow = Some("feature".into());
     let err = rig.core.launch_run(s).expect_err("refused");
     assert!(err.to_string().contains("plan"), "{err}");
+}
+
+fn deliver_step() -> wicked_core::PlanStep {
+    serde_json::from_value(json!({
+        "catalog": "deliver", "id": "deliver", "instructions": "push and open the PR",
+        "executor": {"type": "tool", "cmd": ["true"]}
+    }))
+    .unwrap()
+}
+
+/// A DELIVERING preset launch (crew's `deliver: "pr"`): the launcher's deliver step rides the
+/// preset's plan — appended last, in the floor (§8.5: `deliver` for a run that delivers) — so the
+/// run stays ONE team plan behind the plan_approval gate instead of a separately composed def.
+#[test]
+fn a_delivering_preset_launch_carries_its_deliver_step_behind_the_gate() {
+    let dir = tmp_dir("dlv");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let mut s = spec("rdlv", HumanConfirm::None, None);
+    s.workflow = Some("feature".into());
+    s.deliver_step = Some(deliver_step());
+    rig.core.launch_run(s).unwrap();
+    rig.tap
+        .until("the plan_approval pause and its gate.opened", |s| {
+            paused_on_plan(s, "rdlv").is_some() && !of_type(s, "rdlv", OPENED).is_empty()
+        });
+    let ids = unit_ids(&rig.core, "rdlv");
+    assert_eq!(ids.last().map(String::as_str), Some("deliver"), "{ids:?}");
+    assert_eq!(ids.iter().filter(|i| *i == "deliver").count(), 1);
+    assert_eq!(
+        of_type(&rig.tap.seen, "rdlv", PROPOSED)[0]["preset"],
+        "feature"
+    );
+    assert!(dispatched_ords(&rig.tap.seen, "rdlv").is_empty());
+
+    // A deliver step with no plan or preset to ride is refused, never dropped …
+    let mut bare = spec("rdlv2", HumanConfirm::None, None);
+    bare.deliver_step = Some(deliver_step());
+    let err = rig.core.launch_run(bare).expect_err("refused");
+    assert!(err.to_string().contains("deliver step"), "{err}");
+    // … and one that is not the catalog deliver entry with a command is refused.
+    let mut wrong = spec(
+        "rdlv3",
+        HumanConfirm::None,
+        Some(plan(json!({"steps": [{"catalog": "build"}]}))),
+    );
+    wrong.deliver_step = Some(
+        serde_json::from_value(json!({"catalog": "run", "id": "deliver",
+            "executor": {"type": "tool", "cmd": ["true"]}}))
+        .unwrap(),
+    );
+    let err = rig.core.launch_run(wrong).expect_err("refused");
+    assert!(err.to_string().contains("catalog `deliver`"), "{err}");
+}
+
+/// The straight-through `Core::launch` honours no gate, so it refuses a preset (and a plan)
+/// instead of running one past its plan_approval gate.
+#[test]
+fn the_straight_through_launch_refuses_a_preset() {
+    let dir = tmp_dir("legacy");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let mut s = spec("rleg", HumanConfirm::None, None);
+    s.workflow = Some("feature".into());
+    rig.core.launch(s);
+    rig.tap.until("the refusal", |seen| {
+        seen.iter().any(|e| {
+            matches!(e, CoreEvent::Error { session: Some(id), message }
+                if id == "rleg" && message.contains("launch_run"))
+        })
+    });
+    assert!(dispatched_ords(&rig.tap.seen, "rleg").is_empty());
 }
 
 /// Arm the hermetic emit spool (core#311) before `main`.

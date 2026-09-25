@@ -126,6 +126,7 @@ fn spec(session: &str) -> LaunchSpec {
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
+        deliver_step: None,
     }
 }
 

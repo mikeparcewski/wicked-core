@@ -423,6 +423,9 @@ pub struct PlanStep {
     /// The catalog id (`understand`, `build`, … — `crate::catalog::CATALOG_IDS`).
     pub catalog: String,
     /// The phase id in the composed def (unique within the plan; referenced by `depends_on`).
+    /// May be omitted on input (`{"catalog":"build"}`): the engine's plan pipeline gives it the
+    /// catalog id (`plan_gate::with_default_ids`).
+    #[serde(default)]
     pub id: String,
     /// Free text (§8.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2384,10 +2387,17 @@ mod tests {
                 assert_eq!(r.reason(), "provenance_supplied", "{step}: {r}");
                 assert!(r.to_string().contains("step build"), "{r}");
             }
-            // Codex's exact payload has no `id`, so it never parses at all.
+            // Codex's exact payload has no `id`. Since T3 an omitted id parses (the plan pipeline
+            // gives it the catalog id, T2 (g)'s `{"catalog":"build"}`), and the forged provenance
+            // is refused all the same.
             let exact = json!({"steps": [{"catalog": "build", "added_by": "floor",
                                           "floor_reason": "…"}]});
-            assert!(serde_json::from_value::<PlanSteps>(exact).is_err());
+            let exact = crate::plan_gate::with_default_ids(
+                &serde_json::from_value::<PlanSteps>(exact).expect("an omitted id parses"),
+            );
+            let r = fill(&exact, 30, &AUTO, None).expect_err("forged provenance is refused");
+            assert_eq!(r.reason(), "provenance_supplied", "{r}");
+            assert!(r.to_string().contains("step build"), "{r}");
         }
 
         /// codex on #619 (HIGH): a floor-inserted step gets compose's implicit inputs, like any

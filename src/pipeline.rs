@@ -551,6 +551,10 @@ pub(crate) fn pre_distribute(
             session.run_branch = existing.run_branch;
             session.base_commit = existing.base_commit;
             session.benched_seats = existing.benched_seats;
+            // (DES-TEAMING-002 T3) The gate counter and the plan state are the run's, not the
+            // plan's: a plan written onto a launch stub (or re-planned at an edit) keeps them.
+            session.gate_seq = existing.gate_seq;
+            session.team_plan = existing.team_plan;
         }
     } else {
         put_node(store, session.to_node())?;

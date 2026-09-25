@@ -190,6 +190,7 @@ fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> Launc
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
+        deliver_step: None,
     }
 }
 

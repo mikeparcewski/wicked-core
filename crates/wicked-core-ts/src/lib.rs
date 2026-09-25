@@ -652,11 +652,33 @@ pub struct LaunchOptions {
     /// stderr) rather than failing the launch — the graph is a capability, and losing it should
     /// cost tools, not the run. Omit for the per-repo behaviour, unchanged.
     pub project_graph: Option<ProjectGraphOptions>,
+    /// (DES-TEAMING-002 T3; wicked-core-ts ≥ the release carrying seam T3) A USER-COMPOSED plan,
+    /// as JSON: `{"steps":[{"catalog":"build"}, …], "touch"?: ["src/x.rs"], "override"?: {…}}`.
+    /// The engine publishes `plan.proposed{by:"human"}`, scores it from `touch` (a creator plan
+    /// with no `touch` scores 100, "no declared scope"), floor-fills and composes it into the run's
+    /// `<run>:plan-1`, and pauses at a `plan_approval` gate when the approval matrix requires it —
+    /// in manual mode always, in auto mode (`humanConfirm` omitted / `none`) when high risk.
+    /// Mutually exclusive with `workflow` (a plan or a preset). A refused plan REJECTS the launch.
+    pub plan_json: Option<String>,
+    /// (DES-TEAMING-002 §8.5, T3) The run DELIVERS: the launcher's `deliver` step as JSON — catalog
+    /// `deliver`, id `deliver`, `executor: {type: "tool", cmd: [...]}` (crew's push-and-PR script).
+    /// Only with `planJson` or a preset `workflow`: appended to the plan (unless it has its own
+    /// `deliver` step) and put in the floor. Without a plan or preset the launch is REJECTED.
+    pub deliver_step_json: Option<String>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+    let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
+    let deliver_step = o
+        .deliver_step_json
+        .as_deref()
+        .map(|j| {
+            serde_json::from_str::<wicked_core::PlanStep>(j)
+                .map_err(|e| err(format!("deliverStepJson is not a valid plan step: {e}")))
+        })
+        .transpose()?;
     Ok(LaunchSpec {
         problem: o.problem,
         clis,
@@ -681,7 +703,15 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
             db_path: g.db_path,
             repo_label: g.repo_label,
         }),
+        plan,
+        deliver_step,
     })
+}
+
+/// Parse a plan's JSON (`planJson`): `deny_unknown_fields`, so a misspelled key is an error, never
+/// a silently dropped field.
+fn parse_plan(json: &str) -> napi::Result<wicked_core::PlanSteps> {
+    serde_json::from_str(json).map_err(|e| err(format!("planJson is not a valid plan: {e}")))
 }
 
 // ── the binding surface ────────────────────────────────────────────────────────
@@ -726,6 +756,15 @@ impl Core {
     #[napi]
     pub fn registry_roster() -> napi::Result<String> {
         serde_json::to_string(&wicked_core::registry_roster()).map_err(err)
+    }
+
+    /// Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
+    /// `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
+    /// so a launcher keys on this static's presence before it sends a plan — an older addon would
+    /// drop the plan and run the launch unplanned and ungated.
+    #[napi]
+    pub fn supports_plan_launch() -> bool {
+        true
     }
 
     /// What this process's engine knows about its connection to the bus file at `path`
@@ -1064,6 +1103,11 @@ impl Core {
     /// the cursor unit (default) or the first creator phase at/after it. A disagreement
     /// (`action=request_changes` with `approve=true`, `action=approve` with `approve=false`, an
     /// unknown token) rejects before the engine is asked.
+    ///
+    /// (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
+    /// edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
+    /// as the next plan rev (floor phases added, never refused for being below the floor) or, if it
+    /// refuses it, re-opens the gate with a new gate id.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn confirm_gate(
         &self,
@@ -1072,9 +1116,33 @@ impl Core {
         amend: Option<String>,
         action: Option<String>,
         amend_scope: Option<String>,
+        plan_json: Option<String>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
+            // (DES-TEAMING-002 T3) Approve a `plan_approval` gate WITH AN EDIT: `planJson` is the
+            // edited plan (`action` omitted or `edit_plan`, `approve=true`). The engine accepts it
+            // as the next rev or, refused, re-opens the gate.
+            if let Some(json) = plan_json.as_deref() {
+                if !approve || !matches!(action.as_deref(), None | Some("edit_plan")) {
+                    return Err(err(anyhow::anyhow!(
+                        "planJson answers a plan_approval gate with an edit: it requires \
+                         approve=true and action omitted or `edit_plan`"
+                    )));
+                }
+                let decision = HumanDecision::EditPlan {
+                    plan: parse_plan(json)?,
+                };
+                return core
+                    .confirm_gate(&run_id, decision)
+                    .map(status_token)
+                    .map_err(err);
+            }
+            if action.as_deref() == Some("edit_plan") {
+                return Err(err(anyhow::anyhow!(
+                    "action `edit_plan` needs the edited plan in planJson"
+                )));
+            }
             let scope = match amend_scope.as_deref() {
                 None | Some("cursor") => AmendScope::Cursor,
                 Some("creator") => AmendScope::Creator,
@@ -3367,6 +3435,17 @@ mod tests {
                 "inDiff",
                 "checkpointSeq",
             ],
+        );
+        // DES-TEAMING-002 T3: one engine-published team fact, exactly its bus row.
+        check(
+            CoreEvent::TeamFact {
+                session: s(),
+                event_type: "wicked.team.plan.proposed".to_string(),
+                key: s(),
+                payload: serde_json::json!({}),
+            },
+            "teamFact",
+            &["type", "session", "eventType", "key", "payload"],
         );
         // Review of #456 (F4/F6): the seat's write containment at distribution; a kept worktree.
         check(
