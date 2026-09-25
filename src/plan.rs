@@ -471,10 +471,12 @@ pub struct PlanStep {
     /// evaluator ≠ creator (it stays a property of the catalog).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<crate::workflow::PhaseRole>,
-    /// The record of who added the step ([`floor_fill`] sets it); `compose` ignores it.
+    /// The record of who added the step. Output-only: [`floor_fill`] writes it on every step and
+    /// refuses a plan that supplies it; `compose` ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<AddedBy>,
-    /// Why floor fill added the step (`"band 40-69 requires design"`); `compose` ignores it.
+    /// Why floor fill added the step (`"band 40-69 requires design"`). Output-only, as
+    /// `added_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_reason: Option<String>,
 }
@@ -534,6 +536,9 @@ pub enum PlanRefusal {
     /// A floor phase sits before a floor phase that precedes it in catalog order (§8.5: no step
     /// may reorder a floor phase before its catalog-order predecessors).
     FloorReordered { step: String, catalog: String },
+    /// The step supplies `added_by` or `floor_reason`: provenance is engine-written only, so an
+    /// author cannot forge a floor-added step.
+    ProvenanceSupplied { step: String, catalog: String },
 }
 
 impl PlanRefusal {
@@ -558,6 +563,7 @@ impl PlanRefusal {
             PlanRefusal::OverrideRemovesPinned { .. } => "override_removes_pinned",
             PlanRefusal::OverrideUnknownEntry { .. } => "override_unknown_entry",
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
+            PlanRefusal::ProvenanceSupplied { .. } => "provenance_supplied",
         }
     }
 }
@@ -645,6 +651,11 @@ impl std::fmt::Display for PlanRefusal {
                 "{r}: step {step} puts the floor phase {catalog} before a floor phase that \
                  precedes it in catalog order"
             ),
+            PlanRefusal::ProvenanceSupplied { step, catalog } => write!(
+                f,
+                "{r}: step {step} ({catalog}) supplies added_by or floor_reason — provenance is \
+                 written by floor fill only"
+            ),
         }
     }
 }
@@ -673,8 +684,8 @@ pub enum FieldRule {
     RunOnly,
     /// Never changes; the entry's own value is a no-op.
     Fixed,
-    /// A record of how the step entered the plan (`added_by`, `floor_reason`); constrains
-    /// nothing, and `compose` ignores it.
+    /// A record of how the step entered the plan (`added_by`, `floor_reason`). Output-only:
+    /// [`floor_fill`] refuses it on input and writes it itself; `compose` ignores it.
     Record,
 }
 
@@ -901,11 +912,23 @@ pub struct FloorFilled {
 /// Floor-fill a plan and compose it (DES-TEAMING-002 §8.5): every floor phase type missing from
 /// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
 /// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
+/// Every authored step comes out `added_by: plan`; a step that supplies provenance is refused.
 pub fn floor_fill(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
     input: FloorInput<'_>,
 ) -> Result<FloorFilled, PlanRefusal> {
+    // Provenance is output-only: an author never supplies `added_by` / `floor_reason`.
+    if let Some(s) = plan
+        .steps
+        .iter()
+        .find(|s| s.added_by.is_some() || s.floor_reason.is_some())
+    {
+        return Err(PlanRefusal::ProvenanceSupplied {
+            step: s.id.clone(),
+            catalog: s.catalog.clone(),
+        });
+    }
     let row = crate::review_scale::floor_for(input.score, input.destructive);
     let entry = |c: &str| catalog.iter().find(|e| e.id == c);
     // §8.5: a plan with no creator step has an empty floor and is never high risk.
@@ -950,7 +973,7 @@ pub fn floor_fill(
     let order = |c: &str| catalog.iter().position(|e| e.id == c);
     let mut steps: Vec<PlanStep> = plan.steps.clone();
     for s in &mut steps {
-        s.added_by.get_or_insert(AddedBy::Plan);
+        s.added_by = Some(AddedBy::Plan);
     }
     for (k, ty) in floor.iter().enumerate() {
         if exempt.contains(&ty.as_str()) || steps.iter().any(|s| &s.catalog == ty) {
