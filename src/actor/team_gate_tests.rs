@@ -1289,6 +1289,19 @@ fn t5_c_final_pass_timeout_pauses_team_dispute_and_a_late_fold_changes_nothing()
         payloads(&rig, "t5c", tev::LEDGER_FOLDED).is_empty(),
         "the worker never publishes ledger.folded"
     );
+    // The engine's gate facts are fire-and-forget through the publisher thread: the durable
+    // pause can be on record before its rows are on the bus, so wait (bounded) for them.
+    wait_for(
+        "the unit-review decision and the team_dispute gate on the bus",
+        || {
+            payloads(&rig, "t5c", tev::GATE_OPENED)
+                .iter()
+                .any(|p| p["kind"] == "team_dispute")
+                && payloads(&rig, "t5c", tev::GATE_DECIDED)
+                    .iter()
+                    .any(|p| p["kind"] == "unit_review")
+        },
+    );
     let opened = payloads(&rig, "t5c", tev::GATE_OPENED);
     let review: Vec<_> = opened
         .iter()
