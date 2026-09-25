@@ -573,8 +573,11 @@ pub struct LedgerMonitor {
 
 /// The per-attempt team record the final pass returns (DES §6.1 / §7 `teamLedger`, without the
 /// envelope S6 emits it in).
+///
+/// **Deserialized through [`TeamLedgerWire`]:** `teamPause` is computed, never read from input
+/// (a payload claiming `false`, or omitting it, cannot unpause an unresolved HIGH).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "TeamLedgerWire")]
 pub struct TeamLedger {
     pub final_pass: FinalPass,
     /// S6 sets it when the ledger is rendered into the judge's WORK payload.
@@ -612,6 +615,32 @@ impl TeamLedger {
     /// Recompute `teamPause` after the findings or `finalPass` changed.
     pub fn refresh_pause(&mut self) {
         self.team_pause = events::ledger_pauses(self);
+    }
+}
+
+/// [`TeamLedger`] as it arrives: every field that is a recorded fact, and no `teamPause` (an
+/// incoming one is ignored as an unknown key).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamLedgerWire {
+    final_pass: FinalPass,
+    rendered_to_judge: bool,
+    monitors: Vec<LedgerMonitor>,
+    findings: Vec<LedgerFinding>,
+    rejected: Rejected,
+}
+
+impl From<TeamLedgerWire> for TeamLedger {
+    fn from(w: TeamLedgerWire) -> Self {
+        let team_pause = events::pauses(w.final_pass, &w.findings);
+        TeamLedger {
+            final_pass: w.final_pass,
+            rendered_to_judge: w.rendered_to_judge,
+            monitors: w.monitors,
+            findings: w.findings,
+            rejected: w.rejected,
+            team_pause,
+        }
     }
 }
 
@@ -1731,8 +1760,11 @@ impl Severity {
 
 /// A confirmed monitor finding, as `monitorFinding` shapes it (DES §7): THE one finding type.
 /// S2's confirmation constructs it, the ledger embeds it ([`LedgerFinding`]), and S3 steers it.
+///
+/// **Deserialized through [`FindingWire`]:** `findingId` is computed from `path` and
+/// `evidence` ([`finding_id`]), never read from input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "FindingWire")]
 pub struct Finding {
     /// `"f-" + hex(sha256(path ‖ "\n" ‖ normalized evidence))[..16]` (DES §4.6 step 4).
     pub finding_id: String,
@@ -1754,6 +1786,41 @@ pub struct Finding {
     /// ledger's finding (DES §7 `teamLedger.findings[]`) carries no `checkpointSeq`.
     #[serde(skip)]
     pub checkpoint_seq: u64,
+}
+
+/// [`Finding`] as it arrives: no `findingId` (an incoming one is ignored and recomputed).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingWire {
+    monitor_id: String,
+    seat: String,
+    severity: Severity,
+    path: String,
+    line: u32,
+    evidence: String,
+    claim: String,
+    suggestion: Option<String>,
+    tree: String,
+    in_diff: bool,
+}
+
+impl From<FindingWire> for Finding {
+    fn from(w: FindingWire) -> Self {
+        Finding {
+            finding_id: finding_id(&w.path, &w.evidence),
+            monitor_id: w.monitor_id,
+            seat: w.seat,
+            severity: w.severity,
+            path: w.path,
+            line: w.line,
+            evidence: w.evidence,
+            claim: w.claim,
+            suggestion: w.suggestion,
+            tree: w.tree,
+            in_diff: w.in_diff,
+            checkpoint_seq: 0,
+        }
+    }
 }
 
 impl Finding {

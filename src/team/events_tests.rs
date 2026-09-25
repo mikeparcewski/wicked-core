@@ -1301,7 +1301,10 @@ fn an_unknown_severity_is_rejected_at_parse() {
 /// Every enum §6 documents is a closed set on the wire: an unknown token is refused at parse.
 #[test]
 fn an_unknown_token_in_any_enum_field_is_rejected_at_parse() {
-    let cases: [(&str, &str); 24] = [
+    // Computed fields are not in this list: they are recomputed at parse, so an incoming token
+    // there is ignored, not refused (`ledger.folded.final_pass`, `path.scored.plan`; see the
+    // computed-field tests). Their source fields are covered instead.
+    let cases: [(&str, &str); 23] = [
         (PATH_STARTED, "selection"),
         (PATH_SCORED, "basis"),
         (PLAN_PROPOSED, "kind"),
@@ -1321,7 +1324,6 @@ fn an_unknown_token_in_any_enum_field_is_rejected_at_parse() {
         (FINDING_SETTLED, "status"),
         (COUNCIL_CALLED, "trigger"),
         (COUNCIL_RULED, "verdict"),
-        (LEDGER_FOLDED, "final_pass"),
         (LEDGER_FOLDED, "transport"),
         (GATE_DECIDED, "kind"),
         (GATE_DECIDED, "decision"),
@@ -1337,7 +1339,7 @@ fn an_unknown_token_in_any_enum_field_is_rejected_at_parse() {
         );
     }
     let nested: [(&str, &[&str]); 8] = [
-        (PATH_SCORED, &["plan", "depth"]),
+        (LEDGER_FOLDED, &["ledger", "finalPass"]),
         (PLAN_PROPOSED, &["steps", "2", "owner"]),
         (PLAN_ACCEPTED, &["steps", "0", "added_by"]),
         (GATE_OPENED, &["ledger_source"]),

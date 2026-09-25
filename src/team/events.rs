@@ -604,8 +604,9 @@ pub struct ScorePlan {
     pub post_hoc_other_cli: bool,
 }
 
-/// 2 — `path.scored` (E).
+/// 2 — `path.scored` (E). `score` and `plan` are computed at parse (S4's rule), never read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "PathScoredWire")]
 pub struct PathScored {
     /// [`score_source_intent`] | [`score_source_diff`].
     pub score_source: String,
@@ -730,8 +731,10 @@ pub struct CheckpointReached {
     pub paths: Vec<String>,
 }
 
-/// 11 — `finding.raised` (S; the envelope's `by` is the authoring member's seat).
+/// 11 — `finding.raised` (S; the envelope's `by` is the authoring member's seat). `finding_id` is
+/// computed at parse from `path` and `evidence`, never read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "FindingRaisedWire")]
 pub struct FindingRaised {
     /// S's per-attempt emission counter: the key.
     pub raise_seq: u32,
@@ -883,7 +886,10 @@ pub struct TranscriptRow {
     pub payload: Value,
 }
 
+/// `count` is the attempt's row count: computed as `events.len()` at parse unless `truncated`
+/// (then it is the uncapped total, a fact the capped list cannot give).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "TranscriptWire")]
 pub struct Transcript {
     pub from_event_id: i64,
     pub to_event_id: i64,
@@ -893,8 +899,10 @@ pub struct Transcript {
     pub events: Vec<TranscriptRow>,
 }
 
-/// 22 — `ledger.folded` (S).
+/// 22 — `ledger.folded` (S). `final_pass` mirrors the embedded ledger's and is taken from it at
+/// parse, never read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "LedgerFoldedWire")]
 pub struct LedgerFolded {
     pub final_pass: FinalPass,
     pub ledger: TeamLedger,
@@ -962,6 +970,142 @@ pub struct GateDecided {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathEnded {
     pub status: PathStatus,
+}
+
+// ── Wire mirrors: computed fields are never read from input (review of #616, round 5) ────────────
+//
+// Each type below deserializes through a mirror that omits its computed fields (an incoming one
+// is ignored as an unknown key) and recomputes them. The computed fields:
+//   TeamLedger.teamPause            ⇐ pauses(finalPass, findings)          (team.rs)
+//   Finding.findingId               ⇐ finding_id(path, evidence)           (team.rs)
+//   FindingRaised.finding_id        ⇐ finding_id(path, evidence)
+//   PathScored.score                ⇐ min(100, deterministic + model.add)
+//   PathScored.plan                 ⇐ S4 plan_for(score)
+//   LedgerFolded.final_pass         ⇐ ledger.finalPass
+//   Transcript.count                ⇐ events.len() unless truncated
+//   HelpRequested.help_id           ⇐ mint_help_id(…, help_seq)            (from_payload)
+
+#[derive(Deserialize)]
+struct PathScoredWire {
+    score_source: String,
+    basis: ScoreBasis,
+    deterministic: u8,
+    reasons: Vec<String>,
+    model: Option<ScoreModel>,
+    signals: Option<ScoreSignals>,
+    tree: Option<String>,
+}
+
+impl From<PathScoredWire> for PathScored {
+    fn from(w: PathScoredWire) -> Self {
+        let add = w.model.as_ref().map_or(0, |m| m.add);
+        let score = w.deterministic.saturating_add(add).min(100);
+        let p = crate::review_scale::plan_for(score);
+        PathScored {
+            score_source: w.score_source,
+            basis: w.basis,
+            score,
+            deterministic: w.deterministic,
+            reasons: w.reasons,
+            model: w.model,
+            signals: w.signals,
+            plan: ScorePlan {
+                monitors: p.monitors,
+                depth: match p.depth {
+                    crate::review_scale::Depth::None => ScoreDepth::None,
+                    crate::review_scale::Depth::Standard => ScoreDepth::Standard,
+                    crate::review_scale::Depth::Deep => ScoreDepth::Deep,
+                },
+                post_hoc_reviewer: p.post_hoc_reviewer,
+                post_hoc_other_cli: p.post_hoc_other_cli,
+            },
+            tree: w.tree,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FindingRaisedWire {
+    raise_seq: u32,
+    member_id: String,
+    line_key: Option<String>,
+    anchor: Option<String>,
+    anchor_source: Option<AnchorSource>,
+    severity: Severity,
+    path: String,
+    line: u32,
+    evidence: String,
+    claim: String,
+    suggestion: Option<String>,
+    tree: String,
+    in_diff: bool,
+    corroborated_by: Vec<String>,
+}
+
+impl From<FindingRaisedWire> for FindingRaised {
+    fn from(w: FindingRaisedWire) -> Self {
+        FindingRaised {
+            raise_seq: w.raise_seq,
+            finding_id: super::finding_id(&w.path, &w.evidence),
+            member_id: w.member_id,
+            line_key: w.line_key,
+            anchor: w.anchor,
+            anchor_source: w.anchor_source,
+            severity: w.severity,
+            path: w.path,
+            line: w.line,
+            evidence: w.evidence,
+            claim: w.claim,
+            suggestion: w.suggestion,
+            tree: w.tree,
+            in_diff: w.in_diff,
+            corroborated_by: w.corroborated_by,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TranscriptWire {
+    from_event_id: i64,
+    to_event_id: i64,
+    count: u32,
+    truncated: bool,
+    events: Vec<TranscriptRow>,
+}
+
+impl From<TranscriptWire> for Transcript {
+    fn from(w: TranscriptWire) -> Self {
+        let count = if w.truncated {
+            w.count
+        } else {
+            u32::try_from(w.events.len()).unwrap_or(u32::MAX)
+        };
+        Transcript {
+            from_event_id: w.from_event_id,
+            to_event_id: w.to_event_id,
+            count,
+            truncated: w.truncated,
+            events: w.events,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LedgerFoldedWire {
+    ledger: TeamLedger,
+    transport: Transport,
+    transcript: Transcript,
+}
+
+impl From<LedgerFoldedWire> for LedgerFolded {
+    fn from(w: LedgerFoldedWire) -> Self {
+        LedgerFolded {
+            final_pass: w.ledger.final_pass,
+            ledger: w.ledger,
+            transport: w.transport,
+            transcript: w.transcript,
+        }
+    }
 }
 
 macro_rules! bodies {
@@ -1059,7 +1203,14 @@ impl TeamEvent {
     /// Parse a bus row's payload for `event_type`.
     pub fn from_payload(event_type: &str, payload: &Value) -> Result<Self> {
         let env: Envelope = serde_json::from_value(payload.clone())?;
-        let body = TeamBody::from_value(event_type, payload.clone())?;
+        let mut body = TeamBody::from_value(event_type, payload.clone())?;
+        // A computed id is never read from input: help_id is minted from the producer's counter.
+        if let TeamBody::HelpRequested(b) = &mut body {
+            let (Some(ord), Some(attempt)) = (env.ord, env.attempt) else {
+                bail!("{event_type} needs `ord` and `attempt` to mint its help_id");
+            };
+            b.help_id = mint_help_id(&env.run_id, ord, attempt, &env.by, b.help_seq);
+        }
         let ev = TeamEvent { env, body };
         // A row whose key cannot be built (a keyed type with a null `ord`/`attempt`) is refused:
         // it could be neither deduplicated nor attributed to its attempt.
