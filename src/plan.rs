@@ -2227,6 +2227,73 @@ mod tests {
             assert!(serde_json::from_value::<PlanSteps>(exact).is_err());
         }
 
+        /// codex on #619 (HIGH): a floor-inserted step declares what it consumes. An evaluator
+        /// depends on every creator before it; `deliver` on the step before it; a design-style
+        /// step declares nothing, exactly like an authored step with no `depends_on`.
+        #[test]
+        fn t2_floor_inserted_steps_depend_on_what_they_consume() {
+            let cmd = deliver_cmd();
+            let deps = |f: &FloorFilled| -> Vec<(String, Vec<String>)> {
+                f.def
+                    .phases
+                    .iter()
+                    .map(|p| (p.id.clone(), p.depends_on.clone()))
+                    .collect()
+            };
+            let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "api"},
+                {"catalog": "build", "id": "ui"}
+            ]}));
+            let f = fill(&p, 50, &AUTO, Some(&cmd)).unwrap();
+            assert_eq!(
+                deps(&f),
+                [
+                    ("test_plan".to_string(), s(&[])),
+                    ("design".to_string(), s(&[])),
+                    ("api".to_string(), s(&[])),
+                    ("ui".to_string(), s(&[])),
+                    ("review".to_string(), s(&["api", "ui"])),
+                    ("deliver".to_string(), s(&["review"])),
+                ]
+            );
+            // At 70-100 the security review evaluates the creators too, not the review.
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = fill(&p, 80, &AUTO, None).unwrap();
+            let sec = f
+                .def
+                .phases
+                .iter()
+                .find(|p| p.id == "security_review")
+                .unwrap();
+            assert_eq!(sec.depends_on, ["build"]);
+            // Non-code: the floor-added critique depends on the produce step.
+            let p = plan(json!({"steps": [{"catalog": "produce", "id": "draft"}]}));
+            let f = fill(&p, 30, &AUTO, None).unwrap();
+            assert_eq!(f.def.phases[1].depends_on, ["draft"]);
+        }
+
+        /// codex on #619 (MEDIUM): an override target must be a phase of the computed floor. A
+        /// non-floor target is refused by name; the pinned high-risk rule applies to floor phases.
+        #[test]
+        fn t2_an_override_target_must_be_in_the_floor() {
+            // `test` is pinned but not in the 70-100 floor: not_in_floor, not removes_pinned.
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                "override": {"remove": ["test"], "reason": "r"}}));
+            let r = fill(&p, 80, &MANUAL, None).unwrap_err();
+            assert_eq!(r.reason(), "override_not_in_floor", "{r}");
+            // Unpinned and not in the floor (architecture at 20-39): refused the same way.
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                "override": {"remove": ["architecture"], "reason": "r"}}));
+            let r = fill(&p, 30, &MANUAL, None).unwrap_err();
+            assert_eq!(r.reason(), "override_not_in_floor", "{r}");
+            // A real pinned floor phase in a high-risk band is still refused as pinned.
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                                "override": {"remove": ["security_review"], "reason": "r"}}));
+            let r = fill(&p, 80, &MANUAL, None).unwrap_err();
+            assert_eq!(r.reason(), "override_removes_pinned", "{r}");
+        }
+
         /// T2 (g), the plan half: `POST /runs {plan:{steps:[{catalog:"build"}]}}` with `touch`
         /// omitted or `[]` parses, has a creator, and at the no-scope score (100) gets the 70-100
         /// floor and high risk; `understand` alone has no creator.

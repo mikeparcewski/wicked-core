@@ -14955,6 +14955,49 @@ mod prior_context_tests {
         assert!(prior_context_label(&current, &later_other, "claude").is_none());
     }
 
+    /// T2 (codex on #619, HIGH): a floor-inserted evaluator declares the creator it evaluates, so
+    /// on a single-CLI run the floor-added `review` of a `{build}` plan at score 30 is handed the
+    /// build's output instead of running blind.
+    #[test]
+    fn a_floor_inserted_review_is_handed_the_build_it_evaluates() {
+        let plan: crate::plan::PlanSteps = serde_json::from_value(
+            serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]}),
+        )
+        .unwrap();
+        let filled = crate::plan::floor_fill(
+            crate::catalog::catalog(),
+            &plan,
+            crate::plan::FloorInput {
+                score: 30,
+                destructive: false,
+                human_confirm: &crate::domain::HumanConfirm::None,
+                deliver: None,
+            },
+        )
+        .unwrap();
+        let units = crate::plan::plan_from_def(&filled.def, "intent", "s");
+        let ids: Vec<_> = units.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(ids, ["s:build", "s:review"]);
+        assert_eq!(units[1].depends_on, ["build"]);
+        let label = prior_context_label(&units[1], &units[0], "claude")
+            .expect("the floor-added review is handed the build");
+        assert!(label.contains("depends_on `build`"), "{label}");
+    }
+
+    /// Authored semantics are unchanged (C1): an AUTHORED review with no `depends_on` after an
+    /// authored build declares nothing, so on a single CLI it gets no prior context, as today.
+    #[test]
+    fn an_authored_step_without_depends_on_still_declares_nothing() {
+        let plan: crate::plan::PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "build"}, {"catalog": "review", "id": "review"}
+        ]}))
+        .unwrap();
+        let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
+        let units = crate::plan::plan_from_def(&def, "intent", "s");
+        assert!(units[1].depends_on.is_empty());
+        assert!(prior_context_label(&units[1], &units[0], "claude").is_none());
+    }
+
     /// Prose-planned units carry `u<ord>` ids and no declarations; nothing is invented for them. The
     /// pre-existing cross-CLI behaviour is all they get.
     #[test]
