@@ -36,10 +36,33 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::event::CoreEvent;
+
+/// A closed wire token set: one variant per token, serialized as exactly that token, and an
+/// unknown token refused at parse (a typed field never travels as a free string).
+macro_rules! wire_enum {
+    ($(#[$m:meta])* $vis:vis enum $name:ident { $($(#[$vm:meta])* $var:ident = $tok:literal),+ $(,)? }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+        $vis enum $name {
+            $($(#[$vm])* #[serde(rename = $tok)] $var,)+
+        }
+
+        impl $name {
+            /// The wire token.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $($name::$var => $tok,)+
+                }
+            }
+        }
+    };
+}
+
+pub mod events;
 
 // ── Constants (DES §4.8; env-overridable for rigs only) ──────────────────────────────────────────
 
@@ -302,7 +325,7 @@ pub struct RawFinding {
 
 /// The ledger's `rejected` counters: every `FINDING` line that did not surface, by the first
 /// check it failed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rejected {
     pub malformed: u32,
@@ -430,28 +453,98 @@ pub fn locate(file: Option<&str>, line: u32, evidence: &str) -> Option<u32> {
         .min_by_key(|n| n.abs_diff(line))
 }
 
+wire_enum! {
+    /// How the attempt's final pass ended (DES-001 §7 `teamLedger.finalPass`; DES-002 §6 #22).
+    pub enum FinalPass {
+        Completed = "completed",
+        TimedOut = "timed_out",
+        Skipped = "skipped",
+        /// Rows of the attempt are missing from the stream: an incomplete record (DES-002 §4.7).
+        StreamGap = "stream_gap",
+    }
+}
+
+wire_enum! {
+    /// `teamLedger.monitors[].status` (and `member.left.status`).
+    pub enum MonitorStatus {
+        Completed = "completed",
+        BudgetExhausted = "budget_exhausted",
+        Failed = "failed",
+        TimedOut = "timed_out",
+    }
+}
+
+wire_enum! {
+    /// `teamLedger.findings[].delivery`.
+    pub enum LedgerDelivery {
+        Injected = "injected",
+        NotDelivered = "not_delivered",
+    }
+}
+
+wire_enum! {
+    /// `teamLedger.findings[].status`.
+    pub enum FindingStatus {
+        Accepted = "accepted",
+        Declined = "declined",
+        Withdrawn = "withdrawn",
+        Unanswered = "unanswered",
+        Superseded = "superseded",
+    }
+}
+
+wire_enum! {
+    /// `monitorReply.kind`: the monitor's hold-round answer.
+    pub enum ReplyKind {
+        Hold = "hold",
+        Withdraw = "withdraw",
+    }
+}
+
+wire_enum! {
+    /// A council's verdict (`dispute.verdict`, `council.ruled.verdict`). `NoVerdict` spells the
+    /// DES token `no_verdict`.
+    #[allow(clippy::enum_variant_names)]
+    pub enum Verdict {
+        Yes = "yes",
+        No = "no",
+        NoVerdict = "no_verdict",
+    }
+}
+
+wire_enum! {
+    /// Why a council produced no verdict (DES-001 §6.3).
+    pub enum NoVerdictReason {
+        NoQuorum = "no_quorum",
+        SeatsBenched = "seats_benched",
+        Error = "error",
+        Timeout = "timeout",
+        Cap = "cap",
+    }
+}
+
 /// A monitor's answer on a declined finding at the final pass (S3/S6 fill it).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorReply {
-    pub kind: String,
+    pub kind: ReplyKind,
     pub reason: String,
 }
 
 /// A one-off council's verdict on a dispute (S6 fills it).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dispute {
-    pub verdict: String,
+    pub verdict: Verdict,
     pub agreement_pct: Option<u8>,
     pub dissent: Option<u32>,
     pub seats: Vec<String>,
-    pub reason: Option<String>,
+    pub reason: Option<NoVerdictReason>,
 }
 
 /// One finding in the ledger (DES §7 `teamLedger.findings[]`). S2 fills everything it owns;
 /// `delivery`, `workerReason`, `monitorReply` and `dispute` keep their S2 defaults
 /// (`not_delivered` / `null`) until S3 and S6 write them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerFinding {
     /// The finding as it was confirmed and emitted (`monitorFinding`, DES §7), flattened.
@@ -460,37 +553,95 @@ pub struct LedgerFinding {
     pub final_line: Option<u32>,
     /// The SEATS of the other monitors that raised the same finding (they are parties to it).
     pub corroborated_by: Vec<String>,
-    pub delivery: String,
-    pub status: String,
+    pub delivery: LedgerDelivery,
+    pub status: FindingStatus,
     pub worker_reason: Option<String>,
     pub monitor_reply: Option<MonitorReply>,
     pub dispute: Option<Dispute>,
 }
 
 /// One monitor in the ledger (DES §7 `teamLedger.monitors[]`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerMonitor {
     pub monitor_id: String,
     pub seat: String,
     pub batches: u32,
-    /// `completed` | `budget_exhausted` | `failed` | `timed_out`.
-    pub status: String,
+    pub status: MonitorStatus,
     pub error: Option<String>,
 }
 
 /// The per-attempt team record the final pass returns (DES §6.1 / §7 `teamLedger`, without the
 /// envelope S6 emits it in).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// **Deserialized through [`TeamLedgerWire`]:** `teamPause` is computed, never read from input
+/// (a payload claiming `false`, or omitting it, cannot unpause an unresolved HIGH).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "TeamLedgerWire")]
 pub struct TeamLedger {
-    /// `completed` | `timed_out` | `skipped`.
-    pub final_pass: String,
+    pub final_pass: FinalPass,
     /// S6 sets it when the ledger is rendered into the judge's WORK payload.
     pub rendered_to_judge: bool,
     pub monitors: Vec<LedgerMonitor>,
     pub findings: Vec<LedgerFinding>,
     pub rejected: Rejected,
+    /// Whether the ledger holds an unresolved HIGH without a council YES (DES-TEAMING-001 §6.7):
+    /// the run may not continue unattended. [`events::fold`] decides it from the stream.
+    #[serde(default)]
+    pub team_pause: bool,
+}
+
+impl TeamLedger {
+    /// The one constructor: `teamPause` is computed from the ledger's own contents
+    /// ([`events::pauses`]), never passed in, so no path can build an unpaused ledger that
+    /// holds an unresolved HIGH. `renderedToJudge` starts false (S6 sets it when it renders).
+    pub fn new(
+        final_pass: FinalPass,
+        monitors: Vec<LedgerMonitor>,
+        findings: Vec<LedgerFinding>,
+        rejected: Rejected,
+    ) -> Self {
+        let team_pause = events::pauses(final_pass, &findings);
+        TeamLedger {
+            final_pass,
+            rendered_to_judge: false,
+            monitors,
+            findings,
+            rejected,
+            team_pause,
+        }
+    }
+
+    /// Recompute `teamPause` after the findings or `finalPass` changed.
+    pub fn refresh_pause(&mut self) {
+        self.team_pause = events::ledger_pauses(self);
+    }
+}
+
+/// [`TeamLedger`] as it arrives: every field that is a recorded fact, and no `teamPause` (an
+/// incoming one is ignored as an unknown key).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamLedgerWire {
+    final_pass: FinalPass,
+    rendered_to_judge: bool,
+    monitors: Vec<LedgerMonitor>,
+    findings: Vec<LedgerFinding>,
+    rejected: Rejected,
+}
+
+impl From<TeamLedgerWire> for TeamLedger {
+    fn from(w: TeamLedgerWire) -> Self {
+        let team_pause = events::pauses(w.final_pass, &w.findings);
+        TeamLedger {
+            final_pass: w.final_pass,
+            rendered_to_judge: w.rendered_to_judge,
+            monitors: w.monitors,
+            findings: w.findings,
+            rejected: w.rejected,
+            team_pause,
+        }
+    }
 }
 
 /// What [`FindingBook::admit`] did with a confirmed, above-bar finding.
@@ -536,8 +687,8 @@ impl FindingBook {
             finding,
             final_line: None,
             corroborated_by: Vec::new(),
-            delivery: "not_delivered".to_string(),
-            status: "unanswered".to_string(),
+            delivery: LedgerDelivery::NotDelivered,
+            status: FindingStatus::Unanswered,
             worker_reason: None,
             monitor_reply: None,
             dispute: None,
@@ -952,33 +1103,32 @@ impl UnitTeam {
     }
 
     /// The ledger as it stands.
-    pub fn ledger(&self, final_pass: &str) -> TeamLedger {
-        TeamLedger {
-            final_pass: final_pass.to_string(),
-            rendered_to_judge: false,
-            monitors: self
-                .monitors
-                .iter()
-                .map(|m| LedgerMonitor {
-                    monitor_id: m.id.clone(),
-                    seat: m.seat.clone(),
-                    batches: m.batches,
-                    status: if m.state == SlotState::Failed {
-                        "failed"
-                    } else if m.budget_exhausted {
-                        "budget_exhausted"
-                    } else if m.timed_out {
-                        "timed_out"
-                    } else {
-                        "completed"
-                    }
-                    .to_string(),
-                    error: m.error.clone(),
-                })
-                .collect(),
-            findings: self.book.findings.clone(),
-            rejected: self.book.rejected,
-        }
+    pub fn ledger(&self, final_pass: FinalPass) -> TeamLedger {
+        let monitors = self
+            .monitors
+            .iter()
+            .map(|m| LedgerMonitor {
+                monitor_id: m.id.clone(),
+                seat: m.seat.clone(),
+                batches: m.batches,
+                status: if m.state == SlotState::Failed {
+                    MonitorStatus::Failed
+                } else if m.budget_exhausted {
+                    MonitorStatus::BudgetExhausted
+                } else if m.timed_out {
+                    MonitorStatus::TimedOut
+                } else {
+                    MonitorStatus::Completed
+                },
+                error: m.error.clone(),
+            })
+            .collect();
+        TeamLedger::new(
+            final_pass,
+            monitors,
+            self.book.findings.clone(),
+            self.book.rejected,
+        )
     }
 }
 
@@ -1357,13 +1507,13 @@ pub fn final_pass(
     if !ok {
         let u = unit.lock().unwrap_or_else(|p| p.into_inner());
         close_all(&u);
-        return u.ledger("skipped");
+        return u.ledger(FinalPass::Skipped);
     }
     let (repo, jobs) = {
         let mut u = unit.lock().unwrap_or_else(|p| p.into_inner());
         let Some(repo) = u.ctx.repo.clone() else {
             u.summon(host, emit);
-            return u.ledger("skipped");
+            return u.ledger(FinalPass::Skipped);
         };
         let t_final = match repo.snapshot() {
             Ok(t) => t,
@@ -1372,7 +1522,7 @@ pub fn final_pass(
                     m.error = Some(format!("final snapshot failed: {e}"));
                 }
                 close_all(&u);
-                return u.ledger("skipped");
+                return u.ledger(FinalPass::Skipped);
             }
         };
         u.summon(host, emit);
@@ -1423,12 +1573,16 @@ pub fn final_pass(
             Some(n) => f.final_line = Some(n),
             None => {
                 f.final_line = None;
-                f.status = "superseded".to_string();
+                f.status = FindingStatus::Superseded;
             }
         }
     }
     close_all(&u);
-    u.ledger(if timed_out { "timed_out" } else { "completed" })
+    u.ledger(if timed_out {
+        FinalPass::TimedOut
+    } else {
+        FinalPass::Completed
+    })
 }
 
 // ── The supervisor thread (DES §3, §4.2) ──────────────────────────────────────────────────────────
@@ -1485,7 +1639,7 @@ impl TeamHandle {
             Err(_) => Some(
                 unit.lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .ledger("timed_out"),
+                    .ledger(FinalPass::TimedOut),
             ),
         }
     }
@@ -1578,6 +1732,14 @@ impl serde::Serialize for Severity {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for Severity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Severity::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("severity `{s}` is below the bar")))
+    }
+}
+
 impl Severity {
     /// The bar (DES §4.6 step 2): `high` | `medium`; anything else is below it.
     pub(crate) fn parse(s: &str) -> Option<Self> {
@@ -1598,8 +1760,11 @@ impl Severity {
 
 /// A confirmed monitor finding, as `monitorFinding` shapes it (DES §7): THE one finding type.
 /// S2's confirmation constructs it, the ledger embeds it ([`LedgerFinding`]), and S3 steers it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// **Deserialized through [`FindingWire`]:** `findingId` is computed from `path` and
+/// `evidence` ([`finding_id`]), never read from input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", from = "FindingWire")]
 pub struct Finding {
     /// `"f-" + hex(sha256(path ‖ "\n" ‖ normalized evidence))[..16]` (DES §4.6 step 4).
     pub finding_id: String,
@@ -1621,6 +1786,41 @@ pub struct Finding {
     /// ledger's finding (DES §7 `teamLedger.findings[]`) carries no `checkpointSeq`.
     #[serde(skip)]
     pub checkpoint_seq: u64,
+}
+
+/// [`Finding`] as it arrives: no `findingId` (an incoming one is ignored and recomputed).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingWire {
+    monitor_id: String,
+    seat: String,
+    severity: Severity,
+    path: String,
+    line: u32,
+    evidence: String,
+    claim: String,
+    suggestion: Option<String>,
+    tree: String,
+    in_diff: bool,
+}
+
+impl From<FindingWire> for Finding {
+    fn from(w: FindingWire) -> Self {
+        Finding {
+            finding_id: finding_id(&w.path, &w.evidence),
+            monitor_id: w.monitor_id,
+            seat: w.seat,
+            severity: w.severity,
+            path: w.path,
+            line: w.line,
+            evidence: w.evidence,
+            claim: w.claim,
+            suggestion: w.suggestion,
+            tree: w.tree,
+            in_diff: w.in_diff,
+            checkpoint_seq: 0,
+        }
+    }
 }
 
 impl Finding {

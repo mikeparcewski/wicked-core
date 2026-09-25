@@ -357,7 +357,7 @@ fn only_a_finding_confirmed_at_its_file_line_in_the_snapshot_tree_is_emitted() {
         }]
     );
     let unit = core.take(fx.ctx(1, &["claude#2"]));
-    let ledger = unit.lock().unwrap().ledger("completed");
+    let ledger = unit.lock().unwrap().ledger(FinalPass::Completed);
     assert_eq!(
         ledger.rejected,
         Rejected {
@@ -566,7 +566,7 @@ fn dedup_is_on_line_text_across_monitors_and_low_is_below_the_bar() {
         .take(fx.ctx(2, &["claude#2", "claude#3"]))
         .lock()
         .unwrap()
-        .ledger("completed");
+        .ledger(FinalPass::Completed);
     assert_eq!(ledger.findings.len(), 1);
     assert_eq!(
         ledger.findings[0].corroborated_by,
@@ -676,8 +676,8 @@ fn max_batches_exhaustion_is_disclosed_in_the_ledger() {
         .take(fx.ctx(1, &["claude#2"]))
         .lock()
         .unwrap()
-        .ledger("completed");
-    assert_eq!(ledger.monitors[0].status, "budget_exhausted");
+        .ledger(FinalPass::Completed);
+    assert_eq!(ledger.monitors[0].status, MonitorStatus::BudgetExhausted);
     assert_eq!(ledger.monitors[0].batches, 2);
 }
 
@@ -711,7 +711,7 @@ fn the_final_pass_reviews_the_settled_tree_and_reconfirms_every_finding() {
         Instant::now() + Duration::from_secs(60),
     );
     assert_eq!(findings(&seen).len(), 2);
-    assert_eq!(ledger.final_pass, "completed");
+    assert_eq!(ledger.final_pass, FinalPass::Completed);
     assert_eq!(ledger.monitors[0].batches, 1);
     // Now the worker keeps editing: a line lands above `fn a`, and `let x = 5;` is removed.
     fx.write("src/lib.rs", "// header\nfn a() {}\nfn b() {\n}\n");
@@ -723,16 +723,16 @@ fn the_final_pass_reviews_the_settled_tree_and_reconfirms_every_finding() {
         true,
         Instant::now() + Duration::from_secs(60),
     );
-    let by_line: Vec<(u32, Option<u32>, String)> = again
+    let by_line: Vec<(u32, Option<u32>, FindingStatus)> = again
         .findings
         .iter()
-        .map(|f| (f.finding.line, f.final_line, f.status.clone()))
+        .map(|f| (f.finding.line, f.final_line, f.status))
         .collect();
     assert_eq!(
         by_line,
         vec![
-            (1, Some(2), "unanswered".to_string()),
-            (3, None, "superseded".to_string()),
+            (1, Some(2), FindingStatus::Unanswered),
+            (3, None, FindingStatus::Superseded),
         ]
     );
 }
@@ -788,9 +788,9 @@ DONE"#
         .take(fx.ctx(1, &["claude#2"]))
         .lock()
         .unwrap()
-        .ledger("completed");
+        .ledger(FinalPass::Completed);
     assert_eq!(ledger.monitors[0].batches, 2);
-    assert_eq!(ledger.monitors[0].status, "completed");
+    assert_eq!(ledger.monitors[0].status, MonitorStatus::Completed);
 }
 
 /// codex review of #609 r2 (MEDIUM): `evidence` IS the line text, so a quote over the 512 B cap
@@ -828,7 +828,7 @@ fn an_evidence_quote_over_the_cap_is_unconfirmed_never_truncated() {
         .take(fx.ctx(1, &["claude#2"]))
         .lock()
         .unwrap()
-        .ledger("completed");
+        .ledger(FinalPass::Completed);
     assert_eq!(
         ledger.rejected,
         Rejected {
@@ -863,6 +863,42 @@ fn a_failed_unit_skips_the_final_pass() {
         false,
         Instant::now() + Duration::from_secs(60),
     );
-    assert_eq!(ledger.final_pass, "skipped");
+    assert_eq!(ledger.final_pass, FinalPass::Skipped);
     assert_eq!(host.turns.load(Ordering::Relaxed), 0);
+}
+
+/// codex round 4 (#616): the LIVE final-pass ledger computes `teamPause` like the fold does. A
+/// live attempt holding an unaccepted HIGH (no ADVICE answer, no hold-round reply) serializes
+/// paused; the same ledger with only a MEDIUM does not.
+#[test]
+fn a_live_ledger_with_an_unaccepted_high_is_paused() {
+    let live = |severity: &str| {
+        let fx = Fixture::new(&format!("live-pause-{severity}"));
+        let host = Arc::new(FakeHost::default());
+        host.replies.lock().unwrap().insert(
+            "m1".into(),
+            format!(
+                "FINDING {{\"severity\":\"{severity}\",\"path\":\"src/lib.rs\",\"line\":3,\"evidence\":\"    let x = 2;\",\"claim\":\"x is never read\",\"suggestion\":null}}\nDONE"
+            ),
+        );
+        let (emit, seen) = recorder();
+        let mut core = TeamCore::new(host.clone(), emit.clone(), TeamLimits::default());
+        core.attach(fx.ctx(1, &["claude#2"]));
+        fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+        core.on_event(&checkpoint(7, "edit"));
+        pump(&mut core, &host, &emit, Instant::now());
+        assert_eq!(findings(&seen).len(), 1, "{severity}: one finding raised");
+        let unit = core.take(fx.ctx(1, &["claude#2"]));
+        let ledger = unit.lock().unwrap().ledger(FinalPass::Completed);
+        ledger
+    };
+    let high = live("high");
+    assert_eq!(high.findings[0].status, FindingStatus::Unanswered);
+    assert!(high.team_pause, "an unaccepted HIGH pauses the live ledger");
+    assert_eq!(
+        serde_json::to_value(&high).unwrap()["teamPause"],
+        json!(true),
+        "and it serializes paused"
+    );
+    assert!(!live("medium").team_pause, "a MEDIUM alone does not pause");
 }

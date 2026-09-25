@@ -11,37 +11,62 @@
 
 | Constant | Event type | Declared at | In apps-core `EVENT_CATALOG` | Emit seam (non-test) |
 |---|---|---|---|---|
-| `EV_AGENT_PLAN_CREATED` | `wicked.crew.agent_plan.created` | `crates/wicked-apps-core/src/lib.rs:193` | yes | — |
-| `EV_AGENT_SESSION_COMPLETED` | `wicked.crew.agent_session.completed` | `crates/wicked-apps-core/src/lib.rs:196` | yes | — |
-| `EV_AGENT_SESSION_STARTED` | `wicked.crew.agent_session.started` | `crates/wicked-apps-core/src/lib.rs:192` | yes | — |
-| `EV_AGENT_TASK_COMPLETED` | `wicked.crew.agent_task.completed` | `crates/wicked-apps-core/src/lib.rs:195` | yes | — |
-| `EV_AGENT_WORK_DISTRIBUTED` | `wicked.crew.agent_work.distributed` | `crates/wicked-apps-core/src/lib.rs:194` | yes | — |
-| `EV_CLI_RANKED` | `wicked.crew.cli.ranked` | `crates/wicked-apps-core/src/lib.rs:188` | yes | `crates/wicked-council/src/worker.rs` |
-| `EV_CONFORMANCE_RECORDED` | `wicked.crew.conformance.recorded` | `crates/wicked-apps-core/src/lib.rs:166` | yes | — |
-| `EV_CONFORMANCE_RECORDED_LITERAL` | `wicked.crew.governance.conformance_recorded` | `crates/wicked-governance/src/engine.rs:42` | no | `crates/wicked-governance/src/engine.rs` |
-| `EV_COUNCIL_DELIBERATED` | `wicked.crew.council.deliberated` | `crates/wicked-apps-core/src/lib.rs:181` | yes | `crates/wicked-council/src/worker.rs` |
-| `EV_COUNCIL_REQUESTED` | `wicked.crew.council.requested` | `crates/wicked-apps-core/src/lib.rs:178` | yes | `crates/wicked-council/src/worker.rs` |
-| `EV_COUNCIL_SEAT_FAILED` | `wicked.crew.council_seat.failed` | `crates/wicked-apps-core/src/lib.rs:187` | yes | `crates/wicked-council/src/worker.rs` |
-| `EV_COUNCIL_VOTED` | `wicked.crew.council.voted` | `crates/wicked-apps-core/src/lib.rs:179` | yes | `crates/wicked-council/src/worker.rs` |
+| `ADVICE_ANSWERED` | `wicked.team.advice.answered` | `src/team/events.rs:56` | no | — |
+| `ADVICE_DELIVERED` | `wicked.team.advice.delivered` | `src/team/events.rs:55` | no | — |
+| `CHANGE_REQUESTED` | `wicked.team.change.requested` | `src/team/events.rs:59` | no | — |
+| `CHECKPOINT_REACHED` | `wicked.team.checkpoint.reached` | `src/team/events.rs:53` | no | — |
+| `COUNCIL_CALLED` | `wicked.team.council.called` | `src/team/events.rs:63` | no | — |
+| `COUNCIL_RULED` | `wicked.team.council.ruled` | `src/team/events.rs:64` | no | — |
+| `EV_AGENT_PLAN_CREATED` | `wicked.crew.agent_plan.created` | `crates/wicked-apps-core/src/lib.rs:195` | yes | — |
+| `EV_AGENT_SESSION_COMPLETED` | `wicked.crew.agent_session.completed` | `crates/wicked-apps-core/src/lib.rs:198` | yes | — |
+| `EV_AGENT_SESSION_STARTED` | `wicked.crew.agent_session.started` | `crates/wicked-apps-core/src/lib.rs:194` | yes | — |
+| `EV_AGENT_TASK_COMPLETED` | `wicked.crew.agent_task.completed` | `crates/wicked-apps-core/src/lib.rs:197` | yes | — |
+| `EV_AGENT_WORK_DISTRIBUTED` | `wicked.crew.agent_work.distributed` | `crates/wicked-apps-core/src/lib.rs:196` | yes | — |
+| `EV_CLI_RANKED` | `wicked.crew.cli.ranked` | `crates/wicked-apps-core/src/lib.rs:190` | yes | `crates/wicked-council/src/worker.rs` |
+| `EV_CONFORMANCE_RECORDED` | `wicked.crew.conformance.recorded` | `crates/wicked-apps-core/src/lib.rs:168` | yes | — |
+| `EV_CONFORMANCE_RECORDED_LITERAL` | `wicked.crew.governance.conformance_recorded` | `crates/wicked-governance/src/engine.rs:45` | no | `crates/wicked-governance/src/engine.rs` |
+| `EV_COUNCIL_DELIBERATED` | `wicked.crew.council.deliberated` | `crates/wicked-apps-core/src/lib.rs:183` | yes | `crates/wicked-council/src/worker.rs` |
+| `EV_COUNCIL_REQUESTED` | `wicked.crew.council.requested` | `crates/wicked-apps-core/src/lib.rs:180` | yes | `crates/wicked-council/src/worker.rs` |
+| `EV_COUNCIL_SEAT_FAILED` | `wicked.crew.council_seat.failed` | `crates/wicked-apps-core/src/lib.rs:189` | yes | `crates/wicked-council/src/worker.rs` |
+| `EV_COUNCIL_VOTED` | `wicked.crew.council.voted` | `crates/wicked-apps-core/src/lib.rs:181` | yes | `crates/wicked-council/src/worker.rs` |
 | `EV_DOC_DRIFTED` | `wicked.estate.doc.drifted` | `crates/wicked-governance/src/events.rs:56` | no | `crates/wicked-governance/src/events.rs` |
-| `EV_PHASE_APPROVED` | `wicked.crew.phase.approved` | `crates/wicked-apps-core/src/lib.rs:174` | yes | — |
-| `EV_PHASE_READY_FOR_GATE` | `wicked.crew.phase.ready-for-gate` | `crates/wicked-apps-core/src/lib.rs:173` | yes | — |
-| `EV_PHASE_REJECTED` | `wicked.crew.phase.rejected` | `crates/wicked-apps-core/src/lib.rs:175` | yes | — |
-| `EV_PHASE_STARTED` | `wicked.crew.phase.started` | `crates/wicked-apps-core/src/lib.rs:172` | yes | — |
+| `EV_PHASE_APPROVED` | `wicked.crew.phase.approved` | `crates/wicked-apps-core/src/lib.rs:176` | yes | — |
+| `EV_PHASE_READY_FOR_GATE` | `wicked.crew.phase.ready-for-gate` | `crates/wicked-apps-core/src/lib.rs:175` | yes | — |
+| `EV_PHASE_REJECTED` | `wicked.crew.phase.rejected` | `crates/wicked-apps-core/src/lib.rs:177` | yes | — |
+| `EV_PHASE_STARTED` | `wicked.crew.phase.started` | `crates/wicked-apps-core/src/lib.rs:174` | yes | — |
 | `EV_PHASE_TRANSITIONED` | `wicked.crew.phase.transitioned` | `crates/wicked-orchestration/src/gate.rs:30` | no | `crates/wicked-orchestration/src/gate.rs` |
-| `EV_POLICY_EVALUATED` | `wicked.crew.policy.evaluated` | `crates/wicked-apps-core/src/lib.rs:165` | yes | — |
-| `EV_POLICY_REGISTERED` | `wicked.crew.policy.registered` | `crates/wicked-apps-core/src/lib.rs:164` | yes | — |
-| `EV_POLICY_VIOLATED` | `wicked.crew.policy.violated` | `crates/wicked-apps-core/src/lib.rs:167` | yes | — |
+| `EV_POLICY_EVALUATED` | `wicked.crew.policy.evaluated` | `crates/wicked-apps-core/src/lib.rs:167` | yes | — |
+| `EV_POLICY_REGISTERED` | `wicked.crew.policy.registered` | `crates/wicked-apps-core/src/lib.rs:166` | yes | — |
+| `EV_POLICY_VIOLATED` | `wicked.crew.policy.violated` | `crates/wicked-apps-core/src/lib.rs:169` | yes | — |
 | `EV_RULE_INGESTED` | `wicked.estate.rule.ingested` | `crates/wicked-governance/src/events.rs:51` | no | `crates/wicked-governance/src/events.rs` |
 | `EV_RULE_RETIRED` | `wicked.estate.rule.retired` | `crates/wicked-governance/src/events.rs:53` | no | `crates/wicked-governance/src/events.rs` |
-| `EV_WORKFLOW_COMPLETED` | `wicked.crew.workflow.completed` | `crates/wicked-apps-core/src/lib.rs:171` | yes | — |
-| `EV_WORKFLOW_STARTED` | `wicked.crew.workflow.started` | `crates/wicked-apps-core/src/lib.rs:170` | yes | — |
-| `GATE_EVAL_REQUESTED` | `wicked.gate.eval.requested` | `src/cli_runner.rs:88` | no | `src/cli_runner.rs` |
-| `GATE_EVAL_RESPONDED` | `wicked.gate.eval.responded` | `src/cli_runner.rs:89` | no | — |
-| `RUN_LAUNCHED` | `wicked.crew.run.launched` | `src/bus.rs:600` | no | `src/bus.rs` |
-| `RUN_REQUESTED` | `wicked.crew.run.requested` | `src/bus.rs:598` | no | — |
-| `TASK_COMPLETED` | `wicked.crew.task.completed` | `src/cli_runner.rs:82` | no | `src/cli_runner.rs` |
-| `TASK_DISPATCHED` | `wicked.crew.task.dispatched` | `src/cli_runner.rs:80` | no | `src/cli_runner.rs` |
+| `EV_WORKFLOW_COMPLETED` | `wicked.crew.workflow.completed` | `crates/wicked-apps-core/src/lib.rs:173` | yes | — |
+| `EV_WORKFLOW_STARTED` | `wicked.crew.workflow.started` | `crates/wicked-apps-core/src/lib.rs:172` | yes | — |
+| `FINDING_RAISED` | `wicked.team.finding.raised` | `src/team/events.rs:54` | no | — |
+| `FINDING_SETTLED` | `wicked.team.finding.settled` | `src/team/events.rs:62` | no | — |
+| `GATE_DECIDED` | `wicked.team.gate.decided` | `src/team/events.rs:67` | no | — |
+| `GATE_EVAL_REQUESTED` | `wicked.gate.eval.requested` | `src/cli_runner.rs:92` | no | `src/cli_runner.rs` |
+| `GATE_EVAL_RESPONDED` | `wicked.gate.eval.responded` | `src/cli_runner.rs:93` | no | — |
+| `GATE_OPENED` | `wicked.team.gate.opened` | `src/team/events.rs:66` | no | — |
+| `HELP_ANSWERED` | `wicked.team.help.answered` | `src/team/events.rs:58` | no | — |
+| `HELP_REQUESTED` | `wicked.team.help.requested` | `src/team/events.rs:57` | no | — |
+| `LEDGER_FOLDED` | `wicked.team.ledger.folded` | `src/team/events.rs:65` | no | — |
+| `MEMBER_JOINED` | `wicked.team.member.joined` | `src/team/events.rs:50` | no | — |
+| `MEMBER_LEFT` | `wicked.team.member.left` | `src/team/events.rs:51` | no | — |
+| `PATH_ENDED` | `wicked.team.path.ended` | `src/team/events.rs:68` | no | — |
+| `PATH_SCORED` | `wicked.team.path.scored` | `src/team/events.rs:45` | no | — |
+| `PATH_STARTED` | `wicked.team.path.started` | `src/team/events.rs:44` | no | — |
+| `PLAN_ACCEPTED` | `wicked.team.plan.accepted` | `src/team/events.rs:48` | no | — |
+| `PLAN_PROPOSED` | `wicked.team.plan.proposed` | `src/team/events.rs:46` | no | — |
+| `PLAN_REFUSED` | `wicked.team.plan.refused` | `src/team/events.rs:49` | no | — |
+| `PLAN_REVISED` | `wicked.team.plan.revised` | `src/team/events.rs:47` | no | — |
+| `RUN_LAUNCHED` | `wicked.crew.run.launched` | `src/bus.rs:830` | no | `src/bus.rs` |
+| `RUN_REQUESTED` | `wicked.crew.run.requested` | `src/bus.rs:828` | no | — |
+| `STEP_CLAIMED` | `wicked.team.step.claimed` | `src/team/events.rs:52` | no | — |
+| `STEP_COMPLETED` | `wicked.team.step.completed` | `src/team/events.rs:60` | no | — |
+| `STEP_REVIEWED` | `wicked.team.step.reviewed` | `src/team/events.rs:61` | no | — |
+| `TASK_COMPLETED` | `wicked.crew.task.completed` | `src/cli_runner.rs:85` | no | `src/cli_runner.rs` |
+| `TASK_DISPATCHED` | `wicked.crew.task.dispatched` | `src/cli_runner.rs:83` | no | `src/cli_runner.rs` |
 
 An emit seam is a non-test line referencing the constant (or its literal type)
 within 3 lines of `EmitEvent::new(` / `BusEmit::new(` / `.emit(` — the same
@@ -99,8 +124,8 @@ e.g. the requester side of `wicked.crew.run.requested`, is outside this scan).
 ### Grammar conformance (seed corpus `event-grammar.md`, POL-1801/POL-1802)
 
 - `wicked.crew.phase.ready-for-gate` — segment(s) outside WB-001 charset [a-z0-9_]: `ready-for-gate`
-- `wicked.gate.eval.requested` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
-- `wicked.gate.eval.responded` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe; legacy: test)
+- `wicked.gate.eval.requested` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe, team; legacy: test)
+- `wicked.gate.eval.responded` — producer domain `gate` not in the POL-1802 whitelist (crew, estate, garden, interactive, qe, team; legacy: test)
 
 ### Types with seams in more than one repo (shared contract — informational)
 
@@ -242,6 +267,7 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.interactive.chat.posted` | `crew:packages/crew/src/interactive/chat-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `chat`; owners: ui, agent; UI-emittable | — |
 | `wicked.interactive.demo.requested` | `crew:packages/crew/src/interactive/demo-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `demo`; owners: ui, agent; UI-emittable | — |
 | `wicked.interactive.doc.created` | `crew:packages/crew/src/interactive/draft-events.ts` (mirror)<br>`interactive:src/artifact/create.js` (emit)<br>`interactive:src/service/events.js` (registry) | subdomain `docs`; owners: service | — |
+| `wicked.interactive.doc.retired` | `interactive:src/service/events.js` (registry) | subdomain `docs`; owners: service | — |
 | `wicked.interactive.draft.completed` | `crew:packages/crew/src/interactive/draft-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `generation`; owners: agent, crew | — |
 | `wicked.interactive.edit.completed` | `crew:packages/crew/src/interactive/edit-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `feedback`; owners: agent, crew | — |
 | `wicked.interactive.error.raised` | `interactive:src/service/events.js` (registry) | subdomain `error`; owners: service | — |
@@ -273,6 +299,36 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.qe.release.assessed` | `garden:scripts/_bus.py` (registry) | Release readiness verdict assessed against ledger evidence window | — |
 | `wicked.qe.scenario.authored` | `garden:scripts/_bus.py` (registry) | Scenario file authored from a production incident; queues a human review task | — |
 
+#### `team` events — team model on the bus (wicked-core `src/team/events.rs`, DES-TEAMING-002 §6); `domain` stamp `wicked-core`, subdomain `core.team`; one owner per type (E engine, S supervisor, R attempt runner)
+
+| Event type | Declared / emitted at | Trigger / description | Key payload fields |
+|---|---|---|---|
+| `wicked.team.advice.answered` | `core:src/team/events.rs` (const — **no emit seam**) | R: the PA's `ADVICE` line at the end of its turn | `raise_seq`, `answered_in`, `finding_id`, `disposition`, `reason`; key: ord, attempt, `raise_seq`, `answered_in`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.advice.delivered` | `core:src/team/events.rs` (const — **no emit seam**) | R: one row per finding per delivery (mid-turn steer, step boundary, attempt end) | `raise_seq`, `finding_id`, `delivery_id`, `steer_id`, `channel`, `outcome`, `detail`; key: ord, attempt, `raise_seq`, `delivery_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.change.requested` | `core:src/team/events.rs` (const — **no emit seam**) | S: a member asks for plan steps | `change_id`, `change_seq`, `steps`, `reason`; key: `change_id` (minted from `change_seq`); plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.checkpoint.reached` | `core:src/team/events.rs` (const — **no emit seam**) | R (carrier): terminal `tool_call_update` of a team unit | `seq`, `tool_call_id`, `kind`, `title`, `status`, `paths`; key: ord, attempt, `seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.council.called` | `core:src/team/events.rs` (const — **no emit seam**) | S: an unresolved HIGH or a member-step dispute goes to a one-off council | `subject`, `finding_id`, `trigger`, `question`, `positions`, `evidence`, `excluded_seats`, `transcript`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.council.ruled` | `core:src/team/events.rs` (const — **no emit seam**) | S: the verdict of the council it convened | `subject`, `verdict`, `reason`, `task_id`, `consensus`, `agreement_pct`, `dissent`, `returned`, `seated`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.finding.raised` | `core:src/team/events.rs` (const — **no emit seam**) | S: a confirmed, above-bar, first-seen finding | `raise_seq`, `finding_id`, `member_id`, `severity`, `path`, `line`, `evidence`, `claim`, `suggestion`, `tree`, `in_diff`, `corroborated_by`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.finding.settled` | `core:src/team/events.rs` (const — **no emit seam**) | S: the hold round (held / withdrawn) or re-confirmation (superseded) | `raise_seq`, `finding_id`, `status`, `reason`, `final_line`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.gate.decided` | `core:src/team/events.rs` (const — **no emit seam**) | E: a gate decided (the fold, or a human decision after `confirm_gate`; required transition) | `gate_id`, `kind`, `decision`, `combined`, `team_pause`, `unresolved`; key: `gate_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.gate.opened` | `core:src/team/events.rs` (const — **no emit seam**) | E: a gate opened (`unit_review`, `plan_approval`, `team_dispute`, `team_transport`; required transition) | `gate_id`, `kind` + kind fields; key: `gate_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.help.answered` | `core:src/team/events.rs` (const — **no emit seam**) | S: a member answers a help request | `help_id`, `answer_id`, `answer`, `evidence`; key: `help_id`, `answer_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.help.requested` | `core:src/team/events.rs` (const — **no emit seam**) | R: the PA asks the team (`HELP:` line) | `help_id`, `help_seq`, `question`, `context`; key: `help_id` (minted from `help_seq`, never the question); plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.ledger.folded` | `core:src/team/events.rs` (const — **no emit seam**) | S: the final pass folded the attempt's stream into its TeamLedger | `final_pass`, `ledger`, `transport`, `transcript`; key: ord, attempt; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.member.joined` | `core:src/team/events.rs` (const — **no emit seam**) | S: a monitor session opened (or failed to) | `member_id`, `open_seq`, `seat`, `role`, `status`, `reason`, `error`; key: ord, attempt, `member_id`, `open_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.member.left` | `core:src/team/events.rs` (const — **no emit seam**) | S: a monitor session closed (completed, budget exhausted, failed, timed out) | `member_id`, `open_seq`, `seat`, `status`, `batches`, `error`; key: ord, attempt, `member_id`, `open_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.path.ended` | `core:src/team/events.rs` (const — **no emit seam**) | E: the run reached a terminal state | `status`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.path.scored` | `core:src/team/events.rs` (const — **no emit seam**) | E: intent score at plan time; diff re-score from the supervisor's `TeamRescored` | `score_source`, `basis`, `score`, `deterministic`, `reasons`, `model`, `signals`, `plan`, `tree`; key: `score_source`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.path.started` | `core:src/team/events.rs` (const — **no emit seam**) | E: launch admitted, PA seat known (required transition) | `cli`, `selection`, `roster`, `request`, `workflow`, `plan`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.plan.accepted` | `core:src/team/events.rs` (const — **no emit seam**) | E: composed, floor-filled, approved or auto-released (required transition) | `plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.plan.proposed` | `core:src/team/events.rs` (const — **no emit seam**) | E: a plan or plan change was submitted (command or step result) | `proposal_id`, `base_rev`, `kind`, `preset`, `steps`, `monitors`, `asks`, `touch`, `override`, `rationale`; key: `proposal_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.plan.refused` | `core:src/team/events.rs` (const — **no emit seam**) | E: compose refused a proposal; the run keeps its accepted rev | `proposal_id`, `base_rev`, `reason`; key: `proposal_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.plan.revised` | `core:src/team/events.rs` (const — **no emit seam**) | E: the plan grew (floor raised, PA added, member request) | `plan_rev`, `proposal_id`, `reason`, `from_band`, `to_band`, `high_risk`, `added`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.step.claimed` | `core:src/team/events.rs` (const — **no emit seam**) | R: before the step's turn starts | `step_id`, `role`, `kind`, `phase`, `criterion`, `baseline_tree`, `repo`, `code_graph_db`; key: `step_id`, attempt, by; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.step.completed` | `core:src/team/events.rs` (const — **no emit seam**) | R: the step's turn returned | `step_id`, `status`, `tree`, `output_bytes`, `output_ref`; key: `step_id`, attempt, by; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.step.reviewed` | `core:src/team/events.rs` (const — **no emit seam**) | R: the PA accepted or rejected a member's step (`STEP` line) | `step_id`, `verdict`, `to`, `reason`; key: `step_id`, attempt; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+
 #### `test` events — legacy-stable QE-lifecycle spelling kept at the wicked-testing retirement — the `domain` stamp is `qe`
 
 | Event type | Declared / emitted at | Trigger / description | Key payload fields |
@@ -294,6 +350,7 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | wicked-core | `crates/wicked-orchestration/src/gate.rs` | const |
 | wicked-core | `crates/wicked-governance/src/events.rs` | const |
 | wicked-core | `crates/wicked-governance/src/engine.rs` | const |
+| wicked-core | `src/team/events.rs` | const |
 | wicked-garden | `scripts/_bus.py` | registry |
 | wicked-garden | `scripts/qe/lib/gate.mjs` | emit |
 | wicked-ledger | `lib/bus-emit.mjs` | emit |

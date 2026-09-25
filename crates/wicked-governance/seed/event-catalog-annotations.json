@@ -111,5 +111,105 @@
   "wicked.interactive.artifact.validation_failed": {
     "trigger": "Artifact failed validation (`src/artifact/validate.js`)",
     "payload": "artifact id + failure detail"
+  },
+  "wicked.team.path.started": {
+    "trigger": "E: launch admitted, PA seat known (required transition)",
+    "payload": "`cli`, `selection`, `roster`, `request`, `workflow`, `plan`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.path.scored": {
+    "trigger": "E: intent score at plan time; diff re-score from the supervisor's `TeamRescored`",
+    "payload": "`score_source`, `basis`, `score`, `deterministic`, `reasons`, `model`, `signals`, `plan`, `tree`; key: `score_source`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.plan.proposed": {
+    "trigger": "E: a plan or plan change was submitted (command or step result)",
+    "payload": "`proposal_id`, `base_rev`, `kind`, `preset`, `steps`, `monitors`, `asks`, `touch`, `override`, `rationale`; key: `proposal_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.plan.revised": {
+    "trigger": "E: the plan grew (floor raised, PA added, member request)",
+    "payload": "`plan_rev`, `proposal_id`, `reason`, `from_band`, `to_band`, `high_risk`, `added`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.plan.accepted": {
+    "trigger": "E: composed, floor-filled, approved or auto-released (required transition)",
+    "payload": "`plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.plan.refused": {
+    "trigger": "E: compose refused a proposal; the run keeps its accepted rev",
+    "payload": "`proposal_id`, `base_rev`, `reason`; key: `proposal_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.member.joined": {
+    "trigger": "S: a monitor session opened (or failed to)",
+    "payload": "`member_id`, `open_seq`, `seat`, `role`, `status`, `reason`, `error`; key: ord, attempt, `member_id`, `open_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.member.left": {
+    "trigger": "S: a monitor session closed (completed, budget exhausted, failed, timed out)",
+    "payload": "`member_id`, `open_seq`, `seat`, `status`, `batches`, `error`; key: ord, attempt, `member_id`, `open_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.step.claimed": {
+    "trigger": "R: before the step's turn starts",
+    "payload": "`step_id`, `role`, `kind`, `phase`, `criterion`, `baseline_tree`, `repo`, `code_graph_db`; key: `step_id`, attempt, by; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.checkpoint.reached": {
+    "trigger": "R (carrier): terminal `tool_call_update` of a team unit",
+    "payload": "`seq`, `tool_call_id`, `kind`, `title`, `status`, `paths`; key: ord, attempt, `seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.finding.raised": {
+    "trigger": "S: a confirmed, above-bar, first-seen finding",
+    "payload": "`raise_seq`, `finding_id`, `member_id`, `severity`, `path`, `line`, `evidence`, `claim`, `suggestion`, `tree`, `in_diff`, `corroborated_by`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.advice.delivered": {
+    "trigger": "R: one row per finding per delivery (mid-turn steer, step boundary, attempt end)",
+    "payload": "`raise_seq`, `finding_id`, `delivery_id`, `steer_id`, `channel`, `outcome`, `detail`; key: ord, attempt, `raise_seq`, `delivery_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.advice.answered": {
+    "trigger": "R: the PA's `ADVICE` line at the end of its turn",
+    "payload": "`raise_seq`, `answered_in`, `finding_id`, `disposition`, `reason`; key: ord, attempt, `raise_seq`, `answered_in`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.help.requested": {
+    "trigger": "R: the PA asks the team (`HELP:` line)",
+    "payload": "`help_id`, `help_seq`, `question`, `context`; key: `help_id` (minted from `help_seq`, never the question); plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.help.answered": {
+    "trigger": "S: a member answers a help request",
+    "payload": "`help_id`, `answer_id`, `answer`, `evidence`; key: `help_id`, `answer_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.change.requested": {
+    "trigger": "S: a member asks for plan steps",
+    "payload": "`change_id`, `change_seq`, `steps`, `reason`; key: `change_id` (minted from `change_seq`); plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.step.completed": {
+    "trigger": "R: the step's turn returned",
+    "payload": "`step_id`, `status`, `tree`, `output_bytes`, `output_ref`; key: `step_id`, attempt, by; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.step.reviewed": {
+    "trigger": "R: the PA accepted or rejected a member's step (`STEP` line)",
+    "payload": "`step_id`, `verdict`, `to`, `reason`; key: `step_id`, attempt; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.finding.settled": {
+    "trigger": "S: the hold round (held / withdrawn) or re-confirmation (superseded)",
+    "payload": "`raise_seq`, `finding_id`, `status`, `reason`, `final_line`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.council.called": {
+    "trigger": "S: an unresolved HIGH or a member-step dispute goes to a one-off council",
+    "payload": "`subject`, `finding_id`, `trigger`, `question`, `positions`, `evidence`, `excluded_seats`, `transcript`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.council.ruled": {
+    "trigger": "S: the verdict of the council it convened",
+    "payload": "`subject`, `verdict`, `reason`, `task_id`, `consensus`, `agreement_pct`, `dissent`, `returned`, `seated`; key: ord, attempt, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.ledger.folded": {
+    "trigger": "S: the final pass folded the attempt's stream into its TeamLedger",
+    "payload": "`final_pass`, `ledger`, `transport`, `transcript`; key: ord, attempt; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.gate.opened": {
+    "trigger": "E: a gate opened (`unit_review`, `plan_approval`, `team_dispute`, `team_transport`; required transition)",
+    "payload": "`gate_id`, `kind` + kind fields; key: `gate_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.gate.decided": {
+    "trigger": "E: a gate decided (the fold, or a human decision after `confirm_gate`; required transition)",
+    "payload": "`gate_id`, `kind`, `decision`, `combined`, `team_pause`, `unresolved`; key: `gate_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.team.path.ended": {
+    "trigger": "E: the run reached a terminal state",
+    "payload": "`status`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   }
 }

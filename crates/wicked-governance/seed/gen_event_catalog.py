@@ -57,9 +57,10 @@ ANNOTATIONS = HERE / "event-catalog-annotations.json"
 # POL-1801: four-segment wicked.<domain>.<noun>.<past-tense-verb>, WB-001
 # pattern /^wicked\.[a-z0-9_]+(\.[a-z0-9_]+)*$/ (no hyphens), exactly 4 segments.
 WB001_SEGMENT = re.compile(r"^[a-z0-9_]+$")
-# POL-1802: whitelisted producer domains (+ `estate` per AW-22); `test` survives
+# POL-1802: whitelisted producer domains (+ `estate` per AW-22, `team` per DES-TEAMING-002); `test` survives
 # only as the legacy-stable QE-lifecycle spelling (domain stamp `qe`).
-WHITELISTED_DOMAINS = {"qe", "crew", "garden", "interactive", "estate"}
+# `team` is the designed namespace of the team model on the bus (DES-TEAMING-002 §6).
+WHITELISTED_DOMAINS = {"qe", "crew", "garden", "interactive", "estate", "team"}
 LEGACY_DOMAINS = {"test"}
 
 # Loose shape used for EXTRACTION so violations are captured (hyphens allowed),
@@ -96,6 +97,7 @@ SEAMS = [
     ("wicked-core", "crates/wicked-orchestration/src/gate.rs", "const", "rust_consts"),
     ("wicked-core", "crates/wicked-governance/src/events.rs", "const", "rust_consts"),
     ("wicked-core", "crates/wicked-governance/src/engine.rs", "const", "rust_consts"),
+    ("wicked-core", "src/team/events.rs", "const", "rust_consts"),
     ("wicked-garden", "scripts/_bus.py", "registry", "python_map"),
     ("wicked-garden", "scripts/qe/lib/gate.mjs", "emit", "literals"),
     ("wicked-ledger", "lib/bus-emit.mjs", "emit", "literals"),
@@ -119,6 +121,7 @@ DOMAIN_NOTES = {
     "gate": "governed evaluator round-trip (wicked-core engine)",
     "interactive": "wicked-interactive registry (`src/service/events.js` EVENT_TYPES is the contract)",
     "qe": "QE acceptance gate + lifecycle (garden gate CLI, wicked-ledger)",
+    "team": "team model on the bus (wicked-core `src/team/events.rs`, DES-TEAMING-002 §6); `domain` stamp `wicked-core`, subdomain `core.team`; one owner per type (E engine, S supervisor, R attempt runner)",
     "test": "legacy-stable QE-lifecycle spelling kept at the wicked-testing retirement — the `domain` stamp is `qe`",
 }
 
@@ -238,11 +241,51 @@ def parse_event_catalog_members(text: str) -> list[str]:
 # Core emit-wiring scan (the declared-vs-emitted query)
 # ---------------------------------------------------------------------------
 
-def strip_test_tail(text: str) -> str:
-    """Drop everything from the first top-level `#[cfg(test)]` to EOF
-    (convention in this codebase: the test module is the file's tail)."""
-    m = re.search(r"^#\[cfg\(test\)\]", text, re.M)
-    return text[: m.start()] if m else text
+def strip_test_items(text: str) -> str:
+    """Drop every `#[cfg(test)]` item — a `mod`/`fn`/`impl` block, or a one-line item — wherever
+    it sits, keeping the rest of the file. Stripped lines become empty, so line numbers keep
+    their meaning (the declaration-line check below reads them). Braces are counted outside string literals. (The old
+    rule cut the file at its FIRST top-level `#[cfg(test)]`, assuming the test module is the
+    file's tail; a mid-file `#[cfg(test)]` item — src/cli_runner.rs has one — then hid every
+    emit seam below it.) Mirrors `strip_test_items` in wicked-core tests/bus_handoff.rs."""
+    out: list[str] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != "#[cfg(test)]":
+            out.append(lines[i])
+            i += 1
+            continue
+        out.append("")
+        i += 1
+        depth, opened = 0, False
+        while i < len(lines):
+            line = lines[i]
+            out.append("")
+            i += 1
+            t = line.strip()
+            if not opened and t.startswith("#["):
+                continue
+            in_str = escaped = False
+            for c in line:
+                if in_str:
+                    if escaped:
+                        escaped = False
+                    elif c == "\\":
+                        escaped = True
+                    elif c == '"':
+                        in_str = False
+                    continue
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                    opened = True
+                elif c == "}":
+                    depth -= 1
+            if (opened and depth <= 0) or (not opened and t.endswith(";")):
+                break
+    return "\n".join(out)
 
 
 def scan_core_emit_wiring(ws: Path, consts: dict[str, dict]) -> dict[str, list[str]]:
@@ -255,7 +298,7 @@ def scan_core_emit_wiring(ws: Path, consts: dict[str, dict]) -> dict[str, list[s
         if "/tests/" not in p.as_posix() and "/target/" not in p.as_posix()
     )
     for p in rs_files:
-        lines = strip_test_tail(p.read_text(encoding="utf-8")).splitlines()
+        lines = strip_test_items(p.read_text(encoding="utf-8")).splitlines()
         rel = p.relative_to(core).as_posix()
         opener_ix = [i for i, ln in enumerate(lines) if EMIT_OPENER.search(ln)]
         if not opener_ix:
