@@ -90,7 +90,7 @@ pub(crate) mod test_env {
 
 pub use acp_runner::AcpStepRunner;
 pub use acp_runner::{ChatInfo, ChatOpenOutcomes, ChatScope};
-pub use actor::{NoEligibleSeat, RunBusy, RunExists};
+pub use actor::{NoEligibleSeat, RunBusy, RunExists, CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
     Application, SeedKind,
@@ -132,6 +132,10 @@ pub use gate_hook::{
 };
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;
+pub use team::publish::{
+    DrainReport, LiveTeamRun, PublishOutcome, RunTeamView, TeamBus, TeamConfig, UnitTeamView,
+    TEAM_OUTBOX_FILE,
+};
 pub use team::{TeamLedger, TeamPlan};
 // Governance evals — the JSON-string seams the core-ts binding wraps 1:1
 // (`core.governanceEvals(argsJson)` / `core.governanceCorpusImport(argsJson)`); the report and
@@ -366,6 +370,9 @@ pub struct Core {
     /// What arming the launch bridge came to at spawn (DES-TEAMING-002 T0) — see
     /// [`Core::bus_bridge_state`].
     bus_bridge_state: crate::bus::BusBridgeState,
+    /// Where this core publishes team facts (DES-TEAMING-002 P1) — read by
+    /// [`Core::replay_team_outbox`], which drains on the caller's thread, never the actor's.
+    team: crate::team::publish::TeamConfig,
     _shutdown: Arc<ShutdownGuard>,
 }
 
@@ -523,7 +530,21 @@ impl Core {
         dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
         runner: std::sync::Arc<dyn StepRunner>,
     ) -> Core {
-        Core::spawn_inner(path, dispatcher, runner, None)
+        Core::spawn_inner(path, dispatcher, runner, None, None)
+    }
+
+    /// [`Core::spawn_with_engine`] with an explicit team-publishing config (DES-TEAMING-002 P1) —
+    /// the bus, the team outbox and the retry schedule — instead of [`TeamConfig::for_store`]'s
+    /// env-derived one. For tests that must not touch process env or a real home, and that scale
+    /// the 31 s bound down.
+    #[doc(hidden)]
+    pub fn spawn_with_engine_team(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+        team: TeamConfig,
+    ) -> Core {
+        Core::spawn_inner(path, dispatcher, runner, None, Some(team))
     }
 
     /// Spawn with the Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) turned ON EXPLICITLY against the
@@ -538,7 +559,7 @@ impl Core {
         runner: std::sync::Arc<dyn StepRunner>,
         bus_db_path: impl Into<String>,
     ) -> Core {
-        Core::spawn_inner(path, dispatcher, runner, Some(bus_db_path.into()))
+        Core::spawn_inner(path, dispatcher, runner, Some(bus_db_path.into()), None)
     }
 
     /// Spawn the store actor with a [`PersistentStepRunner`] as the execution seam — units within
@@ -561,6 +582,7 @@ impl Core {
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
+        let team_cfg = crate::team::publish::TeamConfig::for_store(&log_path);
         // Each actor gets its own lifecycle maps (epoch tracking + tombstone) and an empty
         // write registry (no ACP sessions for PTY path).
         let lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
@@ -572,6 +594,7 @@ impl Core {
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
+        let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
             actor::run(
                 bus_bridge_actor,
@@ -585,6 +608,7 @@ impl Core {
                 false, // is_acp
                 Some(lifecycle_arc),
                 empty_write_reg,
+                team_link,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
@@ -596,6 +620,7 @@ impl Core {
             chat: None, // PTY runner — ACP chat sessions unavailable
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
+            team: team_cfg,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -648,10 +673,12 @@ impl Core {
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
+        let team_cfg = crate::team::publish::TeamConfig::for_store(&log_path);
         // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
+        let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
             actor::run(
                 bus_bridge_actor,
@@ -665,6 +692,7 @@ impl Core {
                 true, // is_acp
                 Some(actor_maps),
                 actor_write_reg,
+                team_link,
             )
         });
         spawn_chat_reaper(&runner);
@@ -677,6 +705,7 @@ impl Core {
             chat: Some(runner.clone()),
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
+            team: team_cfg,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -687,6 +716,7 @@ impl Core {
         dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
         runner: std::sync::Arc<dyn StepRunner>,
         exec_bus: Option<String>,
+        team: Option<crate::team::publish::TeamConfig>,
     ) -> Core {
         let (tx, rx) = channel();
         let path = path.into();
@@ -697,6 +727,8 @@ impl Core {
         let pty_actor = pty.clone();
         // Captured before `path` moves into the actor thread (see `spawn_with_pty_sessions`).
         let log_path = path.clone();
+        let team_cfg =
+            team.unwrap_or_else(|| crate::team::publish::TeamConfig::for_store(&log_path));
         let spawn_lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
             crate::acp_runner::ElicitationMaps::new(),
         ));
@@ -706,6 +738,7 @@ impl Core {
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
+        let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
             actor::run(
                 bus_bridge_actor,
@@ -719,6 +752,7 @@ impl Core {
                 false, // is_acp
                 Some(spawn_lifecycle_arc),
                 spawn_write_reg,
+                team_link,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
@@ -730,6 +764,7 @@ impl Core {
             chat: None, // injected runner (tests / bus seam) — ACP chat sessions unavailable
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
+            team: team_cfg,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }
@@ -1303,6 +1338,65 @@ impl Core {
         let (reply, rx) = channel();
         self.tx
             .send(Command::Sessions(reply))
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+    /// Replay the team outbox (DES-TEAMING-002 §4.1, the shape of `replay_emit_outbox`): drain
+    /// every lane in order onto the bus, skipping and compacting superseded lines. Idempotent — a
+    /// line replayed twice lands once (its key resolves to the existing row). Runs on the CALLER's
+    /// thread, never the actor's. Errors when this core has no bus or no team outbox.
+    pub fn replay_team_outbox(&self) -> anyhow::Result<DrainReport> {
+        let (Some(bus), Some(outbox)) = (&self.team.bus_db, &self.team.outbox) else {
+            anyhow::bail!("no team outbox to replay: this core has no bus or no state home");
+        };
+        Ok(TeamBus::new(bus.clone(), outbox.clone(), self.team.attempt_wait).drain_all())
+    }
+
+    /// A team run's transport and its units' team snapshots — the persisted state behind crew's
+    /// `GET /api/v1/runs/:id/team` (`{transport, reason}`). `Ok(None)` for a run that is not a
+    /// team run; `Err` for an unknown run.
+    pub fn run_team(&self, run_id: &str) -> anyhow::Result<Option<RunTeamView>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RunTeam {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// The live TEAMED runs (§4.7 replay step 2): an un-teamed run (`transport: none`) is never
+    /// listed, so a supervisor replaying from this set never arms it.
+    pub fn live_team_runs(&self) -> anyhow::Result<Vec<LiveTeamRun>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::LiveTeamRuns { reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// TEST-ONLY: how many `confirm_gate` replies the actor holds for the team publisher.
+    #[cfg(test)]
+    pub(crate) fn held_team_replies(&self) -> usize {
+        let (reply, rx) = channel();
+        let _ = self.tx.send(Command::HeldTeamReplies { reply });
+        rx.recv().unwrap_or(usize::MAX)
+    }
+
+    /// Register the engine's own composed per-run def (`"<run>:plan-<rev>"`); a run launched on it
+    /// is a team run. Crate-internal: only the engine composes per-run defs.
+    #[allow(dead_code)]
+    pub(crate) fn register_composed(&self, def: WorkflowDef) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RegisterComposed {
+                def: Box::new(def),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?

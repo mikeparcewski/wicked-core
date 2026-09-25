@@ -539,6 +539,7 @@ pub(crate) fn pre_distribute(
         base_commit: None,
         finished_at: None,
         benched_seats: Vec::new(),
+        team: None,
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the

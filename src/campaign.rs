@@ -2293,6 +2293,7 @@ mod tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         put_node(
@@ -2455,6 +2456,7 @@ mod tests {
                 base_commit: None,
                 finished_at: None,
                 benched_seats: Vec::new(),
+                team: None,
             };
             put_node(&mut store, session.to_node()).unwrap();
             put_node(
