@@ -1338,6 +1338,66 @@ impl Core {
         })
     }
 
+    // ── Presets (DES-TEAMING-002 §8.4, seam C2) ────────────────────────────────
+    // Commands through the actor (the single writer), reads included, so a list reflects every
+    // write the actor has acknowledged.
+
+    /// Save a preset: a named phase selection over the catalog. `stepsJson` is a JSON array of
+    /// plan steps (`{catalog, id, …step fields}`); `projectId` null ⇒ global, else that project's
+    /// scope; `createdBy` defaults to `api`. Resolves to the stored `Preset` JSON object
+    /// (`{ name, scope, steps, created_by, updated_at }`). Rejects with a message led by the
+    /// reason token: `preset_invalid_name`, `preset_builtin_readonly`, `preset_reserved_created_by`,
+    /// `preset_unknown_project`, `preset_invalid_steps` (then the catalog's step refusal).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn put_preset(
+        &self,
+        name: String,
+        steps_json: String,
+        project_id: Option<String>,
+        created_by: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let steps: Vec<wicked_core::PlanStep> = serde_json::from_str(&steps_json)
+                .map_err(|e| err(format!("preset_invalid_steps: {e}")))?;
+            let preset = core
+                .put_preset(wicked_core::PresetSpec {
+                    name,
+                    project_id,
+                    steps,
+                    created_by: created_by.unwrap_or_else(|| "api".to_string()),
+                })
+                .map_err(err)?;
+            serde_json::to_string(&preset).map_err(err)
+        })
+    }
+
+    /// Delete a preset in its scope (`projectId` null ⇒ global). Resolves to the JSON literal
+    /// `true`, or `false` when no such live preset exists there. Rejects `preset_builtin_readonly`
+    /// for a built-in.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn delete_preset(&self, name: String, project_id: Option<String>) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let deleted = core
+                .delete_preset(&name, project_id.as_deref())
+                .map_err(err)?;
+            serde_json::to_string(&deleted).map_err(err)
+        })
+    }
+
+    /// The presets a launch in `projectId` sees (null ⇒ the global set), sorted by name, as a JSON
+    /// array of `Preset` objects: every global preset (built-ins included, `created_by: "builtin"`),
+    /// with a project row replacing the global row of the same name.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn list_presets(&self, project_id: Option<String>) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let presets = core.list_presets(project_id.as_deref()).map_err(err)?;
+            serde_json::to_string(&presets).map_err(err)
+        })
+    }
+
     // ── Projects (DES-PROJECT-001) ─────────────────────────────────────────────
     // Writes ride the single-writer actor; reads open READ-ONLY connections, exactly
     // like the governance reads below.
