@@ -188,6 +188,7 @@ pub fn compose_preset(
 ) -> Result<crate::workflow::WorkflowDef, crate::plan::PlanRefusal> {
     let plan = crate::plan::PlanSteps {
         steps: preset.steps.clone(),
+        ..crate::plan::PlanSteps::default()
     };
     let mut def = crate::plan::compose(crate::catalog::catalog(), &plan)?;
     def.id = preset.name.clone();
