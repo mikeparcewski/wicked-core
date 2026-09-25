@@ -1263,6 +1263,110 @@ fn a_plan_that_fits_with_the_worst_case_floor_launches() {
     assert_eq!(unit_ids(&rig.core, "rfit").len(), UNIT_LIMIT);
 }
 
+// ── the deliver step's id is reserved (codex round 6) ─────────────────────────────────────────────
+
+fn ship_plan() -> PlanSteps {
+    plan(json!({"steps": [
+        {"catalog": "build", "id": "build"},
+        {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": ["true"]}}
+    ]}))
+}
+
+fn refused_launch(rig: &Rig, run: &str, s: LaunchSpec) -> String {
+    let err = rig
+        .core
+        .launch_run(s)
+        .expect_err("refused at launch")
+        .to_string();
+    assert!(
+        rig.core
+            .sessions_detail()
+            .unwrap()
+            .iter()
+            .all(|v| v.session.id != run),
+        "no run persisted for {run}"
+    );
+    err
+}
+
+/// A deliver step authored under another id would compose as a unit the deliver gate and the
+/// lift do not recognize: refused at launch, as a duplicate, alongside the launch's own deliver
+/// step, and with a tool that is not installed (the same preflight).
+#[test]
+fn a_renamed_duplicate_or_second_source_deliver_step_is_refused_at_launch() {
+    let dir = tmp_dir("dlvid");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let e = refused_launch(
+        &rig,
+        "rs1",
+        spec("rs1", HumanConfirm::None, Some(ship_plan())),
+    );
+    assert!(e.contains("deliver_id_reserved"), "{e}");
+
+    let dup = plan(json!({"steps": [
+        {"catalog": "build"},
+        {"catalog": "deliver", "executor": {"type": "tool", "cmd": ["true"]}},
+        {"catalog": "deliver", "executor": {"type": "tool", "cmd": ["true"]}}
+    ]}));
+    let e = refused_launch(&rig, "rs2", spec("rs2", HumanConfirm::None, Some(dup)));
+    assert!(e.contains("deliver_duplicate"), "{e}");
+
+    let authored = plan(json!({"steps": [
+        {"catalog": "build"},
+        {"catalog": "deliver", "executor": {"type": "tool", "cmd": ["true"]}}
+    ]}));
+    let mut two_sources = spec("rs3", HumanConfirm::None, Some(authored.clone()));
+    two_sources.deliver_step = Some(deliver_step());
+    let e = refused_launch(&rig, "rs3", two_sources);
+    assert!(e.contains("one source"), "{e}");
+
+    let bad_cmd = plan(json!({"steps": [
+        {"catalog": "build"},
+        {"catalog": "deliver", "executor": {"type": "tool", "cmd": [MISSING_TOOL]}}
+    ]}));
+    let e = refused_launch(&rig, "rs4", spec("rs4", HumanConfirm::None, Some(bad_cmd)));
+    assert!(e.contains(MISSING_TOOL), "{e}");
+
+    let squat = plan(json!({"steps": [{"catalog": "build", "id": "deliver"}]}));
+    let e = refused_launch(&rig, "rs5", spec("rs5", HumanConfirm::None, Some(squat)));
+    assert!(e.contains("deliver_id_reserved"), "{e}");
+}
+
+/// The same rule binds an edit at the gate: a renamed deliver step is refused (plan.refused), the
+/// gate re-opens, nothing is accepted.
+#[test]
+fn a_renamed_deliver_step_is_refused_as_a_gate_edit() {
+    let dir = tmp_dir("dlvedit");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    rig.core
+        .launch_run(spec("rse", HumanConfirm::None, Some(p)))
+        .unwrap();
+    rig.tap
+        .until("the plan_approval pause and its gate.opened", |s| {
+            paused_on_plan(s, "rse").is_some() && !of_type(s, "rse", OPENED).is_empty()
+        });
+    let status = rig
+        .core
+        .confirm_gate("rse", HumanDecision::EditPlan { plan: ship_plan() })
+        .unwrap();
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    rig.tap
+        .until("plan.refused", |s| !of_type(s, "rse", REFUSED).is_empty());
+    let refused = of_type(&rig.tap.seen, "rse", REFUSED);
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("deliver_id_reserved"),
+        "{refused:?}"
+    );
+    assert!(of_type(&rig.tap.seen, "rse", ACCEPTED).is_empty());
+    assert!(unit_ids(&rig.core, "rse").iter().all(|u| u != "ship"));
+}
+
 /// The straight-through `Core::launch` honours no gate, so it refuses a preset (and a plan)
 /// instead of running one past its plan_approval gate.
 #[test]

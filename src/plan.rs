@@ -2065,6 +2065,59 @@ mod tests {
 
     // ── T2 (DES-TEAMING-002 §8.5): floor fill ─────────────────────────────────────────────
 
+    /// codex round 6 on #622: the engine's deliver protections (the human deliver gate, the
+    /// lift + re-verify) key on the phase id `deliver`, so compose reserves it: a `deliver` step
+    /// MUST be id `deliver`, at most one exists, and no other step may take the id.
+    mod deliver_id_reserved {
+        use super::*;
+        use serde_json::json;
+
+        fn compose_json(v: serde_json::Value) -> Result<WorkflowDef, PlanRefusal> {
+            compose(
+                crate::catalog::catalog(),
+                &serde_json::from_value(v).unwrap(),
+            )
+        }
+        fn deliver(id: &str) -> serde_json::Value {
+            json!({"catalog": "deliver", "id": id, "executor": {"type": "tool", "cmd": ["gh", "pr", "create"]}})
+        }
+
+        #[test]
+        fn a_deliver_step_under_another_id_is_refused() {
+            let r = compose_json(
+                json!({"steps": [{"catalog": "build", "id": "build"}, deliver("ship")]}),
+            )
+            .expect_err("a renamed deliver step would skip the deliver gate");
+            assert_eq!(r.reason(), "deliver_id_reserved", "{r}");
+            assert!(r.to_string().contains("ship"), "{r}");
+        }
+
+        #[test]
+        fn a_second_deliver_step_is_refused() {
+            let r = compose_json(json!({"steps": [
+                {"catalog": "build", "id": "build"}, deliver("deliver"), deliver("deliver")
+            ]}))
+            .expect_err("two deliver steps");
+            assert_eq!(r.reason(), "deliver_duplicate", "{r}");
+        }
+
+        #[test]
+        fn a_non_deliver_step_cannot_take_the_deliver_id() {
+            let r = compose_json(json!({"steps": [{"catalog": "build", "id": "deliver"}]}))
+                .expect_err("the id is reserved");
+            assert_eq!(r.reason(), "deliver_id_reserved", "{r}");
+        }
+
+        #[test]
+        fn the_one_deliver_step_under_its_id_composes() {
+            let def = compose_json(
+                json!({"steps": [{"catalog": "build", "id": "build"}, deliver("deliver")]}),
+            )
+            .expect("composes");
+            assert_eq!(def.phases.last().unwrap().id, "deliver");
+        }
+    }
+
     mod floor_fill_t2 {
         use super::super::*;
         use crate::domain::HumanConfirm;
