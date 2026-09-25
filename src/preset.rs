@@ -241,7 +241,8 @@ pub fn put_preset(
             return Err(PresetError::BuiltinReadonly(spec.name).into());
         }
         None => {}
-        Some(p) if p == crate::project::DEFAULT_PROJECT_ID => {}
+        // `get_project` is always `None` for the synthesized `default`, so it is refused here too:
+        // like members, a preset cannot be filed under a project that is never stored.
         Some(p) if crate::project::get_project(store, p)?.is_none() => {
             return Err(PresetError::UnknownProject(p.to_string()).into());
         }
@@ -429,12 +430,36 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_cannot_be_filed_under_the_synthesized_default_project() {
+        let mut store = mem_store();
+        let err = put_preset(
+            &mut store,
+            user("x", Some(crate::project::DEFAULT_PROJECT_ID)),
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<PresetError>(),
+            Some(PresetError::UnknownProject(_))
+        ));
+        assert!(
+            list_presets(&store, Some(crate::project::DEFAULT_PROJECT_ID))
+                .unwrap()
+                .iter()
+                .all(|p| p.scope != "project:default")
+        );
+    }
+
+    #[test]
     fn a_project_row_shadows_only_its_project() {
         let mut store = mem_store();
         seed_builtins(&mut store, 1).unwrap();
-        put_preset(&mut store, user("feature", Some("default")), 2).unwrap();
+        let pid = crate::project::create_project(&mut store, "alpha", None, 1)
+            .unwrap()
+            .id;
+        put_preset(&mut store, user("feature", Some(&pid)), 2).unwrap();
         assert_eq!(
-            resolve(&store, Some("default"), "feature")
+            resolve(&store, Some(&pid), "feature")
                 .unwrap()
                 .unwrap()
                 .steps
@@ -457,15 +482,12 @@ mod tests {
                 .len(),
             6
         );
-        let listed: Vec<_> = list_presets(&store, Some("default"))
+        let listed: Vec<_> = list_presets(&store, Some(&pid))
             .unwrap()
             .into_iter()
             .map(|p| (p.name, p.scope))
             .collect();
-        assert_eq!(
-            listed,
-            [("feature".to_string(), "project:default".to_string())]
-        );
+        assert_eq!(listed, [("feature".to_string(), format!("project:{pid}"))]);
     }
 
     #[test]
