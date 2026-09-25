@@ -1229,7 +1229,10 @@ fn a_plan_the_worst_case_floor_would_push_past_the_limit_is_refused_at_launch() 
         .launch_run(spec("rlim", HumanConfirm::None, Some(builds(UNIT_LIMIT))))
         .expect_err("over the limit once floored");
     let msg = err.to_string();
-    assert!(msg.contains(&format!("{UNIT_LIMIT}-unit governed limit")), "{msg}");
+    assert!(
+        msg.contains(&format!("{UNIT_LIMIT}-unit governed limit")),
+        "{msg}"
+    );
     assert!(msg.contains("5 the floor may add"), "{msg}");
     assert!(
         rig.core
@@ -1248,10 +1251,15 @@ fn a_plan_that_fits_with_the_worst_case_floor_launches() {
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
     rig.core
-        .launch_run(spec("rfit", HumanConfirm::None, Some(builds(UNIT_LIMIT - 5))))
+        .launch_run(spec(
+            "rfit",
+            HumanConfirm::None,
+            Some(builds(UNIT_LIMIT - 5)),
+        ))
         .expect("fits with the floor");
-    rig.tap
-        .until("the plan_approval pause", |s| paused_on_plan(s, "rfit").is_some());
+    rig.tap.until("the plan_approval pause", |s| {
+        paused_on_plan(s, "rfit").is_some()
+    });
     assert_eq!(unit_ids(&rig.core, "rfit").len(), UNIT_LIMIT);
 }
 

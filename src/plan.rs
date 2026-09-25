@@ -966,6 +966,53 @@ pub struct FloorFilled {
     pub floor_override: Option<FloorOverride>,
 }
 
+/// The floor phase types a plan owes for a band's `phases` (§8.5): empty for a plan with no creator
+/// step; on a non-code run (no step executes code) `produce` fills the build slot and `critique`
+/// the review slot; `deliver` only for a run that delivers. The one rule [`floor_fill`] and
+/// [`worst_case_floor_additions`] share.
+fn floor_types(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+    phases: &[&str],
+    delivers: bool,
+) -> Vec<String> {
+    if !plan.has_creator() {
+        return Vec::new();
+    }
+    let entry = |c: &str| catalog.iter().find(|e| e.id == c);
+    let code_run = plan.steps.iter().any(|s| {
+        s.executes_code == Some(true) || entry(&s.catalog).is_some_and(|e| e.executes_code)
+    });
+    phases
+        .iter()
+        .filter(|p| **p != "deliver" || delivers)
+        .map(|p| match (*p, code_run) {
+            ("build", false) => "produce",
+            ("review", false) => "critique",
+            (p, _) => p,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The phase types floor fill could insert into `plan` in the WORST case: the top band's floor
+/// (read from `THRESHOLDS` — the highest score any plan can reach, destructive or not) minus the
+/// types the plan already has. Floor fill inserts exactly one step per missing floor type and a
+/// ratchet never exceeds the top band, so `plan` units plus this count is an exact upper bound on
+/// what the run will plan — what a launch's synchronous unit limit checks (codex round 5 on #622)
+/// before any score exists.
+pub fn worst_case_floor_additions(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+    delivers: bool,
+) -> Vec<String> {
+    let top = crate::review_scale::floor_for(u8::MAX, true);
+    floor_types(catalog, plan, &top.phases, delivers)
+        .into_iter()
+        .filter(|ty| !plan.steps.iter().any(|s| &s.catalog == ty))
+        .collect()
+}
+
 /// Floor-fill a plan and compose it (DES-TEAMING-002 §8.5): every floor phase type missing from
 /// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
 /// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
@@ -991,25 +1038,7 @@ pub fn floor_fill(
     // §8.5: a plan with no creator step has an empty floor and is never high risk.
     let creator = plan.has_creator();
     let high_risk = creator && row.high_risk;
-    // §8.5 non-code runs: no step executes code ⇒ `produce` fills the build slot, `critique` the
-    // review slot. `deliver` is in the floor only for a run that delivers.
-    let code_run = plan.steps.iter().any(|s| {
-        s.executes_code == Some(true) || entry(&s.catalog).is_some_and(|e| e.executes_code)
-    });
-    let floor: Vec<String> = if !creator {
-        Vec::new()
-    } else {
-        row.phases
-            .iter()
-            .filter(|p| **p != "deliver" || input.deliver.is_some())
-            .map(|p| match (*p, code_run) {
-                ("build", false) => "produce",
-                ("review", false) => "critique",
-                (p, _) => p,
-            })
-            .map(str::to_string)
-            .collect()
-    };
+    let floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned phase
     // in a high-risk band. It exempts floor types from the fill; it removes no authored step.
     let mut exempt: Vec<&str> = Vec::new();

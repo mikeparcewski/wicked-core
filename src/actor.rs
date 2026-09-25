@@ -1434,10 +1434,31 @@ pub(crate) fn run(
                         Some(def) => crate::plan::plan_from_def(def, &spec.problem, &run_id).len(),
                         None => crate::plan::plan_units(&spec.problem, &run_id).len(),
                     };
-                    if n_units as u32 > DENY_PHASE_SPAN {
+                    // (codex round 5 on #622) A plan launch is floor-filled once its score exists
+                    // (after the worktree): count the worst case NOW — every phase the top band's
+                    // floor could add — so an over-limit launch is a synchronous Err, never a run
+                    // that fails after its session is persisted. `planned_units` keeps the exact
+                    // count at plan time.
+                    let floor_adds = match &launch_plan {
+                        Some((plan, _)) => crate::plan_gate::worst_case_floor_additions(
+                            plan,
+                            spec.deliver_step.as_ref(),
+                        ),
+                        None => Vec::new(),
+                    };
+                    if (n_units + floor_adds.len()) as u32 > DENY_PHASE_SPAN {
+                        if floor_adds.is_empty() {
+                            anyhow::bail!(
+                                "run has {n_units} units, exceeding the {DENY_PHASE_SPAN}-unit \
+                                 governed limit; split the problem into smaller runs"
+                            );
+                        }
                         anyhow::bail!(
-                            "run has {n_units} units, exceeding the {DENY_PHASE_SPAN}-unit governed limit; \
-                             split the problem into smaller runs"
+                            "run has {n_units} authored units plus up to {} the floor may add \
+                             ({}), exceeding the {DENY_PHASE_SPAN}-unit governed limit; split the \
+                             plan into smaller runs",
+                            floor_adds.len(),
+                            floor_adds.join(", ")
                         );
                     }
                     // Write a Planning stub so GET /runs shows the session immediately.

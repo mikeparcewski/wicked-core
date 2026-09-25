@@ -588,6 +588,20 @@ pub(crate) fn precheck(
     }
 }
 
+/// The phase types floor fill could add to a launch plan in the worst case (the plan with its
+/// deliver step, as it will be floor-filled): the launch's synchronous unit limit counts them.
+pub(crate) fn worst_case_floor_additions(
+    plan: &PlanSteps,
+    deliver_step: Option<&PlanStep>,
+) -> Vec<String> {
+    let plan = with_default_ids(&with_deliver(plan, deliver_step));
+    crate::plan::worst_case_floor_additions(
+        crate::catalog::catalog(),
+        &plan,
+        deliver_step.is_some(),
+    )
+}
+
 /// The launch plan's AUTHORED steps composed as rev 1 (`<run>:plan-1`), for the launch-time
 /// checks that read a def (tool preflight, base skill, seat need). The floor is added later.
 pub(crate) fn authored_def(
@@ -1139,5 +1153,52 @@ mod tests {
         let back = take_queued(&mut state);
         assert_eq!(back, d.events);
         assert!(state.queued.is_empty());
+    }
+
+    /// The worst-case floor additions: the top band's floor types the plan lacks (fixed from
+    /// §8.5's 70-100 row), with the non-code substitution and `deliver` only for a delivering run.
+    #[test]
+    fn worst_case_floor_additions_are_the_top_band_types_the_plan_lacks() {
+        let adds =
+            |v: serde_json::Value, d: Option<&PlanStep>| worst_case_floor_additions(&plan(v), d);
+        assert_eq!(
+            adds(json!({"steps": [{"catalog": "build"}]}), None),
+            [
+                "test_plan",
+                "design",
+                "architecture",
+                "review",
+                "security_review"
+            ]
+        );
+        assert_eq!(
+            adds(
+                json!({"steps": [{"catalog": "build"}, {"catalog": "review"}]}),
+                None
+            ),
+            ["test_plan", "design", "architecture", "security_review"]
+        );
+        // No creator step: an empty floor.
+        assert!(adds(json!({"steps": [{"catalog": "understand"}]}), None).is_empty());
+        // A non-code run: `critique` fills the review slot.
+        assert_eq!(
+            adds(json!({"steps": [{"catalog": "produce"}]}), None),
+            [
+                "test_plan",
+                "design",
+                "architecture",
+                "critique",
+                "security_review"
+            ]
+        );
+        // A delivering run carries its deliver step, so `deliver` is never an addition.
+        let d: PlanStep = serde_json::from_value(json!({
+            "catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}
+        }))
+        .unwrap();
+        assert_eq!(
+            adds(json!({"steps": [{"catalog": "build"}]}), Some(&d)).len(),
+            5
+        );
     }
 }
