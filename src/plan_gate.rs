@@ -813,7 +813,7 @@ pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow:
     )
 }
 
-fn plan_refused(
+pub(crate) fn plan_refused(
     run_id: &str,
     proposal_id: &str,
     base_rev: Option<u32>,

@@ -1128,9 +1128,10 @@ fn an_edit_that_fails_its_preflight_is_refused_before_anything_changes() {
     rig.core
         .launch_run(spec("rpf", HumanConfirm::None, Some(p)))
         .unwrap();
-    rig.tap.until("the plan_approval pause and its gate.opened", |s| {
-        paused_on_plan(s, "rpf").is_some() && !of_type(s, "rpf", OPENED).is_empty()
-    });
+    rig.tap
+        .until("the plan_approval pause and its gate.opened", |s| {
+            paused_on_plan(s, "rpf").is_some() && !of_type(s, "rpf", OPENED).is_empty()
+        });
     let units_before = unit_ids(&rig.core, "rpf");
     let edit = plan(json!({"steps": [
         {"catalog": "build", "id": "build"},
@@ -1147,10 +1148,16 @@ fn an_edit_that_fails_its_preflight_is_refused_before_anything_changes() {
     rig.tap.settle();
     let refused = of_type(&rig.tap.seen, "rpf", REFUSED);
     assert!(
-        refused[0]["reason"].as_str().unwrap().contains(MISSING_TOOL),
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(MISSING_TOOL),
         "{refused:?}"
     );
-    assert!(of_type(&rig.tap.seen, "rpf", ACCEPTED).is_empty(), "no rev accepted");
+    assert!(
+        of_type(&rig.tap.seen, "rpf", ACCEPTED).is_empty(),
+        "no rev accepted"
+    );
     // The only gate.decided is the first gate's record of the (refused) edit — nothing released.
     let decided = of_type(&rig.tap.seen, "rpf", DECIDED);
     assert!(
@@ -1165,8 +1172,9 @@ fn an_edit_that_fails_its_preflight_is_refused_before_anything_changes() {
     // Still answerable: approving the held plan releases it.
     let status = rig.core.confirm_gate("rpf", approve()).unwrap();
     assert_eq!(status, SessionStatus::Executing);
-    rig.tap
-        .until("the first dispatch", |s| !dispatched_ords(s, "rpf").is_empty());
+    rig.tap.until("the first dispatch", |s| {
+        !dispatched_ords(s, "rpf").is_empty()
+    });
 }
 
 /// A PRESET launch whose deliver step names a tool that is not installed is refused by the

@@ -1373,13 +1373,16 @@ pub(crate) fn run(
                             anyhow::bail!("the launch's plan is refused: {}", refusal.reason);
                         }
                     }
-                    let selected_def = match (&launch_plan, &spec.plan) {
-                        (Some((plan, None)), Some(_)) => Some(crate::plan_gate::authored_def(
+                    // (codex round 4) For ANY plan launch — a user plan OR a preset — the checks
+                    // below read the plan as it will run: its steps plus the deliver step, composed
+                    // once here (never the preset's bare def, which lacks the deliver step).
+                    let selected_def = match &launch_plan {
+                        Some((plan, _)) => Some(crate::plan_gate::authored_def(
                             &run_id,
                             plan,
                             spec.deliver_step.as_ref(),
                         )?),
-                        _ => pipeline::resolve_workflow_def(
+                        None => pipeline::resolve_workflow_def(
                             &store,
                             spec.project_id.as_deref(),
                             spec.workflow.as_deref(),
@@ -1487,7 +1490,11 @@ pub(crate) fn run(
                         CoreEvent::SessionStarted {
                             session: run_id.clone(),
                             problem: spec.problem.clone(),
-                            workflow_id: selected_def.as_ref().map(|d| d.id.clone()),
+                            // A preset launch names its preset (studio's workflow label).
+                            workflow_id: launch_plan
+                                .as_ref()
+                                .and_then(|(_, preset)| preset.clone())
+                                .or_else(|| selected_def.as_ref().map(|d| d.id.clone())),
                             cli_count: spec.clis.len() as u32,
                             governed: in_process_governance().is_some(),
                             entity_mode: match spec.entity_mode {
@@ -3812,6 +3819,9 @@ fn team_plan_at_launch(
         crate::plan_gate::Verdict::Accepted { def, .. }
         | crate::plan_gate::Verdict::Held { def, .. } => def,
     };
+    // (codex round 4) Build and check the exact floor-filled def BEFORE anything of the run
+    // changes: a def that cannot plan fails the launch here, with its plan state unwritten.
+    check_def_plans(store, &def, &spec.problem, run_id, spec.repo_ref.as_deref())?;
     let mut scoped = registry.clone();
     scoped
         .register_composed(def.clone())
@@ -8352,6 +8362,24 @@ fn confirm_plan_gate(
         }
         _ => serde_json::json!({"approve": false, "action": "reject", "amend": null}),
     };
+    let now = crate::interaction::now_millis();
+    // (codex round 4 on #622) BUILD AND CHECK BEFORE COMMIT: an edit is decided and the exact def
+    // it would run is composed, registered, preflighted, planned and distributed — every
+    // synchronous check — BEFORE the row is answered or any run state changes. A failed check
+    // refuses the edit exactly as a compose refusal does (acceptance (i)): `plan.refused` names
+    // the reason, the gate re-opens, and the held plan, accepted rev and units are untouched.
+    let staged = match &decision {
+        HumanDecision::EditPlan { plan } => Some(stage_edit(
+            store,
+            &session,
+            &state,
+            &pending,
+            &gate_id,
+            plan.clone(),
+            now,
+        )?),
+        _ => None,
+    };
     crate::interaction::resolve_open_for_session(
         store,
         run_id,
@@ -8359,7 +8387,6 @@ fn confirm_plan_gate(
         Some(answer.to_string()),
         crate::interaction::now_millis(),
     )?;
-    let now = crate::interaction::now_millis();
     let attempt = session.attempt;
     let decided_fact = |d: crate::team_events::GateDecision| {
         crate::plan_gate::gate_decided(run_id, &gate_id, ord, attempt, d, now)
@@ -8376,7 +8403,7 @@ fn confirm_plan_gate(
             in_flight.remove(run_id);
             return Ok(s);
         }
-        HumanDecision::EditPlan { plan } => Some(plan),
+        HumanDecision::EditPlan { .. } => staged,
         _ => None,
     };
     // Layer-3 deny-dominates at the phase boundary, before any approval-side mutation.
@@ -8403,52 +8430,29 @@ fn confirm_plan_gate(
             s.team_plan = Some(next);
             decided
         }
-        Some(edit) => {
+        Some(staged) => {
             let amended = decided_fact(crate::team_events::GateDecision::HumanAmended)?;
-            let repo_root = s
-                .repo_ref
-                .as_deref()
-                .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-                .map(|r| std::path::PathBuf::from(r.root_path));
-            let scored = crate::plan_gate::intent_score_for_run(
-                &edit,
-                repo_root.as_deref(),
-                s.base_commit.as_deref(),
-            );
-            let decided = crate::plan_gate::decide(
-                run_id,
-                crate::plan_gate::Proposal {
-                    by: "human".into(),
-                    source: crate::team_events::ProposalSource::Gate {
-                        gate_id: gate_id.clone(),
-                    },
-                    kind: crate::team_events::ProposalKind::Edit,
-                    preset: None,
-                    plan: edit,
-                    reviewing_ord: pending.reviewing_ord,
-                    approved_by_human: true,
-                },
-                &state,
-                &s.human_confirm,
-                &scored,
-                now,
-            )?;
-            match decided.verdict {
-                crate::plan_gate::Verdict::Accepted { def, .. } => {
-                    // The edit's `plan.proposed` / `path.scored` ride the FIFO; the gate's
-                    // `gate.decided{human_amended}` is the required resume fact (below).
-                    team_gate::publish_plan_facts(&s, decided.events);
-                    s.team_plan = Some(decided.state);
+            match staged {
+                StagedEdit::Accepted {
+                    state: next,
+                    events,
+                    def,
+                } => {
+                    // Every check passed on this exact def: only now do the facts go out, the
+                    // rev is recorded and the units are swapped (the old ones removed only after
+                    // the new set is written).
+                    team_gate::publish_plan_facts(&s, events);
+                    s.team_plan = Some(*next);
                     put_node(store, s.to_node())?;
                     replan_for_accepted_edit(store, subscribers, &s, def)?;
                     s = crate::domain::get_session(&*store, run_id)?
                         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
                     amended
                 }
-                crate::plan_gate::Verdict::Refused { reason } => {
+                StagedEdit::Refused { reason, events } => {
                     // The first gate's answer stays on record; the edit's refusal follows it.
                     let mut facts = vec![amended];
-                    facts.extend(decided.events);
+                    facts.extend(events);
                     team_gate::publish_plan_facts(&s, facts);
                     // Re-open (§8.6): the same plan stays held; the gate is new (a fresh
                     // gate sequence, so a new `gate_id` and a new `gate.opened` row).
@@ -8481,9 +8485,6 @@ fn confirm_plan_gate(
                         }
                     };
                 }
-                crate::plan_gate::Verdict::Held { .. } => {
-                    anyhow::bail!("run {run_id}: an edit approved at the gate cannot be held again")
-                }
             }
         }
     };
@@ -8510,8 +8511,158 @@ fn confirm_plan_gate(
     team_gate::release_plan_gate(&mut cx, s, decided_ev)
 }
 
-/// (T3) Re-plan a run whose every unit is still unrun onto an edit accepted at its plan gate:
-/// the old units are removed, the accepted def (`<run>:plan-<rev>`) is planned and distributed
+/// An edit decided and checked, not yet committed ([`stage_edit`]).
+enum StagedEdit {
+    /// Accepted as the next rev; its def passed every synchronous check.
+    Accepted {
+        state: Box<crate::plan_gate::TeamPlanState>,
+        events: Vec<crate::team_events::TeamEvent>,
+        def: crate::workflow::WorkflowDef,
+    },
+    /// Refused — by compose/floor fill, or by a check on the def it would run.
+    Refused {
+        reason: String,
+        events: Vec<crate::team_events::TeamEvent>,
+    },
+}
+
+/// (codex round 4) Decide an edit and, when it is accepted, build and check the EXACT def it
+/// would run — [`check_def_runs`] — without changing anything of the run. Pure but for the
+/// idempotent built-in validator seeds the attach reads.
+fn stage_edit(
+    store: &mut dyn GraphStore,
+    session: &AgentSession,
+    state: &crate::plan_gate::TeamPlanState,
+    pending: &crate::plan_gate::PendingPlan,
+    gate_id: &str,
+    edit: crate::plan::PlanSteps,
+    now: i64,
+) -> anyhow::Result<StagedEdit> {
+    let run_id = session.id.as_str();
+    let repo_root = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+        .map(|r| std::path::PathBuf::from(r.root_path));
+    let scored = crate::plan_gate::intent_score_for_run(
+        &edit,
+        repo_root.as_deref(),
+        session.base_commit.as_deref(),
+    );
+    let decided = crate::plan_gate::decide(
+        run_id,
+        crate::plan_gate::Proposal {
+            by: "human".into(),
+            source: crate::team_events::ProposalSource::Gate {
+                gate_id: gate_id.to_string(),
+            },
+            kind: crate::team_events::ProposalKind::Edit,
+            preset: None,
+            plan: edit,
+            reviewing_ord: pending.reviewing_ord,
+            approved_by_human: true,
+        },
+        state,
+        &session.human_confirm,
+        &scored,
+        now,
+    )?;
+    match decided.verdict {
+        crate::plan_gate::Verdict::Refused { reason } => Ok(StagedEdit::Refused {
+            reason,
+            events: decided.events,
+        }),
+        crate::plan_gate::Verdict::Held { .. } => {
+            anyhow::bail!("run {run_id}: an edit approved at the gate cannot be held again")
+        }
+        crate::plan_gate::Verdict::Accepted { def } => match check_def_runs(store, session, &def) {
+            Ok(()) => Ok(StagedEdit::Accepted {
+                state: Box::new(decided.state),
+                events: decided.events,
+                def,
+            }),
+            Err(e) => {
+                let reason = format!("{e:#}");
+                let proposal_id = decided
+                    .state
+                    .accepted
+                    .as_ref()
+                    .map(|a| a.proposal_id.clone())
+                    .unwrap_or_default();
+                let base_rev = (state.accepted_rev > 0).then_some(state.accepted_rev);
+                let mut events = decided.events;
+                events.push(crate::plan_gate::plan_refused(
+                    run_id,
+                    &proposal_id,
+                    base_rev,
+                    &reason,
+                    now,
+                )?);
+                Ok(StagedEdit::Refused { reason, events })
+            }
+        },
+    }
+}
+
+/// Every synchronous check the run's planner applies to `def`, on `def` itself: the planning
+/// checks [`pipeline::planned_units`] shares with `pre_distribute` (tool preflight, base skill,
+/// repo binding, unit limit, validator attach) and the seat distribution onto the launch roster.
+fn check_def_runs(
+    store: &mut dyn GraphStore,
+    session: &AgentSession,
+    def: &crate::workflow::WorkflowDef,
+) -> anyhow::Result<()> {
+    let units = check_def_plans(
+        store,
+        def,
+        &session.problem,
+        &session.id,
+        session.repo_ref.as_deref(),
+    )?;
+    let roster = launch_roster(session)?;
+    crate::distribute::distribute_units_on_benched(
+        &units,
+        &roster,
+        &session.id,
+        &session.benched_seats,
+    )?;
+    Ok(())
+}
+
+/// The planning half of [`check_def_runs`]: the def registers (ungated code phases, unpinned
+/// verified evidence) and plans ([`pipeline::planned_units`]: tool preflight, base skill, repo
+/// binding, unit limit, validator attach). Returns the units it would plan.
+fn check_def_plans(
+    store: &mut dyn GraphStore,
+    def: &crate::workflow::WorkflowDef,
+    problem: &str,
+    run_id: &str,
+    repo_ref: Option<&str>,
+) -> anyhow::Result<Vec<crate::domain::WorkUnit>> {
+    crate::workflow::WorkflowRegistry::default()
+        .register_composed(def.clone())
+        .map_err(|e| anyhow::anyhow!("the composed plan `{}` does not register: {e}", def.id))?;
+    pipeline::planned_units(store, Some(def), problem, run_id, repo_ref, Some(&def.id))
+}
+
+/// The launch roster persisted on the plan state (the session keeps only the seat keys).
+fn launch_roster(session: &AgentSession) -> anyhow::Result<Vec<wicked_council::AgenticCli>> {
+    let run_id = session.id.as_str();
+    session
+        .team_plan
+        .as_ref()
+        .map(|t| t.roster.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("run {run_id}: the launch roster does not parse: {e}"))
+}
+
+/// (T3) Re-plan a run whose every unit is still unrun onto an edit accepted at its plan gate —
+/// called only after [`stage_edit`] proved the def passes every check: the new units are
+/// planned, distributed and written first and the old ones not in the new set removed after; the
+/// accepted def (`<run>:plan-<rev>`) is planned and distributed
 /// onto the launch roster (persisted on the plan state, so this survives a restart), and the
 /// session is carried forward (`pre_distribute` keeps `gate_seq`/`team_plan`).
 fn replan_for_accepted_edit(
@@ -8521,23 +8672,13 @@ fn replan_for_accepted_edit(
     def: crate::workflow::WorkflowDef,
 ) -> anyhow::Result<()> {
     let run_id = session.id.as_str();
-    let roster: Vec<wicked_council::AgenticCli> = session
-        .team_plan
-        .as_ref()
-        .map(|t| t.roster.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("run {run_id}: the launch roster does not parse: {e}"))?;
+    let roster = launch_roster(session)?;
     let mut scoped = crate::workflow::WorkflowRegistry::default();
     let def_id = def.id.clone();
     scoped
         .register_composed(def)
         .map_err(|e| anyhow::anyhow!("the edited plan `{def_id}` does not register: {e}"))?;
-    for u in crate::domain::session_units(&*store, run_id)? {
-        store.remove_file(&u.to_node().location.file)?;
-    }
+    let old = crate::domain::session_units(&*store, run_id)?;
     let mut pre = pipeline::pre_distribute(
         store,
         &roster,
@@ -8566,7 +8707,13 @@ fn replan_for_accepted_edit(
     )?;
     pipeline::apply_distributions(store, &mut pre, distributions, &mut |ev| {
         emit(subscribers, ev)
-    })
+    })?;
+    // The new set is written: only now do the old units that are not part of it go.
+    let kept: std::collections::HashSet<&str> = pre.units.iter().map(|u| u.id.as_str()).collect();
+    for u in old.iter().filter(|u| !kept.contains(u.id.as_str())) {
+        store.remove_file(&u.to_node().location.file)?;
+    }
+    Ok(())
 }
 
 /// Resolve a human-confirm gate on a paused run. `Approve` (with an optional amendment to the next
