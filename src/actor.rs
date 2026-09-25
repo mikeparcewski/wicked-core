@@ -5897,7 +5897,7 @@ fn fail_run(
     session.status = SessionStatus::Failed;
     session.finished_at = Some(crate::interaction::now_millis());
     let _ = put_node(store, session.to_node());
-    team_gate::path_ended(
+    team_gate::run_ended(
         &*store,
         &session.id,
         crate::team::events::PathStatus::Failed,
@@ -7885,7 +7885,7 @@ fn finalize_run(
         session.status = SessionStatus::Completed;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        team_gate::path_ended(&*store, run_id, crate::team::events::PathStatus::Completed);
+        team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Completed);
         // (F-7R2-013) A completed run's worktree is RETAINED — the files view, the delivered
         // PR's review cycle and any uncommitted leftover need it — until the run is archived or
         // the retention window elapses (`completed_worktree_retention`); `0` days restores the
@@ -8514,7 +8514,7 @@ pub(crate) fn cancel_run(
     session.status = SessionStatus::Cancelled;
     session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
-    team_gate::path_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
+    team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
     // A cancelled run's open prompt is dead state — resolve it `cancelled` so no skin renders a
     // gate nobody can answer (DES-PROJECT-001 §5.3). No-op when the run was answered/never paused.
     // Best-effort by design (the cancel itself already committed), but LOGGED: a prompt stuck

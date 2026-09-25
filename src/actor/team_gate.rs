@@ -223,7 +223,6 @@ pub(super) fn gate_before_dispatch(
     session: &mut AgentSession,
     units: &[WorkUnit],
 ) -> anyhow::Result<TeamGate> {
-    #[allow(unreachable_code)] return Ok(TeamGate::Proceed);
     if !is_team_run(session, units) {
         return Ok(TeamGate::Proceed);
     }
@@ -310,7 +309,6 @@ fn transport_prompt(fact: &str, reason: &str) -> String {
 /// The team snapshot a dispatched unit carries: `transport: none` (with the run's reason) for a
 /// team unit of an un-teamed run; `None` otherwise (a teamed attempt's snapshot is T5's).
 pub(super) fn unit_snapshot(session: &AgentSession, unit: &WorkUnit) -> Option<UnitTeamSnapshot> {
-    #[allow(unreachable_code)] return None;
     let team = session.team.as_ref()?;
     (unit.team_run && team.is_unteamed()).then(|| UnitTeamSnapshot {
         transport: Transport::None,
@@ -319,14 +317,29 @@ pub(super) fn unit_snapshot(session: &AgentSession, unit: &WorkUnit) -> Option<U
     })
 }
 
-/// Publish `path.ended` for a teamed run reaching a terminal status (not required: a later drain
-/// lets consumers forget the run). Nothing for an un-teamed run (§4.8 row 1).
-pub(super) fn path_ended(store: &dyn GraphStore, run_id: &str, status: PathStatus) {
+/// A team run reached a terminal status. Teamed: publish `path.ended` (not required: a later
+/// drain lets consumers forget the run). Still deciding (its `path.started` in flight): tombstone
+/// the run's lines, so a late landing never opens a path that will not end. Un-teamed: nothing
+/// (§4.8 row 1).
+pub(super) fn run_ended(store: &dyn GraphStore, run_id: &str, status: PathStatus) {
     let Ok(Some(session)) = crate::domain::get_session(store, run_id) else {
         return;
     };
-    if session.team.as_ref().is_some_and(RunTeamState::is_teamed) {
+    let Some(team) = session.team.as_ref() else {
+        return;
+    };
+    if team.is_teamed() {
         publish_fire(event(run_id, TeamBody::PathEnded(PathEnded { status })));
+    } else if team.transport.is_none() {
+        let _ = send(PublisherReq::SupersedeRun {
+            run_id: run_id.to_string(),
+            from_event: tev::PATH_STARTED.to_string(),
+            reason: format!(
+                "the run ended ({}) before its path.started landed",
+                status.as_str()
+            ),
+            ack: None,
+        });
     }
 }
 
@@ -351,6 +364,13 @@ fn pending_for(
     let Some(session) = crate::domain::get_session(store, &token.run_id)? else {
         return Ok(None);
     };
+    // A run that ended meanwhile (cancelled while its fact was in flight) runs no gated step.
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) {
+        return Ok(None);
+    }
     let Some(p) = session.team.as_ref().and_then(|t| t.pending.clone()) else {
         return Ok(None);
     };
@@ -696,7 +716,6 @@ fn run_blocked(
 /// the store — and a run caught mid-fact re-opens its `team_transport` pause so a human decides
 /// again. Runs before the publisher is asked to drain, so no drain can race the tombstone.
 pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) {
-        #[allow(unreachable_code)] return;
     let Ok(sessions) = crate::domain::all_sessions(store) else {
         return;
     };

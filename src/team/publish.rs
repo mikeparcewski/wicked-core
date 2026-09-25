@@ -35,7 +35,7 @@
 //! outbox only through the [`TeamPublisher`] thread (and, at boot, before any drain is started).
 //! One daemon owns a state home, so the mutex is process-local.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -484,7 +484,6 @@ impl TeamBus {
     /// superseded fact is neither published nor spooled. `Err` only when the event cannot be keyed
     /// or its line cannot be written.
     pub fn publish(&self, ev: &TeamEvent) -> Result<PublishOutcome> {
-        #[allow(unreachable_code)] return Err(anyhow::anyhow!("P1 red: TeamBus::publish is not built yet"));
         let fact = Fact::of(ev)?;
         let m = self.mutex();
         let _g = guard(&m);
@@ -529,7 +528,6 @@ impl TeamBus {
     }
 
     fn drain_locked(&self, only: Option<&Lane>) -> DrainReport {
-        #[allow(unreachable_code)] return DrainReport::default();
         let snap = self.read();
         let lanes = match only {
             Some(l) => vec![l.clone()],
@@ -616,7 +614,6 @@ impl TeamBus {
 
     /// Supersede one fact by key (§4.1 tombstone form 1).
     pub fn supersede_fact(&self, key: &str, reason: &str) -> std::io::Result<()> {
-        #[allow(unreachable_code)] return Ok(());
         let m = self.mutex();
         let _g = guard(&m);
         self.append(json!({
@@ -635,7 +632,6 @@ impl TeamBus {
         from_event: &str,
         reason: &str,
     ) -> std::io::Result<()> {
-        #[allow(unreachable_code)] return Ok(());
         let m = self.mutex();
         let _g = guard(&m);
         self.append(json!({
@@ -767,8 +763,8 @@ impl TeamLink {
 pub const TEAM_PUBLISHER_THREAD: &str = "wicked-core-team-publisher";
 
 struct Waiter {
-    lane: Lane,
-    key: String,
+    event: Box<TeamEvent>,
+    run_id: String,
     ack: Option<(TeamToken, Exhausted)>,
     /// Retries done so far.
     tries: usize,
@@ -797,6 +793,21 @@ fn publisher_loop(
     }
 }
 
+fn ack_published(self_tx: &Sender<Command>, ack: Option<(TeamToken, Exhausted)>, id: i64) {
+    if let Some((token, _)) = ack {
+        let _ = self_tx.send(Command::TeamPublished {
+            token,
+            event_id: id,
+        });
+    }
+}
+
+fn ack_failed(self_tx: &Sender<Command>, ack: Option<(TeamToken, Exhausted)>, reason: String) {
+    if let Some((token, _)) = ack {
+        let _ = self_tx.send(Command::TeamTransportFailed { token, reason });
+    }
+}
+
 fn handle_req(
     bus: &TeamBus,
     schedule: &[Duration],
@@ -805,53 +816,26 @@ fn handle_req(
     req: PublisherReq,
 ) {
     match req {
-        PublisherReq::Publish { event, ack } => {
-            let (lane, key) = match (Lane::of(&event), event.key()) {
-                (Ok(l), Ok(k)) => (l, k),
-                (Err(e), _) | (_, Err(e)) => {
-                    if let Some((token, _)) = ack {
-                        let _ = self_tx.send(Command::TeamTransportFailed {
-                            token,
-                            reason: format!("the fact cannot be keyed: {e:#}"),
-                        });
-                    }
-                    return;
-                }
-            };
-            match bus.publish(&event) {
-                Ok(PublishOutcome::Published(id)) => {
-                    if let Some((token, _)) = ack {
-                        let _ = self_tx.send(Command::TeamPublished {
-                            token,
-                            event_id: id,
-                        });
-                    }
-                }
-                Ok(PublishOutcome::Superseded) => {
-                    if let Some((token, _)) = ack {
-                        let _ = self_tx.send(Command::TeamTransportFailed {
-                            token,
-                            reason: "superseded: the run moved past this fact".into(),
-                        });
-                    }
-                }
-                Ok(PublishOutcome::Spooled(_)) => waiting.push(Waiter {
-                    lane,
-                    key,
-                    ack,
-                    tries: 0,
-                    due: Instant::now() + schedule[0],
-                }),
-                Err(e) => {
-                    if let Some((token, _)) = ack {
-                        let _ = self_tx.send(Command::TeamTransportFailed {
-                            token,
-                            reason: format!("the fact could not be spooled: {e:#}"),
-                        });
-                    }
-                }
-            }
-        }
+        PublisherReq::Publish { event, ack } => match bus.publish(&event) {
+            Ok(PublishOutcome::Published(id)) => ack_published(self_tx, ack, id),
+            Ok(PublishOutcome::Superseded) => ack_failed(
+                self_tx,
+                ack,
+                "superseded: the run moved past this fact".into(),
+            ),
+            Ok(PublishOutcome::Spooled(_)) => waiting.push(Waiter {
+                run_id: event.env.run_id.clone(),
+                event,
+                ack,
+                tries: 0,
+                due: Instant::now() + schedule[0],
+            }),
+            Err(e) => ack_failed(
+                self_tx,
+                ack,
+                format!("the fact could not be keyed or spooled: {e:#}"),
+            ),
+        },
         PublisherReq::SupersedeRun {
             run_id,
             from_event,
@@ -859,13 +843,17 @@ fn handle_req(
             ack,
         } => {
             if let Err(e) = bus.supersede_run(&run_id, None, None, &from_event, &reason) {
-                eprintln!("wicked-core: team tombstone for {run_id} not written: {e}");
-                // No ack: the actor keeps waiting rather than persisting a fallback the outbox
-                // does not agree with. Retry once on the next tick.
+                // Fail closed: the actor keeps the run paused rather than persisting a fallback
+                // the outbox does not agree with.
+                ack_failed(
+                    self_tx,
+                    ack.map(|t| (t, Exhausted::Keep)),
+                    format!("the run tombstone could not be written: {e}"),
+                );
                 return;
             }
-            // Waiters of the run are moot now.
-            waiting.retain(|w| w.lane.run_id != run_id || w.lane.owner != LaneOwner::Engine);
+            // The run's engine waiters are moot now; their facts are superseded.
+            waiting.retain(|w| w.run_id != run_id);
             if let Some(token) = ack {
                 let _ = self_tx.send(Command::TeamSuperseded { token });
             }
@@ -885,6 +873,11 @@ fn handle_req(
     }
 }
 
+/// Retry every due waiter by publishing its fact again: [`TeamBus::publish`] drains the fact's
+/// lane in order first (FIFO), resolves a fact another drain already published to its existing
+/// row (the key), and refuses a superseded one. Past the bound a waiter is acknowledged as failed
+/// (for an irreversible fallback, only after the run tombstone is written) and its line stays for
+/// `replay_team_outbox`.
 fn retry_due(
     bus: &TeamBus,
     schedule: &[Duration],
@@ -892,84 +885,62 @@ fn retry_due(
     waiting: &mut Vec<Waiter>,
 ) {
     let now = Instant::now();
-    let due_lanes: Vec<Lane> = {
-        let mut v: Vec<Lane> = waiting
-            .iter()
-            .filter(|w| w.due <= now)
-            .map(|w| w.lane.clone())
-            .collect();
-        v.sort();
-        v.dedup();
-        v
-    };
-    if due_lanes.is_empty() {
-        return;
-    }
-    let mut published: BTreeMap<String, i64> = BTreeMap::new();
-    for lane in &due_lanes {
-        for (k, id) in bus.drain_lane(lane).published {
-            published.insert(k, id);
-        }
-    }
     let mut keep = Vec::new();
-    for mut w in waiting.drain(..) {
-        if let Some(id) = published.get(&w.key) {
-            if let Some((token, _)) = w.ack {
-                let _ = self_tx.send(Command::TeamPublished {
-                    token,
-                    event_id: *id,
-                });
-            }
-            continue;
-        }
-        if !due_lanes.contains(&w.lane) || w.due > now {
+    for mut w in std::mem::take(waiting) {
+        if w.due > now {
             keep.push(w);
             continue;
         }
-        if !bus.is_pending(&w.key) {
-            // Superseded meanwhile (a tombstone), or published by a replay on another path.
-            if let Some((token, _)) = w.ack {
-                let _ = self_tx.send(Command::TeamTransportFailed {
-                    token,
-                    reason: "superseded or drained elsewhere before it was acknowledged".into(),
-                });
+        let why = match bus.publish(&w.event) {
+            Ok(PublishOutcome::Published(id)) => {
+                ack_published(self_tx, w.ack, id);
+                continue;
             }
-            continue;
-        }
+            Ok(PublishOutcome::Superseded) => {
+                ack_failed(
+                    self_tx,
+                    w.ack,
+                    "superseded: the run moved past this fact".into(),
+                );
+                continue;
+            }
+            Ok(PublishOutcome::Spooled(why)) => why,
+            Err(e) => format!("{e:#}"),
+        };
         w.tries += 1;
-        if w.tries >= schedule.len() {
-            let bound: Duration = schedule.iter().sum();
-            let reason = format!(
-                "the bus refused `{}` for {} attempts over {:.0?}",
-                w.lane.run_id,
-                schedule.len(),
-                bound
-            );
-            if let Some((token, exhausted)) = w.ack {
-                let reason = format!("{} could not be published: {reason}", token.event_type);
-                if exhausted == Exhausted::SupersedeRun {
-                    // Tombstone BEFORE the fallback is acknowledged (§4.1).
-                    if let Err(e) =
-                        bus.supersede_run(&token.run_id, None, None, &token.event_type, &reason)
-                    {
-                        eprintln!(
-                            "wicked-core: team tombstone for {} not written ({e}); retrying",
-                            token.run_id
-                        );
-                        w.ack = Some((token, exhausted));
-                        w.due = now + *schedule.last().unwrap_or(&Duration::from_secs(1));
-                        keep.push(w);
-                        continue;
-                    }
-                }
-                let _ = self_tx.send(Command::TeamTransportFailed { token, reason });
-            }
-            // A fact nobody waits on stays in the outbox for `replay_team_outbox`.
+        if w.tries < schedule.len() {
+            w.due = now + schedule[w.tries];
+            keep.push(w);
             continue;
         }
-        w.due = now + schedule[w.tries];
-        keep.push(w);
+        let bound: Duration = schedule.iter().sum();
+        let Some((token, exhausted)) = w.ack.take() else {
+            // Nobody waits on it: the line stays in the outbox for `replay_team_outbox`.
+            continue;
+        };
+        let reason = format!(
+            "{} could not be published: the bus refused it for {} attempts over {bound:.0?} \
+             (last: {why})",
+            token.event_type,
+            schedule.len()
+        );
+        if exhausted == Exhausted::SupersedeRun {
+            // Tombstone BEFORE the fallback is acknowledged (§4.1).
+            if let Err(e) = bus.supersede_run(&token.run_id, None, None, &token.event_type, &reason)
+            {
+                eprintln!(
+                    "wicked-core: team tombstone for {} not written ({e}); retrying",
+                    token.run_id
+                );
+                w.ack = Some((token, exhausted));
+                w.due = now + *schedule.last().unwrap_or(&Duration::from_secs(1));
+                keep.push(w);
+                continue;
+            }
+        }
+        let _ = self_tx.send(Command::TeamTransportFailed { token, reason });
     }
+    keep.append(waiting);
     *waiting = keep;
 }
 

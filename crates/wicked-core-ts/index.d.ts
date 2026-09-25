@@ -380,6 +380,23 @@ export declare class Core {
    */
   listPresets(projectId?: string | undefined | null): Promise<string>
   /**
+   * A team run's transport and its units' team snapshots — the persisted state behind crew's
+   * `GET /api/v1/runs/:id/team` — as JSON `{ runId, transport, reason, streamFloor, planRev,
+   * pending, units: [{ ord, transport, reason, ledgerSource }] }`. `transport` is `"bus"`,
+   * `"none"` (un-teamed: render the "team transport unavailable" banner with `reason`) or
+   * `"pending"` (not decided yet). Resolves to `"null"` for a run that is not a team run;
+   * rejects for an unknown run.
+   */
+  runTeam(runId: string): Promise<string>
+  /**
+   * Replay the team outbox (`<state home>/team-outbox.ndjson`) onto the bus: every lane in
+   * order, superseded lines skipped and compacted, idempotent (a line replayed twice lands
+   * once). Resolves to the JSON report `{ published: [[key, eventId]], superseded, invalid,
+   * remaining, failures: [[runId, reason]] }`; rejects when the engine has no bus or no state
+   * home. Runs off the actor.
+   */
+  replayTeamOutbox(): Promise<string>
+  /**
    * Create a project. Resolves to the persisted `Project` as a JSON object
    * (`{ id, name, description, status, scope, created_at, updated_at }`). Rejects on an
    * empty/overlong name or a name already used by an ACTIVE project (the API's 409).

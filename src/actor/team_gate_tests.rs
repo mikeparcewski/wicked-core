@@ -332,6 +332,10 @@ fn row2_plan_accepted_fails_past_the_bound_the_run_pauses_team_transport() {
         "the reply waits for the acknowledgement"
     );
     wait_status(&e, "row2", SessionStatus::Completed);
+    // `path.ended` is published after the run completes (not required): wait for it.
+    wait_for("path.ended", || {
+        rig.types("row2").last().map(String::as_str) == Some(tev::PATH_ENDED)
+    });
     assert_eq!(
         rig.types("row2"),
         vec![
@@ -585,4 +589,38 @@ fn test_engines_write_only_their_temp_outbox() {
     assert_eq!(rig.outbox.file_name().unwrap(), TEAM_OUTBOX_FILE);
     assert!(rig.outbox.starts_with(std::env::temp_dir()));
     assert!(!rig.outbox_lines().is_empty());
+}
+
+/// A run cancelled while its `path.started` is in flight: the cancel tombstones the run, so the
+/// fact never lands (no path that will not end), and a late acknowledgement dispatches nothing.
+#[test]
+fn a_run_cancelled_while_its_fact_is_in_flight_dispatches_nothing() {
+    let rig = rig("cancelled");
+    rig.refuse(&[]);
+    let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_schedule(vec![Duration::from_millis(200); 3])
+        .with_attempt_wait(Duration::from_millis(30));
+    let e = engine(&rig, cfg);
+    launch_team(&e, "rx");
+    wait_for("the run to wait on path.started", || {
+        e.core
+            .run_team("rx")
+            .ok()
+            .flatten()
+            .and_then(|v| v.pending)
+            .as_deref()
+            == Some(tev::PATH_STARTED)
+    });
+    assert_eq!(e.core.cancel_run("rx").unwrap(), SessionStatus::Cancelled);
+    wait_for("the cancel's run tombstone", || {
+        outbox_has_run_tombstone(&rig, "rx")
+    });
+    rig.allow();
+    // Past every retry of the in-flight fact (3 × 200 ms), and a replay on top.
+    std::thread::sleep(Duration::from_millis(900));
+    e.core.replay_team_outbox().unwrap();
+    e.core.ping();
+    assert!(rig.types("rx").is_empty(), "{:?}", rig.types("rx"));
+    assert_eq!(status(&e, "rx"), Some(SessionStatus::Cancelled));
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
 }

@@ -617,3 +617,55 @@ fn the_team_outbox_is_under_the_store_state_home() {
     );
     assert!(TeamConfig::for_store(":memory:").outbox.is_none());
 }
+
+/// The publisher acknowledges a required fact PUBLISHED when a later publish of the same lane
+/// drained it (FIFO) before its own retry came due — never a false failure.
+#[test]
+fn a_required_fact_drained_by_a_later_publish_is_acknowledged_published() {
+    let rig = rig("ackdrain");
+    let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_schedule(vec![Duration::from_millis(300); 3])
+        .with_attempt_wait(Duration::from_millis(30));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let TeamLink::Publisher { tx: publisher, .. } = TeamLink::spawn(&cfg, tx) else {
+        panic!("a bus and an outbox give a publisher");
+    };
+    let run = "run-ack";
+    let started = fixture(tev::PATH_STARTED, 0, run);
+    let token = TeamToken {
+        run_id: run.into(),
+        event_type: tev::PATH_STARTED.into(),
+        key: started.key().unwrap(),
+    };
+    rig.refuse(&[]);
+    publisher
+        .send(PublisherReq::Publish {
+            event: Box::new(started),
+            ack: Some((token.clone(), Exhausted::SupersedeRun)),
+        })
+        .unwrap();
+    // Let the first attempt fail and spool, then bring the bus back and publish a later fact of
+    // the same lane before the retry is due.
+    let t0 = Instant::now();
+    while rig.outbox_lines().is_empty() && t0.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    rig.allow();
+    publisher
+        .send(PublisherReq::Publish {
+            event: Box::new(fixture(tev::PLAN_ACCEPTED, 0, run)),
+            ack: None,
+        })
+        .unwrap();
+    match rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("an acknowledgement")
+    {
+        Command::TeamPublished { token: t, event_id } => {
+            assert_eq!(t, token);
+            assert_eq!(rig.rows(run)[0].0, event_id);
+        }
+        _ => panic!("expected TeamPublished"),
+    }
+    assert_eq!(rig.types(run), vec![tev::PATH_STARTED, tev::PLAN_ACCEPTED]);
+}

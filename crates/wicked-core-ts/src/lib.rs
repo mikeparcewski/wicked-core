@@ -1398,6 +1398,37 @@ impl Core {
         })
     }
 
+    // ── Team transport (DES-TEAMING-002 P1) ────────────────────────────────────
+
+    /// A team run's transport and its units' team snapshots — the persisted state behind crew's
+    /// `GET /api/v1/runs/:id/team` — as JSON `{ runId, transport, reason, streamFloor, planRev,
+    /// pending, units: [{ ord, transport, reason, ledgerSource }] }`. `transport` is `"bus"`,
+    /// `"none"` (un-teamed: render the "team transport unavailable" banner with `reason`) or
+    /// `"pending"` (not decided yet). Resolves to `"null"` for a run that is not a team run;
+    /// rejects for an unknown run.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn run_team(&self, run_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let view = core.run_team(&run_id).map_err(err)?;
+            serde_json::to_string(&view).map_err(err)
+        })
+    }
+
+    /// Replay the team outbox (`<state home>/team-outbox.ndjson`) onto the bus: every lane in
+    /// order, superseded lines skipped and compacted, idempotent (a line replayed twice lands
+    /// once). Resolves to the JSON report `{ published: [[key, eventId]], superseded, invalid,
+    /// remaining, failures: [[runId, reason]] }`; rejects when the engine has no bus or no state
+    /// home. Runs off the actor.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn replay_team_outbox(&self) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let report = core.replay_team_outbox().map_err(err)?;
+            serde_json::to_string(&report).map_err(err)
+        })
+    }
+
     // ── Projects (DES-PROJECT-001) ─────────────────────────────────────────────
     // Writes ride the single-writer actor; reads open READ-ONLY connections, exactly
     // like the governance reads below.
