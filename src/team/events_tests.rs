@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::bus::{deterministic_key, BusDb};
-use crate::team::{FinalPass, LedgerDelivery};
+use crate::team::{FinalPass, FindingStatus, LedgerDelivery};
 
 /// A wire token as its typed enum (panics on an unknown token: fixtures only).
 fn tok<T: serde::de::DeserializeOwned>(s: &str) -> T {
@@ -1407,4 +1407,97 @@ fn a_high_never_disappears_and_an_orphan_row_is_a_stream_gap() {
         assert_eq!(l["finalPass"], json!("stream_gap"), "{orphan}");
         assert_eq!(l["teamPause"], json!(true), "{orphan}");
     }
+}
+
+// ── Rows must name the finding they claim to be about (review of #616, round 2) ──────────────────
+
+/// codex's scenario 1: an `advice.answered{raise_seq:1, finding_id:"f-other", accepted}` must not
+/// be applied to the real HIGH raised at `raise_seq` 1. A row whose `finding_id` is not the raised
+/// finding's is a stream gap, and the HIGH keeps the ledger paused.
+#[test]
+fn a_row_naming_another_finding_id_is_not_applied_and_is_a_gap() {
+    let base = || {
+        let mut s = Stream::new();
+        s.joined("m1", "claude#2")
+            .raised(1, "high")
+            .injected(1)
+            .answered(1, "build", "declined", "documented")
+            .settled(1, "held", "the finding stands", Some(41));
+        s
+    };
+    let honest = base().fold();
+    assert!(honest.team_pause, "the real HIGH is unresolved");
+
+    // The same stream plus a row that claims raise_seq 1 but names another finding.
+    for kind in ["answered", "delivered", "settled"] {
+        let mut s = base();
+        match kind {
+            "answered" => s.answered(1, "review", "accepted", "fixed"),
+            "delivered" => s.delivered(1, "s-other", "acp_steering", "injected"),
+            _ => s.settled(1, "withdrawn", "not mine", None),
+        };
+        let last = s.rows.last_mut().unwrap();
+        match &mut last.event.body {
+            TeamBody::AdviceAnswered(b) => b.finding_id = "f-other".into(),
+            TeamBody::AdviceDelivered(b) => b.finding_id = "f-other".into(),
+            TeamBody::FindingSettled(b) => b.finding_id = "f-other".into(),
+            _ => unreachable!(),
+        }
+        let l = s.fold();
+        let f = &l.findings[0];
+        assert_eq!(f.finding.finding_id, fid(1), "{kind}");
+        assert_eq!(
+            (f.status, f.worker_reason.as_deref()),
+            (FindingStatus::Declined, Some("documented")),
+            "{kind}: the mismatched row is not applied"
+        );
+        assert_eq!(l.final_pass, FinalPass::StreamGap, "{kind}");
+        assert!(l.team_pause, "{kind}: the pause stands");
+    }
+}
+
+/// codex's scenario 2: a keyed row with a `null` `ord` (its key cannot be built) is refused at
+/// parse, and a row that reaches the fold without a key is a stream gap that is never applied.
+#[test]
+fn a_keyless_row_is_refused_at_parse_and_never_applied_by_the_fold() {
+    let mut p = fixture(ADVICE_ANSWERED);
+    p["ord"] = Value::Null;
+    assert!(
+        TeamEvent::from_payload(ADVICE_ANSWERED, &p).is_err(),
+        "advice.answered with ord:null has no key: refused"
+    );
+    for t in ALL_TYPES {
+        if matches!(t, PATH_STARTED | PATH_ENDED) {
+            continue;
+        }
+        let mut p = fixture(t);
+        if p["ord"].is_null() {
+            continue; // keyed on run-level ids only
+        }
+        p["ord"] = Value::Null;
+        p["attempt"] = Value::Null;
+        let parsed = TeamEvent::from_payload(t, &p);
+        if let Ok(ev) = &parsed {
+            assert!(ev.key().is_ok(), "{t}: a row that parses has a key");
+        }
+    }
+
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2")
+        .raised(1, "high")
+        .injected(1)
+        .answered(1, "build", "declined", "documented")
+        .settled(1, "held", "the finding stands", Some(41))
+        // A second answer that would clear the pause, built past the parser with no key.
+        .answered(1, "review", "accepted", "fixed");
+    s.rows.last_mut().unwrap().event.env.ord = None;
+    assert!(s.rows.last().unwrap().event.key().is_err());
+    let l = s.fold();
+    assert_eq!(
+        (l.findings[0].status, l.findings[0].worker_reason.as_deref()),
+        (FindingStatus::Declined, Some("documented")),
+        "the keyless row is not applied"
+    );
+    assert_eq!(l.final_pass, FinalPass::StreamGap);
+    assert!(l.team_pause);
 }
