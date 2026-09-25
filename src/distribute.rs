@@ -1842,4 +1842,251 @@ mod tests {
             "{err}"
         );
     }
+    // ── DES-TEAMING-002 D1: a team run never grades on its creator seat ─────────────────────
+
+    /// `build_and_review` as a TEAM RUN (units of the run's composed def, `team_run` stamped).
+    fn team_build_and_review() -> [WorkUnit; 2] {
+        let mut units = build_and_review();
+        for u in &mut units {
+            u.team_run = true;
+        }
+        units
+    }
+
+    fn unusable(mut c: AgenticCli) -> AgenticCli {
+        c.health = Some(wicked_council::types::SeatHealth::unusable(
+            "not signed in (launcher health probe)",
+        ));
+        c
+    }
+
+    /// D1 (a): roster `[claude]` plus a usable `claude#2` — the review lands on `claude#2`,
+    /// disclosed `same_cli_instance`.
+    #[test]
+    fn d1_a_team_review_moves_to_a_usable_second_instance() {
+        let dists = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude"), seat("claude#2")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("a usable second instance satisfies a team run");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert_eq!(dists[0].distinctness_fallback, None);
+        assert_eq!(dists[1].assigned_cli, "claude#2");
+        assert_eq!(
+            dists[1].routing,
+            RoutingInfo::EvaluatorDistinct {
+                winner: "claude#2".into(),
+                was: "claude".into()
+            }
+        );
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+
+    /// D1 (b): roster `[claude]`, bench-free — refused `NoEligibleSeat`, naming the unit and the
+    /// missing instance. Never `creator_seat`.
+    #[test]
+    fn d1_b_team_run_without_a_second_instance_is_refused_bench_free() {
+        let err = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("a team run never falls back to the creator seat");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(refusal.run_id, "r1");
+        assert!(refusal.benched_seats.is_empty(), "no bench caused it");
+        assert_eq!(
+            refusal.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: team run \u{2014} no seat \
+             distinct from the creator and no usable second instance (add a signed-in claude#2 \
+             to the roster); a team run never grades on its creator seat"
+        );
+    }
+
+    /// D1 (c): `claude#2` listed but not signed in (health not usable) — refused too. The bench
+    /// names it.
+    #[test]
+    fn d1_c_team_run_with_an_unusable_second_instance_is_refused() {
+        let err = distribute_units_against_benched(
+            &team_build_and_review(),
+            &[seat("claude"), unusable(seat("claude#2"))],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("an instance that is not signed in cannot grade");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(refusal.benched_seats.len(), 1);
+        assert_eq!(refusal.benched_seats[0].cli, "claude#2");
+        assert!(
+            refusal
+                .benched
+                .starts_with("evaluator\u{2260}creator unsatisfiable for unit(s) [2]"),
+            "{}",
+            refusal.benched
+        );
+    }
+
+    /// The all-builder shape: roster `[codex, claude(, claude#2)]`, a Claude-only build on claude,
+    /// an unconstrained build on codex (first seat), and an unconstrained review that routes to
+    /// codex — every roster seat but `claude#2` built.
+    fn all_builder_units(team: bool) -> Vec<WorkUnit> {
+        let mut b1 = skilled(1, "wicked-garden-repo-learn");
+        b1.stage = StageKind::Build;
+        let mut b2 = WorkUnit::pending("u2", "r1", 2, "Build the other thing");
+        b2.stage = StageKind::Build;
+        let mut review = WorkUnit::pending("u3", "r1", 3, "Review the things");
+        review.stage = StageKind::Review;
+        let mut units = vec![b1, b2, review];
+        for u in &mut units {
+            u.team_run = team;
+        }
+        units
+    }
+
+    /// D1 (d): an all-builder roster behaves like (a) with a second instance, like (b) without;
+    /// and (e) the NON-team run of the same shape keeps today's `creator_seat`.
+    #[test]
+    fn d1_d_an_all_builder_roster_behaves_like_a_or_b() {
+        let (_home, _env, _) = hermetic_home("d1-all-builder-home");
+        let snapshot = published("d1-all-builder");
+        let without = [seat_running("codex", "codex"), claude_seat("claude")];
+
+        // (e) twin: non-team, today's behaviour — the review stays on a builder seat, disclosed.
+        let dists =
+            distribute_units_against(&all_builder_units(false), &without, "r1", Some(&snapshot))
+                .expect("non-team routes");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert_eq!(dists[1].assigned_cli, "codex");
+        assert_eq!(dists[2].assigned_cli, "codex");
+        assert_eq!(
+            dists[2].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+
+        // (b) shape: team, no second instance ⇒ refused, naming the unit.
+        let err =
+            distribute_units_against(&all_builder_units(true), &without, "r1", Some(&snapshot))
+                .expect_err("team run on an all-builder roster is refused");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
+        assert_eq!(
+            refusal.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [3]: team run \u{2014} no seat \
+             distinct from the creator and no usable second instance (add a signed-in codex#2 \
+             to the roster); a team run never grades on its creator seat"
+        );
+
+        // (a) shape: team, a usable claude#2 ⇒ the review moves there, `same_cli_instance`.
+        let with = [
+            seat_running("codex", "codex"),
+            claude_seat("claude"),
+            claude_seat("claude#2"),
+        ];
+        let dists =
+            distribute_units_against(&all_builder_units(true), &with, "r1", Some(&snapshot))
+                .expect("a usable instance satisfies it");
+        assert_eq!(dists[2].assigned_cli, "claude#2");
+        assert_eq!(
+            dists[2].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+
+    /// D1 (e): the NON-team launch of the (a)/(b) shape is byte-for-byte today's routing.
+    #[test]
+    fn d1_e_a_non_team_run_keeps_the_creator_seat_fallback() {
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("a non-team run is not refused");
+        assert_eq!(dists[1].assigned_cli, "claude");
+        assert_eq!(
+            dists[1].routing,
+            RoutingInfo::Teamed {
+                winner: "claude".into()
+            }
+        );
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+        // …and with a second instance, the non-team run takes it exactly as today.
+        let dists = distribute_units_against_benched(
+            &build_and_review(),
+            &[seat("claude"), seat("claude#2")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("routes");
+        assert_eq!(dists[1].assigned_cli, "claude#2");
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
+
+    /// D1 (f): a bench-caused shortfall on a team run is refused exactly as today (the bench
+    /// message, the bench as data).
+    #[test]
+    fn d1_f_a_bench_caused_team_shortfall_is_refused_as_today() {
+        let roster = [seat("claude"), unusable(seat("codex"))];
+        let team =
+            distribute_units_against_benched(&team_build_and_review(), &roster, "r1", None, &[])
+                .expect_err("refused");
+        let legacy =
+            distribute_units_against_benched(&build_and_review(), &roster, "r1", None, &[])
+                .expect_err("refused");
+        let (t, l) = (
+            team.downcast_ref::<crate::NoEligibleSeat>().expect("typed"),
+            legacy
+                .downcast_ref::<crate::NoEligibleSeat>()
+                .expect("typed"),
+        );
+        assert_eq!(t.benched, l.benched);
+        assert_eq!(t.benched_seats, l.benched_seats);
+        assert_eq!(
+            t.benched,
+            "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: distinct seat(s) benched; \
+             1 of 2 seats benched: codex (not signed in (launcher health probe) \u{2014} launcher)"
+        );
+    }
+
+    /// §8.1 order for a team run: a distinct CLI before a second instance of the creator's CLI.
+    /// A non-team run keeps today's roster-order pick (the instance, listed first).
+    #[test]
+    fn d1_a_team_run_prefers_a_distinct_cli_over_a_second_instance() {
+        let roster = [seat("claude"), seat("claude#2"), seat("codex")];
+        let team =
+            distribute_units_against_benched(&team_build_and_review(), &roster, "r1", None, &[])
+                .expect("routes");
+        assert_eq!(team[1].assigned_cli, "codex");
+        assert_eq!(team[1].distinctness_fallback, None);
+        let legacy =
+            distribute_units_against_benched(&build_and_review(), &roster, "r1", None, &[])
+                .expect("routes");
+        assert_eq!(legacy[1].assigned_cli, "claude#2");
+        assert_eq!(
+            legacy[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
+        );
+    }
 }

@@ -746,6 +746,7 @@ mod tests {
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             pre_build_scope: false,
+            team_run: false,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
             worktree_baseline: None,
