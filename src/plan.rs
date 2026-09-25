@@ -746,14 +746,18 @@ pub fn compose(
     plan: &PlanSteps,
 ) -> Result<WorkflowDef, PlanRefusal> {
     let mut phases = Vec::with_capacity(plan.steps.len());
-    for step in &plan.steps {
+    for (i, step) in plan.steps.iter().enumerate() {
         let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
             return Err(PlanRefusal::UnknownCatalogEntry {
                 step: step.id.clone(),
                 catalog: step.catalog.clone(),
             });
         };
-        phases.push(apply_step(entry, step)?);
+        let mut phase = apply_step(entry, step)?;
+        if step.depends_on.is_none() && phase.depends_on.is_empty() {
+            phase.depends_on = implicit_inputs(entry, &plan.steps[..i]);
+        }
+        phases.push(phase);
     }
     let def = WorkflowDef {
         id: COMPOSED_DEF_ID.to_string(),
@@ -766,6 +770,25 @@ pub fn compose(
         .register(def.clone())
         .map_err(PlanRefusal::InvalidDef)?;
     Ok(def)
+}
+
+/// What a step that declares no `depends_on` consumes (one rule for every step, authored or
+/// floor-inserted; an explicit `depends_on`, even `[]`, always wins). Declared so `plan_from_def`
+/// carries it and dispatch hands the prior output (FINDING-024): an evaluator depends on every
+/// creator (`build`/`produce`) step before it, `deliver` on the step just before it, and any other
+/// step on nothing, as before.
+fn implicit_inputs(entry: &crate::workflow::PhaseDef, before: &[PlanStep]) -> Vec<String> {
+    if entry.role == crate::workflow::PhaseRole::Evaluator {
+        before
+            .iter()
+            .filter(|s| is_creator_catalog(&s.catalog))
+            .map(|s| s.id.clone())
+            .collect()
+    } else if entry.id == "deliver" {
+        before.last().map(|s| s.id.clone()).into_iter().collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Apply one step to its catalog entry under [`STEP_FIELD_RULES`] — one arm per row, in the
@@ -1022,33 +1045,12 @@ pub fn floor_fill(
                     .map(|cmd| crate::workflow::PhaseExecutor::Tool { cmd: cmd.to_vec() })
             })
             .flatten();
-        // What the inserted step consumes, declared so `plan_from_def` carries it and dispatch
-        // hands it the prior output (FINDING-024): an evaluator depends on every creator before
-        // it, `deliver` on the step before it, and any other step declares nothing, exactly as an
-        // authored step with no `depends_on`.
-        let depends_on: Vec<String> =
-            if entry(ty).is_some_and(|e| e.role == crate::workflow::PhaseRole::Evaluator) {
-                steps[..at]
-                    .iter()
-                    .filter(|s| is_creator_catalog(&s.catalog))
-                    .map(|s| s.id.clone())
-                    .collect()
-            } else if ty == "deliver" {
-                steps[..at]
-                    .last()
-                    .map(|s| s.id.clone())
-                    .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
-            };
         steps.insert(
             at,
             PlanStep {
                 catalog: ty.clone(),
                 id,
                 executor,
-                depends_on: (!depends_on.is_empty()).then_some(depends_on),
                 added_by: Some(AddedBy::Floor),
                 floor_reason: Some(format!("band {} requires {ty}", row.band)),
                 ..PlanStep::default()
@@ -2317,9 +2319,9 @@ mod tests {
             assert!(serde_json::from_value::<PlanSteps>(exact).is_err());
         }
 
-        /// codex on #619 (HIGH): a floor-inserted step declares what it consumes. An evaluator
-        /// depends on every creator before it; `deliver` on the step before it; a design-style
-        /// step declares nothing, exactly like an authored step with no `depends_on`.
+        /// codex on #619 (HIGH): a floor-inserted step gets compose's implicit inputs, like any
+        /// step with no `depends_on`: an evaluator depends on every creator before it, `deliver`
+        /// on the step before it, a design-style step on nothing.
         #[test]
         fn t2_floor_inserted_steps_depend_on_what_they_consume() {
             let cmd = deliver_cmd();
