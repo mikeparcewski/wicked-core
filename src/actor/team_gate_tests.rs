@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
+use super::CONTINUE_WITHOUT_TEAM;
+use wicked_apps_core::ToNode;
 use crate::team::events as tev;
 use crate::team::publish::tests::{rig, Rig};
 use crate::team::publish::{TeamConfig, TEAM_OUTBOX_FILE};
@@ -640,4 +642,157 @@ fn a_run_cancelled_while_its_fact_is_in_flight_dispatches_nothing() {
     assert!(rig.types("rx").is_empty(), "{:?}", rig.types("rx"));
     assert_eq!(status(&e, "rx"), Some(SessionStatus::Cancelled));
     assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+}
+
+// ── Boot reconcile: an answer recorded before a crash is FINISHED, never asked again ─────────────
+
+/// Leave the store as a crash leaves it right after `answer_transport_gate` persisted
+/// `Superseding` (the gate row answered) and before the publisher's `TeamSuperseded` came back:
+/// no tombstone in the outbox yet. `reject` picks the recorded answer.
+fn crashed_mid_answer(name: &str, reject: bool) -> (Rig, String) {
+    let (rig, e) = paused_on_plan(name);
+    let db = e.db.clone();
+    drop(e);
+    let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
+    let mut session = crate::domain::get_session(&store, name).unwrap().unwrap();
+    let team = session.team.as_mut().expect("team state");
+    let pending = team.pending.as_mut().expect("paused on plan.accepted");
+    assert_eq!(pending.stage, crate::domain::PendingStage::Paused);
+    pending.stage = crate::domain::PendingStage::Superseding;
+    if reject {
+        pending.then = crate::domain::TeamBlocked::Cancel;
+    }
+    crate::domain::put_node(&mut store, session.to_node()).unwrap();
+    let answer = if reject {
+        r#"{"approve":false,"action":"reject","amend":null}"#.to_string()
+    } else {
+        format!(r#"{{"approve":true,"action":"approve","amend":"{CONTINUE_WITHOUT_TEAM}"}}"#)
+    };
+    crate::interaction::resolve_open_for_session(
+        &mut store,
+        name,
+        crate::interaction::InteractionStatus::Answered,
+        Some(answer),
+        crate::interaction::now_millis(),
+    )
+    .unwrap();
+    drop(store);
+    assert!(!outbox_has_run_tombstone(&rig, name));
+    (rig, db)
+}
+
+fn open_team_gates(db: &str, run: &str) -> usize {
+    let store = wicked_apps_core::open_store_any(Some(db)).expect("store opens");
+    crate::interaction::list_interactions(
+        &store,
+        Some(run),
+        Some(crate::interaction::InteractionStatus::Open),
+    )
+    .unwrap()
+    .len()
+}
+
+fn amended_units(e: &Engine, run: &str) -> usize {
+    e.core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.session.id == run)
+        .flat_map(|v| v.units)
+        .filter(|u| u.description.contains("operator amendment"))
+        .count()
+}
+
+/// Boot after a crash mid "continue without team": the recorded answer is finished — tombstone
+/// re-issued FIRST, `transport: none` persisted, no gate opened (so the generic confirm path can
+/// never take the transport answer as a unit amendment); the run resumes un-teamed like any run
+/// the restart orphaned, and the row-12 rule holds: a replay publishes nothing more for it.
+#[test]
+fn boot_finishes_a_continue_without_team_answer_recorded_before_the_crash() {
+    let (rig, db) = crashed_mid_answer("bootc", false);
+    let e = engine_on(&db, fast(&rig));
+    assert!(outbox_has_run_tombstone(&rig, "bootc"));
+    let view = e.core.run_team("bootc").unwrap().unwrap();
+    assert_eq!(view.transport, "none", "{view:?}");
+    assert_eq!(view.pending, None);
+    assert_eq!(open_team_gates(&db, "bootc"), 0, "no gate is asked again");
+    assert_ne!(status(&e, "bootc"), Some(SessionStatus::AwaitingHuman));
+    assert!(
+        e.core
+            .confirm_gate("bootc", approve(Some(CONTINUE_WITHOUT_TEAM)))
+            .is_err(),
+        "no gate to answer"
+    );
+    // The daemon restarted, so the run resumes the way every orphaned run does.
+    e.core.resume_run("bootc").unwrap();
+    wait_status(&e, "bootc", SessionStatus::Completed);
+    assert_eq!(
+        amended_units(&e, "bootc"),
+        0,
+        "no generic amendment on any unit"
+    );
+    assert_eq!(unit_transports(&e, "bootc"), vec![Some("none".into()); 2]);
+    rig.allow();
+    e.core.replay_team_outbox().unwrap();
+    assert_eq!(rig.types("bootc"), vec![tev::PATH_STARTED]);
+}
+
+/// Boot after a crash mid reject: the recorded answer is finished — tombstone first, then the
+/// run is cancelled at boot with no new gate; only `path.ended` joins `path.started` on the bus.
+#[test]
+fn boot_finishes_a_reject_answer_recorded_before_the_crash() {
+    let (rig, db) = crashed_mid_answer("bootr", true);
+    let e = engine_on(&db, fast(&rig));
+    assert!(outbox_has_run_tombstone(&rig, "bootr"));
+    assert_eq!(status(&e, "bootr"), Some(SessionStatus::Cancelled));
+    assert_eq!(open_team_gates(&db, "bootr"), 0);
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+    rig.allow();
+    e.core.replay_team_outbox().unwrap();
+    wait_for("path.ended", || {
+        rig.types("bootr") == vec![tev::PATH_STARTED, tev::PATH_ENDED]
+    });
+}
+
+/// Boot after a crash while a REQUIRED fact was still publishing (no answer recorded): the pause
+/// re-opens WITH its pending fact kept paused, so `answer_transport_gate` — never the generic
+/// confirm path — takes the reply.
+#[test]
+fn boot_reopens_a_publishing_fact_as_a_transport_gate_the_team_handler_answers() {
+    let rig = rig("bootp");
+    rig.refuse(&[tev::PLAN_ACCEPTED]);
+    let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_schedule(vec![Duration::from_secs(600)])
+        .with_attempt_wait(Duration::from_millis(30));
+    let e = engine(&rig, slow);
+    launch_team(&e, "bootp");
+    wait_for("plan.accepted in flight", || {
+        e.core
+            .run_team("bootp")
+            .ok()
+            .flatten()
+            .and_then(|v| v.pending)
+            .as_deref()
+            == Some(tev::PLAN_ACCEPTED)
+    });
+    let db = e.db.clone();
+    drop(e);
+    let e = engine_on(&db, fast(&rig));
+    assert_eq!(status(&e, "bootp"), Some(SessionStatus::AwaitingHuman));
+    let view = e.core.run_team("bootp").unwrap().unwrap();
+    assert_eq!(view.pending.as_deref(), Some(tev::PLAN_ACCEPTED));
+    assert!(
+        e.core
+            .confirm_gate("bootp", HumanDecision::RequestChanges { note: None })
+            .is_err(),
+        "the team handler refuses request-changes on a transport gate"
+    );
+    let s = e
+        .core
+        .confirm_gate("bootp", approve(Some(CONTINUE_WITHOUT_TEAM)))
+        .unwrap();
+    assert_eq!(s, SessionStatus::Executing);
+    wait_status(&e, "bootp", SessionStatus::Completed);
+    assert_eq!(amended_units(&e, "bootp"), 0);
+    assert_eq!(e.core.run_team("bootp").unwrap().unwrap().transport, "none");
 }
