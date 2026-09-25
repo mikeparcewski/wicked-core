@@ -1110,6 +1110,94 @@ fn a_delivering_preset_launch_carries_its_deliver_step_behind_the_gate() {
     assert!(err.to_string().contains("catalog `deliver`"), "{err}");
 }
 
+// ── build and check the exact def BEFORE anything durable changes (codex round 4) ─────────────
+
+const MISSING_TOOL: &str = "definitely-not-installed-t3";
+
+/// An edit that COMPOSES (a `run` step is a legal Tool step) but cannot start: its tool is not on
+/// PATH, so the def fails the launch preflight (`workflow::preflight_tool_phases`). It must be
+/// refused like any refused edit (acceptance (i)): no rev accepted, no `plan.accepted`, no
+/// releasing `gate.decided`, the old units intact, `plan.refused` naming the tool, and a gate open
+/// and answerable — then approving the held plan still works.
+#[test]
+fn an_edit_that_fails_its_preflight_is_refused_before_anything_changes() {
+    let dir = tmp_dir("editpf");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    rig.core
+        .launch_run(spec("rpf", HumanConfirm::None, Some(p)))
+        .unwrap();
+    rig.tap.until("the plan_approval pause and its gate.opened", |s| {
+        paused_on_plan(s, "rpf").is_some() && !of_type(s, "rpf", OPENED).is_empty()
+    });
+    let units_before = unit_ids(&rig.core, "rpf");
+    let edit = plan(json!({"steps": [
+        {"catalog": "build", "id": "build"},
+        {"catalog": "run", "id": "lint", "executor": {"type": "tool", "cmd": [MISSING_TOOL]}}
+    ]}));
+    let status = rig
+        .core
+        .confirm_gate("rpf", HumanDecision::EditPlan { plan: edit })
+        .expect("a refused edit is an answer, not an error");
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    rig.tap.until("plan.refused and the re-opened gate", |s| {
+        !of_type(s, "rpf", REFUSED).is_empty() && of_type(s, "rpf", OPENED).len() == 2
+    });
+    rig.tap.settle();
+    let refused = of_type(&rig.tap.seen, "rpf", REFUSED);
+    assert!(
+        refused[0]["reason"].as_str().unwrap().contains(MISSING_TOOL),
+        "{refused:?}"
+    );
+    assert!(of_type(&rig.tap.seen, "rpf", ACCEPTED).is_empty(), "no rev accepted");
+    // The only gate.decided is the first gate's record of the (refused) edit — nothing released.
+    let decided = of_type(&rig.tap.seen, "rpf", DECIDED);
+    assert!(
+        decided.iter().all(|d| d["decision"] == "human_amended"),
+        "{decided:?}"
+    );
+    assert_eq!(unit_ids(&rig.core, "rpf"), units_before, "old units intact");
+    let s = session(&rig.core, "rpf");
+    let tp = s.team_plan.clone().expect("plan state");
+    assert_eq!((tp.accepted_rev, tp.accepted.is_none()), (0, true));
+    assert!(dispatched_ords(&rig.tap.seen, "rpf").is_empty());
+    // Still answerable: approving the held plan releases it.
+    let status = rig.core.confirm_gate("rpf", approve()).unwrap();
+    assert_eq!(status, SessionStatus::Executing);
+    rig.tap
+        .until("the first dispatch", |s| !dispatched_ords(s, "rpf").is_empty());
+}
+
+/// A PRESET launch whose deliver step names a tool that is not installed is refused by the
+/// launch's synchronous preflight — on the composed plan it will run (preset + deliver step),
+/// not the preset's bare def — with no run persisted.
+#[test]
+fn a_preset_launch_with_an_uninstalled_deliver_tool_fails_the_synchronous_preflight() {
+    let dir = tmp_dir("dlvpf");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let mut s = spec("rdpf", HumanConfirm::None, None);
+    s.workflow = Some("feature".into());
+    s.deliver_step = Some(
+        serde_json::from_value(json!({
+            "catalog": "deliver", "id": "deliver",
+            "executor": {"type": "tool", "cmd": [MISSING_TOOL]}
+        }))
+        .unwrap(),
+    );
+    let err = rig.core.launch_run(s).expect_err("refused at launch");
+    assert!(err.to_string().contains(MISSING_TOOL), "{err}");
+    assert!(
+        rig.core
+            .sessions_detail()
+            .unwrap()
+            .iter()
+            .all(|v| v.session.id != "rdpf"),
+        "no run persisted"
+    );
+}
+
 /// The straight-through `Core::launch` honours no gate, so it refuses a preset (and a plan)
 /// instead of running one past its plan_approval gate.
 #[test]
