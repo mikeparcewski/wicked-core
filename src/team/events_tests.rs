@@ -1532,3 +1532,152 @@ fn a_row_from_another_attempt_is_not_applied_and_is_a_gap() {
     assert_eq!(l.final_pass, FinalPass::StreamGap);
     assert!(l.team_pause);
 }
+
+// ── Positive evidence only (review of #616, round 3) ─────────────────────────────────────────────
+//
+// Every way `fold` returns a complete or unpaused result must rest on a row that says so, never on
+// the absence of a failure row. One test per condition:
+//   C1 finalPass `completed`   ⇐ a terminal `step.completed{ok}` of the attempt's own (ord, attempt)
+//   C2 finalPass `skipped`     ⇐ a terminal `step.completed` whose status is not ok
+//   C3 teamPause false         ⇐ C1 or C2, and every HIGH resolved by its own row
+//                                (answered accepted | settled withdrawn/superseded | ruled yes)
+//   C4 monitor status          ⇐ its `member.left` row (or a failed `member.joined`); else timed_out
+//   C5 delivery `injected`     ⇐ an `advice.delivered{injected}` row
+//   C6 an empty stream         ⇐ nothing: a gap
+
+/// codex's scenario: monitors came and went, a MEDIUM was raised, but the attempt's terminal row
+/// is missing. That is not a completed final pass.
+#[test]
+fn an_attempt_with_rows_but_no_terminal_step_is_a_stream_gap() {
+    let mut members_only = Stream::new();
+    members_only
+        .joined("m1", "claude#2")
+        .left("m1", "claude#2", 1);
+    let mut medium_only = Stream::new();
+    medium_only.joined("m1", "claude#2").raised(1, "medium");
+    for (name, s) in [("members only", members_only), ("medium only", medium_only)] {
+        let l = s.fold();
+        assert_eq!(l.final_pass, FinalPass::StreamGap, "{name}");
+        assert!(l.team_pause, "{name}");
+    }
+}
+
+/// C1: `completed` needs the terminal ok row, and that row must be of the attempt the other rows
+/// are about.
+#[test]
+fn c1_completed_needs_the_attempts_own_terminal_ok_row() {
+    let mut ok = Stream::new();
+    ok.joined("m1", "claude#2")
+        .raised(1, "medium")
+        .completed("ok");
+    let l = ok.fold();
+    assert_eq!((l.final_pass, l.team_pause), (FinalPass::Completed, false));
+
+    // The terminal row belongs to another attempt.
+    let mut other = Stream::new();
+    other
+        .joined("m1", "claude#2")
+        .raised(1, "medium")
+        .completed("ok");
+    other.rows.last_mut().unwrap().event.env.attempt = Some(2);
+    let l = other.fold();
+    assert_eq!((l.final_pass, l.team_pause), (FinalPass::StreamGap, true));
+
+    // A member row of another attempt rides along with this attempt's terminal row.
+    let mut mixed = Stream::new();
+    mixed
+        .joined("m1", "claude#2")
+        .left("m1", "claude#2", 1)
+        .completed("ok");
+    mixed.rows[1].event.env.attempt = Some(2);
+    let l = mixed.fold();
+    assert_eq!((l.final_pass, l.team_pause), (FinalPass::StreamGap, true));
+}
+
+/// C2: `skipped` needs a terminal row that did not return ok.
+#[test]
+fn c2_skipped_needs_a_non_ok_terminal_row() {
+    for status in ["failed", "cancelled", "elicitation_failed", "timed_out"] {
+        let mut s = Stream::new();
+        s.joined("m1", "claude#2")
+            .raised(1, "medium")
+            .completed(status);
+        assert_eq!(s.fold().final_pass, FinalPass::Skipped, "{status}");
+    }
+}
+
+/// C3: with the terminal row present, a HIGH clears the pause only through its own row.
+#[test]
+fn c3_a_high_is_resolved_only_by_a_row_that_resolves_it() {
+    let high = || {
+        let mut s = Stream::new();
+        s.joined("m1", "claude#2")
+            .raised(1, "high")
+            .injected(1)
+            .completed("ok");
+        s
+    };
+    assert!(high().fold().team_pause, "no resolving row: paused");
+
+    let mut accepted = high();
+    accepted.answered(1, "build", "accepted", "fixed");
+    let mut withdrawn = high();
+    withdrawn.settled(1, "withdrawn", "cancelled upstream", Some(41));
+    let mut superseded = high();
+    superseded.settled(1, "superseded", "text gone", None);
+    let mut yes = high();
+    yes.answered(1, "build", "declined", "documented")
+        .settled(1, "held", "the finding stands", Some(41))
+        .ruled(1, "yes", None);
+    for (name, s) in [
+        ("accepted", accepted),
+        ("withdrawn", withdrawn),
+        ("superseded", superseded),
+        ("council yes", yes),
+    ] {
+        let l = s.fold();
+        assert_eq!(
+            (l.final_pass, l.team_pause),
+            (FinalPass::Completed, false),
+            "{name}"
+        );
+    }
+}
+
+/// C4: a monitor's status comes from its `member.left` row; with none, it did not complete.
+#[test]
+fn c4_a_monitor_without_its_left_row_is_timed_out() {
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2").completed("ok");
+    let l = s.fold();
+    assert_eq!(l.monitors[0].status, crate::team::MonitorStatus::TimedOut);
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2")
+        .left("m1", "claude#2", 2)
+        .completed("ok");
+    assert_eq!(
+        s.fold().monitors[0].status,
+        crate::team::MonitorStatus::Completed
+    );
+}
+
+/// C5: `injected` needs a row that says the advice was injected.
+#[test]
+fn c5_injected_needs_an_injected_row() {
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2")
+        .raised(1, "high")
+        .delivered(1, "s-1", "acp_steering", "refused")
+        .completed("ok");
+    assert_eq!(s.fold().findings[0].delivery, LedgerDelivery::NotDelivered);
+    // A later steer (its own delivery id) that was injected.
+    s.delivered(1, "s-2", "acp_steering", "injected");
+    assert_eq!(s.fold().findings[0].delivery, LedgerDelivery::Injected);
+}
+
+/// C6: an empty stream carries no evidence of a final pass.
+#[test]
+fn c6_an_empty_stream_is_a_gap() {
+    let l = fold(&[]);
+    assert_eq!((l.final_pass, l.team_pause), (FinalPass::StreamGap, true));
+}
