@@ -1202,6 +1202,11 @@ pub fn gate_pauses(approved: bool, ledger: &TeamLedger) -> bool {
 /// `skipped` when the attempt's `step.completed` did not return `ok`, else `completed`.
 /// `teamPause` is [`ledger_pauses`].
 ///
+/// **Complete or unpaused only on positive evidence.** `final_pass` is `completed` only when a
+/// terminal `step.completed{ok}` row of the attempt is present, and `skipped` only when that row
+/// says the step did not return ok. Every other stream, an empty one included, is `stream_gap`
+/// and pauses: the absence of a failure row never counts as success.
+///
 /// **No row is dropped silently, and none is misapplied.** Every payload enum is a closed set and
 /// every row must carry its key, so a malformed row never parses into a [`TeamRow`]. Each of these
 /// means the record is incomplete, so `final_pass` becomes `stream_gap`, the row is not applied,
@@ -1210,7 +1215,9 @@ pub fn gate_pauses(approved: bool, ledger: &TeamLedger) -> bool {
 /// - a row that names a finding this stream never raised (an `advice.*`, `finding.settled` or
 ///   `council.ruled{finding:<n>}` with no `finding.raised` for `<n>`);
 /// - a row that claims a raised finding's `raise_seq` but names another `finding_id`, or comes
-///   from another attempt.
+///   from another attempt;
+/// - no terminal `step.completed` row, terminal rows of two attempts, or a member, finding or
+///   step row whose `(ord, attempt)` is not the terminal row's.
 ///
 /// Not on the stream, so not folded: `rejected{}` (a rejected monitor line is never raised) and a
 /// corroboration that arrives after the finding was raised. The supervisor, which owns both,
@@ -1229,6 +1236,18 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
         }
     });
 
+    // The attempt is the one its terminal `step.completed` names: the positive evidence that the
+    // attempt's turn returned. No terminal row, or terminal rows of two attempts, is a gap.
+    let terminals: Vec<(Option<u32>, Option<u32>)> = ordered
+        .iter()
+        .filter(|r| matches!(r.event.body, TeamBody::StepCompleted(_)))
+        .map(|r| (r.event.env.ord, r.event.env.attempt))
+        .collect();
+    let attempt = terminals.first().copied();
+    if attempt.is_none() || terminals.iter().any(|t| Some(*t) != attempt) {
+        gap = true;
+    }
+
     let mut monitors: Vec<MonitorAcc> = Vec::new();
     let mut findings: Vec<FindingAcc> = Vec::new();
     // Rows about findings, applied once every raise is known (order-independent).
@@ -1236,6 +1255,24 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
     let mut skipped = false;
     for row in ordered {
         let env = &row.event.env;
+        let consumed = matches!(
+            row.event.body,
+            TeamBody::MemberJoined(_)
+                | TeamBody::MemberLeft(_)
+                | TeamBody::FindingRaised(_)
+                | TeamBody::AdviceDelivered(_)
+                | TeamBody::AdviceAnswered(_)
+                | TeamBody::FindingSettled(_)
+                | TeamBody::CouncilRuled(_)
+                | TeamBody::StepCompleted(_)
+        );
+        // A consumed row of another attempt is not this attempt's: a gap, never applied. (With no
+        // terminal row at all the rows are still folded, so no finding disappears, and the gap
+        // above keeps the ledger paused.)
+        if consumed && attempt.is_some_and(|at| (env.ord, env.attempt) != at) {
+            gap = true;
+            continue;
+        }
         match &row.event.body {
             TeamBody::MemberJoined(b) => {
                 let m = monitor_entry(&mut monitors, &b.member_id, &b.seat);

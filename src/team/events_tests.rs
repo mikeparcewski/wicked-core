@@ -1268,15 +1268,16 @@ fn fold_is_idempotent_under_duplicates_and_order() {
     replayed.push(late);
     assert_eq!(fold(&replayed), once);
 
+    // An empty stream is no evidence of a final pass (C6).
     assert_eq!(
         fold(&[]),
         TeamLedger {
-            final_pass: FinalPass::Completed,
+            final_pass: FinalPass::StreamGap,
             rendered_to_judge: false,
             monitors: vec![],
             findings: vec![],
             rejected: Default::default(),
-            team_pause: false,
+            team_pause: true,
         }
     );
 }
