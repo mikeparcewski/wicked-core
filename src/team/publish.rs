@@ -128,7 +128,11 @@ impl TeamConfig {
                 .map(|home| home.join(TEAM_OUTBOX_FILE)),
             schedule: RETRY_SCHEDULE.to_vec(),
             attempt_wait: ATTEMPT_WAIT,
-            final_pass_budget: crate::team::TeamLimits::from_env().final_pass_budget,
+            // A supplied budget never lets a unit skip its gate wait: the rig override is
+            // floored ([`super::runner::MIN_GATE_WAIT`]).
+            final_pass_budget: crate::team::TeamLimits::from_env()
+                .final_pass_budget
+                .max(super::runner::MIN_GATE_WAIT),
             gate_poll: super::runner::GATE_POLL,
         }
     }

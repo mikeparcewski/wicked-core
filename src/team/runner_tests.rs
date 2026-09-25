@@ -1007,3 +1007,21 @@ fn ledger_authors_are_computed_from_the_ledger() {
         finding_ids: vec![],
     };
 }
+
+/// A supplied budget never lets a unit skip its gate wait: `WICKED_TEAM_FINAL_PASS_SECS=0` is
+/// floored to [`MIN_GATE_WAIT`] in the production config.
+#[test]
+fn a_supplied_zero_budget_never_skips_the_gate_wait() {
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let prior = std::env::var("WICKED_TEAM_FINAL_PASS_SECS").ok();
+    std::env::set_var("WICKED_TEAM_FINAL_PASS_SECS", "0");
+    let rig = rig("t5floor");
+    let cfg = TeamConfig::for_store(rig.dir.join("core.db").to_str().unwrap());
+    match prior {
+        Some(v) => std::env::set_var("WICKED_TEAM_FINAL_PASS_SECS", v),
+        None => std::env::remove_var("WICKED_TEAM_FINAL_PASS_SECS"),
+    }
+    assert!(cfg.final_pass_budget >= MIN_GATE_WAIT, "{cfg:?}");
+}

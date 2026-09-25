@@ -35,6 +35,11 @@ use crate::bus::BusDb;
 use crate::domain::UnitTeamSnapshot;
 use crate::workflow::{PriorUnitOutput, StepInput, StepOutput, StepStatus};
 
+/// The least the production gate wait waits for S's fold, whatever `WICKED_TEAM_FINAL_PASS_SECS`
+/// says: a supplied `0` must never let a unit skip its gate wait (tests inject their own bound
+/// through [`TeamConfig::with_final_pass_budget`]).
+pub const MIN_GATE_WAIT: Duration = Duration::from_secs(30);
+
 /// How often the gate wait polls for `ledger.folded` (injectable: [`TeamConfig::with_gate_poll`]).
 pub const GATE_POLL: Duration = Duration::from_millis(250);
 

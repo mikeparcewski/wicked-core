@@ -1209,10 +1209,12 @@ fn bus_restart_leaves_a_live_teamed_run_live() {
 /// attempt during its turn (a `finding.raised` row, S) — and nothing answers it.
 struct RaisingRunner {
     bus: crate::team::publish::TeamBus,
+    /// The unit whose turn raises the finding.
+    on_ix: usize,
 }
 impl StepRunner for RaisingRunner {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
-        if i.unit_ix == 0 {
+        if i.unit_ix == self.on_ix {
             let f =
                 crate::team::publish::tests::fixture_with(tev::FINDING_RAISED, 0, &i.run_id, |p| {
                     p["ord"] = serde_json::json!(i.unit.ord);
@@ -1273,6 +1275,7 @@ fn t5_c_final_pass_timeout_pauses_team_dispute_and_a_late_fold_changes_nothing()
         fast(&rig),
         Arc::new(RaisingRunner {
             bus: rig.team_bus(),
+            on_ix: 0,
         }),
     );
     launch_team(&e, "t5c");
@@ -1341,6 +1344,34 @@ fn t5_c_final_pass_timeout_pauses_team_dispute_and_a_late_fold_changes_nothing()
     // The human decides: approve continues at the cursor.
     e.core.confirm_gate("t5c", approve(None)).unwrap();
     wait_status(&e, "t5c", SessionStatus::Completed);
+}
+
+/// T5 (c) on the run's LAST unit: the `team_dispute` pause holds the run before it can finalize
+/// (`Completed` is never reached unattended); reject cancels, and the unit's work stays on record.
+#[test]
+fn t5_c_a_dispute_on_the_last_unit_holds_the_run_before_it_completes() {
+    let rig = rig("t5c-last");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 1,
+        }),
+    );
+    launch_team(&e, "t5cl");
+    wait_status(&e, "t5cl", SessionStatus::AwaitingHuman);
+    assert_eq!(
+        awaiting_kinds(&drain_events(&e), "t5cl"),
+        vec!["team_dispute".to_string()]
+    );
+    let view = e.core.run_team("t5cl").unwrap().unwrap();
+    assert_eq!(view.units[0].team_pause, Some(false), "{view:?}");
+    assert_eq!(view.units[1].team_pause, Some(true), "{view:?}");
+    assert_eq!(
+        e.core.confirm_gate("t5cl", HumanDecision::Reject).unwrap(),
+        SessionStatus::Cancelled
+    );
 }
 
 /// T5 (e): under `spawn_with_engine` with NO bus, the team unit produces no team rows and its
