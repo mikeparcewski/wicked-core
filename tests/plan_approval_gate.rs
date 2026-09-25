@@ -1206,6 +1206,55 @@ fn a_preset_launch_with_an_uninstalled_deliver_tool_fails_the_synchronous_prefli
     );
 }
 
+// ── the synchronous unit limit counts the worst-case floor (codex round 5) ──────────────────────
+
+/// The engine's governed unit limit (`DENY_PHASE_SPAN`).
+const UNIT_LIMIT: usize = 256;
+
+fn builds(n: usize) -> PlanSteps {
+    plan(json!({"steps": vec![json!({"catalog": "build"}); n]}))
+}
+
+/// A plan of exactly the limit in authored build steps with no touch: floor fill (the 70-100
+/// band, since no touch scores 100) would add test_plan, design, architecture, review and
+/// security_review past the limit. The launch is refused SYNCHRONOUSLY, naming the limit and the
+/// floor-added count, with no session persisted.
+#[test]
+fn a_plan_the_worst_case_floor_would_push_past_the_limit_is_refused_at_launch() {
+    let dir = tmp_dir("limit");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let err = rig
+        .core
+        .launch_run(spec("rlim", HumanConfirm::None, Some(builds(UNIT_LIMIT))))
+        .expect_err("over the limit once floored");
+    let msg = err.to_string();
+    assert!(msg.contains(&format!("{UNIT_LIMIT}-unit governed limit")), "{msg}");
+    assert!(msg.contains("5 the floor may add"), "{msg}");
+    assert!(
+        rig.core
+            .sessions_detail()
+            .unwrap()
+            .iter()
+            .all(|v| v.session.id != "rlim"),
+        "no run persisted"
+    );
+}
+
+/// A plan that fits WITH the worst-case floor still launches (and floors to exactly the limit).
+#[test]
+fn a_plan_that_fits_with_the_worst_case_floor_launches() {
+    let dir = tmp_dir("limitok");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    rig.core
+        .launch_run(spec("rfit", HumanConfirm::None, Some(builds(UNIT_LIMIT - 5))))
+        .expect("fits with the floor");
+    rig.tap
+        .until("the plan_approval pause", |s| paused_on_plan(s, "rfit").is_some());
+    assert_eq!(unit_ids(&rig.core, "rfit").len(), UNIT_LIMIT);
+}
+
 /// The straight-through `Core::launch` honours no gate, so it refuses a preset (and a plan)
 /// instead of running one past its plan_approval gate.
 #[test]
