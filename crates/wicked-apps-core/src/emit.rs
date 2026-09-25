@@ -93,7 +93,7 @@ impl EmitEvent {
     /// F-022) a 3,400-entry outbox had no recoverable order and no way to tell two daemons' entries
     /// apart; [`replay_outbox`] restores `ts` onto the replayed node so an id-ordered scan of the
     /// store is still chronological.
-    fn spool_record(&self, reason: &str) -> serde_json::Value {
+    pub fn spool_record(&self, reason: &str) -> serde_json::Value {
         let mut record = serde_json::json!({
             "type": self.event_type,
             "domain": self.domain,
@@ -453,43 +453,83 @@ pub fn hermetic_test_spool() -> PathBuf {
 /// Append one NDJSON line for `event` to the outbox spool, writing the loud [`DEADLETTER_MARKER`]
 /// lines to stderr. Used whenever the event could not be written to the shared store.
 fn spool(event: &EmitEvent, reason: &str) {
+    match deadletter_path() {
+        Some(path) => {
+            let _ = spool_to(&path, event, reason, serde_json::Map::new());
+        }
+        None => {
+            eprintln!(
+                "{DEADLETTER_MARKER} event `{}` not stored ({reason}); spooling to outbox",
+                event.event_type
+            );
+            eprintln!(
+                "{DEADLETTER_MARKER} FAILED to spool `{}` to outbox: cannot resolve outbox spool \
+                 path (no HOME/USERPROFILE and no WICKED_APPS_EMIT_DEADLETTER)",
+                event.event_type
+            );
+        }
+    }
+}
+
+/// THE spool writer (one mechanism): announce `event` on stderr with the loud
+/// [`DEADLETTER_MARKER`], then append its outbox record ([`EmitEvent::spool_record`] — the envelope,
+/// `deadletter_reason`, `ts`, `pid`, `origin`) plus the caller's `extra` fields as ONE NDJSON line
+/// to the outbox at `path`, creating parent dirs as needed. The engine's own outbox
+/// (`emit-outbox.ndjson`) and the team outbox (DES-TEAMING-002 §4.1, `team-outbox.ndjson`, whose
+/// lines add the idempotency key, run and owner) both write through here, so a dead letter reads
+/// the same whichever seam spooled it. An `extra` key never overwrites an envelope field.
+pub fn spool_to(
+    path: &Path,
+    event: &EmitEvent,
+    reason: &str,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
     eprintln!(
         "{DEADLETTER_MARKER} event `{}` not stored ({reason}); spooling to outbox",
         event.event_type
     );
-    match append_spool(event, reason) {
-        Ok(path) => eprintln!(
-            "{DEADLETTER_MARKER} spooled `{}` to {}",
-            event.event_type,
-            path.display()
-        ),
-        Err(e) => eprintln!(
-            "{DEADLETTER_MARKER} FAILED to spool `{}` to outbox: {e}",
-            event.event_type
-        ),
+    let mut record = event.spool_record(reason);
+    if let serde_json::Value::Object(map) = &mut record {
+        for (k, v) in extra {
+            map.entry(k).or_insert(v);
+        }
+    }
+    match append_record(path, &record) {
+        Ok(()) => {
+            eprintln!(
+                "{DEADLETTER_MARKER} spooled `{}` to {}",
+                event.event_type,
+                path.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "{DEADLETTER_MARKER} FAILED to spool `{}` to outbox: {e}",
+                event.event_type
+            );
+            Err(e)
+        }
     }
 }
 
-/// Append one NDJSON line for `event` to the outbox spool, creating parent dirs as needed.
-fn append_spool(event: &EmitEvent, reason: &str) -> std::io::Result<PathBuf> {
-    let path = deadletter_path().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "cannot resolve outbox spool path (no HOME/USERPROFILE and no WICKED_APPS_EMIT_DEADLETTER)",
-        )
-    })?;
+/// Append `record` as one NDJSON line to the outbox at `path`, creating parent dirs as needed. The
+/// line is written with ONE `write_all` of the line plus its newline, so a concurrent appender in
+/// another process can interleave whole lines but never split one.
+pub fn append_record(path: &Path, record: &serde_json::Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    let line = serde_json::to_string(&event.spool_record(reason))
+    let mut line = serde_json::to_string(record)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
-    Ok(path)
+        .open(path)?;
+    f.write_all(line.as_bytes())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

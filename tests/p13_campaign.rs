@@ -637,6 +637,7 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         base_commit: None,
         finished_at: None,
         benched_seats: Vec::new(),
+        team: None,
     }
 }
 

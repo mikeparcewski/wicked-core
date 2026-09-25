@@ -35,6 +35,9 @@ use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 use wicked_apps_core::HardenedCommand;
 
+mod team_gate;
+pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
+
 /// The actor-owned terminal registry entry (DES §4 "id → status"). Presence in the registry map IS
 /// the "open" status; removal (on exit/close) is the terminal state — this is the single-emit guard
 /// that keeps `TerminalExited` firing exactly once. `next_seq` is the per-terminal output sequence,
@@ -781,7 +784,11 @@ pub(crate) fn run(
     is_acp: bool,
     elicitation_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     write_reg: WriteReg,
+    team_link: crate::team::publish::TeamLink,
 ) {
+    // DES-TEAMING-002 P1: this thread's link to the team publisher. The actor never opens the
+    // bus; it sends the publisher requests and waits for acknowledgements as commands.
+    team_gate::install(team_link);
     // Backend-agnostic: `path` may be a filesystem path (SQLite, the default) OR a `postgres://`
     // spec (selects estate's Postgres backend under the `postgres` feature). `AnyStore` is one
     // concrete type, so the engine below borrows it as `&dyn GraphRead` / `&mut dyn GraphStore`
@@ -856,6 +863,10 @@ pub(crate) fn run(
         crate::event_log::EventSink::persistent(crate::event_log::log_root(&sidecar_base));
     // Runs with a worker step in flight — guards against double-dispatch (non-idempotent side effects).
     let mut in_flight: HashSet<String> = HashSet::new();
+    // (DES-TEAMING-002 P1) `confirm_gate` replies held while the answer waits on the team
+    // publisher (a `gate.decided` or a run tombstone): answered from the acknowledgement, so the
+    // caller learns the real outcome and the actor never blocks.
+    let mut team_replies: HashMap<String, Sender<anyhow::Result<SessionStatus>>> = HashMap::new();
     // The actor-owned PTY terminal registry (id → status + seq). Byte-I/O lives off-actor in
     // `pty_map`; this small map is the single-writer state the actor owns (DES §4).
     let mut terminals: HashMap<String, TermReg> = HashMap::new();
@@ -881,6 +892,12 @@ pub(crate) fn run(
             "wicked-core: built-in presets not seeded ({e}); their workflows launch their defs"
         );
     }
+    // DES-TEAMING-002 P1 boot reconcile, BEFORE anything can dispatch or drain: a live team run
+    // with no acknowledged `path.started` is tombstoned and then set `transport: none`; a run
+    // caught mid-fact re-opens its `team_transport` pause. Only then does the publisher drain the
+    // outbox, so no drain can race a boot tombstone.
+    team_gate::reconcile_at_boot(&mut store);
+    team_gate::drain_at_boot();
     let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = pipeline::workflow_overlay_dir() {
         if let Err(e) = registry.load_dir(&dir) {
@@ -1376,6 +1393,7 @@ pub(crate) fn run(
                         base_commit: None,
                         finished_at: None,
                         benched_seats: Vec::new(),
+                        team: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1800,7 +1818,9 @@ pub(crate) fn run(
                                 process_gen,
                                 is_acp,
                             ) {
-                                Ok(Progress::Dispatched) => { /* in_flight set in LaunchRun */ }
+                                Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
+                                    /* in_flight set in LaunchRun */
+                                }
                                 Ok(Progress::Paused) => {
                                     in_flight.remove(&run_id);
                                 }
@@ -2011,7 +2031,13 @@ pub(crate) fn run(
                     process_gen,
                     is_acp,
                 );
-                let _ = reply.send(res);
+                if res.is_ok() && team_gate::answer_in_flight(&store, &run_id) {
+                    if let Some(old) = team_replies.insert(run_id, reply) {
+                        let _ = old.send(Ok(SessionStatus::AwaitingHuman));
+                    }
+                } else {
+                    let _ = reply.send(res);
+                }
             }
             Command::CancelRun { run_id, reply } => {
                 // ACP teardown: cancel epoch, signal kill handles (no-op for PTY).
@@ -3324,6 +3350,87 @@ pub(crate) fn run(
                     }
                 }
             }
+            Command::TeamPublished { token, event_id } => {
+                let mut cx = team_gate::Ctx {
+                    store: &mut store,
+                    subscribers: &mut subscribers,
+                    runner: &runner,
+                    self_tx: &self_tx,
+                    in_flight: &mut in_flight,
+                    lifecycle_maps: &lifecycle_maps,
+                    actor_maps: &actor_maps,
+                    process_gen,
+                    is_acp,
+                };
+                let res = team_gate::on_published(&mut cx, &token, event_id);
+                team_gate::settle_reply(&store, &mut team_replies, &token.run_id, res);
+            }
+            Command::TeamTransportFailed { token, reason } => {
+                let mut cx = team_gate::Ctx {
+                    store: &mut store,
+                    subscribers: &mut subscribers,
+                    runner: &runner,
+                    self_tx: &self_tx,
+                    in_flight: &mut in_flight,
+                    lifecycle_maps: &lifecycle_maps,
+                    actor_maps: &actor_maps,
+                    process_gen,
+                    is_acp,
+                };
+                let res = team_gate::on_failed(&mut cx, &token, &reason);
+                team_gate::settle_reply(&store, &mut team_replies, &token.run_id, res);
+            }
+            Command::TeamSuperseded { token } => {
+                let mut cx = team_gate::Ctx {
+                    store: &mut store,
+                    subscribers: &mut subscribers,
+                    runner: &runner,
+                    self_tx: &self_tx,
+                    in_flight: &mut in_flight,
+                    lifecycle_maps: &lifecycle_maps,
+                    actor_maps: &actor_maps,
+                    process_gen,
+                    is_acp,
+                };
+                let res = team_gate::on_superseded(&mut cx, &token);
+                team_gate::settle_reply(&store, &mut team_replies, &token.run_id, res);
+            }
+            Command::RunTeam { run_id, reply } => {
+                let res = crate::domain::get_session(&store, &run_id).and_then(|s| {
+                    let s = s.ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+                    let units = crate::domain::session_units(&store, &run_id)?;
+                    Ok(crate::team::publish::run_team_view(&s, &units))
+                });
+                let _ = reply.send(res);
+            }
+            Command::LiveTeamRuns { reply } => {
+                let res = crate::domain::all_sessions(&store).map(|all| {
+                    all.into_iter()
+                        .filter(|s| {
+                            matches!(
+                                s.status,
+                                SessionStatus::Executing | SessionStatus::AwaitingHuman
+                            )
+                        })
+                        .filter_map(|s| {
+                            let team = s.team.clone().filter(|t| t.is_teamed())?;
+                            Some(crate::team::publish::LiveTeamRun {
+                                run_id: s.id,
+                                status: s.status,
+                                team,
+                            })
+                        })
+                        .collect()
+                });
+                let _ = reply.send(res);
+            }
+            Command::RegisterComposed { def, reply } => {
+                let _ = reply.send(
+                    registry
+                        .register_composed(*def)
+                        .map_err(|e| anyhow::anyhow!("{e}")),
+                );
+            }
             Command::Shutdown => {
                 // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
                 // do not poll the elicitation tombstone, so they must be interrupted through
@@ -3436,6 +3543,9 @@ enum Progress {
     Dispatched,
     Paused,
     Done,
+    /// (DES-TEAMING-002 P1) A required team fact is in flight: nothing dispatched yet, and the
+    /// run stays in flight until the publisher's acknowledgement runs the step.
+    Deferred,
 }
 
 /// Bundle the engine seams for the campaign driver (DES-CAMPAIGN-001).
@@ -3586,7 +3696,7 @@ pub(crate) fn launch_run_inner(
         process_gen,
         is_acp,
     ) {
-        Ok(Progress::Dispatched) => {
+        Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
             in_flight.insert(run_id.clone());
         }
         Ok(Progress::Paused) => {} // paused at a gate — not in flight
@@ -4000,7 +4110,7 @@ pub(crate) fn resume_run_inner(
         process_gen,
         is_acp,
     )? {
-        Progress::Dispatched => {
+        Progress::Dispatched | Progress::Deferred => {
             in_flight.insert(run_id.to_string());
             Ok(SessionStatus::Executing)
         }
@@ -5446,7 +5556,7 @@ fn apply_step_result(
         process_gen,
         is_acp,
     )? {
-        Progress::Dispatched => Ok(StepApplied::Continuing),
+        Progress::Dispatched | Progress::Deferred => Ok(StepApplied::Continuing),
         Progress::Paused => Ok(StepApplied::Paused),
         Progress::Done => {
             finalize_run(store, subscribers, runner, self_tx, &run_id)?;
@@ -5787,6 +5897,11 @@ fn fail_run(
     session.status = SessionStatus::Failed;
     session.finished_at = Some(crate::interaction::now_millis());
     let _ = put_node(store, session.to_node());
+    team_gate::path_ended(
+        &*store,
+        &session.id,
+        crate::team::events::PathStatus::Failed,
+    );
     reap_terminal_worktree(&*store, session);
     emit(
         subscribers,
@@ -6158,6 +6273,27 @@ fn advance_or_pause(
         return Ok(Progress::Done);
     };
 
+    // DES-TEAMING-002 P1: a team run's required transitions come first — `path.started` before
+    // its first dispatch, `plan.accepted` before the plan's first unit — ahead of any human gate,
+    // so no team fact (a gate's included) can precede the run's path on the bus.
+    match team_gate::gate_before_dispatch(store, &mut session, &units)? {
+        team_gate::TeamGate::Proceed => {}
+        team_gate::TeamGate::Deferred => return Ok(Progress::Deferred),
+        team_gate::TeamGate::Pause { prompt } => {
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                unit.ord,
+                None,
+                team_gate::TEAM_TRANSPORT_GATE,
+                prompt,
+            )?;
+            return Ok(Progress::Paused);
+        }
+    }
+
     if let Some(reason) = should_pause(&session, &units, unit_ix) {
         // Describe the decision the operator is actually being asked to make. A DEF-declared gate
         // fires AFTER the preceding phase's work, so the artifact under review is that phase's
@@ -6489,7 +6625,14 @@ fn dispatch_unit(
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
     }
-    if (notes_root.is_some() && unit.notes_root != notes_root) || attempt_changed {
+    // DES-TEAMING-002 P1: a team unit of an un-teamed run carries `transport: none` in its
+    // snapshot BEFORE its turn starts — stamped from the run's persisted state, never the worker.
+    let team_snapshot = team_gate::unit_snapshot(&session, &unit);
+    let team_changed = team_snapshot.is_some() && unit.team != team_snapshot;
+    if team_changed {
+        unit.team = team_snapshot;
+    }
+    if (notes_root.is_some() && unit.notes_root != notes_root) || attempt_changed || team_changed {
         if notes_root.is_some() {
             unit.notes_root = notes_root;
         }
@@ -7742,6 +7885,7 @@ fn finalize_run(
         session.status = SessionStatus::Completed;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
+        team_gate::path_ended(&*store, run_id, crate::team::events::PathStatus::Completed);
         // (F-7R2-013) A completed run's worktree is RETAINED — the files view, the delivered
         // PR's review cycle and any uncommitted leftover need it — until the run is archived or
         // the retention window elapses (`completed_worktree_retention`); `0` days restores the
@@ -7800,6 +7944,10 @@ pub(crate) fn confirm_gate(
             session.status
         );
     }
+
+    // (DES-TEAMING-002 P1) A team fact still in flight, or a `team_transport` pause answered with
+    // anything but its three answers, is refused here — before the gate row resolves.
+    team_gate::refuse_answer(&session, &decision)?;
 
     // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
     // are checked here, before the durable prompt below is marked `answered` — a refused answer
@@ -7865,6 +8013,24 @@ pub(crate) fn confirm_gate(
             Some(answer),
             crate::interaction::now_millis(),
         )?;
+    }
+
+    // (DES-TEAMING-002 P1) A `team_transport` pause: approve retries the missing fact through the
+    // gate's `gate.decided`, continue-without-team and reject tombstone the run first — every
+    // answer is acknowledged by the publisher before the run moves (the reply waits for it).
+    if team_gate::transport_gate_open(&session) {
+        let mut cx = team_gate::Ctx {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            in_flight,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        return team_gate::answer_transport_gate(&mut cx, session, decision);
     }
 
     // (DES-L1 PR-1B) Three arms. Reject = cancel, unchanged (D-2). `RequestChanges` and `Approve`
@@ -8348,6 +8514,7 @@ pub(crate) fn cancel_run(
     session.status = SessionStatus::Cancelled;
     session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
+    team_gate::path_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
     // A cancelled run's open prompt is dead state — resolve it `cancelled` so no skin renders a
     // gate nobody can answer (DES-PROJECT-001 §5.3). No-op when the run was answered/never paused.
     // Best-effort by design (the cancel itself already committed), but LOGGED: a prompt stuck
@@ -8804,6 +8971,7 @@ mod gate_pause_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -9054,6 +9222,7 @@ mod terminal_gate_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -9198,6 +9367,7 @@ retry the deliver phase";
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -9522,6 +9692,7 @@ mod substance_gate_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -10414,6 +10585,7 @@ mod request_changes_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -10487,6 +10659,7 @@ mod request_changes_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -11077,6 +11250,7 @@ mod code_evidence_floor_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -11444,6 +11618,7 @@ mod deliverable_floor_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -11854,6 +12029,7 @@ mod seat_failover_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -12496,6 +12672,7 @@ mod def_gate_disclosure_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -12601,6 +12778,7 @@ mod def_gate_disclosure_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -12695,6 +12873,7 @@ mod def_gate_disclosure_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: bench,
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -13012,6 +13191,7 @@ mod terminal_worktree_reap_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -13484,6 +13664,7 @@ mod terminal_worktree_reap_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -13654,6 +13835,7 @@ mod worker_code_graph_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         }
     }
 
@@ -13976,6 +14158,7 @@ mod project_graph_binding_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         }
     }
 
@@ -14722,6 +14905,7 @@ mod phase_boundary_governance_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -15178,6 +15362,7 @@ mod turn_timeout_vs_cancel_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -15372,6 +15557,7 @@ mod turn_timeout_vs_cancel_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -15430,6 +15616,7 @@ mod turn_timeout_vs_cancel_tests {
             base_commit: None,
             finished_at: Some(now - 60_000),
             benched_seats: Vec::new(),
+            team: None,
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -15506,6 +15693,7 @@ mod turn_timeout_vs_cancel_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -16053,6 +16241,7 @@ mod dead_seat_park_tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");

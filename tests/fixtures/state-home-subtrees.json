@@ -175,6 +175,13 @@
       "owner": "operator",
       "source": "the sanctioned launch redirects the daemon's stdout to <state home>/daemon-stdout.log (operating playbook; src/api/diagnostics.ts names it) — crew itself never writes it",
       "worker_read": "none"
+    },
+    {
+      "prefix": "team-outbox.ndjson",
+      "kind": "file",
+      "owner": "engine",
+      "source": "wicked-core src/team/publish.rs TEAM_OUTBOX_FILE — <state home>/team-outbox.ndjson, the team outbox (DES-TEAMING-002 §4.1): team facts the bus refused, spooled with the emit-outbox record shape, plus supersede tombstones; compaction writes a transient team-outbox.ndjson.compact sidecar and renames it over the file",
+      "worker_read": "none"
     }
   ]
 }

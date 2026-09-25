@@ -15563,6 +15563,7 @@ No further next steps — both questions fully answered.";
             executes_code: false,
             pre_build_scope: false,
             team_run: false,
+            team: None,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
             worktree_baseline: None,

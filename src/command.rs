@@ -443,6 +443,39 @@ pub(crate) enum Command {
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but
     /// the cursor is persisted, so a later `ResumeRun` continues the run.
     Shutdown,
+    // ── DES-TEAMING-002 P1: the TeamPublisher's acknowledgements (§4.1) and the team reads ──
+    /// The engine fact `token` names is on the bus at `event_id`.
+    TeamPublished {
+        token: crate::team::publish::TeamToken,
+        event_id: i64,
+    },
+    /// The engine fact `token` names could not be published within the bound (or was superseded).
+    /// For `path.started` the publisher has already written the run tombstone.
+    TeamTransportFailed {
+        token: crate::team::publish::TeamToken,
+        reason: String,
+    },
+    /// The run tombstone `token` asked for is written.
+    TeamSuperseded {
+        token: crate::team::publish::TeamToken,
+    },
+    /// A run's team state and its units' snapshots (the read behind crew's
+    /// `GET /api/v1/runs/:id/team`).
+    RunTeam {
+        run_id: String,
+        reply: Sender<anyhow::Result<Option<crate::RunTeamView>>>,
+    },
+    /// The live TEAMED runs (status `Executing` / `AwaitingHuman`, transport `bus`, `path.started`
+    /// acknowledged) with their team state — the supervisor's replay set (§4.7 step 2). An
+    /// un-teamed run is never listed, so the supervisor never arms it.
+    LiveTeamRuns {
+        reply: Sender<anyhow::Result<Vec<crate::LiveTeamRun>>>,
+    },
+    /// Register the engine's own composed per-run def (`"<run>:plan-<rev>"`).
+    RegisterComposed {
+        def: Box<crate::workflow::WorkflowDef>,
+        reply: Sender<anyhow::Result<()>>,
+    },
 }
 
 /// Where to direct an injected worker message.

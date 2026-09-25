@@ -196,6 +196,109 @@ pub struct AgentSession {
     /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<BenchedSeat>,
+    /// (DES-TEAMING-002 §4.1/§4.7, seam P1) A TEAM run's durable team state: its transport, the
+    /// acknowledged `path.started` (`stream_floor`), the accepted plan rev, the gate sequence and
+    /// the one engine fact the run is waiting on. `None` on every non-team run (and on a team run
+    /// before its first dispatch). `#[serde(default)]` + skip-if-none: older sessions deserialize
+    /// and non-team sessions serialize byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<RunTeamState>,
+}
+
+/// A team run's durable team state ([`AgentSession::team`], DES-TEAMING-002 §4.7). Written by the
+/// actor, never read from a worker or a wire payload.
+///
+/// **Positive evidence only.** A run is teamed ([`RunTeamState::is_teamed`]) only when its
+/// transport is `bus` AND its `path.started` was acknowledged (`stream_floor` set). An unset
+/// transport is "not decided yet", never "teamed": the actor dispatches nothing while it is unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTeamState {
+    /// `bus` once `path.started` is on the bus; `none` for an un-teamed run; unset until decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<crate::team::events::Transport>,
+    /// Why the run is un-teamed (`transport: none`), in words an operator can act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The bus `event_id` of the run's acknowledged `path.started` (§4.7 replay floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_floor: Option<i64>,
+    /// The plan rev whose `plan.accepted` the bus acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_rev: Option<u32>,
+    /// The last minted gate sequence (`gate_id(run, gate_seq)`).
+    #[serde(default)]
+    pub gate_seq: u32,
+    /// The gate id of the open team gate whose `gate.opened` was sent, if any — its answer must
+    /// publish `gate.decided` before the run resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_gate: Option<String>,
+    /// The required engine fact the run waits on (§4.1 "required transitions").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingTeamFact>,
+    /// The daemon had no bus when the run was decided (§4.8 row 6): its snapshots are built
+    /// locally with `ledger_source: no_bus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_bus: bool,
+}
+
+impl RunTeamState {
+    /// Teamed on positive evidence only: transport `bus` with an acknowledged `path.started`.
+    pub fn is_teamed(&self) -> bool {
+        self.transport == Some(crate::team::events::Transport::Bus) && self.stream_floor.is_some()
+    }
+
+    /// Un-teamed: transport `none`.
+    pub fn is_unteamed(&self) -> bool {
+        self.transport == Some(crate::team::events::Transport::None)
+    }
+}
+
+/// The required engine fact a team run waits on, and the step it gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTeamFact {
+    pub event_type: String,
+    pub key: String,
+    pub stage: PendingStage,
+    /// What runs once the fact is acknowledged (or the run falls back to un-teamed).
+    pub then: TeamBlocked,
+}
+
+/// Where a pending fact stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingStage {
+    /// Sent to the publisher; its acknowledgement is awaited.
+    Publishing,
+    /// Past the bound: the run is paused `team_transport`.
+    Paused,
+    /// The operator chose continue-without-team or reject: the run tombstone is being written.
+    Superseding,
+}
+
+/// The step a pending fact gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum TeamBlocked {
+    /// The run's first dispatch (gated by `path.started`).
+    FirstDispatch,
+    /// The plan's first dispatch (gated by `plan.accepted`, and — once the run paused
+    /// `team_transport` over it — by that gate's `gate.decided`).
+    PlanDispatch { plan_rev: u32 },
+    /// The operator rejected a `team_transport` pause: cancel once the tombstone is written.
+    Cancel,
+}
+
+/// A unit's team snapshot (DES-TEAMING-002 §4.8 rows 1/5/6): what the unit's team record is,
+/// stamped by the actor at dispatch from the run's state — never read from the worker. P1 stamps
+/// the un-teamed snapshot (`transport: none`); the worker-built ledger joins it in T5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitTeamSnapshot {
+    pub transport: crate::team::events::Transport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `no_bus` when the daemon had no bus; unset otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_source: Option<crate::team::events::LedgerSource>,
 }
 
 /// One seat benched for a run ([`AgentSession::benched_seats`], F-7R2-006).
@@ -540,6 +643,11 @@ pub struct WorkUnit {
     /// serialize byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub team_run: bool,
+    /// (DES-TEAMING-002 P1) The unit's team snapshot, stamped by the actor at dispatch for a team
+    /// run ([`UnitTeamSnapshot`]). `None` for a non-team unit. Skip-if-none: non-team units
+    /// serialize byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<UnitTeamSnapshot>,
     /// Operator-visible WARNINGS the completion path recorded WITHOUT denying (core#283): today,
     /// a pre-build phase whose worktree contribution touches non-documentation files — the
     /// design-before-build ladder collapsing into implementation. Advisory gate evidence on the
@@ -797,6 +905,7 @@ impl WorkUnit {
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,
+            team: None,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
             worktree_baseline: None,
@@ -1117,6 +1226,7 @@ mod tests {
             base_commit: None,
             finished_at: None,
             benched_seats: Vec::new(),
+            team: None,
         }
     }
 
