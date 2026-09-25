@@ -854,7 +854,7 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
 
 ### 11.2 Mapping current phases onto catalog types
 
-The hypothesis was that **no consumer needs more than the core catalog**. It is **confirmed**: every phase of every consumer maps onto one of the twelve core types below, with the step-field strengthenings §8.3 allows. Beyond the obvious, the core catalog needs `produce` and `critique` (creating and reviewing a **non-code artifact**) and `run` (a Tool command). None of those is surface-specific: documents, domain extraction, memories, steering and collab all use them. Adding `critique` to §8.3's table makes twelve entries: `review`/evaluator/`auto` gate/`execution` type, **no pin**, no code. Without it, today's unpinned reviews (feature/review, domain-graph-slice/validate, collab/critique, collab/verdict) would each gain the evidence-floor pin, whose criterion judges code evidence.
+The hypothesis was that **no consumer needs more than the core catalog**. It is **confirmed**: every phase of every consumer maps onto one of the thirteen core types below, with the step-field strengthenings §8.3 allows. Beyond the obvious, the core catalog needs `produce` and `critique` (creating and reviewing a **non-code artifact**) and `run` (a Tool command). None of those is surface-specific: documents, domain extraction, memories, steering and collab all use them. Adding `critique` to §8.3's table makes twelve entries: `review`/evaluator/`auto` gate/`execution` type, **no pin**, no code. Without it, today's unpinned reviews (feature/review, domain-graph-slice/validate, collab/critique, collab/verdict) would each gain the evidence-floor pin, whose criterion judges code evidence.
 
 | Consumer | Current phases → catalog (bold = a behaviour change, detailed in §11.3) |
 |---|---|
@@ -868,7 +868,7 @@ The hypothesis was that **no consumer needs more than the core catalog**. It is 
 | capture-learnings | churn, hotspots → `understand`; capture → `produce` (skill_ref kept) |
 | memories | gather → `understand`; store → `produce` |
 | domain-graph-slice | identify → `understand`; extract → `produce`; validate → `critique` |
-| domain-extraction | survey, analyze → `understand`; extract → `produce` (**kind recon → build**); coverage → `test` (pin swapped to `COVERAGE_VALIDATOR_PIN`, `executes_code` raised, skill_ref kept); domain-graph → `run` (gate raised to `human_confirm`) |
+| domain-extraction | survey, analyze → `understand`; extract → `produce` (**kind recon → build**); coverage → `domain_coverage` (the entry carries `COVERAGE_VALIDATOR_PIN`; the step restates it, no swap; `executes_code` raised, skill_ref kept); domain-graph → `run` (gate raised to `human_confirm`) |
 | steering-author | analyze → `understand`; propose → `produce` (**kind recon → build**; gate raised to `human_confirm`) |
 | collab | propose, revise → `produce` (**kind recon → build**); critique → `critique`; verdict → `critique` (gate raised to `human_confirm`) |
 | interactive-chat | understand → `understand`; revise → `produce` |
@@ -976,7 +976,7 @@ The team-run core comes first (T0–T9); then **one migration seam per consumer*
   - named fixture: two `HELP:` lines in one output with the same question and different context yield two `help.requested` rows; two member `change.requested` rows with the same text and different steps yield two;
   - a grep test fails the build if a key builder in `src/team/events.rs` takes a payload text field (question, claim, evidence, reason, context).
 
-**C1 — Phase catalog + compose (core).** `src/catalog.rs` (12 entries, §8.3/§11.2), `PhaseDef.owner`/`WorkUnit.owner`, `plan::compose` with the step rules, and the evidence-floor pin moved onto the entries.
+**C1 — Phase catalog + compose (core).** `src/catalog.rs` (13 entries, §8.3/§11.2), `PhaseDef.owner`/`WorkUnit.owner`, `plan::compose` with the step rules, and the evidence-floor pin moved onto the entries.
 *Accept:* (a) `compose` of every §11.2 mapping yields a def whose per-phase `(kind, role, gate, validator_pin, executes_code, executor, skill_ref, instructions, depends_on)` equals today's def **except** exactly the bold cells of §11.2 (one fixture per consumer, generated from today's defs). The migration fixture pins cleanup as `build`: `kind:build`, `role:creator`, `validator_pin:EVIDENCE_FLOOR_PIN`, `executes_code:true`; (b) a step that lowers a gate, removes a pin, changes `role`, or sets `executor` on a non-Tool entry is refused with a named reason; (c) a misspelled step key is refused (`deny_unknown_fields`); (d) an owner-omitted def serializes byte-identically; (e) `attach_pinned_validators` attaches every catalog pin (an added unapproved pin is refused, `src/pipeline.rs:246-258`); (f) a step that swaps a pinned entry's pin, even for an approved one, is refused `pin_changed` (rev 12).
 
 **C2 — Presets (core + crew).** `src/preset.rs` rows, the built-in seeding, `Core::{put,delete,list}_preset`, crew routes, and `launch_run` resolving `workflow` as a preset name.

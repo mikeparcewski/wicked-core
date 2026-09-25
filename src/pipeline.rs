@@ -2341,8 +2341,9 @@ mod resolve_tests {
     }
 
     /// Seam C1 acceptance (e): a def composed from EVERY catalog entry plans with each entry's pin
-    /// attached (the evidence floor on `build`/`test`/`review`/`security_review`, nothing on the
-    /// rest), and a step that swaps a pin for an UNAPPROVED validator is refused at attach.
+    /// attached (the evidence floor on `build`/`test`/`review`/`security_review`, the coverage pin
+    /// on `domain_coverage`, nothing on the rest), and a step that ADDS an UNAPPROVED pin to an
+    /// unpinned entry is refused at attach (a swap is refused earlier, by `compose`: `pin_changed`).
     #[test]
     fn attach_pinned_validators_attaches_every_catalog_pin() {
         use crate::validator::DeterministicValidator;
@@ -2354,8 +2355,9 @@ mod resolve_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
         crate::builtin_floors::seed_builtin_floors(&mut store).unwrap();
+        crate::domain_extraction::provision_and_approve_coverage_validator(&mut store).unwrap();
 
-        let steps = |swap: Option<&str>| -> crate::plan::PlanSteps {
+        let steps = |add: Option<&str>| -> crate::plan::PlanSteps {
             let mut steps = Vec::new();
             let mut prev: Option<String> = None;
             for id in crate::catalog::CATALOG_IDS {
@@ -2363,7 +2365,7 @@ mod resolve_tests {
                 if matches!(id, "run" | "deliver") {
                     step["executor"] = serde_json::json!({ "type": "tool", "cmd": ["true"] });
                 }
-                if let (Some(pin), "review") = (swap, id) {
+                if let (Some(pin), "critique") = (add, id) {
                     step["validator_pin"] = serde_json::json!(pin);
                 }
                 if let Some(p) = prev.replace(id.to_string()) {
@@ -2383,24 +2385,39 @@ mod resolve_tests {
         )
         .unwrap()
         .unwrap();
+        let coverage = crate::validator_vault::load_validator(
+            &store,
+            crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
+        )
+        .unwrap()
+        .unwrap();
         let pinned: Vec<&str> = units
             .iter()
             .zip(def.phases.iter())
             .filter(|(u, _)| u.validator.is_some())
             .map(|(u, p)| {
-                assert_eq!(
-                    u.validator.as_ref(),
-                    Some(&floor),
-                    "{} carries the floor",
-                    p.id
-                );
+                let want = if p.id == "domain_coverage" {
+                    &coverage
+                } else {
+                    &floor
+                };
+                assert_eq!(u.validator.as_ref(), Some(want), "{} carries its pin", p.id);
                 p.id.as_str()
             })
             .collect();
-        assert_eq!(pinned, ["build", "test", "review", "security_review"]);
+        assert_eq!(
+            pinned,
+            [
+                "build",
+                "test",
+                "review",
+                "security_review",
+                "domain_coverage"
+            ]
+        );
 
-        // A swap to an unapproved (vaulted) validator is refused at attach (pipeline.rs's
-        // UNAPPROVED arm) — the swap rule never bypasses approval.
+        // An unapproved (vaulted) pin ADDED to an unpinned entry is refused at attach
+        // (pipeline.rs's UNAPPROVED arm) — adding a pin never bypasses approval.
         let unapproved = DeterministicValidator {
             criterion: "README exists".into(),
             script: "test -f README.md".into(),
@@ -2410,10 +2427,10 @@ mod resolve_tests {
         let def = crate::plan::compose(crate::catalog::catalog(), &steps(Some(&p))).unwrap();
         let mut units = crate::plan::plan_from_def(&def, "do it", "s");
         let err = attach_pinned_validators(&store, &mut units, &def)
-            .expect_err("an unapproved swapped pin must be refused")
+            .expect_err("an unapproved added pin must be refused")
             .to_string();
         assert!(
-            err.contains("UNAPPROVED") && err.contains(&p) && err.contains("`review`"),
+            err.contains("UNAPPROVED") && err.contains(&p) && err.contains("`critique`"),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
