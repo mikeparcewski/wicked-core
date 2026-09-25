@@ -7716,6 +7716,7 @@ impl AcpStepRunner {
                     scope,
                     phase,
                     phase_alias: None,
+                    catalog_alias: None,
                     db: Some(db.as_str()),
                     decisions_path,
                     // Clone rather than borrow: BoundaryCtx owns its PathBufs and the gate is
