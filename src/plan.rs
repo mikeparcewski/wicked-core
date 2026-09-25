@@ -533,6 +533,9 @@ pub enum PlanRefusal {
     OverrideRemovesPinned { catalog: String },
     /// The override names a catalog id the catalog does not define.
     OverrideUnknownEntry { catalog: String },
+    /// The override names a catalog id that is not a phase of the computed floor: there is
+    /// nothing to go below.
+    OverrideNotInFloor { catalog: String },
     /// A floor phase sits before a floor phase that precedes it in catalog order (§8.5: no step
     /// may reorder a floor phase before its catalog-order predecessors).
     FloorReordered { step: String, catalog: String },
@@ -562,6 +565,7 @@ impl PlanRefusal {
             PlanRefusal::OverrideInAutoMode => "override_in_auto_mode",
             PlanRefusal::OverrideRemovesPinned { .. } => "override_removes_pinned",
             PlanRefusal::OverrideUnknownEntry { .. } => "override_unknown_entry",
+            PlanRefusal::OverrideNotInFloor { .. } => "override_not_in_floor",
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
             PlanRefusal::ProvenanceSupplied { .. } => "provenance_supplied",
         }
@@ -645,6 +649,10 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::OverrideUnknownEntry { catalog } => write!(
                 f,
                 "{r}: the override names {catalog}, which the catalog does not define"
+            ),
+            PlanRefusal::OverrideNotInFloor { catalog } => write!(
+                f,
+                "{r}: the override names {catalog}, which is not a phase of this plan's floor"
             ),
             PlanRefusal::FloorReordered { step, catalog } => write!(
                 f,
@@ -964,6 +972,10 @@ pub fn floor_fill(
             let Some(e) = entry(c) else {
                 return Err(PlanRefusal::OverrideUnknownEntry { catalog: c.clone() });
             };
+            // Validated against the COMPUTED floor first: the pinned rule binds floor phases only.
+            if !floor.contains(c) {
+                return Err(PlanRefusal::OverrideNotInFloor { catalog: c.clone() });
+            }
             if high_risk && e.validator_pin.is_some() {
                 return Err(PlanRefusal::OverrideRemovesPinned { catalog: c.clone() });
             }
@@ -1010,12 +1022,33 @@ pub fn floor_fill(
                     .map(|cmd| crate::workflow::PhaseExecutor::Tool { cmd: cmd.to_vec() })
             })
             .flatten();
+        // What the inserted step consumes, declared so `plan_from_def` carries it and dispatch
+        // hands it the prior output (FINDING-024): an evaluator depends on every creator before
+        // it, `deliver` on the step before it, and any other step declares nothing, exactly as an
+        // authored step with no `depends_on`.
+        let depends_on: Vec<String> =
+            if entry(ty).is_some_and(|e| e.role == crate::workflow::PhaseRole::Evaluator) {
+                steps[..at]
+                    .iter()
+                    .filter(|s| is_creator_catalog(&s.catalog))
+                    .map(|s| s.id.clone())
+                    .collect()
+            } else if ty == "deliver" {
+                steps[..at]
+                    .last()
+                    .map(|s| s.id.clone())
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
         steps.insert(
             at,
             PlanStep {
                 catalog: ty.clone(),
                 id,
                 executor,
+                depends_on: (!depends_on.is_empty()).then_some(depends_on),
                 added_by: Some(AddedBy::Floor),
                 floor_reason: Some(format!("band {} requires {ty}", row.band)),
                 ..PlanStep::default()
