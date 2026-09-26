@@ -488,12 +488,9 @@ fn t2_g_a_declared_touch_set_scores_from_the_graph_path() {
     rig.core
         .launch_run(spec("rgt", HumanConfirm::None, Some(p)))
         .unwrap();
-    // The facts reach the bus through the publisher (asynchronously): wait for them, not only
-    // for the pause.
-    rig.tap
-        .until("the plan_approval pause and path.scored", |s| {
-            paused_on_plan(s, "rgt").is_some() && !of_type(s, "rgt", SCORED).is_empty()
-        });
+    rig.tap.until("the plan_approval pause", |s| {
+        paused_on_plan(s, "rgt").is_some()
+    });
     let scored = of_type(&rig.tap.seen, "rgt", SCORED);
     assert_eq!(scored[0]["score"], 100);
     let reasons: Vec<String> = serde_json::from_value(scored[0]["reasons"].clone()).unwrap();
@@ -1044,10 +1041,9 @@ fn a_preset_launch_becomes_a_team_run() {
     let mut s = spec("rp", HumanConfirm::None, None);
     s.workflow = Some("my-flow".into());
     rig.core.launch_run(s).unwrap();
-    rig.tap
-        .until("the plan_approval pause and plan.proposed", |s| {
-            paused_on_plan(s, "rp").is_some() && !of_type(s, "rp", PROPOSED).is_empty()
-        });
+    rig.tap.until("the plan_approval pause", |s| {
+        paused_on_plan(s, "rp").is_some()
+    });
     let proposed = &of_type(&rig.tap.seen, "rp", PROPOSED)[0];
     assert_eq!(proposed["preset"], "my-flow");
     assert_eq!(proposed["by"], "human");

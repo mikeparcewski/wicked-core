@@ -36,7 +36,6 @@ mod event;
 pub mod event_log;
 mod execute;
 mod execute_wrapped;
-mod failpoint;
 mod gate_hook;
 mod graph_browser;
 mod install_fence;
