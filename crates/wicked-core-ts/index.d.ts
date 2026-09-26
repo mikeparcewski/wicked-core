@@ -447,8 +447,10 @@ export declare class Core {
    * What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` on
    * `repoRef` (the registered repo the launch would run on) with `deliverStepJson` (the
    * launch's deliver step) would compute, persisting and publishing nothing — the launch's own
-   * plan resolution (`projectId`), precheck, intent score against the repo's code graph at the
-   * base its worktree would start from, floor fill, approval matrix and planning checks.
+   * precheck, intent score, floor fill, approval matrix and planning checks. `projectId` only
+   * matters to a preset name, so it does not change a plan's preview. For a behavioural touch
+   * set the score reads `repoRef`'s code graph at the base a launch would start from, read
+   * locally with NO fetch (the local remote-default tip, else HEAD).
    * Resolves to JSON `{ score, deterministic, reasons, destructive, band, high_risk, floor,
    * floor_override, steps, def, pauses, pause_reason, graph }`: `floor` is the floor phase
    * types the plan owes; the steps the floor ADDED are the `steps` with `added_by: "floor"`
@@ -457,7 +459,8 @@ export declare class Core {
    * `"ready"` (the score read the repo's graph), `"not_needed"` (a docs-only touch set) or
    * `"unavailable"` (the fail-closed score: no repo, no or a stale graph, no declared scope).
    * Rejects with the launch's refusal (compose, supplied provenance, an override in auto mode,
-   * a planning check), an unregistered `repoRef`, or a bad `humanConfirm` / `deliverStepJson`.
+   * a planning check), an unregistered `repoRef` or one whose base cannot be resolved, or a bad
+   * `humanConfirm` / `deliverStepJson`.
    */
   previewPlan(planJson: string, projectId?: string | undefined | null, humanConfirm?: string | undefined | null, repoRef?: string | undefined | null, deliverStepJson?: string | undefined | null): Promise<string>
   /**
@@ -466,9 +469,14 @@ export declare class Core {
    * (the ratchet and floor fill apply), which publishes `plan.proposed{by:"human", kind:"edit"}`
    * then `plan.accepted{by:"human"}`: its author approved it, so no `plan_approval` gate opens
    * for it (as for an edit at the gate). Idempotent by `requestId`.
-   * Resolves to JSON `{ proposal_id, duplicate }` (`duplicate: true` = this request id was
-   * already taken; nothing new is held or published). Rejects for an unknown, finished or
-   * un-planned run, an empty request id, or an edit carrying `touch` / `override`.
+   * Resolves to JSON `{ proposal_id, duplicate, band, high_risk, floor_added }`: what the edit
+   * does to the run (the floor band and high-risk rule of the rev it makes, the floor phase
+   * types it adds), from the dry run it is validated by; `duplicate: true` = this request id was
+   * already taken (nothing new is held or published; `band` / `high_risk` null, `floor_added`
+   * empty). Rejects for an unknown, finished or un-planned run, a plan awaiting approval (edit
+   * it at the gate), a started deliver step, an edit the revision refuses, an empty request id,
+   * or an edit carrying `touch` / `override`. An edit still held when the run ends is refused
+   * on the bus (`plan.refused`).
    */
   proposePlan(runId: string, planJson: string, requestId: string): Promise<string>
   /**
