@@ -62,34 +62,76 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-/// What the scripted worker does for the FIRST dispatch of a run: the PA's output, and the paths
-/// the supervisor would report for its settled diff (`None` = no re-score).
-struct Script {
+/// What the scripted worker does on one dispatch.
+#[derive(Default)]
+struct Turn {
     output: String,
+    /// The paths the supervisor would report for this attempt's settled diff (`None` = none).
     diff: Option<Vec<String>>,
+    /// Raise one HIGH finding on the attempt (an unresolved HIGH pauses `team_dispute`).
+    raise_high: bool,
+    /// Hold the turn until the test ends (nothing runs on past it).
+    hold: bool,
 }
 
-/// Runs the first dispatch from its script and HOLDS every later one (recorded), so "what ran
-/// after the revision" is read off the worker itself and nothing runs on past it.
+fn turn(output: &str, diff: Option<&[&str]>) -> Turn {
+    Turn {
+        output: output.to_string(),
+        diff: diff.map(|d| d.iter().map(|p| p.to_string()).collect()),
+        ..Turn::default()
+    }
+}
+
+fn hold() -> Turn {
+    Turn {
+        hold: true,
+        ..Turn::default()
+    }
+}
+
+type ScriptFn = Box<dyn Fn(&StepInput, usize) -> Turn + Send + Sync>;
+
+/// A scripted worker: `script(input, dispatch_index)` decides each turn; every dispatch is
+/// recorded, so "what ran after the revision" (and at which attempt) is read off the worker.
 struct Worker {
     tx: OnceLock<Sender<Command>>,
-    script: Mutex<Script>,
+    bus: OnceLock<crate::team::publish::TeamBus>,
+    script: ScriptFn,
     calls: Mutex<Vec<(u32, u32, String)>>,
-    first: AtomicUsize,
+    n: AtomicUsize,
     release: Arc<(Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl Worker {
-    fn new(output: &str, diff: Option<&[&str]>) -> Arc<Self> {
+    fn scripted(script: impl Fn(&StepInput, usize) -> Turn + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             tx: OnceLock::new(),
-            script: Mutex::new(Script {
-                output: output.to_string(),
-                diff: diff.map(|d| d.iter().map(|p| p.to_string()).collect()),
-            }),
+            bus: OnceLock::new(),
+            script: Box::new(script),
             calls: Mutex::default(),
-            first: AtomicUsize::new(0),
+            n: AtomicUsize::new(0),
             release: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+        })
+    }
+    /// The first dispatch runs `output` (with `diff`); every later one is held.
+    fn new(output: &str, diff: Option<&[&str]>) -> Arc<Self> {
+        let first: Vec<String> = diff
+            .unwrap_or_default()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        let has_diff = diff.is_some();
+        let output = output.to_string();
+        Self::scripted(move |_, n| {
+            if n == 0 {
+                Turn {
+                    output: output.clone(),
+                    diff: has_diff.then(|| first.clone()),
+                    ..Turn::default()
+                }
+            } else {
+                hold()
+            }
         })
     }
     /// `(ord, attempt, unit id)` of every dispatch, in order.
@@ -100,9 +142,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let (l, cv) = &*self.release;
-        *l.lock().unwrap() = true;
-        cv.notify_all();
+        release_all(self);
     }
 }
 
@@ -118,28 +158,41 @@ impl StepRunner for Worker {
             .lock()
             .unwrap()
             .push((i.unit.ord, i.attempt, i.unit.id.clone()));
-        let output = if self.first.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
-            let s = self.script.lock().unwrap();
-            if let (Some(paths), Some(tx)) = (&s.diff, self.tx.get()) {
-                // The supervisor's measurement of this attempt's settled diff.
-                tx.send(Command::TeamRescored {
-                    run_id: i.run_id.clone(),
-                    ord: i.unit.ord,
-                    attempt: i.attempt,
-                    rescore_seq: 1,
-                    tree: "0123456789abcdef0123456789abcdef01234567".into(),
-                    paths: paths.clone(),
-                })
-                .unwrap();
-            }
-            s.output.clone()
-        } else {
+        let t = (self.script)(i, self.n.fetch_add(1, AtomicOrdering::SeqCst));
+        if t.raise_high {
+            let f =
+                crate::team::publish::tests::fixture_with(tev::FINDING_RAISED, 0, &i.run_id, |p| {
+                    p["ord"] = json!(i.unit.ord);
+                    p["attempt"] = json!(i.attempt);
+                    p["raise_seq"] = json!(1);
+                });
+            self.bus
+                .get()
+                .expect("bus")
+                .publish(&f)
+                .expect("the finding is on the bus");
+        }
+        if let (Some(paths), Some(tx)) = (&t.diff, self.tx.get()) {
+            // The supervisor's measurement of this attempt's settled diff, ahead of the result.
+            tx.send(Command::TeamRescored {
+                run_id: i.run_id.clone(),
+                ord: i.unit.ord,
+                attempt: i.attempt,
+                rescore_seq: 1,
+                tree: "0123456789abcdef0123456789abcdef01234567".into(),
+                paths: paths.clone(),
+            })
+            .unwrap();
+        }
+        let output = if t.hold {
             let (l, cv) = &*self.release;
             let mut done = l.lock().unwrap();
             while !*done {
                 done = cv.wait_timeout(done, Duration::from_millis(50)).unwrap().0;
             }
             "held".to_string()
+        } else {
+            t.output
         };
         StepOutput {
             run_id: i.run_id.clone(),
@@ -163,17 +216,17 @@ struct Engine {
     rig: Rig,
 }
 
-fn engine(name: &str, worker: Arc<Worker>) -> Engine {
-    let rig = rig(name);
-    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
-    let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+fn team_cfg(rig: &Rig, final_pass: Duration) -> TeamConfig {
+    TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
         .with_schedule(vec![Duration::from_millis(40); 3])
         .with_attempt_wait(Duration::from_millis(30))
-        // No supervisor in these rigs: the worker synthesizes its (empty) ledger after this.
-        .with_final_pass_budget(Duration::from_millis(300))
-        .with_gate_poll(Duration::from_millis(20));
-    let core = Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), worker.clone(), cfg);
+        .with_final_pass_budget(final_pass)
+        .with_gate_poll(Duration::from_millis(20))
+}
+
+fn wire(core: Core, worker: Arc<Worker>, rig: Rig) -> Engine {
     let _ = worker.tx.set(core.tx.clone());
+    let _ = worker.bus.set(rig.team_bus());
     let events = core.subscribe();
     core.ping();
     Engine {
@@ -183,6 +236,34 @@ fn engine(name: &str, worker: Arc<Worker>) -> Engine {
         seen: Vec::new(),
         rig,
     }
+}
+
+/// No supervisor: the worker synthesizes its (empty, or its own raise's) ledger after 300 ms.
+fn engine(name: &str, worker: Arc<Worker>) -> Engine {
+    let rig = rig(name);
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let cfg = team_cfg(&rig, Duration::from_millis(300));
+    let core = Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), worker.clone(), cfg);
+    wire(core, worker, rig)
+}
+
+/// With the team supervisor on the bus (T6's member steps and the PA's review of them).
+fn engine_supervised(name: &str, worker: Arc<Worker>) -> Engine {
+    use crate::team::supervisor::tests::{FakeCouncil, FakeHost};
+    let rig = rig(name);
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let cfg = team_cfg(&rig, Duration::from_secs(90));
+    let core = Core::spawn_with_engine_team_supervised(
+        db,
+        Arc::new(StubDispatcher),
+        worker.clone(),
+        cfg,
+        None,
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        |c| c.poll = Duration::from_millis(20),
+    );
+    wire(core, worker, rig)
 }
 
 fn plan(v: Value) -> PlanSteps {
@@ -424,11 +505,21 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
     release_all(&w);
 }
 
-/// (a) second clause: a later LOWER re-score publishes nothing — no `path.scored`, no revision.
+/// (a) second clause: the floor RISES first (a behavioural diff: 0-19 → 70-100, one
+/// `path.scored{diff}` and one `plan.revised`), then a later LOWER re-score (a docs-only diff)
+/// publishes nothing more — no second `path.scored`, no second revision, no second gate.
 #[test]
-fn t4_a_a_lower_rescore_publishes_nothing() {
-    // The PA's own addition keeps the run going past the first boundary without a gate.
-    let w = Worker::new(&pa_output("docs only"), Some(&["docs/guide.md"]));
+fn t4_a_a_lower_rescore_after_a_raise_publishes_nothing() {
+    let w = Worker::scripted(|i, _| {
+        let id = i.unit.id.as_str();
+        if id.ends_with(":produce") {
+            turn(&pa_output("built it"), Some(&["src/lib.rs"]))
+        } else if id.ends_with(":test_plan") {
+            turn(&pa_output("planned the tests"), Some(&["docs/tests.md"]))
+        } else {
+            hold()
+        }
+    });
     let mut e = engine("t4low", w.clone());
     launch(
         &e,
@@ -439,15 +530,265 @@ fn t4_a_a_lower_rescore_publishes_nothing() {
                     "touch": ["README.md"]}),
         ),
     );
-    wait_for("the second unit to dispatch", || {
-        e.worker.calls().len() >= 2
+    e.wait_awaiting("low", crate::plan_gate::GATE_KIND, 1);
+    let diff_scores = |e: &Engine| {
+        payloads(e, "low", tev::PATH_SCORED)
+            .into_iter()
+            .filter(|p| p["basis"] == "diff")
+            .count()
+    };
+    wait_for("the raise on the bus", || {
+        diff_scores(&e) == 1 && payloads(&e, "low", tev::PLAN_REVISED).len() == 1
+    });
+    e.core.confirm_gate("low", approve()).unwrap();
+    // test_plan (the lower re-score) runs, and the run moves on to the next unit.
+    wait_for("the unit after test_plan to dispatch", || {
+        e.worker.calls().len() >= 3
     });
     std::thread::sleep(Duration::from_millis(300));
-    assert!(payloads(&e, "low", tev::PATH_SCORED)
+    assert_eq!(
+        diff_scores(&e),
+        1,
+        "the lower re-score publishes no path.scored"
+    );
+    assert_eq!(
+        payloads(&e, "low", tev::PLAN_REVISED).len(),
+        1,
+        "no second revision"
+    );
+    assert_eq!(
+        e.awaiting("low")
+            .iter()
+            .filter(|(_, k)| k == crate::plan_gate::GATE_KIND)
+            .count(),
+        1,
+        "no second plan gate"
+    );
+    release_all(&w);
+}
+
+// ── HIGH-1: every advance applies a held revision — a dispute answer, a member acceptance ─────────
+
+/// The raise on a step whose unit pauses `team_dispute` (an unresolved HIGH) is applied when the
+/// dispute is answered and the run advances: `path.scored{diff}` → `plan.revised{floor_raised}` →
+/// `plan_approval` before the next unit — never a dispatch past it.
+#[test]
+fn t4_high1_a_raise_on_a_disputed_step_is_applied_when_the_dispute_is_answered() {
+    let w = Worker::scripted(|i, n| {
+        if n == 0 {
+            Turn {
+                raise_high: true,
+                ..turn(&pa_output("built it"), Some(&["src/lib.rs"]))
+            }
+        } else {
+            let _ = i;
+            hold()
+        }
+    });
+    let mut e = engine("t4disp", w.clone());
+    launch(
+        &e,
+        "disp",
+        HumanConfirm::None,
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
+    );
+    e.wait_awaiting("disp", "team_dispute", 1);
+    e.core.confirm_gate("disp", approve()).unwrap();
+    e.wait_awaiting("disp", crate::plan_gate::GATE_KIND, 1);
+    assert_eq!(
+        e.worker.calls().len(),
+        1,
+        "nothing dispatched past the raise"
+    );
+    wait_for("the raise on the bus", || {
+        payloads(&e, "disp", tev::PLAN_REVISED).len() == 1
+    });
+    let revised = &payloads(&e, "disp", tev::PLAN_REVISED)[0];
+    assert_eq!(revised["reason"], "floor_raised");
+    assert_eq!(revised["to_band"], "70-100");
+    assert!(payloads(&e, "disp", tev::PATH_SCORED)
         .iter()
-        .all(|p| p["basis"] == "intent"));
-    assert!(payloads(&e, "low", tev::PLAN_REVISED).is_empty());
-    assert!(e.awaiting("low").is_empty());
+        .any(|p| p["basis"] == "diff"));
+    release_all(&w);
+}
+
+/// The step is the team's (`owner:"team"`): the member's work changes `src/`, the PA's review
+/// accepts it, and the acceptance's advance applies the raise before the next unit.
+#[test]
+fn t4_high1_a_raise_on_a_member_step_is_applied_when_the_pa_accepts_it() {
+    let w = Worker::scripted(|_, n| match n {
+        0 => turn(&pa_output("the member built it"), Some(&["src/lib.rs"])),
+        1 => turn("reviewed\nSTEP produce: ACCEPT — it is right", None),
+        _ => hold(),
+    });
+    let mut e = engine_supervised("t4mem-acc", w.clone());
+    launch(
+        &e,
+        "macc",
+        HumanConfirm::None,
+        plan(
+            json!({"steps": [{"catalog": "produce", "owner": "team"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
+    );
+    e.wait_awaiting("macc", crate::plan_gate::GATE_KIND, 1);
+    let calls = e.worker.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the member's work and the PA's review only: {calls:?}"
+    );
+    let revised = payloads(&e, "macc", tev::PLAN_REVISED);
+    assert_eq!(revised.len(), 1);
+    assert_eq!(revised[0]["reason"], "floor_raised");
+    release_all(&w);
+}
+
+// ── MEDIUM-1: the PA answers a member's request in its REVIEW of the member's step ──────────────
+
+/// The render asks the PA to answer `change.requested` at its next boundary; on a member step
+/// that turn is its review. `PLAN <change_id>: ACCEPT` + `PLAN+` there is a revision
+/// (`plan.revised{reason:"member_request"}`) applied when the step is accepted.
+#[test]
+fn t4_medium1_the_pa_review_accepting_a_member_request_revises_the_plan() {
+    let w = Worker::scripted(|_, n| match n {
+        0 => turn(&pa_output("the member built it"), None),
+        1 => turn(
+            "reviewed\nSTEP produce: ACCEPT — it is right\n\
+             PLAN c-00000000000000aa: ACCEPT — the member is right\n\
+             PLAN+ {\"steps\":[{\"catalog\":\"test\"}]}",
+            None,
+        ),
+        _ => hold(),
+    });
+    let e = engine_supervised("t4mem-req", w.clone());
+    launch(
+        &e,
+        "mreq",
+        HumanConfirm::None,
+        plan(
+            json!({"steps": [{"catalog": "produce", "owner": "team"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
+    );
+    wait_for("the unit after the member step to dispatch", || {
+        e.worker.calls().len() >= 3
+    });
+    let revised = payloads(&e, "mreq", tev::PLAN_REVISED);
+    assert_eq!(revised.len(), 1, "{revised:#?}");
+    assert_eq!(revised[0]["reason"], "member_request");
+    let want = tev::mint_proposal_id(
+        "mreq",
+        "a",
+        &tev::ProposalSource::Change {
+            change_id: "c-00000000000000aa".into(),
+        },
+    );
+    assert_eq!(revised[0]["proposal_id"], want.as_str());
+    release_all(&w);
+}
+
+// ── MEDIUM-2: a revision after a request_changes rewind keeps the rewound units' attempts ──────
+
+/// The review requests changes (a def gate on `critique`): the creator re-runs at attempt 1 and
+/// its settled diff re-scores into high risk. The revision inserts the floor phases, and the
+/// review — already run once — re-dispatches at its own NEXT attempt (1), never a reused 0.
+#[test]
+fn t4_medium2_a_revision_after_a_rewind_keeps_the_review_attempt() {
+    let w = Worker::scripted(|i, _| {
+        let id = i.unit.id.as_str();
+        let reran = i.attempt > 0;
+        if id.ends_with(":produce") && reran {
+            turn(&pa_output("reworked it"), Some(&["src/lib.rs"]))
+        } else if id.ends_with(":critique") && reran {
+            hold()
+        } else {
+            turn(&pa_output("did the step"), None)
+        }
+    });
+    let mut e = engine("t4rew", w.clone());
+    launch(
+        &e,
+        "rew",
+        HumanConfirm::None,
+        plan(json!({"steps": [
+            {"catalog": "produce"},
+            {"catalog": "critique", "gate": {"human_confirm": {"unconditional": false}}},
+            {"catalog": "understand", "id": "wrapup"}],
+            "touch": ["README.md"]})),
+    );
+    // The def gate after the review: send it back to the creator.
+    e.wait_awaiting("rew", "def", 1);
+    e.core
+        .confirm_gate(
+            "rew",
+            HumanDecision::RequestChanges {
+                note: Some("cover the edge case".into()),
+            },
+        )
+        .unwrap();
+    e.wait_awaiting("rew", crate::plan_gate::GATE_KIND, 1);
+    e.core.confirm_gate("rew", approve()).unwrap();
+    wait_for("the review to re-dispatch", || {
+        e.worker
+            .calls()
+            .iter()
+            .filter(|c| c.2 == "rew:critique")
+            .count()
+            == 2
+    });
+    let calls = e.worker.calls();
+    let reviews: Vec<u32> = calls
+        .iter()
+        .filter(|c| c.2 == "rew:critique")
+        .map(|c| c.1)
+        .collect();
+    assert_eq!(
+        reviews,
+        [0, 1],
+        "the review re-runs at attempt 1: {calls:?}"
+    );
+    release_all(&w);
+}
+
+// ── MEDIUM-3: a revision that cannot be planned changes nothing ─────────────────────────────────
+
+/// The PA adds a Tool step whose binary does not exist: planning refuses it. The run keeps its
+/// accepted rev and its floor (nothing persisted ahead of the units), says why, and goes on.
+#[test]
+fn t4_medium3_a_revision_that_cannot_be_planned_leaves_the_plan_as_it_was() {
+    let w = Worker::new(
+        &pa_output(
+            r#"PLAN+ {"steps":[{"catalog":"run","id":"run","executor":{"type":"tool","cmd":["wicked-t4-no-such-binary"]}}]}"#,
+        ),
+        None,
+    );
+    let e = engine("t4plan", w.clone());
+    launch(
+        &e,
+        "pln",
+        HumanConfirm::None,
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
+    );
+    wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
+    let v = view(&e, "pln");
+    let tp = v.session.team_plan.as_ref().unwrap();
+    assert_eq!(
+        (tp.rev, tp.accepted_rev),
+        (1, 1),
+        "no rev persisted ahead of its units"
+    );
+    assert_eq!(v.units.len(), 2);
+    assert_eq!(e.worker.calls()[1].2, "pln:critique");
+    assert!(payloads(&e, "pln", tev::PLAN_ACCEPTED)
+        .iter()
+        .all(|p| p["plan_rev"] == 1));
     release_all(&w);
 }
 
