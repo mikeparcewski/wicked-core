@@ -1397,6 +1397,8 @@ fn an_accepted_edit_applies_only_after_its_gate_decided_lands() {
     wait_for("plan.accepted", || {
         rig.types("r9h").contains(&tev::PLAN_ACCEPTED.to_string())
     });
+    // (round 10, LOW 8) The released run says it resumed — once.
+    assert_eq!(resumed(&drain_events(&e), "r9h"), 1);
     let mut want = launch_facts();
     want.extend(
         [
@@ -1597,4 +1599,161 @@ fn a_refused_edit_reopens_only_after_its_gate_decided_lands() {
     );
     assert_eq!(plan_revs(&e, "r9r"), (1, 0));
     assert_eq!(unit_ids(&e, "r9r"), HELD_UNITS);
+}
+
+// ── T3 round 10 (independent review of #622 @ 55b18f8) ───────────────────────────────────────────
+
+fn try_launch_plan(
+    e: &Engine,
+    run: &str,
+    body: serde_json::Value,
+    human_confirm: HumanConfirm,
+    deliver_step: Option<crate::PlanStep>,
+) -> anyhow::Result<String> {
+    e.core.launch_run(LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "add SSO login".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: crate::EntityMode::Shared,
+        session_id: run.into(),
+        human_confirm,
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: None,
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+        plan: Some(steps(body)),
+        deliver_step,
+    })
+}
+
+fn runs(e: &Engine) -> usize {
+    e.runner.0.load(AtomicOrdering::SeqCst)
+}
+
+fn plan_gate_kind() -> Vec<String> {
+    vec![crate::plan_gate::GATE_KIND.to_string()]
+}
+
+/// HIGH 1: an auto-mode plan whose only step is a `review` authored `executes_code: true` is a
+/// creator plan — it scores 100 (no declared scope), is high risk and pauses `plan_approval`
+/// before its unit runs (the unit is unguarded, so it would write the tree unapproved).
+#[test]
+fn an_auto_plan_whose_review_step_executes_code_pauses_for_approval() {
+    let rig = rig("r10cr");
+    let e = engine(&rig, fast(&rig));
+    try_launch_plan(
+        &e,
+        "r10c",
+        serde_json::json!({"steps": [{"catalog": "review", "id": "check", "executes_code": true}]}),
+        HumanConfirm::None,
+        None,
+    )
+    .expect("launch");
+    wait_for("the plan_approval gate", || {
+        open_gate_kinds(&e.db, "r10c") == plan_gate_kind()
+    });
+    assert_eq!(runs(&e), 0);
+}
+
+/// Routing: a run holding a plan whose gate row is already answered (the row answered, nothing
+/// else) → the next answer is still the PLAN gate's: the gate is re-opened and answered through
+/// the plan arm — `gate.decided`, the accepted rev, then
+/// `plan.accepted` before the cursor unit dispatches. Never the generic arm running unit 1 with
+/// no accepted rev.
+#[test]
+fn a_held_plan_whose_row_is_already_answered_is_answered_through_the_plan_arm() {
+    let rig = rig("r10ans");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "r10a");
+    let db = e.db.clone();
+    drop(e);
+    let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
+    crate::interaction::resolve_open_for_session(
+        &mut store,
+        "r10a",
+        crate::interaction::InteractionStatus::Answered,
+        Some(r#"{"approve":true,"action":"approve","amend":null}"#.to_string()),
+        crate::interaction::now_millis(),
+    )
+    .unwrap();
+    drop(store);
+    std::thread::sleep(Duration::from_millis(300));
+    let e = engine_on(&db, fast(&rig));
+    let _ = e.core.confirm_gate("r10a", approve(None));
+    wait_for("plan.accepted", || {
+        rig.types("r10a").contains(&tev::PLAN_ACCEPTED.to_string())
+    });
+    wait_for("the first dispatch", || runs(&e) >= 1);
+    assert_eq!(plan_revs(&e, "r10a"), (1, 1));
+    let types = rig.types("r10a");
+    let decided = types
+        .iter()
+        .position(|t| t == tev::GATE_DECIDED)
+        .expect("gate.decided");
+    let accepted = types.iter().position(|t| t == tev::PLAN_ACCEPTED).unwrap();
+    assert!(decided < accepted, "{types:?}");
+}
+
+/// The dispatch guard: a reassign while the run is Executing with its plan still held (its
+/// `path.started` in flight) dispatches nothing — refused, and the run is not failed.
+#[test]
+fn a_reassign_while_the_plan_is_held_dispatches_nothing() {
+    let rig = rig("r10rs");
+    rig.refuse(&[tev::PATH_STARTED]);
+    let e = engine(&rig, holding(&rig));
+    try_launch_plan(
+        &e,
+        "r10r",
+        serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]}),
+        HumanConfirm::None,
+        None,
+    )
+    .expect("launch");
+    wait_for("path.started in flight", || {
+        e.core
+            .run_team("r10r")
+            .ok()
+            .flatten()
+            .and_then(|v| v.pending)
+            .as_deref()
+            == Some(tev::PATH_STARTED)
+    });
+    assert_eq!(status(&e, "r10r"), Some(SessionStatus::Executing));
+    assert!(e.core.reassign_unit("r10r", 1, Some("b".into())).is_err());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(runs(&e), 0);
+    assert_eq!(status(&e, "r10r"), Some(SessionStatus::Executing));
+}
+
+/// MEDIUM 5: a manual plan whose released unit IS the deliver unit still stops at the deliver
+/// gate (`auto_deliver: false`) — the plan approval never answers the push.
+#[test]
+fn a_released_deliver_unit_still_stops_at_its_deliver_gate() {
+    let rig = rig("r10dl");
+    let e = engine(&rig, fast(&rig));
+    let deliver: crate::PlanStep = serde_json::from_value(serde_json::json!({
+        "catalog": "deliver", "id": "deliver", "instructions": "push and open the PR",
+        "executor": {"type": "tool", "cmd": ["true"]}
+    }))
+    .unwrap();
+    try_launch_plan(
+        &e,
+        "r10d",
+        serde_json::json!({"steps": []}),
+        HumanConfirm::All,
+        Some(deliver),
+    )
+    .expect("launch");
+    wait_for("the plan_approval gate", || {
+        open_gate_kinds(&e.db, "r10d") == plan_gate_kind()
+    });
+    assert_eq!(unit_ids(&e, "r10d"), ["deliver"]);
+    e.core.confirm_gate("r10d", approve(None)).unwrap();
+    wait_for("the deliver gate", || {
+        open_gate_kinds(&e.db, "r10d") == vec!["deliver".to_string()]
+    });
+    assert_eq!(status(&e, "r10d"), Some(SessionStatus::AwaitingHuman));
 }
