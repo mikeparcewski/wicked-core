@@ -929,6 +929,33 @@ mod deliverables_tests {
         let _ = std::fs::remove_dir_all(&inbox);
     }
 
+    /// (codex on #636) A relative deliverable that is a SYMLINK out of the base it resolved
+    /// against is not this run's evidence: a worker can `ln -s /etc/hosts draft.html` from a
+    /// shell, and following it would count bytes the run never wrote. The same containment rule
+    /// the absolute branch applies. A symlink that stays inside its base still counts.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_deliverable_symlinked_out_of_its_base_is_missing() {
+        let inbox = tmp("link-inbox");
+        let sandbox = tmp("link-sandbox");
+        let outside = tmp("link-outside");
+        std::fs::write(outside.join("hosts"), "127.0.0.1 localhost").unwrap();
+        std::os::unix::fs::symlink(outside.join("hosts"), inbox.join("draft.html")).unwrap();
+        assert!(
+            missing_deliverables(&["draft.html".into()], &sandbox, &[s(&inbox)]).is_some(),
+            "a symlink to bytes outside the declared root is not a produced deliverable"
+        );
+        std::fs::write(inbox.join("real.html"), "<p>x</p>").unwrap();
+        std::os::unix::fs::symlink(inbox.join("real.html"), inbox.join("alias.html")).unwrap();
+        assert!(
+            missing_deliverables(&["alias.html".into()], &sandbox, &[s(&inbox)]).is_none(),
+            "a symlink that stays inside the root still counts"
+        );
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     /// Whitespace-only entries are not declarations — they are formatting, and must not be
     /// reported as a missing artifact named "  ".
     #[test]
