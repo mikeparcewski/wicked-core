@@ -1654,9 +1654,12 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
     let amended = seq.iter().position(|t| t == "unitReworkAmended").unwrap();
     let redispatch = seq.iter().position(|t| t == "unitDispatched:1").unwrap();
     assert!(amended < redispatch, "{seq:?}");
-    assert!(payloads(&rig, "t616k", tev::GATE_DECIDED)
-        .iter()
-        .any(|p| p["kind"] == "team_dispute" && p["decision"] == "human_amended"));
+    // Fire-and-forget facts can land just after the status the test waited on.
+    wait_for("tev::GATE_DECIDED on t616k", || {
+        payloads(&rig, "t616k", tev::GATE_DECIDED)
+            .iter()
+            .any(|p| p["kind"] == "team_dispute" && p["decision"] == "human_amended")
+    });
 }
 
 /// DES-002 §4.1: the human's `team_dispute` answer is a REQUIRED fact. With the bus refusing
@@ -2092,9 +2095,12 @@ fn t6_h_no_council_verdict_pauses_team_dispute() {
     );
     launch_member_run(&e, "t6h3");
     wait_status(&e, "t6h3", SessionStatus::AwaitingHuman);
-    assert!(payloads(&rig, "t6h3", tev::GATE_OPENED)
-        .iter()
-        .any(|p| p["kind"] == "team_dispute"));
+    // Fire-and-forget facts can land just after the status the test waited on.
+    wait_for("tev::GATE_OPENED on t6h3", || {
+        payloads(&rig, "t6h3", tev::GATE_OPENED)
+            .iter()
+            .any(|p| p["kind"] == "team_dispute")
+    });
     e.core.confirm_gate("t6h3", approve(None)).unwrap();
     wait_status(&e, "t6h3", SessionStatus::Completed);
     assert_eq!(
