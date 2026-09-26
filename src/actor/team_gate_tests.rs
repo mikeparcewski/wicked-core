@@ -2650,8 +2650,11 @@ fn t6_d2_a_pa_review_that_writes_the_tree_is_restored_and_disputed_never_accepte
         !wd.join("pa-edit.txt").exists(),
         "the PA's new file was removed"
     );
+    // Line endings as git checked the file out (CRLF under Windows `core.autocrlf`).
     assert_eq!(
-        std::fs::read_to_string(wd.join("src/lib.rs")).unwrap(),
+        std::fs::read_to_string(wd.join("src/lib.rs"))
+            .unwrap()
+            .replace("\r\n", "\n"),
         "fn a() {}\n",
         "the PA's edit was reverted"
     );
