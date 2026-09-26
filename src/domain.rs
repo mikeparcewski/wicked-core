@@ -313,17 +313,63 @@ pub enum TeamBlocked {
     Cancel,
 }
 
-/// A unit's team snapshot (DES-TEAMING-002 §4.8 rows 1/5/6): what the unit's team record is,
-/// stamped by the actor at dispatch from the run's state — never read from the worker. P1 stamps
-/// the un-teamed snapshot (`transport: none`); the worker-built ledger joins it in T5.
+/// A unit's team snapshot (DES-TEAMING-002 §4.4, §4.8 rows 1/5/6/7, §8.11): what the unit's team
+/// record is. The actor STAMPS it at dispatch from the run's persisted state (transport, and for a
+/// teamed attempt the run's `stream_floor`); the worker thread FILLS the attempt's ledger and
+/// transcript (T5); the actor MERGES the two when it applies the step result
+/// ([`crate::team::runner::merge_snapshot`]): the worker may only ever downgrade the transport
+/// (a failed `step.claimed`), never upgrade it, and a teamed attempt whose worker returned no
+/// ledger folds as a `stream_gap` ledger, which pauses (fail closed).
+///
+/// The persisted snapshot IS the durable evidence of what the gate read (`UnitEvidence.team`):
+/// the bus rows age out, this does not (§4.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitTeamSnapshot {
     pub transport: crate::team::events::Transport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// `no_bus` when the daemon had no bus; unset otherwise.
+    /// `no_bus` when the daemon had no bus; `folded` / `synthesized` once the attempt's ledger is
+    /// in (T5); unset before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger_source: Option<crate::team::events::LedgerSource>,
+    /// (T5) The run's acknowledged `path.started` event id, stamped at dispatch for a teamed
+    /// attempt: the step-boundary injector's floor (§4.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_floor: Option<i64>,
+    /// (T5) The attempt's `step.claimed` event id: the attempt's own floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_event_id: Option<i64>,
+    /// (T5) The S row the gate used (`"ledger.folded#<ord>:<attempt>"`); `None` for a synthesized
+    /// or local snapshot — consumers then read [`Self::ledger`] (§6 `gate.opened.ledger_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_ref: Option<String>,
+    /// (T5) The attempt's ledger: S's fold, the worker's fail-closed synthesis, or the local empty
+    /// ledger of an un-teamed unit. `teamPause` is recomputed on every parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<crate::team::TeamLedger>,
+    /// (T5) The attempt's transcript: every team row of the attempt, capped (§6 `ledger.folded`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<crate::team::events::Transcript>,
+}
+
+impl UnitTeamSnapshot {
+    /// A snapshot carrying only its transport facts (what the actor stamps at dispatch).
+    pub fn stamped(
+        transport: crate::team::events::Transport,
+        reason: Option<String>,
+        ledger_source: Option<crate::team::events::LedgerSource>,
+    ) -> Self {
+        Self {
+            transport,
+            reason,
+            ledger_source,
+            stream_floor: None,
+            claimed_event_id: None,
+            ledger_ref: None,
+            ledger: None,
+            transcript: None,
+        }
+    }
 }
 
 /// One seat benched for a run ([`AgentSession::benched_seats`], F-7R2-006).

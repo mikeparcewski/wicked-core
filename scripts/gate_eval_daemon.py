@@ -35,13 +35,74 @@ EVAL_TIMEOUT_S = 90.0
 MAX_IDLE_S = 600.0
 MAX_WORK_CHARS = 32_000  # truncate oversized work to avoid prompt limits
 
+# The one seat this daemon judges with (`claude -p`). Reported as `judge_cli` on every verdict
+# so core can verify monitor exclusion (DES-TEAMING-001 §6.2, DES-TEAMING-002 T5).
+JUDGE_CLI = "claude"
+
 
 def _eval_response_key(eval_id: str) -> str:
     return hashlib.sha256(f"gate-eval-resp:{eval_id}".encode()).hexdigest()[:32]
 
 
-def _emit_response(bus_db: str, eval_id: str, pass_: bool, reasoning: str) -> None:
-    payload = json.dumps({"eval_id": eval_id, "pass": pass_, "reasoning": reasoning})
+def _seat_key(seat: str) -> str:
+    """The cli key of a seat instance (`claude#2` -> `claude`)."""
+    return seat.split("#", 1)[0]
+
+
+def _exclusion_set(payload: dict) -> "list[str] | None":
+    """The seats this request bars from judging: `work_author ∪ excluded_seats` (DES-TEAMING-001
+    §6.2, core#625). `None` when the work author is missing: nothing can prove the judge is not
+    the author, so every seat is barred (maximum exclusion, fail-closed)."""
+    author = str(payload.get("work_author") or "").strip()
+    if not author:
+        return None
+    return [author] + [str(s) for s in (payload.get("excluded_seats") or [])]
+
+
+def _judge_excluded(payload: dict, judge: str = JUDGE_CLI) -> bool:
+    """Whether the request bars this daemon's only judge seat, by instance or cli key. The daemon
+    must select no seat in `work_author ∪ excluded_seats`; with one seat it then has none, so it
+    refuses without a model call and core folds the refusal as a DENY."""
+    barred = _exclusion_set(payload)
+    if barred is None:
+        return True
+    return any(s == judge or _seat_key(s) == judge for s in barred)
+
+
+def _refusal(payload: dict, judge: str = JUDGE_CLI) -> str:
+    """The named reason for a refused request (see `_judge_excluded`)."""
+    barred = _exclusion_set(payload)
+    if barred is None:
+        return (
+            "gate-eval daemon: the request names no work author, so no judge seat is provably "
+            "distinct from it (fail-closed)"
+        )
+    if barred[0] == judge or _seat_key(barred[0]) == judge:
+        return (
+            f"gate-eval daemon: its only judge seat ({judge}) is the work author "
+            f"({barred[0]}); a creator never grades its own work (fail-closed)"
+        )
+    return (
+        f"gate-eval daemon: its only judge seat ({judge}) is excluded by excluded_seats "
+        f"{payload.get('excluded_seats')} (fail-closed)"
+    )
+
+
+def _handle(payload: dict) -> "tuple[bool, str, str | None]":
+    """Judge one request: `(pass, reasoning, judge_cli)`. An excluded judge seat is refused with a
+    named reason and NO model call, naming no judge (core treats that as a DENY)."""
+    if _judge_excluded(payload):
+        return False, _refusal(payload), None
+    pass_, reasoning = _evaluate(payload.get("criterion", ""), payload.get("work", ""))
+    return pass_, reasoning, JUDGE_CLI
+
+
+def _emit_response(
+    bus_db: str, eval_id: str, pass_: bool, reasoning: str, judge_cli: "str | None" = None
+) -> None:
+    payload = json.dumps(
+        {"eval_id": eval_id, "pass": pass_, "reasoning": reasoning, "judge_cli": judge_cli}
+    )
     key = _eval_response_key(eval_id)
     now_ms = int(time.time() * 1000)
     ttl_ms = now_ms + 72 * 3_600_000
@@ -192,8 +253,6 @@ def run(bus_db: str, once: bool = False) -> None:
             if eval_id in processed:
                 continue
 
-            criterion = payload.get("criterion", "")
-            work = payload.get("work", "")
             run_id = payload.get("run_id", "?")
             unit_ix = payload.get("unit_ix", "?")
 
@@ -202,7 +261,7 @@ def run(bus_db: str, once: bool = False) -> None:
                 f"(run={run_id} unit={unit_ix})",
                 flush=True,
             )
-            pass_, reasoning = _evaluate(criterion, work)
+            pass_, reasoning, judge_cli = _handle(payload)
             verdict_str = "PASS" if pass_ else "REJECT"
             print(
                 f"[gate-eval-daemon] verdict={verdict_str} reasoning={reasoning[:100]!r}",
@@ -210,7 +269,7 @@ def run(bus_db: str, once: bool = False) -> None:
             )
 
             try:
-                _emit_response(bus_db, eval_id, pass_, reasoning)
+                _emit_response(bus_db, eval_id, pass_, reasoning, judge_cli)
             except Exception as exc:
                 print(f"[gate-eval-daemon] emit error: {exc}", file=sys.stderr, flush=True)
 

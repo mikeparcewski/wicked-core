@@ -283,8 +283,15 @@ fn of_type(seen: &[CoreEvent], run: &str, ty: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The run's plan and gate facts in order. The worker-thread facts T5 publishes once a unit runs
+/// (`step.claimed` / `step.completed`) are left out: these tests pin the plan pipeline's order,
+/// and a step fact's position against it depends on the worker's timing.
 fn fact_types(seen: &[CoreEvent], run: &str) -> Vec<String> {
-    facts(seen, run).into_iter().map(|(t, _, _)| t).collect()
+    facts(seen, run)
+        .into_iter()
+        .map(|(t, _, _)| t)
+        .filter(|t| !t.starts_with("wicked.team.step."))
+        .collect()
 }
 
 const STARTED: &str = "wicked.team.path.started";

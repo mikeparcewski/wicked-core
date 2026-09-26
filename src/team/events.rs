@@ -879,7 +879,7 @@ pub struct CouncilRuled {
     pub seated: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptRow {
     pub event_id: i64,
     pub event_type: String,
@@ -888,7 +888,7 @@ pub struct TranscriptRow {
 
 /// `count` is the attempt's row count: computed as `events.len()` at parse unless `truncated`
 /// (then it is the uncapped total, a fact the capped list cannot give).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "TranscriptWire")]
 pub struct Transcript {
     pub from_event_id: i64,

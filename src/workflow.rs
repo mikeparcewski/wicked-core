@@ -299,6 +299,13 @@ pub struct UnitEvidence {
     /// run (`source: "judge"`) under its own reason. Additive: absent on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judge_refusals: Vec<JudgeRefusal>,
+    /// (DES-TEAMING-002 T5, §8.11) A team unit's attempt snapshot as the worker thread built it:
+    /// S's folded ledger, the worker's fail-closed synthesis on the final-pass timeout, or the
+    /// local un-teamed snapshot. The actor merges it with its dispatch stamp
+    /// ([`crate::team::runner::merge_snapshot`]) — a teamed stamp with no snapshot here folds as
+    /// `stream_gap` (pauses). `None` for a non-team unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::domain::UnitTeamSnapshot>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation

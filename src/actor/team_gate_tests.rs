@@ -77,11 +77,15 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-/// A fast bound: 3 retries 40 ms apart, 30 ms per bus write.
+/// A fast bound: 3 retries 40 ms apart, 30 ms per bus write, a 300 ms final-pass budget.
 fn fast(rig: &Rig) -> TeamConfig {
     TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
         .with_schedule(vec![Duration::from_millis(40); 3])
         .with_attempt_wait(Duration::from_millis(30))
+        // T5: a teamed unit's worker waits for S's `ledger.folded`; with no supervisor on the
+        // bus in these fixtures it synthesizes after this budget (an empty ledger: no pause).
+        .with_final_pass_budget(Duration::from_millis(300))
+        .with_gate_poll(Duration::from_millis(20))
 }
 
 struct Engine {
@@ -344,15 +348,32 @@ fn row2_plan_accepted_fails_past_the_bound_the_run_pauses_team_transport() {
     wait_for("path.ended", || {
         rig.types("row2").last().map(String::as_str) == Some(tev::PATH_ENDED)
     });
+    // The engine's facts in FIFO order (the team_transport gate, then T5's unit-review gate of
+    // each unit); each unit's own R facts (T5) ride the attempt's lane beside them.
+    let types = rig.types("row2");
+    let engine_facts: Vec<&str> = types
+        .iter()
+        .map(String::as_str)
+        .filter(|t| *t != tev::STEP_CLAIMED && *t != tev::STEP_COMPLETED)
+        .collect();
     assert_eq!(
-        rig.types("row2"),
+        engine_facts,
         vec![
             tev::PATH_STARTED,
             tev::PLAN_ACCEPTED,
             tev::GATE_OPENED,
             tev::GATE_DECIDED,
+            tev::GATE_OPENED,
+            tev::GATE_DECIDED,
+            tev::GATE_OPENED,
+            tev::GATE_DECIDED,
             tev::PATH_ENDED
         ]
+    );
+    assert_eq!(
+        types.iter().filter(|t| *t == tev::STEP_CLAIMED).count(),
+        2,
+        "one step.claimed per unit: {types:?}"
     );
     assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(e.core.run_team("row2").unwrap().unwrap().transport, "bus");
@@ -504,6 +525,7 @@ fn row6_bus_absent_at_boot_the_run_is_unteamed_and_nothing_spools() {
 fn crashed_mid_path_started(rig: &Rig, run: &str) -> String {
     rig.refuse(&[]);
     let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_secs(600)])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(rig, slow);
@@ -563,6 +585,7 @@ fn p1_f_crash_before_the_tombstone_boot_writes_it_first() {
 fn p1_c_the_actor_answers_while_the_bus_is_locked() {
     let rig = rig("c");
     let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_millis(300); 4])
         .with_attempt_wait(Duration::from_millis(250));
     // Held for at least twice the bound AND until the run has fallen back (so the lock outlives
@@ -623,6 +646,7 @@ fn a_run_cancelled_while_its_fact_is_in_flight_dispatches_nothing() {
     let rig = rig("cancelled");
     rig.refuse(&[]);
     let cfg = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_millis(200); 3])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(&rig, cfg);
@@ -768,6 +792,7 @@ fn boot_reopens_a_publishing_fact_as_a_transport_gate_the_team_handler_answers()
     let rig = rig("bootp");
     rig.refuse(&[tev::PLAN_ACCEPTED]);
     let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_secs(600)])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(&rig, slow);
@@ -854,6 +879,7 @@ fn boot_ends_a_teamed_terminal_run(name: &str, status: SessionStatus, want: &str
     rig.refuse(&[tev::PATH_ENDED]);
     // A retry schedule this engine never reaches: its publisher cannot land path.ended later.
     let slow = TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300))
         .with_schedule(vec![Duration::from_secs(600)])
         .with_attempt_wait(Duration::from_millis(30));
     let e = engine(&rig, slow);
@@ -1177,6 +1203,250 @@ fn bus_restart_leaves_a_live_teamed_run_live() {
     assert_eq!(view.pending, None);
     assert_eq!(e.core.live_team_runs().unwrap().len(), 1);
     assert!(!outbox_has_run_tombstone(&rig, "lt-b"));
+}
+
+// ── DES-TEAMING-002 T5 through the real engine ───────────────────────────────────────────────────
+
+/// A worker seat that, on the run's FIRST unit, plays the supervisor raising one HIGH on the
+/// attempt during its turn (a `finding.raised` row, S) — and nothing answers it.
+struct RaisingRunner {
+    bus: crate::team::publish::TeamBus,
+    /// The unit whose turn raises the finding.
+    on_ix: usize,
+}
+impl StepRunner for RaisingRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        if i.unit_ix == self.on_ix {
+            let f =
+                crate::team::publish::tests::fixture_with(tev::FINDING_RAISED, 0, &i.run_id, |p| {
+                    p["ord"] = serde_json::json!(i.unit.ord);
+                    p["attempt"] = serde_json::json!(i.attempt);
+                    p["raise_seq"] = serde_json::json!(1);
+                });
+            self.bus.publish(&f).expect("the finding is on the bus");
+        }
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "done".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+fn engine_running(rig: &Rig, cfg: TeamConfig, worker: Arc<dyn StepRunner>) -> Engine {
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let core = Core::spawn_with_engine_team(db.clone(), Arc::new(StubDispatcher), worker, cfg);
+    let events = core.subscribe();
+    core.ping();
+    Engine {
+        core,
+        runner: Arc::new(CountingRunner::default()),
+        events,
+        db,
+    }
+}
+
+/// The payloads of every `event_type` row of `run`.
+fn payloads(rig: &Rig, run: &str, event_type: &str) -> Vec<serde_json::Value> {
+    let db = crate::bus::BusDb::shared(&rig.bus).unwrap();
+    db.poll(event_type, 0, 10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.payload["run_id"] == run)
+        .map(|e| e.payload)
+        .collect()
+}
+
+/// T5 (c), engine half: no `ledger.folded` arrives within the (shortened) budget. The worker's
+/// synthesized `timed_out` snapshot rides `ApplyStepResult`; the engine publishes
+/// `gate.opened{kind:"unit_review", ledger_ref:null, ledger_source:"synthesized"}`, and — the
+/// gate having approved the work with an unresolved HIGH in the ledger — the run pauses
+/// `team_dispute` (no unattended continue). Nothing publishes `ledger.folded` but S: a LATE
+/// fold from S lands on the bus and changes nothing already decided. Approve then continues.
+#[test]
+fn t5_c_final_pass_timeout_pauses_team_dispute_and_a_late_fold_changes_nothing() {
+    let rig = rig("t5c-engine");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 0,
+        }),
+    );
+    launch_team(&e, "t5c");
+    wait_status(&e, "t5c", SessionStatus::AwaitingHuman);
+    let evs = drain_events(&e);
+    assert_eq!(
+        awaiting_kinds(&evs, "t5c"),
+        vec!["team_dispute".to_string()]
+    );
+    assert!(
+        payloads(&rig, "t5c", tev::LEDGER_FOLDED).is_empty(),
+        "the worker never publishes ledger.folded"
+    );
+    // The engine's gate facts are fire-and-forget through the publisher thread: the durable
+    // pause can be on record before its rows are on the bus, so wait (bounded) for them.
+    wait_for(
+        "the unit-review decision and the team_dispute gate on the bus",
+        || {
+            payloads(&rig, "t5c", tev::GATE_OPENED)
+                .iter()
+                .any(|p| p["kind"] == "team_dispute")
+                && payloads(&rig, "t5c", tev::GATE_DECIDED)
+                    .iter()
+                    .any(|p| p["kind"] == "unit_review")
+        },
+    );
+    let opened = payloads(&rig, "t5c", tev::GATE_OPENED);
+    let review: Vec<_> = opened
+        .iter()
+        .filter(|p| p["kind"] == "unit_review")
+        .collect();
+    assert_eq!(review.len(), 1, "{opened:?}");
+    assert_eq!(review[0]["ledger_ref"], serde_json::Value::Null);
+    assert_eq!(review[0]["ledger_source"], "synthesized");
+    let dispute: Vec<_> = opened
+        .iter()
+        .filter(|p| p["kind"] == "team_dispute")
+        .collect();
+    assert_eq!(dispute.len(), 1, "{opened:?}");
+    assert_eq!(dispute[0]["finding_ids"].as_array().unwrap().len(), 1);
+    let decided = payloads(&rig, "t5c", tev::GATE_DECIDED);
+    assert!(
+        decided
+            .iter()
+            .any(|p| p["kind"] == "unit_review" && p["decision"] == "paused"),
+        "{decided:?}"
+    );
+    let unit0 = || e.core.run_team("t5c").unwrap().unwrap().units[0].clone();
+    let before = unit0();
+    assert_eq!(before.transport.as_deref(), Some("bus"));
+    assert_eq!(before.ledger_source.as_deref(), Some("synthesized"));
+    assert_eq!(before.final_pass.as_deref(), Some("timed_out"));
+    assert_eq!(before.team_pause, Some(true));
+    assert_eq!(before.findings, Some(1));
+
+    // S's late fold for the same attempt: published by S alone, read by no one.
+    let first = payloads(&rig, "t5c", tev::STEP_COMPLETED)[0].clone();
+    let late = crate::team::publish::tests::fixture_with(tev::LEDGER_FOLDED, 0, "t5c", |p| {
+        p["ord"] = first["ord"].clone();
+        p["attempt"] = first["attempt"].clone();
+    });
+    rig.team_bus().publish(&late).unwrap();
+    e.core.ping();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(status(&e, "t5c"), Some(SessionStatus::AwaitingHuman));
+    assert_eq!(
+        unit0(),
+        before,
+        "a late fold changes nothing already decided"
+    );
+    assert_eq!(
+        payloads(&rig, "t5c", tev::GATE_OPENED)
+            .iter()
+            .filter(|p| p["kind"] == "unit_review")
+            .count(),
+        1
+    );
+
+    // The human decides: approve continues at the cursor.
+    e.core.confirm_gate("t5c", approve(None)).unwrap();
+    wait_status(&e, "t5c", SessionStatus::Completed);
+}
+
+/// T5 (c) on the run's LAST unit: the `team_dispute` pause holds the run before it can finalize
+/// (`Completed` is never reached unattended); reject cancels, and the unit's work stays on record.
+#[test]
+fn t5_c_a_dispute_on_the_last_unit_holds_the_run_before_it_completes() {
+    let rig = rig("t5c-last");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 1,
+        }),
+    );
+    launch_team(&e, "t5cl");
+    wait_status(&e, "t5cl", SessionStatus::AwaitingHuman);
+    assert_eq!(
+        awaiting_kinds(&drain_events(&e), "t5cl"),
+        vec!["team_dispute".to_string()]
+    );
+    let view = e.core.run_team("t5cl").unwrap().unwrap();
+    assert_eq!(view.units[0].team_pause, Some(false), "{view:?}");
+    assert_eq!(view.units[1].team_pause, Some(true), "{view:?}");
+    assert_eq!(
+        e.core.confirm_gate("t5cl", HumanDecision::Reject).unwrap(),
+        SessionStatus::Cancelled
+    );
+}
+
+/// T5 (e): under `spawn_with_engine` with NO bus, the team unit produces no team rows and its
+/// `UnitEvidence.team` — persisted on the unit — is the local snapshot: `transport: none`,
+/// `no_bus`, an empty ledger.
+#[test]
+fn t5_e_no_bus_every_unit_holds_the_local_snapshot_and_nothing_is_published() {
+    let rig = rig("t5e-engine");
+    let cfg = TeamConfig::new(None, Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300));
+    let e = engine_running(&rig, cfg, Arc::new(CountingRunner::default()));
+    launch_team(&e, "t5e");
+    wait_status(&e, "t5e", SessionStatus::Completed);
+    let view = e.core.run_team("t5e").unwrap().unwrap();
+    assert_eq!(view.transport, "none");
+    assert_eq!(view.units.len(), 2);
+    for u in &view.units {
+        assert_eq!(u.transport.as_deref(), Some("none"), "{u:?}");
+        assert_eq!(u.ledger_source.as_deref(), Some("no_bus"), "{u:?}");
+        assert_eq!(u.findings, Some(0), "an empty ledger: {u:?}");
+        assert_eq!(u.team_pause, Some(false), "{u:?}");
+    }
+    assert!(rig.types("t5e").is_empty(), "no team rows");
+    assert!(
+        rig.outbox_lines().is_empty(),
+        "nothing spooled without a bus"
+    );
+}
+
+/// §4.8 row 5 through the engine: every `step.claimed` fails past the bound → each attempt is
+/// tombstoned, runs un-teamed with the reason in its snapshot, and publishes nothing — no
+/// `step.claimed`, no `step.completed`, no unit-review gate — ever, even after a replay.
+#[test]
+fn t5_row5_a_failed_step_claimed_unteams_the_attempt_through_the_engine() {
+    let rig = rig("t5r5-engine");
+    rig.refuse(&[tev::STEP_CLAIMED]);
+    let e = engine(&rig, fast(&rig));
+    launch_team(&e, "t5r5");
+    wait_status(&e, "t5r5", SessionStatus::Completed);
+    let view = e.core.run_team("t5r5").unwrap().unwrap();
+    assert_eq!(
+        view.transport, "bus",
+        "the RUN stays teamed; the attempts are not"
+    );
+    for u in &view.units {
+        assert_eq!(u.transport.as_deref(), Some("none"), "{u:?}");
+        assert!(
+            u.reason
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("un-teamed attempt"),
+            "{u:?}"
+        );
+    }
+    rig.allow();
+    e.core.replay_team_outbox().unwrap();
+    let types = rig.types("t5r5");
+    for t in [tev::STEP_CLAIMED, tev::STEP_COMPLETED, tev::GATE_OPENED] {
+        assert!(!types.iter().any(|x| x == t), "{t} published: {types:?}");
+    }
 }
 
 /// T3 (codex round 7): a team run launched on a bare composed def (no plan, no preset) says so:
