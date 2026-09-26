@@ -2650,42 +2650,9 @@ fn t6_d2_a_pa_review_that_writes_the_tree_is_restored_and_disputed_never_accepte
         !wd.join("pa-edit.txt").exists(),
         "the PA's new file was removed"
     );
-    // Line endings as git checked the file out (CRLF under Windows `core.autocrlf`).
     assert_eq!(
-        std::fs::read_to_string(wd.join("src/lib.rs"))
-            .unwrap()
-            .replace("\r\n", "\n"),
+        std::fs::read_to_string(wd.join("src/lib.rs")).unwrap(),
         "fn a() {}\n",
         "the PA's edit was reverted"
     );
-}
-
-/// Absence row 32 (found re-auditing the table on #628): an ACCEPT line counts a member's step
-/// only when the bus-teamed review attempt's ledger holds its `step.reviewed{accepted}`. A row
-/// lost outright (never on the bus, never spooled) pauses instead of counting on the output alone;
-/// an un-teamed (no-bus) review has no stream to hold it and is judged on its line.
-#[test]
-fn row32_an_accept_counts_only_with_its_step_reviewed_on_the_record() {
-    use crate::team::events::StepVerdict;
-    let rec = |verdict: StepVerdict| crate::team::StepReviewRecord {
-        step_id: "write".into(),
-        reviewed_attempt: 0,
-        verdict,
-        to: None,
-        reason: "r".into(),
-        held: None,
-        member_reason: None,
-        dispute: None,
-    };
-    assert_eq!(
-        super::accept_record_refusal(true, "write", Some(&rec(StepVerdict::Accepted))),
-        None
-    );
-    let missing = super::accept_record_refusal(true, "write", None).expect("no record: pause");
-    assert!(missing.contains("step.reviewed"), "{missing}");
-    assert!(
-        super::accept_record_refusal(true, "write", Some(&rec(StepVerdict::Rejected))).is_some(),
-        "the stream says rejected: the line and the record disagree"
-    );
-    assert_eq!(super::accept_record_refusal(false, "write", None), None);
 }

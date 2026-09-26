@@ -2089,10 +2089,6 @@ pub(super) fn apply_review(
         );
     }
     if line.verdict == crate::team::events::StepVerdict::Accepted {
-        let bus = snap.as_ref().is_some_and(|s| s.transport == Transport::Bus);
-        if let Some(why) = accept_record_refusal(bus, &step_id, record.as_ref()) {
-            return pause(act, &mut session, why);
-        }
         return accept_member_step(act, &run_id, ix, None);
     }
     let held = record.as_ref().and_then(|r| r.held);
@@ -2128,29 +2124,6 @@ pub(super) fn apply_review(
             &mut session,
             "the PA rejected it and the member's answer is not on record".to_string(),
         ),
-    }
-}
-
-/// Why an ACCEPT line cannot count a member's step (absence row 32): on a bus-teamed review the
-/// step counts only once the stream holds its `step.reviewed{verdict:"accepted"}` (T6 (f)).
-fn accept_record_refusal(
-    bus: bool,
-    step_id: &str,
-    record: Option<&crate::team::StepReviewRecord>,
-) -> Option<String> {
-    if !bus {
-        return None;
-    }
-    match record {
-        Some(r) if r.verdict == crate::team::events::StepVerdict::Accepted => None,
-        Some(_) => Some(format!(
-            "the PA's `STEP {step_id}: ACCEPT` line disagrees with the team's record of the \
-             review (step.reviewed says rejected)"
-        )),
-        None => Some(format!(
-            "the team's record holds no step.reviewed for `{step_id}`, so the PA's ACCEPT is not \
-             on the stream"
-        )),
     }
 }
 

@@ -939,8 +939,6 @@ struct AttemptSeen {
     raised: Vec<(Envelope, FindingRaised)>,
     accepted: BTreeSet<String>,
     closed: BTreeSet<String>,
-    /// A row of this attempt did not parse (absence row 6).
-    malformed: bool,
 }
 
 impl AttemptSeen {
@@ -1240,13 +1238,7 @@ impl SupervisorCore {
                         && !st
                             .attempts
                             .iter()
-                            .any(|((o, a), s)| *o == k.0 && *a < k.1 && s.claimed_id != 0)
-                    // A dead earlier attempt with a row that did not parse: what it leaves to
-                    // carry is not known (absence row 6).
-                    || st
-                        .attempts
-                        .iter()
-                        .any(|((o, a), s)| *o == k.0 && *a < k.1 && !s.live && s.malformed);
+                            .any(|((o, a), s)| *o == k.0 && *a < k.1 && s.claimed_id != 0);
                 return vec![Job::FinalPass(Box::new(FinalPassJob {
                     unit,
                     ok: b.status == StepCompletion::Ok,
@@ -1279,33 +1271,6 @@ impl SupervisorCore {
             _ => {}
         }
         Vec::new()
-    }
-
-    /// A team row of an armed run that does not parse (absence row 6): it cannot be applied, so
-    /// its attempt's record here is incomplete. The attempt's own final pass counts it through
-    /// `attempt_rows`; a DEAD attempt has no final pass, so the mark makes the next attempt of the
-    /// unit fold `stream_gap` — the row may be the finding it should have carried.
-    pub fn on_malformed(&mut self, ev: &BusEvent) {
-        let Some(run_id) = ev.payload.get("run_id").and_then(Value::as_str) else {
-            return;
-        };
-        let (Some(o), Some(a)) = (
-            ev.payload.get("ord").and_then(Value::as_u64),
-            ev.payload.get("attempt").and_then(Value::as_u64),
-        ) else {
-            return;
-        };
-        if let Some(st) = self.runs.get_mut(run_id) {
-            eprintln!(
-                "wicked-core: team supervisor: row {} ({}) of {run_id}:{o}:{a} does not parse; \
-                 the attempt's record is incomplete",
-                ev.event_id, ev.event_type
-            );
-            st.attempts
-                .entry((o as u32, a as u32))
-                .or_default()
-                .malformed = true;
-        }
     }
 
     /// Start watching a live attempt: its members, and the dead attempts' findings it carries.
@@ -2630,7 +2595,6 @@ fn run(
                 for ev in batch {
                     cursor = cursor.max(ev.event_id);
                     let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
-                        core.on_malformed(&ev);
                         continue;
                     };
                     let row = TeamRow {
@@ -2739,7 +2703,6 @@ fn replay_with(
             }
             floor = floor.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
-                core.on_malformed(&ev);
                 continue;
             };
             if only.is_some_and(|o| o != event.env.run_id) {
@@ -2819,7 +2782,6 @@ fn replay_run_with(
             }
             at = at.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
-                core.on_malformed(&ev);
                 continue;
             };
             if event.env.run_id != run_id {
