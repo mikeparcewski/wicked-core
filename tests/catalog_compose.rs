@@ -284,7 +284,7 @@ fn a_step_that_weakens_its_entry_is_refused_with_a_named_reason() {
             "tool_command_missing",
         ),
         (
-            json!([{"catalog": "deliver", "id": "d", "executor": {"type": "tool", "cmd": []}}]),
+            json!([{"catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": []}}]),
             "tool_command_missing",
         ),
         (

@@ -49,6 +49,7 @@ mod outstanding_work;
 pub mod path_policy;
 mod pipeline;
 mod plan;
+mod plan_gate;
 mod preset;
 mod project;
 mod remote_write_fence;
@@ -127,8 +128,8 @@ pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, parse_protocol_version, protocol_version_line,
     run_gate_hook, run_output_gate_hook, HookDrainSummary, COVERAGE_DB_ENV, DECISIONS_PATH_ENV,
-    ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION,
-    GATE_SCOPE_ENV,
+    ESTATE_DB_ENV, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV,
+    GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
 };
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;
@@ -163,6 +164,7 @@ pub use plan::{
     compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
+pub use plan_gate::{PendingPlan, TeamPlanState};
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
@@ -268,6 +270,19 @@ pub struct LaunchSpec {
     /// hostile value degrades the run's tools instead of widening its blast radius. `None` ⇒ the
     /// per-repo graph, unchanged.
     pub project_graph: Option<crate::project::ProjectGraphBinding>,
+    /// A USER-COMPOSED plan (DES-TEAMING-002 §8.4, seam T3): the launch's `steps[]` with its
+    /// optional `touch` and `override`. The engine publishes `plan.proposed{by:"human",
+    /// kind:"initial"}`, scores it from `touch`, floor-fills and composes it into the per-run def
+    /// `<run>:plan-1` (a TEAM run), and holds it at a `plan_approval` gate when the approval
+    /// matrix (§8.6) says so. Mutually exclusive with [`Self::workflow`] (a plan or a preset,
+    /// never both). `None` ⇒ planned from `workflow` as before.
+    pub plan: Option<crate::plan::PlanSteps>,
+    /// (DES-TEAMING-002 §8.5, T3) The run DELIVERS: the launcher's `deliver` step (catalog
+    /// `deliver`, id `deliver`, a Tool command — crew's hardened push-and-PR script). Only with a
+    /// [`Self::plan`] or a preset `workflow`: it is appended to the plan's steps when the plan has
+    /// no `deliver` step of its own, and its command is what puts `deliver` in the floor. A launch
+    /// carrying it without a plan or preset is refused (never a silently dropped delivery).
+    pub deliver_step: Option<crate::plan::PlanStep>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's

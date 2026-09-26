@@ -423,6 +423,8 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch domain-extraction");
 }

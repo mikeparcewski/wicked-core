@@ -134,6 +134,8 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
+            plan: None,
+            deliver_step: None,
         })
         // The actor replies to the caller BEFORE `pre_distribute` runs, so the launch itself
         // succeeds and the failure arrives asynchronously — exactly as the daemon saw it (HTTP 200,

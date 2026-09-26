@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
-use super::CONTINUE_WITHOUT_TEAM;
+use super::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 use crate::team::events as tev;
 use crate::team::publish::tests::{rig, Rig};
 use crate::team::publish::{TeamConfig, TEAM_OUTBOX_FILE};
@@ -150,6 +150,8 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
+            plan: None,
+            deliver_step: None,
         })
         .expect("launch");
 }
@@ -1633,6 +1635,8 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
+            plan: None,
+            deliver_step: None,
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1796,6 +1800,8 @@ fn launch_member_run(e: &Engine, run: &str) {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
+            plan: None,
+            deliver_step: None,
         })
         .expect("launch");
 }
@@ -2502,4 +2508,583 @@ fn t6_restart_between_a_members_fold_and_the_review_dispatches_the_review() {
         .as_ref()
         .is_some_and(|m| m.reviewing.is_some()));
     assert!(unit_view(&e2, "t6or", WRITE).member_step.unwrap().counted);
+}
+
+/// T3 (codex round 7): a team run launched on a bare composed def (no plan, no preset) says so:
+/// `path.started{workflow: null, plan: false}`.
+#[test]
+fn path_started_of_a_bare_def_names_neither_a_preset_nor_a_plan() {
+    let rig = rig("psbare");
+    let e = engine(&rig, fast(&rig));
+    launch_team(&e, "psbare");
+    wait_for("path.started", || {
+        rig.types("psbare").contains(&tev::PATH_STARTED.to_string())
+    });
+    let c = rig.conn();
+    let payload: String = c
+        .query_row(
+            "SELECT payload FROM events WHERE event_type = ?1",
+            [tev::PATH_STARTED],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(v["workflow"], serde_json::Value::Null);
+    assert_eq!(v["plan"], false);
+}
+
+// ── T3 round 9 (codex on #622): a plan-gate answer applies only after its gate.decided lands ────
+
+/// A bound long enough to hold a fact back for the test (retries every 100 ms for ~90 s), so the
+/// test releases the bus well inside it and the retry lands the fact.
+fn holding(rig: &Rig) -> TeamConfig {
+    TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+        .with_schedule(vec![Duration::from_millis(100); 900])
+        .with_attempt_wait(Duration::from_millis(30))
+}
+
+fn steps(v: serde_json::Value) -> crate::PlanSteps {
+    serde_json::from_value(v).expect("a plan")
+}
+
+/// An auto-mode `build` plan with no declared scope: scores 100, is high risk, and pauses
+/// `plan_approval` before its first unit (T2 (g)).
+fn launch_plan_run(e: &Engine, run: &str) {
+    e.core
+        .launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "add SSO login".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: run.into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: None,
+            workflow: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: Some(steps(
+                serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]}),
+            )),
+            deliver_step: None,
+        })
+        .expect("launch");
+}
+
+fn open_gate_kinds(db: &str, run: &str) -> Vec<String> {
+    let store = wicked_apps_core::open_store_any(Some(db)).expect("store opens");
+    crate::interaction::list_interactions(
+        &store,
+        Some(run),
+        Some(crate::interaction::InteractionStatus::Open),
+    )
+    .unwrap()
+    .into_iter()
+    .filter_map(|r| r.gate_kind)
+    .collect()
+}
+
+/// Launch the plan run and wait until its `plan_approval` gate is open AND its `gate.opened` is
+/// on the bus (so everything the launch published has landed).
+fn at_the_plan_gate(rig: &Rig, e: &Engine, run: &str) {
+    launch_plan_run(e, run);
+    wait_for("the plan_approval gate", || {
+        open_gate_kinds(&e.db, run) == vec![crate::plan_gate::GATE_KIND.to_string()]
+            && rig.types(run).contains(&tev::GATE_OPENED.to_string())
+    });
+}
+
+fn unit_ids(e: &Engine, run: &str) -> Vec<String> {
+    e.core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.session.id == run)
+        .flat_map(|v| v.units)
+        .map(|u| {
+            u.id.strip_prefix(&format!("{run}:"))
+                .unwrap_or(&u.id)
+                .to_string()
+        })
+        .collect()
+}
+
+/// `(rev, accepted_rev)` of the run's plan state.
+fn plan_revs(e: &Engine, run: &str) -> (u32, u32) {
+    let s = e
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == run)
+        .expect("run")
+        .session;
+    let tp = s.team_plan.expect("plan state");
+    (tp.rev, tp.accepted_rev)
+}
+
+fn count(types: &[String], ty: &str) -> usize {
+    types.iter().filter(|t| *t == ty).count()
+}
+
+/// The edit every test answers with: accepted as rev 2, floor-filled around `make` + `prove`.
+fn the_edit() -> HumanDecision {
+    HumanDecision::EditPlan {
+        plan: steps(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "make"},
+            {"catalog": "test", "id": "prove"}
+        ]})),
+    }
+}
+
+/// The launch's plan (rev 1, held): its unit ids.
+const HELD_UNITS: [&str; 6] = [
+    "test_plan",
+    "design",
+    "architecture",
+    "build",
+    "review",
+    "security_review",
+];
+
+/// The accepted edit's units (DES §8.5's 70-100 floor around `make` + `prove`).
+const EDITED_UNITS: [&str; 7] = [
+    "test_plan",
+    "design",
+    "architecture",
+    "make",
+    "prove",
+    "review",
+    "security_review",
+];
+
+/// What the launch put on the bus before the gate was answered.
+fn launch_facts() -> Vec<String> {
+    [
+        tev::PATH_STARTED,
+        tev::PLAN_PROPOSED,
+        tev::PATH_SCORED,
+        tev::GATE_OPENED,
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
+/// Answer `decision` from another thread; the reply is held while the gate's `gate.decided`
+/// is in flight.
+fn answer_async(
+    e: &Engine,
+    run: &str,
+    decision: HumanDecision,
+) -> std::sync::mpsc::Receiver<anyhow::Result<SessionStatus>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let core = e.core.clone();
+    let owned = run.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(core.confirm_gate(&owned, decision));
+    });
+    wait_for("the gate.decided to be in flight", || {
+        e.core
+            .run_team(run)
+            .ok()
+            .flatten()
+            .and_then(|v| v.pending)
+            .is_some()
+    });
+    rx
+}
+
+/// Round 9 (1): an ACCEPTED edit whose `gate.decided` is held back changes nothing — no
+/// `plan.proposed` for it on the bus, the rev and the units untouched, nothing dispatched. Once
+/// the bus takes it: `gate.decided`, then the edit's `plan.proposed` / `path.scored`, then
+/// `plan.accepted`, in that order, and the units swapped exactly once.
+#[test]
+fn an_accepted_edit_applies_only_after_its_gate_decided_lands() {
+    let rig = rig("r9held");
+    let e = engine(&rig, holding(&rig));
+    at_the_plan_gate(&rig, &e, "r9h");
+    assert_eq!(unit_ids(&e, "r9h"), HELD_UNITS);
+    assert_eq!(plan_revs(&e, "r9h"), (1, 0));
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let reply = answer_async(&e, "r9h", the_edit());
+    // Several retries of the held fact: nothing may move meanwhile.
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        rig.types("r9h"),
+        launch_facts(),
+        "no edit fact ahead of gate.decided"
+    );
+    assert_eq!(plan_revs(&e, "r9h"), (1, 0), "the rev is unchanged");
+    assert_eq!(unit_ids(&e, "r9h"), HELD_UNITS, "the units are unchanged");
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+    rig.allow();
+    let status = reply
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the reply settles")
+        .expect("the edit is accepted");
+    assert_ne!(status, SessionStatus::AwaitingHuman);
+    wait_for("plan.accepted", || {
+        rig.types("r9h").contains(&tev::PLAN_ACCEPTED.to_string())
+    });
+    // (round 10, LOW 8) The released run says it resumed — once.
+    assert_eq!(resumed(&drain_events(&e), "r9h"), 1);
+    let mut want = launch_facts();
+    want.extend(
+        [
+            tev::GATE_DECIDED,
+            tev::PLAN_PROPOSED,
+            tev::PATH_SCORED,
+            tev::PLAN_ACCEPTED,
+        ]
+        .map(str::to_string),
+    );
+    let types = rig.types("r9h");
+    assert_eq!(types[..want.len()], want[..], "{types:?}");
+    assert_eq!(count(&types, tev::PLAN_PROPOSED), 2);
+    assert_eq!(count(&types, tev::PLAN_ACCEPTED), 1);
+    assert_eq!(plan_revs(&e, "r9h"), (2, 2));
+    assert_eq!(unit_ids(&e, "r9h"), EDITED_UNITS);
+}
+
+/// Round 9 (2): the edit's `gate.decided` fails past the bound → the run pauses
+/// `team_transport` with the edit still staged: the old plan and units untouched. "Continue
+/// without team" then applies the edit, un-teamed.
+#[test]
+fn an_edit_whose_gate_decided_fails_pauses_and_continue_without_team_applies_it() {
+    let rig = rig("r9fail");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "r9f");
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let status = e.core.confirm_gate("r9f", the_edit()).unwrap();
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    wait_for("the team_transport pause", || {
+        open_gate_kinds(&e.db, "r9f") == vec![TEAM_TRANSPORT_GATE.to_string()]
+    });
+    let view = e.core.run_team("r9f").unwrap().unwrap();
+    assert_eq!(view.pending.as_deref(), Some(tev::GATE_DECIDED), "{view:?}");
+    assert_eq!(plan_revs(&e, "r9f"), (1, 0), "the old plan stands");
+    assert_eq!(unit_ids(&e, "r9f"), HELD_UNITS, "the old units stand");
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(count(&rig.types("r9f"), tev::PLAN_PROPOSED), 1);
+    e.core
+        .confirm_gate("r9f", approve(Some(CONTINUE_WITHOUT_TEAM)))
+        .unwrap();
+    wait_for("the first dispatch", || {
+        e.runner.0.load(AtomicOrdering::SeqCst) >= 1
+    });
+    assert_eq!(plan_revs(&e, "r9f"), (2, 2), "the staged edit applied");
+    assert_eq!(unit_ids(&e, "r9f"), EDITED_UNITS);
+    assert_eq!(e.core.run_team("r9f").unwrap().unwrap().transport, "none");
+}
+
+/// Round 9 (3): a restart after the `gate.decided` acknowledgement was recorded and before the
+/// staged edit was applied applies it at boot — once: the rev is 2 (not 3), the units are the
+/// edit's, the edit's `plan.proposed` is on the bus once, and a second restart changes nothing.
+#[test]
+fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
+    let rig = rig("r9boot");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "r9b");
+    rig.refuse(&[tev::GATE_DECIDED]);
+    e.core.confirm_gate("r9b", the_edit()).unwrap();
+    wait_for("the team_transport pause", || {
+        open_gate_kinds(&e.db, "r9b") == vec![TEAM_TRANSPORT_GATE.to_string()]
+    });
+    assert_eq!(
+        plan_revs(&e, "r9b"),
+        (1, 0),
+        "nothing applied before the ack"
+    );
+    let db = e.db.clone();
+    drop(e);
+    // The crash window: the retried gate.decided landed and its acknowledgement was persisted
+    // (`Acknowledged`, the gate closed) — the apply never ran.
+    rig.allow();
+    let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
+    let mut session = crate::domain::get_session(&store, "r9b").unwrap().unwrap();
+    let team = session.team.as_mut().expect("team state");
+    team.open_gate = None;
+    let pending = team.pending.as_mut().expect("the pending gate.decided");
+    assert!(
+        pending.staged.is_some(),
+        "the edit is staged on the pending fact"
+    );
+    pending.stage = crate::domain::PendingStage::Acknowledged;
+    crate::domain::put_node(&mut store, session.to_node()).unwrap();
+    crate::interaction::resolve_open_for_session(
+        &mut store,
+        "r9b",
+        crate::interaction::InteractionStatus::Answered,
+        Some(r#"{"approve":true,"action":"approve","amend":null}"#.to_string()),
+        crate::interaction::now_millis(),
+    )
+    .unwrap();
+    drop(store);
+    std::thread::sleep(Duration::from_millis(300));
+    let e = engine_on(&db, fast(&rig));
+    assert_eq!(plan_revs(&e, "r9b"), (2, 2), "applied at boot");
+    assert_eq!(unit_ids(&e, "r9b"), EDITED_UNITS);
+    assert_eq!(e.core.run_team("r9b").unwrap().unwrap().pending, None);
+    assert!(
+        open_gate_kinds(&db, "r9b").is_empty(),
+        "nothing is asked again"
+    );
+    e.core.resume_run("r9b").unwrap();
+    wait_for("plan.accepted", || {
+        rig.types("r9b").contains(&tev::PLAN_ACCEPTED.to_string())
+    });
+    let types = rig.types("r9b");
+    assert_eq!(count(&types, tev::GATE_DECIDED), 1, "{types:?}");
+    assert_eq!(count(&types, tev::PLAN_PROPOSED), 2, "{types:?}");
+    let decided = types.iter().position(|t| t == tev::GATE_DECIDED).unwrap();
+    let proposed = types.iter().rposition(|t| t == tev::PLAN_PROPOSED).unwrap();
+    assert!(decided < proposed, "{types:?}");
+    drop(e);
+    std::thread::sleep(Duration::from_millis(300));
+    let e = engine_on(&db, fast(&rig));
+    assert_eq!(
+        plan_revs(&e, "r9b"),
+        (2, 2),
+        "a second boot re-applies nothing"
+    );
+    assert_eq!(unit_ids(&e, "r9b"), EDITED_UNITS);
+    assert_eq!(count(&rig.types("r9b"), tev::PLAN_PROPOSED), 2);
+}
+
+/// Round 9 sweep: approving the held plan as-is records the accepted rev only once its
+/// `gate.decided` lands — while it is held back the rev is not accepted and nothing dispatches.
+#[test]
+fn an_approve_accepts_the_rev_only_after_its_gate_decided_lands() {
+    let rig = rig("r9appr");
+    let e = engine(&rig, holding(&rig));
+    at_the_plan_gate(&rig, &e, "r9a");
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let reply = answer_async(&e, "r9a", approve(None));
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(plan_revs(&e, "r9a"), (1, 0), "not accepted before the ack");
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+    rig.allow();
+    reply
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the reply settles")
+        .expect("approved");
+    wait_for("plan.accepted", || {
+        rig.types("r9a").contains(&tev::PLAN_ACCEPTED.to_string())
+    });
+    assert_eq!(plan_revs(&e, "r9a"), (1, 1));
+    assert_eq!(unit_ids(&e, "r9a"), HELD_UNITS);
+}
+
+/// Round 9 sweep: a REFUSED edit re-opens its gate only once the first gate's `gate.decided`
+/// lands — while it is held back no refusal fact and no second gate exist; then `gate.decided`,
+/// `plan.proposed`, `path.scored`, `plan.refused`, `gate.opened`, in that order.
+#[test]
+fn a_refused_edit_reopens_only_after_its_gate_decided_lands() {
+    let rig = rig("r9refd");
+    let e = engine(&rig, holding(&rig));
+    at_the_plan_gate(&rig, &e, "r9r");
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let refused = HumanDecision::EditPlan {
+        plan: steps(serde_json::json!({
+            "steps": [{"catalog": "build", "id": "build"}],
+            "override": {"remove": ["review"], "reason": "trust me"}
+        })),
+    };
+    let reply = answer_async(&e, "r9r", refused);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        rig.types("r9r"),
+        launch_facts(),
+        "nothing ahead of gate.decided"
+    );
+    assert!(
+        open_gate_kinds(&e.db, "r9r").is_empty(),
+        "no second gate before the ack"
+    );
+    rig.allow();
+    let status = reply
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the reply settles")
+        .expect("refused, re-opened");
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    wait_for("the second gate.opened", || {
+        count(&rig.types("r9r"), tev::GATE_OPENED) == 2
+    });
+    let mut want = launch_facts();
+    want.extend(
+        [
+            tev::GATE_DECIDED,
+            tev::PLAN_PROPOSED,
+            tev::PATH_SCORED,
+            tev::PLAN_REFUSED,
+            tev::GATE_OPENED,
+        ]
+        .map(str::to_string),
+    );
+    assert_eq!(rig.types("r9r"), want);
+    assert_eq!(
+        open_gate_kinds(&e.db, "r9r"),
+        vec![crate::plan_gate::GATE_KIND.to_string()]
+    );
+    assert_eq!(plan_revs(&e, "r9r"), (1, 0));
+    assert_eq!(unit_ids(&e, "r9r"), HELD_UNITS);
+}
+
+// ── T3 round 10 (independent review of #622 @ 55b18f8) ───────────────────────────────────────────
+
+fn try_launch_plan(
+    e: &Engine,
+    run: &str,
+    body: serde_json::Value,
+    human_confirm: HumanConfirm,
+    deliver_step: Option<crate::PlanStep>,
+) -> anyhow::Result<String> {
+    e.core.launch_run(LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "add SSO login".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: crate::EntityMode::Shared,
+        session_id: run.into(),
+        human_confirm,
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: None,
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+        plan: Some(steps(body)),
+        deliver_step,
+    })
+}
+
+fn runs(e: &Engine) -> usize {
+    e.runner.0.load(AtomicOrdering::SeqCst)
+}
+
+fn plan_gate_kind() -> Vec<String> {
+    vec![crate::plan_gate::GATE_KIND.to_string()]
+}
+
+/// HIGH 1: an auto-mode plan whose only step is a `review` authored `executes_code: true` is a
+/// creator plan — it scores 100 (no declared scope), is high risk and pauses `plan_approval`
+/// before its unit runs (the unit is unguarded, so it would write the tree unapproved).
+#[test]
+fn an_auto_plan_whose_review_step_executes_code_pauses_for_approval() {
+    let rig = rig("r10cr");
+    let e = engine(&rig, fast(&rig));
+    try_launch_plan(
+        &e,
+        "r10c",
+        serde_json::json!({"steps": [{"catalog": "review", "id": "check", "executes_code": true}]}),
+        HumanConfirm::None,
+        None,
+    )
+    .expect("launch");
+    wait_for("the plan_approval gate", || {
+        open_gate_kinds(&e.db, "r10c") == plan_gate_kind()
+    });
+    assert_eq!(runs(&e), 0);
+}
+
+/// Routing: a run holding a plan whose gate row is already answered (the row answered, nothing
+/// else) → the next answer is still the PLAN gate's: the gate is re-opened and answered through
+/// the plan arm — `gate.decided`, the accepted rev, then
+/// `plan.accepted` before the cursor unit dispatches. Never the generic arm running unit 1 with
+/// no accepted rev.
+#[test]
+fn a_held_plan_whose_row_is_already_answered_is_answered_through_the_plan_arm() {
+    let rig = rig("r10ans");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "r10a");
+    let db = e.db.clone();
+    drop(e);
+    let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
+    crate::interaction::resolve_open_for_session(
+        &mut store,
+        "r10a",
+        crate::interaction::InteractionStatus::Answered,
+        Some(r#"{"approve":true,"action":"approve","amend":null}"#.to_string()),
+        crate::interaction::now_millis(),
+    )
+    .unwrap();
+    drop(store);
+    std::thread::sleep(Duration::from_millis(300));
+    let e = engine_on(&db, fast(&rig));
+    let _ = e.core.confirm_gate("r10a", approve(None));
+    wait_for("plan.accepted", || {
+        rig.types("r10a").contains(&tev::PLAN_ACCEPTED.to_string())
+    });
+    wait_for("the first dispatch", || runs(&e) >= 1);
+    assert_eq!(plan_revs(&e, "r10a"), (1, 1));
+    let types = rig.types("r10a");
+    let decided = types
+        .iter()
+        .position(|t| t == tev::GATE_DECIDED)
+        .expect("gate.decided");
+    let accepted = types.iter().position(|t| t == tev::PLAN_ACCEPTED).unwrap();
+    assert!(decided < accepted, "{types:?}");
+}
+
+/// The dispatch guard: a reassign while the run is Executing with its plan still held (its
+/// `path.started` in flight) dispatches nothing — refused, and the run is not failed.
+#[test]
+fn a_reassign_while_the_plan_is_held_dispatches_nothing() {
+    let rig = rig("r10rs");
+    rig.refuse(&[tev::PATH_STARTED]);
+    let e = engine(&rig, holding(&rig));
+    try_launch_plan(
+        &e,
+        "r10r",
+        serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]}),
+        HumanConfirm::None,
+        None,
+    )
+    .expect("launch");
+    wait_for("path.started in flight", || {
+        e.core
+            .run_team("r10r")
+            .ok()
+            .flatten()
+            .and_then(|v| v.pending)
+            .as_deref()
+            == Some(tev::PATH_STARTED)
+    });
+    assert_eq!(status(&e, "r10r"), Some(SessionStatus::Executing));
+    assert!(e.core.reassign_unit("r10r", 1, Some("b".into())).is_err());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(runs(&e), 0);
+    assert_eq!(status(&e, "r10r"), Some(SessionStatus::Executing));
+}
+
+/// MEDIUM 5: a manual plan whose released unit IS the deliver unit still stops at the deliver
+/// gate (`auto_deliver: false`) — the plan approval never answers the push.
+#[test]
+fn a_released_deliver_unit_still_stops_at_its_deliver_gate() {
+    let rig = rig("r10dl");
+    let e = engine(&rig, fast(&rig));
+    let deliver: crate::PlanStep = serde_json::from_value(serde_json::json!({
+        "catalog": "deliver", "id": "deliver", "instructions": "push and open the PR",
+        "executor": {"type": "tool", "cmd": ["true"]}
+    }))
+    .unwrap();
+    try_launch_plan(
+        &e,
+        "r10d",
+        serde_json::json!({"steps": []}),
+        HumanConfirm::All,
+        Some(deliver),
+    )
+    .expect("launch");
+    wait_for("the plan_approval gate", || {
+        open_gate_kinds(&e.db, "r10d") == plan_gate_kind()
+    });
+    assert_eq!(unit_ids(&e, "r10d"), ["deliver"]);
+    e.core.confirm_gate("r10d", approve(None)).unwrap();
+    wait_for("the deliver gate", || {
+        open_gate_kinds(&e.db, "r10d") == vec!["deliver".to_string()]
+    });
+    assert_eq!(status(&e, "r10d"), Some(SessionStatus::AwaitingHuman));
 }

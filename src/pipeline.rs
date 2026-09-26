@@ -412,102 +412,14 @@ pub(crate) fn pre_distribute(
 
     let selected_def =
         resolve_workflow_def(&*store, project_id.as_deref(), workflow, workflow_registry)?;
-    // core#120: a Tool-executor phase with an unresolvable binary must refuse the launch here —
-    // before anything is planned or persisted — never degrade to agent improvisation.
-    if let Some(def) = &selected_def {
-        crate::workflow::preflight_tool_phases(def)?;
-    }
-    // core#468: the run's BASE skill is admitted HERE, at intake — before anything is planned or
-    // persisted — in the same posture as the tool preflight above: the directive rides every
-    // agent unit, so a snapshot that lacks the skill has no unit that could run, and the refusal
-    // must name the skill and the fix rather than surface as the first unit's worker failure.
-    // (The actor's synchronous launch path judges it too, so an interactive caller gets an `Err`
-    // with no session persisted; this is the choke point `run_session` and a re-plan also cross.)
-    let base_skill = crate::workflow::base_skill_ref_for(selected_def.as_ref());
-    if let Some(base) = base_skill.as_deref() {
-        crate::skills_snapshot::admit_base_skill(base)?;
-    }
-    let mut units = match &selected_def {
-        Some(def) => plan::plan_from_def(def, problem, session_id),
-        None => plan::plan_units(problem, session_id),
-    };
-    // …and lands on every AGENT unit of the plan, def-driven or prose-planned alike (never on a
-    // Tool unit, which has no prompt).
-    plan::apply_base_skill(&mut units, base_skill.as_deref());
-    // Bind THIS run's repo into the placeholders its Tool phases declare, before anything is
-    // persisted. The def is shared by every run of its id; the paths are not. Rewriting a shared def
-    // per launch instead is what made three concurrent registrations index one repo's tree into one
-    // repo's database under three different names (FINDING-075, wicked-crew#196).
-    if let Some(repo_id) = repo_ref.as_deref() {
-        if let Some(repo) = crate::repo::get_repo(store, repo_id)? {
-            plan::bind_repo_paths(&mut units, &repo);
-        }
-    }
-    // Refuse rather than dispatch a command carrying a literal `{repo_root}`. Reached when a def
-    // declaring repo placeholders is launched with no `repo_ref`, or with one that no longer
-    // resolves — both of which would otherwise hand a tool a path that cannot exist, and hand a tool
-    // that treats an unknown path as "use the cwd" the FINDING-067 shape.
-    let unbound = plan::unbound_repo_tokens(&units);
-    if !unbound.is_empty() {
-        // The RESOLVED id, not the caller's argument. A run can reach a def without naming one, and
-        // an error reading "workflow `<none>` declares placeholders" tells an operator nothing about
-        // which def to go look at.
-        let named = selected_def
-            .as_ref()
-            .map(|d| d.id.as_str())
-            .or(workflow)
-            .unwrap_or("<none>");
-        anyhow::bail!(
-            "workflow `{named}` declares repo placeholders that this run cannot fill ({}); it must \
-             be launched against a registered repo — pass `repoRef`",
-            unbound.join(", ")
-        );
-    }
-    if units.len() as u32 > crate::actor::DENY_PHASE_SPAN {
-        anyhow::bail!(
-            "run has {} units, exceeding the {}-unit governed limit; split the problem into smaller runs",
-            units.len(),
-            crate::actor::DENY_PHASE_SPAN
-        );
-    }
-
-    if let Some(def) = &selected_def {
-        // The built-in floors are seeded HERE, at the plan, and not only at actor boot.
-        //
-        // `attach_pinned_validators` is fail-closed on a pin that is not in the vault, and the
-        // shipped `feature`/`bug`/`migration` defs now pin the evidence floor. Seeding only at boot
-        // made that correct for the daemon and BROKEN for everyone else: `run_session` is public and
-        // takes a store directly, so an embedder — or the engine's own `pipeline` test — opened a
-        // fresh store, planned a SHIPPED workflow, and got a hard bail naming a pin they never
-        // wrote. A built-in floor that depends on which entry point you came through is not a floor.
-        //
-        // This is the one choke point both paths cross (actor launch and `run_session`), the writes
-        // are content-addressed upserts, and the pin is a compile-time constant — so it is idempotent
-        // and costs two `put_node`s per plan. The boot-time seed stays as the loud early warning and
-        // to make the floor visible in the vault before a first run; this is the invariant.
-        crate::builtin_floors::seed_builtin_floors(store)?;
-        // The shipped `domain-extraction` drop-in's coverage validator is seeded HERE for the same
-        // reason, and it was NOT — which cost an operator a closed loop (FINDING-066).
-        //
-        // It is the same class of object as the floor above: hand-authored, deterministic,
-        // content-addressed, shipped with the product, and pinned by a def we ship. The only
-        // difference was where it got vaulted — the floor on the plan path, this one only via an
-        // out-of-band `wicked-core seed-domain-validators`. That difference is not survivable,
-        // because THE VAULT IS PER-DATABASE and the CLI's default database is not the engine's:
-        // crew's daemon opens `~/.wicked-crew/core.db`, the CLI falls back to a cwd-relative
-        // `wicked-estate.db`. Measured: the run failed naming this pin, the prescribed command ran
-        // and printed the matching pin, and the relaunch failed identically — the seed had landed in
-        // a database nothing reads. An error whose remedy is inert is worse than an unclear one; the
-        // operator has no signal that they are looping.
-        //
-        // Seeding it here removes the out-of-band step from the critical path entirely, so no
-        // database can be the wrong one. Same cost argument as the floor: two content-addressed
-        // `put_node`s that collapse onto themselves, and the pin is a compile-time constant.
-        // `seed-domain-validators` survives as a visibility/repair tool, not a prerequisite.
-        crate::domain_extraction::provision_and_approve_coverage_validator(store)?;
-        attach_pinned_validators(store, &mut units, def)?;
-        // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
-    }
+    let units = planned_units(
+        store,
+        selected_def.as_ref(),
+        problem,
+        session_id,
+        repo_ref.as_deref(),
+        workflow,
+    )?;
 
     let collection_scope = match entity_mode {
         EntityMode::Shared => Some(resolve_scope(entity_mode, session_id, "shared")),
@@ -540,6 +452,7 @@ pub(crate) fn pre_distribute(
         finished_at: None,
         benched_seats: Vec::new(),
         team: None,
+        team_plan: None,
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -550,6 +463,11 @@ pub(crate) fn pre_distribute(
             session.run_branch = existing.run_branch;
             session.base_commit = existing.base_commit;
             session.benched_seats = existing.benched_seats;
+            // (DES-TEAMING-002 T3) The team state (P1's transport, path floor and gate counter)
+            // and the plan state are the run's, not the plan's: a plan written onto a launch stub
+            // (or re-planned at an edit) keeps them.
+            session.team = existing.team;
+            session.team_plan = existing.team_plan;
         }
     } else {
         put_node(store, session.to_node())?;
@@ -644,6 +562,120 @@ pub(crate) fn pre_distribute(
         workflow_id,
         cli_keys,
     })
+}
+
+/// Every synchronous check a plan must pass BEFORE the run's state changes, and the units it
+/// plans (DES-TEAMING-002 T3, codex round 4): the tool preflight (core#120), the base-skill intake
+/// (core#468), repo-placeholder binding, the governed unit limit and the pinned-validator attach
+/// (fail-closed on an unvaulted pin). Writes nothing of the run's: only the idempotent,
+/// content-addressed built-in floor / coverage validator seeds the attach reads. [`pre_distribute`]
+/// calls it, and the plan gate calls it on an edited plan BEFORE it answers the gate or touches
+/// the old units — one checker, so what was proven is what runs.
+pub(crate) fn planned_units(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    selected_def: Option<&crate::workflow::WorkflowDef>,
+    problem: &str,
+    session_id: &str,
+    repo_ref: Option<&str>,
+    workflow: Option<&str>,
+) -> anyhow::Result<Vec<crate::domain::WorkUnit>> {
+    // core#120: a Tool-executor phase with an unresolvable binary must refuse the launch here —
+    // before anything is planned or persisted — never degrade to agent improvisation.
+    if let Some(def) = selected_def {
+        crate::workflow::preflight_tool_phases(def)?;
+    }
+    // core#468: the run's BASE skill is admitted HERE, at intake — before anything is planned or
+    // persisted — in the same posture as the tool preflight above: the directive rides every
+    // agent unit, so a snapshot that lacks the skill has no unit that could run, and the refusal
+    // must name the skill and the fix rather than surface as the first unit's worker failure.
+    // (The actor's synchronous launch path judges it too, so an interactive caller gets an `Err`
+    // with no session persisted; this is the choke point `run_session` and a re-plan also cross.)
+    let base_skill = crate::workflow::base_skill_ref_for(selected_def);
+    if let Some(base) = base_skill.as_deref() {
+        crate::skills_snapshot::admit_base_skill(base)?;
+    }
+    let mut units = match selected_def {
+        Some(def) => plan::plan_from_def(def, problem, session_id),
+        None => plan::plan_units(problem, session_id),
+    };
+    // …and lands on every AGENT unit of the plan, def-driven or prose-planned alike (never on a
+    // Tool unit, which has no prompt).
+    plan::apply_base_skill(&mut units, base_skill.as_deref());
+    // Bind THIS run's repo into the placeholders its Tool phases declare, before anything is
+    // persisted. The def is shared by every run of its id; the paths are not. Rewriting a shared def
+    // per launch instead is what made three concurrent registrations index one repo's tree into one
+    // repo's database under three different names (FINDING-075, wicked-crew#196).
+    if let Some(repo_id) = repo_ref {
+        if let Some(repo) = crate::repo::get_repo(store, repo_id)? {
+            plan::bind_repo_paths(&mut units, &repo);
+        }
+    }
+    // Refuse rather than dispatch a command carrying a literal `{repo_root}`. Reached when a def
+    // declaring repo placeholders is launched with no `repo_ref`, or with one that no longer
+    // resolves — both of which would otherwise hand a tool a path that cannot exist, and hand a tool
+    // that treats an unknown path as "use the cwd" the FINDING-067 shape.
+    let unbound = plan::unbound_repo_tokens(&units);
+    if !unbound.is_empty() {
+        // The RESOLVED id, not the caller's argument. A run can reach a def without naming one, and
+        // an error reading "workflow `<none>` declares placeholders" tells an operator nothing about
+        // which def to go look at.
+        let named = selected_def
+            .as_ref()
+            .map(|d| d.id.as_str())
+            .or(workflow)
+            .unwrap_or("<none>");
+        anyhow::bail!(
+            "workflow `{named}` declares repo placeholders that this run cannot fill ({}); it must \
+             be launched against a registered repo — pass `repoRef`",
+            unbound.join(", ")
+        );
+    }
+    if units.len() as u32 > crate::actor::DENY_PHASE_SPAN {
+        anyhow::bail!(
+            "run has {} units, exceeding the {}-unit governed limit; split the problem into smaller runs",
+            units.len(),
+            crate::actor::DENY_PHASE_SPAN
+        );
+    }
+
+    if let Some(def) = selected_def {
+        // The built-in floors are seeded HERE, at the plan, and not only at actor boot.
+        //
+        // `attach_pinned_validators` is fail-closed on a pin that is not in the vault, and the
+        // shipped `feature`/`bug`/`migration` defs now pin the evidence floor. Seeding only at boot
+        // made that correct for the daemon and BROKEN for everyone else: `run_session` is public and
+        // takes a store directly, so an embedder — or the engine's own `pipeline` test — opened a
+        // fresh store, planned a SHIPPED workflow, and got a hard bail naming a pin they never
+        // wrote. A built-in floor that depends on which entry point you came through is not a floor.
+        //
+        // This is the one choke point both paths cross (actor launch and `run_session`), the writes
+        // are content-addressed upserts, and the pin is a compile-time constant — so it is idempotent
+        // and costs two `put_node`s per plan. The boot-time seed stays as the loud early warning and
+        // to make the floor visible in the vault before a first run; this is the invariant.
+        crate::builtin_floors::seed_builtin_floors(store)?;
+        // The shipped `domain-extraction` drop-in's coverage validator is seeded HERE for the same
+        // reason, and it was NOT — which cost an operator a closed loop (FINDING-066).
+        //
+        // It is the same class of object as the floor above: hand-authored, deterministic,
+        // content-addressed, shipped with the product, and pinned by a def we ship. The only
+        // difference was where it got vaulted — the floor on the plan path, this one only via an
+        // out-of-band `wicked-core seed-domain-validators`. That difference is not survivable,
+        // because THE VAULT IS PER-DATABASE and the CLI's default database is not the engine's:
+        // crew's daemon opens `~/.wicked-crew/core.db`, the CLI falls back to a cwd-relative
+        // `wicked-estate.db`. Measured: the run failed naming this pin, the prescribed command ran
+        // and printed the matching pin, and the relaunch failed identically — the seed had landed in
+        // a database nothing reads. An error whose remedy is inert is worse than an unclear one; the
+        // operator has no signal that they are looping.
+        //
+        // Seeding it here removes the out-of-band step from the critical path entirely, so no
+        // database can be the wrong one. Same cost argument as the floor: two content-addressed
+        // `put_node`s that collapse onto themselves, and the pin is a compile-time constant.
+        // `seed-domain-validators` survives as a visibility/repair tool, not a prerequisite.
+        crate::domain_extraction::provision_and_approve_coverage_validator(store)?;
+        attach_pinned_validators(store, &mut units, def)?;
+        // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
+    }
+    Ok(units)
 }
 
 /// Apply council distributions to the pre-distributed units, persist assignments to the store, and

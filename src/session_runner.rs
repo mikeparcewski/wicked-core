@@ -762,6 +762,7 @@ mod tests {
             rework_of: None,
             rework_amendment: None,
             status: UnitStatus::Pending,
+            catalog: None,
         }
     }
 
