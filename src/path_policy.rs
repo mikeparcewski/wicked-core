@@ -328,10 +328,12 @@ fn validate_extra_roots(
 /// The declared deliverables a unit did NOT produce, or `None` if all are present (FINDING-101,
 /// widened by core#297 §3).
 ///
-/// A deliverable counts as produced if it exists as a file OR a directory (a phase may declare a
-/// directory of outputs). Checking existence is the whole point — this is a SUBSTANCE check, the
-/// opposite of the presence-shaped gates this campaign keeps filing: the phase said it would
-/// produce X, so require X, not a status code claiming it did.
+/// A deliverable counts as produced if it is a NON-EMPTY file or a directory holding at least one
+/// entry (a phase may declare a directory of outputs). A zero-byte file or an empty directory is
+/// reported as `<path> (empty)`: it is the "nothing was produced" this floor exists to catch
+/// (DES-TEAMING-002 X3; crew's floor, which M9 deletes, refused it first). This is a SUBSTANCE
+/// check, the opposite of the presence-shaped gates this campaign keeps filing: the phase said it
+/// would produce X, so require X, not a status code claiming it did.
 ///
 /// # Where a deliverable may live
 ///
@@ -367,29 +369,72 @@ pub(crate) fn missing_deliverables(
     cwd: &Path,
     write_roots: &[String],
 ) -> Option<String> {
-    let missing: Vec<&str> = declared
+    let missing: Vec<String> = declared
         .iter()
         .filter(|d| !d.trim().is_empty())
-        .filter(|d| !deliverable_exists(d, cwd, write_roots))
-        .map(String::as_str)
+        .filter_map(|d| match deliverable_state(d, cwd, write_roots) {
+            Found::Produced => None,
+            Found::Absent => Some(d.clone()),
+            Found::Empty => Some(format!("{d} (empty)")),
+        })
         .collect();
     (!missing.is_empty()).then(|| missing.join(", "))
 }
 
+/// What one declared deliverable resolved to.
+#[derive(PartialEq, Eq)]
+enum Found {
+    Produced,
+    /// Present but hollow: a zero-byte file or an empty directory.
+    Empty,
+    Absent,
+}
+
 /// One deliverable's presence test — see [`missing_deliverables`] for the rules and why.
-fn deliverable_exists(declared: &str, cwd: &Path, write_roots: &[String]) -> bool {
+fn deliverable_state(declared: &str, cwd: &Path, write_roots: &[String]) -> Found {
     let p = Path::new(declared);
-    if p.is_absolute() {
+    let candidates: Vec<PathBuf> = if p.is_absolute() {
         let resolved = resolve_symlinks(p);
-        return write_roots
+        if write_roots
             .iter()
             .any(|r| resolved_is_within(&resolved, Path::new(r)))
-            && p.exists();
+        {
+            vec![p.to_path_buf()]
+        } else {
+            Vec::new()
+        }
+    } else if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        Vec::new()
+    } else {
+        std::iter::once(cwd.join(p))
+            .chain(write_roots.iter().map(|r| Path::new(r).join(p)))
+            .collect()
+    };
+    let states: Vec<Found> = candidates.iter().map(|c| content_state(c)).collect();
+    if states.contains(&Found::Produced) {
+        Found::Produced
+    } else if states.contains(&Found::Empty) {
+        Found::Empty
+    } else {
+        Found::Absent
     }
-    if p.components().any(|c| matches!(c, Component::ParentDir)) {
-        return false;
+}
+
+/// A file counts when it carries bytes; a directory when it holds an entry.
+fn content_state(path: &Path) -> Found {
+    match std::fs::metadata(path) {
+        Err(_) => Found::Absent,
+        Ok(m) if m.is_dir() => {
+            let occupied = std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some());
+            if occupied {
+                Found::Produced
+            } else {
+                Found::Empty
+            }
+        }
+        Ok(m) if m.len() > 0 => Found::Produced,
+        Ok(_) => Found::Empty,
     }
-    cwd.join(p).exists() || write_roots.iter().any(|r| Path::new(r).join(p).exists())
 }
 
 #[cfg(test)]
@@ -758,8 +803,34 @@ mod deliverables_tests {
     fn a_declared_directory_of_outputs_counts_as_produced() {
         let d = tmp("dir");
         std::fs::create_dir_all(d.join(".wicked/domain")).unwrap();
+        std::fs::write(d.join(".wicked/domain/model.json"), "{}").unwrap();
         assert!(missing_deliverables(&[".wicked/domain".into()], &d, &[]).is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// (DES-TEAMING-002 X3) A ZERO-BYTE file or an EMPTY directory is not a produced deliverable:
+    /// it is the same "nothing was produced" the floor exists to catch, and crew's own floor
+    /// (`packages/crew/src/core/deliverable-floor.ts`) already refuses both — so the engine must,
+    /// before migration M9 deletes crew's. The miss says why, so the operator never guesses.
+    #[test]
+    fn an_empty_file_or_directory_is_not_a_produced_deliverable() {
+        let d = tmp("hollow");
+        std::fs::write(d.join("draft.html"), "").unwrap();
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        let miss = missing_deliverables(&["draft.html".into(), "out".into()], &d, &[])
+            .expect("an empty file and an empty directory are missing");
+        assert!(miss.contains("draft.html (empty)"), "{miss}");
+        assert!(miss.contains("out (empty)"), "{miss}");
+        // Inside a declared write root, absolute, the same.
+        let sandbox = tmp("hollow-sandbox");
+        let abs = s(&d.join("draft.html"));
+        assert!(missing_deliverables(std::slice::from_ref(&abs), &sandbox, &[s(&d)]).is_some());
+        std::fs::write(d.join("draft.html"), "<p>x</p>").unwrap();
+        std::fs::write(d.join("out/fragment-1.html"), "<p>y</p>").unwrap();
+        assert!(missing_deliverables(&["draft.html".into(), "out".into()], &d, &[]).is_none());
+        assert!(missing_deliverables(&[abs], &sandbox, &[s(&d)]).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&sandbox);
     }
 
     /// A deliverable the engine cannot locate is not evidence the phase completed — with NO

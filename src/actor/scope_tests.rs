@@ -630,3 +630,122 @@ fn x1_r2_m2_a_restart_after_the_scope_fold_decides_the_plan_not_completes_the_ru
     assert_eq!(ids, ["xm2:pa-scope", "xm2:draft"]);
     release_all(&w2);
 }
+
+// ── X3: a plan or preset step's declared deliverables are the ENGINE's floor ─────────────────────
+
+/// The per-run inbox an X3 run declares as its write root (crew's interactive shape: an UNBOUND
+/// run whose deliverable is a file in a launch-declared root, `extra_write_roots`).
+fn x3_inbox(run: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("wicked-x3-inbox-{}-{run}", std::process::id()))
+}
+
+/// Launch the preset `workflow` repo-less with `inbox` declared as the run's write root.
+fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::Path) {
+    e.core
+        .launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "x3 preset launch".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: run.into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: None,
+            workflow: Some(workflow.into()),
+            extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: None,
+            deliver_step: None,
+        })
+        .expect("launch");
+}
+
+/// (X3) An interactive-shaped preset (repo-less; `understand` → `produce`) whose `produce` step
+/// declares `required_deliverables: ["draft.html"]`, resolved against the launch's declared write
+/// root. The engine — not a crew-appended tool phase — decides whether the step passes:
+///
+/// - `x3m` writes nothing: the step is Rejected (`deliverables`) naming the file, and the run
+///   pauses at the escalation gate instead of completing;
+/// - `x3e` writes a ZERO-BYTE file: the same (an empty file is not a produced deliverable — crew's
+///   floor, `packages/crew/src/core/deliverable-floor.ts`, already refuses it, so the engine must
+///   too before M9 deletes crew's);
+/// - `x3p` writes the document: the step is Done and the run completes.
+#[test]
+fn x3_a_preset_steps_declared_deliverable_is_the_engines_floor() {
+    let w = Worker::scripted(|i, _| {
+        let phase = i.unit.id.rsplit(':').next().unwrap_or("");
+        match phase {
+            "pa-scope" => turn(
+                &pa_output("RISK {\"score\":0,\"reasons\":[\"an internal draft\"]}"),
+                None,
+            ),
+            "outline" => turn(&pa_output("outlined"), None),
+            "draft" => {
+                let out = x3_inbox(&i.run_id).join("draft.html");
+                match i.run_id.as_str() {
+                    "x3e" => std::fs::write(&out, "").unwrap(),
+                    "x3p" => std::fs::write(&out, "<html><body>the draft</body></html>").unwrap(),
+                    _ => {}
+                }
+                turn(&pa_output("drafted"), None)
+            }
+            _ => hold(),
+        }
+    });
+    let e = engine("x3", w.clone());
+    put(
+        &e,
+        "x3-draft",
+        json!([
+            {"catalog": "understand", "id": "outline"},
+            {"catalog": "produce", "id": "draft", "depends_on": ["outline"],
+             "required_deliverables": ["draft.html"]}
+        ]),
+    );
+    for run in ["x3m", "x3e", "x3p"] {
+        let inbox = x3_inbox(run);
+        let _ = std::fs::remove_dir_all(&inbox);
+        std::fs::create_dir_all(&inbox).unwrap();
+        launch_preset_into(&e, run, "x3-draft", &inbox);
+    }
+    for run in ["x3m", "x3e"] {
+        wait_for(&format!("{run}'s draft step to be judged"), || {
+            view(&e, run)
+                .units
+                .iter()
+                .any(|u| u.id == format!("{run}:draft") && u.denial.is_some())
+        });
+        let v = view(&e, run);
+        let draft = v
+            .units
+            .iter()
+            .find(|u| u.id == format!("{run}:draft"))
+            .unwrap();
+        assert_eq!(draft.status, crate::domain::UnitStatus::Rejected, "{run}");
+        let denial = draft.denial.as_ref().unwrap();
+        assert_eq!(denial.source, "deliverables", "{run}: {denial:?}");
+        assert!(denial.reason.contains("draft.html"), "{run}: {denial:?}");
+        assert_ne!(v.session.status, SessionStatus::Completed, "{run}");
+    }
+    wait_status_done(&e, "x3p");
+    let v = view(&e, "x3p");
+    let draft = v.units.iter().find(|u| u.id == "x3p:draft").unwrap();
+    assert_eq!(
+        draft.status,
+        crate::domain::UnitStatus::Done,
+        "{:?}",
+        draft.denial
+    );
+    release_all(&w);
+    for run in ["x3m", "x3e", "x3p"] {
+        let _ = std::fs::remove_dir_all(x3_inbox(run));
+    }
+}
+
+fn wait_status_done(e: &Engine, run: &str) {
+    wait_for(&format!("{run} to complete"), || {
+        view(e, run).session.status == SessionStatus::Completed
+    });
+}
