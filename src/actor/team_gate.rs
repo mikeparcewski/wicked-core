@@ -911,6 +911,21 @@ pub(super) fn run_ended(store: &dyn GraphStore, run_id: &str, status: PathStatus
     let Ok(Some(session)) = crate::domain::get_session(store, run_id) else {
         return;
     };
+    // (T8 (c), core#630 round 4) A human edit still held when the run ends never reaches a
+    // boundary: refuse it on the record (ahead of `path.ended`, same FIFO), so no edit is silently
+    // spent. Keys are the proposal's, so a re-issued end publishes nothing twice.
+    if let Some(tp) = session.team_plan.as_ref().filter(|t| !t.edits.is_empty()) {
+        let why = format!(
+            "the run ended ({}) before the edit was applied",
+            status.as_str()
+        );
+        let base_rev = Some(tp.accepted_rev);
+        let now = crate::interaction::now_millis();
+        match crate::plan_gate::edits_refused(run_id, base_rev, &tp.edits, &why, now) {
+            Ok(facts) => publish_plan_facts(&session, facts),
+            Err(e) => eprintln!("wicked-core: run {run_id}: held edits not refused ({e:#})"),
+        }
+    }
     if let Some(team) = session.team.as_ref() {
         request_end(run_id, team, status);
     }
@@ -2632,6 +2647,9 @@ pub(super) fn propose_plan(
         return Ok(crate::plan_gate::PlanProposal {
             proposal_id,
             duplicate: true,
+            band: None,
+            high_risk: None,
+            floor_added: Vec::new(),
         });
     }
     if plan.touch.is_some() || plan.floor_override.is_some() {
@@ -2659,6 +2677,12 @@ pub(super) fn propose_plan(
         anyhow::bail!(
             "run {run_id} has no accepted plan yet: edit it at its plan_approval gate \
              (the edit is the gate answer)"
+        );
+    }
+    if tp.pending.is_some() {
+        anyhow::bail!(
+            "run {run_id}: a plan is awaiting approval; edit it at the gate (the edit is the gate \
+             answer)"
         );
     }
     let units = crate::domain::session_units(&*store, run_id)?;
@@ -2702,6 +2726,29 @@ pub(super) fn propose_plan(
     if let crate::plan_gate::Outcome::Refused { reason } = dry.outcome {
         anyhow::bail!("the plan edit is refused: {reason}");
     }
+    // What the edit does to the run, read off the rev the dry run made: its band and risk, and
+    // the floor steps it adds (floor steps that were not in the plan before).
+    let before: std::collections::HashSet<&str> = tp
+        .accepted
+        .as_ref()
+        .map(|a| a.steps.steps.iter().map(|s| s.id.as_str()).collect())
+        .unwrap_or_default();
+    let (band, high_risk, floor_added) = match dry.state.accepted.as_ref() {
+        Some(a) => (
+            Some(a.band.clone()),
+            Some(a.high_risk),
+            a.steps
+                .steps
+                .iter()
+                .filter(|s| {
+                    s.added_by == Some(crate::plan::AddedBy::Floor)
+                        && !before.contains(s.id.as_str())
+                })
+                .map(|s| s.catalog.clone())
+                .collect(),
+        ),
+        None => (None, None, Vec::new()),
+    };
     tp.edit_requests.push(request_id.to_string());
     tp.edits.push(crate::plan_gate::HeldEdit {
         request_id: request_id.to_string(),
@@ -2711,6 +2758,9 @@ pub(super) fn propose_plan(
     Ok(crate::plan_gate::PlanProposal {
         proposal_id,
         duplicate: false,
+        band,
+        high_risk,
+        floor_added,
     })
 }
 

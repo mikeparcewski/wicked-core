@@ -1560,3 +1560,104 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
     assert_eq!(launched, previewed);
     release_all(&w);
 }
+
+// ── core#630 round 4 ─────────────────────────────────────────────────────────────────────────────
+
+/// (round 4) A held edit is never lost to the run ending before its boundary: cancelling the run
+/// while the edit waits publishes the edit's `plan.proposed` and a `plan.refused` for it.
+#[test]
+fn t8_r4_a_held_edit_is_refused_on_the_bus_when_the_run_ends() {
+    let (w, go) = gated_worker();
+    let e = engine("t8r4end", w.clone());
+    launch(&e, "rend", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    settled(&e, "rend", tev::PLAN_ACCEPTED, 1);
+    let p = e
+        .core
+        .propose_plan(
+            "rend",
+            plan(json!({"steps": [{"catalog": "test_plan"}]})),
+            "req-end",
+        )
+        .unwrap();
+    e.core.cancel_run("rend").unwrap();
+    let refused = settled(&e, "rend", tev::PLAN_REFUSED, 1);
+    assert_eq!(refused[0]["proposal_id"], p.proposal_id.as_str());
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "rend").len() == 1
+    });
+    // The id stays spent: a retry is a duplicate, and publishes nothing more.
+    assert!(
+        e.core
+            .propose_plan(
+                "rend",
+                plan(json!({"steps": [{"catalog": "test_plan"}]})),
+                "req-end"
+            )
+            .unwrap()
+            .duplicate
+    );
+    go.store(true, AtomicOrdering::SeqCst);
+    release_all(&w);
+}
+
+/// (round 4) The preview never fetches: on a repo whose `origin` is unreachable it answers
+/// promptly and leaves `refs/remotes` and `FETCH_HEAD` untouched (the base is the local tip).
+#[test]
+fn t8_r4_the_preview_does_not_fetch_the_remote() {
+    let w = Worker::new(&pa_output("built it"), None);
+    let e = engine("t8r4fetch", w.clone());
+    let (repo, _head) = git_repo(&e.rig.dir);
+    {
+        use wicked_apps_core::spawn::HardenedCommand;
+        let ok = std::process::Command::new("git")
+            .hardened()
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://192.0.2.1/unreachable.git",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+    let entry = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "r4fetch".into(),
+            root_path: repo.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    let started = Instant::now();
+    let preview = e
+        .core
+        .preview_plan(
+            plan(json!({"steps": [{"catalog": "produce"}], "touch": ["src/lib.rs"]})),
+            None,
+            Some(&entry.id),
+            None,
+            HumanConfirm::All,
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the preview waited on the network: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        preview.graph, "unavailable",
+        "no graph is indexed for this repo"
+    );
+    let git_dir = repo.join(".git");
+    assert!(!git_dir.join("FETCH_HEAD").exists(), "the preview fetched");
+    assert!(
+        !git_dir.join("refs/remotes").join("origin").exists(),
+        "refs/remotes were touched"
+    );
+    release_all(&w);
+}

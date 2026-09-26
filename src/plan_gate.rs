@@ -130,6 +130,12 @@ pub struct PlanProposal {
     pub proposal_id: String,
     /// `true` when this request id was already taken: nothing new is held or published.
     pub duplicate: bool,
+    /// What the edit does to the run, from the dry run it was validated by (the human's own edit
+    /// opens no gate, so this is where they see it): the floor band and high-risk rule of the rev
+    /// it makes, and the floor phase types it adds. `null` / empty for a duplicate.
+    pub band: Option<String>,
+    pub high_risk: Option<bool>,
+    pub floor_added: Vec<String>,
 }
 
 /// An accepted plan rev: the body of its `plan.accepted` (§6 row 5).

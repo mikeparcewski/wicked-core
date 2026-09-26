@@ -178,3 +178,140 @@ fn an_edit_is_validated_like_a_launch_plan() {
     assert!(!ok.duplicate, "the refused calls did not spend the id");
     assert_eq!(held(&store), 1);
 }
+
+/// Rewrite the fixture run's plan state.
+fn with_plan_state(store: &mut dyn GraphStore, f: impl FnOnce(&mut TeamPlanState)) {
+    let mut s = crate::domain::get_session(&*store, "r").unwrap().unwrap();
+    f(s.team_plan.as_mut().unwrap());
+    put_node(store, s.to_node()).unwrap();
+}
+
+/// (round 4) The answer shows what the edit does to the run's risk (the operator decision stands:
+/// the human's own edit opens no gate, so this is where they see it): the dry run's `band`,
+/// `high_risk` and the floor phases it adds. A plan with no creator at a ratcheted 100 has an
+/// empty floor; adding `produce` makes it owe the 70-100 floor.
+#[test]
+fn the_answer_carries_the_band_high_risk_and_floor_additions_of_the_edit() {
+    let mut store = open_store(Some(":memory:")).unwrap();
+    fixture(
+        &mut store,
+        SessionStatus::Executing,
+        serde_json::json!([
+            {"catalog": "understand", "id": "understand", "added_by": "plan"},
+            {"catalog": "critique", "id": "critique", "added_by": "plan"}
+        ]),
+        &[
+            ("understand", UnitStatus::Done, Some(0)),
+            ("critique", UnitStatus::Distributed, None),
+        ],
+        1,
+        &[],
+    );
+    with_plan_state(&mut store, |tp| tp.max_score = 100);
+    let p = propose_plan(
+        &mut store,
+        "r",
+        plan(serde_json::json!({"steps": [{"catalog": "produce"}]})),
+        "req-risk",
+    )
+    .unwrap();
+    let v = serde_json::to_value(&p).unwrap();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "band",
+            "duplicate",
+            "floor_added",
+            "high_risk",
+            "proposal_id"
+        ]
+    );
+    assert_eq!(v["band"], "70-100");
+    assert_eq!(v["high_risk"], true);
+    let mut added: Vec<&str> = v["floor_added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    added.sort_unstable();
+    assert_eq!(
+        added,
+        ["architecture", "design", "security_review", "test_plan"]
+    );
+    // A duplicate re-decides nothing: no band, no risk, no additions.
+    let again = propose_plan(
+        &mut store,
+        "r",
+        plan(serde_json::json!({"steps": [{"catalog": "produce"}]})),
+        "req-risk",
+    )
+    .unwrap();
+    let a = serde_json::to_value(&again).unwrap();
+    assert_eq!(
+        (
+            a["duplicate"].clone(),
+            a["band"].clone(),
+            a["high_risk"].clone()
+        ),
+        (
+            true.into(),
+            serde_json::Value::Null,
+            serde_json::Value::Null
+        )
+    );
+}
+
+/// (round 4) While a plan is held for approval, a mid-run edit is refused (the edit belongs at
+/// the gate, where it is the answer): nothing is held and the request id is not spent.
+#[test]
+fn an_edit_while_a_plan_awaits_approval_is_refused() {
+    let mut store = open_store(Some(":memory:")).unwrap();
+    fixture(
+        &mut store,
+        SessionStatus::AwaitingHuman,
+        serde_json::json!([
+            {"catalog": "understand", "id": "understand", "added_by": "plan"},
+            {"catalog": "critique", "id": "critique", "added_by": "plan"}
+        ]),
+        &[
+            ("understand", UnitStatus::Done, Some(0)),
+            ("critique", UnitStatus::Distributed, None),
+        ],
+        1,
+        &[],
+    );
+    with_plan_state(&mut store, |tp| {
+        tp.rev = 2;
+        tp.pending = Some(crate::plan_gate::PendingPlan {
+            rev: 2,
+            proposal_id: "p-held".into(),
+            reviewing_ord: Some(1),
+            steps: tp.accepted.as_ref().unwrap().steps.clone(),
+            band: "0-19".into(),
+            high_risk: false,
+            floor_override: None,
+            reason: "manual_mode".into(),
+            floor_added: Vec::new(),
+            gate_id: Some("g-r-1".into()),
+            refusal: None,
+        });
+    });
+    let e = propose_plan(
+        &mut store,
+        "r",
+        plan(serde_json::json!({"steps": [{"catalog": "design"}]})),
+        "req-g",
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("awaiting approval"), "{e}");
+    assert_eq!(held(&store), 0);
+    let tp = crate::domain::get_session(&store, "r")
+        .unwrap()
+        .unwrap()
+        .team_plan
+        .unwrap();
+    assert!(tp.edit_requests.is_empty(), "the request id is not spent");
+}

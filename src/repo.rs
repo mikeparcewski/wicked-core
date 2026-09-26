@@ -742,6 +742,30 @@ impl RunBase {
 /// is never fallen back from: a ref that does not resolve is an `Err` naming it (the launch fails
 /// `WorktreeFailed` → `sessionFailed`), because basing a revision on the default branch instead
 /// would ship a DUPLICATE pull request. `None` ⇒ the remote-default resolution below.
+/// The base a launch's worktree would start from, read WITHOUT touching the network or any ref:
+/// the remote default's LOCAL tracking tip (`origin/HEAD`, else `origin/main` / `origin/master`),
+/// else the clone's `HEAD`. What a preview scores against (`Core::preview_plan`); the launch
+/// itself fetches first ([`resolve_run_base`]), so a stale clone can start a little further on.
+pub(crate) fn local_run_base(repo_root: &str) -> anyhow::Result<String> {
+    let rev = crate::deliver_lift::resolve_remote_default(Path::new(repo_root))
+        .unwrap_or_else(|| "HEAD".to_string());
+    let (ok, tip, err) = git(
+        repo_root,
+        &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")],
+    )?;
+    if !ok || tip.is_empty() {
+        anyhow::bail!(
+            "{repo_root}: cannot resolve {rev}, the base a launch would start from{}",
+            if err.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", err.trim())
+            }
+        );
+    }
+    Ok(tip)
+}
+
 pub(crate) fn resolve_run_base(repo_root: &str, explicit: Option<&str>) -> anyhow::Result<RunBase> {
     let (ok, head, err) = git(repo_root, &["rev-parse", "HEAD"])?;
     if !ok || head.is_empty() {

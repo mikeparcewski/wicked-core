@@ -1443,13 +1443,15 @@ impl Core {
     }
 
     /// (DES-TEAMING-002 T8 (e)) Preview a launch of `plan`: what the launch would compute, with
-    /// nothing persisted or published — the plan (a preset resolves in `project_id`), the launch's
-    /// synchronous refusals, the intent score, floor fill, approval matrix and the def's planning
-    /// checks. `repo_ref` names the registered repo the launch would run on: its root and the base
-    /// commit its worktree would start from are resolved here (off the actor, as the launch does),
-    /// and the score reads that repo's code graph; without one (or when it cannot be read) the
-    /// preview says `graph: "unavailable"`. `deliver_step` is the launch's. `Err` carries the
-    /// launch's refusal.
+    /// nothing persisted or published — the launch's synchronous refusals, the intent score, floor
+    /// fill, approval matrix and the def's planning checks. `project_id` is passed to the launch's
+    /// plan resolution, which only a preset NAME depends on, so it does not change a plan's
+    /// preview. `repo_ref` names the registered repo the launch would run on; for a behavioural
+    /// touch set the score reads that repo's code graph at the base a launch would start from, read
+    /// locally with NO fetch (the local remote-default tip, else HEAD — the launch fetches first,
+    /// so a stale clone may start further on). No usable graph: `graph: "unavailable"` and the
+    /// fail-closed score. `deliver_step` is the launch's. `Err` carries the launch's refusal, an
+    /// unregistered repo, or a base that cannot be resolved.
     pub fn preview_plan(
         &self,
         plan: PlanSteps,
@@ -1458,9 +1460,15 @@ impl Core {
         deliver_step: Option<PlanStep>,
         human_confirm: HumanConfirm,
     ) -> anyhow::Result<PlanPreview> {
-        // The repo the launch would run on, and the base its worktree would start from — resolved
-        // HERE, on the caller's thread, as the launch resolves it off the actor (a fetch may run).
-        // A base that cannot be resolved leaves the score without a graph (`graph: "unavailable"`).
+        // The repo the launch would run on and the base its worktree would start from, read on
+        // the caller's thread with NO fetch (`repo::local_run_base`: the local remote-default tip,
+        // else HEAD) — a preview never touches the user's refs or waits on the network. The base
+        // is read only when the score needs the graph (a behavioural touch set); an unresolvable
+        // base is an error, never a silent fail-closed score.
+        let behavioural = plan.touch.as_ref().is_some_and(|t| {
+            let t: Vec<&str> = t.iter().map(String::as_str).collect();
+            !t.is_empty() && crate::review_scale::signals_from_paths(&t).behavioural()
+        });
         let (repo_root, base_commit) = match repo_ref {
             None => (None, None),
             Some(id) => {
@@ -1469,9 +1477,11 @@ impl Core {
                     .into_iter()
                     .find(|r| r.id == id)
                     .ok_or_else(|| anyhow::anyhow!("repo not registered: {id}"))?;
-                let base = crate::repo::resolve_run_base(&repo.root_path, None)
-                    .ok()
-                    .map(|b| b.commit);
+                let base = if behavioural {
+                    Some(crate::repo::local_run_base(&repo.root_path)?)
+                } else {
+                    None
+                };
                 (Some(std::path::PathBuf::from(repo.root_path)), base)
             }
         };
@@ -1496,9 +1506,13 @@ impl Core {
     /// steps to ADD, held and applied at the run's next step boundary through the same revision
     /// path as the PA's `PLAN+` (the ratchet and floor fill apply; the edit only adds), published
     /// as `plan.proposed{by:"human", kind:"edit"}`. Its author approved it, like an edit at the
-    /// gate: no `plan_approval` gate opens for it, and it is accepted as `plan.accepted{by:"human"}`. Idempotent by `request_id`: a repeat holds and
-    /// publishes nothing (`duplicate: true`). `Err` for an unknown, finished or un-planned run, or
-    /// a plan carrying `touch` / `override` (launch-plan fields: an edit only adds steps).
+    /// gate: no `plan_approval` gate opens for it, and it is accepted as `plan.accepted{by:"human"}`
+    /// — so the answer carries what it does to the run (`band`, `high_risk`, `floor_added`, from
+    /// the dry run it is validated by). Idempotent by `request_id`: a repeat holds and publishes
+    /// nothing (`duplicate: true`). `Err` for an unknown, finished or un-planned run, a plan held
+    /// for approval (edit it at the gate), a started deliver step, an edit the revision would
+    /// refuse, or a plan carrying `touch` / `override` (launch-plan fields: an edit only adds). An
+    /// edit still held when the run ends is refused on the bus (`plan.refused`).
     pub fn propose_plan(
         &self,
         run_id: &str,
