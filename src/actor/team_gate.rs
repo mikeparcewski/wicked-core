@@ -2525,8 +2525,11 @@ pub(super) fn on_rescored(
     let Some(tp) = session.team_plan.as_ref().filter(|t| t.accepted_rev > 0) else {
         return Ok(());
     };
-    let scored =
-        crate::plan_gate::diff_score_for_run(paths, root.as_deref(), session.base_commit.as_deref());
+    let scored = crate::plan_gate::diff_score_for_run(
+        paths,
+        root.as_deref(),
+        session.base_commit.as_deref(),
+    );
     let score = scored.assessment.score;
     if !crate::plan_gate::floor_rises(tp, score, scored.destructive) {
         return Ok(());
@@ -2573,9 +2576,6 @@ pub(super) fn revise_at_boundary(
     run_id: &str,
     output: &crate::workflow::StepOutput,
 ) -> anyhow::Result<()> {
-    if !run_id.is_empty() {
-        return Ok(()); // T4 red: the boundary does not revise yet
-    }
     let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
         return Ok(());
     };
@@ -2601,7 +2601,10 @@ pub(super) fn revise_at_boundary(
     // or its review of a member's step.
     let pa = session.clis.first().cloned().unwrap_or_default();
     if let Some(u) = finished.filter(|_| output.status == crate::workflow::StepStatus::Ok) {
-        let reviewing = u.member_step.as_ref().is_some_and(|m| m.reviewing.is_some());
+        let reviewing = u
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some());
         if u.assigned_cli.as_deref() == Some(pa.as_str()) || reviewing {
             changes.extend(crate::plan_gate::changes_from_output(
                 &output.output,
@@ -2720,7 +2723,12 @@ pub(super) fn revise_units(
                 .to_string(),
                 skill_ref: u.skill_ref.clone(),
                 has_validator_pin: u.validator.is_some(),
-                executor_type: if u.tool_cmd.is_some() { "tool" } else { "agent" }.to_string(),
+                executor_type: if u.tool_cmd.is_some() {
+                    "tool"
+                } else {
+                    "agent"
+                }
+                .to_string(),
             },
         );
     }

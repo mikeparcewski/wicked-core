@@ -204,9 +204,6 @@ pub(crate) fn revise(
     reviewing_ord: Option<u32>,
     now: i64,
 ) -> anyhow::Result<Revised> {
-    if !run_id.is_empty() {
-        anyhow::bail!("T4 red: revise is not implemented");
-    }
     let auto = is_auto(human_confirm);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
     let base = match (&prior.pending, &prior.accepted) {
@@ -506,12 +503,7 @@ pub(crate) fn parse_plan_lines(output: &str) -> Vec<PlanLine> {
 /// The step output's plan changes, in order (§8.7 triggers 1–2): a `PLAN+` right after the PA's
 /// `PLAN <change_id>: ACCEPT` restates that member request (`member_request`, sourced by its
 /// `change_id`); any other `PLAN+` is the PA's own (`pa_added`, sourced `ord:attempt:seq`).
-pub(crate) fn changes_from_output(
-    output: &str,
-    by: &str,
-    ord: u32,
-    attempt: u32,
-) -> Vec<Change> {
+pub(crate) fn changes_from_output(output: &str, by: &str, ord: u32, attempt: u32) -> Vec<Change> {
     let mut out = Vec::new();
     let mut accepted: Option<String> = None;
     let mut seq = 0u32;

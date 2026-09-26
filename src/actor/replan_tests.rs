@@ -172,8 +172,7 @@ fn engine(name: &str, worker: Arc<Worker>) -> Engine {
         // No supervisor in these rigs: the worker synthesizes its (empty) ledger after this.
         .with_final_pass_budget(Duration::from_millis(300))
         .with_gate_poll(Duration::from_millis(20));
-    let core =
-        Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), worker.clone(), cfg);
+    let core = Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), worker.clone(), cfg);
     let _ = worker.tx.set(core.tx.clone());
     let events = core.subscribe();
     core.ping();
@@ -300,7 +299,10 @@ fn step_ids(steps: &Value) -> Vec<String> {
 
 /// The PA's step output: 200+ characters of prose, then its lines.
 fn pa_output(lines: &str) -> String {
-    format!("{}\n{lines}\n", "The step is done; the work is described here. ".repeat(6))
+    format!(
+        "{}\n{lines}\n",
+        "The step is done; the work is described here. ".repeat(6)
+    )
 }
 
 // ── the operator item + (b) + (c): the diff re-score raises the floor into high risk ─────────────
@@ -321,8 +323,10 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
         &e,
         "op",
         HumanConfirm::None,
-        plan(json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
-                    "touch": ["README.md"]})),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
     );
     e.wait_awaiting("op", crate::plan_gate::GATE_KIND, 1);
     // The initial plan went through with no approval: the only plan gate is the revision's.
@@ -401,7 +405,9 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
     assert_eq!(v.units[0].status, crate::domain::UnitStatus::Done);
     // (c) approve: the first new unit dispatches, once; the done creator never again.
     e.core.confirm_gate("op", approve()).unwrap();
-    wait_for("the first new unit to dispatch", || e.worker.calls().len() >= 2);
+    wait_for("the first new unit to dispatch", || {
+        e.worker.calls().len() >= 2
+    });
     std::thread::sleep(Duration::from_millis(300));
     let calls = e.worker.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
@@ -428,10 +434,14 @@ fn t4_a_a_lower_rescore_publishes_nothing() {
         &e,
         "low",
         HumanConfirm::None,
-        plan(json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
-                    "touch": ["README.md"]})),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
     );
-    wait_for("the second unit to dispatch", || e.worker.calls().len() >= 2);
+    wait_for("the second unit to dispatch", || {
+        e.worker.calls().len() >= 2
+    });
     std::thread::sleep(Duration::from_millis(300));
     assert!(payloads(&e, "low", tev::PATH_SCORED)
         .iter()
@@ -457,8 +467,10 @@ fn t4_b_d_a_pa_revision_in_auto_mode_below_high_risk_does_not_pause() {
         &e,
         "pa",
         HumanConfirm::None,
-        plan(json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
-                    "touch": ["README.md"]})),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
     );
     wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
     let proposed = payloads(&e, "pa", tev::PLAN_PROPOSED);
@@ -473,7 +485,10 @@ fn t4_b_d_a_pa_revision_in_auto_mode_below_high_risk_does_not_pause() {
     assert_eq!(revised[0]["reason"], "pa_added");
     assert_eq!(revised[0]["proposal_id"], change["proposal_id"]);
     assert_eq!(revised[0]["high_risk"], false);
-    assert!(e.awaiting("pa").is_empty(), "no pause below high risk in auto mode");
+    assert!(
+        e.awaiting("pa").is_empty(),
+        "no pause below high risk in auto mode"
+    );
     let accepted = payloads(&e, "pa", tev::PLAN_ACCEPTED);
     let last = accepted.last().unwrap();
     assert_eq!(last["plan_rev"], 2);
@@ -505,8 +520,10 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
         &e,
         "man",
         HumanConfirm::Before(99),
-        plan(json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
-                    "touch": ["README.md"]})),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
     );
     e.wait_awaiting("man", crate::plan_gate::GATE_KIND, 1);
     e.core.confirm_gate("man", approve()).unwrap();
@@ -526,7 +543,9 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
             },
         )
         .unwrap();
-    wait_for("the first unit after the edit", || e.worker.calls().len() >= 2);
+    wait_for("the first unit after the edit", || {
+        e.worker.calls().len() >= 2
+    });
     let proposed: Vec<Value> = payloads(&e, "man", tev::PLAN_PROPOSED)
         .into_iter()
         .filter(|p| p["kind"] != "initial")
@@ -576,8 +595,10 @@ fn t4_e_an_accepted_member_request_is_a_revision_from_the_pa_output() {
         &e,
         "mem",
         HumanConfirm::None,
-        plan(json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
-                    "touch": ["README.md"]})),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
     );
     wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
     let revised = payloads(&e, "mem", tev::PLAN_REVISED);
@@ -609,8 +630,10 @@ fn t4_e_a_change_requested_without_the_pa_answer_is_no_revision() {
         &e,
         "req",
         HumanConfirm::None,
-        plan(json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
-                    "touch": ["README.md"]})),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
     );
     wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
     std::thread::sleep(Duration::from_millis(300));
@@ -627,7 +650,10 @@ fn t4_e_the_actor_never_polls_the_bus() {
         ("actor.rs", include_str!("../actor.rs")),
         ("actor/team_gate.rs", include_str!("team_gate.rs")),
         ("plan_gate.rs", include_str!("../plan_gate.rs")),
-        ("plan_gate/revise.rs", include_str!("../plan_gate/revise.rs")),
+        (
+            "plan_gate/revise.rs",
+            include_str!("../plan_gate/revise.rs"),
+        ),
     ] {
         for needle in [".poll(", "read_run(", "TEAM_FILTER", "BusDb::open"] {
             assert!(!src.contains(needle), "{name} must not call `{needle}`");

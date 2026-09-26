@@ -1714,7 +1714,9 @@ fn rescoring(name: &str) -> (Harness, std::sync::mpsc::Receiver<crate::command::
 }
 
 /// `(ord, attempt, rescore_seq, paths)` of every re-score the engine received.
-fn rescores(rx: &std::sync::mpsc::Receiver<crate::command::Command>) -> Vec<(u32, u32, u32, Vec<String>)> {
+fn rescores(
+    rx: &std::sync::mpsc::Receiver<crate::command::Command>,
+) -> Vec<(u32, u32, u32, Vec<String>)> {
     rx.try_iter()
         .filter_map(|c| match c {
             crate::command::Command::TeamRescored {
@@ -1752,7 +1754,10 @@ fn t4_f_a_checkpoint_burst_is_one_rescore_and_completion_adds_one() {
     // The step completes on the SAME tree: no second re-score.
     h.complete(1, 0, "claude#1", "ok");
     h.pump();
-    assert!(rescores(&rx).is_empty(), "an unchanged tree is not re-scored");
+    assert!(
+        rescores(&rx).is_empty(),
+        "an unchanged tree is not re-scored"
+    );
     // Another attempt whose tree moves after its last checkpoint: completion re-scores it.
     h.claim(1, 1, "claude#1");
     h.pump();

@@ -1075,9 +1075,6 @@ pub enum Job {
 /// baseline to the engine (`Command::TeamRescored`), which scores them against the run's graph.
 /// `at_completion`: the re-score at `step.completed` (only a changed tree is needed).
 pub fn rescore(unit: &Arc<Mutex<UnitTeam>>, at_completion: bool) {
-    if !at_completion || at_completion {
-        return; // T4 red: no re-score is sent yet
-    }
     let (repo, baseline, engine, key) = {
         let mut u = unit.lock().unwrap_or_else(|p| p.into_inner());
         if !at_completion {

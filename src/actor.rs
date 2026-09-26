@@ -3613,7 +3613,9 @@ pub(crate) fn run(
                     &tree,
                     &paths,
                 ) {
-                    eprintln!("wicked-core: run {run_id}: the diff re-score was not applied ({e:#})");
+                    eprintln!(
+                        "wicked-core: run {run_id}: the diff re-score was not applied ({e:#})"
+                    );
                 }
             }
             Command::RegisterComposed { def, reply } => {
@@ -9031,9 +9033,15 @@ fn stage_edit(
         crate::plan_gate::Verdict::Held { .. } => {
             anyhow::bail!("run {run_id}: an edit approved at the gate cannot be held again")
         }
-        crate::plan_gate::Verdict::Accepted { def } => {
-            staged_accepted(store, session, state, decided.state, decided.events, def, now)
-        }
+        crate::plan_gate::Verdict::Accepted { def } => staged_accepted(
+            store,
+            session,
+            state,
+            decided.state,
+            decided.events,
+            def,
+            now,
+        ),
     }
 }
 

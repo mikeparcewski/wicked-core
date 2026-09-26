@@ -79,7 +79,10 @@ fn floor(score: u8) -> Change {
         rescore_seq: 1,
         score,
         destructive: false,
-        fact: crate::plan_gate::queued_facts(&[fact]).unwrap().pop().unwrap(),
+        fact: crate::plan_gate::queued_facts(&[fact])
+            .unwrap()
+            .pop()
+            .unwrap(),
     })
 }
 
@@ -119,7 +122,10 @@ fn t4_a_a_rescore_into_40_69_adds_test_plan_and_design_after_the_cursor() {
     assert_eq!(types, [crate::team::events::PATH_SCORED, PLAN_REVISED]);
     let b = revised(&r);
     assert_eq!(b.reason, ReviseReason::FloorRaised);
-    assert_eq!((b.from_band.as_str(), b.to_band.as_str()), ("20-39", "40-69"));
+    assert_eq!(
+        (b.from_band.as_str(), b.to_band.as_str()),
+        ("20-39", "40-69")
+    );
     assert!(!b.high_risk);
     assert_eq!(b.proposal_id, None);
     let added: Vec<(&str, Option<bool>)> = b
@@ -148,7 +154,10 @@ fn t4_a_a_lower_or_same_band_score_does_not_rise() {
     assert!(!floor_rises(&s, 10, false));
     assert!(!floor_rises(&s, 45, false), "same band 40-69");
     assert!(floor_rises(&s, 70, false));
-    assert!(floor_rises(&s, 45, true), "destructive is high risk in any band");
+    assert!(
+        floor_rises(&s, 45, true),
+        "destructive is high risk in any band"
+    );
 }
 
 /// (b) Into high risk in auto mode holds the revision (`into_high_risk`); in manual mode every
@@ -163,9 +172,16 @@ fn t4_b_into_high_risk_holds_in_auto_and_every_revision_holds_in_manual() {
     assert_eq!(p.reason, "into_high_risk");
     assert_eq!(p.reviewing_ord, Some(1));
     assert!(p.high_risk);
-    assert_eq!(r.state.accepted_rev, 1, "nothing accepted until the gate is answered");
+    assert_eq!(
+        r.state.accepted_rev, 1,
+        "nothing accepted until the gate is answered"
+    );
     let manual = HumanConfirm::Before(99);
-    let s = accepted(json!([{"catalog":"build"},{"catalog":"review"}]), 25, &manual);
+    let s = accepted(
+        json!([{"catalog":"build"},{"catalog":"review"}]),
+        25,
+        &manual,
+    );
     let r = revise("r", &s, floor(50), &["build".into()], &manual, Some(1), 0).unwrap();
     assert!(matches!(r.outcome, Outcome::Held { .. }));
     assert_eq!(r.state.pending.as_ref().unwrap().reason, "manual_mode");
@@ -205,7 +221,10 @@ fn t4_c_a_floor_phase_before_a_done_step_is_late_at_the_cursor() {
         .iter()
         .map(|s| s.id.as_str())
         .collect();
-    assert_eq!(logical, ["understand", "test_plan", "design", "build", "review"]);
+    assert_eq!(
+        logical,
+        ["understand", "test_plan", "design", "build", "review"]
+    );
     let r2 = revise("r", &r.state, floor(90), &done, &hc, Some(2), 0).unwrap();
     assert!(matches!(r2.outcome, Outcome::Held { .. }), "into high risk");
 }
