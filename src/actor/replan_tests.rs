@@ -1437,7 +1437,9 @@ fn git_repo(dir: &std::path::Path) -> (std::path::PathBuf, String) {
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     let git = |args: &[&str]| {
+        use wicked_apps_core::spawn::HardenedCommand;
         let out = std::process::Command::new("git")
+            .hardened()
             .arg("-C")
             .arg(&repo)
             .args(args)
