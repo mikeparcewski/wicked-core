@@ -974,16 +974,45 @@ fn run_unit_and_judge_on(
     // DES-002 §8.8: the PA's review of a member's step is team evidence, never the gate — the
     // member's step already had its gate (its creator, the member, excluded). No judge, no floor:
     // the engine reads the `STEP` verdict and the attempt's ledger from this result.
-    if input
-        .unit
-        .member_step
-        .as_ref()
-        .is_some_and(|m| m.reviewing.is_some())
-    {
+    //
+    // The review is a READ-ONLY evaluator turn (`WritePosture::of`), and the worktree guard still
+    // takes its final comparison (review round 2 on #628, D2): a review that changed the member's
+    // tree anyway is undone HERE, before the result reaches the actor, and the outcome rides the
+    // evidence so the actor disputes it instead of counting the member's attempt for a tree that
+    // no longer exists. For every status: an edit left behind by a failed review is undone too.
+    if input.unit.is_member_step_review() {
+        let mut worktree_guard =
+            crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref());
+        if let (Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(m)), Some(wd)) =
+            (worktree_guard.as_mut(), input.workdir.as_deref())
+        {
+            if m.denies() {
+                let suggestion_ref = format!(
+                    "refs/wicked/suggestions/{}/{}/{}",
+                    crate::repo::sanitize_worktree_id(&input.run_id),
+                    input.unit.ord,
+                    input.attempt
+                );
+                match crate::worktree_guard::restore_creator_tree(wd, m, Some(&suggestion_ref)) {
+                    Ok(()) => eprintln!(
+                        "wicked-core: unit {}: the PA's review of a member step changed the tree                          it was reviewing — the edit was discarded and the member's tree {}                          restored in {} (DES-TEAMING-002 §8.8)",
+                        input.unit.ord,
+                        &m.before.tree[..m.before.tree.len().min(10)],
+                        wd.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "wicked-core: unit {}: the PA's review of a member step changed the tree                          and the engine could NOT restore the member's tree in {}: {e}",
+                        input.unit.ord,
+                        wd.display()
+                    ),
+                }
+            }
+        }
         return (
             output,
             None,
             crate::workflow::UnitEvidence {
+                worktree_guard,
                 team: team_snapshot,
                 ..Default::default()
             },

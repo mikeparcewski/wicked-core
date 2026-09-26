@@ -1798,9 +1798,7 @@ pub(super) fn run_owed_step(
 
 /// Whether `u`'s current attempt is the PA's review of a member's step.
 pub(super) fn is_review(u: &WorkUnit) -> bool {
-    u.member_step
-        .as_ref()
-        .is_some_and(|m| m.reviewing.is_some())
+    u.is_member_step_review()
 }
 
 /// A team unit's member step state at dispatch (DES-002 §8.8): an `owner: team` step of a team
@@ -1854,6 +1852,11 @@ pub(super) fn enter_review(
     ms.work_team = work_team;
     unit.assigned_cli = Some(pa);
     unit.status = crate::domain::UnitStatus::Pending;
+    // The review is guarded against the tree the MEMBER left (review round 2 on #628, D2): the
+    // dispatch takes a fresh baseline, never the member's own pre-work one (which would read the
+    // member's work as the review's mutation, and a restore would discard it).
+    unit.worktree_baseline = None;
+    unit.worktree_mutation = None;
     put_node(act.store, unit.to_node())?;
     session.unit_ix = ix;
     session.attempt = next_attempt(unit);
@@ -1987,13 +1990,18 @@ fn rework_member_step(
 /// - REJECT, the member took the rejection, or the council said NO → the rejection stands;
 /// - anything not on record — no `STEP` line, a failed review turn, an incomplete team record, no
 ///   member answer to a rejection, a council with no verdict → a `team_dispute` pause. Nothing
-///   absent ever counts the step.
+///   absent ever counts the step;
+/// - a review that CHANGED the member's tree (the worktree guard's final comparison, taken on the
+///   worker thread, which already restored it), or whose tree could not be compared → a
+///   `team_dispute` pause, whatever its `STEP` line says (review round 2 on #628, D2). The
+///   member's evidence is counted only for the tree the member left.
 pub(super) fn apply_review(
     act: &mut Act<'_>,
     mut session: AgentSession,
     ix: usize,
     output: &crate::workflow::StepOutput,
     worker: Option<UnitTeamSnapshot>,
+    guard: Option<crate::worktree_guard::WorktreeGuardOutcome>,
 ) -> anyhow::Result<Progress> {
     let run_id = session.id.clone();
     let mut units = crate::domain::session_units(act.store, &run_id)?;
@@ -2057,6 +2065,12 @@ pub(super) fn apply_review(
             Vec::new(),
         )
     };
+    // The review is read-only (D2): a changed tree, or one that could not be compared, never
+    // counts the step. Judged before the verdict — an ACCEPT over a rewritten tree certifies the
+    // PA's edit, not the member's work.
+    if let Some(why) = review_tree_refusal(guard.as_ref(), session.workdir.is_some()) {
+        return pause(act, &mut session, why);
+    }
     let Some(line) = line else {
         return pause(
             act,
@@ -2110,6 +2124,52 @@ pub(super) fn apply_review(
             &mut session,
             "the PA rejected it and the member's answer is not on record".to_string(),
         ),
+    }
+}
+
+/// Why the PA's review attempt cannot count a member's step on its tree (D2), or `None` when the
+/// tree is the one the member left: the guard's final comparison was `Clean`, or the run is
+/// unbound (no tree to compare, and none to change).
+fn review_tree_refusal(
+    guard: Option<&crate::worktree_guard::WorktreeGuardOutcome>,
+    bound: bool,
+) -> Option<String> {
+    use crate::worktree_guard::WorktreeGuardOutcome as G;
+    match guard {
+        Some(G::Clean { .. }) => None,
+        None if !bound => None,
+        None => Some(
+            "the review's worktree comparison never ran, so the member's tree cannot be shown \
+             unchanged"
+                .to_string(),
+        ),
+        Some(G::Unverifiable(why)) => Some(format!(
+            "the review's worktree could not be compared against the member's tree ({why})"
+        )),
+        Some(G::Mutated(m)) => {
+            let paths: Vec<String> = m
+                .changed
+                .iter()
+                .map(|c| format!("{} {}", c.status, c.path))
+                .collect();
+            let restored = if m.restored {
+                "the engine restored the member's tree".to_string()
+            } else {
+                format!(
+                    "the engine could NOT restore the member's tree ({})",
+                    m.restore_error.as_deref().unwrap_or("not attempted")
+                )
+            };
+            Some(format!(
+                "the PA's review changed the tree it was reviewing ({}{}); {restored}",
+                if paths.is_empty() {
+                    "no path listed".to_string()
+                } else {
+                    paths.join(", ")
+                },
+                if m.head_moved { "; HEAD moved" } else { "" }
+            ))
+        }
     }
 }
 

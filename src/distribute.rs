@@ -383,10 +383,70 @@ pub(crate) fn distribute_units_against_benched(
         })
         .collect();
     let still_eligible: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+    let team_run = units.iter().any(|u| u.team_run);
+    let pa = team_run
+        .then(|| clis.first().map(|c| c.key.clone()))
+        .flatten();
+    // (DES-TEAMING-002 §8.8, seam T6) A member's step (`owner: team`) of a team run runs on a
+    // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
+    // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
+    // refused, never quietly handed back to the PA (team runs never fall back to one seat).
+    //
+    // Placed BEFORE the evaluator≠creator fence (review round 2 on #628, D1): the fence reads
+    // the builder seats, and a member build it did not see on its final seat would let a
+    // review/test unit land on that very seat (codex grading codex's build). One ordering — the
+    // fence judges final seats — not a second check.
+    if team_run {
+        let mut stranded: Vec<u32> = Vec::new();
+        for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
+            let Some(pa) = pa.as_deref() else {
+                break;
+            };
+            if u.tool_cmd.is_some()
+                || u.owner != crate::workflow::StepOwner::Team
+                || d.assigned_cli != pa
+            {
+                continue;
+            }
+            let admits = |k: &&String| {
+                k.as_str() != pa
+                    && match cands {
+                        Some((eligible, _)) => eligible.iter().any(|c| &c.key == *k),
+                        None => true,
+                    }
+            };
+            let pick = still_eligible
+                .iter()
+                .filter(admits)
+                .find(|k| model_of(k) != model_of(pa))
+                .or_else(|| still_eligible.iter().find(admits))
+                .cloned();
+            match pick {
+                Some(k) => {
+                    d.assigned_invocation = invocation_of(clis, &k);
+                    d.routing = RoutingInfo::Teamed { winner: k.clone() };
+                    d.assigned_cli = k;
+                }
+                None => stranded.push(u.ord),
+            }
+        }
+        if !stranded.is_empty() {
+            return Err(crate::NoEligibleSeat {
+                run_id: session_id.to_string(),
+                benched: format!(
+                    "member step(s) {stranded:?} of a team run need a seat distinct from the PA \
+                     ({}); add a signed-in {} to the roster",
+                    pa.clone().unwrap_or_default(),
+                    next_instance_key(configured, model_of(pa.as_deref().unwrap_or("claude")))
+                ),
+                benched_seats: benched.clone(),
+            }
+            .into());
+        }
+    }
     // (DES-TEAMING-002 §8.1, seam D1) A TEAM RUN — units of the run's composed per-run def,
     // stamped `team_run` at plan time — never grades on its creator seat and prefers a distinct
     // CLI over a second instance of the creator's.
-    let team_run = units.iter().any(|u| u.team_run);
     let (same_seat, same_cli_instance) = enforce_evaluator_distinct(
         units,
         &mut dists,
@@ -394,6 +454,7 @@ pub(crate) fn distribute_units_against_benched(
         clis,
         &candidates,
         team_run,
+        pa.as_deref(),
     );
     // (AC-3 / core#537, core#560) When a benched seat — from ANY source (launcher health probe,
     // or a worker transcript persisted on the session) — made evaluator≠creator unsatisfiable,
@@ -454,59 +515,6 @@ pub(crate) fn distribute_units_against_benched(
             benched_seats: benched.clone(),
         }
         .into());
-    }
-    // (DES-TEAMING-002 §8.8, seam T6) A member's step (`owner: team`) of a team run runs on a
-    // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
-    // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
-    // refused, never quietly handed back to the PA (team runs never fall back to one seat).
-    if team_run {
-        let pa = clis.first().map(|c| c.key.clone());
-        let mut stranded: Vec<u32> = Vec::new();
-        for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
-            let Some(pa) = pa.as_deref() else {
-                break;
-            };
-            if u.tool_cmd.is_some()
-                || u.owner != crate::workflow::StepOwner::Team
-                || d.assigned_cli != pa
-            {
-                continue;
-            }
-            let admits = |k: &&String| {
-                k.as_str() != pa
-                    && match cands {
-                        Some((eligible, _)) => eligible.iter().any(|c| &c.key == *k),
-                        None => true,
-                    }
-            };
-            let pick = still_eligible
-                .iter()
-                .filter(admits)
-                .find(|k| model_of(k) != model_of(pa))
-                .or_else(|| still_eligible.iter().find(admits))
-                .cloned();
-            match pick {
-                Some(k) => {
-                    d.assigned_invocation = invocation_of(clis, &k);
-                    d.routing = RoutingInfo::Teamed { winner: k.clone() };
-                    d.assigned_cli = k;
-                }
-                None => stranded.push(u.ord),
-            }
-        }
-        if !stranded.is_empty() {
-            return Err(crate::NoEligibleSeat {
-                run_id: session_id.to_string(),
-                benched: format!(
-                    "member step(s) {stranded:?} of a team run need a seat distinct from the PA \
-                     ({}); add a signed-in {} to the roster",
-                    pa.clone().unwrap_or_default(),
-                    next_instance_key(configured, model_of(pa.as_deref().unwrap_or("claude")))
-                ),
-                benched_seats: benched.clone(),
-            }
-            .into());
-        }
     }
     // (F-7R2-006 rule 4) `degradedReason` on EVERY unit whenever eligible < configured. The
     // evaluator≠creator fallback is a FIELD (core#461, core#591): `creator_seat` for a
@@ -662,6 +670,9 @@ fn enforce_evaluator_distinct(
     // of a builder's cli only when no model-distinct seat admits the unit. `false` keeps today's
     // roster-order pick.
     prefer_model_distinct: bool,
+    // (DES-TEAMING-002 §8.8) A team run's PA seat: a member's own step (`owner: team`) the fence
+    // moves is never moved onto it — a member step is never the PA's.
+    team_pa: Option<&str>,
 ) -> (Vec<u32>, Vec<u32>) {
     use crate::domain::StageKind;
     let mut same_seat: Vec<u32> = Vec::new();
@@ -711,7 +722,12 @@ fn enforce_evaluator_distinct(
                 Some((eligible, _)) => eligible.iter().any(|c| &c.key == k),
                 None => true,
             };
-            let distinct = |k: &&String| !builder_clis.contains(*k) && admits(k);
+            let member_step = u.owner == crate::workflow::StepOwner::Team;
+            let distinct = |k: &&String| {
+                !builder_clis.contains(*k)
+                    && admits(k)
+                    && !(member_step && team_pa.is_some_and(|pa| pa == k.as_str()))
+            };
             let model_distinct = prefer_model_distinct
                 .then(|| {
                     roster_keys
@@ -1574,6 +1590,7 @@ mod tests {
             &clis,
             &[None, None],
             false,
+            None,
         );
         assert_eq!(
             same,

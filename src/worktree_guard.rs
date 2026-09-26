@@ -788,8 +788,12 @@ pub(crate) fn outcome_for_unit(
 /// Whether the guard governs `unit` at all: a def-driven, agent-executed unit whose phase declared
 /// `executes_code: false` ([`crate::domain::WorkUnit::worktree_guarded`], set at plan time). Tool
 /// units are the engine's own deterministic commands (a `deliver` push MOVES `HEAD` on purpose).
+///
+/// The PA's review attempt of a member's step is guarded too (review round 2 on #628, D2): it is
+/// an evaluator turn over the member's tree, so a change it makes is caught, undone and disputed,
+/// never adopted as the member's work.
 pub(crate) fn applies_to(unit: &crate::domain::WorkUnit) -> bool {
-    unit.worktree_guarded && unit.tool_cmd.is_none()
+    (unit.worktree_guarded || unit.is_member_step_review()) && unit.tool_cmd.is_none()
 }
 
 fn short(id: &str) -> &str {

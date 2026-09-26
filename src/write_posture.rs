@@ -73,6 +73,12 @@ impl WritePosture {
         if !crate::worktree_guard::applies_to(unit) {
             return WritePosture::Full;
         }
+        // The PA's review of a member's step (DES-TEAMING-002 §8.8) is an evaluator turn whatever
+        // the step's own role: its verdict is its output, and the tree is the member's
+        // (review round 2 on #628, D2).
+        if unit.is_member_step_review() {
+            return WritePosture::ReadOnly;
+        }
         match unit.role {
             PhaseRole::Creator if bound => WritePosture::DeliverableRoots,
             PhaseRole::Creator => WritePosture::Full,

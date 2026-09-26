@@ -389,13 +389,10 @@ impl Harness {
                 let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
                     continue;
                 };
-                jobs.extend(self.core.on_row(
-                    &TeamRow {
-                        event_id: ev.event_id,
-                        event,
-                    },
-                    false,
-                ));
+                jobs.extend(self.core.on_row(&TeamRow {
+                    event_id: ev.event_id,
+                    event,
+                }));
             }
             jobs.extend(self.core.due_batches(Instant::now()));
             if batch.is_empty() && jobs.is_empty() {
@@ -919,13 +916,10 @@ fn t6_k_a_row_replayed_and_delivered_live_changes_nothing() {
     let db = BusDb::shared(&h.rig.bus).unwrap();
     for ev in db.poll(TEAM_FILTER, 0, 1000).unwrap() {
         let event = TeamEvent::from_payload(&ev.event_type, &ev.payload).unwrap();
-        let jobs = h.core.on_row(
-            &TeamRow {
-                event_id: ev.event_id,
-                event,
-            },
-            true,
-        );
+        let jobs = h.core.on_row(&TeamRow {
+            event_id: ev.event_id,
+            event,
+        });
         assert!(jobs.is_empty());
     }
     assert_eq!(h.core.units.len(), before);
