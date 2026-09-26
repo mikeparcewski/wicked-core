@@ -242,6 +242,90 @@ fn x1_a_a_small_docs_only_scope_in_auto_mode_proceeds_on_the_light_floor() {
     release_all(&w);
 }
 
+/// core#635: the scope step's id is RESERVED. A plan the PA scopes whose author named a step
+/// `pa-scope` is refused AT LAUNCH — as the preview already refuses it — never dispatched as the
+/// PA's scope step and failed afterwards, when the boundary appends the authored steps beside it.
+/// Both launch spellings through `Core::launch_run`: a user plan and a saved preset. (This path
+/// already refused it through its authored-def check; the campaign path below did not.)
+#[test]
+fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
+    let w = by_unit(|_| None);
+    let e = engine("x635", w.clone());
+    let spec = |run: &str, workflow: Option<&str>, plan: Option<PlanSteps>| LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "core#635".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: crate::EntityMode::Shared,
+        session_id: run.into(),
+        human_confirm: HumanConfirm::None,
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: workflow.map(str::to_string),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+        plan,
+        deliver_step: None,
+    };
+    let authored = json!([{"catalog": "produce", "id": "pa-scope"}]);
+    let err = e
+        .core
+        .launch_run(spec(
+            "x635p",
+            None,
+            Some(plan(json!({ "steps": authored.clone() }))),
+        ))
+        .expect_err("a user plan with an authored `pa-scope` step is refused at launch");
+    assert!(err.to_string().contains("pa-scope"), "{err}");
+    put(&e, "x635-preset", authored);
+    let err = e
+        .core
+        .launch_run(spec("x635s", Some("x635-preset"), None))
+        .expect_err("a preset with an authored `pa-scope` step is refused at launch");
+    assert!(err.to_string().contains("pa-scope"), "{err}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(e.worker.calls().is_empty(), "{:?}", e.worker.calls());
+    release_all(&w);
+}
+
+/// core#635, the path that reproduced it: a campaign node launches through `launch_run_inner`,
+/// which runs `team_plan_at_launch` with no authored-def check, so the scope rev registered and
+/// the authored `pa-scope` step collided only at the scope step's boundary. The reserved id is now
+/// refused where the scope rev is built, before anything registers or persists.
+#[test]
+fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let registry = crate::workflow::WorkflowRegistry::with_defaults();
+    let spec = LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "core#635".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: crate::EntityMode::Shared,
+        session_id: "x635c".into(),
+        human_confirm: HumanConfirm::None,
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: None,
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+        plan: Some(plan(json!({"steps": [
+            {"catalog": "understand", "id": "pa-scope"},
+            {"catalog": "produce", "id": "draft"}
+        ]}))),
+        deliver_step: None,
+    };
+    let Err(err) =
+        crate::actor::team_plan_at_launch(&mut store, &registry, &spec, None, None, false)
+    else {
+        panic!("an authored `pa-scope` step is refused when the scope rev is built");
+    };
+    assert!(err.to_string().contains("pa-scope"), "{err}");
+    assert!(err.to_string().contains("reserved"), "{err}");
+}
+
 /// (X1 b) The PA declares a scope touching an auth module with a high blast radius (forty
 /// importers, no test): the same scorer as a declared touch reads the repo's graph — 80, the
 /// 70-100 band, high risk — so an AUTO-mode run pauses plan_approval before the first unit after

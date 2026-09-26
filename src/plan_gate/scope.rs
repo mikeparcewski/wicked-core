@@ -130,6 +130,15 @@ pub(crate) fn scope_rev(
     prior: TeamPlanState,
     human_confirm: &HumanConfirm,
 ) -> anyhow::Result<(TeamPlanState, WorkflowDef)> {
+    // core#635: the scope step's id is reserved. The boundary appends the authored steps beside
+    // it, so an authored `pa-scope` would dispatch as the PA's scope step and fail only then; the
+    // preview refuses it up front (a duplicate id), and so does the launch.
+    if plan.steps.iter().any(|s| s.id == SCOPE_STEP_ID) {
+        anyhow::bail!(
+            "the launch's plan is refused: step id `{SCOPE_STEP_ID}` is reserved for the PA's \
+             scope step; rename the authored step"
+        );
+    }
     let steps = PlanSteps {
         steps: vec![scope_step(plan, unbound)],
         touch: None,
