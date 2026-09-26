@@ -170,3 +170,13 @@ fn a_core_without_a_bus_refuses() {
         .to_string()
         .contains("no bus"));
 }
+
+/// Arm the hermetic emit spool before `main` (core#311): nothing this binary spawns may spool to
+/// the operator's real replay queue.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
