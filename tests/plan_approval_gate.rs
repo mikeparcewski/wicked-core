@@ -45,7 +45,11 @@ impl Dispatcher for StubDispatcher {
 type Calls = Arc<Mutex<Vec<(String, u32, u32, String)>>>;
 
 /// Records `(run, unit_ix, attempt, unit id)` for every dispatch, then holds the unit until the
-/// test ends, so exactly the dispatches the engine made are observable and nothing runs on.
+/// test ends, so exactly the dispatches the engine made are observable and nothing runs on. The
+/// one exception is the PA's read-only `pa-scope` step (DES-TEAMING-002 X1: the first unit of a
+/// creator plan with no declared touch set, e.g. every preset): it is recorded and answers at
+/// once, with no `SCOPE` line, so the plan fails closed at 100 (`"the PA declared no scope"`) —
+/// the top band these tests pin — and is decided at that step's boundary.
 struct RecordAndHold {
     calls: Calls,
     gate: Arc<(Mutex<bool>, Condvar)>,
@@ -58,6 +62,19 @@ impl StepRunner for RecordAndHold {
             input.attempt,
             input.unit.id.clone(),
         ));
+        if input.unit.id.ends_with(":pa-scope") {
+            return StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "looked around; nothing to declare".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            };
+        }
         let (lock, cv) = &*self.gate;
         let mut done = lock.lock().unwrap();
         while !*done {
@@ -142,7 +159,10 @@ fn spawn(db: &str) -> Rig {
             calls: calls.clone(),
             gate: gate.clone(),
         }),
-        TeamConfig::new(Some(bus), Some(dir.join(TEAM_OUTBOX_FILE))),
+        // A unit that finishes (the PA's `pa-scope` step) folds without a supervisor on the bus:
+        // its worker synthesizes the ledger after this budget.
+        TeamConfig::new(Some(bus), Some(dir.join(TEAM_OUTBOX_FILE)))
+            .with_final_pass_budget(Duration::from_millis(300)),
     );
     let tap = Tap {
         rx: core.subscribe(),
@@ -174,7 +194,8 @@ fn spawn_no_bus(db: &str) -> Rig {
             calls: calls.clone(),
             gate: gate.clone(),
         }),
-        TeamConfig::new(None, Some(dir.join(TEAM_OUTBOX_FILE))),
+        TeamConfig::new(None, Some(dir.join(TEAM_OUTBOX_FILE)))
+            .with_final_pass_budget(Duration::from_millis(300)),
     );
     let tap = Tap {
         rx: core.subscribe(),
@@ -391,9 +412,12 @@ fn approve() -> HumanDecision {
 
 // ── T2 (g) end to end ────────────────────────────────────────────────────────────────────────────
 
-/// T2 (g) + T3 (c): an auto-mode `{plan:{steps:[{catalog:"build"}]}}` with `touch` omitted, and
-/// again with `touch: []`, scores 100 with reason "no declared scope", gets the 70-100 floor, and
-/// pauses `plan_approval` (high risk) BEFORE `build` dispatches. The step's `id` is omitted too,
+/// T2 (g) + T3 (c), as DES-TEAMING-002 rev 13 (X1) states them: an auto-mode
+/// `{plan:{steps:[{catalog:"build"}]}}` with `touch` omitted, and again with `touch: []`, is NOT
+/// scored at launch. Its rev 1 is the PA's read-only `pa-scope` step, accepted by the engine;
+/// that step runs first, and its answer declares no scope, so at its boundary the plan fails
+/// closed at 100 with the reason "the PA declared no scope", gets the 70-100 floor, and pauses
+/// `plan_approval` (high risk) BEFORE `build` dispatches. The step's `id` is omitted too,
 /// exactly as the acceptance spells the payload.
 #[test]
 fn t2_g_c_a_build_plan_with_no_declared_scope_pauses_before_build() {
@@ -411,8 +435,10 @@ fn t2_g_c_a_build_plan_with_no_declared_scope_pauses_before_build() {
         rig.core
             .launch_run(spec(&run, HumanConfirm::None, Some(plan(p))))
             .unwrap();
-        rig.tap.until("the plan_approval pause", |s| {
+        rig.tap.until("the plan_approval pause and its facts", |s| {
             paused_on_plan(s, &run).is_some()
+                && !of_type(s, &run, OPENED).is_empty()
+                && !of_type(s, &run, SCORED).is_empty()
         });
         rig.tap.settle();
         let seen = &rig.tap.seen;
@@ -421,24 +447,40 @@ fn t2_g_c_a_build_plan_with_no_declared_scope_pauses_before_build() {
         assert_eq!(scored.len(), 1, "one intent score");
         assert_eq!(scored[0]["basis"], "intent");
         assert_eq!(scored[0]["score"], 100);
-        assert_eq!(scored[0]["reasons"], json!(["no declared scope"]));
+        assert_eq!(scored[0]["reasons"][0], "the PA declared no scope");
 
         let proposed = of_type(seen, &run, PROPOSED);
         assert_eq!(proposed.len(), 1);
-        assert_eq!(proposed[0]["by"], "human");
+        assert_eq!(
+            proposed[0]["by"], "a",
+            "the PA seat proposed the scoped plan"
+        );
         assert_eq!(proposed[0]["kind"], "initial");
-        assert_eq!(catalogs(&proposed[0]["steps"]), ["build"]);
+        assert_eq!(proposed[0]["base_rev"], 1);
+        assert_eq!(catalogs(&proposed[0]["steps"]), ["understand", "build"]);
 
-        let opened = of_type(seen, &run, OPENED);
+        let accepted = of_type(seen, &run, ACCEPTED);
+        assert_eq!(accepted.len(), 1, "only the scope rev is accepted");
+        assert_eq!(accepted[0]["plan_rev"], 1);
+        assert_eq!(accepted[0]["by"], "engine");
+        assert_eq!(catalogs(&accepted[0]["steps"]), ["understand"]);
+
+        // The scope step is a teamed unit: its own unit_review gate opens and decides first.
+        let opened: Vec<Value> = of_type(seen, &run, OPENED)
+            .into_iter()
+            .filter(|g| g["kind"] == "plan_approval")
+            .collect();
         assert_eq!(opened.len(), 1);
         let g = &opened[0];
-        assert_eq!(g["kind"], "plan_approval");
         assert_eq!(g["band"], "70-100");
         assert_eq!(g["high_risk"], true);
         assert_eq!(g["mode"], "auto");
         assert_eq!(g["reason"], "high_risk");
-        assert_eq!(g["plan_rev"], 1);
-        assert_eq!(g["gate_id"], format!("g-{run}-1"));
+        assert_eq!(g["plan_rev"], 2);
+        assert_eq!(
+            g["reviewing_ord"], 1,
+            "the PA's scope step produced the plan"
+        );
         assert_eq!(
             g["diff"]["added"],
             json!([
@@ -449,30 +491,36 @@ fn t2_g_c_a_build_plan_with_no_declared_scope_pauses_before_build() {
                 "security_review"
             ])
         );
-        assert!(
-            of_type(seen, &run, ACCEPTED).is_empty(),
-            "nothing accepted yet"
-        );
 
-        // The facts, in order: the path first (P1), then proposed → scored → gate opened.
-        assert_eq!(fact_types(seen, &run), [STARTED, PROPOSED, SCORED, OPENED]);
+        // The plan facts, in order: the path first (P1), the scope rev, then (after the scope
+        // step's own unit_review gate) proposed → scored → the plan gate opened.
+        let plan_facts: Vec<String> = facts(seen, &run)
+            .into_iter()
+            .filter(|(t, _, p)| !t.starts_with("wicked.team.step.") && p["kind"] != "unit_review")
+            .map(|(t, _, _)| t)
+            .collect();
+        assert_eq!(plan_facts, [STARTED, ACCEPTED, PROPOSED, SCORED, OPENED]);
 
-        // Paused BEFORE the first unit: nothing dispatched, the cursor has not moved.
-        assert_eq!(unit_ids(&rig.core, &run), FLOOR_70_AROUND_BUILD);
+        // Paused BEFORE `build`: only the scope step ran; the cursor sits on the next unit.
+        let mut units = vec!["pa-scope"];
+        units.extend(FLOOR_70_AROUND_BUILD);
+        assert_eq!(unit_ids(&rig.core, &run), units);
         let (ord, reviewing, _) = paused_on_plan(seen, &run).unwrap();
-        assert_eq!((ord, reviewing), (1, None));
-        assert!(dispatched_ords(seen, &run).is_empty(), "no unit dispatched");
-        assert!(
-            rig.calls.lock().unwrap().is_empty(),
-            "the runner ran nothing"
-        );
+        assert_eq!((ord, reviewing), (2, Some(1)));
+        assert_eq!(dispatched_ords(seen, &run), [(1, 0)], "only the scope step");
+        let calls = rig.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].3, format!("{run}:pa-scope"));
         let s = session(&rig.core, &run);
         assert_eq!(s.status, SessionStatus::AwaitingHuman);
+        assert_eq!(s.unit_ix, 1);
+        let seq = s.team.as_ref().map_or(0, |t| t.gate_seq);
         assert_eq!(
-            (s.unit_ix, s.team.as_ref().map_or(0, |t| t.gate_seq)),
-            (0, 1)
+            g["gate_id"],
+            format!("g-{run}-{seq}"),
+            "the run's latest gate"
         );
-        // A launched plan is a team run: its units come from `<run>:plan-1`.
+        // A launched plan is a team run: its units come from `<run>:plan-<rev>`.
         let views = rig.core.sessions_detail().unwrap();
         let v = views.iter().find(|v| v.session.id == run).unwrap();
         assert!(
@@ -574,7 +622,7 @@ fn a_manual_mode_pauses_plan_approval_before_the_first_unit() {
         (
             "rbb",
             HumanConfirm::Before(1),
-            json!({"steps": [{"catalog": "build"}]}),
+            json!({"steps": [{"catalog": "build"}], "touch": ["src/sso.rs"]}),
             true,
         ),
     ];
@@ -609,7 +657,7 @@ fn d_approve_dispatches_the_cursor_unit_once_and_keeps_the_attempt() {
     let dir = tmp_dir("d");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec("rd", HumanConfirm::None, Some(p)))
         .unwrap();
@@ -667,7 +715,7 @@ fn e_an_edit_below_the_floor_is_accepted_as_rev_2_with_floor_phases_added() {
     let dir = tmp_dir("e");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec("re", HumanConfirm::None, Some(p)))
         .unwrap();
@@ -774,7 +822,7 @@ fn f_reject_cancels() {
     let dir = tmp_dir("f");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec("rf", HumanConfirm::None, Some(p)))
         .unwrap();
@@ -801,7 +849,7 @@ fn g_a_restart_while_paused_keeps_the_gate_open_and_resumable() {
     let dir = tmp_dir("gr");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec("rr", HumanConfirm::None, Some(p)))
         .unwrap();
@@ -854,7 +902,7 @@ fn run_reopen(restart_between: bool) {
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
     let mut all: Vec<CoreEvent> = Vec::new();
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec(run, HumanConfirm::None, Some(p)))
         .unwrap();
@@ -980,6 +1028,7 @@ fn h_a_manual_override_is_recorded_and_an_auto_override_is_refused() {
     let with_override = || {
         plan(json!({
             "steps": [{"catalog": "build", "id": "build"}],
+            "touch": ["src/sso.rs"],
             "override": {"remove": ["architecture"], "reason": "a one-line fix"}
         }))
     };
@@ -1058,9 +1107,11 @@ fn a_preset_launch_becomes_a_team_run() {
     rig.tap.until("the proposed fact", |s| {
         !of_type(s, "rp", PROPOSED).is_empty()
     });
+    // (X1) A preset declares no touch set: its PA scoped it (the `pa-scope` step, rev 1) and
+    // proposed it with the preset's name.
     let proposed = &of_type(&rig.tap.seen, "rp", PROPOSED)[0];
     assert_eq!(proposed["preset"], "my-flow");
-    assert_eq!(proposed["by"], "human");
+    assert_eq!(proposed["by"], "a");
     let views = rig.core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "rp").unwrap();
     assert!(
@@ -1070,6 +1121,7 @@ fn a_preset_launch_becomes_a_team_run() {
     assert_eq!(
         unit_ids(&rig.core, "rp"),
         [
+            "pa-scope",
             "scope",
             "test_plan",
             "design",
@@ -1081,10 +1133,10 @@ fn a_preset_launch_becomes_a_team_run() {
     );
     rig.core.confirm_gate("rp", approve()).unwrap();
     rig.tap
-        .until("plan.accepted", |s| !of_type(s, "rp", ACCEPTED).is_empty());
-    let a = &of_type(&rig.tap.seen, "rp", ACCEPTED)[0];
-    assert_eq!(a["workflow_id"], "rp:plan-1");
-    assert_eq!(a["plan_rev"], 1);
+        .until("plan.accepted", |s| of_type(s, "rp", ACCEPTED).len() >= 2);
+    let a = &of_type(&rig.tap.seen, "rp", ACCEPTED)[1];
+    assert_eq!(a["workflow_id"], "rp:plan-2");
+    assert_eq!(a["plan_rev"], 2);
 }
 
 /// A launch names a plan OR a preset, never both: refused synchronously, no run persisted.
@@ -1130,11 +1182,16 @@ fn a_delivering_preset_launch_carries_its_deliver_step_behind_the_gate() {
     let ids = unit_ids(&rig.core, "rdlv");
     assert_eq!(ids.last().map(String::as_str), Some("deliver"), "{ids:?}");
     assert_eq!(ids.iter().filter(|i| *i == "deliver").count(), 1);
+    rig.tap.until("the proposed fact", |s| {
+        !of_type(s, "rdlv", PROPOSED).is_empty()
+    });
     assert_eq!(
         of_type(&rig.tap.seen, "rdlv", PROPOSED)[0]["preset"],
         "feature"
     );
-    assert!(dispatched_ords(&rig.tap.seen, "rdlv").is_empty());
+    // (X1) Only the PA's read-only scope step ran; the deliver step waits behind the gate.
+    assert_eq!(dispatched_ords(&rig.tap.seen, "rdlv"), [(1, 0)]);
+    assert_eq!(ids[0], "pa-scope", "{ids:?}");
 
     // A deliver step with no plan or preset to ride is refused, never dropped …
     let mut bare = spec("rdlv2", HumanConfirm::None, None);
@@ -1170,7 +1227,7 @@ fn an_edit_that_fails_its_preflight_is_refused_before_anything_changes() {
     let dir = tmp_dir("editpf");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec("rpf", HumanConfirm::None, Some(p)))
         .unwrap();
@@ -1261,10 +1318,11 @@ fn builds(n: usize) -> PlanSteps {
     plan(json!({"steps": vec![json!({"catalog": "build"}); n]}))
 }
 
-/// A plan of exactly the limit in authored build steps with no touch: floor fill (the 70-100
-/// band, since no touch scores 100) would add test_plan, design, architecture, review and
-/// security_review past the limit. The launch is refused SYNCHRONOUSLY, naming the limit and the
-/// floor-added count, with no session persisted.
+/// A plan of exactly the limit in authored build steps with no touch: its PA's `pa-scope` step
+/// (X1) is one more unit, and floor fill (the 70-100 band in the worst case: a missing answer
+/// fails closed at 100) would add test_plan, design, architecture, review and security_review
+/// past the limit. The launch is refused SYNCHRONOUSLY, naming the limit and the floor-added
+/// count, with no session persisted.
 #[test]
 fn a_plan_the_worst_case_floor_would_push_past_the_limit_is_refused_at_launch() {
     let dir = tmp_dir("limit");
@@ -1290,7 +1348,8 @@ fn a_plan_the_worst_case_floor_would_push_past_the_limit_is_refused_at_launch() 
     );
 }
 
-/// A plan that fits WITH the worst-case floor still launches (and floors to exactly the limit).
+/// A plan that fits WITH its scope step and the worst-case floor still launches (and floors to
+/// exactly the limit once its PA's answer — none, so 100 — is scored).
 #[test]
 fn a_plan_that_fits_with_the_worst_case_floor_launches() {
     let dir = tmp_dir("limitok");
@@ -1300,7 +1359,7 @@ fn a_plan_that_fits_with_the_worst_case_floor_launches() {
         .launch_run(spec(
             "rfit",
             HumanConfirm::None,
-            Some(builds(UNIT_LIMIT - 5)),
+            Some(builds(UNIT_LIMIT - 6)),
         ))
         .expect("fits with the floor");
     rig.tap.until("the plan_approval pause", |s| {
@@ -1386,7 +1445,7 @@ fn a_renamed_deliver_step_is_refused_as_a_gate_edit() {
     let dir = tmp_dir("dlvedit");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec("rse", HumanConfirm::None, Some(p)))
         .unwrap();
@@ -1430,7 +1489,7 @@ fn refused_edit_keeps_the_answered_row(with_bus: bool) {
     } else {
         spawn_no_bus(&db)
     };
-    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
     rig.core
         .launch_run(spec(name, HumanConfirm::None, Some(p)))
         .unwrap();

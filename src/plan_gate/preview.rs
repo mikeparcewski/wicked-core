@@ -45,7 +45,11 @@ pub struct PlanPreview {
     /// `"ready"`: the score read the repo's code graph at the base commit. `"not_needed"`: the
     /// touch set is docs-only (or the plan has no creator and no touch set), so no graph enters
     /// the score. `"unavailable"`: the score is the fail-closed one — no repo given, no graph
-    /// indexed, a stale graph, or a creator plan with no declared scope; `reasons` says which.
+    /// indexed or a stale graph; `reasons` says which. `"pending_pa_scope"` (X1): a creator plan
+    /// with no declared touch set — the launch runs the PA's read-only `pa-scope` step first and
+    /// scores the plan from its answer, so `score` / `band` / `steps` are the baseline's (the
+    /// lowest band), not a final score, and `pauses` is manual mode's (an auto-mode run may still
+    /// pause once the PA's scope lands in high risk).
     pub graph: &'static str,
 }
 
@@ -62,7 +66,23 @@ pub(crate) fn preview_plan(
     if let Err(r) = super::precheck(plan, deliver_step, human_confirm) {
         anyhow::bail!("the plan is refused: {}", r.reason);
     }
-    let scored = super::intent_score_for_run(plan, repo_root, base_commit);
+    // (X1) A plan the PA will scope has no score yet: the launch runs its scope step first and
+    // decides the plan from the PA's answer. The preview shows that plan (the scope step first)
+    // floor-filled at the baseline, and says the score is pending — never 100 as if final.
+    let scoping = super::needs_pa_scope(plan);
+    let unbound = repo_root.is_none();
+    let (plan, scored) = if scoping {
+        (
+            super::with_scope_step(plan, unbound),
+            super::scope::pending_scored(unbound),
+        )
+    } else {
+        (
+            plan.clone(),
+            super::intent_score_for_run(plan, repo_root, base_commit),
+        )
+    };
+    let plan = &plan;
     let decided = super::decide(
         PREVIEW_RUN,
         super::Proposal {
@@ -99,6 +119,7 @@ pub(crate) fn preview_plan(
         !t.is_empty() && crate::review_scale::signals_from_paths(&t).behavioural()
     });
     let graph = match (a.signals.is_some(), behavioural) {
+        _ if scoping => super::scope::PENDING_PA_SCOPE,
         (true, true) => "ready",
         (true, false) => "not_needed",
         (false, _) => "unavailable",
@@ -197,47 +218,58 @@ mod tests {
         assert_eq!(p["pause_reason"], "manual_mode");
     }
 
-    /// A creator plan with no declared scope fails closed at 100: high risk, the top band's floor
-    /// added (each floor step with its reason), and a pause in auto mode too.
+    /// (X1) A creator plan with no declared scope is scored by its PA after launch: the preview
+    /// says the score is PENDING (`graph: "pending_pa_scope"`) instead of showing the fail-closed
+    /// 100 as if final — the baseline's band and floor, the PA's read-only `pa-scope` step first, no
+    /// auto-mode pause yet (manual mode always pauses).
     #[test]
-    fn an_undeclared_creator_plan_is_high_risk_floor_filled_and_pauses_in_auto_mode() {
+    fn an_undeclared_creator_plan_previews_as_pending_the_pa_scope() {
         let p = preview(json!({"steps": [{"catalog": "build"}]}), HumanConfirm::None);
-        assert_eq!(p["score"], 100);
-        assert_eq!(
-            p["graph"], "unavailable",
-            "the fail-closed score is labelled"
-        );
-        assert_eq!(p["band"], "70-100");
-        assert_eq!(p["high_risk"], true);
-        assert_eq!(p["pauses"], true);
-        assert_eq!(p["pause_reason"], "high_risk");
-        assert!(!p["reasons"].as_array().unwrap().is_empty());
-        let floor: Vec<&str> = p["floor"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f.as_str().unwrap())
-            .collect();
+        assert_eq!(p["graph"], "pending_pa_scope");
+        assert_eq!(p["score"], 0);
+        assert_ne!(p["score"], 100, "never the fail-closed score as if final");
+        assert_eq!(p["band"], "0-19");
+        assert_eq!(p["high_risk"], false);
+        assert_eq!(p["pauses"], false);
+        let reasons = p["reasons"].as_array().unwrap();
         assert!(
-            floor.contains(&"build") && floor.contains(&"review"),
-            "{floor:?}"
+            reasons[0]
+                .as_str()
+                .unwrap()
+                .starts_with("pending the PA's scope"),
+            "{reasons:?}"
         );
-        let added: Vec<&Value> = p["steps"]
+        let steps: Vec<(&str, &str)> = p["steps"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|s| s["added_by"] == "floor")
+            .map(|s| (s["catalog"].as_str().unwrap(), s["id"].as_str().unwrap()))
             .collect();
-        assert!(!added.is_empty());
-        assert!(added.iter().all(|s| s["floor_reason"].is_string()));
-        // The authored step stays the plan's.
-        let build = p["steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["catalog"] == "build")
-            .unwrap();
-        assert_eq!(build["added_by"], "plan");
+        assert_eq!(steps, [("understand", "pa-scope"), ("build", "build")]);
+        assert_eq!(p["def"]["phases"][0]["id"], "pa-scope");
+        // Manual mode: the plan gate after the scope step, always.
+        let m = preview(json!({"steps": [{"catalog": "build"}]}), HumanConfirm::All);
+        assert_eq!(
+            (
+                m["graph"].clone(),
+                m["pauses"].clone(),
+                m["pause_reason"].clone()
+            ),
+            (json!("pending_pa_scope"), json!(true), json!("manual_mode"))
+        );
+        // A declared touch set with no graph is still the fail-closed score (not pending).
+        let d = preview(
+            json!({"steps": [{"catalog": "build"}], "touch": ["src/x.rs"]}),
+            HumanConfirm::None,
+        );
+        assert_eq!(
+            (
+                d["graph"].clone(),
+                d["score"].clone(),
+                d["pause_reason"].clone()
+            ),
+            (json!("unavailable"), json!(100), json!("high_risk"))
+        );
     }
 
     /// The launch's refusals are the preview's: an override in auto mode, an unknown catalog id,
@@ -257,9 +289,17 @@ mod tests {
             &auto
         )
         .is_err());
+        // (X1) An override needs a declared touch set (its floor is scored from it).
+        let e = preview_of(
+            &plan(json!({"steps": [{"catalog": "build"}],
+                         "override": {"remove": ["design"], "reason": "x"}})),
+            &HumanConfirm::All,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("needs a declared touch set"), "{e}");
         // In manual mode the override is recorded and the plan pauses for it.
         let p = preview(
-            json!({"steps": [{"catalog": "build"}],
+            json!({"steps": [{"catalog": "build"}], "touch": ["src/x.rs"],
                    "override": {"remove": ["design"], "reason": "x"}}),
             HumanConfirm::All,
         );
