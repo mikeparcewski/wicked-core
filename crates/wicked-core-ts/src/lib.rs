@@ -1597,8 +1597,9 @@ impl Core {
     /// types the plan owes; the steps the floor ADDED are the `steps` with `added_by: "floor"`
     /// (each with its `floor_reason`); `pauses` / `pause_reason` (`manual_mode` | `high_risk` |
     /// `override`) say whether the launch would pause at a `plan_approval` gate; `graph` is
-    /// `"ready"` (the score read the repo's graph), `"not_needed"` (a docs-only touch set) or
-    /// `"unavailable"` (the fail-closed score: no repo, no or a stale graph, no declared scope).
+    /// `"ready"` (the score read the repo's graph), `"not_needed"` (a docs-only touch set),
+    /// `"unavailable"` (the fail-closed score: no repo, no or a stale graph) or `"pending_pa_scope"` (a
+    /// creator plan with no touch set: the PA scopes it after launch, so the score is pending).
     /// Rejects with the launch's refusal (compose, supplied provenance, an override in auto mode,
     /// a planning check), an unregistered `repoRef` or one whose base cannot be resolved, or a bad
     /// `humanConfirm` / `deliverStepJson`.

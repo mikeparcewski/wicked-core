@@ -194,6 +194,9 @@ pub(crate) struct Thresholds {
     pub destructive_floor: u32,
     /// A behavioural change with no usable graph scores this. Fail closed.
     pub no_graph_score: u8,
+    /// (X1) The deterministic score of work with no repo (no graph to read): the lowest band.
+    /// The PA's `RISK` rating can only raise it, through the model part.
+    pub repo_less_baseline: u8,
     /// The model hook is consulted only from this deterministic score up.
     pub model_hook_min_score: u8,
     pub model_bonus_step: u8,
@@ -304,6 +307,7 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
     critical_points: 20,
     destructive_floor: 70,
     no_graph_score: 100,
+    repo_less_baseline: 0,
     model_hook_min_score: 20,
     model_bonus_step: 10,
     model_bonus_max: 20,

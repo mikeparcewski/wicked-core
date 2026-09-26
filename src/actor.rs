@@ -1400,6 +1400,7 @@ pub(crate) fn run(
                             &run_id,
                             plan,
                             spec.deliver_step.as_ref(),
+                            spec.repo_ref.is_none(),
                         )?),
                         None => pipeline::resolve_workflow_def(
                             &store,
@@ -3849,6 +3850,10 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
 /// (via `register_composed`) in a registry scoped to this plan, so the planner resolves it and the
 /// long-lived registry never accumulates per-run defs.
 ///
+/// (X1) A plan with a creator step and no declared touch set (every preset with one) is not
+/// scored here: its rev 1 is the PA's read-only `pa-scope` step alone, and the launch plan waits
+/// on the state until that step's boundary decides it (`team_gate::apply_scope`).
+///
 /// Returns `None` when the launch carries no plan (planned from `workflow` as before), else the
 /// run's plan state, the def id to plan from, and that registry. `persist` writes the state onto
 /// the launch stub (the interactive path); the campaign path persists it once its session exists.
@@ -3884,7 +3889,6 @@ fn team_plan_at_launch(
         }
         return Ok(None);
     };
-    let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);
     let prior = crate::plan_gate::TeamPlanState {
         roster: spec
             .clis
@@ -3894,6 +3898,22 @@ fn team_plan_at_launch(
         deliver_step: spec.deliver_step.clone(),
         ..Default::default()
     };
+    // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
+    // read-only scope step alone, and the launch plan is decided at that step's boundary
+    // (`team_gate::apply_scope`), before any creator step dispatches.
+    if crate::plan_gate::needs_pa_scope(&plan) {
+        let unbound = repo_root.is_none() && spec.repo_ref.is_none();
+        let (state, def) = crate::plan_gate::scope_rev(
+            run_id,
+            &plan,
+            preset,
+            unbound,
+            prior,
+            &spec.human_confirm,
+        )?;
+        return register_launch_plan(store, registry, spec, state, def, persist).map(Some);
+    }
+    let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);
     let decided = crate::plan_gate::decide(
         run_id,
         crate::plan_gate::Proposal {
@@ -3923,6 +3943,25 @@ fn team_plan_at_launch(
         crate::plan_gate::Verdict::Accepted { def, .. }
         | crate::plan_gate::Verdict::Held { def, .. } => def,
     };
+    register_launch_plan(store, registry, spec, decided.state, def, persist).map(Some)
+}
+
+/// The launch's plan state and def, landed: the exact def checked, registered in a registry
+/// scoped to this plan, and the state written onto the launch stub when `persist`.
+#[allow(clippy::type_complexity)]
+fn register_launch_plan(
+    store: &mut dyn GraphStore,
+    registry: &crate::workflow::WorkflowRegistry,
+    spec: &LaunchSpec,
+    state: crate::plan_gate::TeamPlanState,
+    def: crate::workflow::WorkflowDef,
+    persist: bool,
+) -> anyhow::Result<(
+    crate::plan_gate::TeamPlanState,
+    String,
+    crate::workflow::WorkflowRegistry,
+)> {
+    let run_id = spec.session_id.as_str();
     // (codex round 4) Build and check the exact floor-filled def BEFORE anything of the run
     // changes: a def that cannot plan fails the launch here, with its plan state unwritten.
     check_def_plans(store, &def, &spec.problem, run_id, spec.repo_ref.as_deref())?;
@@ -3933,10 +3972,10 @@ fn team_plan_at_launch(
     if persist {
         let mut s = crate::domain::get_session(&*store, run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} has no launch record"))?;
-        s.team_plan = Some(decided.state.clone());
+        s.team_plan = Some(state.clone());
         put_node(store, s.to_node())?;
     }
-    Ok(Some((decided.state, def.id, scoped)))
+    Ok((state, def.id, scoped))
 }
 
 /// (DES-TEAMING-002 T8 (e)) `Core::preview_plan` on the actor: what [`team_plan_at_launch`] and
@@ -6035,6 +6074,8 @@ fn apply_step_result(
     // (T4, §8.7) The PA's `PLAN` lines of this turn, held for the run's next advance — which
     // applies them whichever path gets there (this fold, a dispute answer, a member acceptance).
     team_gate::record_plan_lines(&mut session, unit, &output);
+    // (X1) The PA's scope answer (`SCOPE` / `RISK`), held for the boundary that scores the plan.
+    team_gate::record_scope_answer(&mut session, unit, &output);
     let member_work = team_gate::is_member_work(unit);
     if let Some(d) = team_dispute {
         put_node(store, session.to_node())?;
@@ -6806,6 +6847,12 @@ fn advance_or_pause(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<Progress> {
+    // (X1) The scope step's boundary: the launch plan is scored from the PA's answer and decided
+    // as the initial plan (accepted, or held for its plan_approval gate) before any creator step
+    // dispatches. A plan that cannot be decided or planned fails the run: it never runs on with
+    // only its scope step.
+    team_gate::apply_scope(store, subscribers, run_id)
+        .map_err(|e| e.context("the PA-scoped plan could not be decided"))?;
     // (DES-TEAMING-002 T4, §8.7) THE revision hook: every advance goes through here, so a held
     // diff re-score or the PA's held `PLAN` lines are applied before anything is dispatched —
     // after a fold, a dispute answer, a member step's acceptance or a gate alike.
@@ -7204,6 +7251,12 @@ fn should_pause(
         .is_some_and(|t| t.pending.is_some())
     {
         return Some(PauseReason::PlanApproval);
+    }
+    // (X1) The PA's read-only scope step runs ahead of the plan it scopes, and the plan_approval
+    // gate that follows it is manual mode's approval: the run-level policy never pauses it (a
+    // `before:1` run pauses once, at the plan gate, not twice).
+    if team_gate::is_scope_unit(session, &units[unit_ix]) {
+        return None;
     }
     // DELIVER GATE (F-E2E-030): the deliver unit pushes the run branch to the remote and opens the
     // PR under whatever `gh` account the daemon holds — a step a customer must be able to review
