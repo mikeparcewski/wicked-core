@@ -436,6 +436,50 @@ export declare class Core {
    */
   replayTeamOutbox(): Promise<string>
   /**
+   * The phase catalog (`src/catalog.rs`) for studio's phase picker, in catalog order, as a JSON
+   * array of `{ id, kind, role, gate, gate_type, executes_code, executor, validator_pin, pinned,
+   * evidence_floor, skill_ref, description }` (`executor` is `"agent"` | `"tool"`; `pinned` =
+   * the entry carries a validator pin; `evidence_floor` = that pin is the evidence floor;
+   * `description` is `null` when the entry has none).
+   */
+  catalog(): Promise<string>
+  /**
+   * What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` on
+   * `repoRef` (the registered repo the launch would run on) with `deliverStepJson` (the
+   * launch's deliver step) would compute, persisting and publishing nothing — the launch's own
+   * precheck, intent score, floor fill, approval matrix and planning checks. `projectId` only
+   * matters to a preset name, so it does not change a plan's preview. For a behavioural touch
+   * set the score reads `repoRef`'s code graph at the base a launch would start from, read
+   * locally with NO fetch (the local remote-default tip, else HEAD).
+   * Resolves to JSON `{ score, deterministic, reasons, destructive, band, high_risk, floor,
+   * floor_override, steps, def, pauses, pause_reason, graph }`: `floor` is the floor phase
+   * types the plan owes; the steps the floor ADDED are the `steps` with `added_by: "floor"`
+   * (each with its `floor_reason`); `pauses` / `pause_reason` (`manual_mode` | `high_risk` |
+   * `override`) say whether the launch would pause at a `plan_approval` gate; `graph` is
+   * `"ready"` (the score read the repo's graph), `"not_needed"` (a docs-only touch set) or
+   * `"unavailable"` (the fail-closed score: no repo, no or a stale graph, no declared scope).
+   * Rejects with the launch's refusal (compose, supplied provenance, an override in auto mode,
+   * a planning check), an unregistered `repoRef` or one whose base cannot be resolved, or a bad
+   * `humanConfirm` / `deliverStepJson`.
+   */
+  previewPlan(planJson: string, projectId?: string | undefined | null, humanConfirm?: string | undefined | null, repoRef?: string | undefined | null, deliverStepJson?: string | undefined | null): Promise<string>
+  /**
+   * A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
+   * ADD. Held and applied at the run's next step boundary through the engine's revision path
+   * (the ratchet and floor fill apply), which publishes `plan.proposed{by:"human", kind:"edit"}`
+   * then `plan.accepted{by:"human"}`: its author approved it, so no `plan_approval` gate opens
+   * for it (as for an edit at the gate). Idempotent by `requestId`.
+   * Resolves to JSON `{ proposal_id, duplicate, band, high_risk, floor_added }`: what the edit
+   * does to the run (the floor band and high-risk rule of the rev it makes, the floor phase
+   * types it adds), from the dry run it is validated by; `duplicate: true` = this request id was
+   * already taken (nothing new is held or published; `band` / `high_risk` null, `floor_added`
+   * empty). Rejects for an unknown, finished or un-planned run, a plan awaiting approval (edit
+   * it at the gate), a started deliver step, an edit the revision refuses, an empty request id,
+   * or an edit carrying `touch` / `override`. An edit still held when the run ends is refused
+   * on the bus (`plan.refused`).
+   */
+  proposePlan(runId: string, planJson: string, requestId: string): Promise<string>
+  /**
    * Create a project. Resolves to the persisted `Project` as a JSON object
    * (`{ id, name, description, status, scope, created_at, updated_at }`). Rejects on an
    * empty/overlong name or a name already used by an ACTIVE project (the API's 409).

@@ -1037,3 +1037,627 @@ fn t4_e_the_actor_never_polls_the_bus() {
         }
     }
 }
+
+// ── T8 (c), (e): Core::propose_plan and Core::preview_plan through the real engine ─────────────
+
+/// A worker whose first dispatch waits until the test says `go` (so an edit arrives mid-unit);
+/// every later dispatch is held.
+fn gated_worker() -> (Arc<Worker>, Arc<std::sync::atomic::AtomicBool>) {
+    gated_worker_with(pa_output("built it"), None)
+}
+
+/// [`gated_worker`] whose first turn ends with `output` and, when given, the supervisor's re-score
+/// of `diff` (sent before the result, as the supervisor's final pass is).
+fn gated_worker_with(
+    output: String,
+    diff: Option<Vec<String>>,
+) -> (Arc<Worker>, Arc<std::sync::atomic::AtomicBool>) {
+    let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let g = go.clone();
+    let w = Worker::scripted(move |_, n| {
+        if n == 0 {
+            wait_for("the test to release the first unit", || {
+                g.load(AtomicOrdering::SeqCst)
+            });
+            Turn {
+                output: output.clone(),
+                diff: diff.clone(),
+                ..Turn::default()
+            }
+        } else {
+            hold()
+        }
+    });
+    (w, go)
+}
+
+fn docs_plan() -> PlanSteps {
+    plan(
+        json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                "touch": ["README.md"]}),
+    )
+}
+
+fn human_edits(e: &Engine, run: &str) -> Vec<Value> {
+    payloads(e, run, tev::PLAN_PROPOSED)
+        .into_iter()
+        .filter(|p| p["kind"] == "edit")
+        .collect()
+}
+
+/// (T8 (c)) An edit proposed mid-unit is HELD (nothing published while the unit runs) and applied
+/// at the step boundary through the revision path: `plan.proposed{by:"human", kind:"edit"}`
+/// sourced by the request id, then `plan.accepted{by:"human"}` (its author approved it) as rev 2, the added step at the cursor, the done unit never re-run. The same request id, before
+/// or after the boundary, is a `duplicate`: no second row. (T8 (e)) the preview of the launch plan
+/// is the floor fill the launch computed.
+#[test]
+fn t8_c_propose_plan_applies_at_the_boundary_once_per_request_id() {
+    let (w, go) = gated_worker();
+    let e = engine("t8prop", w.clone());
+    let preview = e
+        .core
+        .preview_plan(docs_plan(), None, None, None, HumanConfirm::None)
+        .unwrap();
+    launch(&e, "prop", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    let accepted = settled(&e, "prop", tev::PLAN_ACCEPTED, 1);
+    // (e) The preview is what the launch computed.
+    let shape = |steps: &Value| -> Vec<(String, String, String)> {
+        steps
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["catalog"].as_str().unwrap().to_string(),
+                    s["id"].as_str().unwrap().to_string(),
+                    s["added_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let previewed = serde_json::to_value(&preview).unwrap();
+    assert_eq!(shape(&previewed["steps"]), shape(&accepted[0]["steps"]));
+    assert_eq!(previewed["band"], accepted[0]["band"]);
+    assert_eq!(previewed["high_risk"], accepted[0]["high_risk"]);
+    assert!(!preview.pauses);
+
+    let edit = plan(json!({"steps": [{"catalog": "test_plan"}]}));
+    let first = e.core.propose_plan("prop", edit.clone(), "req-1").unwrap();
+    let again = e.core.propose_plan("prop", edit.clone(), "req-1").unwrap();
+    let want = tev::mint_proposal_id(
+        "prop",
+        "human",
+        &tev::ProposalSource::Edit {
+            request_id: "req-1".into(),
+        },
+    );
+    assert_eq!(
+        (first.proposal_id.as_str(), first.duplicate),
+        (want.as_str(), false)
+    );
+    assert_eq!(
+        (again.proposal_id.as_str(), again.duplicate),
+        (want.as_str(), true)
+    );
+    // Held while the unit runs: nothing of the edit is on the bus yet.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(human_edits(&e, "prop").is_empty());
+    go.store(true, AtomicOrdering::SeqCst);
+    // The boundary applies it; the facts are fire-and-forget, so wait for them.
+    let accepted = settled(&e, "prop", tev::PLAN_ACCEPTED, 2);
+    wait_for("the added unit to dispatch", || e.worker.calls().len() >= 2);
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "prop").len() == 1
+    });
+    let proposed = &human_edits(&e, "prop")[0];
+    assert_eq!(proposed["by"], "human");
+    assert_eq!(proposed["proposal_id"], want.as_str());
+    assert_eq!(proposed["base_rev"], 1);
+    assert_eq!(accepted[1]["plan_rev"], 2);
+    assert_eq!(
+        accepted[1]["by"], "human",
+        "a human edit is approved by its author"
+    );
+    assert_eq!(accepted[1]["proposal_id"], want.as_str());
+    let ids: Vec<String> = view(&e, "prop")
+        .units
+        .iter()
+        .map(|u| u.id.clone())
+        .collect();
+    assert_eq!(ids, ["prop:produce", "prop:test_plan", "prop:critique"]);
+    let calls = e.worker.calls();
+    assert_eq!(calls[1].2, "prop:test_plan", "{calls:?}");
+    // After the boundary the request id is still spent: no second row of any kind.
+    let late = e.core.propose_plan("prop", edit, "req-1").unwrap();
+    assert!(late.duplicate);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(human_edits(&e, "prop").len(), 1);
+    assert_eq!(payloads(&e, "prop", tev::PLAN_ACCEPTED).len(), 2);
+    assert!(payloads(&e, "prop", tev::PLAN_REFUSED).is_empty());
+    release_all(&w);
+}
+
+/// (T8 (c), operator decision) A HUMAN's mid-run edit is approved by its author, like an edit at
+/// the gate: in manual mode it opens NO second `plan_approval` gate — it is accepted directly as
+/// rev 2 `by:"human"` — while floor fill and the ratchet still apply. The launch plan has no
+/// creator but a behavioural touch set, so the run's ratcheted score is 100 with an empty floor;
+/// the edit adds a creator (`produce`), and the 70-100 floor it now owes is added with it.
+#[test]
+fn t8_c_a_human_edit_in_manual_mode_is_accepted_by_its_author_and_floor_filled() {
+    let (w, go) = gated_worker();
+    let mut e = engine("t8man", w.clone());
+    // Manual mode that pauses only for plans (no unit is at ord 99).
+    launch_on(
+        &e,
+        "man",
+        HumanConfirm::Before(99),
+        plan(
+            json!({"steps": [{"catalog": "understand"}, {"catalog": "critique"}],
+                    "touch": ["src/lib.rs"]}),
+        ),
+        &["a", "b", "c"],
+    );
+    e.wait_awaiting("man", crate::plan_gate::GATE_KIND, 1);
+    e.core.confirm_gate("man", approve()).unwrap();
+    wait_for("the first unit to dispatch", || e.worker.calls().len() == 1);
+    let p = e
+        .core
+        .propose_plan(
+            "man",
+            plan(json!({"steps": [{"catalog": "produce"}]})),
+            "req-m",
+        )
+        .unwrap();
+    assert!(!p.duplicate);
+    go.store(true, AtomicOrdering::SeqCst);
+    // No second plan gate: the next unit dispatches straight away.
+    wait_for("the unit after the edit to dispatch", || {
+        e.worker.calls().len() >= 2
+    });
+    let accepted = settled(&e, "man", tev::PLAN_ACCEPTED, 2);
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "man").len() == 1
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        e.awaiting("man")
+            .iter()
+            .filter(|(_, k)| k == crate::plan_gate::GATE_KIND)
+            .count(),
+        1,
+        "only the launch plan's gate"
+    );
+    assert_eq!(
+        payloads(&e, "man", tev::GATE_OPENED)
+            .iter()
+            .filter(|g| g["kind"] == "plan_approval")
+            .count(),
+        1
+    );
+    assert_eq!(accepted[1]["plan_rev"], 2);
+    assert_eq!(accepted[1]["by"], "human");
+    let mut floor_added: Vec<String> = accepted[1]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["added_by"] == "floor")
+        .map(|s| s["catalog"].as_str().unwrap().to_string())
+        .collect();
+    floor_added.sort();
+    assert_eq!(
+        floor_added,
+        ["architecture", "design", "security_review", "test_plan"],
+        "the floor the edit owes at the ratcheted score"
+    );
+    let ids: Vec<String> = view(&e, "man").units.iter().map(|u| u.id.clone()).collect();
+    assert!(ids.contains(&"man:produce".to_string()), "{ids:?}");
+    release_all(&w);
+}
+
+/// (T8 (c)) What `propose_plan` refuses synchronously, holding nothing: an unknown run, an empty
+/// request id, and an edit carrying `touch` or `override` (launch-plan fields) or no steps.
+#[test]
+fn t8_c_propose_plan_refusals() {
+    let (w, go) = gated_worker();
+    let e = engine("t8ref", w.clone());
+    launch(&e, "ref", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    let add = || plan(json!({"steps": [{"catalog": "test_plan"}]}));
+    assert!(e.core.propose_plan("nope", add(), "r").is_err());
+    assert!(e.core.propose_plan("ref", add(), " ").is_err());
+    for bad in [
+        json!({"steps": [{"catalog": "test_plan"}], "touch": ["src/x.rs"]}),
+        json!({"steps": [{"catalog": "test_plan"}], "override": {"remove": ["design"], "reason": "x"}}),
+        json!({"steps": []}),
+    ] {
+        let err = e
+            .core
+            .propose_plan("ref", plan(bad.clone()), "r2")
+            .unwrap_err();
+        assert!(!err.to_string().is_empty(), "{bad}");
+    }
+    // None of the refused calls spent its request id.
+    assert!(!e.core.propose_plan("ref", add(), "r2").unwrap().duplicate);
+    go.store(true, AtomicOrdering::SeqCst);
+    release_all(&w);
+}
+
+// ── core#630 round 3 ─────────────────────────────────────────────────────────────────────────────
+
+/// (round 3, HIGH) A human edit never carries a held floor raise past the approval matrix: in auto
+/// mode, a human edit and a diff re-score into 70-100 at the SAME boundary still pause
+/// `plan_approval` (into high risk) before the next unit. The edit (a step the raise's floor does
+/// not add) is applied first, as its own rev; the raise is judged by the matrix against it.
+#[test]
+fn t8_r3_a_human_edit_does_not_carry_a_held_floor_raise_past_the_matrix() {
+    let (w, go) = gated_worker_with(pa_output("built it"), Some(vec!["src/lib.rs".into()]));
+    let mut e = engine("t8r3fl", w.clone());
+    launch(&e, "rfl", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    e.core
+        .propose_plan(
+            "rfl",
+            plan(json!({"steps": [{"catalog": "understand"}]})),
+            "req-f",
+        )
+        .unwrap();
+    go.store(true, AtomicOrdering::SeqCst);
+    e.wait_awaiting("rfl", crate::plan_gate::GATE_KIND, 1);
+    assert_eq!(
+        e.worker.calls().len(),
+        1,
+        "nothing dispatched past the raise"
+    );
+    let gate = wait_plan_gate(&e, "rfl", 1);
+    assert_eq!(gate["reason"], "into_high_risk");
+    let v = view(&e, "rfl");
+    let tp = v.session.team_plan.as_ref().unwrap();
+    assert!(
+        !tp.approved_high_risk,
+        "no human approved the high-risk raise"
+    );
+    let pending = tp.pending.as_ref().expect("the raise is held");
+    assert!(pending.high_risk);
+    // The human's step is in the held plan, and so is the raise's floor.
+    let cats: Vec<&str> = pending
+        .steps
+        .steps
+        .iter()
+        .map(|s| s.catalog.as_str())
+        .collect();
+    assert!(
+        cats.contains(&"understand") && cats.contains(&"security_review"),
+        "{cats:?}"
+    );
+    release_all(&w);
+}
+
+/// (round 3, HIGH) Same for a held PA revision that needs approval: in manual mode the PA's
+/// `PLAN+` and a human edit at the same boundary still pause `plan_approval` (manual mode) — the
+/// human's own edit does not approve the PA's step.
+#[test]
+fn t8_r3_a_human_edit_does_not_carry_a_held_pa_revision_past_the_matrix() {
+    let (w, go) = gated_worker_with(pa_output(r#"PLAN+ {"steps":[{"catalog":"design"}]}"#), None);
+    let mut e = engine("t8r3pa", w.clone());
+    launch(&e, "rpa", HumanConfirm::Before(99), docs_plan());
+    e.wait_awaiting("rpa", crate::plan_gate::GATE_KIND, 1);
+    e.core.confirm_gate("rpa", approve()).unwrap();
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    e.core
+        .propose_plan(
+            "rpa",
+            plan(json!({"steps": [{"catalog": "test_plan"}]})),
+            "req-p",
+        )
+        .unwrap();
+    go.store(true, AtomicOrdering::SeqCst);
+    e.wait_awaiting("rpa", crate::plan_gate::GATE_KIND, 2);
+    assert_eq!(
+        e.worker.calls().len(),
+        1,
+        "nothing dispatched past the PA's revision"
+    );
+    let gate = wait_plan_gate(&e, "rpa", 2);
+    assert_eq!(gate["reason"], "manual_mode");
+    let v = view(&e, "rpa");
+    let tp = v.session.team_plan.as_ref().unwrap();
+    // The human's edit is the accepted rev; the PA's is the held one.
+    let accepted: Vec<&str> = tp
+        .accepted
+        .as_ref()
+        .unwrap()
+        .steps
+        .steps
+        .iter()
+        .map(|s| s.catalog.as_str())
+        .collect();
+    assert!(
+        accepted.contains(&"test_plan") && !accepted.contains(&"design"),
+        "{accepted:?}"
+    );
+    let held: Vec<&str> = tp
+        .pending
+        .as_ref()
+        .unwrap()
+        .steps
+        .steps
+        .iter()
+        .map(|s| s.catalog.as_str())
+        .collect();
+    assert!(held.contains(&"design"), "{held:?}");
+    release_all(&w);
+}
+
+/// The run's `n`-th `gate.opened{plan_approval}` payload, once it is on the bus (fire-and-forget).
+fn wait_plan_gate(e: &Engine, run: &str, n: usize) -> Value {
+    let gates = |e: &Engine| -> Vec<Value> {
+        payloads(e, run, tev::GATE_OPENED)
+            .into_iter()
+            .filter(|g| g["kind"] == "plan_approval")
+            .collect()
+    };
+    wait_for("the plan_approval gate.opened", || gates(e).len() >= n);
+    gates(e)[n - 1].clone()
+}
+
+/// (round 3, MEDIUM) An edit that passes the synchronous checks but cannot be PLANNED at the
+/// boundary (a Tool step whose binary does not exist) is never silently spent: the engine
+/// publishes its `plan.proposed` and a `plan.refused` for its proposal id, and the run goes on.
+#[test]
+fn t8_r3_an_edit_that_cannot_be_planned_is_refused_on_the_bus() {
+    let (w, go) = gated_worker();
+    let e = engine("t8r3pl", w.clone());
+    launch(&e, "rpl", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    let p = e
+        .core
+        .propose_plan(
+            "rpl",
+            plan(json!({"steps": [{"catalog": "run", "id": "run",
+                "executor": {"type": "tool", "cmd": ["wicked-r3-no-such-binary"]}}]})),
+            "req-x",
+        )
+        .unwrap();
+    go.store(true, AtomicOrdering::SeqCst);
+    wait_for("the run to go on", || e.worker.calls().len() >= 2);
+    let refused = settled(&e, "rpl", tev::PLAN_REFUSED, 1);
+    assert_eq!(refused[0]["proposal_id"], p.proposal_id.as_str());
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "rpl").len() == 1
+    });
+    let tp = view(&e, "rpl").session.team_plan.unwrap();
+    assert_eq!((tp.rev, tp.accepted_rev), (1, 1));
+    assert!(tp.edits.is_empty());
+    release_all(&w);
+}
+
+/// A throwaway git repo (README + `src/lib.rs`, one commit) and its HEAD commit.
+fn git_repo(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let git = |args: &[&str]| {
+        use wicked_apps_core::spawn::HardenedCommand;
+        let out = std::process::Command::new("git")
+            .hardened()
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("README.md"), "hello").unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    (repo, head)
+}
+
+/// (round 3, MEDIUM) The preview scores against the repo the launch would run on: on the same
+/// indexed repo, `preview_plan(repoRef)` and the launch give the same score, band and floor-filled
+/// steps — and the score is the graph's (not the fail-closed 100), with `graph: "ready"`.
+#[test]
+fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
+    use wicked_apps_core::{GraphWrite, Language, Location, Node, NodeKind, Span, Symbol};
+    let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let w = Worker::new(&pa_output("built it"), None);
+    let e = engine("t8r3repo", w.clone());
+    let (repo, head) = git_repo(&e.rig.dir);
+    let entry = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "r3repo".into(),
+            root_path: repo.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    // The repo's code graph, where the engine reads it, indexed at HEAD: `f` in src/lib.rs.
+    let db = e.rig.dir.join("core.db");
+    let root = crate::code_graph::repo_graph_root_for_store(db.to_str().unwrap()).unwrap();
+    let graph_db =
+        crate::code_graph::repo_graph_db_at(&root, std::path::Path::new(&entry.root_path));
+    std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
+    {
+        let mut g = wicked_apps_core::open_store(Some(graph_db.to_str().unwrap())).unwrap();
+        let f = Node::new(
+            Symbol::global(
+                "test",
+                None,
+                vec![wicked_apps_core::Descriptor::method("f", None)],
+            )
+            .id(),
+            NodeKind::Function,
+            "f",
+            Language::new("rust"),
+            Location::new(
+                "src/lib.rs",
+                Span {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 1,
+                    end_col: 0,
+                },
+            ),
+        );
+        g.begin_batch().unwrap();
+        g.upsert_nodes(&[f]).unwrap();
+        g.commit_batch().unwrap();
+        g.set_repo_info(&wicked_estate_core::RepoInfo {
+            commit: Some(head.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let p = plan(
+        json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                        "touch": ["src/lib.rs"]}),
+    );
+    let preview = e
+        .core
+        .preview_plan(p.clone(), None, Some(&entry.id), None, HumanConfirm::None)
+        .unwrap();
+    assert_eq!(preview.graph, "ready", "{:?}", preview.reasons);
+    assert!(
+        preview.score < 100,
+        "the graph's score, not the fail-closed one: {}",
+        preview.score
+    );
+    e.core
+        .launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "r3 repo".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: "rrepo".into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: Some(entry.id.clone()),
+            workflow: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: Some(p),
+            deliver_step: None,
+        })
+        .unwrap();
+    let scored = settled(&e, "rrepo", tev::PATH_SCORED, 1);
+    assert_eq!(scored[0]["score"], preview.score);
+    let accepted = settled(&e, "rrepo", tev::PLAN_ACCEPTED, 1);
+    assert_eq!(accepted[0]["band"], preview.band.as_str());
+    let launched: Vec<String> = step_ids(&accepted[0]["steps"]);
+    let previewed: Vec<String> = preview.steps.iter().map(|s| s.id.clone()).collect();
+    assert_eq!(launched, previewed);
+    release_all(&w);
+}
+
+// ── core#630 round 4 ─────────────────────────────────────────────────────────────────────────────
+
+/// (round 4) A held edit is never lost to the run ending before its boundary: cancelling the run
+/// while the edit waits publishes the edit's `plan.proposed` and a `plan.refused` for it.
+#[test]
+fn t8_r4_a_held_edit_is_refused_on_the_bus_when_the_run_ends() {
+    let (w, go) = gated_worker();
+    let e = engine("t8r4end", w.clone());
+    launch(&e, "rend", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    settled(&e, "rend", tev::PLAN_ACCEPTED, 1);
+    let p = e
+        .core
+        .propose_plan(
+            "rend",
+            plan(json!({"steps": [{"catalog": "test_plan"}]})),
+            "req-end",
+        )
+        .unwrap();
+    e.core.cancel_run("rend").unwrap();
+    let refused = settled(&e, "rend", tev::PLAN_REFUSED, 1);
+    assert_eq!(refused[0]["proposal_id"], p.proposal_id.as_str());
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "rend").len() == 1
+    });
+    // The id stays spent: a retry is a duplicate, and publishes nothing more.
+    assert!(
+        e.core
+            .propose_plan(
+                "rend",
+                plan(json!({"steps": [{"catalog": "test_plan"}]})),
+                "req-end"
+            )
+            .unwrap()
+            .duplicate
+    );
+    go.store(true, AtomicOrdering::SeqCst);
+    release_all(&w);
+}
+
+/// (round 4) The preview never fetches: on a repo whose `origin` is unreachable it answers
+/// promptly and leaves `refs/remotes` and `FETCH_HEAD` untouched (the base is the local tip).
+#[test]
+fn t8_r4_the_preview_does_not_fetch_the_remote() {
+    let w = Worker::new(&pa_output("built it"), None);
+    let e = engine("t8r4fetch", w.clone());
+    let (repo, _head) = git_repo(&e.rig.dir);
+    {
+        use wicked_apps_core::spawn::HardenedCommand;
+        let ok = std::process::Command::new("git")
+            .hardened()
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://192.0.2.1/unreachable.git",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+    let entry = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "r4fetch".into(),
+            root_path: repo.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    let started = Instant::now();
+    let preview = e
+        .core
+        .preview_plan(
+            plan(json!({"steps": [{"catalog": "produce"}], "touch": ["src/lib.rs"]})),
+            None,
+            Some(&entry.id),
+            None,
+            HumanConfirm::All,
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the preview waited on the network: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        preview.graph, "unavailable",
+        "no graph is indexed for this repo"
+    );
+    let git_dir = repo.join(".git");
+    assert!(!git_dir.join("FETCH_HEAD").exists(), "the preview fetched");
+    assert!(
+        !git_dir.join("refs/remotes").join("origin").exists(),
+        "refs/remotes were touched"
+    );
+    release_all(&w);
+}

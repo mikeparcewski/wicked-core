@@ -34,7 +34,10 @@ use crate::team::events::{
 };
 use crate::workflow::WorkflowDef;
 
+mod preview;
 mod revise;
+pub(crate) use preview::preview_plan;
+pub use preview::PlanPreview;
 pub(crate) use revise::{
     changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
     Change, DiffRescore, Outcome, PlanLines,
@@ -101,6 +104,38 @@ pub struct TeamPlanState {
     /// through the one hook, whichever path (fold, dispute answer, member accept) led there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_lines: Vec<PlanLines>,
+    /// (T8 (c)) Mid-run human edits taken by `Core::propose_plan`, held — like the PA's `PLAN`
+    /// lines — for the run's next advance, which applies them through the same revision path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<HeldEdit>,
+    /// Every request id `Core::propose_plan` took for this run: a repeat is a no-op, so one
+    /// request id never proposes (or publishes) twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edit_requests: Vec<String>,
+}
+
+/// A mid-run human edit (`Core::propose_plan`) waiting for the next step boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldEdit {
+    /// Crew's per-POST request id: the `plan.proposed` source (§6.1 row 3).
+    pub request_id: String,
+    /// The steps to ADD (the plan only grows, §8.7).
+    pub steps: Vec<PlanStep>,
+}
+
+/// What `Core::propose_plan` did with an edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanProposal {
+    /// The `plan.proposed` id the edit is published under (`"p-" + key([run, "human", request id])`).
+    pub proposal_id: String,
+    /// `true` when this request id was already taken: nothing new is held or published.
+    pub duplicate: bool,
+    /// What the edit does to the run, from the dry run it was validated by (the human's own edit
+    /// opens no gate, so this is where they see it): the floor band and high-risk rule of the rev
+    /// it makes, and the floor phase types it adds. `null` / empty for a duplicate.
+    pub band: Option<String>,
+    pub high_risk: Option<bool>,
+    pub floor_added: Vec<String>,
 }
 
 /// An accepted plan rev: the body of its `plan.accepted` (§6 row 5).
@@ -454,6 +489,9 @@ pub(crate) struct Decided {
     /// The facts to publish, in order.
     pub events: Vec<TeamEvent>,
     pub verdict: Verdict,
+    /// The floor fill the verdict was reached on (`None` when refused before it):
+    /// what `Core::preview_plan` reads back.
+    pub filled: Option<crate::plan::FloorFilled>,
 }
 
 /// The per-run composed def id (§8.3): `<run>:plan-<rev>`, the shape
@@ -507,6 +545,7 @@ pub(crate) fn decide(
             state: prior.clone(),
             events,
             verdict: Verdict::Refused { reason },
+            filled: None,
         })
     };
     if let Some(why) = deliver_refusal {
@@ -534,6 +573,10 @@ pub(crate) fn decide(
     let rev = prior.rev + 1;
     let mut def = filled.def.clone();
     def.id = per_run_def_id(run_id, rev);
+    let read_back = Some(crate::plan::FloorFilled {
+        def: def.clone(),
+        ..filled.clone()
+    });
     let event = if prior.accepted_rev == 0 {
         PlanEvent::Initial
     } else {
@@ -588,6 +631,7 @@ pub(crate) fn decide(
                 state,
                 events,
                 verdict: Verdict::Accepted { def },
+                filled: read_back,
             })
         }
         Some(reason) => {
@@ -614,6 +658,7 @@ pub(crate) fn decide(
                 state,
                 events,
                 verdict: Verdict::Held { def },
+                filled: read_back,
             })
         }
     }
@@ -931,6 +976,45 @@ pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow:
             "proposal_id": (!a.proposal_id.is_empty()).then_some(&a.proposal_id),
         }),
     )
+}
+
+/// (T8 (c)) The record of human edits refused AFTER `Core::propose_plan` took them (the deliver
+/// step started, or the revision could not be planned): each edit's
+/// `plan.proposed{by:"human", kind:"edit"}` and its `plan.refused`, so no edit is silently spent.
+pub(crate) fn edits_refused(
+    run_id: &str,
+    base_rev: Option<u32>,
+    edits: &[HeldEdit],
+    reason: &str,
+    now: i64,
+) -> anyhow::Result<Vec<TeamEvent>> {
+    let mut out = Vec::new();
+    for e in edits {
+        let pid = ev::mint_proposal_id(
+            run_id,
+            "human",
+            &ProposalSource::Edit {
+                request_id: e.request_id.clone(),
+            },
+        );
+        let plan = PlanSteps {
+            steps: e.steps.clone(),
+            touch: None,
+            floor_override: None,
+        };
+        out.push(plan_proposed(
+            run_id,
+            "human",
+            &pid,
+            base_rev,
+            ProposalKind::Edit,
+            None,
+            &plan,
+            now,
+        )?);
+        out.push(plan_refused(run_id, &pid, base_rev, reason, now)?);
+    }
+    Ok(out)
 }
 
 pub(crate) fn plan_refused(

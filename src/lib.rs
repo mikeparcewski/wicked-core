@@ -148,7 +148,10 @@ pub use wicked_governance::{
     EvalReport, EvalSample, ImportReceipt,
 };
 
-pub use catalog::{builtin_presets, catalog, catalog_entry, CATALOG_IDS, SECURITY_REVIEW_SKILL};
+pub use catalog::{
+    builtin_presets, catalog, catalog_entries, catalog_entry, CatalogEntry, CATALOG_IDS,
+    SECURITY_REVIEW_SKILL,
+};
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,
@@ -164,7 +167,7 @@ pub use plan::{
     compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
-pub use plan_gate::{PendingPlan, TeamPlanState};
+pub use plan_gate::{PendingPlan, PlanPreview, PlanProposal, TeamPlanState};
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
@@ -1432,6 +1435,96 @@ impl Core {
         self.tx
             .send(Command::RunTeam {
                 run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-TEAMING-002 T8 (e)) Preview a launch of `plan`: what the launch would compute, with
+    /// nothing persisted or published — the launch's synchronous refusals, the intent score, floor
+    /// fill, approval matrix and the def's planning checks. `project_id` is passed to the launch's
+    /// plan resolution, which only a preset NAME depends on, so it does not change a plan's
+    /// preview. `repo_ref` names the registered repo the launch would run on; for a behavioural
+    /// touch set the score reads that repo's code graph at the base a launch would start from, read
+    /// locally with NO fetch (the local remote-default tip, else HEAD — the launch fetches first,
+    /// so a stale clone may start further on). No usable graph: `graph: "unavailable"` and the
+    /// fail-closed score. `deliver_step` is the launch's. `Err` carries the launch's refusal, an
+    /// unregistered repo, or a base that cannot be resolved.
+    pub fn preview_plan(
+        &self,
+        plan: PlanSteps,
+        project_id: Option<&str>,
+        repo_ref: Option<&str>,
+        deliver_step: Option<PlanStep>,
+        human_confirm: HumanConfirm,
+    ) -> anyhow::Result<PlanPreview> {
+        // The repo the launch would run on and the base its worktree would start from, read on
+        // the caller's thread with NO fetch (`repo::local_run_base`: the local remote-default tip,
+        // else HEAD) — a preview never touches the user's refs or waits on the network. The base
+        // is read only when the score needs the graph (a behavioural touch set); an unresolvable
+        // base is an error, never a silent fail-closed score.
+        let behavioural = plan.touch.as_ref().is_some_and(|t| {
+            let t: Vec<&str> = t.iter().map(String::as_str).collect();
+            !t.is_empty() && crate::review_scale::signals_from_paths(&t).behavioural()
+        });
+        let (repo_root, base_commit) = match repo_ref {
+            None => (None, None),
+            Some(id) => {
+                let repo = self
+                    .list_repos()?
+                    .into_iter()
+                    .find(|r| r.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("repo not registered: {id}"))?;
+                let base = if behavioural {
+                    Some(crate::repo::local_run_base(&repo.root_path)?)
+                } else {
+                    None
+                };
+                (Some(std::path::PathBuf::from(repo.root_path)), base)
+            }
+        };
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::PreviewPlan {
+                plan,
+                project_id: project_id.map(str::to_string),
+                repo_ref: repo_ref.map(str::to_string),
+                repo_root,
+                base_commit,
+                deliver_step,
+                human_confirm,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit (`POST /api/v1/runs/:id/plan`): the
+    /// steps to ADD, held and applied at the run's next step boundary through the same revision
+    /// path as the PA's `PLAN+` (the ratchet and floor fill apply; the edit only adds), published
+    /// as `plan.proposed{by:"human", kind:"edit"}`. Its author approved it, like an edit at the
+    /// gate: no `plan_approval` gate opens for it, and it is accepted as `plan.accepted{by:"human"}`
+    /// — so the answer carries what it does to the run (`band`, `high_risk`, `floor_added`, from
+    /// the dry run it is validated by). Idempotent by `request_id`: a repeat holds and publishes
+    /// nothing (`duplicate: true`). `Err` for an unknown, finished or un-planned run, a plan held
+    /// for approval (edit it at the gate), a started deliver step, an edit the revision would
+    /// refuse, or a plan carrying `touch` / `override` (launch-plan fields: an edit only adds). An
+    /// edit still held when the run ends is refused on the bus (`plan.refused`).
+    pub fn propose_plan(
+        &self,
+        run_id: &str,
+        plan: PlanSteps,
+        request_id: &str,
+    ) -> anyhow::Result<PlanProposal> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ProposePlan {
+                run_id: run_id.to_string(),
+                plan,
+                request_id: request_id.to_string(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;

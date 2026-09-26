@@ -465,6 +465,27 @@ pub(crate) enum Command {
         run_id: String,
         reply: Sender<anyhow::Result<Option<crate::RunTeamView>>>,
     },
+    /// (DES-TEAMING-002 T8 (e)) Preview a launch plan: the launch's plan resolution, precheck,
+    /// score (against `repo_root` at `base_commit`, resolved by the caller off the actor), floor
+    /// fill, approval matrix and def checks — nothing persisted or published.
+    PreviewPlan {
+        plan: crate::plan::PlanSteps,
+        project_id: Option<String>,
+        repo_ref: Option<String>,
+        repo_root: Option<std::path::PathBuf>,
+        base_commit: Option<String>,
+        deliver_step: Option<crate::plan::PlanStep>,
+        human_confirm: crate::domain::HumanConfirm,
+        reply: Sender<anyhow::Result<crate::plan_gate::PlanPreview>>,
+    },
+    /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit: held for the run's next step boundary
+    /// and applied there through the revision path (§8.7); idempotent by `request_id`.
+    ProposePlan {
+        run_id: String,
+        plan: crate::plan::PlanSteps,
+        request_id: String,
+        reply: Sender<anyhow::Result<crate::plan_gate::PlanProposal>>,
+    },
     /// The live TEAMED runs (status `Executing` / `AwaitingHuman`, transport `bus`, `path.started`
     /// acknowledged) with their team state — the supervisor's replay set (§4.7 step 2). An
     /// un-teamed run is never listed, so the supervisor never arms it.

@@ -133,14 +133,16 @@ pub(crate) fn plan_lines_of(output: &str) -> String {
 pub(crate) enum Change {
     /// §8.7 trigger 3: a diff re-score raised the floor.
     Floor(DiffRescore),
-    /// §8.7 triggers 1–2 (the PA's `PLAN+`, an accepted member request) and a human edit at a
-    /// mid-run plan gate: steps to ADD.
+    /// §8.7 triggers 1–2 (the PA's `PLAN+`, an accepted member request) and a human edit — at a
+    /// mid-run plan gate, or through `Core::propose_plan`: steps to ADD.
     Steps {
         by: String,
         source: ProposalSource,
         kind: ProposalKind,
-        /// The `plan.revised.reason`; `None` for a human edit at the gate (accepted as the next
-        /// rev by the human who made it, `plan.accepted{by:"human"}`).
+        /// The `plan.revised.reason`; `None` for a human edit, at the gate or through
+        /// `Core::propose_plan`: approved by the human who made it, so it skips the approval
+        /// matrix and is accepted as the next rev `plan.accepted{by:"human"}` (floor fill and the
+        /// ratchet still apply).
         reason: Option<ReviseReason>,
         steps: Vec<PlanStep>,
     },

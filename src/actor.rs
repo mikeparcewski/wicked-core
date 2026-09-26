@@ -3563,6 +3563,40 @@ pub(crate) fn run(
                 });
                 let _ = reply.send(res);
             }
+            Command::PreviewPlan {
+                plan,
+                project_id,
+                repo_ref,
+                repo_root,
+                base_commit,
+                deliver_step,
+                human_confirm,
+                reply,
+            } => {
+                let _ = reply.send(preview_launch_plan(
+                    &mut store,
+                    plan,
+                    project_id.as_deref(),
+                    repo_ref.as_deref(),
+                    repo_root.as_deref(),
+                    base_commit.as_deref(),
+                    deliver_step,
+                    &human_confirm,
+                ));
+            }
+            Command::ProposePlan {
+                run_id,
+                plan,
+                request_id,
+                reply,
+            } => {
+                let _ = reply.send(team_gate::propose_plan(
+                    &mut store,
+                    &run_id,
+                    plan,
+                    &request_id,
+                ));
+            }
             Command::LiveTeamRuns { reply } => {
                 let res = crate::domain::all_sessions(&store).map(|all| {
                     all.into_iter()
@@ -3903,6 +3937,36 @@ fn team_plan_at_launch(
         put_node(store, s.to_node())?;
     }
     Ok(Some((decided.state, def.id, scoped)))
+}
+
+/// (DES-TEAMING-002 T8 (e)) `Core::preview_plan` on the actor: what [`team_plan_at_launch`] and
+/// the launch's synchronous checks would compute for `plan`, with nothing persisted.
+#[allow(clippy::too_many_arguments)]
+fn preview_launch_plan(
+    store: &mut dyn GraphStore,
+    plan: crate::plan::PlanSteps,
+    project_id: Option<&str>,
+    repo_ref: Option<&str>,
+    repo_root: Option<&std::path::Path>,
+    base_commit: Option<&str>,
+    deliver_step: Option<crate::plan::PlanStep>,
+    human_confirm: &crate::domain::HumanConfirm,
+) -> anyhow::Result<crate::plan_gate::PlanPreview> {
+    // The plan as the launch resolves it (a preset name resolves per project; a plan is itself).
+    let (plan, _) = crate::plan_gate::launch_plan(&*store, Some(&plan), None, project_id)?
+        .ok_or_else(|| anyhow::anyhow!("the preview carries no plan"))?;
+    let preview = crate::plan_gate::preview_plan(
+        &plan,
+        human_confirm,
+        repo_root,
+        base_commit,
+        deliver_step.as_ref(),
+    )?;
+    // The launch's planning checks on the exact def it would run (tool preflight, base skill,
+    // repo binding, unit limit, validator attach): a plan the launch would refuse is refused here.
+    check_def_plans(store, &preview.def, "plan preview", "preview", repo_ref)
+        .map_err(|e| e.context("the launch would refuse the plan"))?;
+    Ok(preview)
 }
 
 /// The body of `Command::LaunchRun` (also the campaign driver's node launcher, DES §4). Plans +
