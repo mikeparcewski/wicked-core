@@ -278,7 +278,7 @@ impl RunTombstone {
 
 #[derive(Debug, Clone)]
 enum Line {
-    Fact(Fact),
+    Fact(Box<Fact>),
     Superseded {
         key: String,
         ts: i64,
@@ -365,7 +365,7 @@ fn parse_line(raw: &str) -> Line {
         Err(e) => return Line::Invalid(format!("`{event_type}` payload refused: {e}")),
     };
     match Fact::of(&ev) {
-        Ok(f) if f.key == stored_key => Line::Fact(f),
+        Ok(f) if f.key == stored_key => Line::Fact(Box::new(f)),
         Ok(f) => Line::Invalid(format!(
             "stored key {stored_key} is not the event's key {}",
             f.key
@@ -401,7 +401,7 @@ impl Snapshot {
             .enumerate()
             .filter_map(|(i, (_, l))| match l {
                 Line::Fact(f) if f.lane == *lane && !self.superseded(f, Some(i)) => {
-                    Some((i, f.clone()))
+                    Some((i, (**f).clone()))
                 }
                 _ => None,
             })

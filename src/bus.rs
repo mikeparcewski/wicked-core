@@ -73,6 +73,10 @@ use crate::{HumanConfirm, LaunchSpec};
 pub const DEFAULT_TTL_HOURS: i64 = 72;
 /// wicked-bus config default: the idempotency dedup row survives 24h (`config.dedup_ttl_hours`).
 pub const DEFAULT_DEDUP_TTL_HOURS: i64 = 24;
+/// wicked-bus config default: the largest payload `emit()` accepts (`config.max_payload_bytes`).
+pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1_048_576;
+/// The most rows one [`BusDb::read_after`] returns; a caller pages with [`BusPage::next`].
+pub const READ_LIMIT_MAX: usize = 1000;
 const MS_PER_HOUR: i64 = 3_600_000;
 
 /// The base `events` table DDL — byte-for-byte the NOT NULL/UNIQUE shape from wicked-bus
@@ -172,6 +176,9 @@ pub struct BusEmit {
     pub idempotency_key: Option<String>,
     /// Per-event TTL override in hours (defaults to [`DEFAULT_TTL_HOURS`]).
     pub ttl_hours: Option<i64>,
+    /// The emitting process's identity (wicked-bus migration 3's `producer_id` column); `None` =
+    /// NULL, as wicked-bus writes it when no producer is named.
+    pub producer_id: Option<String>,
 }
 
 impl BusEmit {
@@ -189,6 +196,7 @@ impl BusEmit {
             payload,
             idempotency_key: None,
             ttl_hours: None,
+            producer_id: None,
         }
     }
 
@@ -216,6 +224,15 @@ pub struct BusEvent {
 struct BusConfig {
     ttl_hours: Option<i64>,
     dedup_ttl_hours: Option<i64>,
+    max_payload_bytes: Option<usize>,
+}
+
+/// The operator's wicked-bus `config.json` values this bridge honours (see [`load_bus_config`]).
+#[derive(Debug, Clone, Copy)]
+struct BusLimits {
+    ttl_hours: i64,
+    dedup_ttl_hours: i64,
+    max_payload_bytes: usize,
 }
 
 /// Resolve the wicked-bus data dir the way JS `paths.js`/`config.js` do — for the sole purpose of
@@ -235,22 +252,29 @@ fn resolve_config_dir(db_path: &str) -> Option<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
-/// Load `(ttl_hours, dedup_ttl_hours)` from `<dataDir>/config.json`, matching JS `loadConfig()`: a
-/// missing file or malformed JSON silently yields the defaults (72/24), and an absent key falls back
-/// to its own default. This is what makes the Rust two-timer TTL agree with JS under a NON-default
+/// Load `ttl_hours`, `dedup_ttl_hours` and `max_payload_bytes` from `<dataDir>/config.json`,
+/// matching JS `loadConfig()`: a missing file or malformed JSON silently yields the defaults
+/// (72/24/1 MiB), and an absent key falls back to its own default. This is what makes the Rust two-timer TTL agree with JS under a NON-default
 /// operator config — otherwise the JS sweep (which deletes on `dedup_expires_at`) reaps Rust rows on a
 /// different clock than JS-written rows.
-fn load_bus_ttls(db_path: &str) -> (i64, i64) {
+fn load_bus_config(db_path: &str) -> BusLimits {
     let cfg = resolve_config_dir(db_path)
         .map(|dir| dir.join("config.json"))
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str::<BusConfig>(&raw).ok());
-    match cfg {
-        Some(c) => (
-            c.ttl_hours.unwrap_or(DEFAULT_TTL_HOURS),
-            c.dedup_ttl_hours.unwrap_or(DEFAULT_DEDUP_TTL_HOURS),
-        ),
-        None => (DEFAULT_TTL_HOURS, DEFAULT_DEDUP_TTL_HOURS),
+    BusLimits {
+        ttl_hours: cfg
+            .as_ref()
+            .and_then(|c| c.ttl_hours)
+            .unwrap_or(DEFAULT_TTL_HOURS),
+        dedup_ttl_hours: cfg
+            .as_ref()
+            .and_then(|c| c.dedup_ttl_hours)
+            .unwrap_or(DEFAULT_DEDUP_TTL_HOURS),
+        max_payload_bytes: cfg
+            .as_ref()
+            .and_then(|c| c.max_payload_bytes)
+            .unwrap_or(DEFAULT_MAX_PAYLOAD_BYTES),
     }
 }
 
@@ -272,6 +296,9 @@ pub struct BusDb {
     /// (falls back to [`DEFAULT_DEDUP_TTL_HOURS`]). Drives `dedup_expires_at`, which the JS sweep
     /// deletes on — so this must agree with JS or Rust rows are reaped early/late.
     dedup_ttl_hours: i64,
+    /// The largest payload a wire emit ([`BusDb::emit_wire`]) accepts (`config.max_payload_bytes`),
+    /// same provenance.
+    max_payload_bytes: usize,
 }
 
 impl BusDb {
@@ -285,13 +312,8 @@ impl BusDb {
     /// writer. Production code takes [`BusDb::shared`].
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open bus db at {path}"))?;
-        let (default_ttl_hours, dedup_ttl_hours) = init_bus_connection(&conn, path)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            path: Arc::from(path),
-            default_ttl_hours,
-            dedup_ttl_hours,
-        })
+        let limits = init_bus_connection(&conn, path)?;
+        Ok(Self::with_connection(conn, path, limits))
     }
 
     /// The process-wide handle to the bus db at `path`: opened on first use, then the SAME
@@ -314,19 +336,14 @@ impl BusDb {
             }
         }
         let conn = Connection::open(path).with_context(|| format!("open bus db at {path}"))?;
-        let (default_ttl_hours, dedup_ttl_hours) = match init_bus_connection(&conn, path) {
-            Ok(ttls) => ttls,
+        let limits = match init_bus_connection(&conn, path) {
+            Ok(limits) => limits,
             Err(e) => {
                 std::mem::forget(conn);
                 return Err(e);
             }
         };
-        let db = Self {
-            conn: Arc::new(Mutex::new(conn)),
-            path: Arc::from(path),
-            default_ttl_hours,
-            dedup_ttl_hours,
-        };
+        let db = Self::with_connection(conn, path, limits);
         let opener = std::thread::current().name().unwrap_or("").to_string();
         let identity = file_identity(&key);
         let opens = match registry.get(&key) {
@@ -348,6 +365,16 @@ impl BusDb {
         );
         SHARED_OPENS_TOTAL.fetch_add(1, Ordering::SeqCst);
         Ok(db)
+    }
+
+    fn with_connection(conn: Connection, path: &str, limits: BusLimits) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: Arc::from(path),
+            default_ttl_hours: limits.ttl_hours,
+            dedup_ttl_hours: limits.dedup_ttl_hours,
+            max_payload_bytes: limits.max_payload_bytes,
+        }
     }
 
     /// Lock the connection, waiting at most `max_wait` for another thread's statement to finish.
@@ -479,8 +506,8 @@ pub fn shared_bus_stats(path: &str) -> Option<(usize, String)> {
         .map(|e| (e.opens, e.opener.clone()))
 }
 
-/// Apply the bus PRAGMAs and ensure the schema on a fresh connection; returns the operator's TTLs.
-fn init_bus_connection(conn: &Connection, path: &str) -> Result<(i64, i64)> {
+/// Apply the bus PRAGMAs and ensure the schema on a fresh connection; returns the operator's config.
+fn init_bus_connection(conn: &Connection, path: &str) -> Result<BusLimits> {
     {
         // Match wicked-bus lib/db.js PRAGMAs. WAL + a busy timeout so a concurrent JS writer/sweeper
         // never trips us with SQLITE_BUSY.
@@ -495,8 +522,48 @@ fn init_bus_connection(conn: &Connection, path: &str) -> Result<(i64, i64)> {
         // Stable-owner registry (DES-002 startup reclamation — see CURSOR_OWNERS_DDL).
         conn.execute_batch(CURSOR_OWNERS_DDL)
             .context("ensure core_exec_meta table")?;
+        // wicked-bus migration 3's seven `events` columns (every emit writes `producer_id`), each
+        // added only if missing and in that migration's order, so an engine-created file has the
+        // column ORDER of a wicked-bus-created one: wicked-bus's archive sweep copies rows by
+        // position (`INSERT INTO events_archive SELECT * FROM events`). A JS `migrate()` that runs
+        // later finds them present and skips them; `schema_migrations` is left alone (see
+        // CURSORS_DDL).
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('events')")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (column, decl) in MIGRATION_3_EVENTS_COLUMNS {
+            if !existing.iter().any(|c| c == column) {
+                add_events_column(conn, column, decl)?;
+            }
+        }
     }
-    Ok(load_bus_ttls(path))
+    Ok(load_bus_config(path))
+}
+
+/// wicked-bus migration 3's `events` columns, in its order (`lib/migrate.js` `applyMigration3`).
+const MIGRATION_3_EVENTS_COLUMNS: [(&str, &str); 7] = [
+    ("parent_event_id", "INTEGER"),
+    ("session_id", "TEXT"),
+    ("correlation_id", "TEXT"),
+    ("producer_id", "TEXT"),
+    ("origin_node_id", "TEXT"),
+    ("registry_schema_version", "INTEGER"),
+    ("payload_cas_sha", "TEXT"),
+];
+
+/// Add `column` to `events`. "duplicate column name" is success: a JS migrator added it between
+/// our existence check and this ALTER (wicked-bus's `addColumnIfMissing` race).
+fn add_events_column(conn: &Connection, column: &str, decl: &str) -> Result<()> {
+    match conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {column} {decl}")) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+            if msg.starts_with("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("add events.{column}")),
+    }
 }
 
 impl BusDb {
@@ -523,8 +590,8 @@ impl BusDb {
 
         let res = conn.execute(
             "INSERT INTO events (event_type, domain, subdomain, payload, schema_version, \
-             idempotency_key, emitted_at, expires_at, dedup_expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             idempotency_key, emitted_at, expires_at, dedup_expires_at, producer_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 event.event_type,
                 event.domain,
@@ -535,6 +602,7 @@ impl BusDb {
                 emitted_at,
                 expires_at,
                 dedup_expires_at,
+                event.producer_id,
             ],
         );
         match res {
@@ -748,6 +816,203 @@ impl BusDb {
             }
         }
         Ok(out)
+    }
+}
+
+/// One event as a wicked-bus producer hands it to `emit()` — the wire shape of
+/// [`BusDb::emit_wire`] (crew's rows since wicked-core#631). Only the fields this bridge writes are
+/// accepted; any other field (`metadata`, `schema_version`, the causality columns) is refused
+/// rather than silently dropped.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireEmit {
+    event_type: Option<serde_json::Value>,
+    domain: Option<serde_json::Value>,
+    subdomain: Option<serde_json::Value>,
+    payload: Option<serde_json::Value>,
+    idempotency_key: Option<String>,
+    producer_id: Option<String>,
+    ttl_hours: Option<i64>,
+}
+
+/// wicked-bus `EVENT_TYPE_REGEX`: `^wicked\.[a-z0-9_]+(\.[a-z0-9_]+)*$`.
+fn valid_event_type(t: &str) -> bool {
+    let mut segments = t.split('.');
+    segments.next() == Some("wicked")
+        && t.len() > "wicked.".len()
+        && segments.all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
+}
+
+/// A wicked-bus `WB-001 INVALID_EVENT_SCHEMA` refusal.
+fn wb001(msg: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("WB-001 invalid event: {msg}")
+}
+
+/// A required string field, checked as wicked-bus `validateEvent` checks it.
+fn wire_str(v: Option<serde_json::Value>, name: &str, max: usize) -> Result<String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Err(wb001(format!("missing {name}"))),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Err(wb001(format!("missing {name}"))),
+        Some(serde_json::Value::String(s)) if s.chars().count() > max => Err(wb001(format!(
+            "{name} exceeds {max} chars (got {})",
+            s.chars().count()
+        ))),
+        Some(serde_json::Value::String(s)) => Ok(s),
+        Some(_) => Err(wb001(format!("{name} must be a string"))),
+    }
+}
+
+/// One page of [`BusDb::read_after`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BusPage {
+    /// The cursor to pass as `after_id` next: the last row's id when the page is full (more may
+    /// follow), else the bus tail as of this read, so rows the prefix skipped are not scanned again.
+    /// `0` when `after_id` is past the tail: the path names a file whose ids restarted (the bus
+    /// file was replaced), so every row in it is new to the caller.
+    pub next: i64,
+    /// Whole `events` rows (every column the file has, wicked-bus's `SELECT *`), oldest first, with
+    /// `payload` parsed (the stored string when it is not JSON, as wicked-bus's poll delivers it).
+    pub rows: Vec<serde_json::Value>,
+}
+
+impl BusDb {
+    /// Publish one event given as wicked-bus `emit()` takes it, as JSON
+    /// `{ event_type, domain, subdomain?, payload, idempotency_key?, producer_id?, ttl_hours? }`
+    /// (wicked-core#631: crew's bus writes). Validated as wicked-bus `validateEvent` validates
+    /// (`WB-001` on a refusal, nothing written): `event_type` matches `wicked.<seg>(.<seg>)*` in at
+    /// most 128 chars, `domain` at most 64, `subdomain` at most 64, `payload` a JSON object (or a
+    /// JSON string holding one) of at most `config.max_payload_bytes`. Written by [`BusDb::emit`]:
+    /// the same row, the same two-timer TTL, and a key already on the bus resolves to its existing
+    /// row's id (where wicked-bus raises WB-002, which its callers treat as success).
+    /// Not wicked-bus `emit()` in full: it runs no schema registry (no size policy, no CAS
+    /// offload of a large payload, no JSON Schema check) and takes no causality fields
+    /// (`correlation_id`, `session_id`, `parent_event_id`) from the environment — those columns
+    /// stay NULL.
+    pub fn emit_wire(&self, event_json: &str) -> Result<i64> {
+        let wire: WireEmit = serde_json::from_str(event_json).map_err(wb001)?;
+        let event_type = wire_str(wire.event_type, "event_type", 128)?;
+        if !valid_event_type(&event_type) {
+            return Err(wb001(format!(
+                "event_type {event_type:?} does not match wicked.<segment>(.<segment>)* \
+                 (lowercase letters, digits, _)"
+            )));
+        }
+        let domain = wire_str(wire.domain, "domain", 64)?;
+        let subdomain = match wire.subdomain {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(s)) if s.is_empty() => s,
+            v => wire_str(v, "subdomain", 64)?,
+        };
+        let payload = match wire.payload {
+            None | Some(serde_json::Value::Null) => return Err(wb001("missing payload")),
+            Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(&s)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .ok_or_else(|| wb001("payload must be a valid JSON object"))?,
+            Some(v) if v.is_object() => v,
+            Some(_) => return Err(wb001("payload must be a valid JSON object")),
+        };
+        let bytes = serde_json::to_string(&payload)?.len();
+        if bytes > self.max_payload_bytes {
+            return Err(wb001(format!(
+                "payload size {bytes} bytes exceeds max_payload_bytes ({})",
+                self.max_payload_bytes
+            )));
+        }
+        self.emit(&BusEmit {
+            event_type,
+            domain,
+            subdomain,
+            payload,
+            idempotency_key: wire.idempotency_key.filter(|k| !k.is_empty()),
+            ttl_hours: wire.ttl_hours,
+            producer_id: wire.producer_id,
+        })
+    }
+
+    /// Up to `limit` (at most [`READ_LIMIT_MAX`]) rows strictly after `after_id`, oldest first,
+    /// whose `event_type` starts with `type_prefix` (a literal prefix, compared in SQL; `None` =
+    /// every type). Expired rows (`expires_at <= now`) are skipped, as wicked-bus's poll skips
+    /// them, unless `include_expired` (history readers: nothing may have swept the file, and a row
+    /// past its TTL is still the record). `limit` 0 reads no rows and returns the tail as [`BusPage::next`] (where a reader that
+    /// starts at the newest row begins). Reads nothing a caller could not also read through
+    /// wicked-bus, and writes nothing (wicked-core#631: crew's bus reads).
+    pub fn read_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+        type_prefix: Option<&str>,
+        include_expired: bool,
+    ) -> Result<BusPage> {
+        let limit = limit.min(READ_LIMIT_MAX);
+        // `i64::MIN` as the floor admits every row: an expired one included.
+        let now = if include_expired { i64::MIN } else { now_ms() };
+        let conn = self.lock();
+        // The tail first, then rows up to it: every row at or below it is committed (one writer at
+        // a time allocates ids), so a short page can move the cursor to the tail without skipping
+        // a row that commits between the two statements.
+        let tail: i64 =
+            conn.query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
+                r.get(0)
+            })?;
+        if after_id > tail {
+            return Ok(BusPage {
+                next: 0,
+                rows: Vec::new(),
+            });
+        }
+        if limit == 0 {
+            return Ok(BusPage {
+                next: tail,
+                rows: Vec::new(),
+            });
+        }
+        let mut stmt = conn.prepare(
+            "SELECT * FROM events WHERE event_id > ?1 AND event_id <= ?2 AND expires_at > ?3 \
+             AND (?4 IS NULL OR substr(event_type, 1, length(?4)) = ?4) \
+             ORDER BY event_id ASC LIMIT ?5",
+        )?;
+        let names: Vec<String> = stmt.column_names().iter().map(|n| n.to_string()).collect();
+        let rows = stmt
+            .query_map(
+                rusqlite::params![after_id, tail, now, type_prefix, limit as i64],
+                |r| {
+                    let mut row = serde_json::Map::with_capacity(names.len());
+                    for (i, name) in names.iter().enumerate() {
+                        let v = match r.get_ref(i)? {
+                            rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => n.into(),
+                            rusqlite::types::ValueRef::Real(f) => f.into(),
+                            rusqlite::types::ValueRef::Text(t) => {
+                                let t = String::from_utf8_lossy(t);
+                                if name == "payload" {
+                                    serde_json::from_str(&t)
+                                        .unwrap_or_else(|_| serde_json::Value::String(t.into()))
+                                } else {
+                                    serde_json::Value::String(t.into())
+                                }
+                            }
+                            rusqlite::types::ValueRef::Blob(_) => serde_json::Value::Null,
+                        };
+                        row.insert(name.clone(), v);
+                    }
+                    Ok(serde_json::Value::Object(row))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let next = if rows.len() == limit {
+            rows.last()
+                .and_then(|r| r["event_id"].as_i64())
+                .unwrap_or(tail)
+        } else {
+            tail
+        };
+        Ok(BusPage { next, rows })
     }
 }
 
@@ -1989,5 +2254,406 @@ mod tests {
         .unwrap();
         let result = db.find_completed("c", "my-run", 99).unwrap();
         assert!(result.is_none(), "no match → None");
+    }
+
+    // ── wire emit / read (wicked-core#631: crew's one bus writer and reader) ─────────────────────
+
+    /// The columns of the row with `event_id` in the file at `path`, read through a raw connection.
+    fn raw_row(path: &str, event_id: i64) -> serde_json::Map<String, serde_json::Value> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM events WHERE event_id = ?1")
+            .unwrap();
+        let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        stmt.query_row([event_id], |r| {
+            let mut m = serde_json::Map::new();
+            for (i, n) in names.iter().enumerate() {
+                let v = match r.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                    rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        serde_json::json!(String::from_utf8_lossy(t))
+                    }
+                    other => panic!("unexpected column type {other:?}"),
+                };
+                m.insert(n.clone(), v);
+            }
+            Ok(m)
+        })
+        .unwrap()
+    }
+
+    /// A wire emit writes the row wicked-bus `emit()` writes: the given fields, `schema_version`
+    /// 1.0.0, the two-timer TTL, and the `producer_id` column (wicked-bus migration 3).
+    #[test]
+    fn emit_wire_writes_the_wicked_bus_row() {
+        let path = tmp_bus("wire-row");
+        let db = BusDb::open(&path).unwrap();
+        let id = db
+            .emit_wire(
+                &serde_json::json!({
+                    "event_type": "wicked.interactive.status.posted",
+                    "domain": "wicked-interactive",
+                    "subdomain": "status",
+                    "payload": {"document_id": "d1", "n": 1},
+                    "idempotency_key": "k-row",
+                    "producer_id": "wi-crew"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let row = raw_row(&path, id);
+        assert_eq!(row["event_type"], "wicked.interactive.status.posted");
+        assert_eq!(row["domain"], "wicked-interactive");
+        assert_eq!(row["subdomain"], "status");
+        assert_eq!(row["idempotency_key"], "k-row");
+        assert_eq!(row["producer_id"], "wi-crew");
+        assert_eq!(row["schema_version"], "1.0.0");
+        let payload: serde_json::Value =
+            serde_json::from_str(row["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({"document_id": "d1", "n": 1}));
+        let emitted = row["emitted_at"].as_i64().unwrap();
+        assert_eq!(
+            row["expires_at"].as_i64().unwrap() - emitted,
+            DEFAULT_TTL_HOURS * MS_PER_HOUR
+        );
+        assert_eq!(
+            row["dedup_expires_at"].as_i64().unwrap() - emitted,
+            DEFAULT_DEDUP_TTL_HOURS * MS_PER_HOUR
+        );
+
+        // No key: a fresh one, so two identical emits are two rows. No subdomain: ''.
+        let bare = serde_json::json!({
+            "event_type": "wicked.crew.project.created",
+            "domain": "wicked-crew",
+            "payload": {}
+        })
+        .to_string();
+        let a = db.emit_wire(&bare).unwrap();
+        let b = db.emit_wire(&bare).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(raw_row(&path, a)["subdomain"], "");
+        assert_eq!(raw_row(&path, a)["producer_id"], serde_json::Value::Null);
+    }
+
+    /// A key already on the bus resolves to its existing row (wicked-bus raises WB-002, which crew
+    /// treats as success): the same id back, and no second row.
+    #[test]
+    fn emit_wire_duplicate_key_returns_the_existing_row() {
+        let path = tmp_bus("wire-dup");
+        let db = BusDb::open(&path).unwrap();
+        let ev = |n: i64| {
+            serde_json::json!({
+                "event_type": "wicked.crew.project.created",
+                "domain": "wicked-crew",
+                "payload": {"n": n},
+                "idempotency_key": "k-dup"
+            })
+            .to_string()
+        };
+        let first = db.emit_wire(&ev(1)).unwrap();
+        let again = db.emit_wire(&ev(2)).unwrap();
+        assert_eq!(again, first);
+        assert_eq!(db.read_after(0, 100, None, false).unwrap().rows.len(), 1);
+    }
+
+    /// What wicked-bus `validateEvent` refuses (WB-001) is refused here too, and nothing is written;
+    /// a field wicked-bus would store but this emit does not is refused rather than dropped.
+    #[test]
+    fn emit_wire_refuses_what_wicked_bus_refuses() {
+        let path = tmp_bus("wire-refuse");
+        std::fs::write(
+            Path::new(&path).parent().unwrap().join("config.json"),
+            serde_json::json!({"max_payload_bytes": 64}).to_string(),
+        )
+        .unwrap();
+        let db = BusDb::open(&path).unwrap();
+        let long = "x".repeat(65);
+        let long_type = "x".repeat(128);
+        let j = |v: serde_json::Value| v.to_string();
+        for bad in [
+            "not json".to_string(),
+            j(serde_json::json!({"domain": "d", "payload": {}})),
+            j(serde_json::json!({"event_type": "wicked.a.b", "payload": {}})),
+            j(serde_json::json!({"event_type": "wicked.a.b", "domain": "d"})),
+            j(serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "payload": null})),
+            j(serde_json::json!({"event_type": "other.a.b", "domain": "d", "payload": {}})),
+            j(serde_json::json!({"event_type": "wicked.A.b", "domain": "d", "payload": {}})),
+            j(
+                serde_json::json!({"event_type": format!("wicked.{long_type}"), "domain": "d", "payload": {}}),
+            ),
+            j(serde_json::json!({"event_type": "wicked.a.b", "domain": long, "payload": {}})),
+            j(
+                serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "subdomain": long, "payload": {}}),
+            ),
+            j(serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "payload": [1]})),
+            j(serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "payload": "[1]"})),
+            j(
+                serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "payload": {"s": long}}),
+            ),
+            j(
+                serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "payload": {}, "metadata": {}}),
+            ),
+            j(
+                serde_json::json!({"event_type": "wicked.a.b", "domain": "d", "payload": {}, "ttl_hours": 1.5}),
+            ),
+        ] {
+            let err = db.emit_wire(&bad).expect_err(&bad).to_string();
+            assert!(err.starts_with("WB-001"), "{bad} → {err}");
+        }
+        assert_eq!(db.tail_event_id().unwrap(), 0, "nothing was written");
+        // A payload given as a JSON string of an object is accepted, as wicked-bus accepts it.
+        let id = db
+            .emit_wire(&j(serde_json::json!({
+                "event_type": "wicked.a.b",
+                "domain": "d",
+                "payload": serde_json::json!({"n": 1}).to_string()
+            })))
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(raw_row(&path, id)["payload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({"n": 1}));
+    }
+
+    /// A bus file created before wicked-bus migration 3 has no `producer_id` column: opening it
+    /// adds the column (as that migration's idempotent column-add does), so a wire emit lands.
+    #[test]
+    fn open_adds_producer_id_to_a_pre_migration_3_bus() {
+        let path = tmp_bus("wire-premig3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(EVENTS_DDL)
+            .unwrap();
+        let db = BusDb::open(&path).unwrap();
+        let id = db
+            .emit_wire(
+                &serde_json::json!({
+                    "event_type": "wicked.a.b",
+                    "domain": "d",
+                    "payload": {},
+                    "producer_id": "p"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(raw_row(&path, id)["producer_id"], "p");
+        // Idempotent: a second open of a file that already has the column is fine.
+        drop(db);
+        BusDb::open(&path).unwrap();
+    }
+
+    /// `read_after`: rows strictly after the cursor, oldest first, whole wicked-bus rows (payload
+    /// parsed), filtered by a literal type prefix in SQL, expired rows skipped, bounded by `limit`,
+    /// and `next` the cursor to pass back (the tail once the page is short, so non-matching rows are
+    /// never rescanned).
+    #[test]
+    fn read_after_pages_by_prefix_and_honours_expiry() {
+        let path = tmp_bus("read-after");
+        let db = BusDb::open(&path).unwrap();
+        let emit = |t: &str, n: i64| {
+            db.emit_wire(
+                &serde_json::json!({
+                    "event_type": t,
+                    "domain": "d",
+                    "subdomain": "s",
+                    "payload": {"n": n},
+                    "producer_id": "p"
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let a1 = emit("wicked.team.gate.opened", 1);
+        let _x = emit("wicked.interactive.doc.created", 2);
+        let a2 = emit("wicked.team.ledger.folded", 3);
+        let _y = emit("wicked.teamx.other", 4); // shares the text "wicked.team" but not the prefix
+        let _z = emit("wicked.team_b.other", 5); // `_` is literal, not a LIKE wildcard
+        db.emit(&BusEmit {
+            ttl_hours: Some(-1),
+            ..BusEmit::new("wicked.team.expired", "d", "s", serde_json::json!({"n": 6}))
+        })
+        .unwrap();
+        let tail = db.tail_event_id().unwrap();
+
+        let page = db.read_after(0, 100, Some("wicked.team."), false).unwrap();
+        let ids: Vec<i64> = page
+            .rows
+            .iter()
+            .map(|r| r["event_id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![a1, a2]);
+        assert_eq!(page.next, tail, "a short page moves the cursor to the tail");
+        let row = &page.rows[0];
+        assert_eq!(row["event_type"], "wicked.team.gate.opened");
+        assert_eq!(row["domain"], "d");
+        assert_eq!(row["subdomain"], "s");
+        assert_eq!(
+            row["payload"],
+            serde_json::json!({"n": 1}),
+            "payload is parsed"
+        );
+        assert_eq!(row["producer_id"], "p");
+        assert_eq!(row["schema_version"], "1.0.0");
+        assert!(row["idempotency_key"].is_string());
+        assert!(row["emitted_at"].is_i64() && row["expires_at"].is_i64());
+
+        // A full page stops at its last row; the next page resumes after it.
+        let first = db.read_after(0, 1, Some("wicked.team."), false).unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.next, a1);
+        let second = db
+            .read_after(first.next, 1, Some("wicked.team."), false)
+            .unwrap();
+        assert_eq!(second.rows[0]["event_id"].as_i64().unwrap(), a2);
+
+        // No prefix: every live row. Limit 0: no rows, the cursor at the tail (a tap's start).
+        assert_eq!(db.read_after(0, 100, None, false).unwrap().rows.len(), 5);
+        let start = db.read_after(0, 0, None, false).unwrap();
+        assert!(start.rows.is_empty());
+        assert_eq!(start.next, tail);
+        // Past the tail — the path now names a file whose ids restarted: start over at 0.
+        let restarted = db.read_after(tail + 50, 100, None, false).unwrap();
+        assert!(restarted.rows.is_empty());
+        assert_eq!(restarted.next, 0);
+        // An empty bus reads as empty, cursor 0.
+        let empty = BusDb::open(&tmp_bus("read-empty")).unwrap();
+        let page = empty.read_after(0, 10, None, false).unwrap();
+        assert!(page.rows.is_empty());
+        assert_eq!(page.next, 0);
+    }
+
+    /// A stored payload that is not JSON is delivered as the stored string (as wicked-bus's poll does).
+    #[test]
+    fn read_after_delivers_an_unparseable_payload_as_stored() {
+        let path = tmp_bus("read-raw");
+        let db = BusDb::open(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO events (event_type, domain, payload, idempotency_key, emitted_at, \
+                 expires_at, dedup_expires_at) VALUES ('wicked.a.b', 'd', 'not json', 'k', 1, ?1, 1)",
+                [now_ms() + 60_000],
+            )
+            .unwrap();
+        let page = db.read_after(0, 10, None, false).unwrap();
+        assert_eq!(page.rows[0]["payload"], "not json");
+    }
+
+    /// wicked-bus `lib/schema.sql` events columns, then migration 3's seven (`lib/migrate.js`
+    /// `applyMigration3`), in that order: the shape a wicked-bus-created file has. Its archive sweep
+    /// copies rows by position (`INSERT INTO events_archive SELECT * FROM events`), so an engine-
+    /// created file must have the same column ORDER, not only the same set.
+    const WICKED_BUS_EVENTS_COLUMNS: [&str; 18] = [
+        "event_id",
+        "event_type",
+        "domain",
+        "subdomain",
+        "payload",
+        "schema_version",
+        "idempotency_key",
+        "emitted_at",
+        "expires_at",
+        "dedup_expires_at",
+        "metadata",
+        "parent_event_id",
+        "session_id",
+        "correlation_id",
+        "producer_id",
+        "origin_node_id",
+        "registry_schema_version",
+        "payload_cas_sha",
+    ];
+
+    fn events_columns(path: &str) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('events') ORDER BY cid")
+            .unwrap();
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        cols
+    }
+
+    /// An engine-created bus file has wicked-bus's column order (all seven migration-3 columns,
+    /// in migration 3's order), and so does a pre-migration-3 file the engine opens; a file that
+    /// already has some of them (a JS migrator got there first, or ran half-way) keeps them and
+    /// gets the rest.
+    #[test]
+    fn engine_created_bus_has_the_wicked_bus_column_order() {
+        let fresh = tmp_bus("cols-fresh");
+        BusDb::open(&fresh).unwrap();
+        assert_eq!(events_columns(&fresh), WICKED_BUS_EVENTS_COLUMNS);
+
+        let base = tmp_bus("cols-base");
+        Connection::open(&base)
+            .unwrap()
+            .execute_batch(EVENTS_DDL)
+            .unwrap();
+        BusDb::open(&base).unwrap();
+        assert_eq!(events_columns(&base), WICKED_BUS_EVENTS_COLUMNS);
+
+        // Half-migrated: the first three are there already; opening adds the other four, in order.
+        let half = tmp_bus("cols-half");
+        Connection::open(&half)
+            .unwrap()
+            .execute_batch(&format!(
+                "{EVENTS_DDL} ALTER TABLE events ADD COLUMN parent_event_id INTEGER; \
+                 ALTER TABLE events ADD COLUMN session_id TEXT; \
+                 ALTER TABLE events ADD COLUMN correlation_id TEXT;"
+            ))
+            .unwrap();
+        BusDb::open(&half).unwrap();
+        assert_eq!(events_columns(&half), WICKED_BUS_EVENTS_COLUMNS);
+        // And a second open changes nothing.
+        BusDb::open(&half).unwrap();
+        assert_eq!(events_columns(&half), WICKED_BUS_EVENTS_COLUMNS);
+    }
+
+    /// A column-add that loses a race with a JS migrator ("duplicate column name") is success.
+    #[test]
+    fn a_duplicate_column_from_a_racing_migrator_is_success() {
+        let path = tmp_bus("cols-race");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(EVENTS_DDL).unwrap();
+        conn.execute_batch("ALTER TABLE events ADD COLUMN producer_id TEXT")
+            .unwrap();
+        // The add itself, as if the existence check had run before the other migrator's ALTER.
+        add_events_column(&conn, "producer_id", "TEXT").unwrap();
+        assert!(add_events_column(&conn, "no such type!", "(").is_err());
+    }
+
+    /// History readers (crew's activity feed, the team route) read expired rows too: nothing
+    /// sweeps the daemon's bus, and a row past its TTL is still the record.
+    #[test]
+    fn read_after_can_include_expired_rows() {
+        let db = BusDb::open(&tmp_bus("read-expired")).unwrap();
+        let live = db
+            .emit(&BusEmit::new(
+                "wicked.a.live",
+                "d",
+                "s",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let old = db
+            .emit(&BusEmit {
+                ttl_hours: Some(-1),
+                ..BusEmit::new("wicked.a.old", "d", "s", serde_json::json!({}))
+            })
+            .unwrap();
+        let ids = |page: BusPage| -> Vec<i64> {
+            page.rows
+                .iter()
+                .map(|r| r["event_id"].as_i64().unwrap())
+                .collect()
+        };
+        assert_eq!(ids(db.read_after(0, 10, None, false).unwrap()), vec![live]);
+        assert_eq!(
+            ids(db.read_after(0, 10, Some("wicked.a."), true).unwrap()),
+            vec![live, old]
+        );
     }
 }

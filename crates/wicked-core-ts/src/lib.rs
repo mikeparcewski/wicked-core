@@ -538,6 +538,39 @@ impl Task for CoreTask {
     }
 }
 
+/// `Core.busRead()`'s JSON `{ next, rows }`.
+fn bus_read_json(
+    core: &wicked_core::Core,
+    after_id: i64,
+    limit: u32,
+    type_prefix: Option<&str>,
+    include_expired: bool,
+) -> napi::Result<String> {
+    let page = core
+        .bus_read(after_id, limit as usize, type_prefix, include_expired)
+        .map_err(err)?;
+    serde_json::to_string(&page).map_err(err)
+}
+
+/// `Core.busEmit` off the JS thread → a JS `Promise<number>` (the event id).
+pub struct BusEmitTask {
+    core: wicked_core::Core,
+    event_json: String,
+}
+
+impl Task for BusEmitTask {
+    type Output = i64;
+    type JsValue = i64;
+
+    fn compute(&mut self) -> napi::Result<i64> {
+        self.core.bus_emit(&self.event_json).map_err(err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: i64) -> napi::Result<i64> {
+        Ok(output)
+    }
+}
+
 /// Wrap a blocking closure in an [`AsyncTask`] → a JS `Promise<string>`.
 /// `Core.catalog()`'s JSON.
 fn catalog_json() -> napi::Result<String> {
@@ -862,6 +895,52 @@ impl Core {
             }
         }
         .to_string()
+    }
+
+    /// Publish one event on this engine's bus (`WICKED_BUS_DB`), given as wicked-bus `emit()`
+    /// takes it: JSON `{ event_type, domain, subdomain?, payload, idempotency_key?, producer_id?,
+    /// ttl_hours? }`. Resolves to the row's `event_id`; a key already on the bus resolves to the
+    /// existing row's id (where wicked-bus raises WB-002). Rejects with `WB-001 …` for an event
+    /// wicked-bus would refuse (and for a field this emit does not write), and when the engine has
+    /// no bus. Unlike wicked-bus `emit()`, it runs no schema registry or CAS offload and takes no
+    /// causality fields (`correlation_id`, `session_id`, `parent_event_id`) from the environment
+    /// (wicked-core#631: the engine is the one writer and the one SQLite library on its bus,
+    /// so crew writes through here). Runs on the libuv pool over the engine's one bus connection;
+    /// never through the actor.
+    #[napi(ts_return_type = "Promise<number>")]
+    pub fn bus_emit(&self, event_json: String) -> AsyncTask<BusEmitTask> {
+        AsyncTask::new(BusEmitTask {
+            core: self.inner.clone(),
+            event_json,
+        })
+    }
+
+    /// Read this engine's bus: live rows (`expires_at` in the future; every row when
+    /// `includeExpired` — history readers) strictly after `afterId`,
+    /// oldest first, whose `event_type` starts with `typePrefix` (a literal prefix; omitted = every
+    /// type), at most `limit` of them (capped at 1000). Resolves to JSON `{ next, rows }`: `rows` are
+    /// whole wicked-bus `events` rows with `payload` parsed; `next` is the cursor to pass back (the
+    /// last row's id when the page is full, else the bus tail, `0` when `afterId` is past the tail
+    /// — the bus file was replaced and its ids restarted). `limit` 0 reads no rows and resolves the
+    /// tail as `next`. Rejects when the engine has no bus. Runs like `busEmit`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn bus_read(
+        &self,
+        after_id: i64,
+        limit: u32,
+        type_prefix: Option<String>,
+        include_expired: Option<bool>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            bus_read_json(
+                &core,
+                after_id,
+                limit,
+                type_prefix.as_deref(),
+                include_expired.unwrap_or(false),
+            )
+        })
     }
 
     /// EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
@@ -2453,6 +2532,97 @@ mod tests {
             .map(|e| e["id"].as_str().unwrap())
             .collect();
         assert_eq!(verified, ["test", "domain_coverage"]);
+    }
+
+    /// (wicked-core#631) `Core.busEmit()` / `Core.busRead()`: an emit resolves to the row's id (a
+    /// duplicate key to the existing row's), `busRead` answers `{ next, rows }` with whole rows
+    /// filtered by type prefix, a refused event rejects `WB-001`, and an engine without a bus
+    /// rejects both.
+    #[test]
+    fn bus_emit_and_bus_read_pin_the_wire_shapes() {
+        hermetic_spool();
+        let dir = std::env::temp_dir().join(format!("wct-bus631-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus = dir.join("bus.db").to_string_lossy().to_string();
+        let spawn = |bus: Option<String>, name: &str| {
+            let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
+            wicked_core::Core::spawn_with_engine_team(
+                temp_store_path(name),
+                dispatcher,
+                Arc::new(StubStepRunner),
+                wicked_core::TeamConfig::new(bus, Some(dir.join("team-outbox.ndjson"))),
+            )
+        };
+        let core = spawn(Some(bus), "bus631");
+        let emit = |core: &wicked_core::Core, json: &str| {
+            BusEmitTask {
+                core: core.clone(),
+                event_json: json.to_string(),
+            }
+            .compute()
+        };
+        let row = r#"{"event_type":"wicked.crew.project.created","domain":"wicked-crew","subdomain":"project","payload":{"project_id":"p1"},"idempotency_key":"k1","producer_id":"wicked-crew"}"#;
+        let id = emit(&core, row).unwrap();
+        assert_eq!(
+            emit(&core, row).unwrap(),
+            id,
+            "a duplicate key is the existing row"
+        );
+        emit(
+            &core,
+            r#"{"event_type":"wicked.team.gate.opened","domain":"wicked-core","payload":{}}"#,
+        )
+        .unwrap();
+        let refused = emit(&core, r#"{"event_type":"nope","domain":"d","payload":{}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("WB-001"), "{refused}");
+
+        let page: serde_json::Value = serde_json::from_str(
+            &bus_read_json(&core, 0, 10, Some("wicked.crew."), false).unwrap(),
+        )
+        .unwrap();
+        let mut keys: Vec<&str> = page
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["next", "rows"]);
+        let rows = page["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], id);
+        assert_eq!(rows[0]["payload"]["project_id"], "p1");
+        assert_eq!(rows[0]["producer_id"], "wicked-crew");
+        let start: serde_json::Value =
+            serde_json::from_str(&bus_read_json(&core, 0, 0, None, false).unwrap()).unwrap();
+        assert_eq!(start["rows"].as_array().unwrap().len(), 0);
+        assert_eq!(start["next"], id + 1, "limit 0 answers the tail");
+
+        // History readers ask for expired rows too; the default stays live-only.
+        let expired = emit(
+            &core,
+            r#"{"event_type":"wicked.crew.project.archived","domain":"wicked-crew","payload":{},"ttl_hours":-1}"#,
+        )
+        .unwrap();
+        let live: serde_json::Value = serde_json::from_str(
+            &bus_read_json(&core, 0, 10, Some("wicked.crew."), false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live["rows"].as_array().unwrap().len(), 1);
+        let all: serde_json::Value =
+            serde_json::from_str(&bus_read_json(&core, 0, 10, Some("wicked.crew."), true).unwrap())
+                .unwrap();
+        assert_eq!(all["rows"][1]["event_id"], expired);
+
+        let bare = spawn(None, "bus631-nobus");
+        assert!(emit(&bare, row).unwrap_err().to_string().contains("no bus"));
+        assert!(bus_read_json(&bare, 0, 10, None, false)
+            .unwrap_err()
+            .to_string()
+            .contains("no bus"));
     }
 
     /// (T8 (e)) `Core.previewPlan()`: the pinned shape, the approval answer per `humanConfirm`,

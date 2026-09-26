@@ -160,6 +160,30 @@ export declare class Core {
    */
   busBridgeState(): string
   /**
+   * Publish one event on this engine's bus (`WICKED_BUS_DB`), given as wicked-bus `emit()`
+   * takes it: JSON `{ event_type, domain, subdomain?, payload, idempotency_key?, producer_id?,
+   * ttl_hours? }`. Resolves to the row's `event_id`; a key already on the bus resolves to the
+   * existing row's id (where wicked-bus raises WB-002). Rejects with `WB-001 …` for an event
+   * wicked-bus would refuse (and for a field this emit does not write), and when the engine has
+   * no bus. Unlike wicked-bus `emit()`, it runs no schema registry or CAS offload and takes no
+   * causality fields (`correlation_id`, `session_id`, `parent_event_id`) from the environment
+   * (wicked-core#631: the engine is the one writer and the one SQLite library on its bus,
+   * so crew writes through here). Runs on the libuv pool over the engine's one bus connection;
+   * never through the actor.
+   */
+  busEmit(eventJson: string): Promise<number>
+  /**
+   * Read this engine's bus: live rows (`expires_at` in the future; every row when
+   * `includeExpired` — history readers) strictly after `afterId`,
+   * oldest first, whose `event_type` starts with `typePrefix` (a literal prefix; omitted = every
+   * type), at most `limit` of them (capped at 1000). Resolves to JSON `{ next, rows }`: `rows` are
+   * whole wicked-bus `events` rows with `payload` parsed; `next` is the cursor to pass back (the
+   * last row's id when the page is full, else the bus tail, `0` when `afterId` is past the tail
+   * — the bus file was replaced and its ids restarted). `limit` 0 reads no rows and resolves the
+   * tail as `next`. Rejects when the engine has no bus. Runs like `busEmit`.
+   */
+  busRead(afterId: number, limit: number, typePrefix?: string | undefined | null, includeExpired?: boolean | undefined | null): Promise<string>
+  /**
    * EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
    * governance events to (`WICKED_ESTATE_DB`; wicked-crew#495) — as a JSON number string, over
    * a READ-ONLY connection (never the single-writer actor's handle; the store must already
