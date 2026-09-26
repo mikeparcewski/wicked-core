@@ -2134,11 +2134,24 @@ pub(super) fn apply_review(
 /// Why an ACCEPT line cannot count a member's step (absence row 32): on a bus-teamed review the
 /// step counts only once the stream holds its `step.reviewed{verdict:"accepted"}` (T6 (f)).
 fn accept_record_refusal(
-    _bus: bool,
-    _step_id: &str,
-    _record: Option<&crate::team::StepReviewRecord>,
+    bus: bool,
+    step_id: &str,
+    record: Option<&crate::team::StepReviewRecord>,
 ) -> Option<String> {
-    None
+    if !bus {
+        return None;
+    }
+    match record {
+        Some(r) if r.verdict == crate::team::events::StepVerdict::Accepted => None,
+        Some(_) => Some(format!(
+            "the PA's `STEP {step_id}: ACCEPT` line disagrees with the team's record of the \
+             review (step.reviewed says rejected)"
+        )),
+        None => Some(format!(
+            "the team's record holds no step.reviewed for `{step_id}`, so the PA's ACCEPT is not \
+             on the stream"
+        )),
+    }
 }
 
 /// Why the PA's review attempt cannot count a member's step on its tree (D2), or `None` when the
