@@ -2373,6 +2373,13 @@ pub(super) fn apply_review(
     let run_id = session.id.clone();
     let mut units = crate::domain::session_units(act.store, &run_id)?;
     let unit = units[ix].clone();
+    // (T4, §8.7 trigger 2) The PA answers a member's `change.requested` in this review turn:
+    // its `PLAN <change_id>: ACCEPT` + `PLAN+` lines are held for the run's next advance.
+    let before = session.team_plan.as_ref().map(|t| t.plan_lines.len());
+    record_plan_lines(&mut session, &unit, output);
+    if session.team_plan.as_ref().map(|t| t.plan_lines.len()) != before {
+        put_node(act.store, session.to_node())?;
+    }
     let ms = unit.member_step.clone().unwrap_or_default();
     let reviewed = ms.reviewing.unwrap_or_default();
     let step_id = unit
@@ -2564,17 +2571,50 @@ pub(super) fn on_rescored(
     put_node(store, session.to_node())
 }
 
-/// (T4) The step boundary (§8.7 "Applying a revision"): after the finished unit folds and before
-/// the next dispatch. The triggers, in order: a held diff re-score that raised the floor, then the
-/// PA's `PLAN <change_id>: ACCEPT` / `PLAN+` lines of this output. Each is one revision (`rev`
-/// n+1, n+2, …); the new units are inserted after the cursor in one pass, the done prefix is never
-/// touched, and a revision the approval matrix holds leaves the plan pending, so the run pauses
-/// `plan_approval` before its next unit (the caller's `advance_or_pause`).
-pub(super) fn revise_at_boundary(
+/// (T4, §8.7 triggers 1–2) Hold the PA's `PLAN` lines of a finished turn for the run's next
+/// advance: its own step, or its review of a member's step (the render asks it to answer a
+/// member's `change.requested` there). A member's own work never speaks for the plan (§8.8: the
+/// PA owns it), and a failed turn has no answer to read.
+/// Mutates `session` only; the caller persists it (every path after a fold writes the session).
+pub(super) fn record_plan_lines(
+    session: &mut AgentSession,
+    unit: &WorkUnit,
+    output: &crate::workflow::StepOutput,
+) {
+    if output.status != crate::workflow::StepStatus::Ok || is_member_work(unit) {
+        return;
+    }
+    let text = crate::plan_gate::plan_lines_of(&output.output);
+    if text.is_empty() {
+        return;
+    }
+    let pa = pa_seat(session);
+    if !is_review(unit) && unit.assigned_cli.as_deref() != Some(pa.as_str()) {
+        return;
+    }
+    if let Some(tp) = session.team_plan.as_mut().filter(|t| t.accepted_rev > 0) {
+        tp.plan_lines.push(crate::plan_gate::PlanLines {
+            ord: unit.ord,
+            attempt: output.attempt,
+            by: pa,
+            text,
+        });
+    }
+}
+
+/// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
+/// `advance_or_pause`, which calls this first — the fold's, a dispute answer's, a member step's
+/// acceptance, a gate's. It applies what is held (a diff re-score that raised the floor, then
+/// the PA's `PLAN` lines, in order), each as one revision (`rev` n+1, n+2, …), only while the
+/// cursor unit has not run (a step boundary: never mid-unit, never under a done unit that still
+/// owes its team step). New units go after the cursor; nothing before it is touched; a revision
+/// the approval matrix holds leaves the plan pending, and the caller pauses `plan_approval`.
+/// The raised state is persisted only once the units are in: a revision that cannot be planned
+/// keeps the run's floor where it was (a later re-score raises it again) and says why.
+pub(super) fn apply_held_revision(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
     run_id: &str,
-    output: &crate::workflow::StepOutput,
 ) -> anyhow::Result<()> {
     let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
         return Ok(());
@@ -2583,51 +2623,48 @@ pub(super) fn revise_at_boundary(
         .team_plan
         .clone()
         .filter(|t| t.accepted_rev > 0 && t.pending.is_none())
+        .filter(|t| t.rescored.is_some() || !t.plan_lines.is_empty())
     else {
         return Ok(());
     };
     let units = crate::domain::session_units(&*store, run_id)?;
     let cursor = session.unit_ix.min(units.len());
+    if units.get(cursor).is_some_and(|u| {
+        !matches!(
+            u.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+    }) {
+        return Ok(());
+    }
     let done: Vec<String> = units[..cursor]
         .iter()
         .map(|u| u.phase_id().unwrap_or_default().to_string())
         .collect();
-    let finished = units.get(output.unit_ix);
+    let reviewing_ord = cursor.checked_sub(1).map(|i| units[i].ord);
     let mut changes = Vec::new();
     if let Some(r) = prior.rescored.clone() {
         changes.push(crate::plan_gate::Change::Floor(r));
     }
-    // Only the PA's own turn speaks for the plan (§8.8: the PA owns a member's step): its step,
-    // or its review of a member's step.
-    let pa = session.clis.first().cloned().unwrap_or_default();
-    if let Some(u) = finished.filter(|_| output.status == crate::workflow::StepStatus::Ok) {
-        let reviewing = u
-            .member_step
-            .as_ref()
-            .is_some_and(|m| m.reviewing.is_some());
-        if u.assigned_cli.as_deref() == Some(pa.as_str()) || reviewing {
-            changes.extend(crate::plan_gate::changes_from_output(
-                &output.output,
-                &pa,
-                u.ord,
-                output.attempt,
-            ));
-        }
+    for l in &prior.plan_lines {
+        changes.extend(crate::plan_gate::changes_from_output(
+            &l.text, &l.by, l.ord, l.attempt,
+        ));
     }
-    if changes.is_empty() {
-        return Ok(());
-    }
+    // What was held is taken, whatever comes of it.
+    let mut cleared = prior.clone();
+    cleared.rescored = None;
+    cleared.plan_lines.clear();
     if done.iter().any(|d| d == "deliver") {
-        // Nothing runs after the push: a revision there would ship unreviewed. Say so; the plan
-        // stays as it is.
+        session.team_plan = Some(cleared);
+        put_node(store, session.to_node())?;
+        // Nothing runs after the push: a revision there would ship unreviewed.
         anyhow::bail!("the plan was not revised: its deliver step already ran");
     }
-    let mut state = prior.clone();
-    state.rescored = None;
+    let mut state = cleared.clone();
     let mut facts = Vec::new();
     let mut def = None;
     let now = crate::interaction::now_millis();
-    let reviewing_ord = finished.map(|u| u.ord);
     for change in changes {
         let r = match crate::plan_gate::revise(
             run_id,
@@ -2654,20 +2691,34 @@ pub(super) fn revise_at_boundary(
             crate::plan_gate::Outcome::Refused { .. } => {}
         }
     }
-    session.team_plan = Some(state);
-    put_node(store, session.to_node())?;
-    if let Some(def) = def {
-        revise_units(store, subscribers, &session, def)?;
+    let Some(def) = def else {
+        // Nothing to insert (every change refused): the refusals are the record.
+        session.team_plan = Some(state);
+        put_node(store, session.to_node())?;
+        publish_plan_facts(&session, facts);
+        return Ok(());
+    };
+    let mut next = session.clone();
+    next.team_plan = Some(state);
+    if let Err(e) = revise_units(store, subscribers, &next, def) {
+        session.team_plan = Some(cleared);
+        put_node(store, session.to_node())?;
+        return Err(e.context("the revision could not be planned; the plan is unchanged"));
     }
+    let session = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     publish_plan_facts(&session, facts);
     Ok(())
 }
 
-/// (T4, §8.7 "Mechanism") Insert a revision's units into the live run: plan the def (every
-/// synchronous planning check, the pins attached), distribute it on the launch roster (the whole
-/// plan, so evaluator ≠ creator holds against the done units too), and write ONLY the units after
-/// the cursor — renumbered from it — leaving every unit already dispatched or done untouched.
-/// The cursor unit's attempt is re-read: a new unit there is dispatched at attempt 0.
+/// (T4, §8.7 "Mechanism") Insert a revision's units into the live run and persist `session`
+/// (with the revised plan state) in the same pass. The def is planned (every synchronous planning
+/// check, the pins attached) and distributed on the launch roster as a whole, so evaluator ≠
+/// creator holds against the units that already ran. Only NEW units are written as planned; a
+/// unit already in the run keeps everything it has — its seat, status, attempts and rework
+/// state (a rewound review re-runs at its own next attempt, never a reused key) — and only its
+/// ord moves (with that ord's dispatch history as its attempt floor). Nothing before the cursor
+/// changes. Nothing is written if planning fails.
 pub(super) fn revise_units(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -2699,9 +2750,34 @@ pub(super) fn revise_units(
         run_id,
         &session.benched_seats,
     )?;
-    let old_ids: std::collections::HashSet<&str> = old.iter().map(|u| u.id.as_str()).collect();
-    let tail: Vec<WorkUnit> = planned.iter().skip(cursor).cloned().collect();
-    for u in tail.iter().filter(|u| !old_ids.contains(u.id.as_str())) {
+    // A dispatch key is `(run, ord, attempt)` (the phase id), so a unit placed on an ord that
+    // already ran (the tail of a `request_changes` rewind) dispatches above that ord's last
+    // attempt — never a reused key. Nothing else about a unit already in the run changes.
+    let ran_at = |ord: u32| {
+        old.iter()
+            .find(|o| o.ord == ord)
+            .and_then(|o| o.last_attempt)
+    };
+    let mut kept = Vec::new();
+    let mut fresh = Vec::new();
+    let mut fresh_dists = Vec::new();
+    for (mut u, d) in planned.into_iter().zip(dists).skip(cursor) {
+        let floor = ran_at(u.ord);
+        match old.iter().find(|o| o.id == u.id) {
+            Some(o) => {
+                let mut k = o.clone();
+                k.ord = u.ord;
+                k.last_attempt = k.last_attempt.max(floor);
+                kept.push(k);
+            }
+            None => {
+                u.last_attempt = floor;
+                fresh.push(u);
+                fresh_dists.push(d);
+            }
+        }
+    }
+    for u in &fresh {
         emit(
             subscribers,
             CoreEvent::UnitPlanned {
@@ -2732,25 +2808,36 @@ pub(super) fn revise_units(
             },
         );
     }
+    let mut s = session.clone();
+    // The cursor unit may be new (a late floor phase lands at the cursor): it dispatches at its
+    // own next attempt, as a unit already in the run does.
+    s.attempt = fresh
+        .iter()
+        .chain(&kept)
+        .find(|u| u.ord as usize == cursor + 1)
+        .map(super::next_attempt)
+        .unwrap_or(0);
+    let status = s.status;
     let mut pre = crate::pipeline::PreDistributed {
         session_id: run_id.to_string(),
-        session: session.clone(),
-        units: tail,
+        session: s,
+        units: fresh,
         clis: roster,
         workflow_id: session.workflow_id.clone(),
         cli_keys: session.clis.clone(),
     };
-    let tail_dists = dists.into_iter().skip(cursor).collect();
-    crate::pipeline::apply_distributions(store, &mut pre, tail_dists, &mut |ev| {
+    crate::pipeline::apply_distributions(store, &mut pre, fresh_dists, &mut |ev| {
         emit(subscribers, ev)
     })?;
-    // The cursor unit may be new (a late floor phase lands at the cursor): its first dispatch is
-    // its own attempt 0, never the finished unit's.
-    let mut s = crate::domain::get_session(&*store, run_id)?
-        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
-    let units = crate::domain::session_units(&*store, run_id)?;
-    s.attempt = units.get(s.unit_ix).map(super::next_attempt).unwrap_or(0);
-    put_node(store, s.to_node())
+    for k in &kept {
+        put_node(store, k.to_node())?;
+    }
+    // `apply_distributions` marks the run Executing; a revision keeps the run's own status.
+    if pre.session.status != status {
+        pre.session.status = status;
+        put_node(store, pre.session.to_node())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

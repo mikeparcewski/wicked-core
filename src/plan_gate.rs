@@ -36,8 +36,8 @@ use crate::workflow::WorkflowDef;
 
 mod revise;
 pub(crate) use revise::{
-    changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, revise, Change,
-    DiffRescore, Outcome,
+    changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
+    Change, DiffRescore, Outcome, PlanLines,
 };
 
 /// The `gate_kind` token of a plan approval pause (`AwaitingHuman.gate_kind`, the durable
@@ -96,6 +96,11 @@ pub struct TeamPlanState {
     /// applied there as `plan.revised{reason:"floor_raised"}`, never mid-unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescored: Option<DiffRescore>,
+    /// (T4, §8.7) The PA's `PLAN` lines from its finished turns (its own step or its review of a
+    /// member's step), held until the run's next advance applies them — every advance goes
+    /// through the one hook, whichever path (fold, dispute answer, member accept) led there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_lines: Vec<PlanLines>,
 }
 
 /// An accepted plan rev: the body of its `plan.accepted` (§6 row 5).

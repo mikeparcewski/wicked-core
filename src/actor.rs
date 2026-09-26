@@ -5968,6 +5968,9 @@ fn apply_step_result(
     // without a council YES — the work stands, but the run pauses for a human BEFORE anything
     // else runs (DES-001 §6.7). The cursor STAYS on the unit: approve counts it (the withheld
     // `gateDecided` + `unitDone`) and advances, never re-dispatches; reject cancels.
+    // (T4, §8.7) The PA's `PLAN` lines of this turn, held for the run's next advance — which
+    // applies them whichever path gets there (this fold, a dispute answer, a member acceptance).
+    team_gate::record_plan_lines(&mut session, unit, &output);
     let member_work = team_gate::is_member_work(unit);
     if let Some(d) = team_dispute {
         put_node(store, session.to_node())?;
@@ -6016,16 +6019,8 @@ fn apply_step_result(
     session.unit_ix = output.unit_ix + 1;
     session.attempt = units.get(session.unit_ix).map(next_attempt).unwrap_or(0);
     put_node(store, session.to_node())?;
-    // (DES-TEAMING-002 T4, §8.7) The step boundary: a diff re-score that raised the floor and the
-    // PA's `PLAN+` lines revise the plan HERE — after the finished unit folds, before the next
-    // dispatch. New units go after the cursor; nothing dispatched or done is touched. A revision
-    // the approval matrix holds pauses `plan_approval` in `advance_or_pause` below.
-    if let Err(e) = team_gate::revise_at_boundary(store, subscribers, &run_id, &output) {
-        // Log it and show it: the run goes on with the plan it has.
-        emit_run_error(subscribers, &run_id, e);
-    }
 
-    // Advance: dispatch the next unit, pause at its human-confirm gate, or finalize.
+    // Advance (a held revision is applied first, in `advance_or_pause`): dispatch the next unit, pause at its human-confirm gate, or finalize.
     match advance_or_pause(
         store,
         subscribers,
@@ -6747,6 +6742,13 @@ fn advance_or_pause(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<Progress> {
+    // (DES-TEAMING-002 T4, §8.7) THE revision hook: every advance goes through here, so a held
+    // diff re-score or the PA's held `PLAN` lines are applied before anything is dispatched —
+    // after a fold, a dispute answer, a member step's acceptance or a gate alike.
+    if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
+        // Log it and show it: the run goes on with the plan it has.
+        emit_run_error(subscribers, run_id, e);
+    }
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;

@@ -108,6 +108,27 @@ pub(crate) fn path_scored_diff(
     )
 }
 
+/// The PA's `PLAN` lines of one finished turn, held for the next advance (§8.7 triggers 1–2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanLines {
+    /// The unit and attempt whose output carried them (the `PLAN+` proposal source).
+    pub ord: u32,
+    pub attempt: u32,
+    /// The PA seat.
+    pub by: String,
+    /// Only the `PLAN` lines of the output.
+    pub text: String,
+}
+
+/// The `PLAN` lines of a step output (the rest of the output is not kept).
+pub(crate) fn plan_lines_of(output: &str) -> String {
+    output
+        .lines()
+        .filter(|l| l.trim_start().starts_with("PLAN"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What changes the plan.
 pub(crate) enum Change {
     /// §8.7 trigger 3: a diff re-score raised the floor.
@@ -277,8 +298,15 @@ pub(crate) fn revise(
         })
         .collect();
     for s in additions {
-        // The plan only grows: a step already in the plan (same id) is already there.
-        if !s.id.is_empty() && provenance.contains_key(&s.id) {
+        // The plan only grows: a step already in the plan is already there — by its id, or, for
+        // a step that names no id, by its catalog entry (a restated or retried proposal adds
+        // nothing twice; a deliberate second `review` names its own id).
+        let present = if s.id.is_empty() {
+            steps.iter().any(|b| b.catalog == s.catalog)
+        } else {
+            provenance.contains_key(&s.id)
+        };
+        if present {
             continue;
         }
         insert_by_catalog(&mut steps, s);

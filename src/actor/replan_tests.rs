@@ -271,12 +271,17 @@ fn plan(v: Value) -> PlanSteps {
 }
 
 fn launch(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps) {
+    launch_on(e, run, hc, p, &["a", "b"]);
+}
+
+/// Launch on the named seats (the first is the PA).
+fn launch_on(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps, seats: &[&str]) {
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
             project_id: None,
             problem: "t4 re-plan".into(),
-            clis: vec![cli("a"), cli("b")],
+            clis: seats.iter().map(|k| cli(k)).collect(),
             entity_mode: crate::EntityMode::Shared,
             session_id: run.into(),
             human_confirm: hc,
@@ -356,9 +361,20 @@ impl Engine {
             .collect()
     }
     fn wait_awaiting(&mut self, run: &str, kind: &str, n: usize) {
-        wait_for(&format!("{run}: {n} `{kind}` pause(s)"), || {
-            self.awaiting(run).iter().filter(|(_, k)| k == kind).count() >= n
-        });
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            if self.awaiting(run).iter().filter(|(_, k)| k == kind).count() >= n {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "timed out waiting for {run}: {n} `{kind}` pause(s); paused {:?}; dispatched {:?}; \
+             status {:?}",
+            self.awaiting(run),
+            self.worker.calls(),
+            view(self, run).session.status
+        );
     }
 }
 
@@ -625,7 +641,9 @@ fn t4_high1_a_raise_on_a_member_step_is_applied_when_the_pa_accepts_it() {
         _ => hold(),
     });
     let mut e = engine_supervised("t4mem-acc", w.clone());
-    launch(
+    // Three seats: on two, the revised high-risk plan cannot be staffed (a team run never grades
+    // on a creator seat, seam D1) and the revision is refused as unplannable.
+    launch_on(
         &e,
         "macc",
         HumanConfirm::None,
@@ -633,6 +651,7 @@ fn t4_high1_a_raise_on_a_member_step_is_applied_when_the_pa_accepts_it() {
             json!({"steps": [{"catalog": "produce", "owner": "team"}, {"catalog": "critique"}],
                     "touch": ["README.md"]}),
         ),
+        &["a", "b", "c"],
     );
     e.wait_awaiting("macc", crate::plan_gate::GATE_KIND, 1);
     let calls = e.worker.calls();
@@ -706,7 +725,8 @@ fn t4_medium2_a_revision_after_a_rewind_keeps_the_review_attempt() {
         } else if id.ends_with(":critique") && reran {
             hold()
         } else {
-            turn(&pa_output("did the step"), None)
+            // An evaluator ends with its verdict (a creator ignores the line).
+            turn(&pa_output("did the step\nVERDICT: PASS"), None)
         }
     });
     let mut e = engine("t4rew", w.clone());
