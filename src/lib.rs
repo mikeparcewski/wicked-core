@@ -98,7 +98,7 @@ pub use applications::{
 };
 pub use bus::{
     deterministic_key, live_bus_bridges, matches_filter, shared_bus_stats, BusBridge,
-    BusBridgeState, BusDb, BusEmit, BusEvent, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD,
+    BusBridgeState, BusDb, BusEmit, BusEvent, BusPage, BUS_ARM_TIMEOUT, BUS_EXEC_INIT_THREAD,
     BUS_POLLER_THREAD, CORE_DOMAIN, RUN_LAUNCHED, RUN_REQUESTED,
 };
 pub use campaign::{
@@ -1425,6 +1425,39 @@ impl Core {
             anyhow::bail!("no team outbox to replay: this core has no bus or no state home");
         };
         Ok(TeamBus::new(bus.clone(), outbox.clone(), self.team.attempt_wait).drain_all())
+    }
+
+    /// This core's bus (`WICKED_BUS_DB`) through the process-wide handle ([`BusDb::shared`]) —
+    /// opened on the CALLER's thread, never the actor's.
+    fn bus(&self) -> anyhow::Result<BusDb> {
+        let Some(path) = &self.team.bus_db else {
+            anyhow::bail!("this engine has no bus (WICKED_BUS_DB is not set)");
+        };
+        BusDb::shared(path)
+    }
+
+    /// Publish one event on this core's bus, given as wicked-bus `emit()` takes it (JSON
+    /// `{ event_type, domain, subdomain?, payload, idempotency_key?, producer_id?, ttl_hours? }`),
+    /// and return its `event_id` (wicked-core#631: the engine is the one writer on its bus, so crew
+    /// writes through here instead of through a second SQLite library in the same process). A key
+    /// already on the bus resolves to the existing row's id. See [`BusDb::emit_wire`] for the
+    /// validation (`WB-001`). Runs on the caller's thread over the shared connection: it never
+    /// goes through the actor, and the actor's own bus publish is bounded, so neither waits on
+    /// the other. Errors when this core has no bus.
+    pub fn bus_emit(&self, event_json: &str) -> anyhow::Result<i64> {
+        self.bus()?.emit_wire(event_json)
+    }
+
+    /// Read this core's bus: live rows after `after_id` whose type starts with `type_prefix`, at
+    /// most `limit` of them, and the cursor to pass next (see [`BusDb::read_after`]). Same thread
+    /// rule as [`Core::bus_emit`]. Errors when this core has no bus.
+    pub fn bus_read(
+        &self,
+        after_id: i64,
+        limit: usize,
+        type_prefix: Option<&str>,
+    ) -> anyhow::Result<BusPage> {
+        self.bus()?.read_after(after_id, limit, type_prefix)
     }
 
     /// A team run's transport and its units' team snapshots — the persisted state behind crew's
