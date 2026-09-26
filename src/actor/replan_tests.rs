@@ -1661,3 +1661,6 @@ fn t8_r4_the_preview_does_not_fetch_the_remote() {
     );
     release_all(&w);
 }
+
+#[path = "scope_tests.rs"]
+mod scope_tests;

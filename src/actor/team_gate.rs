@@ -2617,6 +2617,136 @@ pub(super) fn record_plan_lines(
     }
 }
 
+// ── X1: the PA scopes a plan that declares no scope (DES-TEAMING-002 §8.2, §8.4, rev 13) ────────
+
+/// Whether `u` is the PA's scope step of a run whose launch plan is still waiting on it.
+pub(super) fn is_scope_unit(session: &AgentSession, u: &WorkUnit) -> bool {
+    u.phase_id() == Some(crate::plan_gate::SCOPE_STEP_ID)
+        && session
+            .team_plan
+            .as_ref()
+            .is_some_and(|t| t.scope.is_some())
+}
+
+/// Hold the scope step's answer (its `SCOPE` / `RISK` lines, from the PA seat only) for the
+/// boundary that scores the plan. A later attempt of the step replaces an earlier one's; a failed turn has no answer. An
+/// answer with no such line is recorded empty, so the boundary fails it closed with its reason.
+/// Mutates `session` only; the caller persists it.
+pub(super) fn record_scope_answer(
+    session: &mut AgentSession,
+    unit: &WorkUnit,
+    output: &crate::workflow::StepOutput,
+) {
+    if output.status != crate::workflow::StepStatus::Ok || !is_scope_unit(session, unit) {
+        return;
+    }
+    // (round 2, L2) Only the PA speaks for the scope, as only the PA speaks for the plan
+    // (`record_plan_lines`): an answer from any other seat is not recorded, so the boundary fails
+    // it closed ("no answer from the PA seat").
+    let by = pa_seat(session);
+    if unit.assigned_cli.as_deref() != Some(by.as_str()) {
+        return;
+    }
+    if let Some(hold) = session.team_plan.as_mut().and_then(|t| t.scope.as_mut()) {
+        hold.answer = Some(crate::plan_gate::ScopeAnswer {
+            ord: unit.ord,
+            attempt: output.attempt,
+            by,
+            lines: crate::plan_gate::scope_lines_of(&output.output),
+        });
+    }
+}
+
+/// (round 2, M2) The run's scope step is done but its plan is still held: the scope step's
+/// boundary ([`apply_scope`]) has not landed (a restart between the fold and its write). Such a
+/// run is not complete — it goes through `advance_or_pause`, never straight to finalize.
+pub(super) fn scope_due(store: &dyn GraphStore, session: &AgentSession) -> bool {
+    if session.team_plan.as_ref().is_none_or(|t| t.scope.is_none()) {
+        return false;
+    }
+    let Ok(units) = crate::domain::session_units(store, &session.id) else {
+        return false;
+    };
+    let cursor = session.unit_ix.min(units.len());
+    units[..cursor]
+        .iter()
+        .any(|u| u.phase_id() == Some(crate::plan_gate::SCOPE_STEP_ID))
+}
+
+/// (X1) The scope step's boundary: once it is done and the unit after it has not run, score the
+/// held launch plan from the PA's answer and decide it as the run's INITIAL plan — one pipeline
+/// ([`crate::plan_gate::decide`]): `plan.proposed` (by the PA, from its understand turn) →
+/// `path.scored{basis:"intent"}` → floor fill → compose → the approval matrix. Its units go in
+/// after the scope step ([`revise_units`]) with the plan state in the same write, then the facts
+/// publish; a held plan pauses `plan_approval` at the next unit (`should_pause`), an accepted one
+/// dispatches behind its `plan.accepted`. Idempotent until it lands (the hold is dropped in the
+/// same write as the units). `Err` (a refused or unplannable plan) fails the run: it must never
+/// run on with only its scope step.
+pub(super) fn apply_scope(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    let Some(session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    let Some(prior) = session
+        .team_plan
+        .clone()
+        .filter(|t| t.scope.is_some() && t.pending.is_none())
+    else {
+        return Ok(());
+    };
+    let units = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(units.len());
+    let Some(scope) = units[..cursor]
+        .iter()
+        .find(|u| u.phase_id() == Some(crate::plan_gate::SCOPE_STEP_ID))
+    else {
+        return Ok(()); // the scope step has not finished yet
+    };
+    if units.get(cursor).is_some_and(|u| {
+        !matches!(
+            u.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+    }) {
+        return Ok(());
+    }
+    let root = repo_root(&*store, &session);
+    let now = crate::interaction::now_millis();
+    let decided = crate::plan_gate::decide_scoped(
+        run_id,
+        &prior,
+        &pa_seat(&session),
+        scope.ord,
+        scope.last_attempt.unwrap_or(0),
+        root.as_deref(),
+        session.base_commit.as_deref(),
+        // (round 2, M1) T4's diff re-score runs only for a teamed run (the supervisor measures
+        // the settled diff); an un-teamed repo run's declared scope would never be corrected.
+        session.team.as_ref().is_some_and(RunTeamState::is_teamed),
+        &session.human_confirm,
+        now,
+    )?;
+    let def = match decided.verdict {
+        crate::plan_gate::Verdict::Refused { reason } => {
+            publish_plan_facts(&session, decided.events);
+            anyhow::bail!("the PA-scoped plan is refused: {reason}");
+        }
+        crate::plan_gate::Verdict::Accepted { def } | crate::plan_gate::Verdict::Held { def } => {
+            def
+        }
+    };
+    let mut next = session.clone();
+    next.team_plan = Some(decided.state);
+    revise_units(store, subscribers, &next, def)?;
+    let session = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    publish_plan_facts(&session, decided.events);
+    Ok(())
+}
+
 /// (DES-TEAMING-002 T8 (c)) `Core::propose_plan`: hold a mid-run human edit for the run's next
 /// advance ([`apply_held_revision`]). Idempotent by `request_id` — a spent id answers
 /// `duplicate: true` whatever the run's state. Validated when proposed, as a launch plan is: a
@@ -2683,6 +2813,12 @@ pub(super) fn propose_plan(
         anyhow::bail!(
             "run {run_id}: a plan is awaiting approval; edit it at the gate (the edit is the gate \
              answer)"
+        );
+    }
+    if tp.scope.is_some() {
+        anyhow::bail!(
+            "run {run_id}: its PA is still scoping the launch plan; propose the edit once the plan \
+             is decided (or at its plan_approval gate)"
         );
     }
     let units = crate::domain::session_units(&*store, run_id)?;
@@ -2785,7 +2921,7 @@ pub(super) fn apply_held_revision(
     let Some(prior) = session
         .team_plan
         .clone()
-        .filter(|t| t.accepted_rev > 0 && t.pending.is_none())
+        .filter(|t| t.accepted_rev > 0 && t.pending.is_none() && t.scope.is_none())
         .filter(|t| t.rescored.is_some() || !t.plan_lines.is_empty() || !t.edits.is_empty())
     else {
         return Ok(());
