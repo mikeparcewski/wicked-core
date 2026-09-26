@@ -1037,3 +1037,206 @@ fn t4_e_the_actor_never_polls_the_bus() {
         }
     }
 }
+
+// ── T8 (c), (e): Core::propose_plan and Core::preview_plan through the real engine ─────────────
+
+/// A worker whose first dispatch waits until the test says `go` (so an edit arrives mid-unit);
+/// every later dispatch is held.
+fn gated_worker() -> (Arc<Worker>, Arc<std::sync::atomic::AtomicBool>) {
+    let go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let g = go.clone();
+    let w = Worker::scripted(move |_, n| {
+        if n == 0 {
+            wait_for("the test to release the first unit", || {
+                g.load(AtomicOrdering::SeqCst)
+            });
+            turn(&pa_output("built it"), None)
+        } else {
+            hold()
+        }
+    });
+    (w, go)
+}
+
+fn docs_plan() -> PlanSteps {
+    plan(
+        json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                "touch": ["README.md"]}),
+    )
+}
+
+fn human_edits(e: &Engine, run: &str) -> Vec<Value> {
+    payloads(e, run, tev::PLAN_PROPOSED)
+        .into_iter()
+        .filter(|p| p["kind"] == "edit")
+        .collect()
+}
+
+/// (T8 (c)) An edit proposed mid-unit is HELD (nothing published while the unit runs) and applied
+/// at the step boundary through the revision path: `plan.proposed{by:"human", kind:"edit"}`
+/// sourced by the request id, then — auto mode, not high risk — `plan.accepted{by:"engine"}` as
+/// rev 2, the added step at the cursor, the done unit never re-run. The same request id, before
+/// or after the boundary, is a `duplicate`: no second row. (T8 (e)) the preview of the launch plan
+/// is the floor fill the launch computed.
+#[test]
+fn t8_c_propose_plan_applies_at_the_boundary_once_per_request_id() {
+    let (w, go) = gated_worker();
+    let e = engine("t8prop", w.clone());
+    let preview = crate::plan_gate::preview_plan(&docs_plan(), &HumanConfirm::None).unwrap();
+    launch(&e, "prop", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    let accepted = settled(&e, "prop", tev::PLAN_ACCEPTED, 1);
+    // (e) The preview is what the launch computed.
+    let shape = |steps: &Value| -> Vec<(String, String, String)> {
+        steps
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["catalog"].as_str().unwrap().to_string(),
+                    s["id"].as_str().unwrap().to_string(),
+                    s["added_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let previewed = serde_json::to_value(&preview).unwrap();
+    assert_eq!(shape(&previewed["steps"]), shape(&accepted[0]["steps"]));
+    assert_eq!(previewed["band"], accepted[0]["band"]);
+    assert_eq!(previewed["high_risk"], accepted[0]["high_risk"]);
+    assert!(!preview.pauses);
+
+    let edit = plan(json!({"steps": [{"catalog": "test_plan"}]}));
+    let first = e.core.propose_plan("prop", edit.clone(), "req-1").unwrap();
+    let again = e.core.propose_plan("prop", edit.clone(), "req-1").unwrap();
+    let want = tev::mint_proposal_id(
+        "prop",
+        "human",
+        &tev::ProposalSource::Edit {
+            request_id: "req-1".into(),
+        },
+    );
+    assert_eq!(
+        (first.proposal_id.as_str(), first.duplicate),
+        (want.as_str(), false)
+    );
+    assert_eq!(
+        (again.proposal_id.as_str(), again.duplicate),
+        (want.as_str(), true)
+    );
+    // Held while the unit runs: nothing of the edit is on the bus yet.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(human_edits(&e, "prop").is_empty());
+    go.store(true, AtomicOrdering::SeqCst);
+    // The boundary applies it; the facts are fire-and-forget, so wait for them.
+    let accepted = settled(&e, "prop", tev::PLAN_ACCEPTED, 2);
+    wait_for("the added unit to dispatch", || e.worker.calls().len() >= 2);
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "prop").len() == 1
+    });
+    let proposed = &human_edits(&e, "prop")[0];
+    assert_eq!(proposed["by"], "human");
+    assert_eq!(proposed["proposal_id"], want.as_str());
+    assert_eq!(proposed["base_rev"], 1);
+    assert_eq!(accepted[1]["plan_rev"], 2);
+    assert_eq!(accepted[1]["by"], "engine");
+    assert_eq!(accepted[1]["proposal_id"], want.as_str());
+    let ids: Vec<String> = view(&e, "prop")
+        .units
+        .iter()
+        .map(|u| u.id.clone())
+        .collect();
+    assert_eq!(ids, ["prop:produce", "prop:test_plan", "prop:critique"]);
+    let calls = e.worker.calls();
+    assert_eq!(calls[1].2, "prop:test_plan", "{calls:?}");
+    // After the boundary the request id is still spent: no second row of any kind.
+    let late = e.core.propose_plan("prop", edit, "req-1").unwrap();
+    assert!(late.duplicate);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(human_edits(&e, "prop").len(), 1);
+    assert_eq!(payloads(&e, "prop", tev::PLAN_ACCEPTED).len(), 2);
+    assert!(payloads(&e, "prop", tev::PLAN_REFUSED).is_empty());
+    release_all(&w);
+}
+
+/// (T8 (c)) The approval matrix applies to a mid-run human edit exactly as to any revision: in
+/// manual mode it pauses at a `plan_approval` gate (reason `manual_mode`) before the next unit,
+/// and approving it accepts rev 2 `by:"human"` and dispatches the added step.
+#[test]
+fn t8_c_a_proposed_edit_in_manual_mode_pauses_for_approval() {
+    let (w, go) = gated_worker();
+    let mut e = engine("t8man", w.clone());
+    // Manual mode that pauses only for plans (no unit is at ord 99).
+    launch(&e, "man", HumanConfirm::Before(99), docs_plan());
+    e.wait_awaiting("man", crate::plan_gate::GATE_KIND, 1);
+    e.core.confirm_gate("man", approve()).unwrap();
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    let p = e
+        .core
+        .propose_plan(
+            "man",
+            plan(json!({"steps": [{"catalog": "test_plan"}]})),
+            "req-m",
+        )
+        .unwrap();
+    assert!(!p.duplicate);
+    go.store(true, AtomicOrdering::SeqCst);
+    e.wait_awaiting("man", crate::plan_gate::GATE_KIND, 2);
+    // gate.opened is fire-and-forget: wait for the second PLAN gate's row itself.
+    let plan_gates = |e: &Engine| -> Vec<Value> {
+        payloads(e, "man", tev::GATE_OPENED)
+            .into_iter()
+            .filter(|g| g["kind"] == "plan_approval")
+            .collect()
+    };
+    wait_for("the edit's plan_approval gate.opened", || {
+        plan_gates(&e).len() >= 2
+    });
+    let gates = plan_gates(&e);
+    assert_eq!(gates.len(), 2, "{gates:#?}");
+    assert_eq!(gates[1]["reason"], "manual_mode");
+    assert_eq!(
+        e.worker.calls().len(),
+        1,
+        "nothing dispatched past the edit"
+    );
+    wait_for("the edit's plan.proposed", || {
+        human_edits(&e, "man").len() == 1
+    });
+    e.core.confirm_gate("man", approve()).unwrap();
+    wait_for("the added unit to dispatch", || e.worker.calls().len() >= 2);
+    assert_eq!(e.worker.calls()[1].2, "man:test_plan");
+    let accepted = settled(&e, "man", tev::PLAN_ACCEPTED, 2);
+    assert_eq!(accepted[1]["plan_rev"], 2);
+    assert_eq!(accepted[1]["by"], "human");
+    release_all(&w);
+}
+
+/// (T8 (c)) What `propose_plan` refuses synchronously, holding nothing: an unknown run, an empty
+/// request id, and an edit carrying `touch` or `override` (launch-plan fields) or no steps.
+#[test]
+fn t8_c_propose_plan_refusals() {
+    let (w, go) = gated_worker();
+    let e = engine("t8ref", w.clone());
+    launch(&e, "ref", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    let add = || plan(json!({"steps": [{"catalog": "test_plan"}]}));
+    assert!(e.core.propose_plan("nope", add(), "r").is_err());
+    assert!(e.core.propose_plan("ref", add(), " ").is_err());
+    for bad in [
+        json!({"steps": [{"catalog": "test_plan"}], "touch": ["src/x.rs"]}),
+        json!({"steps": [{"catalog": "test_plan"}], "override": {"remove": ["design"], "reason": "x"}}),
+        json!({"steps": []}),
+    ] {
+        let err = e
+            .core
+            .propose_plan("ref", plan(bad.clone()), "r2")
+            .unwrap_err();
+        assert!(!err.to_string().is_empty(), "{bad}");
+    }
+    // None of the refused calls spent its request id.
+    assert!(!e.core.propose_plan("ref", add(), "r2").unwrap().duplicate);
+    go.store(true, AtomicOrdering::SeqCst);
+    release_all(&w);
+}

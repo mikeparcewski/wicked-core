@@ -34,7 +34,9 @@ use crate::team::events::{
 };
 use crate::workflow::WorkflowDef;
 
+mod preview;
 mod revise;
+pub use preview::{preview_plan, PlanPreview};
 pub(crate) use revise::{
     changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
     Change, DiffRescore, Outcome, PlanLines,
@@ -101,6 +103,32 @@ pub struct TeamPlanState {
     /// through the one hook, whichever path (fold, dispute answer, member accept) led there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_lines: Vec<PlanLines>,
+    /// (T8 (c)) Mid-run human edits taken by `Core::propose_plan`, held — like the PA's `PLAN`
+    /// lines — for the run's next advance, which applies them through the same revision path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<HeldEdit>,
+    /// Every request id `Core::propose_plan` took for this run: a repeat is a no-op, so one
+    /// request id never proposes (or publishes) twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edit_requests: Vec<String>,
+}
+
+/// A mid-run human edit (`Core::propose_plan`) waiting for the next step boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldEdit {
+    /// Crew's per-POST request id: the `plan.proposed` source (§6.1 row 3).
+    pub request_id: String,
+    /// The steps to ADD (the plan only grows, §8.7).
+    pub steps: Vec<PlanStep>,
+}
+
+/// What `Core::propose_plan` did with an edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlanProposal {
+    /// The `plan.proposed` id the edit is published under (`"p-" + key([run, "human", request id])`).
+    pub proposal_id: String,
+    /// `true` when this request id was already taken: nothing new is held or published.
+    pub duplicate: bool,
 }
 
 /// An accepted plan rev: the body of its `plan.accepted` (§6 row 5).
@@ -454,6 +482,9 @@ pub(crate) struct Decided {
     /// The facts to publish, in order.
     pub events: Vec<TeamEvent>,
     pub verdict: Verdict,
+    /// The floor fill the verdict was reached on (`None` when refused before it):
+    /// what `Core::preview_plan` reads back.
+    pub filled: Option<crate::plan::FloorFilled>,
 }
 
 /// The per-run composed def id (§8.3): `<run>:plan-<rev>`, the shape
@@ -507,6 +538,7 @@ pub(crate) fn decide(
             state: prior.clone(),
             events,
             verdict: Verdict::Refused { reason },
+            filled: None,
         })
     };
     if let Some(why) = deliver_refusal {
@@ -534,6 +566,10 @@ pub(crate) fn decide(
     let rev = prior.rev + 1;
     let mut def = filled.def.clone();
     def.id = per_run_def_id(run_id, rev);
+    let read_back = Some(crate::plan::FloorFilled {
+        def: def.clone(),
+        ..filled.clone()
+    });
     let event = if prior.accepted_rev == 0 {
         PlanEvent::Initial
     } else {
@@ -588,6 +624,7 @@ pub(crate) fn decide(
                 state,
                 events,
                 verdict: Verdict::Accepted { def },
+                filled: read_back,
             })
         }
         Some(reason) => {
@@ -614,6 +651,7 @@ pub(crate) fn decide(
                 state,
                 events,
                 verdict: Verdict::Held { def },
+                filled: read_back,
             })
         }
     }

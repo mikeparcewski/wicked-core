@@ -68,6 +68,50 @@ pub fn catalog_entry(id: &str) -> Option<&'static PhaseDef> {
     catalog().iter().find(|e| e.id == id)
 }
 
+/// One catalog entry as studio's phase picker reads it (`Core.catalog()`, crew `GET /catalog`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub kind: StageKind,
+    pub role: PhaseRole,
+    pub gate: GateSpec,
+    pub gate_type: Option<GateType>,
+    pub executes_code: bool,
+    /// `"agent"` or `"tool"` (a Tool step supplies its own command).
+    pub executor: &'static str,
+    pub validator_pin: Option<String>,
+    /// The entry carries a validator pin (a step may not remove or swap it).
+    pub pinned: bool,
+    /// That pin is the evidence floor ([`EVIDENCE_FLOOR_PIN`]).
+    pub evidence_floor: bool,
+    pub skill_ref: Option<String>,
+    /// The entry's one-line description, when it has one (`null` for every entry today).
+    pub description: Option<String>,
+}
+
+/// The catalog as [`CatalogEntry`] rows, in [`CATALOG_IDS`] order.
+pub fn catalog_entries() -> Vec<CatalogEntry> {
+    catalog()
+        .iter()
+        .map(|e| CatalogEntry {
+            id: e.id.clone(),
+            kind: e.kind,
+            role: e.role,
+            gate: e.gate,
+            gate_type: e.gate_type,
+            executes_code: e.executes_code,
+            executor: if is_tool_entry(e) { "tool" } else { "agent" },
+            validator_pin: e.validator_pin.clone(),
+            pinned: e.validator_pin.is_some(),
+            evidence_floor: e.validator_pin.as_deref() == Some(EVIDENCE_FLOOR_PIN),
+            skill_ref: e.skill_ref.clone(),
+            // No entry carries a description yet (the §8.3 table has none); the key is pinned so
+            // a picker can render one the day an entry gains it.
+            description: None,
+        })
+        .collect()
+}
+
 /// `true` for an entry whose executor is a Tool (`run`, `deliver`): the only entries a step may
 /// hand an `executor`.
 pub fn is_tool_entry(entry: &PhaseDef) -> bool {
@@ -264,6 +308,67 @@ mod tests {
         assert_eq!(got, want);
         let ids: Vec<_> = catalog().iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, CATALOG_IDS);
+    }
+
+    /// (T8, `Core.catalog()`) Every entry as studio's phase picker reads it, in catalog order,
+    /// with the exact key set pinned: `pinned` = the entry carries a validator pin, and
+    /// `evidence_floor` = that pin is the evidence floor. `description` is the entry's own text
+    /// (`null`: no catalog entry carries one today).
+    #[test]
+    fn catalog_entries_are_the_catalog_as_the_picker_reads_it() {
+        let v = serde_json::to_value(catalog_entries()).unwrap();
+        let entries = v.as_array().unwrap();
+        let ids: Vec<_> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, CATALOG_IDS);
+        let keys: Vec<&str> = entries[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "description",
+                "evidence_floor",
+                "executes_code",
+                "executor",
+                "gate",
+                "gate_type",
+                "id",
+                "kind",
+                "pinned",
+                "role",
+                "skill_ref",
+                "validator_pin"
+            ]
+        );
+        let by = |id: &str| entries.iter().find(|e| e["id"] == id).unwrap().clone();
+        assert_eq!(
+            by("build"),
+            serde_json::json!({
+                "id": "build", "kind": "build", "role": "creator", "gate": "auto",
+                "gate_type": "execution", "executes_code": true, "executor": "agent",
+                "validator_pin": EVIDENCE_FLOOR_PIN, "pinned": true, "evidence_floor": true,
+                "skill_ref": null, "description": null
+            })
+        );
+        let cov = by("domain_coverage");
+        assert_eq!(
+            (cov["pinned"].clone(), cov["evidence_floor"].clone()),
+            (true.into(), false.into())
+        );
+        assert_eq!(
+            cov["gate"],
+            serde_json::json!({"human_confirm_if": "verdict_not_pass"})
+        );
+        let run = by("run");
+        assert_eq!(run["executor"], "tool");
+        assert_eq!(
+            (run["pinned"].clone(), run["evidence_floor"].clone()),
+            (false.into(), false.into())
+        );
+        assert_eq!(by("security_review")["skill_ref"], SECURITY_REVIEW_SKILL);
     }
 
     /// The evidence floor moved onto the catalog (DES-TEAMING-002 §10): exactly the entries whose

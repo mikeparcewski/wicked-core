@@ -539,6 +539,31 @@ impl Task for CoreTask {
 }
 
 /// Wrap a blocking closure in an [`AsyncTask`] → a JS `Promise<string>`.
+/// `Core.catalog()`'s JSON.
+fn catalog_json() -> napi::Result<String> {
+    serde_json::to_string(&wicked_core::catalog_entries()).map_err(err)
+}
+
+/// `Core.previewPlan()`'s JSON.
+fn preview_plan_json(plan_json: &str, human_confirm: Option<&str>) -> napi::Result<String> {
+    let plan = parse_plan(plan_json)?;
+    let hc = HumanConfirm::parse(human_confirm).map_err(err)?;
+    let preview = wicked_core::preview_plan(&plan, &hc).map_err(err)?;
+    serde_json::to_string(&preview).map_err(err)
+}
+
+/// `Core.proposePlan()`'s JSON.
+fn propose_plan_json(
+    core: &wicked_core::Core,
+    run_id: &str,
+    plan_json: &str,
+    request_id: &str,
+) -> napi::Result<String> {
+    let plan = parse_plan(plan_json)?;
+    let proposal = core.propose_plan(run_id, plan, request_id).map_err(err)?;
+    serde_json::to_string(&proposal).map_err(err)
+}
+
 fn task<F>(f: F) -> AsyncTask<CoreTask>
 where
     F: FnOnce() -> napi::Result<String> + Send + 'static,
@@ -1533,6 +1558,58 @@ impl Core {
         })
     }
 
+    // ── Plans (DES-TEAMING-002 T8) ─────────────────────────────────────────────
+
+    /// The phase catalog (`src/catalog.rs`) for studio's phase picker, in catalog order, as a JSON
+    /// array of `{ id, kind, role, gate, gate_type, executes_code, executor, validator_pin, pinned,
+    /// evidence_floor, skill_ref, description }` (`executor` is `"agent"` | `"tool"`; `pinned` =
+    /// the entry carries a validator pin; `evidence_floor` = that pin is the evidence floor;
+    /// `description` is `null` when the entry has none).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn catalog(&self) -> AsyncTask<CoreTask> {
+        task(catalog_json)
+    }
+
+    /// What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` would
+    /// compute, persisting and publishing nothing — the launch's own precheck, intent score, floor
+    /// fill and approval matrix. Resolves to JSON `{ score, deterministic, reasons, destructive,
+    /// band, high_risk, floor, floor_override, steps, def, pauses, pause_reason }`: `floor` is the
+    /// floor phase types the plan owes; the steps the floor ADDED are the `steps` with
+    /// `added_by: "floor"` (each with its `floor_reason`); `pauses` / `pause_reason`
+    /// (`manual_mode` | `high_risk` | `override`) say whether the launch would pause at a
+    /// `plan_approval` gate. Scores as a launch with no repo (a preview has no worktree) and no
+    /// deliver step. `projectId` is accepted for the route's shape: a plan's preview does not
+    /// depend on the project (only a preset name resolves per project). Rejects with the launch's
+    /// refusal (compose, supplied provenance, an override in auto mode) or a bad `humanConfirm`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn preview_plan(
+        &self,
+        plan_json: String,
+        project_id: Option<String>,
+        human_confirm: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let _ = project_id;
+        task(move || preview_plan_json(&plan_json, human_confirm.as_deref()))
+    }
+
+    /// A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
+    /// ADD. Held and applied at the run's next step boundary through the engine's revision path
+    /// (the ratchet, floor fill, the approval matrix), which publishes `plan.proposed{by:"human",
+    /// kind:"edit"}` then `plan.accepted` or a `plan_approval` gate. Idempotent by `requestId`.
+    /// Resolves to JSON `{ proposal_id, duplicate }` (`duplicate: true` = this request id was
+    /// already taken; nothing new is held or published). Rejects for an unknown, finished or
+    /// un-planned run, an empty request id, or an edit carrying `touch` / `override`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn propose_plan(
+        &self,
+        run_id: String,
+        plan_json: String,
+        request_id: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || propose_plan_json(&core, &run_id, &plan_json, &request_id))
+    }
+
     // ── Projects (DES-PROJECT-001) ─────────────────────────────────────────────
     // Writes ride the single-writer actor; reads open READ-ONLY connections, exactly
     // like the governance reads below.
@@ -2316,6 +2393,72 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (DES-TEAMING-002 T8) `Core.catalog()`: the thirteen entries, in catalog order, each with
+    /// the picker's keys.
+    #[test]
+    fn catalog_json_is_the_catalog_in_order() {
+        let v: serde_json::Value = serde_json::from_str(&catalog_json().unwrap()).unwrap();
+        let entries = v.as_array().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, wicked_core::CATALOG_IDS);
+        let build = entries.iter().find(|e| e["id"] == "build").unwrap();
+        assert_eq!(build["role"], "creator");
+        assert_eq!(build["pinned"], true);
+        assert_eq!(build["evidence_floor"], true);
+        assert!(build["description"].is_null());
+    }
+
+    /// (T8 (e)) `Core.previewPlan()`: the pinned shape, the approval answer per `humanConfirm`,
+    /// and rejections for a refused plan, bad JSON and a bad `humanConfirm` token.
+    #[test]
+    fn preview_plan_json_pins_the_shape_and_rejects_what_a_launch_refuses() {
+        let docs =
+            r#"{"steps":[{"catalog":"produce"},{"catalog":"critique"}],"touch":["README.md"]}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&preview_plan_json(docs, None).unwrap()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "band",
+                "def",
+                "destructive",
+                "deterministic",
+                "floor",
+                "floor_override",
+                "high_risk",
+                "pause_reason",
+                "pauses",
+                "reasons",
+                "score",
+                "steps"
+            ]
+        );
+        assert_eq!(v["pauses"], false);
+        assert!(v.get("added_by_floor").is_none());
+        let manual: serde_json::Value =
+            serde_json::from_str(&preview_plan_json(docs, Some("all")).unwrap()).unwrap();
+        assert_eq!(manual["pause_reason"], "manual_mode");
+        assert!(preview_plan_json(docs, Some("al")).is_err());
+        assert!(preview_plan_json("{", None).is_err());
+        assert!(preview_plan_json(r#"{"steps":[{"catalog":"nope"}]}"#, None).is_err());
+    }
+
+    /// (T8 (c)) `Core.proposePlan()` rejects bad JSON and an unknown run (no store write).
+    #[test]
+    fn propose_plan_json_rejects_bad_json_and_an_unknown_run() {
+        hermetic_spool();
+        let db_path = temp_store_path("propose-plan");
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
+        let core =
+            wicked_core::Core::spawn_with_engine(db_path, dispatcher, Arc::new(StubStepRunner));
+        assert!(propose_plan_json(&core, "run-x", "{", "r1").is_err());
+        let e = propose_plan_json(&core, "run-x", r#"{"steps":[{"catalog":"test"}]}"#, "r1")
+            .unwrap_err();
+        assert!(e.reason.contains("run-x"), "{}", e.reason);
+    }
 
     /// (T3 round 10, LOW 9) `planJson` is the whole answer: an `amend` or `amendScope` beside it
     /// is refused, never silently dropped; without them the edit decision is built.

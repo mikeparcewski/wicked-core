@@ -3563,6 +3563,19 @@ pub(crate) fn run(
                 });
                 let _ = reply.send(res);
             }
+            Command::ProposePlan {
+                run_id,
+                plan,
+                request_id,
+                reply,
+            } => {
+                let _ = reply.send(team_gate::propose_plan(
+                    &mut store,
+                    &run_id,
+                    plan,
+                    &request_id,
+                ));
+            }
             Command::LiveTeamRuns { reply } => {
                 let res = crate::domain::all_sessions(&store).map(|all| {
                     all.into_iter()
@@ -8979,6 +8992,7 @@ fn stage_edit(
                 },
                 kind: crate::team_events::ProposalKind::Edit,
                 reason: None,
+                approved_by_human: true,
                 steps: edit.steps,
             },
             &done,

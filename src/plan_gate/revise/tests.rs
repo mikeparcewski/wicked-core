@@ -307,6 +307,7 @@ fn t4_a_proposal_adding_nothing_is_refused() {
         },
         kind: ProposalKind::Change,
         reason: Some(ReviseReason::PaAdded),
+        approved_by_human: false,
         steps: plan(json!({"steps":[{"catalog":"review","id":"review"}]})).steps,
     };
     let r = revise("r", &s, change, &["build".into()], &hc, Some(1), 0).unwrap();

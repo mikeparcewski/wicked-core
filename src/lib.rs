@@ -148,7 +148,10 @@ pub use wicked_governance::{
     EvalReport, EvalSample, ImportReceipt,
 };
 
-pub use catalog::{builtin_presets, catalog, catalog_entry, CATALOG_IDS, SECURITY_REVIEW_SKILL};
+pub use catalog::{
+    builtin_presets, catalog, catalog_entries, catalog_entry, CatalogEntry, CATALOG_IDS,
+    SECURITY_REVIEW_SKILL,
+};
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,
@@ -164,7 +167,7 @@ pub use plan::{
     compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
-pub use plan_gate::{PendingPlan, TeamPlanState};
+pub use plan_gate::{preview_plan, PendingPlan, PlanPreview, PlanProposal, TeamPlanState};
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
@@ -1432,6 +1435,31 @@ impl Core {
         self.tx
             .send(Command::RunTeam {
                 run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit (`POST /api/v1/runs/:id/plan`): the
+    /// steps to ADD, held and applied at the run's next step boundary through the same revision
+    /// path as the PA's `PLAN+` (the ratchet, floor fill and the approval matrix), published as
+    /// `plan.proposed{by:"human", kind:"edit"}`. Idempotent by `request_id`: a repeat holds and
+    /// publishes nothing (`duplicate: true`). `Err` for an unknown, finished or un-planned run, or
+    /// a plan carrying `touch` / `override` (launch-plan fields: an edit only adds steps).
+    pub fn propose_plan(
+        &self,
+        run_id: &str,
+        plan: PlanSteps,
+        request_id: &str,
+    ) -> anyhow::Result<PlanProposal> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ProposePlan {
+                run_id: run_id.to_string(),
+                plan,
+                request_id: request_id.to_string(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
