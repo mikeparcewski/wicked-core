@@ -84,6 +84,9 @@ pub struct CatalogEntry {
     pub pinned: bool,
     /// That pin is the evidence floor ([`EVIDENCE_FLOOR_PIN`]).
     pub evidence_floor: bool,
+    /// The entry declares re-verified evidence (`PhaseDef::verified_evidence`): a step of it is
+    /// an acceptance requirement of the run that contains it (`test`, `domain_coverage`).
+    pub verified_evidence: bool,
     pub skill_ref: Option<String>,
     /// The entry's one-line description, when it has one (`null` for every entry today).
     pub description: Option<String>,
@@ -104,6 +107,7 @@ pub fn catalog_entries() -> Vec<CatalogEntry> {
             validator_pin: e.validator_pin.clone(),
             pinned: e.validator_pin.is_some(),
             evidence_floor: e.validator_pin.as_deref() == Some(EVIDENCE_FLOOR_PIN),
+            verified_evidence: e.verified_evidence,
             skill_ref: e.skill_ref.clone(),
             // No entry carries a description yet (the §8.3 table has none); the key is pinned so
             // a picker can render one the day an entry gains it.
@@ -312,7 +316,8 @@ mod tests {
 
     /// (T8, `Core.catalog()`) Every entry as studio's phase picker reads it, in catalog order,
     /// with the exact key set pinned: `pinned` = the entry carries a validator pin, and
-    /// `evidence_floor` = that pin is the evidence floor. `description` is the entry's own text
+    /// `evidence_floor` = that pin is the evidence floor, `verified_evidence` = a step of the entry
+    /// is an acceptance requirement of its run. `description` is the entry's own text
     /// (`null`: no catalog entry carries one today).
     #[test]
     fn catalog_entries_are_the_catalog_as_the_picker_reads_it() {
@@ -340,7 +345,8 @@ mod tests {
                 "pinned",
                 "role",
                 "skill_ref",
-                "validator_pin"
+                "validator_pin",
+                "verified_evidence"
             ]
         );
         let by = |id: &str| entries.iter().find(|e| e["id"] == id).unwrap().clone();
@@ -350,7 +356,7 @@ mod tests {
                 "id": "build", "kind": "build", "role": "creator", "gate": "auto",
                 "gate_type": "execution", "executes_code": true, "executor": "agent",
                 "validator_pin": EVIDENCE_FLOOR_PIN, "pinned": true, "evidence_floor": true,
-                "skill_ref": null, "description": null
+                "verified_evidence": false, "skill_ref": null, "description": null
             })
         );
         let cov = by("domain_coverage");
@@ -369,6 +375,13 @@ mod tests {
             (false.into(), false.into())
         );
         assert_eq!(by("security_review")["skill_ref"], SECURITY_REVIEW_SKILL);
+        // `verified_evidence`: the entries whose step is an acceptance requirement of its run.
+        let verified: Vec<_> = entries
+            .iter()
+            .filter(|e| e["verified_evidence"] == true)
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(verified, ["test", "domain_coverage"]);
     }
 
     /// The evidence floor moved onto the catalog (DES-TEAMING-002 §10): exactly the entries whose

@@ -438,9 +438,11 @@ export declare class Core {
   /**
    * The phase catalog (`src/catalog.rs`) for studio's phase picker, in catalog order, as a JSON
    * array of `{ id, kind, role, gate, gate_type, executes_code, executor, validator_pin, pinned,
-   * evidence_floor, skill_ref, description }` (`executor` is `"agent"` | `"tool"`; `pinned` =
-   * the entry carries a validator pin; `evidence_floor` = that pin is the evidence floor;
-   * `description` is `null` when the entry has none).
+   * evidence_floor, verified_evidence, skill_ref, description }` (`executor` is `"agent"` |
+   * `"tool"`; `pinned` = the entry carries a validator pin; `evidence_floor` = that pin is the
+   * evidence floor; `verified_evidence` = the entry declares re-verified evidence, so a step of it
+   * is an acceptance requirement of the run that contains it; `description` is `null` when the
+   * entry has none).
    */
   catalog(): Promise<string>
   /**
