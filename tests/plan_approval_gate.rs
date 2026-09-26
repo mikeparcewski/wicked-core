@@ -498,6 +498,9 @@ fn t2_g_a_declared_touch_set_scores_from_the_graph_path() {
     rig.tap.until("the plan_approval pause", |s| {
         paused_on_plan(s, "rgt").is_some()
     });
+    // `scored` is published without waiting on an ack: it can land just after the pause.
+    rig.tap
+        .until("the scored fact", |s| !of_type(s, "rgt", SCORED).is_empty());
     let scored = of_type(&rig.tap.seen, "rgt", SCORED);
     assert_eq!(scored[0]["score"], 100);
     let reasons: Vec<String> = serde_json::from_value(scored[0]["reasons"].clone()).unwrap();
@@ -1050,6 +1053,10 @@ fn a_preset_launch_becomes_a_team_run() {
     rig.core.launch_run(s).unwrap();
     rig.tap.until("the plan_approval pause", |s| {
         paused_on_plan(s, "rp").is_some()
+    });
+    // `proposed` is published without waiting on an ack: it can land just after the pause.
+    rig.tap.until("the proposed fact", |s| {
+        !of_type(s, "rp", PROPOSED).is_empty()
     });
     let proposed = &of_type(&rig.tap.seen, "rp", PROPOSED)[0];
     assert_eq!(proposed["preset"], "my-flow");

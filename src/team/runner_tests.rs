@@ -191,6 +191,8 @@ fn authored_ledger() -> TeamLedger {
                 tree: b.tree,
                 in_diff: true,
                 checkpoint_seq: 0,
+                anchor: String::new(),
+                carried_from_attempt: None,
             },
             final_line: None,
             corroborated_by: vec!["claude#3".into()],
@@ -622,6 +624,8 @@ fn an_unreadable_stream_at_the_timeout_is_stream_gap() {
         step_id: "unit-1".into(),
         stream_floor: 1,
         claimed_id: 2,
+        reviewing: None,
+        criterion: String::new(),
     };
     let i = input("t5c3", 1, 0, Some(bus_stamp(1)));
     let snap = complete(&c, &ok_output(&i));
@@ -1122,4 +1126,243 @@ fn a_supplied_zero_budget_never_skips_the_gate_wait() {
         None => std::env::remove_var("WICKED_TEAM_FINAL_PASS_SECS"),
     }
     assert!(cfg.final_pass_budget >= MIN_GATE_WAIT, "{cfg:?}");
+}
+
+// ── DES-TEAMING-002 T6 ───────────────────────────────────────────────────────────────────────────
+
+/// T6 (i): evaluator ≠ creator for a MEMBER's step. The step runs on the member seat (`codex`, its
+/// `assigned_cli`), so the member is its work author; the ledger's authors (`claude#2`, and its
+/// corroborator `claude#3`) are excluded too. The judge is none of them.
+#[test]
+fn t6_i_the_judge_of_a_member_step_is_neither_the_member_nor_a_ledger_author() {
+    let rig = rig("t6i");
+    let run = "t6i";
+    let floor = start(&rig, run);
+    let _s = supervise(&rig, run, authored_ledger());
+    let wd = workdir("t6i");
+    let worker = Seat::new(|_| {});
+    let r: Arc<dyn StepRunner> = worker.clone();
+    let roster = [
+        instance("claude#2", "claude2"),
+        instance("claude#3", "claude3"),
+        seat("codex"),
+        seat("gemini"),
+    ];
+    let mut i = judged_input(run, floor, &wd);
+    i.unit.owner = crate::workflow::StepOwner::Team;
+    i.unit.assigned_cli = Some("codex".into());
+    i.unit.member_step = Some(crate::domain::MemberStepState {
+        member: "codex".into(),
+        ..Default::default()
+    });
+    i.unit.validator = None;
+    i.unit.default_floor = true;
+    let tr = runner(&rig);
+    let (_, verdict, _) = run_unit_and_judge_with_team(&r, &i, NOOP, &roster, None, Some(&tr));
+    assert!(verdict.is_some(), "a judge ran");
+    let seats: Vec<String> = worker
+        .judges()
+        .iter()
+        .map(|j| j.unit.assigned_cli.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        seats,
+        vec!["gemini".to_string()],
+        "never the member nor an author"
+    );
+    let _ = std::fs::remove_dir_all(&wd);
+}
+
+/// T6 (f), the worker half: the PA's review attempt of a member's step runs no judge and no floor
+/// (team evidence, never the gate), and its `STEP` line becomes one `step.reviewed` naming the
+/// member attempt under review, before its `step.completed`.
+#[test]
+fn t6_f_a_review_attempt_is_not_judged_and_publishes_its_step_verdict() {
+    let rig = rig("t6f-review");
+    let run = "t6fr";
+    let floor = start(&rig, run);
+    let _s = supervise(
+        &rig,
+        run,
+        TeamLedger::new(FinalPass::Completed, vec![], vec![], Default::default()),
+    );
+    let wd = workdir("t6fr");
+    let worker = Seat::new(|_| {});
+    let r: Arc<dyn StepRunner> = Arc::new(Scripted {
+        inner: worker.clone(),
+        out: "reviewed\nSTEP u1: REJECT to:pa — the migration drops a column\n".into(),
+    });
+    let mut i = judged_input(run, floor, &wd);
+    i.unit.owner = crate::workflow::StepOwner::Team;
+    i.unit.member_step = Some(crate::domain::MemberStepState {
+        member: "codex".into(),
+        reviewing: Some(0),
+        ..Default::default()
+    });
+    i.attempt = 1;
+    i.unit.default_floor = true;
+    let tr = runner(&rig);
+    let roster = [seat("claude"), seat("codex"), seat("gemini")];
+    let (_, verdict, evidence) =
+        run_unit_and_judge_with_team(&r, &i, NOOP, &roster, None, Some(&tr));
+    assert!(verdict.is_none(), "no judge on a review attempt");
+    assert!(worker.judges().is_empty());
+    assert!(
+        evidence.team.is_some(),
+        "the attempt's team snapshot rides back"
+    );
+    let reviewed = rows_of(&rig, run, tev::STEP_REVIEWED);
+    assert_eq!(reviewed.len(), 1, "{reviewed:?}");
+    let p = &reviewed[0].1;
+    assert_eq!(p["step_id"], step_id_of(&i));
+    assert_eq!(p["verdict"], "rejected");
+    assert_eq!(p["to"], "pa");
+    assert_eq!(p["reviewed_attempt"], 0);
+    assert_eq!(p["attempt"], 1);
+    let completed = rows_of(&rig, run, tev::STEP_COMPLETED);
+    assert!(
+        reviewed[0].0 < completed[0].0,
+        "step.reviewed precedes step.completed"
+    );
+    let _ = std::fs::remove_dir_all(&wd);
+}
+
+/// A runner that answers every worker turn with `out` and delegates judges to `inner`.
+struct Scripted {
+    inner: Arc<Seat>,
+    out: String,
+}
+
+impl StepRunner for Scripted {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let mut o = self.inner.run_unit(input);
+        if !is_judge(input) {
+            o.output = self.out.clone();
+        }
+        o
+    }
+}
+
+/// T6 §8.9: a worker's `ADVICE` lines become `advice.answered` rows (R) — on the raise of THIS
+/// attempt when there is one, else the latest raise of the unit — before its `step.completed`.
+#[test]
+fn t6_advice_lines_are_answered_on_the_bus_before_step_completed() {
+    let rig = rig("t6-advice");
+    let run = "t6adv";
+    let floor = start(&rig, run);
+    let old = finding(run, 1, 0, 1, "high", "src/a.rs", "claude#2");
+    let cur = finding(run, 1, 1, 1, "high", "src/b.rs", "claude#2");
+    publish(&rig, &old);
+    publish(&rig, &cur);
+    let (old_id, cur_id) = (finding_id_of(&old), finding_id_of(&cur));
+    let i = input(run, 1, 1, Some(bus_stamp(floor)));
+    let tr = runner(&rig);
+    let Attempt::Claimed(c) = claim(Some(&tr), &i).unwrap() else {
+        panic!("claimed")
+    };
+    let out = StepOutput {
+        run_id: run.into(),
+        unit_ix: 1,
+        attempt: 1,
+        output: format!(
+            "done\nADVICE {cur_id}: ACCEPT — fixed\nADVICE {old_id}: DECLINE — not a bug\n\
+             ADVICE f-0000000000000000: ACCEPT — never raised\n"
+        ),
+        status: StepStatus::Ok,
+        usage: None,
+        files: vec![],
+        tools: vec![],
+        governed: false,
+    };
+    let _ = complete(&c, &out);
+    let answered = rows_of(&rig, run, tev::ADVICE_ANSWERED);
+    assert_eq!(answered.len(), 2, "{answered:#?}");
+    let by_id = |id: &str| {
+        answered
+            .iter()
+            .find(|(_, p)| p["finding_id"] == id)
+            .map(|(_, p)| p.clone())
+            .unwrap()
+    };
+    assert_eq!(by_id(&cur_id)["attempt"], 1);
+    assert_eq!(by_id(&cur_id)["disposition"], "accepted");
+    assert_eq!(by_id(&old_id)["attempt"], 0, "the latest raise of the unit");
+    assert_eq!(by_id(&old_id)["reason"], "not a bug");
+    assert_eq!(
+        by_id(&cur_id)["answered_in"],
+        format!("{}:1", step_id_of(&i))
+    );
+    let completed = rows_of(&rig, run, tev::STEP_COMPLETED);
+    assert!(answered.iter().all(|(id, _)| *id < completed[0].0));
+}
+
+/// T6 (k)'s boundary half: a finding an EARLIER attempt of this unit raised is labelled
+/// `carried_from_attempt:<n>` in the advice block; the same finding re-raised by the supervisor on
+/// this attempt is rendered once (its latest raise), not twice.
+#[test]
+fn t6_k_the_boundary_labels_a_finding_carried_from_an_earlier_attempt() {
+    let rig = rig("t6k-bnd");
+    let run = "t6kb";
+    let floor = start(&rig, run);
+    let old = finding(run, 1, 0, 1, "high", "src/a.rs", "claude#2");
+    publish(&rig, &old);
+    let i = input(run, 1, 1, Some(bus_stamp(floor)));
+    let tr = runner(&rig);
+    let Attempt::Claimed(c) = claim(Some(&tr), &i).unwrap() else {
+        panic!("claimed")
+    };
+    let b = boundary(&c);
+    let text = b.block.expect("rendered").output;
+    assert!(text.contains("carried_from_attempt:0"), "{text}");
+    // The supervisor re-raises it on this attempt: the next boundary renders the one raise.
+    let carried = fixture_with(tev::FINDING_RAISED, 0, run, |p| {
+        p["ord"] = json!(1);
+        p["attempt"] = json!(1);
+        p["raise_seq"] = json!(1);
+        p["path"] = json!("src/a.rs");
+        p["by"] = json!("claude#2");
+        p["evidence"] = json!("evidence of src/a.rs");
+        p["carried_from_attempt"] = json!(0);
+    });
+    publish(&rig, &carried);
+    let b = boundary(&Claimed {
+        attempt: 2,
+        ..(*c).clone()
+    });
+    let text = b.block.expect("rendered").output;
+    assert_eq!(text.matches(&finding_id_of(&old)).count(), 1, "{text}");
+    assert!(text.contains("carried_from_attempt:0"), "{text}");
+}
+
+/// T6 (j): nothing in `src` names the deleted direct channels. The tokens are assembled here so
+/// this file does not contain them.
+#[test]
+fn t6_j_no_direct_team_channel_is_left_in_src() {
+    let banned: Vec<String> = [
+        ["Team", "Cmd"],
+        ["Team", "Handle"],
+        ["team", "_finish"],
+        ["Steer", "Mailbox"],
+    ]
+    .iter()
+    .map(|p| p.concat())
+    .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut hits = Vec::new();
+    let mut stack = vec![root];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(text) = std::fs::read_to_string(&p) {
+                for (n, line) in text.lines().enumerate() {
+                    if banned.iter().any(|b| line.contains(b.as_str())) {
+                        hits.push(format!("{}:{}: {line}", p.display(), n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(hits.is_empty(), "{hits:#?}");
 }

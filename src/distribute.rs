@@ -383,10 +383,70 @@ pub(crate) fn distribute_units_against_benched(
         })
         .collect();
     let still_eligible: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+    let team_run = units.iter().any(|u| u.team_run);
+    let pa = team_run
+        .then(|| clis.first().map(|c| c.key.clone()))
+        .flatten();
+    // (DES-TEAMING-002 §8.8, seam T6) A member's step (`owner: team`) of a team run runs on a
+    // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
+    // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
+    // refused, never quietly handed back to the PA (team runs never fall back to one seat).
+    //
+    // Placed BEFORE the evaluator≠creator fence (review round 2 on #628, D1): the fence reads
+    // the builder seats, and a member build it did not see on its final seat would let a
+    // review/test unit land on that very seat (codex grading codex's build). One ordering — the
+    // fence judges final seats — not a second check.
+    if team_run {
+        let mut stranded: Vec<u32> = Vec::new();
+        for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
+            let Some(pa) = pa.as_deref() else {
+                break;
+            };
+            if u.tool_cmd.is_some()
+                || u.owner != crate::workflow::StepOwner::Team
+                || d.assigned_cli != pa
+            {
+                continue;
+            }
+            let admits = |k: &&String| {
+                k.as_str() != pa
+                    && match cands {
+                        Some((eligible, _)) => eligible.iter().any(|c| &c.key == *k),
+                        None => true,
+                    }
+            };
+            let pick = still_eligible
+                .iter()
+                .filter(admits)
+                .find(|k| model_of(k) != model_of(pa))
+                .or_else(|| still_eligible.iter().find(admits))
+                .cloned();
+            match pick {
+                Some(k) => {
+                    d.assigned_invocation = invocation_of(clis, &k);
+                    d.routing = RoutingInfo::Teamed { winner: k.clone() };
+                    d.assigned_cli = k;
+                }
+                None => stranded.push(u.ord),
+            }
+        }
+        if !stranded.is_empty() {
+            return Err(crate::NoEligibleSeat {
+                run_id: session_id.to_string(),
+                benched: format!(
+                    "member step(s) {stranded:?} of a team run need a seat distinct from the PA \
+                     ({}); add a signed-in {} to the roster",
+                    pa.clone().unwrap_or_default(),
+                    next_instance_key(configured, model_of(pa.as_deref().unwrap_or("claude")))
+                ),
+                benched_seats: benched.clone(),
+            }
+            .into());
+        }
+    }
     // (DES-TEAMING-002 §8.1, seam D1) A TEAM RUN — units of the run's composed per-run def,
     // stamped `team_run` at plan time — never grades on its creator seat and prefers a distinct
     // CLI over a second instance of the creator's.
-    let team_run = units.iter().any(|u| u.team_run);
     let (same_seat, same_cli_instance) = enforce_evaluator_distinct(
         units,
         &mut dists,
@@ -394,6 +454,7 @@ pub(crate) fn distribute_units_against_benched(
         clis,
         &candidates,
         team_run,
+        pa.as_deref(),
     );
     // (AC-3 / core#537, core#560) When a benched seat — from ANY source (launcher health probe,
     // or a worker transcript persisted on the session) — made evaluator≠creator unsatisfiable,
@@ -609,6 +670,9 @@ fn enforce_evaluator_distinct(
     // of a builder's cli only when no model-distinct seat admits the unit. `false` keeps today's
     // roster-order pick.
     prefer_model_distinct: bool,
+    // (DES-TEAMING-002 §8.8) A team run's PA seat: a member's own step (`owner: team`) the fence
+    // moves is never moved onto it — a member step is never the PA's.
+    team_pa: Option<&str>,
 ) -> (Vec<u32>, Vec<u32>) {
     use crate::domain::StageKind;
     let mut same_seat: Vec<u32> = Vec::new();
@@ -658,7 +722,12 @@ fn enforce_evaluator_distinct(
                 Some((eligible, _)) => eligible.iter().any(|c| &c.key == k),
                 None => true,
             };
-            let distinct = |k: &&String| !builder_clis.contains(*k) && admits(k);
+            let member_step = u.owner == crate::workflow::StepOwner::Team;
+            let distinct = |k: &&String| {
+                !builder_clis.contains(*k)
+                    && admits(k)
+                    && !(member_step && team_pa.is_some_and(|pa| pa == k.as_str()))
+            };
             let model_distinct = prefer_model_distinct
                 .then(|| {
                     roster_keys
@@ -1521,6 +1590,7 @@ mod tests {
             &clis,
             &[None, None],
             false,
+            None,
         );
         assert_eq!(
             same,
@@ -2226,6 +2296,121 @@ mod tests {
             "no eligible seat for r1: evaluator\u{2260}creator unsatisfiable for unit(s) [2]: \
              distinct seat(s) benched; 1 of 2 seats benched: claude#2 (not signed in (launcher \
              health probe) \u{2014} launcher) \u{2014} sign a seat in, or add one, before launching"
+        );
+    }
+
+    // ── DES-TEAMING-002 T6 review round 2, D1: member steps are placed BEFORE the fence ────────
+
+    /// A team run of `[member build (owner: team), <evaluator stage>]` (optionally led by a PA
+    /// build), every unit stamped `team_run`.
+    fn team_member_build_then(stage: StageKind, pa_build: bool) -> Vec<WorkUnit> {
+        let mut units = Vec::new();
+        if pa_build {
+            let mut b = WorkUnit::pending("u0", "r1", 0, "Build the base");
+            b.stage = StageKind::Build;
+            units.push(b);
+        }
+        let mut member = WorkUnit::pending("u1", "r1", 1, "Build the thing");
+        member.stage = StageKind::Build;
+        member.owner = crate::workflow::StepOwner::Team;
+        units.push(member);
+        let mut check = WorkUnit::pending("u2", "r1", 2, "Check the thing");
+        check.stage = stage;
+        units.push(check);
+        for u in &mut units {
+            u.team_run = true;
+        }
+        units
+    }
+
+    /// D1 (review round 2 on #628): roster `[claude (PA), codex]`, a member Build step and a
+    /// Review unit. The member's build lands on codex, so the review must NOT land on codex too
+    /// (codex would grade codex's build). evaluator≠creator must see the member's FINAL seat.
+    #[test]
+    fn t6_d1_a_review_never_lands_on_the_seat_a_member_build_was_moved_to() {
+        for stage in [StageKind::Review, StageKind::Test] {
+            let units = team_member_build_then(stage, false);
+            let dists = distribute_units_against_benched(
+                &units,
+                &[seat("claude"), seat("codex")],
+                "r1",
+                None,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("{stage:?}: {e:#}"));
+            assert_eq!(
+                dists[0].assigned_cli, "codex",
+                "{stage:?}: the member's seat"
+            );
+            assert_ne!(
+                dists[1].assigned_cli, dists[0].assigned_cli,
+                "{stage:?}: the evaluator is on the member builder's seat"
+            );
+            assert_eq!(
+                dists[1].assigned_cli, "claude",
+                "{stage:?}: claude built nothing"
+            );
+            assert_eq!(dists[1].distinctness_fallback, None, "{stage:?}");
+        }
+    }
+
+    /// D1: with a PA build AND a member build, every seat of `[claude, codex]` built: the
+    /// evaluator has nowhere distinct to go, and the team run is refused by name (never graded on
+    /// a builder seat, never silently).
+    #[test]
+    fn t6_d1_a_pa_build_and_a_member_build_leave_no_evaluator_seat_and_refuse() {
+        for stage in [StageKind::Review, StageKind::Test] {
+            let units = team_member_build_then(stage, true);
+            let err = distribute_units_against_benched(
+                &units,
+                &[seat("claude"), seat("codex")],
+                "r1",
+                None,
+                &[],
+            )
+            .expect_err("both seats built: no distinct evaluator");
+            let refusal = err
+                .downcast_ref::<crate::NoEligibleSeat>()
+                .unwrap_or_else(|| panic!("{stage:?}: must be NoEligibleSeat: {err:?}"));
+            assert!(
+                refusal
+                    .benched
+                    .starts_with("evaluator\u{2260}creator unsatisfiable for unit(s) [2]"),
+                "{stage:?}: {}",
+                refusal.benched
+            );
+        }
+    }
+
+    /// D1: a member's own Review step (owner: team) of a member build is moved off the builder's
+    /// seat by the fence, but never onto the PA's (a member step is never the PA's): with a third
+    /// seat it lands there.
+    #[test]
+    fn t6_d1_a_member_review_moved_by_the_fence_never_lands_on_the_pa() {
+        let mut units = team_member_build_then(StageKind::Review, false);
+        units[1].owner = crate::workflow::StepOwner::Team;
+        let dists = distribute_units_against_benched(
+            &units,
+            &[seat("claude"), seat("codex"), seat("pi")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("a third seat is distinct from the builder and the PA");
+        assert_eq!(dists[0].assigned_cli, "codex");
+        assert_eq!(dists[1].assigned_cli, "pi", "not the PA, not the builder");
+        // Without the third seat: refused, never the PA and never the builder.
+        let err = distribute_units_against_benched(
+            &units,
+            &[seat("claude"), seat("codex")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("no seat is distinct from both the member builder and the PA");
+        assert!(
+            err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
+            "{err:?}"
         );
     }
 }

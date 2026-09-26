@@ -105,14 +105,9 @@ const HAND_AUTHORED = `${BEGIN}
  * gains \`rework_amendment\` (string | absent) — the full findings+note text stored at request_changes
  * so the creator's re-dispatch receives the amendment whole, never capped; unitContextInjected's
  * \`outputBytes\` per item reflects the full amendment byte length.
- * DES-TEAMING-001 S2 (#601, additive — three new \`type\` values, no existing shape changes):
- * unitCheckpoint {session, ord, attempt, seq, toolCallId, kind, title, status: 'completed' |
- * 'failed', paths} (a TEAMED unit's ACP tool call reached a terminal status; \`kind\` is the ACP
- * ToolKind, 'other' when absent); monitorAttached {session, ord, attempt, monitorId, seat, status:
- * 'attached' | 'failed', reason, error: string | null}; monitorFinding {session, ord, attempt,
- * findingId, monitorId, seat, severity: 'high' | 'medium', path, line, evidence, claim,
- * suggestion: string | null, tree, inDiff, checkpointSeq} (a read-only monitor's finding whose
- * \`evidence\` IS line \`line\` of \`path\` in snapshot tree \`tree\` — advisory, never a verdict).
+ * DES-TEAMING-002 T6 (removal): the DES-001 team events unitCheckpoint, monitorAttached,
+ * monitorFinding, adviceDelivered and workerAdviceResponse are no longer emitted. Team
+ * communication is the \`wicked.team.*\` bus stream (crew relays it as \`teamEvent\` frames).
  */
 export interface CoreEventJson {
   type: string

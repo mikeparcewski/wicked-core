@@ -1168,93 +1168,6 @@ pub enum CoreEvent {
         action: String,
         reason: String,
     },
-    /// (DES-TEAMING-001 §5.2 / §7, S3 #602; additive) What became of HIGH monitor advice for one
-    /// attempt of a unit. `carrier: "acp_steering"` — one `_session/steering` request, always sent
-    /// with `idleBehavior: "promptRequired"`, was answered: `outcome` is `"injected"` (it reached
-    /// the running turn), `"turn_ended"` (the adapter answered `promptRequired`: the turn had
-    /// settled, nothing was started, the advice goes to the gate) or `"refused"` (a JSON-RPC error,
-    /// in `detail`; the turn continues). `outcome: "not_delivered"` — the advice never rode a
-    /// steer: the carrier has no mid-turn channel (`carrier: "none"`: wrapped, PTY, an ACP adapter
-    /// not advertising steering) or the turn ended before another tool-call boundary; `detail`
-    /// says which. `detail` is `null`, never absent, when there is nothing to add.
-    AdviceDelivered {
-        session: String,
-        ord: u32,
-        attempt: u32,
-        finding_ids: Vec<String>,
-        carrier: String,
-        outcome: String,
-        detail: Option<String>,
-    },
-    /// (DES-TEAMING-001 §5.3 / §7, S3 #602; additive) The worker's answer to one delivered
-    /// finding, read from its final output line `ADVICE <id>: ACCEPT|DECLINE — <reason>` (the
-    /// last line per id wins). `disposition` is `"accepted"` or `"declined"`; `reason` is ≤2 KB
-    /// and may be `""` (a refusal with no evidence is recorded as exactly that). The worker may
-    /// decline: the gate, not the monitor, decides.
-    WorkerAdviceResponse {
-        session: String,
-        ord: u32,
-        attempt: u32,
-        finding_id: String,
-        disposition: String,
-        reason: String,
-    },
-    // ── DES-TEAMING-001 S2 (#601): monitor subscription. Additive; wire shapes in DES §7. ─────
-    /// A TEAMED unit's tool call reached a terminal status on the ACP carrier (a
-    /// `tool_call_update` with `status` `completed` | `failed`) — the semantic checkpoint a
-    /// monitor batch is paced on (never a token). `session` is the run id. `seq` is monotonic per
-    /// attempt from 1. `kind` is the ACP ToolKind verbatim (`"other"` when the agent sent none),
-    /// remembered from the earlier `tool_call`/refinement frames; `title` ≤ 256 B; `paths` from
-    /// the call's `locations`, ≤ 16. Emitted only for a unit with a team context, so a
-    /// non-teamed unit emits none.
-    UnitCheckpoint {
-        session: String,
-        ord: u32,
-        attempt: u32,
-        seq: u64,
-        tool_call_id: String,
-        kind: String,
-        title: String,
-        status: String,
-        paths: Vec<String>,
-    },
-    /// The team supervisor summoned a read-only monitor on a seat instance for a unit's attempt
-    /// (`status: "attached"`), or could not (`status: "failed"`, `error` says why: the candidate
-    /// is the creator's instance, its adapter is not admitted to input governance, the unit has
-    /// no worktree baseline, or the session did not start). Never retried within the attempt.
-    MonitorAttached {
-        session: String,
-        ord: u32,
-        attempt: u32,
-        monitor_id: String,
-        seat: String,
-        status: String,
-        reason: String,
-        error: Option<String>,
-    },
-    /// A monitor finding that PASSED the mechanical checks: parsed, at or above the bar
-    /// (`high` | `medium`), its `evidence` equal to line `line` of `path` in the snapshot tree
-    /// `tree`, and first-seen by its id (`f-` + 16 hex of sha256(path, normalized evidence)).
-    /// Advisory: nothing in the fold reads it. `evidence` ≤ 512 B, `claim` and `suggestion`
-    /// ≤ 2 KB; `inDiff` says whether `path` changed baseline..`tree`; `checkpointSeq` is the
-    /// last checkpoint the batch covered (0 when none — a final pass on a wrapped unit).
-    MonitorFinding {
-        session: String,
-        ord: u32,
-        attempt: u32,
-        finding_id: String,
-        monitor_id: String,
-        seat: String,
-        severity: String,
-        path: String,
-        line: u32,
-        evidence: String,
-        claim: String,
-        suggestion: Option<String>,
-        tree: String,
-        in_diff: bool,
-        checkpoint_seq: u64,
-    },
 }
 
 /// Render a [`crate::domain::UnitDenial`] in the events wire's camelCase convention (the persisted
@@ -2397,117 +2310,6 @@ impl CoreEvent {
                 "action": action,
                 "reason": reason,
             }),
-            CoreEvent::AdviceDelivered {
-                session,
-                ord,
-                attempt,
-                finding_ids,
-                carrier,
-                outcome,
-                detail,
-            } => json!({
-                "type": "adviceDelivered",
-                "session": session,
-                "ord": ord,
-                "attempt": attempt,
-                "findingIds": finding_ids,
-                "carrier": carrier,
-                "outcome": outcome,
-                "detail": detail,
-            }),
-            CoreEvent::WorkerAdviceResponse {
-                session,
-                ord,
-                attempt,
-                finding_id,
-                disposition,
-                reason,
-            } => json!({
-                "type": "workerAdviceResponse",
-                "session": session,
-                "ord": ord,
-                "attempt": attempt,
-                "findingId": finding_id,
-                "disposition": disposition,
-                "reason": reason,
-            }),
-            // DES-TEAMING-001 §7 (S2, #601). Every field always present; `Option` → `null`.
-            CoreEvent::UnitCheckpoint {
-                session,
-                ord,
-                attempt,
-                seq,
-                tool_call_id,
-                kind,
-                title,
-                status,
-                paths,
-            } => json!({
-                "type": "unitCheckpoint",
-                "session": session,
-                "ord": ord,
-                "attempt": attempt,
-                "seq": seq,
-                "toolCallId": tool_call_id,
-                "kind": kind,
-                "title": title,
-                "status": status,
-                "paths": paths,
-            }),
-            CoreEvent::MonitorAttached {
-                session,
-                ord,
-                attempt,
-                monitor_id,
-                seat,
-                status,
-                reason,
-                error,
-            } => json!({
-                "type": "monitorAttached",
-                "session": session,
-                "ord": ord,
-                "attempt": attempt,
-                "monitorId": monitor_id,
-                "seat": seat,
-                "status": status,
-                "reason": reason,
-                "error": error,
-            }),
-            CoreEvent::MonitorFinding {
-                session,
-                ord,
-                attempt,
-                finding_id,
-                monitor_id,
-                seat,
-                severity,
-                path,
-                line,
-                evidence,
-                claim,
-                suggestion,
-                tree,
-                in_diff,
-                checkpoint_seq,
-            } => json!({
-                "type": "monitorFinding",
-                "session": session,
-                "ord": ord,
-                "attempt": attempt,
-                "findingId": finding_id,
-                "monitorId": monitor_id,
-                "seat": seat,
-                "severity": severity,
-                "path": path,
-                "line": line,
-                "evidence": evidence,
-                "claim": claim,
-                "suggestion": suggestion,
-                "tree": tree,
-                "inDiff": in_diff,
-                "checkpointSeq": checkpoint_seq,
-            }),
         }
     }
 }
@@ -2963,131 +2765,26 @@ mod tests {
         );
     }
 
-    /// DES-TEAMING-001 §7 (S3): the two advice events' EXACT wire shape — every key always
-    /// present (`detail: null`, never absent), camelCase, nothing extra. crew-api-types mirrors
-    /// these byte for byte; a renamed or dropped key fails here first.
+    /// DES-TEAMING-002 §4.6 / §10: team communication is `wicked.team.*` on the bus, never a
+    /// CoreEvent. The DES-001 team variants are deleted, not mirrored; this pins that no CoreEvent
+    /// tag carries their names.
     #[test]
-    fn advice_events_wire_shape_is_exact() {
-        let keys = |j: &serde_json::Value| {
-            let mut k: Vec<String> = j.as_object().unwrap().keys().cloned().collect();
-            k.sort();
-            k
-        };
-        let j = CoreEvent::AdviceDelivered {
-            session: "run-1".into(),
-            ord: 3,
-            attempt: 1,
-            finding_ids: vec!["f-3fa9c2e1d0b4a7e6".into()],
-            carrier: "acp_steering".into(),
-            outcome: "injected".into(),
-            detail: None,
-        }
-        .to_json();
-        assert_eq!(
-            j,
-            serde_json::json!({"type":"adviceDelivered","session":"run-1","ord":3,"attempt":1,
-                "findingIds":["f-3fa9c2e1d0b4a7e6"],"carrier":"acp_steering",
-                "outcome":"injected","detail":null})
-        );
-        assert_eq!(
-            keys(&j),
-            [
-                "attempt",
-                "carrier",
-                "detail",
-                "findingIds",
-                "ord",
-                "outcome",
-                "session",
-                "type"
-            ]
-        );
-        let j = CoreEvent::WorkerAdviceResponse {
-            session: "run-1".into(),
-            ord: 3,
-            attempt: 1,
-            finding_id: "f-3fa9c2e1d0b4a7e6".into(),
-            disposition: "declined".into(),
-            reason: "campaign.rs:325 documents the exclusion".into(),
-        }
-        .to_json();
-        assert_eq!(
-            j,
-            serde_json::json!({"type":"workerAdviceResponse","session":"run-1","ord":3,
-                "attempt":1,"findingId":"f-3fa9c2e1d0b4a7e6","disposition":"declined",
-                "reason":"campaign.rs:325 documents the exclusion"})
-        );
-    }
-
-    /// DES-TEAMING-001 §7 (S2, #601): the three S2 events serialize to EXACTLY the DES shapes —
-    /// the fixtures below are the §7 examples typed out key by key (DES order), with the `<…>`
-    /// placeholders filled in. Compared as serialized bytes after both sides pass through
-    /// `serde_json` (whose maps are key-sorted here, so key order is canonical on both sides): a
-    /// renamed, missing, extra or `Option`-skipped key fails.
-    #[test]
-    fn s2_team_events_match_the_des_wire_shapes_byte_for_byte() {
-        let same = |ev: CoreEvent, fixture: &str| {
-            let want: serde_json::Value = serde_json::from_str(fixture).expect("fixture parses");
+    fn no_core_event_carries_a_deleted_team_tag() {
+        let src = include_str!("event.rs");
+        // Assembled at runtime, so this test's own text never matches.
+        for tag in [
+            ["advice", "Delivered"],
+            ["worker", "AdviceResponse"],
+            ["unit", "Checkpoint"],
+            ["monitor", "Attached"],
+            ["monitor", "Finding"],
+        ] {
+            let quoted = format!("\"{}\"", tag.concat());
             assert_eq!(
-                serde_json::to_string(&ev.to_json()).unwrap(),
-                serde_json::to_string(&want).unwrap()
+                src.matches(&quoted).count(),
+                0,
+                "{quoted} still in event.rs"
             );
-        };
-        same(
-            CoreEvent::UnitCheckpoint {
-                session: "run-1".into(),
-                ord: 3,
-                attempt: 1,
-                seq: 17,
-                tool_call_id: "toolu_01".into(),
-                kind: "edit".into(),
-                title: "Edit src/retire.ts".into(),
-                status: "completed".into(),
-                paths: vec!["src/retire.ts".into()],
-            },
-            r#"{"type":"unitCheckpoint","session":"run-1","ord":3,"attempt":1,
-                "seq":17,"toolCallId":"toolu_01","kind":"edit","title":"Edit src/retire.ts",
-                "status":"completed","paths":["src/retire.ts"]}"#,
-        );
-        same(
-            CoreEvent::MonitorAttached {
-                session: "run-1".into(),
-                ord: 3,
-                attempt: 1,
-                monitor_id: "m1".into(),
-                seat: "claude#2".into(),
-                status: "attached".into(),
-                reason: "review_plan monitors=1 (critical,destructive)".into(),
-                error: None,
-            },
-            r#"{"type":"monitorAttached","session":"run-1","ord":3,"attempt":1,
-                "monitorId":"m1","seat":"claude#2","status":"attached",
-                "reason":"review_plan monitors=1 (critical,destructive)","error":null}"#,
-        );
-        same(
-            CoreEvent::MonitorFinding {
-                session: "run-1".into(),
-                ord: 3,
-                attempt: 1,
-                finding_id: "f-3fa9c2e1d0b4a7e6".into(),
-                monitor_id: "m1".into(),
-                seat: "claude#2".into(),
-                severity: "high".into(),
-                path: "src/retire.ts".into(),
-                line: 41,
-                evidence: "fetchCoverage(scope).then(setCount)".into(),
-                claim: "no cancellation".into(),
-                suggestion: None,
-                tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
-                in_diff: true,
-                checkpoint_seq: 17,
-            },
-            r#"{"type":"monitorFinding","session":"run-1","ord":3,"attempt":1,
-                "findingId":"f-3fa9c2e1d0b4a7e6","monitorId":"m1","seat":"claude#2",
-                "severity":"high","path":"src/retire.ts","line":41,
-                "evidence":"fetchCoverage(scope).then(setCount)","claim":"no cancellation",
-                "suggestion":null,"tree":"4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-                "inDiff":true,"checkpointSeq":17}"#,
-        );
+        }
     }
 }

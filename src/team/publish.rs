@@ -741,6 +741,30 @@ impl TeamBus {
         }))
     }
 
+    /// Whether `lane` still has an unpublished, unsuperseded fact in the outbox. An unreadable
+    /// outbox answers `true`.
+    pub fn lane_has_pending(&self, lane: &Lane) -> bool {
+        let m = self.mutex();
+        let _g = guard(&m);
+        match self.read() {
+            Ok(snap) => !snap.pending(lane).is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// Whether any fact of `run_id` — of any owner — is still waiting in the outbox (unpublished,
+    /// unsuperseded). An unreadable outbox answers `true` (it may hold such a line).
+    pub fn run_has_pending(&self, run_id: &str) -> bool {
+        let m = self.mutex();
+        let _g = guard(&m);
+        let Ok(snap) = self.read() else {
+            return true;
+        };
+        snap.lines.iter().enumerate().any(|(i, (_, l))| {
+            matches!(l, Line::Fact(f) if f.lane.run_id == run_id && !snap.superseded(f, Some(i)))
+        })
+    }
+
     /// Whether the fact keyed `key` is still waiting in the outbox (unpublished, unsuperseded).
     pub fn is_pending(&self, key: &str) -> bool {
         let m = self.mutex();
@@ -1110,6 +1134,9 @@ pub struct LiveTeamRun {
     pub run_id: String,
     pub status: crate::domain::SessionStatus,
     pub team: crate::domain::RunTeamState,
+    /// (T6) The run's seats (`AgentSession::clis`; the first is the PA): the supervisor's member
+    /// candidates even when the run's `path.started` has aged off the bus.
+    pub roster: Vec<String>,
 }
 
 /// Build the read view for a team run (`None` for a run that is not a team run).

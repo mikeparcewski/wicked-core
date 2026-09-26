@@ -251,6 +251,9 @@ pub struct RunTeamState {
     /// re-issues the end (DES-TEAMING-002 §4.1, review of #623 round 3).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ended: bool,
+    /// (T6) The open `team_dispute` gate, while the run is paused on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispute: Option<DisputeGate>,
 }
 
 impl RunTeamState {
@@ -309,8 +312,73 @@ pub enum TeamBlocked {
     /// Resume the run at its cursor: a teamed run paused because THIS process has no publisher
     /// for its required facts (bus present at launch, absent now).
     Continue,
-    /// The operator rejected a `team_transport` pause: cancel once the tombstone is written.
+    /// The operator rejected a `team_transport` pause (once the tombstone is written) or a
+    /// `team_dispute` pause (once its `gate.decided` landed): cancel.
     Cancel,
+    /// (T6) A `team_dispute` gate approved: once its `gate.decided` landed, the step counts
+    /// (DES-001 §6.7 resume: `resumed`, then `gateDecided` + `unitDone` for a finding dispute)
+    /// and the run advances past it. Never a re-dispatch.
+    DisputeApproved,
+    /// (T6) A `team_dispute` gate answered with changes: once its `gate.decided` landed, the
+    /// creator reruns with the note (`rewind_to_creator`).
+    DisputeAmended { note: String },
+}
+
+/// (T6) What a `team_dispute` pause is about (DES-001 §6.7, DES-002 §8.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisputeKind {
+    /// The gate approved the unit's work with an unresolved HIGH (or an incomplete record) and no
+    /// council YES: the fold withheld `gateDecided` + `unitDone`.
+    Finding,
+    /// A member's step whose count the team could not settle: the PA gave no verdict, the member
+    /// gave no answer, or the council gave none.
+    MemberStep,
+}
+
+/// (T6) The open `team_dispute` gate of a run, persisted with the pause so its answer publishes
+/// the gate's `gate.decided` (required) and resumes exactly the paused unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisputeGate {
+    pub gate_id: String,
+    pub ord: u32,
+    pub attempt: u32,
+    pub kind: DisputeKind,
+    /// The unresolved HIGHs the pause names (empty for an incomplete record or a member step).
+    #[serde(default)]
+    pub finding_ids: Vec<String>,
+}
+
+/// (T6, DES-002 §8.8) A member's step: the member seat it belongs to and where its review stands.
+/// A step "counts" only once the PA accepted it (or a council YES / a human approved it); until
+/// then the run's cursor stays on it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MemberStepState {
+    /// The member seat instance the step runs on (never the PA).
+    pub member: String,
+    /// The member attempt under the PA's review: the unit's NEXT dispatch is the PA's review turn
+    /// (on the PA seat, read-only, no gate of its own). `None` = the next dispatch is the work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewing: Option<u32>,
+    /// The PA's rejections so far (`MAX_STEP_REWORK` go back to the member; the next to the PA).
+    #[serde(default)]
+    pub rejections: u32,
+    /// The step was re-planned onto the PA seat (`REJECT to:pa`, or the rejection past the rework
+    /// limit): from here it is the PA's own step, gated as any other.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replanned: bool,
+    /// The member attempt's team snapshot (the gate's evidence), kept while the PA's review runs
+    /// (the review attempt's dispatch re-stamps `WorkUnit.team`) and restored when the step counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_team: Option<UnitTeamSnapshot>,
+    /// Every review of this step, in order (the durable record beside the bus rows).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<crate::team::StepReviewRecord>,
+    /// The step COUNTS (the PA accepted it, a council said YES, or a human approved it) — set in
+    /// the same write that marks the unit done, so a restart between that write and the cursor's
+    /// advance never sends a counted step back to review.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counted: bool,
 }
 
 /// A unit's team snapshot (DES-TEAMING-002 §4.4, §4.8 rows 1/5/6/7, §8.11): what the unit's team
@@ -726,6 +794,10 @@ pub struct WorkUnit {
     /// serialize byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<UnitTeamSnapshot>,
+    /// (T6, DES-002 §8.8) Set for a member's step (`owner: team`) of a team run: the member seat
+    /// and the PA's review state. Skip-if-none: every other unit serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_step: Option<MemberStepState>,
     /// Operator-visible WARNINGS the completion path recorded WITHOUT denying (core#283): today,
     /// a pre-build phase whose worktree contribution touches non-documentation files — the
     /// design-before-build ladder collapsing into implementation. Advisory gate evidence on the
@@ -985,6 +1057,7 @@ impl WorkUnit {
             team_run: false,
             catalog: None,
             team: None,
+            member_step: None,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
             worktree_baseline: None,
@@ -1014,6 +1087,16 @@ impl WorkUnit {
             .strip_prefix(&self.session_id)?
             .strip_prefix(':')
             .filter(|suffix| !suffix.is_empty())
+    }
+
+    /// Whether this unit's current attempt is the PA's review of a member's step
+    /// (DES-TEAMING-002 §8.8): an evaluator turn over the member's tree, read-only by
+    /// construction ([`crate::write_posture::WritePosture::of`]) whatever the step's own phase
+    /// declared.
+    pub fn is_member_step_review(&self) -> bool {
+        self.member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some())
     }
 }
 

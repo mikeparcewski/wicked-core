@@ -1449,6 +1449,1073 @@ fn t5_row5_a_failed_step_claimed_unteams_the_attempt_through_the_engine() {
     }
 }
 
+// ── DES-TEAMING-002 T6 through the real engine ───────────────────────────────────────────────────
+
+use crate::team::supervisor::tests::{FakeCouncil, FakeHost};
+use crate::team::supervisor::{Council, CouncilOutcome};
+
+/// A T6 bound: the supervisor folds long before it; the worker returns as soon as the fold lands
+/// (generous for slow CI hosts: only a stuck fold waits it out).
+fn t6_cfg(rig: &Rig) -> TeamConfig {
+    fast(rig).with_final_pass_budget(Duration::from_secs(90))
+}
+
+/// An engine with the team supervisor on the bus (injected host and council).
+fn supervised(
+    rig: &Rig,
+    db: &str,
+    worker: Arc<dyn StepRunner>,
+    host: Arc<FakeHost>,
+    council: Arc<dyn Council>,
+    exec: bool,
+) -> Engine {
+    let core = Core::spawn_with_engine_team_supervised(
+        db.to_string(),
+        Arc::new(StubDispatcher),
+        worker,
+        t6_cfg(rig),
+        exec.then(|| rig.bus.clone()),
+        host,
+        council,
+        |c| c.poll = Duration::from_millis(20),
+    );
+    let events = core.subscribe();
+    core.ping();
+    Engine {
+        core,
+        runner: Arc::new(CountingRunner::default()),
+        events,
+        db: db.to_string(),
+    }
+}
+
+/// Every CoreEvent the engine emitted, gathered as the test goes.
+fn collect(e: &Engine, into: &mut Vec<CoreEvent>) {
+    into.extend(e.events.try_iter());
+}
+
+fn ord_events(evs: &[CoreEvent], run: &str, ord: u32) -> Vec<String> {
+    evs.iter()
+        .filter_map(|ev| {
+            let j = ev.to_json();
+            (j["session"] == run && j["ord"] == ord).then(|| {
+                let t = j["type"].as_str().unwrap_or("?").to_string();
+                match ev {
+                    CoreEvent::GateDecided { allow, .. } => format!("{t}:{allow}"),
+                    CoreEvent::AwaitingHuman { gate_kind, .. } => format!("{t}:{gate_kind}"),
+                    CoreEvent::UnitDispatched { attempt, .. } => format!("{t}:{attempt}"),
+                    _ => t,
+                }
+            })
+        })
+        .collect()
+}
+
+/// DES-001 #13 + #16 (g) on the T6 engine: on a `team_dispute` pause the unit's events are exactly
+/// `gateEvaluated` → `awaitingHuman{team_dispute}` — no `gateDecided`, no `unitDone` — and the
+/// cursor stays on the unit. Approve publishes the human's `gate.decided{kind:"team_dispute"}` and
+/// only then emits `resumed` → `gateDecided{allow:true}` → `unitDone`; the unit is never
+/// re-dispatched and its attempt never bumped.
+#[test]
+fn t6_13_a_dispute_withholds_the_decision_until_approved_and_never_redispatches() {
+    let rig = rig("t6-13");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 0,
+        }),
+    );
+    let mut evs = Vec::new();
+    launch_team(&e, "t613");
+    wait_status(&e, "t613", SessionStatus::AwaitingHuman);
+    collect(&e, &mut evs);
+    let before = ord_events(&evs, "t613", 1);
+    let tail: Vec<&str> = before
+        .iter()
+        .map(String::as_str)
+        .filter(|t| {
+            t.starts_with("gateEvaluated")
+                || t.starts_with("gateDecided")
+                || t.starts_with("unitDone")
+                || t.starts_with("awaitingHuman")
+        })
+        .collect();
+    assert_eq!(
+        tail,
+        ["gateEvaluated", "awaitingHuman:team_dispute"],
+        "{before:?}"
+    );
+    let session = e
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "t613")
+        .unwrap()
+        .session;
+    assert_eq!(session.unit_ix, 0, "the cursor stays on the disputed unit");
+    let dispute = session
+        .team
+        .clone()
+        .unwrap()
+        .dispute
+        .expect("the gate is recorded");
+    assert_eq!(dispute.kind, crate::domain::DisputeKind::Finding);
+
+    e.core.confirm_gate("t613", approve(None)).unwrap();
+    wait_status(&e, "t613", SessionStatus::Completed);
+    collect(&e, &mut evs);
+    let after = ord_events(&evs, "t613", 1);
+    let from = after
+        .iter()
+        .position(|t| t == "resumed")
+        .expect("resumed after the approve");
+    assert_eq!(
+        &after[from..from + 3],
+        ["resumed", "gateDecided:true", "unitDone"],
+        "{after:?}"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|t| t.starts_with("unitDispatched"))
+            .count(),
+        1,
+        "never re-dispatched: {after:?}"
+    );
+    let decided = payloads(&rig, "t613", tev::GATE_DECIDED);
+    let human: Vec<_> = decided
+        .iter()
+        .filter(|p| p["kind"] == "team_dispute")
+        .collect();
+    assert_eq!(human.len(), 1, "{decided:?}");
+    assert_eq!(human[0]["decision"], "human_approved");
+    assert_eq!(human[0]["by"], "human");
+    assert_eq!(human[0]["gate_id"], dispute.gate_id);
+}
+
+/// DES-001 #16 (k): approving a `team_dispute` with an amendment reruns the creator with it —
+/// `unitReworkAmended`, then `unitDispatched` at the next attempt — after the human's
+/// `gate.decided{human_amended}` lands.
+#[test]
+fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
+    let rig = rig("t6-16k");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 1,
+        }),
+    );
+    let mut evs = Vec::new();
+    let def: crate::workflow::WorkflowDef = serde_json::from_value(serde_json::json!({
+        "id": "t616k:plan-1",
+        "phases": [
+            {"id": "understand", "kind": "build", "gate": "auto"},
+            {"id": "build", "kind": "build", "gate": "auto", "role": "creator"}
+        ]
+    }))
+    .unwrap();
+    e.core.register_composed(def).unwrap();
+    e.core
+        .launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "t6 amend".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: "t616k".into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: None,
+            workflow: Some("t616k:plan-1".into()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: None,
+            deliver_step: None,
+        })
+        .unwrap();
+    wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
+    collect(&e, &mut evs);
+    e.core
+        .confirm_gate("t616k", approve(Some("cancel the stale fetch")))
+        .unwrap();
+    wait_for("the creator's rework dispatch", || {
+        collect(&e, &mut evs);
+        ord_events(&evs, "t616k", 2)
+            .iter()
+            .any(|t| t == "unitDispatched:1")
+    });
+    let seq = ord_events(&evs, "t616k", 2);
+    let amended = seq.iter().position(|t| t == "unitReworkAmended").unwrap();
+    let redispatch = seq.iter().position(|t| t == "unitDispatched:1").unwrap();
+    assert!(amended < redispatch, "{seq:?}");
+    // Fire-and-forget facts can land just after the status the test waited on.
+    wait_for("tev::GATE_DECIDED on t616k", || {
+        payloads(&rig, "t616k", tev::GATE_DECIDED)
+            .iter()
+            .any(|p| p["kind"] == "team_dispute" && p["decision"] == "human_amended")
+    });
+}
+
+/// DES-002 §4.1: the human's `team_dispute` answer is a REQUIRED fact. With the bus refusing
+/// `gate.decided`, approve leaves the run paused — now `team_transport` — with no `resumed` and no
+/// dispatch; once the bus takes it again, the transport gate's approve lands both decisions in
+/// order and the run resumes.
+#[test]
+fn t6_the_dispute_answer_is_a_required_fact() {
+    let rig = rig("t6-req");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 0,
+        }),
+    );
+    launch_team(&e, "t6req");
+    wait_status(&e, "t6req", SessionStatus::AwaitingHuman);
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let _ = drain_events(&e);
+    let _ = e.core.confirm_gate("t6req", approve(None));
+    wait_for("the transport pause", || {
+        awaiting_kinds(&drain_events(&e), "t6req")
+            .iter()
+            .any(|k| k == super::TEAM_TRANSPORT_GATE)
+            || e.core
+                .run_team("t6req")
+                .ok()
+                .flatten()
+                .and_then(|v| v.pending)
+                .is_some_and(|p| p == tev::GATE_DECIDED)
+    });
+    assert_eq!(status(&e, "t6req"), Some(SessionStatus::AwaitingHuman));
+    assert_eq!(
+        resumed(&drain_events(&e), "t6req"),
+        0,
+        "nothing resumes unacknowledged"
+    );
+    assert!(payloads(&rig, "t6req", tev::GATE_DECIDED)
+        .iter()
+        .all(|p| p["kind"] != "team_dispute"));
+    rig.allow();
+    e.core.confirm_gate("t6req", approve(None)).unwrap();
+    wait_status(&e, "t6req", SessionStatus::Completed);
+    let decided = payloads(&rig, "t6req", tev::GATE_DECIDED);
+    let dispute_at = decided.iter().position(|p| p["kind"] == "team_dispute");
+    let transport_at = decided.iter().position(|p| p["kind"] == "team_transport");
+    assert!(
+        dispute_at.is_some() && dispute_at < transport_at,
+        "{decided:#?}"
+    );
+}
+
+// ── Member steps (§8.8): (f) (g) (h) through the engine and the supervisor ──────────────────────
+
+/// A worker that does a member's step as the member and reviews it as the PA, from a script.
+struct MemberRunner {
+    /// `(review number) → the PA's review output`.
+    review: Box<dyn Fn(usize) -> String + Send + Sync>,
+    seen: std::sync::Mutex<Vec<StepInput>>,
+    reviews: AtomicUsize,
+}
+
+impl MemberRunner {
+    fn new(review: impl Fn(usize) -> String + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            review: Box::new(review),
+            seen: Default::default(),
+            reviews: AtomicUsize::new(0),
+        })
+    }
+    fn inputs(&self, ord: u32) -> Vec<StepInput> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.unit.ord == ord)
+            .cloned()
+            .collect()
+    }
+}
+
+impl StepRunner for MemberRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        self.seen.lock().unwrap().push(i.clone());
+        let output = if i
+            .unit
+            .member_step
+            .as_ref()
+            .is_some_and(|m| m.reviewing.is_some())
+        {
+            let n = self.reviews.fetch_add(1, AtomicOrdering::SeqCst);
+            (self.review)(n)
+        } else {
+            "done".to_string()
+        };
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output,
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// The ord of the `write` step (ords are 1-based: `understand` is 1).
+const WRITE: u32 = 2;
+
+/// Launch a three-step team run whose middle step (`write`) is the team's: PA `a`, member `b`.
+fn launch_member_run(e: &Engine, run: &str) {
+    let def: crate::workflow::WorkflowDef = serde_json::from_value(serde_json::json!({
+        "id": format!("{run}:plan-1"),
+        "phases": [
+            {"id": "understand", "kind": "build", "gate": "auto"},
+            {"id": "write", "kind": "build", "gate": "auto", "owner": "team"},
+            {"id": "finish", "kind": "build", "gate": "auto"}
+        ]
+    }))
+    .unwrap();
+    e.core
+        .register_composed(def)
+        .expect("composed def registers");
+    e.core
+        .launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "t6 member step".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: run.into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: None,
+            workflow: Some(format!("{run}:plan-1")),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: None,
+            deliver_step: None,
+        })
+        .expect("launch");
+}
+
+fn member_engine(
+    name: &str,
+    review: impl Fn(usize) -> String + Send + Sync + 'static,
+    member: impl Fn(&str, &str) -> Result<String, String> + Send + Sync + 'static,
+    council: FakeCouncil,
+) -> (Rig, Engine, Arc<MemberRunner>, Arc<FakeCouncil>) {
+    let rig = rig(name);
+    let worker = MemberRunner::new(review);
+    let host = Arc::new(FakeHost::new(member));
+    let council = Arc::new(council);
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let e = supervised(&rig, &db, worker.clone(), host, council.clone(), false);
+    (rig, e, worker, council)
+}
+
+fn unit_view(e: &Engine, run: &str, ord: u32) -> crate::domain::WorkUnit {
+    e.core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == run)
+        .unwrap()
+        .units
+        .into_iter()
+        .find(|u| u.ord == ord)
+        .unwrap()
+}
+
+/// T6 (f): an `owner:"team"` step runs on a MEMBER seat (`assigned_cli` = the member, its
+/// `step.claimed{by}`), does not count until the PA's `step.reviewed{verdict:"accepted"}`, and
+/// then advances: its `gateDecided{allow:true}` + `unitDone` follow the review, and the unit's
+/// evidence is the member attempt's snapshot.
+#[test]
+fn t6_f_a_member_step_runs_on_the_member_and_counts_once_the_pa_accepts() {
+    let (rig, e, worker, _) = member_engine(
+        "t6-f",
+        |_| "reviewed\nSTEP write: ACCEPT — it covers the migration".into(),
+        |_, _| Ok("DONE".into()),
+        FakeCouncil::yes(),
+    );
+    let mut evs = Vec::new();
+    launch_member_run(&e, "t6f");
+    wait_status(&e, "t6f", SessionStatus::Completed);
+    collect(&e, &mut evs);
+    let ord = unit_view(&e, "t6f", WRITE).ord;
+    let runs = worker.inputs(ord);
+    assert_eq!(runs.len(), 2, "the member's work, then the PA's review");
+    assert_eq!(
+        runs[0].unit.assigned_cli.as_deref(),
+        Some("b"),
+        "the member's seat"
+    );
+    assert_eq!(
+        runs[1].unit.assigned_cli.as_deref(),
+        Some("a"),
+        "the PA reviews"
+    );
+    assert!(runs[1]
+        .prior_outputs
+        .iter()
+        .any(|p| p.label == "[team step — write by b]"));
+    let claimed = payloads(&rig, "t6f", tev::STEP_CLAIMED);
+    assert!(claimed
+        .iter()
+        .any(|p| p["step_id"] == "write" && p["by"] == "b" && p["attempt"] == 0));
+    let reviewed = payloads(&rig, "t6f", tev::STEP_REVIEWED);
+    assert_eq!(reviewed.len(), 1);
+    assert_eq!(reviewed[0]["verdict"], "accepted");
+    assert_eq!(reviewed[0]["by"], "a");
+    let seq = ord_events(&evs, "t6f", ord);
+    let review_dispatch = seq.iter().position(|t| t == "unitDispatched:1").unwrap();
+    let counted = seq.iter().position(|t| t == "gateDecided:true").unwrap();
+    assert!(
+        review_dispatch < counted,
+        "counted only after the review: {seq:?}"
+    );
+    assert_eq!(seq.iter().filter(|t| *t == "unitDone").count(), 1);
+    let u = unit_view(&e, "t6f", ord);
+    assert_eq!(u.status, crate::domain::UnitStatus::Done);
+    assert_eq!(u.assigned_cli.as_deref(), Some("b"));
+    assert_eq!(
+        u.team.as_ref().and_then(|t| t.claimed_event_id),
+        claimed
+            .iter()
+            .zip(0..)
+            .find(|(p, _)| p["step_id"] == "write" && p["attempt"] == 0)
+            .map(|_| {
+                let db = crate::bus::BusDb::shared(&rig.bus).unwrap();
+                db.poll(tev::STEP_CLAIMED, 0, 100)
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.payload["step_id"] == "write" && r.payload["attempt"] == 0)
+                    .unwrap()
+                    .event_id
+            }),
+        "the unit's evidence is the member attempt's snapshot"
+    );
+}
+
+/// T6 (g): `REJECT to:member` reworks the step on the member with the reason as its amendment
+/// (the member took the rejection: `ACCEPT write`); the second review accepts it.
+#[test]
+fn t6_g_reject_to_member_reworks_it_on_the_member_with_the_reason() {
+    let (_rig, e, worker, _) = member_engine(
+        "t6-g1",
+        |n| {
+            if n == 0 {
+                "STEP write: REJECT to:member — the rollback path is missing".into()
+            } else {
+                "STEP write: ACCEPT — fixed".into()
+            }
+        },
+        |_, p| {
+            if p.contains("your step was rejected") {
+                Ok("ACCEPT write\nDONE".into())
+            } else {
+                Ok("DONE".into())
+            }
+        },
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6g1");
+    wait_status(&e, "t6g1", SessionStatus::Completed);
+    let runs = worker.inputs(WRITE);
+    let seats: Vec<&str> = runs
+        .iter()
+        .map(|i| i.unit.assigned_cli.as_deref().unwrap())
+        .collect();
+    assert_eq!(seats, ["b", "a", "b", "a"], "work, review, rework, review");
+    let rework = &runs[2];
+    assert!(rework
+        .unit
+        .rework_amendment
+        .as_deref()
+        .unwrap()
+        .contains("the rollback path is missing"));
+    let u = unit_view(&e, "t6g1", WRITE);
+    let ms = u.member_step.unwrap();
+    assert_eq!(ms.rejections, 1);
+    assert_eq!(ms.reviews.len(), 2);
+    assert_eq!(
+        ms.reviews[0].held,
+        Some(false),
+        "the member took the rejection"
+    );
+}
+
+/// T6 (g): `REJECT to:pa` re-plans the step onto the PA seat: it runs there as the PA's own step,
+/// gated as any other, with no review.
+#[test]
+fn t6_g_reject_to_pa_replans_the_step_onto_the_pa() {
+    let (_rig, e, worker, _) = member_engine(
+        "t6-g2",
+        |_| "STEP write: REJECT to:pa — I will take this one".into(),
+        |_, p| {
+            if p.contains("your step was rejected") {
+                Ok("ACCEPT write\nDONE".into())
+            } else {
+                Ok("DONE".into())
+            }
+        },
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6g2");
+    wait_status(&e, "t6g2", SessionStatus::Completed);
+
+    let seats: Vec<String> = worker
+        .inputs(WRITE)
+        .iter()
+        .map(|i| i.unit.assigned_cli.clone().unwrap())
+        .collect();
+    assert_eq!(seats, ["b", "a", "a"], "work, review, the PA's own step");
+    let u = unit_view(&e, "t6g2", WRITE);
+    assert_eq!(u.owner, crate::workflow::StepOwner::Pa);
+    assert!(u.member_step.unwrap().replanned);
+}
+
+/// T6 (g): the THIRD rejection goes to the PA (`MAX_STEP_REWORK` = 2 back to the member).
+#[test]
+fn t6_g_the_third_rejection_goes_to_the_pa() {
+    let (_rig, e, worker, _) = member_engine(
+        "t6-g3",
+        |_| "STEP write: REJECT to:member — still wrong".into(),
+        |_, p| {
+            if p.contains("your step was rejected") {
+                Ok("ACCEPT write\nDONE".into())
+            } else {
+                Ok("DONE".into())
+            }
+        },
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6g3");
+    wait_status(&e, "t6g3", SessionStatus::Completed);
+    let seats: Vec<String> = worker
+        .inputs(WRITE)
+        .iter()
+        .map(|i| i.unit.assigned_cli.clone().unwrap())
+        .collect();
+    assert_eq!(
+        seats,
+        ["b", "a", "b", "a", "b", "a", "a"],
+        "three member attempts, three reviews, then the PA's own"
+    );
+}
+
+/// T6 (h): a member `HOLD` on a rejection convenes ONE council (`trigger:"member_step"`) that
+/// excludes the member and the PA: YES counts the step (no rework).
+#[test]
+fn t6_h_a_member_hold_convenes_one_council_and_yes_counts_the_step() {
+    let (rig, e, worker, council) = member_engine(
+        "t6-h1",
+        |_| "STEP write: REJECT to:member — wrong API".into(),
+        |_, p| {
+            if p.contains("your step was rejected") {
+                Ok("HOLD write — the API is the documented one\nDONE".into())
+            } else {
+                Ok("DONE".into())
+            }
+        },
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6h1");
+    wait_status(&e, "t6h1", SessionStatus::Completed);
+    let called = payloads(&rig, "t6h1", tev::COUNCIL_CALLED);
+    assert_eq!(called.len(), 1, "{called:#?}");
+    assert_eq!(called[0]["trigger"], "member_step");
+    assert_eq!(called[0]["subject"], "step:write:0");
+    let calls = council.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].1.contains(&"b".to_string()) && calls[0].1.contains(&"a".to_string()));
+    assert_eq!(
+        worker.inputs(WRITE).len(),
+        2,
+        "counted: work + review, no rework"
+    );
+}
+
+/// T6 (h): council NO keeps the rejection (the member reworks it).
+#[test]
+fn t6_h_council_no_keeps_the_rejection() {
+    let (_rig, e, worker, _) = member_engine(
+        "t6-h2",
+        |n| {
+            if n == 0 {
+                "STEP write: REJECT to:member — wrong API".into()
+            } else {
+                "STEP write: ACCEPT — fine now".into()
+            }
+        },
+        |_, p| {
+            if p.contains("your step was rejected") {
+                Ok("HOLD write — it is right\nDONE".into())
+            } else {
+                Ok("DONE".into())
+            }
+        },
+        FakeCouncil::new(|_| FakeCouncil::ruling(Some(1))),
+    );
+    launch_member_run(&e, "t6h2");
+    wait_status(&e, "t6h2", SessionStatus::Completed);
+    assert_eq!(
+        worker.inputs(WRITE).len(),
+        4,
+        "work, review, rework, review"
+    );
+}
+
+/// T6 (h): a council with no verdict pauses `team_dispute` (a human decides); approve counts the
+/// member's output.
+#[test]
+fn t6_h_no_council_verdict_pauses_team_dispute() {
+    let (rig, e, worker, _) = member_engine(
+        "t6-h3",
+        |_| "STEP write: REJECT to:member — wrong API".into(),
+        |_, p| {
+            if p.contains("your step was rejected") {
+                Ok("HOLD write — it is right\nDONE".into())
+            } else {
+                Ok("DONE".into())
+            }
+        },
+        FakeCouncil::new(|_| CouncilOutcome::Failed("boom".into())),
+    );
+    launch_member_run(&e, "t6h3");
+    wait_status(&e, "t6h3", SessionStatus::AwaitingHuman);
+    // Fire-and-forget facts can land just after the status the test waited on.
+    wait_for("tev::GATE_OPENED on t6h3", || {
+        payloads(&rig, "t6h3", tev::GATE_OPENED)
+            .iter()
+            .any(|p| p["kind"] == "team_dispute")
+    });
+    e.core.confirm_gate("t6h3", approve(None)).unwrap();
+    wait_status(&e, "t6h3", SessionStatus::Completed);
+    assert_eq!(
+        worker.inputs(WRITE).len(),
+        2,
+        "no rework: the human counted it"
+    );
+}
+
+/// §8.8, fail closed: a review with no `STEP` line never counts the step — it pauses.
+#[test]
+fn t6_a_review_without_a_step_line_pauses_and_never_counts() {
+    let (_rig, e, _worker, _) = member_engine(
+        "t6-nostep",
+        |_| "I looked at it.".into(),
+        |_, _| Ok("DONE".into()),
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6ns");
+    wait_status(&e, "t6ns", SessionStatus::AwaitingHuman);
+    let u = unit_view(&e, "t6ns", WRITE);
+    assert_ne!(u.status, crate::domain::UnitStatus::Done);
+}
+
+// ── (k) restart mid-step ─────────────────────────────────────────────────────────────────────────
+
+/// Attempt 0 of unit 0 plays the supervisor raising one HIGH on it, then hangs (the daemon dies
+/// mid-turn); every later attempt records its input and returns.
+struct DyingRunner {
+    bus: crate::team::publish::TeamBus,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    seen: std::sync::Mutex<Vec<StepInput>>,
+}
+
+impl StepRunner for DyingRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        self.seen.lock().unwrap().push(i.clone());
+        if i.unit_ix == 0 && i.attempt == 0 {
+            let f =
+                crate::team::publish::tests::fixture_with(tev::FINDING_RAISED, 0, &i.run_id, |p| {
+                    p["ord"] = serde_json::json!(i.unit.ord);
+                    p["attempt"] = serde_json::json!(0);
+                    p["raise_seq"] = serde_json::json!(1);
+                    p["by"] = serde_json::json!("claude#9");
+                });
+            self.bus.publish(&f).expect("the finding is on the bus");
+            if let Some(rx) = self.release.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+        }
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "done".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// The restart fixture: engine 1 runs attempt 0 of unit 0 until it has claimed and raised one
+/// HIGH, then dies. Returns the rig, the db, the team state persisted before the kill, the
+/// release for the hung worker, and engine 2's worker.
+fn killed_mid_step(
+    name: &str,
+    exec: bool,
+) -> (
+    Rig,
+    String,
+    crate::domain::RunTeamState,
+    std::sync::mpsc::Sender<()>,
+) {
+    let rig = rig(name);
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let w1 = Arc::new(DyingRunner {
+        bus: rig.team_bus(),
+        release: std::sync::Mutex::new(Some(release_rx)),
+        seen: Default::default(),
+    });
+    let e1 = supervised(
+        &rig,
+        &db,
+        w1,
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        exec,
+    );
+    launch_team(&e1, name);
+    wait_for("attempt 0's claim and its HIGH", || {
+        payloads(&rig, name, tev::FINDING_RAISED).len() == 1
+            && payloads(&rig, name, tev::STEP_CLAIMED).len() == 1
+    });
+    assert!(payloads(&rig, name, tev::STEP_COMPLETED).is_empty());
+    let team = e1
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == name)
+        .unwrap()
+        .session
+        .team
+        .unwrap();
+    drop(e1);
+    // Let the dead actor release the store before the new daemon opens it.
+    std::thread::sleep(Duration::from_millis(300));
+    (rig, db, team, release_tx)
+}
+
+fn restart(rig: &Rig, db: &str, exec: bool) -> (Engine, Arc<DyingRunner>) {
+    let w2 = Arc::new(DyingRunner {
+        bus: rig.team_bus(),
+        release: std::sync::Mutex::new(None),
+        seen: Default::default(),
+    });
+    let e2 = supervised(
+        rig,
+        db,
+        w2.clone(),
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        exec,
+    );
+    (e2, w2)
+}
+
+fn assert_recovered(
+    rig: &Rig,
+    e2: &Engine,
+    w2: &DyingRunner,
+    run: &str,
+    before: &crate::domain::RunTeamState,
+) {
+    wait_status(e2, run, SessionStatus::Completed);
+    // The redriven attempt's claim attached LIVE: its gate read S's fold, never a timeout.
+    let view = e2.core.run_team(run).unwrap().unwrap();
+    assert_eq!(
+        view.units[0].ledger_source.as_deref(),
+        Some("folded"),
+        "{view:?}"
+    );
+    assert_eq!(
+        view.units[0].final_pass.as_deref(),
+        Some("completed"),
+        "{view:?}"
+    );
+    // The carried HIGH reached the redriven attempt's boundary, labelled.
+    let redriven = w2
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|i| i.unit_ix == 0 && i.attempt >= 1)
+        .cloned()
+        .expect("unit 0 was redriven");
+    assert!(redriven.attempt >= 1);
+    let advice = redriven
+        .prior_outputs
+        .iter()
+        .find(|p| p.label == crate::team::runner::ADVICE_LABEL)
+        .expect("the advice block");
+    assert!(
+        advice.output.contains("carried_from_attempt:0"),
+        "{}",
+        advice.output
+    );
+    // The fold of the redriven attempt holds the carried finding.
+    let folded = payloads(rig, run, tev::LEDGER_FOLDED);
+    let ord = redriven.unit.ord;
+    let f = folded
+        .iter()
+        .find(|p| p["ord"] == ord && p["attempt"] == redriven.attempt)
+        .expect("the redriven attempt folded");
+    assert!(f["ledger"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["carriedFromAttempt"] == 0));
+    assert!(
+        !folded.iter().any(|p| p["ord"] == ord && p["attempt"] == 0),
+        "the dead attempt is never folded"
+    );
+    // The team state persisted before the kill is the one the run resumed on.
+    let after = e2
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == run)
+        .unwrap()
+        .session
+        .team
+        .unwrap();
+    assert_eq!(after.plan_rev, before.plan_rev);
+    assert_eq!(after.stream_floor, before.stream_floor);
+    assert!(after.gate_seq >= before.gate_seq);
+}
+
+/// T6 (k), orphan + `POST /runs/:id/resume`: the daemon dies after attempt 0's `step.claimed` and
+/// before its `step.completed`, with one unanswered HIGH on the stream. The new daemon's
+/// supervisor replays the run from its `stream_floor`; the resumed attempt 1's claim attaches
+/// live (no gate timeout), its boundary carries the HIGH `carried_from_attempt:0`, the plan and
+/// gate sequence are those persisted before the kill, and the run completes.
+#[test]
+fn t6_k_restart_mid_step_resume_carries_the_high_and_attaches_live() {
+    let (rig, db, before, release) = killed_mid_step("t6k-res", false);
+    let (e2, w2) = restart(&rig, &db, false);
+    assert_eq!(
+        status(&e2, "t6k-res"),
+        Some(SessionStatus::Executing),
+        "an orphan"
+    );
+    e2.core.resume_run("t6k-res").unwrap();
+    assert_recovered(&rig, &e2, &w2, "t6k-res", &before);
+    drop(release);
+}
+
+/// T6 (k), armed exec redrive: the same kill, on an exec-mediated daemon; the new daemon
+/// redrives the cursor unit itself (attempt bumped) and the same holds.
+#[test]
+fn t6_k_restart_mid_step_exec_redrive_carries_the_high_and_attaches_live() {
+    let (rig, db, before, release) = killed_mid_step("t6k-exec", true);
+    let (e2, w2) = restart(&rig, &db, true);
+    assert_recovered(&rig, &e2, &w2, "t6k-exec", &before);
+    drop(release);
+}
+
+/// T6 (k), the stream gap: the same kill, then the bus loses the run's `path.started` and attempt
+/// 0's rows. The redriven attempt's fold is `stream_gap`, and the gate pauses for a human instead
+/// of passing.
+#[test]
+fn t6_k_with_the_stream_gone_the_gate_records_stream_gap_and_pauses() {
+    let (rig, db, _before, release) = killed_mid_step("t6k-gap", false);
+    let conn = rig.conn();
+    conn.execute(
+        "DELETE FROM events WHERE subdomain = 'core.team' AND (event_type = ?1 OR \
+         json_extract(payload, '$.attempt') = 0)",
+        [tev::PATH_STARTED],
+    )
+    .unwrap();
+    drop(conn);
+    let (e2, _w2) = restart(&rig, &db, false);
+    e2.core.resume_run("t6k-gap").unwrap();
+    wait_status(&e2, "t6k-gap", SessionStatus::AwaitingHuman);
+    let view = e2.core.run_team("t6k-gap").unwrap().unwrap();
+    assert_eq!(
+        view.units[0].final_pass.as_deref(),
+        Some("stream_gap"),
+        "{view:?}"
+    );
+    assert_eq!(view.units[0].team_pause, Some(true));
+    assert_eq!(
+        awaiting_kinds(&drain_events(&e2), "t6k-gap"),
+        vec!["team_dispute".to_string()]
+    );
+    drop(release);
+}
+
+/// T6: an amend on a dispute over a unit with no creator to rerun is refused BEFORE the gate row
+/// resolves or its `gate.decided` is published — the run stays paused on the same dispute.
+#[test]
+fn t6_an_amend_with_no_creator_to_rerun_is_refused_and_the_dispute_stays_open() {
+    let rig = rig("t6-amend-no");
+    let e = engine_running(
+        &rig,
+        fast(&rig),
+        Arc::new(RaisingRunner {
+            bus: rig.team_bus(),
+            on_ix: 1,
+        }),
+    );
+    launch_team(&e, "t6anc");
+    wait_status(&e, "t6anc", SessionStatus::AwaitingHuman);
+    let err = e
+        .core
+        .confirm_gate("t6anc", approve(Some("rework it")))
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("no creator phase"), "{err:#}");
+    assert!(payloads(&rig, "t6anc", tev::GATE_DECIDED)
+        .iter()
+        .all(|p| p["kind"] != "team_dispute"));
+    assert_eq!(status(&e, "t6anc"), Some(SessionStatus::AwaitingHuman));
+    e.core.confirm_gate("t6anc", approve(None)).unwrap();
+    wait_status(&e, "t6anc", SessionStatus::Completed);
+}
+
+/// Edit a stopped engine's store: `f` over the run's session and its units.
+fn edit_store(
+    db: &str,
+    run: &str,
+    f: impl FnOnce(&mut crate::domain::AgentSession, &mut Vec<crate::domain::WorkUnit>),
+) {
+    let mut store = wicked_apps_core::open_store_any(Some(db)).expect("store opens");
+    let mut s = crate::domain::get_session(&store, run).unwrap().unwrap();
+    let mut units = crate::domain::session_units(&store, run).unwrap();
+    f(&mut s, &mut units);
+    crate::domain::put_node(&mut store, s.to_node()).unwrap();
+    for u in &units {
+        crate::domain::put_node(&mut store, u.to_node()).unwrap();
+    }
+}
+
+/// Restart between the fold and the `team_dispute` pause (the unit is done, its ledger pauses, and
+/// no gate was opened): the resumed run opens the dispute instead of passing the unit.
+#[test]
+fn t6_restart_between_the_fold_and_the_dispute_pause_reopens_the_dispute() {
+    let rig = rig("t6-owed-d");
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    {
+        let core = Core::spawn_with_engine_team(
+            db.clone(),
+            Arc::new(StubDispatcher),
+            Arc::new(RaisingRunner {
+                bus: rig.team_bus(),
+                on_ix: 0,
+            }),
+            fast(&rig),
+        );
+        let e = Engine {
+            events: core.subscribe(),
+            core,
+            runner: Arc::new(CountingRunner::default()),
+            db: db.clone(),
+        };
+        launch_team(&e, "t6od");
+        wait_status(&e, "t6od", SessionStatus::AwaitingHuman);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // The state a crash between the fold's unit write and the pause leaves behind.
+    edit_store(&db, "t6od", |s, _| {
+        s.status = SessionStatus::Executing;
+        if let Some(t) = s.team.as_mut() {
+            t.dispute = None;
+        }
+    });
+    let e = engine_on(&db, fast(&rig));
+    e.core.resume_run("t6od").unwrap();
+    wait_status(&e, "t6od", SessionStatus::AwaitingHuman);
+    assert!(awaiting_kinds(&drain_events(&e), "t6od")
+        .iter()
+        .any(|k| k == "team_dispute"));
+    assert_eq!(
+        e.runner.0.load(AtomicOrdering::SeqCst),
+        0,
+        "the unit is not re-run"
+    );
+    e.core.confirm_gate("t6od", approve(None)).unwrap();
+    wait_status(&e, "t6od", SessionStatus::Completed);
+}
+
+/// Restart between a member's fold and the PA's review (the unit is done, not counted, and no
+/// review is under way): the resumed run dispatches the PA's review — the member's work is not
+/// re-run and the step does not count on its own.
+#[test]
+fn t6_restart_between_a_members_fold_and_the_review_dispatches_the_review() {
+    let (rig, e, _worker, _) = member_engine(
+        "t6-owed-r",
+        |_| "STEP write: ACCEPT — ok".into(),
+        |_, _| Ok("DONE".into()),
+        FakeCouncil::yes(),
+    );
+    launch_member_run(&e, "t6or");
+    wait_status(&e, "t6or", SessionStatus::Completed);
+    let db = e.db.clone();
+    drop(e);
+    std::thread::sleep(Duration::from_millis(300));
+    // The run never ended in the state being reconstructed: no `path.ended` on the bus or record.
+    rig.conn()
+        .execute(
+            "DELETE FROM events WHERE event_type = ?1",
+            [tev::PATH_ENDED],
+        )
+        .unwrap();
+    edit_store(&db, "t6or", |s, units| {
+        s.status = SessionStatus::Executing;
+        s.finished_at = None;
+        if let Some(t) = s.team.as_mut() {
+            t.ended = false;
+        }
+        let ix = units.iter().position(|u| u.ord == WRITE).unwrap();
+        s.unit_ix = ix;
+        let ms = units[ix].member_step.as_mut().unwrap();
+        ms.counted = false;
+        ms.reviewing = None;
+        ms.reviews.clear();
+        for u in units.iter_mut().skip(ix + 1) {
+            u.status = crate::domain::UnitStatus::Pending;
+        }
+    });
+    let worker = MemberRunner::new(|_| "STEP write: ACCEPT — ok".into());
+    let e2 = supervised(
+        &rig,
+        &db,
+        worker.clone(),
+        Arc::new(FakeHost::new(|_, _| Ok("DONE".into()))),
+        Arc::new(FakeCouncil::yes()),
+        false,
+    );
+    e2.core.resume_run("t6or").unwrap();
+    wait_status(&e2, "t6or", SessionStatus::Completed);
+    let runs = worker.inputs(WRITE);
+    assert_eq!(runs.len(), 1, "only the PA's review ran");
+    assert!(runs[0]
+        .unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some()));
+    assert!(unit_view(&e2, "t6or", WRITE).member_step.unwrap().counted);
+}
+
 /// T3 (codex round 7): a team run launched on a bare composed def (no plan, no preset) says so:
 /// `path.started{workflow: null, plan: false}`.
 #[test]

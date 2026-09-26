@@ -3584,6 +3584,7 @@ pub(crate) fn run(
                                 run_id: s.id,
                                 status: s.status,
                                 team,
+                                roster: s.clis,
                             })
                         })
                         .collect()
@@ -4539,11 +4540,44 @@ fn redrive_executing_sessions(
         let mut advanced = false;
         while units
             .get(sess.unit_ix)
-            .map(|u| u.status == crate::domain::UnitStatus::Done)
+            .map(|u| {
+                u.status == crate::domain::UnitStatus::Done
+                    // (T6) a done unit that still owes its review or its team_dispute pause is
+                    // not skipped: it gets that step below.
+                    && team_gate::owed_team_step(&sess, u).is_none()
+            })
             .unwrap_or(false)
         {
             sess.unit_ix += 1;
             advanced = true;
+        }
+        if let Some(step) = units
+            .get(sess.unit_ix)
+            .and_then(|u| team_gate::owed_team_step(&sess, u))
+        {
+            if let Err(e) = put_node(store, sess.to_node()) {
+                emit_run_error(subscribers, &run_id, e);
+                continue;
+            }
+            let ix = sess.unit_ix;
+            let mut act = team_gate::Act {
+                store: &mut *store,
+                subscribers: &mut *subscribers,
+                runner,
+                self_tx,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            };
+            match team_gate::run_owed_step(&mut act, sess, ix, step) {
+                Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
+                    in_flight.insert(run_id);
+                }
+                Ok(_) => {}
+                Err(e) => emit_run_error(subscribers, &run_id, e),
+            }
+            continue;
         }
         // Mint a fresh idempotency key (findings #1 + #2/#3) and persist BEFORE dispatch (dispatch
         // reads `attempt` from the store). (DES-L1 PR-1B) Keyed on the cursor unit's OWN history
@@ -4977,6 +5011,31 @@ fn apply_step_result(
         );
         notify_campaign(self_tx, &run_id, crate::campaign::NodeOutcome::Cancelled);
         return Ok(StepApplied::Finished);
+    }
+    // DES-TEAMING-002 §8.8 (T6): the PA's review of a member's step is team evidence, never the
+    // gate — it never reaches the failure ladder or the fold. Its verdict (and the attempt's
+    // ledger) decide whether the member's step counts; anything missing pauses `team_dispute`.
+    if team_gate::is_review(unit) {
+        let ix = output.unit_ix;
+        let mut act = team_gate::Act {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        let progress = team_gate::apply_review(&mut act, session, ix, &output, evidence.team);
+        return match progress? {
+            Progress::Dispatched | Progress::Deferred => Ok(StepApplied::Continuing),
+            Progress::Paused => Ok(StepApplied::Paused),
+            Progress::Done => {
+                finalize_run(store, subscribers, runner, self_tx, &run_id)?;
+                Ok(StepApplied::Finished)
+            }
+        };
     }
     // An elicitation that could not be completed is terminal and non-retriable. In
     // particular, do not let it fall through to `apply_and_finish_unit` (which would
@@ -5785,6 +5844,20 @@ fn apply_step_result(
     if team_review.is_some() {
         put_node(store, session.to_node())?;
     }
+    // (T6, DES-001 #13) The fold withholds `gateDecided{allow:true}` + `unitDone` for a unit that
+    // may not count yet: a teamed unit whose ledger pauses (its `team_dispute` answer emits them),
+    // and a member's work (the PA's review, or a council, counts it). A DENY is emitted as ever.
+    let withhold = team_review.is_some()
+        && unit
+            .team
+            .as_ref()
+            .and_then(|t| t.ledger.as_ref())
+            .is_none_or(|l| l.team_pause)
+        || team_gate::is_member_work(unit);
+    let mut fold_emit = |ev: CoreEvent| match ev {
+        CoreEvent::GateDecided { allow: true, .. } | CoreEvent::UnitDone { .. } if withhold => {}
+        ev => emit(subscribers, ev),
+    };
     let outcome = pipeline::apply_and_finish_unit(
         store,
         unit,
@@ -5802,7 +5875,7 @@ fn apply_step_result(
         // The worker-thread evidence (F-036 guard outcome, F-039 repo checks) — folded as
         // deny-dominant layers beside the pinned validator.
         &evidence,
-        &mut |ev| emit(subscribers, ev),
+        &mut fold_emit,
         coverage_db.as_deref(),
     )?;
     // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
@@ -5868,33 +5941,58 @@ fn apply_step_result(
     if let Some(t) = &evidence.verified_tree {
         session.verified_tree = Some(t.clone());
     }
+    // T5 (c) / T6: a teamed unit's ledger holds an unresolved HIGH (or an incomplete record)
+    // without a council YES — the work stands, but the run pauses for a human BEFORE anything
+    // else runs (DES-001 §6.7). The cursor STAYS on the unit: approve counts it (the withheld
+    // `gateDecided` + `unitDone`) and advances, never re-dispatches; reject cancels.
+    let member_work = team_gate::is_member_work(unit);
+    if let Some(d) = team_dispute {
+        put_node(store, session.to_node())?;
+        let mut act = team_gate::Act {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        team_gate::open_dispute(
+            &mut act,
+            &mut session,
+            unit_ord,
+            output.attempt,
+            crate::domain::DisputeKind::Finding,
+            d.prompt,
+            d.finding_ids,
+        )?;
+        return Ok(StepApplied::Paused);
+    }
+    // DES-002 §8.8: a member's work passed its gate but counts only once the PA accepts it — the
+    // PA's review runs next, on the PA seat, as this unit's next attempt.
+    if member_work {
+        put_node(store, session.to_node())?;
+        let mut act = team_gate::Act {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        team_gate::enter_review(&mut act, &run_id, output.unit_ix, output.attempt)?;
+        return Ok(StepApplied::Continuing);
+    }
+
     // Approved → advance the resume cursor past the unit we just applied. (DES-L1 PR-1B) The next
     // unit's attempt is ITS `next_attempt` — 0 on a first pass, `last_attempt + 1` for a unit a
     // `request_changes` rewind re-armed — so the re-run never reuses a `(run, unit, attempt)` key.
     session.unit_ix = output.unit_ix + 1;
     session.attempt = units.get(session.unit_ix).map(next_attempt).unwrap_or(0);
     put_node(store, session.to_node())?;
-
-    // T5 (c): a teamed unit's ledger holds an unresolved HIGH (or an incomplete record) without a
-    // council YES — the work stands, but the run pauses for a human BEFORE anything else runs
-    // (DES-001 §6.7). Approve continues at the cursor; reject cancels.
-    if let Some(prompt) = team_dispute {
-        let next_ord = units
-            .get(session.unit_ix)
-            .map(|u| u.ord)
-            .unwrap_or(unit_ord);
-        pause_for_human(
-            store,
-            subscribers,
-            self_tx,
-            &mut session,
-            next_ord,
-            Some(unit_ord),
-            team_gate::TEAM_DISPUTE_GATE,
-            prompt,
-        )?;
-        return Ok(StepApplied::Paused);
-    }
 
     // Advance: dispatch the next unit, pause at its human-confirm gate, or finalize.
     match advance_or_pause(
@@ -6654,6 +6752,23 @@ fn advance_or_pause(
         return Ok(Progress::Done);
     };
 
+    // DES-TEAMING-002 T6: a DONE cursor unit that still owes a team step (a restart between the
+    // fold's unit write and the review / pause that follows it) gets that step — never a
+    // re-dispatch of its work, never a silent pass.
+    if let Some(step) = team_gate::owed_team_step(&session, unit) {
+        let mut act = team_gate::Act {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        return team_gate::run_owed_step(&mut act, session, unit_ix, step);
+    }
+
     // DES-TEAMING-002 P1: a team run's required transitions come first — `path.started` before
     // its first dispatch, `plan.accepted` before the plan's first unit — ahead of any human gate,
     // so no team fact (a gate's included) can precede the run's path on the bus.
@@ -7112,10 +7227,12 @@ fn dispatch_unit(
     // DES-TEAMING-002 P1: a team unit of an un-teamed run carries `transport: none` in its
     // snapshot BEFORE its turn starts — stamped from the run's persisted state, never the worker.
     let team_snapshot = team_gate::unit_snapshot(&session, &unit);
-    let team_changed = team_snapshot.is_some() && unit.team != team_snapshot;
+    let mut team_changed = team_snapshot.is_some() && unit.team != team_snapshot;
     if team_changed {
         unit.team = team_snapshot;
     }
+    // DES-TEAMING-002 §8.8 (T6): a member's step records the member seat it belongs to.
+    team_changed |= team_gate::stamp_member_step(&session, &mut unit);
     if (notes_root.is_some() && unit.notes_root != notes_root) || attempt_changed || team_changed {
         if notes_root.is_some() {
             unit.notes_root = notes_root;
@@ -7341,6 +7458,37 @@ fn dispatch_unit(
             }
         }
     }
+    // DES-TEAMING-002 §8.8 (T6): the PA's review of a member's step — the member's output as
+    // prior context, and the one line the PA answers with. The review is team evidence; the
+    // member's step already passed its own gate.
+    let review_of = unit
+        .member_step
+        .as_ref()
+        .and_then(|m| m.reviewing.map(|a| (m.member.clone(), a)));
+    if let Some((member, reviewed)) = &review_of {
+        let step_id = unit
+            .phase_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("unit-{}", unit.ord));
+        let label = format!("[team step — {step_id} by {member}]");
+        let output = crate::domain::get_work_output(store, &unit.id).unwrap_or_default();
+        context_items.push(crate::event::InjectedContext {
+            ord: unit.ord,
+            label: label.clone(),
+            output_bytes: output.len(),
+        });
+        prior_outputs.push(PriorUnitOutput {
+            label,
+            output: format!(
+                "{output}\n\n[team step review] The step above (`{step_id}`, attempt {reviewed}) \
+                 was done by the team member {member}, and it counts only once you accept it. \
+                 Review it; do not redo it. End your answer with exactly one line:\n  STEP \
+                 {step_id}: ACCEPT — <why it is right>\n  STEP {step_id}: REJECT to:member — \
+                 <what is wrong; the member reworks it>\n  STEP {step_id}: REJECT to:pa — <you \
+                 take the step over>\n"
+            ),
+        });
+    }
     // (EVT-007) Emit UnitContextInjected when prior outputs are being injected — a cross-CLI carry-over
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
@@ -7377,11 +7525,24 @@ fn dispatch_unit(
     } else {
         (0, 0)
     };
+    // The PA's review turn reads a review instruction, not the step's task (it must not redo it).
+    let dispatched_unit = match &review_of {
+        Some((member, reviewed)) => {
+            let mut u = unit.clone();
+            u.description = format!(
+                "Review the team member {member}'s output for this step (attempt {reviewed}) and \
+                 answer with one STEP line. The step's task was: {}",
+                unit.description
+            );
+            u
+        }
+        None => unit.clone(),
+    };
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
         attempt: session.attempt,
-        unit: unit.clone(),
+        unit: dispatched_unit,
         workflow_id: session.workflow_id.clone(),
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
@@ -8473,6 +8634,21 @@ fn phase_boundary_claim(
     ))
 }
 
+/// Layer-3 as a verdict: `true` = a policy DENIES the boundary, with its claim recorded — the
+/// caller cancels, never continues. [`phase_boundary_claim`] is the one evaluation.
+fn phase_boundary_denied(
+    store: &mut dyn GraphStore,
+    session: &AgentSession,
+    run_id: &str,
+) -> anyhow::Result<bool> {
+    let claim = phase_boundary_claim(store, session, run_id)?;
+    if matches!(claim.decision, Decision::Deny) {
+        conform(store, &claim)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// (DES-TEAMING-002 §8.6, T3) The `plan_approval` arm of [`confirm_gate`], entered when the run's
 /// OPEN interaction row is a plan gate (DES-001 §6.7: its `gate_kind` is read before the row is
 /// resolved). Approve releases the held plan (`gate.decided{human_approved}` →
@@ -9017,6 +9193,32 @@ pub(crate) fn confirm_gate(
         let units = crate::domain::session_units(store, run_id)?;
         let cursor = units.get(session.unit_ix);
         let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+        // (T6) A `team_dispute` over a unit's findings answered with changes reruns its creator:
+        // refused here, before the row resolves and before its `gate.decided` is published, when
+        // there is no creator to rerun (a member-step dispute reworks the member instead).
+        let dispute_amend = team_gate::dispute_gate_open(&session)
+            && session
+                .team
+                .as_ref()
+                .and_then(|t| t.dispute.as_ref())
+                .is_some_and(|d| d.kind == crate::domain::DisputeKind::Finding)
+            && match &decision {
+                crate::workflow::HumanDecision::RequestChanges { .. } => true,
+                crate::workflow::HumanDecision::Approve { amend: Some(a), .. } => {
+                    !a.trim().is_empty()
+                }
+                _ => false,
+            };
+        if dispute_amend {
+            let has_creator = cursor.is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
+                || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
+            if !has_creator {
+                anyhow::bail!(
+                    "no creator phase precedes unit {cursor_ord} to rework — approve (the work \
+                     counts) or reject"
+                );
+            }
+        }
         match &decision {
             crate::workflow::HumanDecision::RequestChanges { .. } => {
                 let has_creator = cursor
@@ -9097,6 +9299,33 @@ pub(crate) fn confirm_gate(
         return team_gate::answer_transport_gate(&mut cx, session, decision);
     }
 
+    // (DES-TEAMING-002 T6, DES-001 §6.7) A `team_dispute` pause: every answer publishes the
+    // gate's `gate.decided{by:"human"}` (required) first; approve then counts the unit and
+    // advances — never a re-dispatch, never an attempt bump — amend reworks, reject cancels.
+    if team_gate::dispute_gate_open(&session) {
+        if !matches!(decision, crate::workflow::HumanDecision::Reject)
+            && phase_boundary_denied(store, &session, run_id)?
+        {
+            let result = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps);
+            if result.is_ok() {
+                in_flight.remove(run_id);
+            }
+            return result;
+        }
+        let mut cx = team_gate::Ctx {
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            in_flight,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        };
+        return team_gate::answer_dispute_gate(&mut cx, session, decision);
+    }
+
     // (DES-L1 PR-1B) Three arms. Reject = cancel, unchanged (D-2). `RequestChanges` and `Approve`
     // both pass the layer-3 boundary check below first; `rework` is `Some(note)` for the former.
     let (amend, amend_scope, rework): (
@@ -9123,23 +9352,15 @@ pub(crate) fn confirm_gate(
         {
             // Layer-3: governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
             // Runs BEFORE any approval-side mutations so a Deny cancels cleanly (no partial state committed).
-            // Without policies loaded (`wicked-core rules ingest`), select() returns empty and decide()
-            // always returns Allow — the check is a no-op until policies are populated.
-            {
-                let claim = phase_boundary_claim(store, &session, run_id)?;
-                if matches!(claim.decision, Decision::Deny) {
-                    conform(store, &claim)?;
-                    // Persist the deny evidence then cancel the run. The run stays cancelled
-                    // (the human must re-launch) — deny-dominates means Approve cannot override
-                    // a policy veto (ADR-0003). Remove from in_flight only after cancel_run so
-                    // a write failure leaves the map consistent (run stays in_flight = retryable).
-                    let result =
-                        cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps);
-                    if result.is_ok() {
-                        in_flight.remove(run_id);
-                    }
-                    return result;
+            if phase_boundary_denied(store, &session, run_id)? {
+                // Deny-dominates: Approve cannot override a policy veto (ADR-0003). Remove from
+                // in_flight only after cancel_run so a write failure leaves the map consistent.
+                let result =
+                    cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps);
+                if result.is_ok() {
+                    in_flight.remove(run_id);
                 }
+                return result;
             }
             // (DES-L1 PR-1B) REQUEST CHANGES: rewind to the creator and re-dispatch it there.
             if let Some(note) = rework {

@@ -388,6 +388,9 @@ pub struct Core {
     /// Where this core publishes team facts (DES-TEAMING-002 P1) — read by
     /// [`Core::replay_team_outbox`], which drains on the caller's thread, never the actor's.
     team: crate::team::publish::TeamConfig,
+    /// (DES-TEAMING-002 T6) The team supervisor on the bus, when this core runs one
+    /// (`spawn_with_acp_sessions` with a bus): stopped when the last handle drops.
+    _team_supervisor: Option<Arc<crate::team::supervisor::SupervisorHandle>>,
     _shutdown: Arc<ShutdownGuard>,
 }
 
@@ -562,6 +565,42 @@ impl Core {
         Core::spawn_inner(path, dispatcher, runner, None, Some(team))
     }
 
+    /// [`Core::spawn_with_engine_team`] plus the team supervisor on the bus (DES-TEAMING-002 T6),
+    /// with an injected member host and council — for tests that exercise the supervisor end to
+    /// end without real ACP seats. `exec_bus` turns exec mediation on as
+    /// [`Core::spawn_with_engine_exec`] does; `tune` adjusts the supervisor's bounds.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_engine_team_supervised(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+        team: TeamConfig,
+        exec_bus: Option<String>,
+        host: std::sync::Arc<dyn crate::team::MonitorHost>,
+        council: std::sync::Arc<dyn crate::team::supervisor::Council>,
+        tune: impl FnOnce(&mut crate::team::supervisor::SupervisorConfig),
+    ) -> Core {
+        let boot_ms = crate::interaction::now_millis();
+        let mut core = Core::spawn_inner(path, dispatcher, runner, exec_bus, Some(team.clone()));
+        if let Some(mut cfg) = crate::team::supervisor::SupervisorConfig::from_team(&team, boot_ms)
+        {
+            tune(&mut cfg);
+            let tx = core.tx.clone();
+            let live: crate::team::supervisor::LiveRuns = std::sync::Arc::new(move || {
+                let (reply, rx) = channel();
+                tx.send(Command::LiveTeamRuns { reply })
+                    .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+                rx.recv()
+                    .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+            });
+            core._team_supervisor = Some(Arc::new(crate::team::supervisor::spawn(
+                cfg, host, council, live,
+            )));
+        }
+        core
+    }
+
     /// Spawn with the Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) turned ON EXPLICITLY against the
     /// bus db at `bus_db_path` — the actor publishes `wicked.task.dispatched` for a `cli-runner`
     /// subscriber instead of dispatching units in-process, and consumes `wicked.task.completed` back. This
@@ -636,6 +675,7 @@ impl Core {
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             team: team_cfg,
+            _team_supervisor: None,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -660,26 +700,6 @@ impl Core {
         // The runner knows the store it serves (codex round 8): the database's canonical parent is
         // the daemon's operational state home, fenced on every launch — snapshot or not.
         let runner = std::sync::Arc::new(AcpStepRunner::new_for_store(tx.clone(), &path));
-        // DES-TEAMING-001 S2 (#601): the per-daemon team supervisor, subscribed to the engine's own
-        // event fan-out (queued ahead of the actor's start, so it sees every event), running
-        // monitors through a WEAK handle on this runner. Dormant until a unit is teamed.
-        {
-            let (sub_tx, sub_rx) = channel();
-            let _ = tx.send(Command::Subscribe(sub_tx));
-            let emit_tx = tx.clone();
-            let emit: crate::team::Emit = std::sync::Arc::new(move |ev| {
-                let _ = emit_tx.send(Command::EmitEvent(ev));
-            });
-            let host: std::sync::Arc<dyn crate::team::MonitorHost> = std::sync::Arc::new(
-                crate::acp_runner::RunnerHost(std::sync::Arc::downgrade(&runner)),
-            );
-            runner.install_team(crate::team::spawn_supervisor(
-                host,
-                emit,
-                sub_rx,
-                crate::team::TeamLimits::from_env(),
-            ));
-        }
         // Share the maps and write registry already inside the runner so the actor and the
         // ACP execution layer use a single consistent lock.
         let actor_maps = runner.elicitation_maps().clone();
@@ -689,11 +709,19 @@ impl Core {
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
         let team_cfg = crate::team::publish::TeamConfig::for_store(&log_path);
+        // DES-TEAMING-002 T6: this process's boot — an attempt claimed before it is dead (§4.7).
+        let boot_ms = crate::interaction::now_millis();
+        // The carrier publishes a claimed attempt's checkpoints and steer rows on the same bus and
+        // outbox as the engine and the worker thread.
+        if let Some(r) = crate::team::runner::TeamRunner::from_config(&team_cfg) {
+            runner.install_team_runner(r);
+        }
         // DES-TEAMING-002 T0: the launch bridge is armed below, on THIS (the caller's) thread, never
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
+        let publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
         std::thread::spawn(move || {
             actor::run(
                 bus_bridge_actor,
@@ -714,6 +742,29 @@ impl Core {
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
         // it polls strictly after the bus tail as of now, or has reported itself not armed.
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
+        // DES-TEAMING-002 T6: the team supervisor on the bus — armed only from the engine's live
+        // teamed runs (P1's replay set) and from `path.started` rows. Its members run through a
+        // WEAK handle on this runner; its councils go through the engine's one council entry
+        // point. No bus (or no publisher) = no team run, so no supervisor.
+        let supervisor = crate::team::supervisor::SupervisorConfig::from_team(&team_cfg, boot_ms)
+            .filter(|_| publishes)
+            .map(|cfg| {
+                let host: std::sync::Arc<dyn crate::team::MonitorHost> = std::sync::Arc::new(
+                    crate::acp_runner::RunnerHost(std::sync::Arc::downgrade(&runner)),
+                );
+                let council: std::sync::Arc<dyn crate::team::supervisor::Council> =
+                    std::sync::Arc::new(crate::team::supervisor::ActorCouncil { tx: tx.clone() });
+                let live_tx = tx.clone();
+                let live: crate::team::supervisor::LiveRuns = std::sync::Arc::new(move || {
+                    let (reply, rx) = channel();
+                    live_tx
+                        .send(Command::LiveTeamRuns { reply })
+                        .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+                    rx.recv()
+                        .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+                });
+                Arc::new(crate::team::supervisor::spawn(cfg, host, council, live))
+            });
         let core = Core {
             tx: tx.clone(),
             pty,
@@ -721,6 +772,7 @@ impl Core {
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             team: team_cfg,
+            _team_supervisor: supervisor,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -780,6 +832,7 @@ impl Core {
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             team: team_cfg,
+            _team_supervisor: None,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }

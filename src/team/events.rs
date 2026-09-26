@@ -741,8 +741,11 @@ pub struct FindingRaised {
     /// Identity, never a key.
     pub finding_id: String,
     pub member_id: String,
-    /// DES-001 §4.6 fields T6 builds; `null` until then.
+    /// DES-001 §4.6: `"l-" + hex(sha256(path ‖ "\n" ‖ normalized evidence))[..16]`, the
+    /// moved-line correlation key. Computed at parse ([`super::line_key`]), never read.
     pub line_key: Option<String>,
+    /// DES-001 §4.6: the enclosing location context the id is minted over (`null` / `""` =
+    /// file-level). T6 resolves it with git's own funcname heuristic (`anchor_source: "hunk"`).
     pub anchor: Option<String>,
     pub anchor_source: Option<AnchorSource>,
     /// The bar: `high` | `medium`; anything else is refused at parse.
@@ -755,6 +758,10 @@ pub struct FindingRaised {
     pub tree: String,
     pub in_diff: bool,
     pub corroborated_by: Vec<String>,
+    /// (T6, §4.7 replay step 3) The attempt this finding was first raised on, when the supervisor
+    /// re-raised it into a redriven attempt because the attempt that raised it died unresolved.
+    /// `null` for a finding raised on this attempt.
+    pub carried_from_attempt: Option<u32>,
 }
 
 /// 12 — `advice.delivered` (R).
@@ -821,7 +828,9 @@ pub struct StepCompleted {
     pub output_ref: String,
 }
 
-/// 18 — `step.reviewed` (R).
+/// 18 — `step.reviewed` (R). The envelope's `(ord, attempt)` is the REVIEW attempt (the PA's turn
+/// that carried the `STEP` line), so the row rides that runner's lane in order before its
+/// `step.completed`; `reviewed_attempt` names the member attempt under review.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepReviewed {
     pub step_id: String,
@@ -829,6 +838,9 @@ pub struct StepReviewed {
     /// On `rejected`: who reworks it.
     pub to: Option<ReworkBy>,
     pub reason: String,
+    /// (T6) The member attempt the review is about. Additive: an older payload reads `null`.
+    #[serde(default)]
+    pub reviewed_attempt: Option<u32>,
 }
 
 /// 19 — `finding.settled` (S).
@@ -978,8 +990,9 @@ pub struct PathEnded {
 // Each type below deserializes through a mirror that omits its computed fields (an incoming one
 // is ignored as an unknown key) and recomputes them. The computed fields:
 //   TeamLedger.teamPause            ⇐ pauses(finalPass, findings)          (team.rs)
-//   Finding.findingId               ⇐ finding_id(path, evidence)           (team.rs)
-//   FindingRaised.finding_id        ⇐ finding_id(path, evidence)
+//   Finding.findingId               ⇐ finding_id_anchored(path, anchor, evidence) (team.rs)
+//   FindingRaised.finding_id        ⇐ finding_id_anchored(path, anchor, evidence)
+//   FindingRaised.line_key          ⇐ line_key(path, evidence)             (T6)
 //   PathScored.score                ⇐ min(100, deterministic + model.add)
 //   PathScored.plan                 ⇐ S4 plan_for(score)
 //   LedgerFolded.final_pass         ⇐ ledger.finalPass
@@ -1029,7 +1042,6 @@ impl From<PathScoredWire> for PathScored {
 struct FindingRaisedWire {
     raise_seq: u32,
     member_id: String,
-    line_key: Option<String>,
     anchor: Option<String>,
     anchor_source: Option<AnchorSource>,
     severity: Severity,
@@ -1041,15 +1053,22 @@ struct FindingRaisedWire {
     tree: String,
     in_diff: bool,
     corroborated_by: Vec<String>,
+    /// Additive in T6: a payload that predates it reads as "raised on this attempt".
+    #[serde(default)]
+    carried_from_attempt: Option<u32>,
 }
 
 impl From<FindingRaisedWire> for FindingRaised {
     fn from(w: FindingRaisedWire) -> Self {
         FindingRaised {
             raise_seq: w.raise_seq,
-            finding_id: super::finding_id(&w.path, &w.evidence),
+            finding_id: super::finding_id_anchored(
+                &w.path,
+                w.anchor.as_deref().unwrap_or(""),
+                &w.evidence,
+            ),
             member_id: w.member_id,
-            line_key: w.line_key,
+            line_key: Some(super::line_key(&w.path, &w.evidence)),
             anchor: w.anchor,
             anchor_source: w.anchor_source,
             severity: w.severity,
@@ -1061,6 +1080,7 @@ impl From<FindingRaisedWire> for FindingRaised {
             tree: w.tree,
             in_diff: w.in_diff,
             corroborated_by: w.corroborated_by,
+            carried_from_attempt: w.carried_from_attempt,
         }
     }
 }
@@ -1409,6 +1429,9 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
 
     let mut monitors: Vec<MonitorAcc> = Vec::new();
     let mut findings: Vec<FindingAcc> = Vec::new();
+    let mut reviews: Vec<super::StepReviewRecord> = Vec::new();
+    let mut step_calls: Vec<CouncilCalled> = Vec::new();
+    let mut step_rulings: Vec<CouncilRuled> = Vec::new();
     // Rows about findings, applied once every raise is known (order-independent).
     let mut about: Vec<&TeamRow> = Vec::new();
     let mut skipped = false;
@@ -1422,8 +1445,10 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                 | TeamBody::AdviceDelivered(_)
                 | TeamBody::AdviceAnswered(_)
                 | TeamBody::FindingSettled(_)
+                | TeamBody::CouncilCalled(_)
                 | TeamBody::CouncilRuled(_)
                 | TeamBody::StepCompleted(_)
+                | TeamBody::StepReviewed(_)
         );
         // A consumed row of another attempt is not this attempt's: a gap, never applied. (With no
         // terminal row at all the rows are still folded, so no finding disappears, and the gap
@@ -1463,6 +1488,8 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                     tree: b.tree.clone(),
                     in_diff: b.in_diff,
                     checkpoint_seq: 0,
+                    anchor: b.anchor.clone().unwrap_or_default(),
+                    carried_from_attempt: b.carried_from_attempt,
                 },
                 corroborated_by: b.corroborated_by.clone(),
                 injected: false,
@@ -1470,12 +1497,52 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                 settled: None,
                 ruling: None,
             }),
+            TeamBody::StepReviewed(b) => {
+                // The first `STEP` line per step wins (the key is `(step_id, attempt)`, so after
+                // the key dedup there is one row per step per review attempt).
+                if !reviews.iter().any(|r| r.step_id == b.step_id) {
+                    reviews.push(super::StepReviewRecord {
+                        step_id: b.step_id.clone(),
+                        reviewed_attempt: b.reviewed_attempt.unwrap_or_default(),
+                        verdict: b.verdict,
+                        to: b.to,
+                        reason: b.reason.clone(),
+                        held: None,
+                        member_reason: None,
+                        dispute: None,
+                    });
+                }
+            }
+            TeamBody::CouncilCalled(b) if b.trigger == CouncilTrigger::MemberStep => {
+                step_calls.push(b.clone())
+            }
+            TeamBody::CouncilRuled(b) if b.subject.starts_with("step:") => {
+                step_rulings.push(b.clone())
+            }
             TeamBody::AdviceDelivered(_)
             | TeamBody::AdviceAnswered(_)
             | TeamBody::FindingSettled(_)
             | TeamBody::CouncilRuled(_) => about.push(row),
             TeamBody::StepCompleted(b) => skipped |= b.status != StepCompletion::Ok,
             _ => {}
+        }
+    }
+    // A member's HOLD is on the stream as the council it convened (`council.called{trigger:
+    // "member_step"}`); the ruling is that council's `council.ruled`. A rejection with neither is
+    // left `held: None` — no answer on record — which the engine never reads as a counted step.
+    for r in &mut reviews {
+        let subject = subject_step(&r.step_id, r.reviewed_attempt);
+        if let Some(c) = step_calls.iter().find(|c| c.subject == subject) {
+            r.held = Some(true);
+            r.member_reason = c
+                .positions
+                .iter()
+                .find(|p| p.by.starts_with("member"))
+                .map(|p| p.reason.clone());
+        }
+        if let Some(ruled) = step_rulings.iter().find(|x| x.subject == subject) {
+            r.held = Some(true);
+            r.dispute = Some(dispute_of(ruled));
         }
     }
 
@@ -1530,12 +1597,29 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
     } else {
         FinalPass::Completed
     };
-    TeamLedger::new(
+    let mut ledger = TeamLedger::new(
         final_pass,
         monitors.into_iter().map(MonitorAcc::into_ledger).collect(),
         findings.into_iter().map(FindingAcc::into_ledger).collect(),
         Default::default(),
-    )
+    );
+    ledger.step_reviews = reviews;
+    ledger
+}
+
+/// A council's ruling as the ledger records it (DES-001 §6.3): YES/NO with its agreement and
+/// dissent; a no-verdict with its reason (`error` when the call did not say why).
+pub fn dispute_of(r: &CouncilRuled) -> Dispute {
+    match r.verdict {
+        Verdict::Yes | Verdict::No => Dispute {
+            verdict: r.verdict,
+            agreement_pct: Some(r.agreement_pct),
+            dissent: Some(r.dissent.len() as u32),
+            seats: Vec::new(),
+            reason: r.reason,
+        },
+        Verdict::NoVerdict => no_verdict(r.reason.unwrap_or(NoVerdictReason::Error)),
+    }
 }
 
 /// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every unaccepted HIGH
@@ -1562,7 +1646,7 @@ pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
     ledger
 }
 
-fn no_verdict(reason: NoVerdictReason) -> Dispute {
+pub(crate) fn no_verdict(reason: NoVerdictReason) -> Dispute {
     Dispute {
         verdict: Verdict::NoVerdict,
         agreement_pct: None,
@@ -1664,17 +1748,8 @@ impl FindingAcc {
                 reason: s.reason.clone(),
             })
         });
-        let dispute = self.ruling.map(|r| match r.verdict {
-            Verdict::Yes | Verdict::No => Dispute {
-                verdict: r.verdict,
-                agreement_pct: Some(r.agreement_pct),
-                dissent: Some(r.dissent.len() as u32),
-                seats: Vec::new(),
-                reason: r.reason,
-            },
-            // A no-verdict with no reason is the council call failing to say why: `error`.
-            Verdict::NoVerdict => no_verdict(r.reason.unwrap_or(NoVerdictReason::Error)),
-        });
+        // A no-verdict with no reason is the council call failing to say why: `error`.
+        let dispute = self.ruling.as_ref().map(dispute_of);
         LedgerFinding {
             finding: self.finding,
             final_line: self.settled.as_ref().and_then(|s| s.final_line),

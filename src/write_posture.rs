@@ -70,6 +70,12 @@ impl WritePosture {
     /// / `AgentSession::workdir` is `Some`): the tree the guard protects and the creator fence
     /// excludes. Read off the unit's plan-time markers, never guessed from the prompt.
     pub(crate) fn of(unit: &WorkUnit, bound: bool) -> Self {
+        // The PA's review of a member's step (DES-TEAMING-002 §8.8) is an evaluator turn whatever
+        // the step's own role or phase: its verdict is its output, the tree is the member's, and
+        // it gets no write tools (review round 2 on #628, D2).
+        if unit.is_member_step_review() && unit.tool_cmd.is_none() {
+            return WritePosture::ReadOnly;
+        }
         if !crate::worktree_guard::applies_to(unit) {
             return WritePosture::Full;
         }
@@ -478,5 +484,27 @@ mod tests {
             parse_deliverable_roots_env(Some(&env)),
             vec![PathBuf::from("/notes/u2")]
         );
+    }
+
+    /// D2 (review round 2 on #628): the PA's review of a member's step gets no write tools —
+    /// read-only on a bound or unbound run, whatever the step's own role and `executes_code`.
+    #[test]
+    fn a_member_step_review_is_read_only_whatever_the_steps_own_posture() {
+        let mut u = crate::domain::WorkUnit::pending("u1", "s1", 1, "Build the thing");
+        u.role = PhaseRole::Creator;
+        u.worktree_guarded = false;
+        assert_eq!(
+            WritePosture::of(&u, true),
+            WritePosture::Full,
+            "the member's own turn"
+        );
+        u.member_step = Some(crate::domain::MemberStepState {
+            member: "codex".into(),
+            reviewing: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(WritePosture::of(&u, true), WritePosture::ReadOnly);
+        assert_eq!(WritePosture::of(&u, false), WritePosture::ReadOnly);
+        assert!(WritePosture::of(&u, true).fences_writes());
     }
 }
