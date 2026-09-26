@@ -224,15 +224,35 @@ pub fn resolve_open_for_session(
         status != InteractionStatus::Open,
         "resolving TO open is a bug"
     );
-    let open = list_interactions(store, Some(session_id), Some(InteractionStatus::Open))?;
-    let n = open.len();
-    for mut req in open {
-        req.status = status;
-        req.answer = answer.clone();
-        req.resolved_at = Some(now_ms);
+    let resolved = resolve_open_rows(store, session_id, status, answer, now_ms)?;
+    let n = resolved.len();
+    for req in resolved {
         put_node(store, req.to_node())?;
     }
     Ok(n)
+}
+
+/// [`resolve_open_for_session`] without the write: every OPEN request on `session_id`, resolved
+/// to `status` with `answer`, for the caller to write in ITS batch (DES-TEAMING-002 T3 round 10:
+/// a plan gate's answered row and the staged answer it commits land together, or not at all).
+pub fn resolve_open_rows(
+    store: &dyn GraphRead,
+    session_id: &str,
+    status: InteractionStatus,
+    answer: Option<String>,
+    now_ms: i64,
+) -> anyhow::Result<Vec<InteractionRequest>> {
+    debug_assert!(
+        status != InteractionStatus::Open,
+        "resolving TO open is a bug"
+    );
+    let mut open = list_interactions(store, Some(session_id), Some(InteractionStatus::Open))?;
+    for req in &mut open {
+        req.status = status;
+        req.answer = answer.clone();
+        req.resolved_at = Some(now_ms);
+    }
+    Ok(open)
 }
 
 #[cfg(test)]

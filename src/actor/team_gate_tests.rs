@@ -1495,7 +1495,13 @@ fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
     let e = engine_on(&db, fast(&rig));
     assert_eq!(plan_revs(&e, "r9b"), (2, 2), "applied at boot");
     assert_eq!(unit_ids(&e, "r9b"), EDITED_UNITS);
-    assert_eq!(e.core.run_team("r9b").unwrap().unwrap().pending, None);
+    // No staged answer is left: the boot applied it and the run now waits only on the accepted
+    // rev's own `plan.accepted` (round 10: the boot releases through the team gate).
+    let pending = e.core.run_team("r9b").unwrap().unwrap().pending;
+    assert!(
+        pending.is_none() || pending.as_deref() == Some(tev::PLAN_ACCEPTED),
+        "{pending:?}"
+    );
     assert!(
         open_gate_kinds(&db, "r9b").is_empty(),
         "nothing is asked again"

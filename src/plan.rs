@@ -388,15 +388,32 @@ pub struct PlanSteps {
 }
 
 impl PlanSteps {
-    /// The plan has a creator step (`build` or `produce`, §8.5): the steps that change something.
+    /// The plan has a creator step (§8.5) against the phase catalog — see [`is_creator_step`].
     pub fn has_creator(&self) -> bool {
-        self.steps.iter().any(|s| is_creator_catalog(&s.catalog))
+        self.has_creator_in(crate::catalog::catalog())
+    }
+
+    /// [`Self::has_creator`] against `catalog` — the ONE creator predicate floor fill, the floor
+    /// types and the intent score share.
+    pub fn has_creator_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
+        self.steps.iter().any(|s| is_creator_step(catalog, s))
     }
 }
 
-/// `build` and `produce`: the catalog's creator entries (§8.5 "a plan with no creator step").
-fn is_creator_catalog(catalog: &str) -> bool {
-    matches!(catalog, "build" | "produce")
+/// (§8.5, T3 round 10) A step that CHANGES something, judged on the phase it COMPOSES to — never
+/// the catalog name alone: its entry is a creator (`build`, `produce`), or it is a non-Tool step
+/// whose composed `executes_code` is true (a step may raise `executes_code`, TightenOnly, and such
+/// a phase is unguarded — it writes the tree). A Tool step is the engine's own command. An
+/// unknown catalog id composes nothing (compose refuses it), so it is not a creator here.
+pub fn is_creator_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
+    let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
+        return false;
+    };
+    if entry.role == crate::workflow::PhaseRole::Creator {
+        return true;
+    }
+    let executes_code = step.executes_code.unwrap_or(entry.executes_code);
+    executes_code && !crate::catalog::is_tool_entry(entry)
 }
 
 /// A floor override (§8.5): the floor phase types the plan runs without, and why. Recorded on
@@ -813,10 +830,10 @@ pub fn compose(
         let (before, after) = (&plan.steps[..i], &plan.steps[i + 1..]);
         if step.depends_on.is_none()
             && entry.role == crate::workflow::PhaseRole::Evaluator
-            && !before.iter().any(|s| is_creator_catalog(&s.catalog))
+            && !before.iter().any(|s| is_creator_step(catalog, s))
         {
             // Fail closed: an evaluator whose creator comes later would run blind before it.
-            if let Some(creator) = after.iter().find(|s| is_creator_catalog(&s.catalog)) {
+            if let Some(creator) = after.iter().find(|s| is_creator_step(catalog, s)) {
                 return Err(PlanRefusal::EvaluatorPrecedesCreator {
                     step: step.id.clone(),
                     creator: creator.id.clone(),
@@ -824,7 +841,7 @@ pub fn compose(
             }
         }
         if step.depends_on.is_none() && phase.depends_on.is_empty() {
-            phase.depends_on = implicit_inputs(entry, &plan.steps[..i]);
+            phase.depends_on = implicit_inputs(catalog, entry, &plan.steps[..i]);
         }
         phases.push(phase);
     }
@@ -846,11 +863,15 @@ pub fn compose(
 /// carries it and dispatch hands the prior output (FINDING-024): an evaluator depends on every
 /// creator (`build`/`produce`) step before it, `deliver` on the step just before it, and any other
 /// step on nothing, as before.
-fn implicit_inputs(entry: &crate::workflow::PhaseDef, before: &[PlanStep]) -> Vec<String> {
+fn implicit_inputs(
+    catalog: &[crate::workflow::PhaseDef],
+    entry: &crate::workflow::PhaseDef,
+    before: &[PlanStep],
+) -> Vec<String> {
     if entry.role == crate::workflow::PhaseRole::Evaluator {
         before
             .iter()
-            .filter(|s| is_creator_catalog(&s.catalog))
+            .filter(|s| is_creator_step(catalog, s))
             .map(|s| s.id.clone())
             .collect()
     } else if entry.id == "deliver" {
@@ -1019,7 +1040,7 @@ fn floor_types(
     phases: &[&str],
     delivers: bool,
 ) -> Vec<String> {
-    if !plan.has_creator() {
+    if !plan.has_creator_in(catalog) {
         return Vec::new();
     }
     let entry = |c: &str| catalog.iter().find(|e| e.id == c);
@@ -1079,7 +1100,7 @@ pub fn floor_fill(
     let row = crate::review_scale::floor_for(input.score, input.destructive);
     let entry = |c: &str| catalog.iter().find(|e| e.id == c);
     // §8.5: a plan with no creator step has an empty floor and is never high risk.
-    let creator = plan.has_creator();
+    let creator = plan.has_creator_in(catalog);
     let high_risk = creator && row.high_risk;
     let floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned phase

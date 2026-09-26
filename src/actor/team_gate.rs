@@ -328,14 +328,7 @@ pub(super) fn gate_before_dispatch(
     }
     // DES-TEAMING-002 T3: the facts the plan pipeline built before the path landed (the launch's
     // `plan.proposed` / `path.scored`) follow `path.started` onto the bus — never ahead of it.
-    if let Some(tp) = session.team_plan.as_mut() {
-        if !tp.queued.is_empty() {
-            for fact in crate::plan_gate::take_queued(tp) {
-                publish_fire(fact);
-            }
-            put_node(store, session.to_node())?;
-        }
-    }
+    flush_queued(store, session)?;
     // T3: a plan still held for approval has no accepted rev: nothing to accept yet — the
     // `plan_approval` pause (`should_pause`) comes next, and its answer accepts the rev.
     let accepted = match session.team_plan.as_ref() {
@@ -390,6 +383,44 @@ pub(super) fn gate_before_dispatch(
     }
 }
 
+/// (DES-TEAMING-002 T3, round 10) Why no unit of this run may dispatch now — the ONE dispatch
+/// guard, enforced inside `dispatch_unit` (every path that runs a unit goes through it: the
+/// advance, a redrive, a reassign, a rework): a plan held for approval (nothing is released
+/// until its `plan_approval` gate is answered), or — on a teamed run — an accepted rev whose
+/// `plan.accepted` has not landed (P1's required transition before the rev's first dispatch).
+/// `None` for a run the plan pipeline does not hold.
+pub(super) fn dispatch_blocked(session: &AgentSession) -> Option<String> {
+    let tp = session.team_plan.as_ref()?;
+    if let Some(p) = tp.pending.as_ref() {
+        return Some(format!(
+            "run {} holds plan rev {} for approval: no unit dispatches until its plan_approval \
+             gate is answered",
+            session.id, p.rev
+        ));
+    }
+    let accepted = tp.accepted.as_ref()?;
+    let team = session.team.as_ref()?;
+    (team.is_teamed() && team.plan_rev != Some(accepted.rev)).then(|| {
+        format!(
+            "run {}: plan rev {}'s plan.accepted has not landed: no unit dispatches before it",
+            session.id, accepted.rev
+        )
+    })
+}
+
+/// A dispatch refused by [`dispatch_blocked`]: typed, so a caller that can route the run to the
+/// gate that holds it (a restart redrive) tells it from a dispatch fault.
+#[derive(Debug)]
+pub(crate) struct DispatchHeld(pub String);
+
+impl std::fmt::Display for DispatchHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DispatchHeld {}
+
 // ── T3: the plan_approval gate on P1's path (DES-TEAMING-002 §8.6) ─────────────────────────────
 
 /// Whether this run's team facts go on the bus: teamed (acknowledged `path.started`) with a
@@ -417,13 +448,14 @@ pub(super) fn mint_gate_id(session: &mut AgentSession) -> String {
     tev::gate_id(&run_id, team.gate_seq)
 }
 
-/// A `plan_approval` gate opened: `gate.opened` rides the FIFO behind the pause, and the gate is
-/// the run's open team gate until its `gate.decided` lands (P1 `open_gate`).
-pub(super) fn plan_gate_opened(
-    store: &mut dyn GraphStore,
+/// Stage a `plan_approval` gate's opening in the pause's batch (the caller writes `session`): the
+/// gate becomes the run's open team gate until its `gate.decided` lands (P1 `open_gate`), and its
+/// `gate.opened` is queued on the plan state — published by [`flush_queued`] once the batch is
+/// written, or by the boot if the process dies in between.
+pub(super) fn stage_plan_gate_opened(
     session: &mut AgentSession,
     gate_id: &str,
-    opened: TeamEvent,
+    opened: &TeamEvent,
 ) -> anyhow::Result<()> {
     if !publishes(session) {
         return Ok(());
@@ -431,9 +463,33 @@ pub(super) fn plan_gate_opened(
     if let Some(team) = session.team.as_mut() {
         team.open_gate = Some(gate_id.to_string());
     }
-    put_node(store, session.to_node())?;
-    publish_fire(opened);
+    if let Some(tp) = session.team_plan.as_mut() {
+        crate::plan_gate::queue(tp, std::slice::from_ref(opened))?;
+    }
     Ok(())
+}
+
+/// Publish the facts queued on the run's plan state, in order, then clear the queue (published
+/// first, cleared after: a crash between re-publishes, and the bus resolves a fact it already
+/// holds to its existing row by key — never a lost fact). Only for a run that publishes and has
+/// no required fact pending: a queued fact never overtakes one.
+pub(super) fn flush_queued(
+    store: &mut dyn GraphStore,
+    session: &mut AgentSession,
+) -> anyhow::Result<()> {
+    if !publishes(session) || session.team.as_ref().is_some_and(|t| t.pending.is_some()) {
+        return Ok(());
+    }
+    let Some(tp) = session.team_plan.as_mut() else {
+        return Ok(());
+    };
+    if tp.queued.is_empty() {
+        return Ok(());
+    }
+    for fact in crate::plan_gate::take_queued(tp) {
+        publish_fire(fact);
+    }
+    put_node(store, session.to_node())
 }
 
 /// Release the run past an answered `plan_approval` gate (approve, an edit accepted as the next
@@ -448,8 +504,15 @@ pub(super) fn release_plan_gate(
     mut session: AgentSession,
     decided: TeamEvent,
     release: crate::plan_gate::StagedRelease,
+    answered: Vec<wicked_apps_core::Node>,
 ) -> anyhow::Result<SessionStatus> {
     let run_id = session.id.clone();
+    // (T3 round 10) The gate's answered rows and the staged answer land in ONE batch.
+    let batch = |store: &mut dyn GraphStore, session: &AgentSession| {
+        let mut nodes = vec![session.to_node()];
+        nodes.extend(answered.iter().cloned());
+        crate::domain::put_nodes(store, &nodes)
+    };
     if publishes(&session) {
         let then = TeamBlocked::Continue;
         let key = decided.key()?;
@@ -464,7 +527,7 @@ pub(super) fn release_plan_gate(
                     then,
                     staged,
                 });
-                put_node(cx.store, session.to_node())?;
+                batch(cx.store, &session)?;
                 cx.in_flight.insert(run_id);
                 return Ok(SessionStatus::AwaitingHuman);
             }
@@ -476,10 +539,25 @@ pub(super) fn release_plan_gate(
                     then,
                     staged,
                 };
+                let team = session.team.get_or_insert_with(RunTeamState::default);
+                team.pending = Some(pending.clone());
+                batch(cx.store, &session)?;
                 return pause_team_transport(cx, session, pending, &reason);
             }
         }
     }
+    // Un-teamed: nothing to wait on. The answer is recorded `Acknowledged` with its rows (a
+    // restart finishes it at boot), then applied at once through the same step an ack runs.
+    if let Some(team) = session.team.as_mut() {
+        team.pending = Some(PendingTeamFact {
+            event_type: tev::GATE_DECIDED.to_string(),
+            key: String::new(),
+            stage: PendingStage::Acknowledged,
+            then: TeamBlocked::Continue,
+            staged: Some(Box::new(release.clone())),
+        });
+    }
+    batch(cx.store, &session)?;
     finish_release(cx, session, release)
 }
 
@@ -560,6 +638,21 @@ fn finish_release(
         }
     };
     if !reopen {
+        // (T3 round 10) The run was paused at its plan gate: say it resumed. `run_blocked` says so
+        // for a run still `AwaitingHuman`; an accepted edit's re-plan already wrote `Executing`.
+        if session.status != SessionStatus::AwaitingHuman {
+            let ord = crate::domain::session_units(cx.store, &run_id)?
+                .get(session.unit_ix)
+                .map(|u| u.ord)
+                .unwrap_or(0);
+            emit(
+                cx.subscribers,
+                CoreEvent::Resumed {
+                    session: run_id.clone(),
+                    ord,
+                },
+            );
+        }
         return run_blocked(cx, session, TeamBlocked::Continue);
     }
     match advance_or_pause(
@@ -605,21 +698,11 @@ fn acknowledge_staged(
 
 /// Boot: finish a staged plan-gate answer whose `gate.decided` was acknowledged (or whose
 /// operator continued without team) before the restart — applied once ([`apply_release`] is
-/// idempotent). A release leaves the run `Executing`, resumed like every run a restart
-/// interrupts (`resume_run`); a refused edit re-opens its gate now.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn finish_release_at_boot(
-    store: &mut dyn GraphStore,
-    subscribers: &mut crate::event_log::EventSink,
-    runner: &Arc<dyn StepRunner>,
-    self_tx: &Sender<Command>,
-    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
-    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
-    process_gen: uuid::Uuid,
-    is_acp: bool,
-    run_id: &str,
-) -> anyhow::Result<()> {
-    let Some(session) = crate::domain::get_session(&*store, run_id)? else {
+/// idempotent) and taken through the SAME step a live acknowledgement takes ([`finish_release`]):
+/// a release resumes through the team gate (the accepted rev's `plan.accepted` before any
+/// dispatch), a refused edit re-opens its gate. Never a bare `Executing` left for a redrive.
+pub(super) fn finish_release_at_boot(cx: &mut Ctx<'_>, run_id: &str) -> anyhow::Result<()> {
+    let Some(session) = crate::domain::get_session(&*cx.store, run_id)? else {
         return Ok(());
     };
     let Some(staged) = session
@@ -631,27 +714,7 @@ pub(super) fn finish_release_at_boot(
     else {
         return Ok(());
     };
-    let reopen = staged.reopen;
-    let mut session = apply_release(store, subscribers, session, *staged)?;
-    if reopen {
-        let unit_ix = session.unit_ix;
-        advance_or_pause(
-            store,
-            subscribers,
-            runner,
-            self_tx,
-            run_id,
-            unit_ix,
-            lifecycle_maps,
-            actor_maps,
-            process_gen,
-            is_acp,
-        )?;
-    } else {
-        session.status = SessionStatus::Executing;
-        put_node(store, session.to_node())?;
-    }
-    Ok(())
+    finish_release(cx, session, *staged).map(|_| ())
 }
 
 fn transport_prompt(fact: &str, reason: &str) -> String {
@@ -1263,6 +1326,13 @@ pub(super) fn reconcile_at_boot(store: &mut dyn GraphStore) -> BootPlan {
             continue;
         }
         let Some(pending) = team.pending.clone() else {
+            // (T3 round 10) Facts queued in a batch the process died after (a plan gate's
+            // `gate.opened`) are published now, once.
+            if let Err(e) = flush_queued(store, &mut session) {
+                eprintln!(
+                    "wicked-core: boot could not publish the queued team facts of {run_id}: {e:#}"
+                );
+            }
             plan.drain.push(run_id);
             continue;
         };

@@ -71,6 +71,7 @@ pub fn run_session(
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
         false, // stub not yet created
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
+        None,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -406,6 +407,10 @@ pub(crate) fn pre_distribute(
     // must never read the GOV_DB_PATH thread-local directly, because thread-locals do not
     // propagate to spawned threads (including the sync/test path where it is unset).
     governed: bool,
+    // (DES-TEAMING-002 T3, round 10) The run's plan state, carried by the FIRST session write, so
+    // no crash can leave a planned team run without it (its plan gate, its accepted rev). `None`
+    // for a run the plan pipeline did not plan, or one whose stub already carries it.
+    team_plan: Option<crate::plan_gate::TeamPlanState>,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -452,7 +457,7 @@ pub(crate) fn pre_distribute(
         finished_at: None,
         benched_seats: Vec::new(),
         team: None,
-        team_plan: None,
+        team_plan,
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -467,7 +472,7 @@ pub(crate) fn pre_distribute(
             // and the plan state are the run's, not the plan's: a plan written onto a launch stub
             // (or re-planned at an edit) keeps them.
             session.team = existing.team;
-            session.team_plan = existing.team_plan;
+            session.team_plan = session.team_plan.take().or(existing.team_plan);
         }
     } else {
         put_node(store, session.to_node())?;
@@ -825,6 +830,10 @@ pub(crate) fn plan_and_distribute(
     // GOV_DB_PATH thread-local internally. Pass in_process_governance().is_some() from the
     // calling thread; the sync/test path correctly gets false when GOV_DB_PATH is not set.
     governed: bool,
+    // (DES-TEAMING-002 T3, round 10) The run's plan state, carried by the FIRST session write, so
+    // no crash can leave a planned team run without it (its plan gate, its accepted rev). `None`
+    // for a run the plan pipeline did not plan, or one whose stub already carries it.
+    team_plan: Option<crate::plan_gate::TeamPlanState>,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -845,6 +854,7 @@ pub(crate) fn plan_and_distribute(
         workflow_registry,
         session_already_started,
         governed,
+        team_plan,
     )?;
     let distributions = distribute::distribute_units_on(&pre.units, clis, session_id)?;
     apply_distributions(store, &mut pre, distributions, emit)?;
@@ -2237,6 +2247,7 @@ mod resolve_tests {
             Some(&registry),
             false,
             false,
+            None,
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -2362,6 +2373,7 @@ mod resolve_tests {
             Some(&registry),
             false,
             false,
+            None,
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -2741,6 +2753,7 @@ mod resolve_tests {
             None,
             false,
             false,
+            None,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());
