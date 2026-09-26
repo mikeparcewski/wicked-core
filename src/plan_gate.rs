@@ -36,7 +36,8 @@ use crate::workflow::WorkflowDef;
 
 mod preview;
 mod revise;
-pub use preview::{preview_plan, PlanPreview};
+pub(crate) use preview::preview_plan;
+pub use preview::PlanPreview;
 pub(crate) use revise::{
     changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
     Change, DiffRescore, Outcome, PlanLines,
@@ -969,6 +970,45 @@ pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow:
             "proposal_id": (!a.proposal_id.is_empty()).then_some(&a.proposal_id),
         }),
     )
+}
+
+/// (T8 (c)) The record of human edits refused AFTER `Core::propose_plan` took them (the deliver
+/// step started, or the revision could not be planned): each edit's
+/// `plan.proposed{by:"human", kind:"edit"}` and its `plan.refused`, so no edit is silently spent.
+pub(crate) fn edits_refused(
+    run_id: &str,
+    base_rev: Option<u32>,
+    edits: &[HeldEdit],
+    reason: &str,
+    now: i64,
+) -> anyhow::Result<Vec<TeamEvent>> {
+    let mut out = Vec::new();
+    for e in edits {
+        let pid = ev::mint_proposal_id(
+            run_id,
+            "human",
+            &ProposalSource::Edit {
+                request_id: e.request_id.clone(),
+            },
+        );
+        let plan = PlanSteps {
+            steps: e.steps.clone(),
+            touch: None,
+            floor_override: None,
+        };
+        out.push(plan_proposed(
+            run_id,
+            "human",
+            &pid,
+            base_rev,
+            ProposalKind::Edit,
+            None,
+            &plan,
+            now,
+        )?);
+        out.push(plan_refused(run_id, &pid, base_rev, reason, now)?);
+    }
+    Ok(out)
 }
 
 pub(crate) fn plan_refused(

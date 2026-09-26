@@ -2603,7 +2603,11 @@ pub(super) fn record_plan_lines(
 }
 
 /// (DES-TEAMING-002 T8 (c)) `Core::propose_plan`: hold a mid-run human edit for the run's next
-/// advance ([`apply_held_revision`]). Idempotent by `request_id`.
+/// advance ([`apply_held_revision`]). Idempotent by `request_id` — a spent id answers
+/// `duplicate: true` whatever the run's state. Validated when proposed, as a launch plan is: a
+/// dry run of the same [`crate::plan_gate::revise`] the boundary applies (compose, provenance, a
+/// step the plan already has); refused up front once the deliver step has started (nothing may
+/// follow the push).
 pub(super) fn propose_plan(
     store: &mut dyn GraphStore,
     run_id: &str,
@@ -2614,6 +2618,22 @@ pub(super) fn propose_plan(
     if request_id.is_empty() {
         anyhow::bail!("a plan edit needs a request id (its idempotency key)");
     }
+    let mut session = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let source = crate::team_events::ProposalSource::Edit {
+        request_id: request_id.to_string(),
+    };
+    let proposal_id = crate::team_events::mint_proposal_id(run_id, "human", &source);
+    if session
+        .team_plan
+        .as_ref()
+        .is_some_and(|tp| tp.edit_requests.iter().any(|r| r == request_id))
+    {
+        return Ok(crate::plan_gate::PlanProposal {
+            proposal_id,
+            duplicate: true,
+        });
+    }
     if plan.touch.is_some() || plan.floor_override.is_some() {
         anyhow::bail!(
             "a mid-run plan edit only adds steps: `touch` and `override` belong to the launch plan"
@@ -2622,8 +2642,6 @@ pub(super) fn propose_plan(
     if plan.steps.is_empty() {
         anyhow::bail!("a plan edit adds at least one step");
     }
-    let mut session = crate::domain::get_session(&*store, run_id)?
-        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     if matches!(
         session.status,
         SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
@@ -2633,6 +2651,7 @@ pub(super) fn propose_plan(
             session.status
         );
     }
+    let human_confirm = session.human_confirm;
     let Some(tp) = session.team_plan.as_mut() else {
         anyhow::bail!("run {run_id} was not launched with a plan: there is no plan to edit");
     };
@@ -2642,32 +2661,64 @@ pub(super) fn propose_plan(
              (the edit is the gate answer)"
         );
     }
-    let proposal_id = crate::team_events::mint_proposal_id(
-        run_id,
-        "human",
-        &crate::team_events::ProposalSource::Edit {
-            request_id: request_id.to_string(),
-        },
-    );
-    let duplicate = tp.edit_requests.iter().any(|r| r == request_id);
-    if !duplicate {
-        tp.edit_requests.push(request_id.to_string());
-        tp.edits.push(crate::plan_gate::HeldEdit {
-            request_id: request_id.to_string(),
-            steps: plan.steps,
-        });
-        put_node(store, session.to_node())?;
+    let units = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(units.len());
+    let started = |i: usize, u: &crate::domain::WorkUnit| {
+        i < cursor
+            || u.last_attempt.is_some()
+            || !matches!(
+                u.status,
+                crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+            )
+    };
+    if units
+        .iter()
+        .enumerate()
+        .any(|(i, u)| u.phase_id() == Some("deliver") && started(i, u))
+    {
+        anyhow::bail!(
+            "run {run_id}'s deliver step has started: nothing can be added after the push"
+        );
     }
+    let done: Vec<String> = units[..cursor]
+        .iter()
+        .map(|u| u.phase_id().unwrap_or_default().to_string())
+        .collect();
+    let dry = crate::plan_gate::revise(
+        run_id,
+        tp,
+        crate::plan_gate::Change::Steps {
+            by: "human".into(),
+            source,
+            kind: crate::team_events::ProposalKind::Edit,
+            reason: None,
+            steps: plan.steps.clone(),
+        },
+        &done,
+        &human_confirm,
+        None,
+        crate::interaction::now_millis(),
+    )?;
+    if let crate::plan_gate::Outcome::Refused { reason } = dry.outcome {
+        anyhow::bail!("the plan edit is refused: {reason}");
+    }
+    tp.edit_requests.push(request_id.to_string());
+    tp.edits.push(crate::plan_gate::HeldEdit {
+        request_id: request_id.to_string(),
+        steps: plan.steps,
+    });
+    put_node(store, session.to_node())?;
     Ok(crate::plan_gate::PlanProposal {
         proposal_id,
-        duplicate,
+        duplicate: false,
     })
 }
 
 /// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
 /// `advance_or_pause`, which calls this first — the fold's, a dispute answer's, a member step's
-/// acceptance, a gate's. It applies what is held (a diff re-score that raised the floor, then
-/// the PA's `PLAN` lines, in order), each as one revision (`rev` n+1, n+2, …), only while the
+/// acceptance, a gate's. It applies what is held (the human's edits, then a diff re-score that
+/// raised the floor, then the PA's `PLAN` lines, in order), each as one revision (`rev` n+1, n+2,
+/// …), only while the
 /// cursor unit has not run (a step boundary: never mid-unit, never under a done unit that still
 /// owes its team step). New units go after the cursor; nothing before it is touched; a revision
 /// the approval matrix holds leaves the plan pending, and the caller pauses `plan_approval`.
@@ -2705,16 +2756,11 @@ pub(super) fn apply_held_revision(
         .collect();
     let reviewing_ord = cursor.checked_sub(1).map(|i| units[i].ord);
     let mut changes = Vec::new();
-    if let Some(r) = prior.rescored.clone() {
-        changes.push(crate::plan_gate::Change::Floor(r));
-    }
-    for l in &prior.plan_lines {
-        changes.extend(crate::plan_gate::changes_from_output(
-            &l.text, &l.by, l.ord, l.attempt,
-        ));
-    }
-    // (T8 (c)) The human's mid-run edits, in arrival order: approved by their author like an
-    // edit at the gate (no second plan gate), floor-filled at the ratcheted score.
+    // (T8 (c), core#630 round 3) The human's mid-run edits come FIRST, in arrival order: each is
+    // approved by its author like an edit at the gate (no plan gate of its own) and floor-filled
+    // at the ratcheted score — but it must never approve what it did not make, so the held floor
+    // raise and the PA's lines are applied AFTER it, each judged by the approval matrix against
+    // the human's accepted rev.
     for edit in &prior.edits {
         changes.push(crate::plan_gate::Change::Steps {
             by: "human".into(),
@@ -2726,21 +2772,36 @@ pub(super) fn apply_held_revision(
             steps: edit.steps.clone(),
         });
     }
+    if let Some(r) = prior.rescored.clone() {
+        changes.push(crate::plan_gate::Change::Floor(r));
+    }
+    for l in &prior.plan_lines {
+        changes.extend(crate::plan_gate::changes_from_output(
+            &l.text, &l.by, l.ord, l.attempt,
+        ));
+    }
     // What was held is taken, whatever comes of it.
     let mut cleared = prior.clone();
     cleared.rescored = None;
     cleared.plan_lines.clear();
     cleared.edits.clear();
+    let now = crate::interaction::now_millis();
+    let base_rev = Some(prior.accepted_rev);
     if done.iter().any(|d| d == "deliver") {
         session.team_plan = Some(cleared);
         put_node(store, session.to_node())?;
-        // Nothing runs after the push: a revision there would ship unreviewed.
-        anyhow::bail!("the plan was not revised: its deliver step already ran");
+        // Nothing runs after the push: a revision there would ship unreviewed. A human edit taken
+        // before the deliver step started is refused on the record, never silently spent.
+        let why = "the plan was not revised: its deliver step already ran";
+        publish_plan_facts(
+            &session,
+            crate::plan_gate::edits_refused(run_id, base_rev, &prior.edits, why, now)?,
+        );
+        anyhow::bail!("{why}");
     }
     let mut state = cleared.clone();
     let mut facts = Vec::new();
     let mut def = None;
-    let now = crate::interaction::now_millis();
     for change in changes {
         let r = match crate::plan_gate::revise(
             run_id,
@@ -2779,6 +2840,12 @@ pub(super) fn apply_held_revision(
     if let Err(e) = revise_units(store, subscribers, &next, def) {
         session.team_plan = Some(cleared);
         put_node(store, session.to_node())?;
+        // The human's edits were taken (their request ids spent): refuse them on the record.
+        let why = format!("the revision could not be planned: {e:#}");
+        publish_plan_facts(
+            &session,
+            crate::plan_gate::edits_refused(run_id, base_rev, &prior.edits, &why, now)?,
+        );
         return Err(e.context("the revision could not be planned; the plan is unchanged"));
     }
     let session = crate::domain::get_session(&*store, run_id)?
@@ -2923,3 +2990,7 @@ mod tests;
 #[cfg(test)]
 #[path = "replan_tests.rs"]
 mod replan_tests;
+
+#[cfg(test)]
+#[path = "propose_tests.rs"]
+mod propose_tests;

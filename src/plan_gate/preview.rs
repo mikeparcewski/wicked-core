@@ -2,9 +2,10 @@
 //! nothing persisted and nothing published: the SAME functions the launch runs — [`super::precheck`],
 //! [`super::intent_score_for_run`] and [`super::decide`] over a fresh plan state — read back as
 //! the intent score, the floor fill ([`crate::plan::FloorFilled`], field for field) and whether the
-//! `plan_approval` gate would pause. A preview has no worktree, so it scores as a launch with no
-//! repo does (a behavioural touch set fails closed at 100; a docs-only one scores 0), and it has
-//! no deliver step (the floor carries no `deliver`).
+//! `plan_approval` gate would pause. The caller hands it what a launch would have: the repo's
+//! root and the base commit its worktree would start from (`Core::preview_plan` resolves both the
+//! way the launch does), and the launch's deliver step. Without a usable graph the plan scores as
+//! a repo-less launch does (a behavioural touch set fails closed at 100), and `graph` says so.
 
 use serde::Serialize;
 
@@ -41,16 +42,27 @@ pub struct PlanPreview {
     /// before its first unit, with the reason token (`manual_mode`, `high_risk`, `override`).
     pub pauses: bool,
     pub pause_reason: Option<String>,
+    /// `"ready"`: the score read the repo's code graph at the base commit. `"not_needed"`: the
+    /// touch set is docs-only (or the plan has no creator and no touch set), so no graph enters
+    /// the score. `"unavailable"`: the score is the fail-closed one — no repo given, no graph
+    /// indexed, a stale graph, or a creator plan with no declared scope; `reasons` says which.
+    pub graph: &'static str,
 }
 
 /// Preview `plan` as a launch with `human_confirm` would decide it. `Err` carries the refusal the
 /// launch would return (compose, provenance, the override in auto mode, …).
-pub fn preview_plan(plan: &PlanSteps, human_confirm: &HumanConfirm) -> anyhow::Result<PlanPreview> {
+pub(crate) fn preview_plan(
+    plan: &PlanSteps,
+    human_confirm: &HumanConfirm,
+    repo_root: Option<&std::path::Path>,
+    base_commit: Option<&str>,
+    deliver_step: Option<&PlanStep>,
+) -> anyhow::Result<PlanPreview> {
     // The launch's synchronous checks, then its decision — the same calls, in the same order.
-    if let Err(r) = super::precheck(plan, None, human_confirm) {
+    if let Err(r) = super::precheck(plan, deliver_step, human_confirm) {
         anyhow::bail!("the plan is refused: {}", r.reason);
     }
-    let scored = super::intent_score_for_run(plan, None, None);
+    let scored = super::intent_score_for_run(plan, repo_root, base_commit);
     let decided = super::decide(
         PREVIEW_RUN,
         super::Proposal {
@@ -64,7 +76,10 @@ pub fn preview_plan(plan: &PlanSteps, human_confirm: &HumanConfirm) -> anyhow::R
             reviewing_ord: None,
             approved_by_human: false,
         },
-        &super::TeamPlanState::default(),
+        &super::TeamPlanState {
+            deliver_step: deliver_step.cloned(),
+            ..super::TeamPlanState::default()
+        },
         human_confirm,
         &scored,
         0,
@@ -77,6 +92,17 @@ pub fn preview_plan(plan: &PlanSteps, human_confirm: &HumanConfirm) -> anyhow::R
         .ok_or_else(|| anyhow::anyhow!("the plan decision carried no floor fill"))?;
     let pending = decided.state.pending;
     let a = scored.assessment;
+    // Did the score need the repo's graph, and could it read it? A docs-only (or absent, for a
+    // plan with no creator) touch set needs none; a behavioural one reads it or fails closed.
+    let behavioural = plan.touch.as_ref().is_some_and(|t| {
+        let t: Vec<&str> = t.iter().map(String::as_str).collect();
+        !t.is_empty() && crate::review_scale::signals_from_paths(&t).behavioural()
+    });
+    let graph = match (a.signals.is_some(), behavioural) {
+        (true, true) => "ready",
+        (true, false) => "not_needed",
+        (false, _) => "unavailable",
+    };
     Ok(PlanPreview {
         score: a.score,
         deterministic: a.deterministic,
@@ -90,6 +116,7 @@ pub fn preview_plan(plan: &PlanSteps, human_confirm: &HumanConfirm) -> anyhow::R
         def: filled.def,
         pauses: pending.is_some(),
         pause_reason: pending.map(|p| p.reason),
+        graph,
     })
 }
 
@@ -102,8 +129,12 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    fn preview_of(p: &PlanSteps, hc: &HumanConfirm) -> anyhow::Result<PlanPreview> {
+        preview_plan(p, hc, None, None, None)
+    }
+
     fn preview(v: Value, hc: HumanConfirm) -> Value {
-        serde_json::to_value(preview_plan(&plan(v), &hc).expect("a preview")).unwrap()
+        serde_json::to_value(preview_of(&plan(v), &hc).expect("a preview")).unwrap()
     }
 
     /// The exact key set, and a docs-only non-code plan in auto mode: score 0, band 0-19, no pause.
@@ -123,6 +154,7 @@ mod tests {
                 "deterministic",
                 "floor",
                 "floor_override",
+                "graph",
                 "high_risk",
                 "pause_reason",
                 "pauses",
@@ -137,6 +169,8 @@ mod tests {
         assert_eq!(p["pauses"], false);
         assert_eq!(p["pause_reason"], Value::Null);
         assert_eq!(p["def"]["id"], "preview:plan-1");
+        // A docs-only touch set: no graph enters the score.
+        assert_eq!(p["graph"], "not_needed");
         for s in p["steps"].as_array().unwrap() {
             assert!(
                 s["added_by"].is_string(),
@@ -169,6 +203,10 @@ mod tests {
     fn an_undeclared_creator_plan_is_high_risk_floor_filled_and_pauses_in_auto_mode() {
         let p = preview(json!({"steps": [{"catalog": "build"}]}), HumanConfirm::None);
         assert_eq!(p["score"], 100);
+        assert_eq!(
+            p["graph"], "unavailable",
+            "the fail-closed score is labelled"
+        );
         assert_eq!(p["band"], "70-100");
         assert_eq!(p["high_risk"], true);
         assert_eq!(p["pauses"], true);
@@ -207,14 +245,14 @@ mod tests {
     #[test]
     fn the_launch_refusals_are_the_preview_refusals() {
         let auto = HumanConfirm::None;
-        let e = preview_plan(
+        let e = preview_of(
             &plan(json!({"steps": [{"catalog": "build"}], "override": {"remove": ["review"], "reason": "x"}})),
             &auto,
         )
         .unwrap_err();
         assert!(e.to_string().contains("override in auto mode"), "{e}");
-        assert!(preview_plan(&plan(json!({"steps": [{"catalog": "nope"}]})), &auto).is_err());
-        assert!(preview_plan(
+        assert!(preview_of(&plan(json!({"steps": [{"catalog": "nope"}]})), &auto).is_err());
+        assert!(preview_of(
             &plan(json!({"steps": [{"catalog": "build", "added_by": "floor"}]})),
             &auto
         )
@@ -235,5 +273,38 @@ mod tests {
             .unwrap()
             .iter()
             .any(|s| s["catalog"] == "design"));
+    }
+
+    /// (round 3) The launch's deliver step rides the preview: a delivering launch's floor carries
+    /// `deliver`, and the step is the launcher's (a plan authoring its own is refused, as at launch).
+    #[test]
+    fn a_delivering_launch_previews_with_its_deliver_step() {
+        let d: PlanStep = serde_json::from_value(json!({
+            "catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}
+        }))
+        .unwrap();
+        let p = preview_plan(
+            &plan(json!({"steps": [{"catalog": "build"}], "touch": ["README.md"]})),
+            &HumanConfirm::All,
+            None,
+            None,
+            Some(&d),
+        )
+        .unwrap();
+        assert!(p.floor.contains(&"deliver".to_string()), "{:?}", p.floor);
+        let last = p.steps.last().unwrap();
+        assert_eq!(
+            (last.catalog.as_str(), last.id.as_str()),
+            ("deliver", "deliver")
+        );
+        assert!(preview_plan(
+            &plan(json!({"steps": [{"catalog": "build"},
+                {"catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}}]})),
+            &HumanConfirm::All,
+            None,
+            None,
+            Some(&d),
+        )
+        .is_err());
     }
 }

@@ -742,7 +742,7 @@ impl RunBase {
 /// is never fallen back from: a ref that does not resolve is an `Err` naming it (the launch fails
 /// `WorktreeFailed` → `sessionFailed`), because basing a revision on the default branch instead
 /// would ship a DUPLICATE pull request. `None` ⇒ the remote-default resolution below.
-fn resolve_run_base(repo_root: &str, explicit: Option<&str>) -> anyhow::Result<RunBase> {
+pub(crate) fn resolve_run_base(repo_root: &str, explicit: Option<&str>) -> anyhow::Result<RunBase> {
     let (ok, head, err) = git(repo_root, &["rev-parse", "HEAD"])?;
     if !ok || head.is_empty() {
         anyhow::bail!("{repo_root}: cannot resolve HEAD: {err}");

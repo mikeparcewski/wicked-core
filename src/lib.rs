@@ -167,7 +167,7 @@ pub use plan::{
     compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
-pub use plan_gate::{preview_plan, PendingPlan, PlanPreview, PlanProposal, TeamPlanState};
+pub use plan_gate::{PendingPlan, PlanPreview, PlanProposal, TeamPlanState};
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
@@ -1435,6 +1435,56 @@ impl Core {
         self.tx
             .send(Command::RunTeam {
                 run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (DES-TEAMING-002 T8 (e)) Preview a launch of `plan`: what the launch would compute, with
+    /// nothing persisted or published — the plan (a preset resolves in `project_id`), the launch's
+    /// synchronous refusals, the intent score, floor fill, approval matrix and the def's planning
+    /// checks. `repo_ref` names the registered repo the launch would run on: its root and the base
+    /// commit its worktree would start from are resolved here (off the actor, as the launch does),
+    /// and the score reads that repo's code graph; without one (or when it cannot be read) the
+    /// preview says `graph: "unavailable"`. `deliver_step` is the launch's. `Err` carries the
+    /// launch's refusal.
+    pub fn preview_plan(
+        &self,
+        plan: PlanSteps,
+        project_id: Option<&str>,
+        repo_ref: Option<&str>,
+        deliver_step: Option<PlanStep>,
+        human_confirm: HumanConfirm,
+    ) -> anyhow::Result<PlanPreview> {
+        // The repo the launch would run on, and the base its worktree would start from — resolved
+        // HERE, on the caller's thread, as the launch resolves it off the actor (a fetch may run).
+        // A base that cannot be resolved leaves the score without a graph (`graph: "unavailable"`).
+        let (repo_root, base_commit) = match repo_ref {
+            None => (None, None),
+            Some(id) => {
+                let repo = self
+                    .list_repos()?
+                    .into_iter()
+                    .find(|r| r.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("repo not registered: {id}"))?;
+                let base = crate::repo::resolve_run_base(&repo.root_path, None)
+                    .ok()
+                    .map(|b| b.commit);
+                (Some(std::path::PathBuf::from(repo.root_path)), base)
+            }
+        };
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::PreviewPlan {
+                plan,
+                project_id: project_id.map(str::to_string),
+                repo_ref: repo_ref.map(str::to_string),
+                repo_root,
+                base_commit,
+                deliver_step,
+                human_confirm,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
