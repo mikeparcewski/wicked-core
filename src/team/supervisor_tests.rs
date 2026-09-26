@@ -387,6 +387,7 @@ impl Harness {
             for ev in &batch {
                 self.cursor = self.cursor.max(ev.event_id);
                 let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
+                    self.core.on_malformed(ev);
                     continue;
                 };
                 jobs.extend(self.core.on_row(&TeamRow {
@@ -1834,4 +1835,57 @@ fn row18_a_failed_hold_round_read_folds_stream_gap() {
         assert_eq!(l.final_pass, FinalPass::StreamGap, "fail {fail}: {l:#?}");
         assert!(l.team_pause, "fail {fail}");
     }
+}
+
+/// Corrupt a published row in place so it no longer parses (an unknown severity).
+fn corrupt(h: &Harness, event_id: i64) {
+    h.rig
+        .conn()
+        .execute(
+            "UPDATE events SET payload = json_set(payload, '$.severity', 'bogus') \
+             WHERE event_id = ?1",
+            [event_id],
+        )
+        .unwrap();
+}
+
+/// Absence row 6, the attempt's own rows: a row of the live attempt that does not parse is
+/// skipped by the cursor, and the final pass counts it → `stream_gap` (pauses).
+#[test]
+fn row6_a_malformed_row_of_the_live_attempt_folds_stream_gap() {
+    let mut h = Harness::new("t6-row6-live");
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    let bad = raise_high(&h, 3, 1, 1, "f-row6live");
+    corrupt(&h, bad);
+    h.pump();
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let l = h.folded(3, 1);
+    assert_eq!(l.final_pass, FinalPass::StreamGap, "{l:#?}");
+    assert!(l.team_pause);
+}
+
+/// Absence row 6, a DEAD attempt's rows (found re-auditing the table on #628): a dead attempt's
+/// row that does not parse may be the HIGH the next attempt should carry. Skipping it silently
+/// would lose it with a clean fold; the next attempt's fold is `stream_gap` instead.
+#[test]
+fn row6_a_malformed_row_of_a_dead_attempt_makes_the_next_fold_stream_gap() {
+    let mut h = Harness::new("t6-row6-dead");
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 0, "claude#1");
+    let bad = raise_high(&h, 3, 0, 1, "f-row6dead");
+    corrupt(&h, bad);
+    let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
+    let mut b = restarted(&h, floor);
+    let (cursor, _) = replay(&mut b, &h.rig.bus, tail, None);
+    h.core = b;
+    h.cursor = cursor;
+    h.claim(3, 1, "claude#1");
+    h.pump();
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let l = h.folded(3, 1);
+    assert_eq!(l.final_pass, FinalPass::StreamGap, "{l:#?}");
+    assert!(l.team_pause);
 }

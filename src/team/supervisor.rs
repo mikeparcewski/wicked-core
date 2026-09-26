@@ -1273,6 +1273,9 @@ impl SupervisorCore {
         Vec::new()
     }
 
+    /// A team row of an armed run that does not parse (absence row 6).
+    pub fn on_malformed(&mut self, _ev: &BusEvent) {}
+
     /// Start watching a live attempt: its members, and the dead attempts' findings it carries.
     fn attach(
         &mut self,
@@ -2595,6 +2598,7 @@ fn run(
                 for ev in batch {
                     cursor = cursor.max(ev.event_id);
                     let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
+                        core.on_malformed(&ev);
                         continue;
                     };
                     let row = TeamRow {
@@ -2703,6 +2707,7 @@ fn replay_with(
             }
             floor = floor.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
+                core.on_malformed(&ev);
                 continue;
             };
             if only.is_some_and(|o| o != event.env.run_id) {
@@ -2782,6 +2787,7 @@ fn replay_run_with(
             }
             at = at.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
+                core.on_malformed(&ev);
                 continue;
             };
             if event.env.run_id != run_id {
