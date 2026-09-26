@@ -129,7 +129,7 @@ pub(crate) fn apply_unit(
 
     // 3. governance SELECT + DECIDE → a ConformanceClaim. Select on the synthetic execution phase
     // AND the workflow phase id (FINDING-021); the claim keeps the canonical `unit-<ord>`.
-    let phases = crate::scope::phase_aliases(&phase_name, unit.phase_id());
+    let phases = crate::scope::phase_aliases(&phase_name, unit.phase_id(), unit.catalog.as_deref());
     let selected = select_any(store, &collection_scope, &phases, &context)?;
     // Real wall-clock, not a base + unit index (FINDING-017): an audit record that cannot say
     // WHEN a decision was taken is not an audit record.
@@ -294,7 +294,9 @@ pub fn evaluate_unit(
     // The evaluator pass runs at `eval-<phase>`, so its aliases are the eval-prefixed pair
     // (`eval-unit-3` / `eval-review`) — see [`crate::scope::phase_aliases`].
     let eval_alias = unit.phase_id().map(|p| format!("eval-{p}"));
-    let phases = crate::scope::phase_aliases(&eval_phase, eval_alias.as_deref());
+    let eval_catalog = unit.catalog.as_deref().map(|c| format!("eval-{c}"));
+    let phases =
+        crate::scope::phase_aliases(&eval_phase, eval_alias.as_deref(), eval_catalog.as_deref());
     let selected = select_any(store, collection_scope, &phases, &eval_context)?;
     let claim = decide_as(
         &selected,

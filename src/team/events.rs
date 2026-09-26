@@ -369,7 +369,7 @@ pub fn subject_step(step_id: &str, attempt: u32) -> String {
     format!("step:{step_id}:{attempt}")
 }
 
-/// `"g-<run>-<gate_seq>"` for every gate kind (`AgentSession.gate_seq`).
+/// `"g-<run>-<gate_seq>"` for every gate kind (`RunTeamState.gate_seq`, one counter per run).
 pub fn gate_id(run_id: &str, gate_seq: u32) -> String {
     format!("g-{run_id}-{gate_seq}")
 }
@@ -926,7 +926,8 @@ pub enum GateOpenedKind {
         ledger_source: LedgerSource,
     },
     PlanApproval {
-        reviewing_ord: u32,
+        /// The unit whose output produced the plan; `null` for a plan the launch carried (T3).
+        reviewing_ord: Option<u32>,
         plan_rev: u32,
         band: String,
         high_risk: bool,

@@ -205,6 +205,7 @@ fn entry(
         validator_pin,
         executor: PhaseExecutor::Agent,
         owner: StepOwner::Pa,
+        catalog: None,
     }
 }
 

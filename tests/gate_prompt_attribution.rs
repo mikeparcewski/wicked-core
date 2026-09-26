@@ -170,6 +170,8 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
 
@@ -236,6 +238,8 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
 
