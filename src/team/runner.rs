@@ -604,8 +604,9 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
                 }
             )),
             TeamBody::ChangeRequested(b) => out.push_str(&format!(
-                "- change requested {} by {}: steps [{}] — {}. Answer `PLAN {}: ACCEPT` with a \
-                 `PLAN+` block, or `PLAN {}: DECLINE — <why>`.\n",
+                "- change requested {} by {}: steps [{}] — {}. Answer `PLAN {}: ACCEPT` and on the \
+                 next line the steps you accept as `PLAN+ {{\"steps\":[{{\"catalog\":\"…\"}}]}}`, \
+                 or `PLAN {}: DECLINE — <why>`.\n",
                 b.change_id,
                 r.event.env.by,
                 b.steps

@@ -2373,6 +2373,13 @@ pub(super) fn apply_review(
     let run_id = session.id.clone();
     let mut units = crate::domain::session_units(act.store, &run_id)?;
     let unit = units[ix].clone();
+    // (T4, §8.7 trigger 2) The PA answers a member's `change.requested` in this review turn:
+    // its `PLAN <change_id>: ACCEPT` + `PLAN+` lines are held for the run's next advance.
+    let before = session.team_plan.as_ref().map(|t| t.plan_lines.len());
+    record_plan_lines(&mut session, &unit, output);
+    if session.team_plan.as_ref().map(|t| t.plan_lines.len()) != before {
+        put_node(act.store, session.to_node())?;
+    }
     let ms = unit.member_step.clone().unwrap_or_default();
     let reviewed = ms.reviewing.unwrap_or_default();
     let step_id = unit
@@ -2488,6 +2495,355 @@ pub(super) fn apply_review(
     }
 }
 
+// ── T4: re-plan (DES-TEAMING-002 §8.7) ───────────────────────────────────────────────────────────
+
+/// The run's repo root, for the graph a score reads.
+fn repo_root(store: &dyn GraphStore, session: &AgentSession) -> Option<PathBuf> {
+    session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+        .map(|r| PathBuf::from(r.root_path))
+}
+
+/// (T4) The supervisor's diff measurement (`Command::TeamRescored`): score it against the run's
+/// graph; when its band rises above the run's ratcheted floor (§8.5), hold it for the next step
+/// boundary (the highest one waiting wins). A lower score changes and publishes nothing.
+pub(super) fn on_rescored(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    rescore_seq: u32,
+    tree: &str,
+    paths: &[String],
+) -> anyhow::Result<()> {
+    let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    if !matches!(
+        session.status,
+        SessionStatus::Executing | SessionStatus::AwaitingHuman
+    ) || paths.is_empty()
+    {
+        return Ok(());
+    }
+    let root = repo_root(&*store, &session);
+    let Some(tp) = session.team_plan.as_ref().filter(|t| t.accepted_rev > 0) else {
+        return Ok(());
+    };
+    let scored = crate::plan_gate::diff_score_for_run(
+        paths,
+        root.as_deref(),
+        session.base_commit.as_deref(),
+    );
+    let score = scored.assessment.score;
+    if !crate::plan_gate::floor_rises(tp, score, scored.destructive) {
+        return Ok(());
+    }
+    if let Some(r) = &tp.rescored {
+        if r.score >= score && (r.destructive || !scored.destructive) {
+            return Ok(());
+        }
+    }
+    let fact = crate::plan_gate::path_scored_diff(
+        run_id,
+        ord,
+        attempt,
+        rescore_seq,
+        Some(tree),
+        &scored.assessment,
+        crate::interaction::now_millis(),
+    )?;
+    let rescored = crate::plan_gate::DiffRescore {
+        ord,
+        attempt,
+        rescore_seq,
+        score,
+        destructive: scored.destructive,
+        fact: crate::plan_gate::queued_facts(&[fact])?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
+    };
+    if let Some(tp) = session.team_plan.as_mut() {
+        tp.rescored = Some(rescored);
+    }
+    put_node(store, session.to_node())
+}
+
+/// (T4, §8.7 triggers 1–2) Hold the PA's `PLAN` lines of a finished turn for the run's next
+/// advance: its own step, or its review of a member's step (the render asks it to answer a
+/// member's `change.requested` there). A member's own work never speaks for the plan (§8.8: the
+/// PA owns it), and a failed turn has no answer to read.
+/// Mutates `session` only; the caller persists it (every path after a fold writes the session).
+pub(super) fn record_plan_lines(
+    session: &mut AgentSession,
+    unit: &WorkUnit,
+    output: &crate::workflow::StepOutput,
+) {
+    if output.status != crate::workflow::StepStatus::Ok || is_member_work(unit) {
+        return;
+    }
+    let text = crate::plan_gate::plan_lines_of(&output.output);
+    if text.is_empty() {
+        return;
+    }
+    let pa = pa_seat(session);
+    if !is_review(unit) && unit.assigned_cli.as_deref() != Some(pa.as_str()) {
+        return;
+    }
+    if let Some(tp) = session.team_plan.as_mut().filter(|t| t.accepted_rev > 0) {
+        tp.plan_lines.push(crate::plan_gate::PlanLines {
+            ord: unit.ord,
+            attempt: output.attempt,
+            by: pa,
+            text,
+        });
+    }
+}
+
+/// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
+/// `advance_or_pause`, which calls this first — the fold's, a dispute answer's, a member step's
+/// acceptance, a gate's. It applies what is held (a diff re-score that raised the floor, then
+/// the PA's `PLAN` lines, in order), each as one revision (`rev` n+1, n+2, …), only while the
+/// cursor unit has not run (a step boundary: never mid-unit, never under a done unit that still
+/// owes its team step). New units go after the cursor; nothing before it is touched; a revision
+/// the approval matrix holds leaves the plan pending, and the caller pauses `plan_approval`.
+/// The raised state is persisted only once the units are in: a revision that cannot be planned
+/// keeps the run's floor where it was (a later re-score raises it again) and says why.
+pub(super) fn apply_held_revision(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    let Some(prior) = session
+        .team_plan
+        .clone()
+        .filter(|t| t.accepted_rev > 0 && t.pending.is_none())
+        .filter(|t| t.rescored.is_some() || !t.plan_lines.is_empty())
+    else {
+        return Ok(());
+    };
+    let units = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(units.len());
+    if units.get(cursor).is_some_and(|u| {
+        !matches!(
+            u.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+    }) {
+        return Ok(());
+    }
+    let done: Vec<String> = units[..cursor]
+        .iter()
+        .map(|u| u.phase_id().unwrap_or_default().to_string())
+        .collect();
+    let reviewing_ord = cursor.checked_sub(1).map(|i| units[i].ord);
+    let mut changes = Vec::new();
+    if let Some(r) = prior.rescored.clone() {
+        changes.push(crate::plan_gate::Change::Floor(r));
+    }
+    for l in &prior.plan_lines {
+        changes.extend(crate::plan_gate::changes_from_output(
+            &l.text, &l.by, l.ord, l.attempt,
+        ));
+    }
+    // What was held is taken, whatever comes of it.
+    let mut cleared = prior.clone();
+    cleared.rescored = None;
+    cleared.plan_lines.clear();
+    if done.iter().any(|d| d == "deliver") {
+        session.team_plan = Some(cleared);
+        put_node(store, session.to_node())?;
+        // Nothing runs after the push: a revision there would ship unreviewed.
+        anyhow::bail!("the plan was not revised: its deliver step already ran");
+    }
+    let mut state = cleared.clone();
+    let mut facts = Vec::new();
+    let mut def = None;
+    let now = crate::interaction::now_millis();
+    for change in changes {
+        let r = match crate::plan_gate::revise(
+            run_id,
+            &state,
+            change,
+            &done,
+            &session.human_confirm,
+            reviewing_ord,
+            now,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                emit_run_error(subscribers, run_id, e);
+                continue;
+            }
+        };
+        facts.extend(r.events);
+        match r.outcome {
+            crate::plan_gate::Outcome::Accepted { def: d }
+            | crate::plan_gate::Outcome::Held { def: d } => {
+                state = r.state;
+                def = Some(d);
+            }
+            crate::plan_gate::Outcome::Refused { .. } => {}
+        }
+    }
+    let Some(def) = def else {
+        // Nothing to insert (every change refused): the refusals are the record.
+        session.team_plan = Some(state);
+        put_node(store, session.to_node())?;
+        publish_plan_facts(&session, facts);
+        return Ok(());
+    };
+    let mut next = session.clone();
+    next.team_plan = Some(state);
+    if let Err(e) = revise_units(store, subscribers, &next, def) {
+        session.team_plan = Some(cleared);
+        put_node(store, session.to_node())?;
+        return Err(e.context("the revision could not be planned; the plan is unchanged"));
+    }
+    let session = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    publish_plan_facts(&session, facts);
+    Ok(())
+}
+
+/// (T4, §8.7 "Mechanism") Insert a revision's units into the live run and persist `session`
+/// (with the revised plan state) in the same pass. The def is planned (every synchronous planning
+/// check, the pins attached) and distributed on the launch roster as a whole, so evaluator ≠
+/// creator holds against the units that already ran. Only NEW units are written as planned; a
+/// unit already in the run keeps everything it has — its seat, status, attempts and rework
+/// state (a rewound review re-runs at its own next attempt, never a reused key) — and only its
+/// ord moves (with that ord's dispatch history as its attempt floor). Nothing before the cursor
+/// changes. Nothing is written if planning fails.
+pub(super) fn revise_units(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    session: &AgentSession,
+    def: crate::workflow::WorkflowDef,
+) -> anyhow::Result<()> {
+    let run_id = session.id.as_str();
+    let old = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(old.len());
+    let planned = super::check_def_plans(
+        store,
+        &def,
+        &session.problem,
+        run_id,
+        session.repo_ref.as_deref(),
+    )?;
+    for (o, n) in old[..cursor].iter().zip(&planned) {
+        if o.id != n.id || o.ord != n.ord {
+            anyhow::bail!(
+                "run {run_id}: the revised plan moves the unit `{}` that already ran",
+                o.id
+            );
+        }
+    }
+    let roster = super::launch_roster(session)?;
+    let dists = crate::distribute::distribute_units_on_benched(
+        &planned,
+        &roster,
+        run_id,
+        &session.benched_seats,
+    )?;
+    // A dispatch key is `(run, ord, attempt)` (the phase id), so a unit placed on an ord that
+    // already ran (the tail of a `request_changes` rewind) dispatches above that ord's last
+    // attempt — never a reused key. Nothing else about a unit already in the run changes.
+    let ran_at = |ord: u32| {
+        old.iter()
+            .find(|o| o.ord == ord)
+            .and_then(|o| o.last_attempt)
+    };
+    let mut kept = Vec::new();
+    let mut fresh = Vec::new();
+    let mut fresh_dists = Vec::new();
+    for (mut u, d) in planned.into_iter().zip(dists).skip(cursor) {
+        let floor = ran_at(u.ord);
+        match old.iter().find(|o| o.id == u.id) {
+            Some(o) => {
+                let mut k = o.clone();
+                k.ord = u.ord;
+                k.last_attempt = k.last_attempt.max(floor);
+                kept.push(k);
+            }
+            None => {
+                u.last_attempt = floor;
+                fresh.push(u);
+                fresh_dists.push(d);
+            }
+        }
+    }
+    for u in &fresh {
+        emit(
+            subscribers,
+            CoreEvent::UnitPlanned {
+                session: run_id.to_string(),
+                ord: u.ord,
+                description: u.description.clone(),
+                stage: u.stage.label().to_string(),
+                role: match u.role {
+                    crate::workflow::PhaseRole::Neutral => "neutral",
+                    crate::workflow::PhaseRole::Creator => "creator",
+                    crate::workflow::PhaseRole::Evaluator => "evaluator",
+                }
+                .to_string(),
+                gate: match &u.gate {
+                    crate::workflow::GateSpec::Auto => "auto",
+                    crate::workflow::GateSpec::HumanConfirm { .. } => "human_confirm",
+                    crate::workflow::GateSpec::HumanConfirmIf(_) => "human_confirm_if",
+                }
+                .to_string(),
+                skill_ref: u.skill_ref.clone(),
+                has_validator_pin: u.validator.is_some(),
+                executor_type: if u.tool_cmd.is_some() {
+                    "tool"
+                } else {
+                    "agent"
+                }
+                .to_string(),
+            },
+        );
+    }
+    let mut s = session.clone();
+    // The cursor unit may be new (a late floor phase lands at the cursor): it dispatches at its
+    // own next attempt, as a unit already in the run does.
+    s.attempt = fresh
+        .iter()
+        .chain(&kept)
+        .find(|u| u.ord as usize == cursor + 1)
+        .map(super::next_attempt)
+        .unwrap_or(0);
+    let status = s.status;
+    let mut pre = crate::pipeline::PreDistributed {
+        session_id: run_id.to_string(),
+        session: s,
+        units: fresh,
+        clis: roster,
+        workflow_id: session.workflow_id.clone(),
+        cli_keys: session.clis.clone(),
+    };
+    crate::pipeline::apply_distributions(store, &mut pre, fresh_dists, &mut |ev| {
+        emit(subscribers, ev)
+    })?;
+    for k in &kept {
+        put_node(store, k.to_node())?;
+    }
+    // `apply_distributions` marks the run Executing; a revision keeps the run's own status.
+    if pre.session.status != status {
+        pre.session.status = status;
+        put_node(store, pre.session.to_node())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "team_gate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "replan_tests.rs"]
+mod replan_tests;

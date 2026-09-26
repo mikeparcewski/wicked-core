@@ -3595,6 +3595,29 @@ pub(crate) fn run(
             Command::HeldTeamReplies { reply } => {
                 let _ = reply.send(team_replies.len());
             }
+            Command::TeamRescored {
+                run_id,
+                ord,
+                attempt,
+                rescore_seq,
+                tree,
+                paths,
+            } => {
+                // (T4) Fire-and-forget: a failure is logged and the run goes on at its floor.
+                if let Err(e) = team_gate::on_rescored(
+                    &mut store,
+                    &run_id,
+                    ord,
+                    attempt,
+                    rescore_seq,
+                    &tree,
+                    &paths,
+                ) {
+                    eprintln!(
+                        "wicked-core: run {run_id}: the diff re-score was not applied ({e:#})"
+                    );
+                }
+            }
             Command::RegisterComposed { def, reply } => {
                 let _ = reply.send(
                     registry
@@ -5945,6 +5968,9 @@ fn apply_step_result(
     // without a council YES — the work stands, but the run pauses for a human BEFORE anything
     // else runs (DES-001 §6.7). The cursor STAYS on the unit: approve counts it (the withheld
     // `gateDecided` + `unitDone`) and advances, never re-dispatches; reject cancels.
+    // (T4, §8.7) The PA's `PLAN` lines of this turn, held for the run's next advance — which
+    // applies them whichever path gets there (this fold, a dispute answer, a member acceptance).
+    team_gate::record_plan_lines(&mut session, unit, &output);
     let member_work = team_gate::is_member_work(unit);
     if let Some(d) = team_dispute {
         put_node(store, session.to_node())?;
@@ -5994,7 +6020,7 @@ fn apply_step_result(
     session.attempt = units.get(session.unit_ix).map(next_attempt).unwrap_or(0);
     put_node(store, session.to_node())?;
 
-    // Advance: dispatch the next unit, pause at its human-confirm gate, or finalize.
+    // Advance (a held revision is applied first, in `advance_or_pause`): dispatch the next unit, pause at its human-confirm gate, or finalize.
     match advance_or_pause(
         store,
         subscribers,
@@ -6716,6 +6742,13 @@ fn advance_or_pause(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<Progress> {
+    // (DES-TEAMING-002 T4, §8.7) THE revision hook: every advance goes through here, so a held
+    // diff re-score or the PA's held `PLAN` lines are applied before anything is dispatched —
+    // after a fold, a dispute answer, a member step's acceptance or a gate alike.
+    if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
+        // Log it and show it: the run goes on with the plan it has.
+        emit_run_error(subscribers, run_id, e);
+    }
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
@@ -8713,14 +8746,8 @@ fn confirm_plan_gate(
                      has not run"
                 );
             }
-            if matches!(decision, HumanDecision::EditPlan { .. })
-                && units.iter().any(|u| !not_run(u))
-            {
-                anyhow::bail!(
-                    "an edited plan re-plans the whole run, and a unit of it has already run — \
-                     approve and revise the running plan instead"
-                );
-            }
+            // (T4, §8.7) An edit at a mid-run gate ADDS to the held plan: the units that ran
+            // are kept as they ran (`stage_edit`), so it is answered like any other edit.
         }
         HumanDecision::Reject => {}
     }
@@ -8932,6 +8959,46 @@ fn stage_edit(
     now: i64,
 ) -> anyhow::Result<StagedEdit> {
     let run_id = session.id.as_str();
+    // (DES-TEAMING-002 T4, §8.7) An edit at a MID-RUN plan gate (units already ran): the plan
+    // only grows, so the edit's steps are ADDED to the held plan and the units before the cursor
+    // are kept as they ran — never a whole-plan replace that would re-plan finished work.
+    let units = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(units.len());
+    if cursor > 0 {
+        let done: Vec<String> = units[..cursor]
+            .iter()
+            .map(|u| u.phase_id().unwrap_or_default().to_string())
+            .collect();
+        let r = crate::plan_gate::revise(
+            run_id,
+            state,
+            crate::plan_gate::Change::Steps {
+                by: "human".into(),
+                source: crate::team_events::ProposalSource::Gate {
+                    gate_id: gate_id.to_string(),
+                },
+                kind: crate::team_events::ProposalKind::Edit,
+                reason: None,
+                steps: edit.steps,
+            },
+            &done,
+            &session.human_confirm,
+            pending.reviewing_ord,
+            now,
+        )?;
+        return match r.outcome {
+            crate::plan_gate::Outcome::Refused { reason } => Ok(StagedEdit::Refused {
+                reason,
+                events: r.events,
+            }),
+            crate::plan_gate::Outcome::Held { .. } => {
+                anyhow::bail!("run {run_id}: an edit approved at the gate cannot be held again")
+            }
+            crate::plan_gate::Outcome::Accepted { def } => {
+                staged_accepted(store, session, state, r.state, r.events, def, now)
+            }
+        };
+    }
     let repo_root = session
         .repo_ref
         .as_deref()
@@ -8968,32 +9035,53 @@ fn stage_edit(
         crate::plan_gate::Verdict::Held { .. } => {
             anyhow::bail!("run {run_id}: an edit approved at the gate cannot be held again")
         }
-        crate::plan_gate::Verdict::Accepted { def } => match check_def_runs(store, session, &def) {
-            Ok(()) => Ok(StagedEdit::Accepted {
-                state: Box::new(decided.state),
-                events: decided.events,
-                def,
-            }),
-            Err(e) => {
-                let reason = format!("{e:#}");
-                let proposal_id = decided
-                    .state
-                    .accepted
-                    .as_ref()
-                    .map(|a| a.proposal_id.clone())
-                    .unwrap_or_default();
-                let base_rev = (state.accepted_rev > 0).then_some(state.accepted_rev);
-                let mut events = decided.events;
-                events.push(crate::plan_gate::plan_refused(
-                    run_id,
-                    &proposal_id,
-                    base_rev,
-                    &reason,
-                    now,
-                )?);
-                Ok(StagedEdit::Refused { reason, events })
-            }
-        },
+        crate::plan_gate::Verdict::Accepted { def } => staged_accepted(
+            store,
+            session,
+            state,
+            decided.state,
+            decided.events,
+            def,
+            now,
+        ),
+    }
+}
+
+/// An accepted edit's def, checked with every synchronous check it will run under
+/// ([`check_def_runs`]); a failing check refuses the edit exactly as a compose refusal does.
+fn staged_accepted(
+    store: &mut dyn GraphStore,
+    session: &AgentSession,
+    prior: &crate::plan_gate::TeamPlanState,
+    next: crate::plan_gate::TeamPlanState,
+    events: Vec<crate::team_events::TeamEvent>,
+    def: crate::workflow::WorkflowDef,
+    now: i64,
+) -> anyhow::Result<StagedEdit> {
+    match check_def_runs(store, session, &def) {
+        Ok(()) => Ok(StagedEdit::Accepted {
+            state: Box::new(next),
+            events,
+            def,
+        }),
+        Err(e) => {
+            let reason = format!("{e:#}");
+            let proposal_id = next
+                .accepted
+                .as_ref()
+                .map(|a| a.proposal_id.clone())
+                .unwrap_or_default();
+            let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
+            let mut events = events;
+            events.push(crate::plan_gate::plan_refused(
+                &session.id,
+                &proposal_id,
+                base_rev,
+                &reason,
+                now,
+            )?);
+            Ok(StagedEdit::Refused { reason, events })
+        }
     }
 }
 
@@ -9065,6 +9153,10 @@ fn replan_for_accepted_edit(
     def: crate::workflow::WorkflowDef,
 ) -> anyhow::Result<()> {
     let run_id = session.id.as_str();
+    // (T4) Units already ran: insert the edit's units after the cursor, never re-plan the run.
+    if session.unit_ix > 0 {
+        return team_gate::revise_units(store, subscribers, session, def);
+    }
     let roster = launch_roster(session)?;
     let mut scoped = crate::workflow::WorkflowRegistry::default();
     let def_id = def.id.clone();

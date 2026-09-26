@@ -34,6 +34,12 @@ use crate::team::events::{
 };
 use crate::workflow::WorkflowDef;
 
+mod revise;
+pub(crate) use revise::{
+    changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
+    Change, DiffRescore, Outcome, PlanLines,
+};
+
 /// The `gate_kind` token of a plan approval pause (`AwaitingHuman.gate_kind`, the durable
 /// interaction row, `gate.opened.kind`).
 pub(crate) const GATE_KIND: &str = "plan_approval";
@@ -86,6 +92,15 @@ pub struct TeamPlanState {
     /// approval already answered (the confirm path's "bypass `should_pause`"), once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_ord: Option<u32>,
+    /// (T4, §8.7) The highest diff re-score that raised the floor since the last step boundary:
+    /// applied there as `plan.revised{reason:"floor_raised"}`, never mid-unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescored: Option<DiffRescore>,
+    /// (T4, §8.7) The PA's `PLAN` lines from its finished turns (its own step or its review of a
+    /// member's step), held until the run's next advance applies them — every advance goes
+    /// through the one hook, whichever path (fold, dispute answer, member accept) led there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_lines: Vec<PlanLines>,
 }
 
 /// An accepted plan rev: the body of its `plan.accepted` (§6 row 5).
@@ -912,7 +927,8 @@ pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow:
             "mode": if a.auto { "auto" } else { "manual" },
             "steps": wire_steps(&a.steps),
             "override": a.floor_override,
-            "proposal_id": a.proposal_id,
+            // A floor raise composes no proposal (§6 row 4): `null`, never an empty id.
+            "proposal_id": (!a.proposal_id.is_empty()).then_some(&a.proposal_id),
         }),
     )
 }

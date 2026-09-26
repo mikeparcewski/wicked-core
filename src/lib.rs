@@ -585,6 +585,7 @@ impl Core {
         let mut core = Core::spawn_inner(path, dispatcher, runner, exec_bus, Some(team.clone()));
         if let Some(mut cfg) = crate::team::supervisor::SupervisorConfig::from_team(&team, boot_ms)
         {
+            cfg.engine = Some(core.tx.clone());
             tune(&mut cfg);
             let tx = core.tx.clone();
             let live: crate::team::supervisor::LiveRuns = std::sync::Arc::new(move || {
@@ -748,7 +749,9 @@ impl Core {
         // point. No bus (or no publisher) = no team run, so no supervisor.
         let supervisor = crate::team::supervisor::SupervisorConfig::from_team(&team_cfg, boot_ms)
             .filter(|_| publishes)
-            .map(|cfg| {
+            .map(|mut cfg| {
+                // (T4) The supervisor's diff re-scores come back on the actor's channel.
+                cfg.engine = Some(tx.clone());
                 let host: std::sync::Arc<dyn crate::team::MonitorHost> = std::sync::Arc::new(
                     crate::acp_runner::RunnerHost(std::sync::Arc::downgrade(&runner)),
                 );

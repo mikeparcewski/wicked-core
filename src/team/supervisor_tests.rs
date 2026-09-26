@@ -244,6 +244,7 @@ pub(crate) fn sup_cfg(rig: &Rig) -> SupervisorConfig {
         boot_ms: 0,
         tail: None,
         publish_bound: Duration::from_millis(500),
+        engine: None,
     }
 }
 
@@ -412,6 +413,7 @@ impl Harness {
             }
             Job::FinalPass(fp) => run_final_pass(*fp, &*self.host, &*self.council),
             Job::Help(h) => run_help(&h, &*self.host, &self.core.publisher_bus()),
+            Job::Rescore(u) => rescore(&u, false),
         }
     }
 
@@ -1691,4 +1693,115 @@ fn t6_d5_no_tail_snapshot_replays_everything_and_a_dead_attempts_help_starts_not
     h.pump();
     assert_eq!(h.host.turn_count(), 0);
     assert!(h.rows(tev::HELP_ANSWERED).is_empty());
+}
+
+// ── T4 (§8.7): the diff re-score at checkpoints and at `step.completed` ─────────────────────────
+
+/// A harness whose supervisor sends its re-scores to a channel the test reads.
+fn rescoring(name: &str) -> (Harness, std::sync::mpsc::Receiver<crate::command::Command>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = std::sync::Mutex::new(Some(tx));
+    let h = Harness::with(
+        name,
+        move |rig| {
+            let mut c = sup_cfg(rig);
+            c.engine = tx.lock().unwrap().take();
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    (h, rx)
+}
+
+/// `(ord, attempt, rescore_seq, paths)` of every re-score the engine received.
+fn rescores(
+    rx: &std::sync::mpsc::Receiver<crate::command::Command>,
+) -> Vec<(u32, u32, u32, Vec<String>)> {
+    rx.try_iter()
+        .filter_map(|c| match c {
+            crate::command::Command::TeamRescored {
+                ord,
+                attempt,
+                rescore_seq,
+                paths,
+                ..
+            } => Some((ord, attempt, rescore_seq, paths)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// (f) A 30-checkpoint burst inside `RESCORE_MIN_INTERVAL` with one tree change is at most ONE
+/// re-score; the re-score at `step.completed` runs once more only when the tree moved since.
+/// (Operator item, supervisor half) The measurement is the real settled diff: a creator step that
+/// writes `src/` files reports exactly those paths against the attempt's baseline.
+#[test]
+fn t4_f_a_checkpoint_burst_is_one_rescore_and_completion_adds_one() {
+    let (mut h, rx) = rescoring("t4f");
+    h.start("claude#1", &["claude#1", "claude#2"], "0-19");
+    h.claim(1, 0, "claude#1");
+    h.pump();
+    h.fx.write("src/auth.rs", "pub fn login() {}\n");
+    for seq in 1..=30 {
+        h.checkpoint(1, 0, seq, "edit");
+        h.pump();
+    }
+    let burst = rescores(&rx);
+    assert_eq!(burst.len(), 1, "{burst:?}");
+    assert_eq!(burst[0].0, 1);
+    assert_eq!(burst[0].2, 1, "rescore_seq 1");
+    assert_eq!(burst[0].3, vec!["src/auth.rs".to_string()]);
+    // The step completes on the SAME tree: no second re-score.
+    h.complete(1, 0, "claude#1", "ok");
+    h.pump();
+    assert!(
+        rescores(&rx).is_empty(),
+        "an unchanged tree is not re-scored"
+    );
+    // Another attempt whose tree moves after its last checkpoint: completion re-scores it.
+    h.claim(1, 1, "claude#1");
+    h.pump();
+    h.fx.write("src/session.rs", "pub fn open() {}\n");
+    h.complete(1, 1, "claude#1", "ok");
+    h.pump();
+    let done = rescores(&rx);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].1, 1);
+    assert_eq!(
+        done[0].3,
+        vec!["src/auth.rs".to_string(), "src/session.rs".to_string()],
+        "the settled diff against the attempt's baseline"
+    );
+}
+
+/// (f) The bound itself: at most `RESCORE_MAX` checkpoint re-scores per attempt, each at least
+/// `RESCORE_MIN_INTERVAL` apart and on a new tree, plus the one at `step.completed`: never more
+/// than 11.
+#[test]
+fn t4_f_an_attempt_is_rescored_at_most_eleven_times() {
+    let t0 = Instant::now();
+    let mut r = Rescores::from_baseline("base");
+    // 30 checkpoints inside one interval, one tree change: one.
+    let mut n = 0;
+    for i in 0..30u64 {
+        let now = t0 + Duration::from_secs(i);
+        if r.may_start(now) && r.admit("t1", now, false).is_some() {
+            n += 1;
+        }
+    }
+    assert_eq!(n, 1);
+    // A new tree every 61 s for an hour: capped at RESCORE_MAX.
+    for i in 1..60u64 {
+        let now = t0 + Duration::from_secs(61 * i);
+        if r.may_start(now) {
+            r.admit(&format!("t{}", i + 1), now, false);
+        }
+    }
+    assert_eq!(r.count(), RESCORE_MAX);
+    // …and the completion re-score on a moved tree: 11, and never a 12th.
+    let end = t0 + Duration::from_secs(4000);
+    assert_eq!(r.admit("final", end, true), Some(RESCORE_MAX + 1));
+    assert!(r.admit("final", end, true).is_none());
+    assert!(!r.may_start(end + RESCORE_MIN_INTERVAL));
+    assert_eq!(r.count(), 11);
 }
