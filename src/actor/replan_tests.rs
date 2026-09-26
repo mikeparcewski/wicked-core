@@ -329,6 +329,15 @@ fn payloads(e: &Engine, run: &str, event_type: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The run's `event_type` payloads once `n` are on the bus. A revision's facts are published
+/// fire-and-forget, so they can land after the pause or dispatch that follows them.
+fn settled(e: &Engine, run: &str, event_type: &str, n: usize) -> Vec<Value> {
+    wait_for(&format!("{n} `{event_type}` of {run} on the bus"), || {
+        payloads(e, run, event_type).len() >= n
+    });
+    payloads(e, run, event_type)
+}
+
 /// Every team row of the run, `(event_id, type, payload)`, in bus order.
 fn rows(e: &Engine, run: &str) -> Vec<(i64, String, Value)> {
     crate::bus::BusDb::shared(&e.rig.bus)
@@ -426,6 +435,7 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
         ),
     );
     e.wait_awaiting("op", crate::plan_gate::GATE_KIND, 1);
+    settled(&e, "op", tev::PLAN_REVISED, 1);
     // The initial plan went through with no approval: the only plan gate is the revision's.
     let accepted = payloads(&e, "op", tev::PLAN_ACCEPTED);
     assert_eq!(accepted.len(), 1, "rev 1 accepted once, by the engine");
@@ -660,7 +670,7 @@ fn t4_high1_a_raise_on_a_member_step_is_applied_when_the_pa_accepts_it() {
         2,
         "the member's work and the PA's review only: {calls:?}"
     );
-    let revised = payloads(&e, "macc", tev::PLAN_REVISED);
+    let revised = settled(&e, "macc", tev::PLAN_REVISED, 1);
     assert_eq!(revised.len(), 1);
     assert_eq!(revised[0]["reason"], "floor_raised");
     release_all(&w);
@@ -696,7 +706,7 @@ fn t4_medium1_the_pa_review_accepting_a_member_request_revises_the_plan() {
     wait_for("the unit after the member step to dispatch", || {
         e.worker.calls().len() >= 3
     });
-    let revised = payloads(&e, "mreq", tev::PLAN_REVISED);
+    let revised = settled(&e, "mreq", tev::PLAN_REVISED, 1);
     assert_eq!(revised.len(), 1, "{revised:#?}");
     assert_eq!(revised[0]["reason"], "member_request");
     let want = tev::mint_proposal_id(
@@ -834,6 +844,7 @@ fn t4_b_d_a_pa_revision_in_auto_mode_below_high_risk_does_not_pause() {
         ),
     );
     wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
+    settled(&e, "pa", tev::PLAN_REVISED, 1);
     let proposed = payloads(&e, "pa", tev::PLAN_PROPOSED);
     let change = proposed
         .iter()
@@ -891,7 +902,7 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
     // The PA's revision pauses, even below high risk.
     e.wait_awaiting("man", crate::plan_gate::GATE_KIND, 2);
     assert_eq!(e.worker.calls().len(), 1);
-    let revised = payloads(&e, "man", tev::PLAN_REVISED);
+    let revised = settled(&e, "man", tev::PLAN_REVISED, 1);
     assert_eq!(revised.len(), 1);
     assert_eq!(revised[0]["reason"], "pa_added");
     assert_eq!(revised[0]["high_risk"], false);
@@ -906,6 +917,11 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
         .unwrap();
     wait_for("the first unit after the edit", || {
         e.worker.calls().len() >= 2
+    });
+    wait_for("rev 3 on the bus", || {
+        payloads(&e, "man", tev::PLAN_ACCEPTED)
+            .last()
+            .is_some_and(|p| p["plan_rev"] == 3)
     });
     let proposed: Vec<Value> = payloads(&e, "man", tev::PLAN_PROPOSED)
         .into_iter()
@@ -962,7 +978,7 @@ fn t4_e_an_accepted_member_request_is_a_revision_from_the_pa_output() {
         ),
     );
     wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
-    let revised = payloads(&e, "mem", tev::PLAN_REVISED);
+    let revised = settled(&e, "mem", tev::PLAN_REVISED, 1);
     assert_eq!(revised.len(), 1);
     assert_eq!(revised[0]["reason"], "member_request");
     let want = tev::mint_proposal_id(
