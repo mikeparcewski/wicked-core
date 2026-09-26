@@ -1575,9 +1575,11 @@ impl Core {
 
     /// The phase catalog (`src/catalog.rs`) for studio's phase picker, in catalog order, as a JSON
     /// array of `{ id, kind, role, gate, gate_type, executes_code, executor, validator_pin, pinned,
-    /// evidence_floor, skill_ref, description }` (`executor` is `"agent"` | `"tool"`; `pinned` =
-    /// the entry carries a validator pin; `evidence_floor` = that pin is the evidence floor;
-    /// `description` is `null` when the entry has none).
+    /// evidence_floor, verified_evidence, skill_ref, description }` (`executor` is `"agent"` |
+    /// `"tool"`; `pinned` = the entry carries a validator pin; `evidence_floor` = that pin is the
+    /// evidence floor; `verified_evidence` = the entry declares re-verified evidence, so a step of it
+    /// is an acceptance requirement of the run that contains it; `description` is `null` when the
+    /// entry has none).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn catalog(&self) -> AsyncTask<CoreTask> {
         task(catalog_json)
@@ -2442,7 +2444,15 @@ mod tests {
         assert_eq!(build["role"], "creator");
         assert_eq!(build["pinned"], true);
         assert_eq!(build["evidence_floor"], true);
+        assert_eq!(build["verified_evidence"], false);
         assert!(build["description"].is_null());
+        // The entries that declare re-verified evidence — what a plan run's acceptance reads.
+        let verified: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["verified_evidence"] == true)
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(verified, ["test", "domain_coverage"]);
     }
 
     /// (T8 (e)) `Core.previewPlan()`: the pinned shape, the approval answer per `humanConfirm`,
