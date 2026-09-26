@@ -715,18 +715,26 @@ fn parse_plan(json: &str) -> napi::Result<wicked_core::PlanSteps> {
 }
 
 /// The decision `confirmGate` builds when it is handed `planJson` (an edit at a `plan_approval`
-/// gate): it requires `approve=true` and `action` omitted or `edit_plan`.
+/// gate): it requires `approve=true` and `action` omitted or `edit_plan`. The edited plan IS the
+/// whole answer (T3 round 10): a non-empty `amend` or any `amendScope` beside it is refused, never
+/// silently dropped.
 fn edit_decision(
     approve: bool,
-    _amend: Option<&str>,
+    amend: Option<&str>,
     action: Option<&str>,
-    _amend_scope: Option<&str>,
+    amend_scope: Option<&str>,
     plan_json: &str,
 ) -> napi::Result<HumanDecision> {
     if !approve || !matches!(action, None | Some("edit_plan")) {
         return Err(err(anyhow::anyhow!(
             "planJson answers a plan_approval gate with an edit: it requires approve=true and \
              action omitted or `edit_plan`"
+        )));
+    }
+    if amend.is_some_and(|a| !a.trim().is_empty()) || amend_scope.is_some() {
+        return Err(err(anyhow::anyhow!(
+            "planJson is the whole answer to a plan_approval gate: send the edit in the plan, \
+             not as amend / amendScope"
         )));
     }
     Ok(HumanDecision::EditPlan {

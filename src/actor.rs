@@ -2901,6 +2901,12 @@ pub(crate) fn run(
                     )));
                     continue;
                 }
+                // (T3 round 10) The dispatch guard, judged BEFORE anything is reaped or bumped: a
+                // reassign is refused — the run untouched — while no unit may dispatch.
+                if let Some(why) = team_gate::dispatch_blocked(&session) {
+                    let _ = reply.send(Err(anyhow::anyhow!("cannot reassign: {why}")));
+                    continue;
+                }
                 let units = match crate::domain::session_units(&store, &run_id) {
                     Ok(u) => u,
                     Err(e) => {
@@ -4496,6 +4502,35 @@ fn redrive_executing_sessions(
             continue;
         }
         let run_id = s.id.clone();
+        // (T3 round 10) A run the dispatch guard holds (its plan held, or its accepted rev's
+        // `plan.accepted` not landed) is not redriven onto its unit: it goes through the team gate
+        // and the pauses (`advance_or_pause`), which open the gate or publish the fact it waits on.
+        if team_gate::dispatch_blocked(&s).is_some() {
+            match advance_or_pause(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                &run_id,
+                s.unit_ix,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            ) {
+                Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
+                    in_flight.insert(run_id);
+                }
+                Ok(Progress::Paused) => {}
+                Ok(Progress::Done) => {
+                    if let Err(e) = finalize_run(store, subscribers, runner, self_tx, &run_id) {
+                        emit_run_error(subscribers, &run_id, e);
+                    }
+                }
+                Err(e) => emit_run_error(subscribers, &run_id, e),
+            }
+            continue;
+        }
         let units = crate::domain::session_units(store, &run_id).unwrap_or_default();
         let mut sess = s;
         // Skip any cursor unit that already completed before the crash (a crash between the unit-Done
@@ -6613,8 +6648,12 @@ fn advance_or_pause(
         }
         put_node(store, session.to_node())?;
     }
+    // (T3 round 10) …but never the DELIVER gate: approving a plan is not approving a push. A
+    // released deliver unit still stops for its engine-enforced deliver gate (unless the launch
+    // set `auto_deliver`).
     let pause = if released {
-        None
+        should_pause(&session, &units, unit_ix)
+            .filter(|r| matches!(r, PauseReason::DeliverGate { .. }))
     } else {
         should_pause(&session, &units, unit_ix)
     };
@@ -6992,6 +7031,11 @@ fn dispatch_unit(
 ) -> anyhow::Result<bool> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    // (DES-TEAMING-002 T3, round 10) THE dispatch guard: no unit runs past a held plan, or ahead
+    // of the accepted rev's `plan.accepted` on a teamed run — whichever path asked.
+    if let Some(why) = team_gate::dispatch_blocked(&session) {
+        return Err(team_gate::DispatchHeld(why).into());
+    }
     let units = crate::domain::session_units(store, run_id)?;
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
@@ -8575,6 +8619,47 @@ fn confirm_plan_gate(
     team_gate::release_plan_gate(&mut cx, session, decided_ev, release)
 }
 
+/// The row of `held`'s gate, re-opened in memory for its answer (the plan arm resolves it). A
+/// run holding a plan answers only through the plan arm; when its row was already answered (the
+/// process stopped before the answer took effect), the gate is re-opened rather than answered by
+/// the generic arm. Refused when the gate never opened — the run opens it on its next advance.
+fn reopen_plan_row(
+    store: &dyn GraphStore,
+    run_id: &str,
+    held: &crate::plan_gate::PendingPlan,
+) -> anyhow::Result<crate::interaction::InteractionRequest> {
+    let Some(gate_id) = held.gate_id.as_deref() else {
+        anyhow::bail!(
+            "run {run_id} holds plan rev {} but its plan_approval gate is not open: resume the run \
+             to open it",
+            held.rev
+        );
+    };
+    let mut row = crate::interaction::list_interactions(store, Some(run_id), None)?
+        .into_iter()
+        .find(|r| {
+            r.gate_kind.as_deref() == Some(crate::plan_gate::GATE_KIND)
+                && r.id
+                    == crate::interaction::open_gate_keyed(
+                        run_id,
+                        r.ord.unwrap_or(0),
+                        None,
+                        "",
+                        crate::plan_gate::GATE_KIND,
+                        Some(gate_id),
+                        0,
+                    )
+                    .id
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("run {run_id}: the row of plan gate {gate_id} is missing")
+        })?;
+    row.status = crate::interaction::InteractionStatus::Open;
+    row.answer = None;
+    row.resolved_at = None;
+    Ok(row)
+}
+
 /// An edit decided and checked, not yet committed ([`stage_edit`]).
 enum StagedEdit {
     /// Accepted as the next rev; its def passed every synchronous check.
@@ -8817,6 +8902,21 @@ pub(crate) fn confirm_gate(
     )?
     .into_iter()
     .find(|r| r.gate_kind.as_deref() == Some(crate::plan_gate::GATE_KIND));
+    // (T3 round 10) A run holding a plan answers ONLY through the plan arm — never the generic
+    // arm (which would dispatch the cursor unit with no accepted rev). With no open plan row (a
+    // crash after the row was answered and before the staged answer was written; before round 10
+    // those were two writes), its gate's own row is re-opened and answered here.
+    // A team fact still pending (the plan gate's own `gate.decided`, or a `team_transport` pause
+    // over it) is the team handler's below, never a re-opened plan row.
+    let team_fact_pending = session.team.as_ref().is_some_and(|t| t.pending.is_some());
+    let open_plan_gate = match open_plan_gate {
+        Some(row) => Some(row),
+        None if team_fact_pending => None,
+        None => match session.team_plan.as_ref().and_then(|t| t.pending.as_ref()) {
+            Some(held) => Some(reopen_plan_row(&*store, run_id, held)?),
+            None => None,
+        },
+    };
     if let Some(row) = open_plan_gate {
         return confirm_plan_gate(
             store,

@@ -390,6 +390,32 @@ pub(super) fn gate_before_dispatch(
     }
 }
 
+/// (DES-TEAMING-002 T3) Why no unit of this run may dispatch now — the ONE dispatch guard,
+/// enforced inside `dispatch_unit` (every path that runs a unit goes through it: the advance, a
+/// redrive, a reassign, a rework): a plan held for approval. Nothing is released until its
+/// `plan_approval` gate is answered. `None` for a run the plan pipeline does not hold.
+pub(super) fn dispatch_blocked(session: &AgentSession) -> Option<String> {
+    let p = session.team_plan.as_ref()?.pending.as_ref()?;
+    Some(format!(
+        "run {} holds plan rev {} for approval: no unit dispatches until its plan_approval gate \
+         is answered",
+        session.id, p.rev
+    ))
+}
+
+/// A dispatch refused by [`dispatch_blocked`]: typed, so a caller that can route the run to the
+/// gate that holds it (a restart redrive) tells it from a dispatch fault.
+#[derive(Debug)]
+pub(crate) struct DispatchHeld(pub String);
+
+impl std::fmt::Display for DispatchHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DispatchHeld {}
+
 // ── T3: the plan_approval gate on P1's path (DES-TEAMING-002 §8.6) ─────────────────────────────
 
 /// Whether this run's team facts go on the bus: teamed (acknowledged `path.started`) with a
@@ -560,6 +586,21 @@ fn finish_release(
         }
     };
     if !reopen {
+        // (T3 round 10) The run was paused at its plan gate: say it resumed. `run_blocked` says so
+        // for a run still `AwaitingHuman`; an accepted edit's re-plan already wrote `Executing`.
+        if session.status != SessionStatus::AwaitingHuman {
+            let ord = crate::domain::session_units(cx.store, &run_id)?
+                .get(session.unit_ix)
+                .map(|u| u.ord)
+                .unwrap_or(0);
+            emit(
+                cx.subscribers,
+                CoreEvent::Resumed {
+                    session: run_id.clone(),
+                    ord,
+                },
+            );
+        }
         return run_blocked(cx, session, TeamBlocked::Continue);
     }
     match advance_or_pause(
