@@ -2281,4 +2281,119 @@ mod tests {
              health probe) \u{2014} launcher) \u{2014} sign a seat in, or add one, before launching"
         );
     }
+
+    // ── DES-TEAMING-002 T6 review round 2, D1: member steps are placed BEFORE the fence ────────
+
+    /// A team run of `[member build (owner: team), <evaluator stage>]` (optionally led by a PA
+    /// build), every unit stamped `team_run`.
+    fn team_member_build_then(stage: StageKind, pa_build: bool) -> Vec<WorkUnit> {
+        let mut units = Vec::new();
+        if pa_build {
+            let mut b = WorkUnit::pending("u0", "r1", 0, "Build the base");
+            b.stage = StageKind::Build;
+            units.push(b);
+        }
+        let mut member = WorkUnit::pending("u1", "r1", 1, "Build the thing");
+        member.stage = StageKind::Build;
+        member.owner = crate::workflow::StepOwner::Team;
+        units.push(member);
+        let mut check = WorkUnit::pending("u2", "r1", 2, "Check the thing");
+        check.stage = stage;
+        units.push(check);
+        for u in &mut units {
+            u.team_run = true;
+        }
+        units
+    }
+
+    /// D1 (review round 2 on #628): roster `[claude (PA), codex]`, a member Build step and a
+    /// Review unit. The member's build lands on codex, so the review must NOT land on codex too
+    /// (codex would grade codex's build). evaluator≠creator must see the member's FINAL seat.
+    #[test]
+    fn t6_d1_a_review_never_lands_on_the_seat_a_member_build_was_moved_to() {
+        for stage in [StageKind::Review, StageKind::Test] {
+            let units = team_member_build_then(stage, false);
+            let dists = distribute_units_against_benched(
+                &units,
+                &[seat("claude"), seat("codex")],
+                "r1",
+                None,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("{stage:?}: {e:#}"));
+            assert_eq!(
+                dists[0].assigned_cli, "codex",
+                "{stage:?}: the member's seat"
+            );
+            assert_ne!(
+                dists[1].assigned_cli, dists[0].assigned_cli,
+                "{stage:?}: the evaluator is on the member builder's seat"
+            );
+            assert_eq!(
+                dists[1].assigned_cli, "claude",
+                "{stage:?}: claude built nothing"
+            );
+            assert_eq!(dists[1].distinctness_fallback, None, "{stage:?}");
+        }
+    }
+
+    /// D1: with a PA build AND a member build, every seat of `[claude, codex]` built: the
+    /// evaluator has nowhere distinct to go, and the team run is refused by name (never graded on
+    /// a builder seat, never silently).
+    #[test]
+    fn t6_d1_a_pa_build_and_a_member_build_leave_no_evaluator_seat_and_refuse() {
+        for stage in [StageKind::Review, StageKind::Test] {
+            let units = team_member_build_then(stage, true);
+            let err = distribute_units_against_benched(
+                &units,
+                &[seat("claude"), seat("codex")],
+                "r1",
+                None,
+                &[],
+            )
+            .expect_err("both seats built: no distinct evaluator");
+            let refusal = err
+                .downcast_ref::<crate::NoEligibleSeat>()
+                .unwrap_or_else(|| panic!("{stage:?}: must be NoEligibleSeat: {err:?}"));
+            assert!(
+                refusal
+                    .benched
+                    .starts_with("evaluator\u{2260}creator unsatisfiable for unit(s) [2]"),
+                "{stage:?}: {}",
+                refusal.benched
+            );
+        }
+    }
+
+    /// D1: a member's own Review step (owner: team) of a member build is moved off the builder's
+    /// seat by the fence, but never onto the PA's (a member step is never the PA's): with a third
+    /// seat it lands there.
+    #[test]
+    fn t6_d1_a_member_review_moved_by_the_fence_never_lands_on_the_pa() {
+        let mut units = team_member_build_then(StageKind::Review, false);
+        units[1].owner = crate::workflow::StepOwner::Team;
+        let dists = distribute_units_against_benched(
+            &units,
+            &[seat("claude"), seat("codex"), seat("pi")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect("a third seat is distinct from the builder and the PA");
+        assert_eq!(dists[0].assigned_cli, "codex");
+        assert_eq!(dists[1].assigned_cli, "pi", "not the PA, not the builder");
+        // Without the third seat: refused, never the PA and never the builder.
+        let err = distribute_units_against_benched(
+            &units,
+            &[seat("claude"), seat("codex")],
+            "r1",
+            None,
+            &[],
+        )
+        .expect_err("no seat is distinct from both the member builder and the PA");
+        assert!(
+            err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
+            "{err:?}"
+        );
+    }
 }

@@ -48,7 +48,7 @@ use super::{
     RawFinding, Rejected, ReplyKind, Repo, Severity, TeamLedger, TeamLimits, TeamPlan, UnitKey,
     Verdict,
 };
-use crate::bus::BusDb;
+use crate::bus::{BusDb, BusEvent};
 use crate::decision::{DecisionRequest, DecisionVerdict};
 
 /// The bus filter the supervisor's cursor reads (§4.2).
@@ -1628,6 +1628,10 @@ fn attempt_rows(
     key: &UnitKey,
     claimed_id: i64,
 ) -> anyhow::Result<(Vec<TeamRow>, usize)> {
+    #[cfg(test)]
+    if tests::take_injected_read_failure() {
+        anyhow::bail!("injected attempt_rows read failure (test)");
+    }
     let db = BusDb::shared(bus_db)?;
     let mut floor = claimed_id.saturating_sub(1);
     let mut rows = Vec::new();
@@ -2511,7 +2515,7 @@ fn run(
     let bus_db = cfg.bus_db.clone();
     // Without a tail the supervisor cannot tell history from live: it replays from 0 (every row
     // is history) and tails from what it read — a missing snapshot never skips a row.
-    let tail = cfg.tail.unwrap_or(0);
+    let tail = replay_tail(cfg.tail);
     let mut core = SupervisorCore::new(cfg, host, council);
     // §4.7 steps 2–3: arm the live runs, replay their rows up to T.
     match live() {
@@ -2576,7 +2580,8 @@ fn run(
             if let Ok(runs) = live() {
                 for r in runs.iter().filter(|r| due.contains(&r.run_id)) {
                     core.arm(r);
-                    let jobs = replay_run(&mut core, &bus_db, &r.run_id, cursor);
+                    let jobs =
+                        replay_run(&mut core, &bus_db, &r.run_id, cursor).unwrap_or_default();
                     for job in jobs {
                         spawn_job(job, &core, &back_tx);
                     }
@@ -2598,6 +2603,14 @@ fn run(
     }
 }
 
+/// The replay's upper bound from the spawn's tail snapshot.
+fn replay_tail(snapshot: Option<i64>) -> i64 {
+    snapshot.unwrap_or(0)
+}
+
+/// A bus read: the team rows after an event id, at most `n` of them.
+type ReadRows<'a> = dyn FnMut(i64, usize) -> anyhow::Result<Vec<BusEvent>> + 'a;
+
 /// §4.7 step 3: read every armed run's rows from the lowest floor up to `tail`, as history.
 /// Returns the cursor to tail from, and the jobs a row of THIS process's own attempts made due
 /// (a claim or a completion that landed before the tail was read).
@@ -2607,18 +2620,19 @@ fn replay(
     tail: i64,
     only: Option<&str>,
 ) -> (i64, Vec<Job>) {
-    let mut jobs = Vec::new();
-    let cursor = replay_into(core, bus_db, tail, only, &mut jobs);
-    (cursor, jobs)
+    let mut read =
+        |after: i64, n: usize| BusDb::shared(bus_db).and_then(|db| db.poll(TEAM_FILTER, after, n));
+    replay_with(core, tail, only, &mut read, READ_BATCH)
 }
 
-fn replay_into(
+fn replay_with(
     core: &mut SupervisorCore,
-    bus_db: &str,
     tail: i64,
     only: Option<&str>,
-    jobs: &mut Vec<Job>,
-) -> i64 {
+    read: &mut ReadRows<'_>,
+    batch_size: usize,
+) -> (i64, Vec<Job>) {
+    let mut jobs = Vec::new();
     let floors = core.floors();
     let Some(from) = floors
         .iter()
@@ -2626,28 +2640,21 @@ fn replay_into(
         .map(|(_, f)| *f)
         .min()
     else {
-        return tail;
+        return (tail, jobs);
     };
     let mut floor = from.saturating_sub(1);
-    let db = match BusDb::shared(bus_db) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("wicked-core: team supervisor: replay could not open the bus ({e:#})");
-            return tail;
-        }
-    };
     loop {
-        let batch = match db.poll(TEAM_FILTER, floor, READ_BATCH) {
+        let batch = match read(floor, batch_size) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("wicked-core: team supervisor: replay read failed ({e:#})");
-                return tail.max(floor);
+                return (tail.max(floor), jobs);
             }
         };
         let n = batch.len();
         for ev in batch {
             if ev.event_id > tail {
-                return tail;
+                return (tail, jobs);
             }
             floor = floor.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
@@ -2664,7 +2671,7 @@ fn replay_into(
             // this process's own attempt is live however it was read.
             jobs.extend(core.on_row(&row, true));
         }
-        if n < READ_BATCH {
+        if n < batch_size {
             break;
         }
     }
@@ -2677,25 +2684,39 @@ fn replay_into(
             );
         }
     }
-    tail
+    (tail, jobs)
 }
 
 /// Arm-and-replay one run that surfaced live: its rows from its floor up to the cursor. Rows of
 /// this process's attempts are live (their `at` is past boot), so they attach as usual.
-fn replay_run(core: &mut SupervisorCore, bus_db: &str, run_id: &str, upto: i64) -> Vec<Job> {
+fn replay_run(
+    core: &mut SupervisorCore,
+    bus_db: &str,
+    run_id: &str,
+    upto: i64,
+) -> anyhow::Result<Vec<Job>> {
+    let mut read =
+        |after: i64, n: usize| BusDb::shared(bus_db).and_then(|db| db.poll(TEAM_FILTER, after, n));
+    replay_run_with(core, run_id, upto, &mut read, READ_BATCH)
+}
+
+fn replay_run_with(
+    core: &mut SupervisorCore,
+    run_id: &str,
+    upto: i64,
+    read: &mut ReadRows<'_>,
+    batch_size: usize,
+) -> anyhow::Result<Vec<Job>> {
     let Some(floor) = core.runs.get(run_id).map(|s| s.floor) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut jobs = Vec::new();
-    let Ok(db) = BusDb::shared(bus_db) else {
-        return jobs;
-    };
     let mut at = floor.saturating_sub(1);
-    while let Ok(batch) = db.poll(TEAM_FILTER, at, READ_BATCH) {
+    while let Ok(batch) = read(at, batch_size) {
         let n = batch.len();
         for ev in batch {
             if ev.event_id > upto {
-                return jobs;
+                return Ok(jobs);
             }
             at = at.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
@@ -2712,11 +2733,11 @@ fn replay_run(core: &mut SupervisorCore, bus_db: &str, run_id: &str, upto: i64) 
                 true,
             ));
         }
-        if n < READ_BATCH {
+        if n < batch_size {
             break;
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 #[cfg(test)]

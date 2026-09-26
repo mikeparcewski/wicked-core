@@ -1624,3 +1624,220 @@ fn a_completion_without_a_seen_claim_folds_stream_gap() {
     assert_eq!(l.final_pass, FinalPass::StreamGap, "{l:?}");
     assert!(l.team_pause);
 }
+
+// ── Review round 2 on #628: replay never skips rows, a partial age-out is a gap, no tail ─────────
+
+thread_local! {
+    /// How many of this thread's next `attempt_rows` reads fail (the final pass runs inline on
+    /// the test thread in the harness).
+    static FAIL_ATTEMPT_ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Consumed by `attempt_rows` under `cfg(test)`: `true` while an injected failure is pending.
+pub(crate) fn take_injected_read_failure() -> bool {
+    FAIL_ATTEMPT_ROWS.with(|c| {
+        let n = c.get();
+        if n > 0 {
+            c.set(n - 1);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// A restarted supervisor over the harness's bus: boot after every row published so far (every
+/// earlier claim is dead), armed on `floor`.
+fn restarted(h: &Harness, floor: i64) -> SupervisorCore {
+    let mut cfg = sup_cfg(&h.rig);
+    std::thread::sleep(Duration::from_millis(5));
+    cfg.boot_ms = crate::interaction::now_millis() + 1;
+    std::thread::sleep(Duration::from_millis(5));
+    let mut b = SupervisorCore::new(cfg, h.host.clone(), h.council.clone());
+    b.arm(&LiveTeamRun {
+        run_id: RUN.into(),
+        status: crate::domain::SessionStatus::Executing,
+        team: crate::domain::RunTeamState {
+            transport: Some(Transport::Bus),
+            stream_floor: Some(floor),
+            ..Default::default()
+        },
+        roster: vec!["claude#1".into(), "claude#2".into()],
+    });
+    b
+}
+
+fn raise_high(h: &Harness, ord: u32, attempt: u32, seq: u32, id: &str) -> i64 {
+    h.publish(&fixture_with(tev::FINDING_RAISED, 0, RUN, |p| {
+        p["ord"] = json!(ord);
+        p["attempt"] = json!(attempt);
+        p["raise_seq"] = json!(seq);
+        p["finding_id"] = json!(id);
+        p["line_key"] = json!(format!("l-{id}"));
+    }))
+}
+
+/// A bus reader that serves `ok` reads of one row each, then fails every read.
+fn failing_after(bus: &str, ok: usize) -> impl FnMut(i64, usize) -> anyhow::Result<Vec<BusEvent>> {
+    let bus = bus.to_string();
+    let mut calls = 0usize;
+    move |after, n| {
+        calls += 1;
+        if calls > ok {
+            anyhow::bail!("injected replay read failure");
+        }
+        BusDb::shared(&bus).and_then(|db| db.poll(TEAM_FILTER, after, n))
+    }
+}
+
+/// D3 (review round 2 on #628): a replay read that fails AFTER the run's `path.started` was read
+/// must not skip the rows it never read. The dead attempt's HIGH is still carried into the next
+/// attempt (the live loop re-reads from where the replay stopped), never lost with a clean fold.
+#[test]
+fn t6_d3_a_replay_read_failure_never_skips_rows_and_the_dead_high_is_carried() {
+    let mut h = Harness::new("t6-d3");
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 0, "claude#1");
+    raise_high(&h, 3, 0, 1, "f-d3high");
+    let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
+    let mut b = restarted(&h, floor);
+    // One row (path.started) is read, then every read fails.
+    let mut read = failing_after(&h.rig.bus, 1);
+    let (cursor, jobs) = replay_with(&mut b, tail, None, &mut read, 1);
+    assert!(jobs.is_empty(), "history starts nothing");
+    h.core = b;
+    h.cursor = cursor;
+    h.pump();
+    h.claim(3, 1, "claude#1");
+    h.pump();
+    let carried: Vec<Value> = h
+        .rows(tev::FINDING_RAISED)
+        .into_iter()
+        .filter(|r| r["attempt"] == 1)
+        .collect();
+    assert_eq!(
+        carried.len(),
+        1,
+        "the dead attempt's HIGH is carried: {carried:#?}"
+    );
+    assert_eq!(carried[0]["carried_from_attempt"], 0);
+    assert!(
+        cursor < tail,
+        "a failed replay resumes below the rows it never read (cursor {cursor}, tail {tail})"
+    );
+}
+
+/// D3: the arm-and-replay of a run that surfaced live surfaces a failed read (never a silent
+/// stop), and the run is re-armed and re-read at the next `ARM_RETRY`.
+#[test]
+fn t6_d3_replay_run_surfaces_a_failed_read_and_re_arms_the_run() {
+    let h = Harness::new("t6-d3run");
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 0, "claude#1");
+    raise_high(&h, 3, 0, 1, "f-d3run");
+    let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
+    let mut b = restarted(&h, floor);
+    let mut read = failing_after(&h.rig.bus, 1);
+    let r = replay_run_with(&mut b, RUN, tail, &mut read, 1);
+    assert!(
+        r.is_err(),
+        "a failed read is surfaced: {:?}",
+        r.map(|j| j.len())
+    );
+    assert!(
+        b.unknown_due(Instant::now() + ARM_RETRY)
+            .contains(&RUN.to_string()),
+        "the run is asked for again and replayed from its floor"
+    );
+}
+
+/// D4 (review round 2 on #628): retention drops `path.started`, attempt 0's `step.claimed` and its
+/// first `finding.raised{high}`, while a LATER row of attempt 0 survives. The survivor must not
+/// read as "attempt 0's rows are all here": only a present claim proves that. Attempt 1's fold is
+/// `stream_gap` (pauses) instead of losing the HIGH.
+#[test]
+fn t6_d4_a_partial_age_out_of_an_earlier_attempt_is_a_stream_gap() {
+    let mut h = Harness::new("t6-d4");
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    let claim0 = h.claim(3, 0, "claude#1");
+    let high = raise_high(&h, 3, 0, 1, "f-d4high");
+    h.publish(&fixture_with(tev::FINDING_RAISED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(0);
+        p["raise_seq"] = json!(2);
+        p["finding_id"] = json!("f-d4medium");
+        p["line_key"] = json!("l-d4medium");
+        p["severity"] = json!("medium");
+    }));
+    let conn = h.rig.conn();
+    for id in [floor, claim0, high] {
+        conn.execute("DELETE FROM events WHERE event_id = ?1", [id])
+            .unwrap();
+    }
+    drop(conn);
+    let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
+    let mut b = restarted(&h, floor);
+    let (cursor, _) = replay(&mut b, &h.rig.bus, tail, None);
+    h.core = b;
+    h.cursor = cursor;
+    h.claim(3, 1, "claude#1");
+    h.pump();
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let l = h.folded(3, 1);
+    assert_eq!(l.final_pass, FinalPass::StreamGap, "{l:#?}");
+    assert!(l.team_pause);
+}
+
+/// D5 (review round 2 on #628): with no tail snapshot, the replay covers EVERYTHING as history,
+/// and a dead attempt's `help.requested` starts no member turn in any read mode — no
+/// `help.answered` is published for an attempt nobody waits on.
+#[test]
+fn t6_d5_no_tail_snapshot_replays_everything_and_a_dead_attempts_help_starts_nothing() {
+    let mut h = Harness::new("t6-d5");
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 0, "claude#1");
+    h.publish(&fixture_with(tev::HELP_REQUESTED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(0);
+    }));
+    let mut b = restarted(&h, floor);
+    let (cursor, jobs) = replay(&mut b, &h.rig.bus, replay_tail(None), None);
+    assert!(jobs.is_empty(), "history starts nothing");
+    h.core = b;
+    h.cursor = cursor;
+    h.pump();
+    assert_eq!(
+        h.host.turn_count(),
+        0,
+        "no member turn for a dead attempt's help"
+    );
+    assert!(h.rows(tev::HELP_ANSWERED).is_empty());
+    // The same row read LIVE (the mode never decides liveness) starts nothing either.
+    h.cursor = 0;
+    h.pump();
+    assert_eq!(h.host.turn_count(), 0);
+    assert!(h.rows(tev::HELP_ANSWERED).is_empty());
+}
+
+/// Absence row 18 (review round 2 on #628): the hold round's (or the councils') read of the
+/// attempt's rows fails while the fold's own read succeeds. The fold must not look complete: it
+/// is `stream_gap` and pauses.
+#[test]
+fn row18_a_failed_hold_round_read_folds_stream_gap() {
+    for fail in [1u32, 2] {
+        let mut h = Harness::new(&format!("t6-row18-{fail}"));
+        h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+        h.claim(3, 1, "claude#1");
+        h.pump();
+        h.complete(3, 1, "claude#1", "ok");
+        // The final pass runs inline in `pump`: fail its first `fail` reads (the hold round's,
+        // then the councils'), and let the fold's read succeed.
+        FAIL_ATTEMPT_ROWS.with(|c| c.set(fail));
+        h.pump();
+        FAIL_ATTEMPT_ROWS.with(|c| c.set(0));
+        let l = h.folded(3, 1);
+        assert_eq!(l.final_pass, FinalPass::StreamGap, "fail {fail}: {l:#?}");
+        assert!(l.team_pause, "fail {fail}");
+    }
+}
