@@ -491,7 +491,7 @@ mod stub_output_tests {
 // needs to drive a phase (its gate policy, whether it runs code, whether it needs verified evidence,
 // its role for the evaluator≠creator split, its dependencies) is DATA on the phase. The reducer
 // branches on these fields — never on the workflow `id` and never on a closed `match` over a phase
-// name. Adding a built-in (feature/bug/migration/onboarding/collab, below) or a new workflow is a
+// name. Adding a built-in (feature/bug/migration, below) or a new workflow is a
 // data value, not a core change.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -824,6 +824,9 @@ impl PhaseDef {
         self.allowed_skills = allowed.iter().map(|s| s.to_string()).collect();
         self
     }
+    /// Test fixtures only: no compiled built-in has a Tool phase since `onboarding` became a
+    /// preset (DES-TEAMING-002 M4).
+    #[cfg(test)]
     pub(crate) fn executor(mut self, executor: PhaseExecutor) -> Self {
         self.executor = executor;
         self
@@ -1022,7 +1025,8 @@ impl WorkflowDef {
 }
 
 /// The registry of known workflows — id → def. `with_defaults()` seeds the built-ins
-/// (feature/bug/migration/onboarding/collab).
+/// (feature/bug/migration). `chat` and `onboarding` are built-in PRESETS now
+/// (`crate::catalog::builtin_presets`, DES-TEAMING-002 M3/M4).
 /// Registering a new workflow is a data insert (Law 2); the reducer only ever `get`s a def.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowRegistry {
@@ -1030,17 +1034,10 @@ pub struct WorkflowRegistry {
 }
 
 impl WorkflowRegistry {
-    /// The built-in workflows (feature/bug/migration/onboarding/collab), each validated at
-    /// construction.
+    /// The built-in workflows (feature/bug/migration), each validated at construction.
     pub fn with_defaults() -> Self {
         let mut r = WorkflowRegistry::default();
-        for def in [
-            feature_def(),
-            bug_def(),
-            migration_def(),
-            onboarding_def(),
-            collab_def(),
-        ] {
+        for def in [feature_def(), bug_def(), migration_def()] {
             r.register(def).expect("built-in workflow defs are valid");
         }
         r
@@ -1244,40 +1241,6 @@ fn refuse_unpinned_verified_evidence(def: &WorkflowDef) -> Result<(), WorkflowDe
 
 /// `feature` — clarify(value) → design(strategy) → build(execution) → adversarial-review → test → review.
 /// Gates: HumanConfirm after clarify + after adversarial-review; HumanConfirmIf(¬PASS) on test.
-/// The collaborative-discussion workflow: two (or more) seats argue a design to an
-/// outcome. Roles alternate creator/evaluator so evaluator-distinct FORCES the critic
-/// onto a different CLI, and cross-CLI context injection carries each side's actual
-/// words to the other. Verified to produce genuine dialogue (grounded critique,
-/// point-by-point revision, honest verdicts).
-pub fn collab_def() -> WorkflowDef {
-    WorkflowDef {
-        base_skill_ref: None,
-        id: "collab".to_string(),
-        phases: vec![
-            PhaseDef::new("propose", StageKind::Recon)
-                .gate(GateType::Value, GateSpec::Auto)
-                .role(PhaseRole::Creator),
-            PhaseDef::new("critique", StageKind::Review)
-                .gate(GateType::Value, GateSpec::Auto)
-                .role(PhaseRole::Evaluator)
-                .after("propose"),
-            PhaseDef::new("revise", StageKind::Recon)
-                .gate(GateType::Strategy, GateSpec::Auto)
-                .role(PhaseRole::Creator)
-                .after("critique"),
-            PhaseDef::new("verdict", StageKind::Review)
-                .gate(
-                    GateType::Value,
-                    GateSpec::HumanConfirm {
-                        unconditional: false,
-                    },
-                )
-                .role(PhaseRole::Evaluator)
-                .after("revise"),
-        ],
-    }
-}
-
 pub fn feature_def() -> WorkflowDef {
     WorkflowDef {
         base_skill_ref: None,
@@ -1409,64 +1372,10 @@ pub fn migration_def() -> WorkflowDef {
     }
 }
 
-/// `onboarding` — estate indexing pipeline for a registered repo (2 deterministic tool phases).
-/// Phases run in the session's `workdir` (the repo root); no council is convened.
-/// index → annotate (sequential).
-///
-/// # What this deliberately does NOT do
-///
-/// It does not produce `requirements_graph.json`. A third phase used to run `wicked-core
-/// domain-graph` here, and it could never succeed: that command gates fail-closed on front-half
-/// coverage == 1.0, and coverage is the fraction of behavior-bearing symbols carrying a requirement
-/// annotation or risk flag. `wicked-estate clusters --annotate` is CLUSTERING — it does not annotate
-/// a single symbol with a requirement. On a real repo (AutoGPT, 42,925 nodes, indexed and annotated
-/// by exactly these two phases) the recompute is **0.0000 — 28,885 of 28,885 behavior-bearing nodes
-/// unaccounted**. Not "usually short of the bar": nothing had ever been in the numerator.
-///
-/// So every repo registration ended `sessionFailed` on a phase that was structurally incapable of
-/// passing, after the two phases that matter had both succeeded (FINDING-068).
-///
-/// Coverage comes from the AGENTIC front-half — [`crate::DOMAIN_EXTRACTION_WORKFLOW_ID`], whose
-/// `extract` phase writes the annotations and whose `coverage` phase measures them. `domain-graph`
-/// is the last phase of THAT workflow, downstream of the four phases that produce its precondition.
-/// Onboarding is deterministic tools and no council by construction, so it cannot host any of them.
-///
-/// The gate is not the defect and must not be relaxed to make this pass: refusing to translate a
-/// partially-annotated graph is the design (DES-OUTGOV-001/005), and a domain model built from a
-/// 0%-covered graph is a file full of confident nonsense.
 /// Placeholder for the run's repo root, substituted per run by [`crate::plan::bind_repo_paths`].
 pub const REPO_ROOT_TOKEN: &str = "{repo_root}";
 /// Placeholder for the run's engine-resolved code graph, substituted per run.
 pub const CODE_GRAPH_DB_TOKEN: &str = "{code_graph_db}";
-
-pub fn onboarding_def() -> WorkflowDef {
-    WorkflowDef {
-        base_skill_ref: None,
-        id: "onboarding".to_string(),
-        phases: vec![
-            PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
-                cmd: vec![
-                    "wicked-estate".to_string(),
-                    "index".to_string(),
-                    REPO_ROOT_TOKEN.to_string(),
-                    "--db".to_string(),
-                    CODE_GRAPH_DB_TOKEN.to_string(),
-                ],
-            }),
-            PhaseDef::new("annotate", StageKind::Recon)
-                .executor(PhaseExecutor::Tool {
-                    cmd: vec![
-                        "wicked-estate".to_string(),
-                        "clusters".to_string(),
-                        "--annotate".to_string(),
-                        "--db".to_string(),
-                        CODE_GRAPH_DB_TOKEN.to_string(),
-                    ],
-                })
-                .after("index"),
-        ],
-    }
-}
 
 #[cfg(test)]
 mod workflow_def_tests {
@@ -1475,26 +1384,7 @@ mod workflow_def_tests {
     #[test]
     fn registry_seeds_the_builtin_workflows() {
         let r = WorkflowRegistry::with_defaults();
-        assert_eq!(
-            r.ids(),
-            vec!["bug", "collab", "feature", "migration", "onboarding"]
-        );
-    }
-
-    #[test]
-    fn collab_alternates_creator_and_evaluator_roles() {
-        let def = collab_def();
-        let roles: Vec<_> = def.phases.iter().map(|p| p.role).collect();
-        assert_eq!(
-            roles,
-            vec![
-                PhaseRole::Creator,
-                PhaseRole::Evaluator,
-                PhaseRole::Creator,
-                PhaseRole::Evaluator
-            ],
-            "evaluator-distinct must force the critic/verdict onto a different CLI"
-        );
+        assert_eq!(r.ids(), vec!["bug", "feature", "migration"]);
     }
 
     #[test]
@@ -1566,42 +1456,6 @@ mod workflow_def_tests {
         for def in [feature_def(), bug_def(), migration_def()] {
             def.validate()
                 .unwrap_or_else(|e| panic!("{} invalid: {e}", def.id));
-        }
-    }
-
-    /// Onboarding runs the two deterministic phases and stops (FINDING-068).
-    ///
-    /// A third phase ran `wicked-core domain-graph`, which gates fail-closed on front-half coverage
-    /// == 1.0. Neither phase here writes a requirement annotation — `clusters --annotate` is
-    /// clustering — so the recompute is 0.0 and the phase could not pass. Measured on AutoGPT after
-    /// exactly these two phases: 28,885 of 28,885 behavior-bearing nodes unaccounted. Every repo
-    /// registration ended `sessionFailed` after the work that mattered had already succeeded.
-    ///
-    /// `domain-graph` belongs to `domain-extraction`, downstream of the `extract` + `coverage`
-    /// phases that produce its precondition. Do not move it back here to "complete" onboarding, and
-    /// do not relax the coverage gate to make it pass — a domain model translated from a 0%-covered
-    /// graph is confident nonsense, which is why the gate fails closed.
-    #[test]
-    fn onboarding_runs_only_what_it_can_actually_finish() {
-        let def = onboarding_def();
-        def.validate().expect("onboarding is a valid def");
-        assert_eq!(
-            def.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            ["index", "annotate"]
-        );
-
-        // Stated as "no phase shells out to domain-graph" rather than "no phase named `domain`",
-        // because the defect is the COMMAND's unmeetable precondition, not the phase's name.
-        for phase in &def.phases {
-            if let PhaseExecutor::Tool { cmd } = &phase.executor {
-                assert!(
-                    !cmd.iter().any(|a| a == "domain-graph"),
-                    "onboarding phase `{}` runs `{}`, whose coverage gate no phase in this \
-                     workflow can satisfy — see FINDING-068",
-                    phase.id,
-                    cmd.join(" ")
-                );
-            }
         }
     }
 
@@ -2453,76 +2307,6 @@ mod workflow_def_tests {
         assert_eq!(pin_of(&reg, "wf-unverified", "check"), None);
     }
 
-    /// FINDING-011, asserted against the SHIPPED `survey-repo` drop-in (the workflow the finding
-    /// billed: $3.09 / 1.74M tokens for three near-identical surveys and no answer).
-    ///
-    /// Substance, not presence: the property is that the PLANNED PROMPTS stop being interchangeable
-    /// and that something downstream consumes the recon phases. So this plans the def and asserts
-    /// the prompt BODIES (after the `<phase> — ` prefix, the only part that ever differed) are
-    /// pairwise distinct, and that the final phase declares a dependency on EVERY earlier phase —
-    /// the declared-handoff edge (FINDING-024) is what makes the actor inject their outputs as
-    /// prior context, so synthesis reads the surveys instead of re-running one.
-    #[test]
-    fn shipped_survey_repo_plans_distinct_prompts_and_a_synthesis_over_all_recon() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/survey-repo.json");
-        let def = WorkflowRegistry::def_from_file(&path).expect("shipped survey-repo parses");
-
-        // The last phase consumes every phase before it — a synthesis, not another survey.
-        let last = def.phases.last().expect("non-empty");
-        let earlier: Vec<&str> = def.phases[..def.phases.len() - 1]
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect();
-        assert!(
-            earlier.len() >= 3,
-            "survey-repo must still fan out over multiple recon phases, found {earlier:?}"
-        );
-        for id in &earlier {
-            assert!(
-                last.depends_on.iter().any(|d| d == id),
-                "final phase `{}` must depend on `{id}` so that phase's output is injected as \
-                 prior context — without the edge the synthesis runs blind (FINDING-024/011)",
-                last.id
-            );
-        }
-
-        // Every phase states its own slice of the work, and no two slices are the same text.
-        for p in &def.phases {
-            let instr = p.instructions.as_deref().map(str::trim).unwrap_or("");
-            assert!(
-                !instr.is_empty(),
-                "phase `{}` carries no instructions — its prompt collapses back to \
-                 `<phase> — <intent>`, the near-identical shape this finding is about",
-                p.id
-            );
-        }
-
-        // The planned prompt bodies are pairwise distinct beyond the phase-id token. Strip the
-        // `<phase.id> — ` prefix so the comparison cannot be satisfied by the id alone (which is
-        // exactly how the defective prompts "differed").
-        let units =
-            crate::plan::plan_from_def(&def, "what is this repo and how do I work in it", "s");
-        let bodies: Vec<String> = units
-            .iter()
-            .zip(def.phases.iter())
-            .map(|(u, p)| {
-                u.description
-                    .strip_prefix(&format!("{} — ", p.id))
-                    .unwrap_or(&u.description)
-                    .to_string()
-            })
-            .collect();
-        for i in 0..bodies.len() {
-            for j in (i + 1)..bodies.len() {
-                assert_ne!(
-                    bodies[i], bodies[j],
-                    "phases `{}` and `{}` plan the same prompt body — near-identical prompts again",
-                    def.phases[i].id, def.phases[j].id
-                );
-            }
-        }
-    }
     // ---- DES-TEAMING-002 D1: the per-run plan namespace is reserved ----
 
     fn def_with_id(id: &str) -> WorkflowDef {

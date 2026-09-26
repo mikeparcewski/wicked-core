@@ -14246,7 +14246,7 @@ mod def_gate_disclosure_tests {
 
     /// The terminal-gate pause (seam finding #4) is a def-authored gate too, reached through a
     /// DIFFERENT branch of `advance_or_pause` — it must disclose under `none` as well, or the one
-    /// workflow ending on a human gate (`collab`) stalls its unattended runs unexplained.
+    /// workflow ending on a human gate stalls its unattended runs unexplained.
     #[test]
     fn a_terminal_def_gate_under_none_discloses_too() {
         let mut store = open_store(Some(":memory:")).unwrap();

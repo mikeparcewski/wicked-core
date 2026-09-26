@@ -369,7 +369,10 @@ mod tests {
     #[test]
     fn seeding_is_idempotent_by_name() {
         let mut store = mem_store();
-        assert_eq!(seed_builtins(&mut store, 10).unwrap(), ["feature"]);
+        assert_eq!(
+            seed_builtins(&mut store, 10).unwrap(),
+            ["chat", "feature", "onboarding"]
+        );
         assert!(seed_builtins(&mut store, 20).unwrap().is_empty());
         let f = resolve(&store, None, "feature").unwrap().unwrap();
         assert_eq!((f.created_by.as_str(), f.updated_at), ("builtin", 10));
@@ -387,7 +390,10 @@ mod tests {
             deleted_at: None,
         };
         crate::domain::put_node(&mut store, stale.to_node()).unwrap();
-        assert_eq!(seed_builtins(&mut store, 5).unwrap(), ["feature"]);
+        assert_eq!(
+            seed_builtins(&mut store, 5).unwrap(),
+            ["chat", "feature", "onboarding"]
+        );
         let f = resolve(&store, None, "feature").unwrap().unwrap();
         assert_eq!(f.steps.len(), 6);
     }
@@ -488,7 +494,14 @@ mod tests {
             .into_iter()
             .map(|p| (p.name, p.scope))
             .collect();
-        assert_eq!(listed, [("feature".to_string(), format!("project:{pid}"))]);
+        assert_eq!(
+            listed,
+            [
+                ("chat".to_string(), GLOBAL_SCOPE.to_string()),
+                ("feature".to_string(), format!("project:{pid}")),
+                ("onboarding".to_string(), GLOBAL_SCOPE.to_string()),
+            ]
+        );
     }
 
     #[test]

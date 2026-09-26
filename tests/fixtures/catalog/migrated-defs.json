@@ -1,0 +1,76 @@
+{
+  "chat": {
+    "id": "chat",
+    "phases": [
+      {
+        "id": "explore",
+        "kind": "recon",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null
+      }
+    ]
+  },
+  "onboarding": {
+    "id": "onboarding",
+    "phases": [
+      {
+        "id": "index",
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "wicked-estate",
+            "index",
+            "{repo_root}",
+            "--db",
+            "{code_graph_db}"
+          ]
+        },
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null
+      },
+      {
+        "id": "annotate",
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "wicked-estate",
+            "clusters",
+            "--annotate",
+            "--db",
+            "{code_graph_db}"
+          ]
+        },
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "index"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null
+      }
+    ]
+  }
+}

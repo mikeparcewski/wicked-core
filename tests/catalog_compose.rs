@@ -7,7 +7,9 @@
 //! "Today's def" is read LIVE for every consumer core owns — `WorkflowRegistry::with_defaults()`
 //! overlaid with the shipped `workflows/*.json`, which is what the engine resolves — and from
 //! `tests/fixtures/catalog/crew-defs.json` for the consumers only crew defines (dumped from crew
-//! `main` 4870c87 — see `tests/fixtures/catalog/README.md`). The steps and the bold cells are
+//! `main` 4870c87 — see `tests/fixtures/catalog/README.md`), and from
+//! `tests/fixtures/catalog/migrated-defs.json` for the consumers whose def a migration seam
+//! deleted (M3 `chat`, M4 `onboarding`): the fixture keeps pinning their built-in presets. The steps and the bold cells are
 //! `tests/fixtures/catalog/mappings.json`; the bold cells are fixed values, and the migration
 //! cleanup cells are pinned again below in code.
 
@@ -36,21 +38,19 @@ const FIELDS: [&str; 9] = [
     "depends_on",
 ];
 
-/// Every §11.2 consumer row.
-const CONSUMERS: [&str; 19] = [
+/// Every §11.2 consumer row that still exists. `survey-repo`, `memories`, `domain-graph-slice`
+/// and `collab` were deleted outright (operator decision, 2026-09-26: nothing launched them), so
+/// they have no preset and no fixture.
+const CONSUMERS: [&str; 15] = [
     "feature",
     "bug",
     "migration",
     "deliver",
     "chat",
     "onboarding",
-    "survey-repo",
     "capture-learnings",
-    "memories",
-    "domain-graph-slice",
     "domain-extraction",
     "steering-author",
-    "collab",
     "interactive-chat",
     "interactive-draft",
     "interactive-edit",
@@ -76,21 +76,30 @@ fn today_defs() -> BTreeMap<String, WorkflowDef> {
         .expect("the shipped workflows/ overlay loads");
     assert_eq!(
         loaded.len(),
-        8,
+        4,
         "every shipped workflow file loads: {loaded:?}"
     );
     let mut out = BTreeMap::new();
     for id in reg.ids() {
         out.insert(id.clone(), reg.get(&id).unwrap().clone());
     }
-    let crew = read_json(fixtures().join("crew-defs.json"));
-    for (consumer, def) in crew.as_object().expect("crew-defs.json is an object") {
+    let mut fixed = read_json(fixtures().join("crew-defs.json"))
+        .as_object()
+        .cloned()
+        .expect("crew-defs.json is an object");
+    fixed.extend(
+        read_json(fixtures().join("migrated-defs.json"))
+            .as_object()
+            .cloned()
+            .expect("migrated-defs.json is an object"),
+    );
+    for (consumer, def) in &fixed {
         let def: WorkflowDef = serde_json::from_value(def.clone())
             .unwrap_or_else(|e| panic!("crew fixture {consumer}: {e}"));
         def.validate().unwrap();
         assert!(
             out.insert(consumer.clone(), def).is_none(),
-            "{consumer} is defined by core — its fixture must come from core, not crew"
+            "{consumer} is defined by core — its fixture must come from core, not a fixture file"
         );
     }
     out
@@ -162,8 +171,8 @@ fn compose_of_every_mapping_equals_todays_def_except_the_bold_cells() {
         bold_total += bold.len();
     }
     // feature 2 (test/review role), migration 5 (cutover pin+role, cleanup pin+code+role),
-    // domain-extraction 1, steering-author 1, collab 2 (kind recon → build).
-    assert_eq!(bold_total, 11, "§11.2 has eleven bold cells");
+    // domain-extraction 1, steering-author 1 (collab's 2 left with the deleted workflow).
+    assert_eq!(bold_total, 9, "§11.2 has nine bold cells");
 }
 
 /// domain-extraction's coverage maps onto `domain_coverage`, which carries the coverage pin as
