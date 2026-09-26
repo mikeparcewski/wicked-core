@@ -167,7 +167,9 @@ pub use plan::{
     compose, floor_fill, plan_from_def, AddedBy, FieldRule, FloorFilled, FloorInput, FloorOverride,
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
-pub use plan_gate::{PendingPlan, PlanPreview, PlanProposal, TeamPlanState};
+pub use plan_gate::{
+    PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, TeamPlanState,
+};
 pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
@@ -1450,7 +1452,9 @@ impl Core {
     /// touch set the score reads that repo's code graph at the base a launch would start from, read
     /// locally with NO fetch (the local remote-default tip, else HEAD — the launch fetches first,
     /// so a stale clone may start further on). No usable graph: `graph: "unavailable"` and the
-    /// fail-closed score. `deliver_step` is the launch's. `Err` carries the launch's refusal, an
+    /// fail-closed score. A creator plan with no declared touch set (DES-TEAMING-002 X1) is scored
+    /// by its PA after launch: `graph: "pending_pa_scope"`, the `pa-scope` step first and the
+    /// baseline's floor, never the fail-closed score as if final. `deliver_step` is the launch's. `Err` carries the launch's refusal, an
     /// unregistered repo, or a base that cannot be resolved.
     pub fn preview_plan(
         &self,

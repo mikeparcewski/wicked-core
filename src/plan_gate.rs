@@ -36,12 +36,17 @@ use crate::workflow::WorkflowDef;
 
 mod preview;
 mod revise;
+mod scope;
 pub(crate) use preview::preview_plan;
 pub use preview::PlanPreview;
 pub(crate) use revise::{
     changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
     Change, DiffRescore, Outcome, PlanLines,
 };
+pub(crate) use scope::{
+    decide_scoped, needs_pa_scope, scope_lines_of, scope_rev, with_scope_step, SCOPE_STEP_ID,
+};
+pub use scope::{ScopeAnswer, ScopeHold};
 
 /// The `gate_kind` token of a plan approval pause (`AwaitingHuman.gate_kind`, the durable
 /// interaction row, `gate.opened.kind`).
@@ -50,6 +55,10 @@ pub(crate) const GATE_KIND: &str = "plan_approval";
 /// `plan.refused.reason` for a floor override in auto mode (§8.5), spelled as DES-TEAMING-002
 /// spells it.
 pub(crate) const OVERRIDE_IN_AUTO: &str = "override in auto mode";
+
+/// (X1) The refusal of a floor override on a plan with no declared touch set.
+pub(crate) const OVERRIDE_NEEDS_TOUCH: &str = "a floor override needs a declared touch set: the \
+     floor it removes from is scored from it, and a plan with none is scored by its PA after launch";
 
 /// A run's plan state (DES-TEAMING-002 §8.4-§8.6), persisted on `AgentSession.team_plan` so a
 /// restart keeps a `plan_approval` gate open and answerable. Every field is engine-computed.
@@ -112,6 +121,11 @@ pub struct TeamPlanState {
     /// request id never proposes (or publishes) twice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edit_requests: Vec<String>,
+    /// (X1) The launch plan the PA is scoping: set at launch for a creator plan with no declared
+    /// touch set (rev 1 is then the read-only scope step alone), taken at the scope step's
+    /// boundary, where the plan is scored from the PA's answer and decided as the initial plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeHold>,
 }
 
 /// A mid-run human edit (`Core::propose_plan`) waiting for the next step boundary.
@@ -577,7 +591,9 @@ pub(crate) fn decide(
         def: def.clone(),
         ..filled.clone()
     });
-    let event = if prior.accepted_rev == 0 {
+    // The run's first plan — or (X1) the launch plan its PA just scoped, whose only accepted rev
+    // is the read-only scope step — meets the matrix's initial row.
+    let event = if prior.accepted_rev == 0 || proposal.kind == ProposalKind::Initial {
         PlanEvent::Initial
     } else {
         PlanEvent::Revision {
@@ -725,6 +741,10 @@ pub(crate) fn precheck(
         }))
     } else if plan.floor_override.is_some() && is_auto(human_confirm) {
         Some(OVERRIDE_IN_AUTO.to_string())
+    } else if plan.floor_override.is_some() && needs_pa_scope(&plan) {
+        // (X1) The floor an override removes from is computed from the score, and a creator plan
+        // with no touch set is scored by its PA after launch: nothing to judge the override by.
+        Some(OVERRIDE_NEEDS_TOUCH.to_string())
     } else {
         crate::plan::compose(crate::catalog::catalog(), &plan)
             .err()
@@ -753,13 +773,17 @@ pub(crate) fn worst_case_floor_additions(
 }
 
 /// The launch plan's AUTHORED steps composed as rev 1 (`<run>:plan-1`), for the launch-time
-/// checks that read a def (tool preflight, base skill, seat need). The floor is added later.
+/// checks that read a def (tool preflight, base skill, seat need). The floor is added later. A
+/// plan the PA scopes (X1) is checked with its scope step first, as it will run (`unbound`: the
+/// run has no repo).
 pub(crate) fn authored_def(
     run_id: &str,
     plan: &PlanSteps,
     deliver_step: Option<&PlanStep>,
+    unbound: bool,
 ) -> anyhow::Result<WorkflowDef> {
-    let plan = with_default_ids(&with_deliver(plan, deliver_step).map_err(anyhow::Error::msg)?);
+    let plan = with_scope_step(plan, unbound);
+    let plan = with_default_ids(&with_deliver(&plan, deliver_step).map_err(anyhow::Error::msg)?);
     let mut def = crate::plan::compose(crate::catalog::catalog(), &plan)
         .map_err(|r| anyhow::anyhow!("{r}"))?;
     def.id = per_run_def_id(run_id, 1);

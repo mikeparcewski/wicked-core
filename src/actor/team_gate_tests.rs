@@ -2553,8 +2553,9 @@ fn steps(v: serde_json::Value) -> crate::PlanSteps {
     serde_json::from_value(v).expect("a plan")
 }
 
-/// An auto-mode `build` plan with no declared scope: scores 100, is high risk, and pauses
-/// `plan_approval` before its first unit (T2 (g)).
+/// An auto-mode `build` plan whose declared touch set cannot be scored (no repo, so no graph):
+/// scores 100, is high risk, and pauses `plan_approval` before its first unit (T2 (g)). It
+/// declares `touch`, so the launch decides it (X1: a plan with none is scoped by its PA first).
 fn launch_plan_run(e: &Engine, run: &str) {
     e.core
         .launch_run(LaunchSpec {
@@ -2571,9 +2572,10 @@ fn launch_plan_run(e: &Engine, run: &str) {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
-            plan: Some(steps(
-                serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]}),
-            )),
+            plan: Some(steps(serde_json::json!({
+                "steps": [{"catalog": "build", "id": "build"}],
+                "touch": ["src/sso.rs"]
+            }))),
             deliver_step: None,
         })
         .expect("launch");
@@ -2975,8 +2977,10 @@ fn plan_gate_kind() -> Vec<String> {
 }
 
 /// HIGH 1: an auto-mode plan whose only step is a `review` authored `executes_code: true` is a
-/// creator plan — it scores 100 (no declared scope), is high risk and pauses `plan_approval`
-/// before its unit runs (the unit is unguarded, so it would write the tree unapproved).
+/// creator plan — so (X1) its PA scopes it first: the read-only `pa-scope` step is the only unit
+/// that runs; its answer declares nothing, so the plan fails closed at 100, is high risk and
+/// pauses `plan_approval` before `check` runs (the unit is unguarded, so it would write the tree
+/// unapproved).
 #[test]
 fn an_auto_plan_whose_review_step_executes_code_pauses_for_approval() {
     let rig = rig("r10cr");
@@ -2992,7 +2996,8 @@ fn an_auto_plan_whose_review_step_executes_code_pauses_for_approval() {
     wait_for("the plan_approval gate", || {
         open_gate_kinds(&e.db, "r10c") == plan_gate_kind()
     });
-    assert_eq!(runs(&e), 0);
+    assert_eq!(runs(&e), 1, "only the PA's scope step ran");
+    assert_eq!(unit_ids(&e, "r10c")[0], crate::plan_gate::SCOPE_STEP_ID);
 }
 
 /// Routing: a run holding a plan whose gate row is already answered (the row answered, nothing
@@ -3044,7 +3049,7 @@ fn a_reassign_while_the_plan_is_held_dispatches_nothing() {
     try_launch_plan(
         &e,
         "r10r",
-        serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]}),
+        serde_json::json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}),
         HumanConfirm::None,
         None,
     )

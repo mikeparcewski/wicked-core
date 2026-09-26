@@ -45,10 +45,26 @@ impl Dispatcher for StubDispatcher {
 }
 
 /// Holds every unit until the test ends: the plan is persisted, nothing completes, so the unit
-/// list read back is exactly what the launch planned.
+/// list read back is exactly what the launch planned. The one exception is the PA's read-only
+/// `pa-scope` step (DES-TEAMING-002 X1: a preset declares no touch set, so its PA scopes it
+/// first): it answers at once with no `SCOPE` line, so the plan fails closed at 100 — the top
+/// band these tests pin — and is decided at that step's boundary.
 struct Hold(Arc<(Mutex<bool>, Condvar)>);
 impl StepRunner for Hold {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
+        if input.unit.id.ends_with(":pa-scope") {
+            return StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "looked around; nothing to declare".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            };
+        }
         let (lock, cv) = &*self.0;
         let mut done = lock.lock().unwrap();
         while !*done {
@@ -140,13 +156,19 @@ fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
 }
 
 /// The run's persisted units, once planning has written them (the launch returns before the
-/// deferred plan lands).
+/// deferred plan lands) — for a plan its PA scopes (X1), once the scoped plan is in, not just the
+/// `pa-scope` step of rev 1.
 fn units_of(core: &Core, run: &str) -> Vec<WorkUnit> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == run) {
-                if !v.units.is_empty() {
+                let scoping = v
+                    .session
+                    .team_plan
+                    .as_ref()
+                    .is_some_and(|t| t.scope.is_some());
+                if !v.units.is_empty() && !scoping {
                     return v.units.clone();
                 }
             }
@@ -195,14 +217,16 @@ fn r(
 
 /// C1(a)'s `feature` composition as a unit list (fixed values: §11.2's row, with its two bold
 /// cells — `test` and `review` on the evaluator role), launched as a TEAM plan (DES-TEAMING-002
-/// T3): a preset declares no `touch`, so its creator plan scores 100 ("no declared scope") and
-/// floor fill inserts the 70-100 floor phases it lacks (`test_plan`, `architecture`,
+/// T3): a preset declares no `touch`, so (X1) its PA scopes it first — the read-only `pa-scope`
+/// step, ord 1 — and this rig's PA declares nothing, so the plan fails closed at 100 and floor
+/// fill inserts the 70-100 floor phases it lacks (`test_plan`, `architecture`,
 /// `security_review`; `deliver` only for a delivering run) at their catalog-order positions.
 fn feature_units() -> Vec<(String, String, String, String, Option<String>)> {
     let hc = r#"{"human_confirm":{"unconditional":false}}"#;
     let hci = r#"{"human_confirm_if":"verdict_not_pass"}"#;
     let f = Some(EVIDENCE_FLOOR_PIN);
     vec![
+        r("pa-scope", "recon", "neutral", "auto", None),
         r("clarify", "recon", "neutral", hc, None),
         r("test_plan", "test", "neutral", "auto", None),
         r("design", "recon", "neutral", "auto", None),
@@ -242,6 +266,7 @@ fn my_flow_steps() -> Vec<PlanStep> {
 fn my_flow_units() -> Vec<(String, String, String, String, Option<String>)> {
     let f = Some(EVIDENCE_FLOOR_PIN);
     vec![
+        r("pa-scope", "recon", "neutral", "auto", None),
         r("scope", "recon", "neutral", "auto", None),
         r("test_plan", "test", "neutral", "auto", None),
         r("design", "recon", "neutral", "auto", None),
