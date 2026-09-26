@@ -2636,5 +2636,39 @@ mod tests {
             let read_only = plan(json!({"steps": [{"catalog": "understand", "id": "u"}]}));
             assert!(!read_only.has_creator());
         }
+
+        /// (T3 round 10, HIGH 1) A creator is the COMPOSED value, not the catalog name: any
+        /// non-Tool step whose phase executes code changes the tree, so it scores as a creator
+        /// (100 with no declared scope), gets the floor and is high risk — a `review` authored
+        /// `executes_code: true`, or an `understand` with a pin and `executes_code: true`. A Tool
+        /// step and a plain evaluator stay non-creators (score 0, empty floor).
+        #[test]
+        fn a_step_that_executes_code_is_a_creator_whatever_its_catalog() {
+            let pin = crate::builtin_floors::EVIDENCE_FLOOR_PIN;
+            for body in [
+                json!({"steps": [{"catalog": "review", "id": "check", "executes_code": true}]}),
+                json!({"steps": [{"catalog": "understand", "id": "u", "executes_code": true,
+                                  "validator_pin": pin}]}),
+            ] {
+                let p = plan(body.clone());
+                let scored = crate::plan_gate::intent_score_for_run(&p, None, None);
+                assert_eq!(scored.assessment.score, 100, "{body}");
+                let f = fill(&p, 100, &AUTO, None).unwrap();
+                assert!(f.high_risk, "{body}");
+                assert!(!f.floor.is_empty(), "{body}");
+            }
+            for body in [
+                json!({"steps": [{"catalog": "review", "id": "check"}]}),
+                json!({"steps": [{"catalog": "run", "id": "r", "executes_code": true,
+                                  "executor": {"type": "tool", "cmd": ["true"]}}]}),
+            ] {
+                let p = plan(body.clone());
+                let scored = crate::plan_gate::intent_score_for_run(&p, None, None);
+                assert_eq!(scored.assessment.score, 0, "{body}");
+                let f = fill(&p, 100, &AUTO, None).unwrap();
+                assert!(!f.high_risk, "{body}");
+                assert!(f.floor.is_empty(), "{body}");
+            }
+        }
     }
 }

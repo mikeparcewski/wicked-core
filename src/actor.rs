@@ -3957,6 +3957,7 @@ pub(crate) fn launch_run_inner(
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
     )?;
+    crate::failpoint::crash_point("launch.after_plan", &run_id);
     if let Some((state, _, _)) = team {
         let mut s = crate::domain::get_session(store, &run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} planned no session"))?;
@@ -6764,6 +6765,9 @@ fn advance_or_pause(
             plan_gate_key.as_deref(),
             prompt,
         )?;
+        if reason == PauseReason::PlanApproval {
+            crate::failpoint::crash_point("plan_gate.after_pause_batch", run_id);
+        }
         if let Some((gate_id, pending, from_rev)) = plan_gate_opened {
             match crate::plan_gate::gate_opened(
                 run_id,

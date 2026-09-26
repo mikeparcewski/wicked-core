@@ -714,6 +714,26 @@ fn parse_plan(json: &str) -> napi::Result<wicked_core::PlanSteps> {
     serde_json::from_str(json).map_err(|e| err(format!("planJson is not a valid plan: {e}")))
 }
 
+/// The decision `confirmGate` builds when it is handed `planJson` (an edit at a `plan_approval`
+/// gate): it requires `approve=true` and `action` omitted or `edit_plan`.
+fn edit_decision(
+    approve: bool,
+    _amend: Option<&str>,
+    action: Option<&str>,
+    _amend_scope: Option<&str>,
+    plan_json: &str,
+) -> napi::Result<HumanDecision> {
+    if !approve || !matches!(action, None | Some("edit_plan")) {
+        return Err(err(anyhow::anyhow!(
+            "planJson answers a plan_approval gate with an edit: it requires approve=true and \
+             action omitted or `edit_plan`"
+        )));
+    }
+    Ok(HumanDecision::EditPlan {
+        plan: parse_plan(plan_json)?,
+    })
+}
+
 // ── the binding surface ────────────────────────────────────────────────────────
 
 /// A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -1124,15 +1144,13 @@ impl Core {
             // edited plan (`action` omitted or `edit_plan`, `approve=true`). The engine accepts it
             // as the next rev or, refused, re-opens the gate.
             if let Some(json) = plan_json.as_deref() {
-                if !approve || !matches!(action.as_deref(), None | Some("edit_plan")) {
-                    return Err(err(anyhow::anyhow!(
-                        "planJson answers a plan_approval gate with an edit: it requires \
-                         approve=true and action omitted or `edit_plan`"
-                    )));
-                }
-                let decision = HumanDecision::EditPlan {
-                    plan: parse_plan(json)?,
-                };
+                let decision = edit_decision(
+                    approve,
+                    amend.as_deref(),
+                    action.as_deref(),
+                    amend_scope.as_deref(),
+                    json,
+                )?;
                 return core
                     .confirm_gate(&run_id, decision)
                     .map(status_token)
@@ -2282,6 +2300,21 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (T3 round 10, LOW 9) `planJson` is the whole answer: an `amend` or `amendScope` beside it
+    /// is refused, never silently dropped; without them the edit decision is built.
+    #[test]
+    fn an_edit_with_an_amend_or_amend_scope_is_refused() {
+        let plan = r#"{"steps":[{"catalog":"build","id":"build"}]}"#;
+        assert!(edit_decision(true, Some("tweak"), None, None, plan).is_err());
+        assert!(edit_decision(true, None, None, Some("creator"), plan).is_err());
+        assert!(edit_decision(true, Some(""), None, Some("cursor"), plan).is_err());
+        assert!(matches!(
+            edit_decision(true, None, Some("edit_plan"), None, plan),
+            Ok(HumanDecision::EditPlan { .. })
+        ));
+        assert!(edit_decision(false, None, None, None, plan).is_err());
+    }
     // Only the tests name a failure kind now that the CoreEvent → JSON mapping lives in core.
     use serde_json::Value;
     use wicked_core::StepFailureKind;
