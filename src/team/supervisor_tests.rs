@@ -1395,6 +1395,26 @@ fn t6_a_fold_past_its_deadline_is_tombstoned_never_published() {
     h.rig.refuse(&[tev::LEDGER_FOLDED]);
     h.complete(3, 1, "claude#1", "ok");
     h.pump();
+    // On a slow host the pass stops at its margin and spools a synthesized fold BEFORE the
+    // deadline; the cursor loop tombstones it once the deadline passes. Wait for that (as the
+    // test above does) before the bus returns, so the drain below races nothing.
+    let spooled_folds = |h: &Harness| -> Vec<String> {
+        h.rig
+            .outbox_lines()
+            .into_iter()
+            .filter(|l| l.get("type").and_then(Value::as_str) == Some(tev::LEDGER_FOLDED))
+            .filter_map(|l| l["idempotency_key"].as_str().map(str::to_string))
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while spooled_folds(&h)
+        .iter()
+        .any(|k| h.rig.team_bus().is_pending(k))
+        && Instant::now() < deadline
+    {
+        h.core.retry_spooled();
+        std::thread::sleep(Duration::from_millis(100));
+    }
     h.rig.allow();
     h.rig.team_bus().drain_all();
     assert!(
