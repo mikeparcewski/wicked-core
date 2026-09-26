@@ -406,8 +406,14 @@ fn deliverable_state(declared: &str, cwd: &Path, write_roots: &[String]) -> Foun
     } else if p.components().any(|c| matches!(c, Component::ParentDir)) {
         Vec::new()
     } else {
-        std::iter::once(cwd.join(p))
-            .chain(write_roots.iter().map(|r| Path::new(r).join(p)))
+        // Each candidate must stay inside the base it was joined to once symlinks resolve: a
+        // link out of the root is not this run's evidence (the absolute branch's rule).
+        std::iter::once(cwd)
+            .chain(write_roots.iter().map(Path::new))
+            .filter_map(|base| {
+                let c = base.join(p);
+                resolved_is_within(&resolve_symlinks(&c), base).then_some(c)
+            })
             .collect()
     };
     let states: Vec<Found> = candidates.iter().map(|c| content_state(c)).collect();
