@@ -327,6 +327,75 @@ fn x1_c_a_missing_answer_fails_closed_at_100_and_pauses() {
     release_all(&w);
 }
 
+/// (X4, DES-TEAMING-002 §8.3 / §11.2 capture-learnings, seam M7) A preset step carries its own
+/// `skill_ref` (a plan-step field, `SetIfUnset` on an entry with none), and the engine hands it to
+/// the worker of THAT step: no def and no launch field is needed to migrate a consumer whose
+/// phases name a skill. Launched as capture-learnings is — a creator preset on a repo, so the PA's
+/// `pa-scope` step runs first (and carries no skill: it is the engine's step, not the preset's) —
+/// and read off what each dispatched unit actually carried to the runner.
+#[test]
+fn x4_a_preset_steps_skill_ref_reaches_its_dispatched_unit() {
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+    let seen: Seen = Arc::default();
+    let rec = seen.clone();
+    let w = Worker::scripted(move |i, _| {
+        let phase = i.unit.id.rsplit(':').next().unwrap_or("").to_string();
+        rec.lock()
+            .unwrap()
+            .push((phase.clone(), i.unit.skill_ref.clone()));
+        match phase.as_str() {
+            "pa-scope" => turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None),
+            _ => turn(&pa_output("learned"), None),
+        }
+    });
+    let e = engine("x4", w.clone());
+    let (repo_id, _) = repo(&e, "x4");
+    let skill = "wicked-garden-repo-learn";
+    put(
+        &e,
+        "x4-capture-learnings",
+        json!([
+            {"catalog": "understand", "id": "churn", "skill_ref": skill},
+            {"catalog": "understand", "id": "hotspots", "skill_ref": skill,
+             "depends_on": ["churn"]},
+            {"catalog": "produce", "id": "capture", "skill_ref": skill,
+             "depends_on": ["hotspots"]}
+        ]),
+    );
+    launch_preset(
+        &e,
+        "x4r",
+        "x4-capture-learnings",
+        Some(&repo_id),
+        HumanConfirm::None,
+    );
+    wait_for("the preset's three steps to dispatch", || {
+        seen.lock().unwrap().len() >= 4
+    });
+    let got = seen.lock().unwrap().clone();
+    let want = |p: &str, s: Option<&str>| (p.to_string(), s.map(str::to_string));
+    assert_eq!(
+        got[..4],
+        [
+            want("pa-scope", None),
+            want("churn", Some(skill)),
+            want("hotspots", Some(skill)),
+            want("capture", Some(skill)),
+        ]
+    );
+    // The persisted units carry it too (studio and a restart read the node, not the runner).
+    let v = view(&e, "x4r");
+    for id in ["churn", "hotspots", "capture"] {
+        let u = v
+            .units
+            .iter()
+            .find(|u| u.id == format!("x4r:{id}"))
+            .unwrap();
+        assert_eq!(u.skill_ref.as_deref(), Some(skill), "{id}");
+    }
+    release_all(&w);
+}
+
 /// (X1 d) A preset with NO repo: the PA rates the content and audience; a client-facing RFP answer
 /// rated 45 lands in 40-69 (raised from the lowest-band baseline 0 through the model part — no
 /// graph) and proceeds in auto mode (not high risk). A later, LOWER rating from the PA changes
