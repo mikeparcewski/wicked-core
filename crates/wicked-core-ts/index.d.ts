@@ -460,8 +460,9 @@ export declare class Core {
   /**
    * A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
    * ADD. Held and applied at the run's next step boundary through the engine's revision path
-   * (the ratchet, floor fill, the approval matrix), which publishes `plan.proposed{by:"human",
-   * kind:"edit"}` then `plan.accepted` or a `plan_approval` gate. Idempotent by `requestId`.
+   * (the ratchet and floor fill apply), which publishes `plan.proposed{by:"human", kind:"edit"}`
+   * then `plan.accepted{by:"human"}`: its author approved it, so no `plan_approval` gate opens
+   * for it (as for an edit at the gate). Idempotent by `requestId`.
    * Resolves to JSON `{ proposal_id, duplicate }` (`duplicate: true` = this request id was
    * already taken; nothing new is held or published). Rejects for an unknown, finished or
    * un-planned run, an empty request id, or an edit carrying `touch` / `override`.
