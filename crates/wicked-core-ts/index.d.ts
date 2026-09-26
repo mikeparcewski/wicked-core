@@ -444,19 +444,22 @@ export declare class Core {
    */
   catalog(): Promise<string>
   /**
-   * What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` would
-   * compute, persisting and publishing nothing — the launch's own precheck, intent score, floor
-   * fill and approval matrix. Resolves to JSON `{ score, deterministic, reasons, destructive,
-   * band, high_risk, floor, floor_override, steps, def, pauses, pause_reason }`: `floor` is the
-   * floor phase types the plan owes; the steps the floor ADDED are the `steps` with
-   * `added_by: "floor"` (each with its `floor_reason`); `pauses` / `pause_reason`
-   * (`manual_mode` | `high_risk` | `override`) say whether the launch would pause at a
-   * `plan_approval` gate. Scores as a launch with no repo (a preview has no worktree) and no
-   * deliver step. `projectId` is accepted for the route's shape: a plan's preview does not
-   * depend on the project (only a preset name resolves per project). Rejects with the launch's
-   * refusal (compose, supplied provenance, an override in auto mode) or a bad `humanConfirm`.
+   * What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` on
+   * `repoRef` (the registered repo the launch would run on) with `deliverStepJson` (the
+   * launch's deliver step) would compute, persisting and publishing nothing — the launch's own
+   * plan resolution (`projectId`), precheck, intent score against the repo's code graph at the
+   * base its worktree would start from, floor fill, approval matrix and planning checks.
+   * Resolves to JSON `{ score, deterministic, reasons, destructive, band, high_risk, floor,
+   * floor_override, steps, def, pauses, pause_reason, graph }`: `floor` is the floor phase
+   * types the plan owes; the steps the floor ADDED are the `steps` with `added_by: "floor"`
+   * (each with its `floor_reason`); `pauses` / `pause_reason` (`manual_mode` | `high_risk` |
+   * `override`) say whether the launch would pause at a `plan_approval` gate; `graph` is
+   * `"ready"` (the score read the repo's graph), `"not_needed"` (a docs-only touch set) or
+   * `"unavailable"` (the fail-closed score: no repo, no or a stale graph, no declared scope).
+   * Rejects with the launch's refusal (compose, supplied provenance, an override in auto mode,
+   * a planning check), an unregistered `repoRef`, or a bad `humanConfirm` / `deliverStepJson`.
    */
-  previewPlan(planJson: string, projectId?: string | undefined | null, humanConfirm?: string | undefined | null): Promise<string>
+  previewPlan(planJson: string, projectId?: string | undefined | null, humanConfirm?: string | undefined | null, repoRef?: string | undefined | null, deliverStepJson?: string | undefined | null): Promise<string>
   /**
    * A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
    * ADD. Held and applied at the run's next step boundary through the engine's revision path

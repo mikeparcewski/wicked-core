@@ -545,11 +545,27 @@ fn catalog_json() -> napi::Result<String> {
 }
 
 /// `Core.previewPlan()`'s JSON.
-fn preview_plan_json(plan_json: &str, human_confirm: Option<&str>) -> napi::Result<String> {
+fn preview_plan_json(
+    core: &wicked_core::Core,
+    plan_json: &str,
+    project_id: Option<&str>,
+    human_confirm: Option<&str>,
+    repo_ref: Option<&str>,
+    deliver_step_json: Option<&str>,
+) -> napi::Result<String> {
     let plan = parse_plan(plan_json)?;
     let hc = HumanConfirm::parse(human_confirm).map_err(err)?;
-    let preview = wicked_core::preview_plan(&plan, &hc).map_err(err)?;
+    let deliver_step = deliver_step_json.map(parse_deliver_step).transpose()?;
+    let preview = core
+        .preview_plan(plan, project_id, repo_ref, deliver_step, hc)
+        .map_err(|e| err(format!("{e:#}")))?;
     serde_json::to_string(&preview).map_err(err)
+}
+
+/// Parse `deliverStepJson` (a launch's deliver step, or a preview's).
+fn parse_deliver_step(json: &str) -> napi::Result<wicked_core::PlanStep> {
+    serde_json::from_str(json)
+        .map_err(|e| err(format!("deliverStepJson is not a valid plan step: {e}")))
 }
 
 /// `Core.proposePlan()`'s JSON.
@@ -699,10 +715,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let deliver_step = o
         .deliver_step_json
         .as_deref()
-        .map(|j| {
-            serde_json::from_str::<wicked_core::PlanStep>(j)
-                .map_err(|e| err(format!("deliverStepJson is not a valid plan step: {e}")))
-        })
+        .map(parse_deliver_step)
         .transpose()?;
     Ok(LaunchSpec {
         problem: o.problem,
@@ -1570,26 +1583,40 @@ impl Core {
         task(catalog_json)
     }
 
-    /// What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` would
-    /// compute, persisting and publishing nothing — the launch's own precheck, intent score, floor
-    /// fill and approval matrix. Resolves to JSON `{ score, deterministic, reasons, destructive,
-    /// band, high_risk, floor, floor_override, steps, def, pauses, pause_reason }`: `floor` is the
-    /// floor phase types the plan owes; the steps the floor ADDED are the `steps` with
-    /// `added_by: "floor"` (each with its `floor_reason`); `pauses` / `pause_reason`
-    /// (`manual_mode` | `high_risk` | `override`) say whether the launch would pause at a
-    /// `plan_approval` gate. Scores as a launch with no repo (a preview has no worktree) and no
-    /// deliver step. `projectId` is accepted for the route's shape: a plan's preview does not
-    /// depend on the project (only a preset name resolves per project). Rejects with the launch's
-    /// refusal (compose, supplied provenance, an override in auto mode) or a bad `humanConfirm`.
+    /// What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` on
+    /// `repoRef` (the registered repo the launch would run on) with `deliverStepJson` (the
+    /// launch's deliver step) would compute, persisting and publishing nothing — the launch's own
+    /// plan resolution (`projectId`), precheck, intent score against the repo's code graph at the
+    /// base its worktree would start from, floor fill, approval matrix and planning checks.
+    /// Resolves to JSON `{ score, deterministic, reasons, destructive, band, high_risk, floor,
+    /// floor_override, steps, def, pauses, pause_reason, graph }`: `floor` is the floor phase
+    /// types the plan owes; the steps the floor ADDED are the `steps` with `added_by: "floor"`
+    /// (each with its `floor_reason`); `pauses` / `pause_reason` (`manual_mode` | `high_risk` |
+    /// `override`) say whether the launch would pause at a `plan_approval` gate; `graph` is
+    /// `"ready"` (the score read the repo's graph), `"not_needed"` (a docs-only touch set) or
+    /// `"unavailable"` (the fail-closed score: no repo, no or a stale graph, no declared scope).
+    /// Rejects with the launch's refusal (compose, supplied provenance, an override in auto mode,
+    /// a planning check), an unregistered `repoRef`, or a bad `humanConfirm` / `deliverStepJson`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn preview_plan(
         &self,
         plan_json: String,
         project_id: Option<String>,
         human_confirm: Option<String>,
+        repo_ref: Option<String>,
+        deliver_step_json: Option<String>,
     ) -> AsyncTask<CoreTask> {
-        let _ = project_id;
-        task(move || preview_plan_json(&plan_json, human_confirm.as_deref()))
+        let core = self.inner.clone();
+        task(move || {
+            preview_plan_json(
+                &core,
+                &plan_json,
+                project_id.as_deref(),
+                human_confirm.as_deref(),
+                repo_ref.as_deref(),
+                deliver_step_json.as_deref(),
+            )
+        })
     }
 
     /// A mid-run plan edit (`POST /api/v1/runs/:id/plan`): `planJson` is `{ steps }`, the steps to
@@ -2411,13 +2438,24 @@ mod tests {
     }
 
     /// (T8 (e)) `Core.previewPlan()`: the pinned shape, the approval answer per `humanConfirm`,
-    /// and rejections for a refused plan, bad JSON and a bad `humanConfirm` token.
+    /// the deliver step carried into the floor, and rejections for a refused plan, bad JSON, a
+    /// bad `humanConfirm` token, a bad `deliverStepJson` and an unregistered `repoRef`.
     #[test]
     fn preview_plan_json_pins_the_shape_and_rejects_what_a_launch_refuses() {
+        hermetic_spool();
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
+        let core = wicked_core::Core::spawn_with_engine(
+            temp_store_path("preview-plan"),
+            dispatcher,
+            Arc::new(StubStepRunner),
+        );
+        let preview = |plan: &str, hc: Option<&str>, repo: Option<&str>, d: Option<&str>| {
+            preview_plan_json(&core, plan, None, hc, repo, d)
+        };
         let docs =
             r#"{"steps":[{"catalog":"produce"},{"catalog":"critique"}],"touch":["README.md"]}"#;
         let v: serde_json::Value =
-            serde_json::from_str(&preview_plan_json(docs, None).unwrap()).unwrap();
+            serde_json::from_str(&preview(docs, None, None, None).unwrap()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
@@ -2429,6 +2467,7 @@ mod tests {
                 "deterministic",
                 "floor",
                 "floor_override",
+                "graph",
                 "high_risk",
                 "pause_reason",
                 "pauses",
@@ -2438,13 +2477,31 @@ mod tests {
             ]
         );
         assert_eq!(v["pauses"], false);
+        assert_eq!(v["graph"], "not_needed");
         assert!(v.get("added_by_floor").is_none());
         let manual: serde_json::Value =
-            serde_json::from_str(&preview_plan_json(docs, Some("all")).unwrap()).unwrap();
+            serde_json::from_str(&preview(docs, Some("all"), None, None).unwrap()).unwrap();
         assert_eq!(manual["pause_reason"], "manual_mode");
-        assert!(preview_plan_json(docs, Some("al")).is_err());
-        assert!(preview_plan_json("{", None).is_err());
-        assert!(preview_plan_json(r#"{"steps":[{"catalog":"nope"}]}"#, None).is_err());
+        let deliver = r#"{"catalog":"deliver","id":"deliver","executor":{"type":"tool","cmd":["git","--version"]}}"#;
+        let build = r#"{"steps":[{"catalog":"build"}],"touch":["README.md"]}"#;
+        let d: serde_json::Value =
+            serde_json::from_str(&preview(build, Some("all"), None, Some(deliver)).unwrap())
+                .unwrap();
+        assert!(
+            d["floor"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "deliver"),
+            "{}",
+            d["floor"]
+        );
+        assert!(preview(docs, Some("al"), None, None).is_err());
+        assert!(preview("{", None, None, None).is_err());
+        assert!(preview(r#"{"steps":[{"catalog":"nope"}]}"#, None, None, None).is_err());
+        assert!(preview(build, Some("all"), None, Some("{")).is_err());
+        let e = preview(docs, None, Some("no-such-repo"), None).unwrap_err();
+        assert!(e.reason.contains("no-such-repo"), "{}", e.reason);
     }
 
     /// (T8 (c)) `Core.proposePlan()` rejects bad JSON and an unknown run (no store write).
