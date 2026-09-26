@@ -99,14 +99,14 @@ fn bus_emit_and_bus_read_go_through_the_engines_one_connection() {
     )
     .unwrap();
 
-    let page = core.bus_read(0, 100, Some("wicked.crew.")).unwrap();
+    let page = core.bus_read(0, 100, Some("wicked.crew."), false).unwrap();
     assert_eq!(page.rows.len(), 1);
     assert_eq!(page.rows[0]["event_id"].as_i64(), Some(id));
     assert_eq!(page.rows[0]["payload"]["project_id"], "p1");
     assert_eq!(page.rows[0]["producer_id"], "wicked-crew");
-    assert_eq!(core.bus_read(0, 100, None).unwrap().rows.len(), 2);
+    assert_eq!(core.bus_read(0, 100, None, false).unwrap().rows.len(), 2);
     assert_eq!(
-        core.bus_read(page.next, 100, Some("wicked.crew."))
+        core.bus_read(page.next, 100, Some("wicked.crew."), false)
             .unwrap()
             .rows
             .len(),
@@ -123,7 +123,7 @@ fn bus_emit_never_waits_on_the_actor_and_the_actor_never_waits_on_it() {
     let bus = dir.join("bus.db").to_string_lossy().to_string();
     let core = core_on(&dir, Some(&bus));
     // Open the engine's connection first (schema in place), then lock the file from outside.
-    core.bus_read(0, 0, None).unwrap();
+    core.bus_read(0, 0, None, false).unwrap();
     let holder = rusqlite::Connection::open(&bus).unwrap();
     holder
         .execute_batch(
@@ -165,7 +165,7 @@ fn a_core_without_a_bus_refuses() {
         .to_string();
     assert!(e.contains("no bus"), "{e}");
     assert!(core
-        .bus_read(0, 10, None)
+        .bus_read(0, 10, None, false)
         .unwrap_err()
         .to_string()
         .contains("no bus"));

@@ -1443,21 +1443,25 @@ impl Core {
     /// already on the bus resolves to the existing row's id. See [`BusDb::emit_wire`] for the
     /// validation (`WB-001`). Runs on the caller's thread over the shared connection: it never
     /// goes through the actor, and the actor's own bus publish is bounded, so neither waits on
-    /// the other. Errors when this core has no bus.
+    /// the other. Errors when this core has no bus. Unlike wicked-bus `emit()`, it runs no schema
+    /// registry or CAS offload and takes no causality fields from the environment.
     pub fn bus_emit(&self, event_json: &str) -> anyhow::Result<i64> {
         self.bus()?.emit_wire(event_json)
     }
 
-    /// Read this core's bus: live rows after `after_id` whose type starts with `type_prefix`, at
-    /// most `limit` of them, and the cursor to pass next (see [`BusDb::read_after`]). Same thread
-    /// rule as [`Core::bus_emit`]. Errors when this core has no bus.
+    /// Read this core's bus: rows after `after_id` whose type starts with `type_prefix`, at most
+    /// `limit` of them, live ones only unless `include_expired`, and the cursor to pass next (see
+    /// [`BusDb::read_after`]). Same thread rule as [`Core::bus_emit`]. Errors when this core has
+    /// no bus.
     pub fn bus_read(
         &self,
         after_id: i64,
         limit: usize,
         type_prefix: Option<&str>,
+        include_expired: bool,
     ) -> anyhow::Result<BusPage> {
-        self.bus()?.read_after(after_id, limit, type_prefix)
+        self.bus()?
+            .read_after(after_id, limit, type_prefix, include_expired)
     }
 
     /// A team run's transport and its units' team snapshots — the persisted state behind crew's

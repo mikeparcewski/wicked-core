@@ -544,9 +544,10 @@ fn bus_read_json(
     after_id: i64,
     limit: u32,
     type_prefix: Option<&str>,
+    include_expired: bool,
 ) -> napi::Result<String> {
     let page = core
-        .bus_read(after_id, limit as usize, type_prefix)
+        .bus_read(after_id, limit as usize, type_prefix, include_expired)
         .map_err(err)?;
     serde_json::to_string(&page).map_err(err)
 }
@@ -901,7 +902,9 @@ impl Core {
     /// ttl_hours? }`. Resolves to the row's `event_id`; a key already on the bus resolves to the
     /// existing row's id (where wicked-bus raises WB-002). Rejects with `WB-001 …` for an event
     /// wicked-bus would refuse (and for a field this emit does not write), and when the engine has
-    /// no bus (wicked-core#631: the engine is the one writer and the one SQLite library on its bus,
+    /// no bus. Unlike wicked-bus `emit()`, it runs no schema registry or CAS offload and takes no
+    /// causality fields (`correlation_id`, `session_id`, `parent_event_id`) from the environment
+    /// (wicked-core#631: the engine is the one writer and the one SQLite library on its bus,
     /// so crew writes through here). Runs on the libuv pool over the engine's one bus connection;
     /// never through the actor.
     #[napi(ts_return_type = "Promise<number>")]
@@ -912,7 +915,8 @@ impl Core {
         })
     }
 
-    /// Read this engine's bus: live rows (`expires_at` in the future) strictly after `afterId`,
+    /// Read this engine's bus: live rows (`expires_at` in the future; every row when
+    /// `includeExpired` — history readers) strictly after `afterId`,
     /// oldest first, whose `event_type` starts with `typePrefix` (a literal prefix; omitted = every
     /// type), at most `limit` of them (capped at 1000). Resolves to JSON `{ next, rows }`: `rows` are
     /// whole wicked-bus `events` rows with `payload` parsed; `next` is the cursor to pass back (the
@@ -925,9 +929,18 @@ impl Core {
         after_id: i64,
         limit: u32,
         type_prefix: Option<String>,
+        include_expired: Option<bool>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
-        task(move || bus_read_json(&core, after_id, limit, type_prefix.as_deref()))
+        task(move || {
+            bus_read_json(
+                &core,
+                after_id,
+                limit,
+                type_prefix.as_deref(),
+                include_expired.unwrap_or(false),
+            )
+        })
     }
 
     /// EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
@@ -2566,9 +2579,10 @@ mod tests {
             .to_string();
         assert!(refused.contains("WB-001"), "{refused}");
 
-        let page: serde_json::Value =
-            serde_json::from_str(&bus_read_json(&core, 0, 10, Some("wicked.crew.")).unwrap())
-                .unwrap();
+        let page: serde_json::Value = serde_json::from_str(
+            &bus_read_json(&core, 0, 10, Some("wicked.crew."), false).unwrap(),
+        )
+        .unwrap();
         let mut keys: Vec<&str> = page
             .as_object()
             .unwrap()
@@ -2583,13 +2597,29 @@ mod tests {
         assert_eq!(rows[0]["payload"]["project_id"], "p1");
         assert_eq!(rows[0]["producer_id"], "wicked-crew");
         let start: serde_json::Value =
-            serde_json::from_str(&bus_read_json(&core, 0, 0, None).unwrap()).unwrap();
+            serde_json::from_str(&bus_read_json(&core, 0, 0, None, false).unwrap()).unwrap();
         assert_eq!(start["rows"].as_array().unwrap().len(), 0);
         assert_eq!(start["next"], id + 1, "limit 0 answers the tail");
 
+        // History readers ask for expired rows too; the default stays live-only.
+        let expired = emit(
+            &core,
+            r#"{"event_type":"wicked.crew.project.archived","domain":"wicked-crew","payload":{},"ttl_hours":-1}"#,
+        )
+        .unwrap();
+        let live: serde_json::Value = serde_json::from_str(
+            &bus_read_json(&core, 0, 10, Some("wicked.crew."), false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live["rows"].as_array().unwrap().len(), 1);
+        let all: serde_json::Value =
+            serde_json::from_str(&bus_read_json(&core, 0, 10, Some("wicked.crew."), true).unwrap())
+                .unwrap();
+        assert_eq!(all["rows"][1]["event_id"], expired);
+
         let bare = spawn(None, "bus631-nobus");
         assert!(emit(&bare, row).unwrap_err().to_string().contains("no bus"));
-        assert!(bus_read_json(&bare, 0, 10, None)
+        assert!(bus_read_json(&bare, 0, 10, None, false)
             .unwrap_err()
             .to_string()
             .contains("no bus"));
