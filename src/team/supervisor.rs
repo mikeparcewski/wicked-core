@@ -48,7 +48,7 @@ use super::{
     RawFinding, Rejected, ReplyKind, Repo, Severity, TeamLedger, TeamLimits, TeamPlan, UnitKey,
     Verdict,
 };
-use crate::bus::{BusDb, BusEvent};
+use crate::bus::BusDb;
 use crate::decision::{DecisionRequest, DecisionVerdict};
 
 /// The bus filter the supervisor's cursor reads (§4.2).
@@ -1182,7 +1182,8 @@ impl SupervisorCore {
                     .get(&run_id)
                     .and_then(|st| st.attempts.get(&k))
                     .is_some_and(|a| a.live);
-                // A dead attempt's question has nobody waiting on its answer, in any read mode.
+                // A dead attempt's question has nobody waiting on its answer (and a member turn
+                // would burn tokens for it), in any read mode.
                 if !live || !self.helped.insert(b.help_id.clone()) {
                     return Vec::new();
                 }
@@ -1227,18 +1228,8 @@ impl SupervisorCore {
                     ))),
                     None => return Vec::new(),
                 };
-                // The gap (§4.7): `path.started` is gone and no earlier attempt's CLAIM survived.
-                // Rows age out oldest first, so a present claim proves every later row of the
-                // run is present; any other surviving row of an earlier attempt (a later
-                // `finding.raised`, an answer, a fold) proves nothing about the rows before it
-                // (review round 2 on #628, D4).
                 let gap = unseen
-                    || st.gap
-                        && k.1 > 0
-                        && !st
-                            .attempts
-                            .iter()
-                            .any(|((o, a), s)| *o == k.0 && *a < k.1 && s.claimed_id != 0);
+                    || st.gap && k.1 > 0 && !st.attempts.keys().any(|(o, a)| *o == k.0 && *a < k.1);
                 return vec![Job::FinalPass(Box::new(FinalPassJob {
                     unit,
                     ok: b.status == StepCompletion::Ok,
@@ -1640,10 +1631,6 @@ fn attempt_rows(
     key: &UnitKey,
     claimed_id: i64,
 ) -> anyhow::Result<(Vec<TeamRow>, usize)> {
-    #[cfg(test)]
-    if tests::take_injected_read_failure() {
-        anyhow::bail!("injected attempt_rows read failure (test)");
-    }
     let db = BusDb::shared(bus_db)?;
     let mut floor = claimed_id.saturating_sub(1);
     let mut rows = Vec::new();
@@ -1851,10 +1838,6 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
         drain();
         attempt_rows(&job.bus_db, &key, job.claimed_id)
     };
-    // A read of the attempt's rows that failed for the hold round or the councils leaves the
-    // record incomplete (settlements and rulings never made): the fold is `stream_gap`, even when
-    // its own read succeeds (absence row 18, review round 2 on #628).
-    let mut read_failed = false;
     if job.ok {
         match read() {
             Ok((rows, _)) => {
@@ -1871,14 +1854,10 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     &mut timed_out,
                 );
             }
-            Err(e) => {
-                read_failed = true;
-                eprintln!(
-                    "wicked-core: team: {}:{}:{} hold round could not read the stream ({e:#}); \
-                     the ledger is stream_gap",
-                    key.0, key.1, key.2
-                )
-            }
+            Err(e) => eprintln!(
+                "wicked-core: team: {}:{}:{} hold round could not read the stream ({e:#})",
+                key.0, key.1, key.2
+            ),
         }
     }
 
@@ -1886,19 +1865,15 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
     let mut disputes = 0usize;
     let mut step_answers: BTreeMap<String, (bool, String)> = BTreeMap::new();
     if job.ok {
-        let rows = match read() {
-            Ok((rows, _)) => Some(rows),
-            Err(e) => {
-                read_failed = true;
+        let rows = read()
+            .map_err(|e| {
                 eprintln!(
-                    "wicked-core: team: {}:{}:{} councils could not read the stream ({e:#}); the \
-                     ledger is stream_gap",
+                    "wicked-core: team: {}:{}:{} councils could not read the stream ({e:#})",
                     key.0, key.1, key.2
-                );
-                None
-            }
-        };
-        if let Some(rows) = rows {
+                )
+            })
+            .ok();
+        if let Some((rows, _)) = rows {
             let ledger = tev::fold(&rows);
             let deliveries = delivery_outcomes(&rows);
             let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
@@ -2050,7 +2025,6 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                 bus.drain_lane(&s_lane);
                 let spooled = bus.lane_has_pending(&s_lane);
                 if malformed > 0
-                    || read_failed
                     || job.gap
                     || u.lost
                     || spooled
@@ -2546,10 +2520,9 @@ fn run(
     let (back_tx, back_rx): (Sender<Back>, Receiver<Back>) = channel();
     let poll = cfg.poll;
     let bus_db = cfg.bus_db.clone();
-    // Without a tail snapshot the replay pass covers EVERYTHING on the bus (every row is
-    // history) and the live tail starts from the last row it read — a missing snapshot never
-    // skips a row, and never reads history as live (review round 2 on #628, D5).
-    let tail = replay_tail(cfg.tail);
+    // Without a tail snapshot the replay pass reads the whole bus as history and the live tail
+    // starts after the last row it read (review round 2 on #628, D5).
+    let tail = cfg.tail.unwrap_or(i64::MAX);
     let mut core = SupervisorCore::new(cfg, host, council);
     // §4.7 steps 2–3: arm the live runs, replay their rows up to T.
     match live() {
@@ -2614,13 +2587,9 @@ fn run(
             if let Ok(runs) = live() {
                 for r in runs.iter().filter(|r| due.contains(&r.run_id)) {
                     core.arm(r);
-                    match replay_run(&mut core, &bus_db, &r.run_id, cursor) {
-                        Ok(jobs) => {
-                            for job in jobs {
-                                spawn_job(job, &core, &back_tx);
-                            }
-                        }
-                        Err(e) => eprintln!("wicked-core: team supervisor: {e:#}"),
+                    let jobs = replay_run(&mut core, &bus_db, &r.run_id, cursor);
+                    for job in jobs {
+                        spawn_job(job, &core, &back_tx);
                     }
                 }
             }
@@ -2640,15 +2609,6 @@ fn run(
     }
 }
 
-/// The replay's upper bound from the spawn's tail snapshot: with none, the replay reads to the
-/// end of the bus ([`replay_with`] then returns the last row it read, not this bound).
-fn replay_tail(snapshot: Option<i64>) -> i64 {
-    snapshot.unwrap_or(i64::MAX)
-}
-
-/// A bus read: the team rows after an event id, at most `n` of them.
-type ReadRows<'a> = dyn FnMut(i64, usize) -> anyhow::Result<Vec<BusEvent>> + 'a;
-
 /// §4.7 step 3: read every armed run's rows from the lowest floor up to `tail`, as history.
 /// Returns the cursor to tail from, and the jobs a row of THIS process's own attempts made due
 /// (a claim or a completion that landed before the tail was read).
@@ -2658,19 +2618,18 @@ fn replay(
     tail: i64,
     only: Option<&str>,
 ) -> (i64, Vec<Job>) {
-    let mut read =
-        |after: i64, n: usize| BusDb::shared(bus_db).and_then(|db| db.poll(TEAM_FILTER, after, n));
-    replay_with(core, tail, only, &mut read, READ_BATCH)
+    let mut jobs = Vec::new();
+    let cursor = replay_into(core, bus_db, tail, only, &mut jobs);
+    (cursor, jobs)
 }
 
-fn replay_with(
+fn replay_into(
     core: &mut SupervisorCore,
+    bus_db: &str,
     tail: i64,
     only: Option<&str>,
-    read: &mut ReadRows<'_>,
-    batch_size: usize,
-) -> (i64, Vec<Job>) {
-    let mut jobs = Vec::new();
+    jobs: &mut Vec<Job>,
+) -> i64 {
     let floors = core.floors();
     let Some(from) = floors
         .iter()
@@ -2678,28 +2637,37 @@ fn replay_with(
         .map(|(_, f)| *f)
         .min()
     else {
-        // Nothing armed: the live tail starts at `T` — or, with no snapshot, at the start.
-        return (if tail == i64::MAX { 0 } else { tail }, jobs);
+        // Nothing armed: tail live from `T`, or from the start with no snapshot.
+        return if tail == i64::MAX { 0 } else { tail };
     };
     let mut floor = from.saturating_sub(1);
+    // With no snapshot (`tail` = MAX) the live tail starts after the last row read.
+    let resume = |floor: i64| {
+        if tail == i64::MAX {
+            floor
+        } else {
+            tail.max(floor)
+        }
+    };
+    let db = match BusDb::shared(bus_db) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("wicked-core: team supervisor: replay could not open the bus ({e:#})");
+            return resume(floor);
+        }
+    };
     loop {
-        let batch = match read(floor, batch_size) {
+        let batch = match db.poll(TEAM_FILTER, floor, READ_BATCH) {
             Ok(b) => b,
             Err(e) => {
-                // Never skip a row (review round 2 on #628, D3): the live loop re-reads from the
-                // last row applied. Liveness is the claim's time against boot, never the read
-                // mode, so a history row read live starts nothing a replayed one would not.
-                eprintln!(
-                    "wicked-core: team supervisor: replay read failed after event {floor} \
-                     ({e:#}); the live tail resumes from there"
-                );
-                return (floor, jobs);
+                eprintln!("wicked-core: team supervisor: replay read failed ({e:#})");
+                return resume(floor);
             }
         };
         let n = batch.len();
         for ev in batch {
             if ev.event_id > tail {
-                return (tail, jobs);
+                return tail;
             }
             floor = floor.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
@@ -2716,7 +2684,7 @@ fn replay_with(
             // this process's own attempt is live however it was read.
             jobs.extend(core.on_row(&row));
         }
-        if n < batch_size {
+        if n < READ_BATCH {
             break;
         }
     }
@@ -2729,56 +2697,35 @@ fn replay_with(
             );
         }
     }
-    // The end of the bus: every row up to `T` was applied, and with no snapshot every row there
-    // was — the live tail starts after the last one read.
-    (if tail == i64::MAX { floor } else { tail }, jobs)
+    resume(floor)
 }
 
 /// Arm-and-replay one run that surfaced live: its rows from its floor up to the cursor. Rows of
 /// this process's attempts are live (their `at` is past boot), so they attach as usual.
-fn replay_run(
-    core: &mut SupervisorCore,
-    bus_db: &str,
-    run_id: &str,
-    upto: i64,
-) -> anyhow::Result<Vec<Job>> {
-    let mut read =
-        |after: i64, n: usize| BusDb::shared(bus_db).and_then(|db| db.poll(TEAM_FILTER, after, n));
-    replay_run_with(core, run_id, upto, &mut read, READ_BATCH)
-}
-
-fn replay_run_with(
-    core: &mut SupervisorCore,
-    run_id: &str,
-    upto: i64,
-    read: &mut ReadRows<'_>,
-    batch_size: usize,
-) -> anyhow::Result<Vec<Job>> {
+fn replay_run(core: &mut SupervisorCore, bus_db: &str, run_id: &str, upto: i64) -> Vec<Job> {
     let Some(floor) = core.runs.get(run_id).map(|s| s.floor) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let mut jobs = Vec::new();
+    let Ok(db) = BusDb::shared(bus_db) else {
+        return jobs;
+    };
     let mut at = floor.saturating_sub(1);
     loop {
-        let batch = match read(at, batch_size) {
+        let batch = match db.poll(TEAM_FILTER, at, READ_BATCH) {
             Ok(b) => b,
             Err(e) => {
-                // Surfaced, never a silent stop (review round 2 on #628, D3): the rows past `at`
-                // were not applied, so the run is un-armed and asked for again at the next
-                // `ARM_RETRY` — re-armed, it is re-read from its floor (rows apply idempotently).
-                core.runs.remove(run_id);
-                core.unknown
-                    .insert(run_id.to_string(), Some(Instant::now()));
-                return Err(e.context(format!(
-                    "replaying run {run_id} failed after event {at}; it is re-armed and re-read \
-                     at the next retry"
-                )));
+                eprintln!(
+                    "wicked-core: team supervisor: replaying {run_id} stopped after event {at} \
+                     ({e:#}); its later rows were not read"
+                );
+                break;
             }
         };
         let n = batch.len();
         for ev in batch {
             if ev.event_id > upto {
-                return Ok(jobs);
+                return jobs;
             }
             at = at.max(ev.event_id);
             let Ok(event) = TeamEvent::from_payload(&ev.event_type, &ev.payload) else {
@@ -2792,11 +2739,11 @@ fn replay_run_with(
                 event,
             }));
         }
-        if n < batch_size {
+        if n < READ_BATCH {
             break;
         }
     }
-    Ok(jobs)
+    jobs
 }
 
 #[cfg(test)]

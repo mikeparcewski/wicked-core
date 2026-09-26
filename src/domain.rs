@@ -1066,8 +1066,8 @@ impl WorkUnit {
 
     /// Whether this unit's current attempt is the PA's review of a member's step
     /// (DES-TEAMING-002 §8.8): an evaluator turn over the member's tree, read-only by
-    /// construction ([`crate::write_posture::WritePosture::of`]) and under the worktree guard
-    /// ([`crate::worktree_guard::applies_to`]) whatever the step's own phase declared.
+    /// construction ([`crate::write_posture::WritePosture::of`]) whatever the step's own phase
+    /// declared.
     pub fn is_member_step_review(&self) -> bool {
         self.member_step
             .as_ref()

@@ -4751,14 +4751,7 @@ fn apply_step_result(
             process_gen,
             is_acp,
         };
-        let progress = team_gate::apply_review(
-            &mut act,
-            session,
-            ix,
-            &output,
-            evidence.team,
-            evidence.worktree_guard,
-        );
+        let progress = team_gate::apply_review(&mut act, session, ix, &output, evidence.team);
         return match progress? {
             Progress::Dispatched | Progress::Deferred => Ok(StepApplied::Continuing),
             Progress::Paused => Ok(StepApplied::Paused),
