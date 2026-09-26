@@ -8992,7 +8992,6 @@ fn stage_edit(
                 },
                 kind: crate::team_events::ProposalKind::Edit,
                 reason: None,
-                approved_by_human: true,
                 steps: edit.steps,
             },
             &done,

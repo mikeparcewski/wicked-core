@@ -2713,8 +2713,8 @@ pub(super) fn apply_held_revision(
             &l.text, &l.by, l.ord, l.attempt,
         ));
     }
-    // (T8 (c)) The human's mid-run edits, in arrival order: a revision like any other, so the
-    // approval matrix decides it (only an edit AT the gate is approved by its author).
+    // (T8 (c)) The human's mid-run edits, in arrival order: approved by their author like an
+    // edit at the gate (no second plan gate), floor-filled at the ratcheted score.
     for edit in &prior.edits {
         changes.push(crate::plan_gate::Change::Steps {
             by: "human".into(),
@@ -2723,7 +2723,6 @@ pub(super) fn apply_held_revision(
             },
             kind: crate::team_events::ProposalKind::Edit,
             reason: None,
-            approved_by_human: false,
             steps: edit.steps.clone(),
         });
     }

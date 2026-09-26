@@ -1444,8 +1444,9 @@ impl Core {
 
     /// (DES-TEAMING-002 T8 (c)) A mid-run human plan edit (`POST /api/v1/runs/:id/plan`): the
     /// steps to ADD, held and applied at the run's next step boundary through the same revision
-    /// path as the PA's `PLAN+` (the ratchet, floor fill and the approval matrix), published as
-    /// `plan.proposed{by:"human", kind:"edit"}`. Idempotent by `request_id`: a repeat holds and
+    /// path as the PA's `PLAN+` (the ratchet and floor fill apply; the edit only adds), published
+    /// as `plan.proposed{by:"human", kind:"edit"}`. Its author approved it, like an edit at the
+    /// gate: no `plan_approval` gate opens for it, and it is accepted as `plan.accepted{by:"human"}`. Idempotent by `request_id`: a repeat holds and
     /// publishes nothing (`duplicate: true`). `Err` for an unknown, finished or un-planned run, or
     /// a plan carrying `touch` / `override` (launch-plan fields: an edit only adds steps).
     pub fn propose_plan(

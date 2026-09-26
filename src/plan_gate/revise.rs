@@ -134,18 +134,16 @@ pub(crate) enum Change {
     /// §8.7 trigger 3: a diff re-score raised the floor.
     Floor(DiffRescore),
     /// §8.7 triggers 1–2 (the PA's `PLAN+`, an accepted member request) and a human edit — at a
-    /// mid-run plan gate, or mid-run through `Core::propose_plan`: steps to ADD.
+    /// mid-run plan gate, or through `Core::propose_plan`: steps to ADD.
     Steps {
         by: String,
         source: ProposalSource,
         kind: ProposalKind,
-        /// The `plan.revised.reason`; `None` for a human edit (no `plan.revised`: its
-        /// `plan.proposed{kind:"edit"}` and the rev's `plan.accepted` are the record).
+        /// The `plan.revised.reason`; `None` for a human edit, at the gate or through
+        /// `Core::propose_plan`: approved by the human who made it, so it skips the approval
+        /// matrix and is accepted as the next rev `plan.accepted{by:"human"}` (floor fill and the
+        /// ratchet still apply).
         reason: Option<ReviseReason>,
-        /// The human who made it approved it: an edit AT the gate (§8.6 "approve with amend"),
-        /// accepted as the next rev `by:"human"` with no approval matrix. `false` for everything
-        /// else — a `Core::propose_plan` edit included — so the matrix decides.
-        approved_by_human: bool,
         steps: Vec<PlanStep>,
     },
 }
@@ -257,7 +255,6 @@ pub(crate) fn revise(
             source,
             kind,
             reason,
-            approved_by_human,
             steps,
         } => {
             let pid = ev::mint_proposal_id(run_id, &by, &source);
@@ -269,7 +266,8 @@ pub(crate) fn revise(
             events.push(plan_proposed(
                 run_id, &by, &pid, base_rev, kind, None, &proposed, now,
             )?);
-            (steps, Some(pid), reason, 0, false, approved_by_human)
+            let human = reason.is_none();
+            (steps, Some(pid), reason, 0, false, human)
         }
     };
     let refuse = |mut events: Vec<TeamEvent>, reason: String| -> anyhow::Result<Revised> {
@@ -565,7 +563,6 @@ pub(crate) fn changes_from_output(output: &str, by: &str, ord: u32, attempt: u32
                     source,
                     kind: ProposalKind::Change,
                     reason: Some(reason),
-                    approved_by_human: false,
                     steps,
                 });
             }
