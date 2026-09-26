@@ -474,6 +474,19 @@ pub(crate) enum Command {
     /// TEST-ONLY: how many `confirm_gate` replies the actor holds for the team publisher.
     #[cfg(test)]
     HeldTeamReplies { reply: Sender<usize> },
+    /// (DES-TEAMING-002 T4, §8.7) The supervisor's own measurement of an attempt's settled diff:
+    /// the tree it snapshotted and the paths that differ from the attempt's baseline. The actor
+    /// scores it against the run's graph (the intent score's graph and fail-closed rule) and,
+    /// when the band rises above the run's ratcheted floor, holds it for the next step boundary.
+    /// Fire-and-forget: a lower score changes nothing.
+    TeamRescored {
+        run_id: String,
+        ord: u32,
+        attempt: u32,
+        rescore_seq: u32,
+        tree: String,
+        paths: Vec<String>,
+    },
     /// Register the engine's own composed per-run def (`"<run>:plan-<rev>"`).
     RegisterComposed {
         def: Box<crate::workflow::WorkflowDef>,

@@ -66,6 +66,13 @@ pub const MAX_MONITORS: u8 = 3;
 /// How long the supervisor waits between cursor reads when nothing is due.
 pub const SUPERVISOR_POLL: Duration = Duration::from_millis(250);
 
+/// (T4, §8.7) The least time between two checkpoint re-scores of one attempt.
+pub const RESCORE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// (T4, §8.7) The most checkpoint re-scores per attempt; the one at `step.completed` is always
+/// added, so an attempt is re-scored at most `RESCORE_MAX + 1` times.
+pub const RESCORE_MAX: u32 = 10;
+
 /// How often an unknown run's rows make the supervisor ask the engine whether it is live.
 const ARM_RETRY: Duration = Duration::from_secs(5);
 
@@ -189,6 +196,9 @@ pub struct SupervisorConfig {
     pub tail: Option<i64>,
     /// How long an S lane's spooled facts are retried before they stay for `replay_team_outbox`.
     pub publish_bound: Duration,
+    /// (T4) The engine's command channel: the supervisor's diff re-scores go to the actor as
+    /// `Command::TeamRescored` (§8.7). `None` = no re-score is sent.
+    pub(crate) engine: Option<Sender<crate::command::Command>>,
 }
 
 impl SupervisorConfig {
@@ -206,6 +216,7 @@ impl SupervisorConfig {
             boot_ms,
             tail: None,
             publish_bound: cfg.bound(),
+            engine: None,
         })
     }
 
@@ -366,6 +377,65 @@ pub struct UnitTeam {
     change_seq: u32,
     /// The `event_id` of each raise this attempt published, by `raise_seq`.
     raised_ids: BTreeMap<u32, i64>,
+    /// (T4) The attempt's diff re-scores (§8.7).
+    rescores: Rescores,
+    /// (T4) Where a re-score goes: the engine's command channel.
+    engine: Option<Sender<crate::command::Command>>,
+}
+
+/// (T4, §8.7) The re-score bound of one attempt: a checkpoint re-scores only when the tree differs
+/// from the last re-score's, [`RESCORE_MIN_INTERVAL`] has passed since it, and fewer than
+/// [`RESCORE_MAX`] ran; the one at `step.completed` needs only a changed tree.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Rescores {
+    last_tree: String,
+    last_at: Option<Instant>,
+    count: u32,
+    in_flight: bool,
+}
+
+impl Rescores {
+    pub(crate) fn from_baseline(baseline: &str) -> Self {
+        Self {
+            last_tree: baseline.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// A checkpoint may start one (checked before any snapshot is taken).
+    pub(crate) fn may_start(&self, now: Instant) -> bool {
+        !self.in_flight
+            && self.count < RESCORE_MAX
+            && self
+                .last_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= RESCORE_MIN_INTERVAL)
+    }
+
+    /// Admit a re-score of `tree` and record it; `Some(rescore_seq)` when it runs.
+    pub(crate) fn admit(&mut self, tree: &str, now: Instant, at_completion: bool) -> Option<u32> {
+        if tree == self.last_tree {
+            return None;
+        }
+        if !at_completion && !self.may_start_ignoring_flight(now) {
+            return None;
+        }
+        self.last_tree = tree.to_string();
+        self.last_at = Some(now);
+        self.count += 1;
+        Some(self.count)
+    }
+
+    fn may_start_ignoring_flight(&self, now: Instant) -> bool {
+        self.count < RESCORE_MAX
+            && self
+                .last_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= RESCORE_MIN_INTERVAL)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
 }
 
 impl UnitTeam {
@@ -382,6 +452,8 @@ impl UnitTeam {
             lost: false,
             change_seq: 0,
             raised_ids: BTreeMap::new(),
+            rescores: Rescores::default(),
+            engine: None,
         }
     }
 
@@ -994,6 +1066,58 @@ pub enum Job {
     FinalPass(Box<FinalPassJob>),
     /// A member's turn answering the PA's `HELP:` question.
     Help(HelpJob),
+    /// (T4) A checkpoint's diff re-score (§8.7).
+    Rescore(Arc<Mutex<UnitTeam>>),
+}
+
+/// (T4, §8.7) Re-score an attempt's settled diff: snapshot the tree through the pinned git dir,
+/// and when the bound admits it, send the tree and the paths that differ from the attempt's
+/// baseline to the engine (`Command::TeamRescored`), which scores them against the run's graph.
+/// `at_completion`: the re-score at `step.completed` (only a changed tree is needed).
+pub fn rescore(unit: &Arc<Mutex<UnitTeam>>, at_completion: bool) {
+    if !at_completion || at_completion {
+        return; // T4 red: no re-score is sent yet
+    }
+    let (repo, baseline, engine, key) = {
+        let mut u = unit.lock().unwrap_or_else(|p| p.into_inner());
+        if !at_completion {
+            u.rescores.in_flight = false;
+        }
+        match (
+            u.ctx.repo.clone(),
+            u.ctx.baseline_tree.clone(),
+            u.engine.clone(),
+        ) {
+            (Some(r), Some(b), Some(e)) => (r, b, e, u.key()),
+            _ => return,
+        }
+    };
+    let tree = match repo.snapshot() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: team re-score of {}:{}:{} skipped: the snapshot failed ({e:#})",
+                key.0, key.1, key.2
+            );
+            return;
+        }
+    };
+    let seq = {
+        let mut u = unit.lock().unwrap_or_else(|p| p.into_inner());
+        u.rescores.admit(&tree, Instant::now(), at_completion)
+    };
+    let Some(rescore_seq) = seq else {
+        return;
+    };
+    let paths: Vec<String> = repo.changed_paths(&baseline, &tree).into_iter().collect();
+    let _ = engine.send(crate::command::Command::TeamRescored {
+        run_id: key.0,
+        ord: key.1,
+        attempt: key.2,
+        rescore_seq,
+        tree,
+        paths,
+    });
 }
 
 /// The supervisor's state over every armed run.
@@ -1128,14 +1252,22 @@ impl SupervisorCore {
             TeamBody::CheckpointReached(b) => {
                 if let Some(k) = key(&env) {
                     let uk = (run_id.clone(), k.0, k.1);
-                    if let Some(u) = self.units.get(&uk) {
-                        let mut u = u.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(arc) = self.units.get(&uk) {
+                        let mut u = arc.lock().unwrap_or_else(|p| p.into_inner());
                         u.last_seq = u.last_seq.max(b.seq);
                         u.titles.push(b.title.clone());
                         if kind_may_change_tree(&b.kind) {
                             u.pending = true;
                             for m in &mut u.monitors {
                                 m.pending = true;
+                            }
+                            // (T4) A tree-changing checkpoint may re-score the diff (§8.7).
+                            if u.engine.is_some()
+                                && u.ctx.repo.is_some()
+                                && u.rescores.may_start(Instant::now())
+                            {
+                                u.rescores.in_flight = true;
+                                return vec![Job::Rescore(Arc::clone(arc))];
                             }
                         }
                     }
@@ -1305,6 +1437,8 @@ impl SupervisorCore {
             .collect();
         let _ = claimed_id;
         let mut unit = UnitTeam::new(ctx, self.pub_.clone());
+        unit.rescores = Rescores::from_baseline(b.baseline_tree.as_deref().unwrap_or_default());
+        unit.engine = self.cfg.engine.clone();
         for (from, e, f) in carried {
             unit.carry(super::runner::finding_of(&e, &f), from);
         }
@@ -1745,6 +1879,12 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
         bus.drain_lane(&s_lane);
     };
     drain();
+
+    // (T4, §8.7) The re-score at `step.completed`, always, over the settled tree: sent before the
+    // fold is published, so it reaches the engine before the unit's result does.
+    if job.ok {
+        rescore(&job.unit, true);
+    }
 
     // 1–3 (S2): the final batch per member over the settled tree, and re-confirmation.
     if job.ok {
@@ -2556,6 +2696,11 @@ fn run(
             let _ = std::thread::Builder::new()
                 .name("wicked-core-team-help".into())
                 .spawn(move || run_help(&h, &*host, &bus));
+        }
+        Job::Rescore(u) => {
+            let _ = std::thread::Builder::new()
+                .name("wicked-core-team-rescore".into())
+                .spawn(move || rescore(&u, false));
         }
     };
     for job in replayed {

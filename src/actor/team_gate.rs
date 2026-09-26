@@ -2488,6 +2488,267 @@ pub(super) fn apply_review(
     }
 }
 
+// ── T4: re-plan (DES-TEAMING-002 §8.7) ───────────────────────────────────────────────────────────
+
+/// The run's repo root, for the graph a score reads.
+fn repo_root(store: &dyn GraphStore, session: &AgentSession) -> Option<PathBuf> {
+    session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+        .map(|r| PathBuf::from(r.root_path))
+}
+
+/// (T4) The supervisor's diff measurement (`Command::TeamRescored`): score it against the run's
+/// graph; when its band rises above the run's ratcheted floor (§8.5), hold it for the next step
+/// boundary (the highest one waiting wins). A lower score changes and publishes nothing.
+pub(super) fn on_rescored(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    rescore_seq: u32,
+    tree: &str,
+    paths: &[String],
+) -> anyhow::Result<()> {
+    let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    if !matches!(
+        session.status,
+        SessionStatus::Executing | SessionStatus::AwaitingHuman
+    ) || paths.is_empty()
+    {
+        return Ok(());
+    }
+    let root = repo_root(&*store, &session);
+    let Some(tp) = session.team_plan.as_ref().filter(|t| t.accepted_rev > 0) else {
+        return Ok(());
+    };
+    let scored =
+        crate::plan_gate::diff_score_for_run(paths, root.as_deref(), session.base_commit.as_deref());
+    let score = scored.assessment.score;
+    if !crate::plan_gate::floor_rises(tp, score, scored.destructive) {
+        return Ok(());
+    }
+    if let Some(r) = &tp.rescored {
+        if r.score >= score && (r.destructive || !scored.destructive) {
+            return Ok(());
+        }
+    }
+    let fact = crate::plan_gate::path_scored_diff(
+        run_id,
+        ord,
+        attempt,
+        rescore_seq,
+        Some(tree),
+        &scored.assessment,
+        crate::interaction::now_millis(),
+    )?;
+    let rescored = crate::plan_gate::DiffRescore {
+        ord,
+        attempt,
+        rescore_seq,
+        score,
+        destructive: scored.destructive,
+        fact: crate::plan_gate::queued_facts(&[fact])?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
+    };
+    if let Some(tp) = session.team_plan.as_mut() {
+        tp.rescored = Some(rescored);
+    }
+    put_node(store, session.to_node())
+}
+
+/// (T4) The step boundary (§8.7 "Applying a revision"): after the finished unit folds and before
+/// the next dispatch. The triggers, in order: a held diff re-score that raised the floor, then the
+/// PA's `PLAN <change_id>: ACCEPT` / `PLAN+` lines of this output. Each is one revision (`rev`
+/// n+1, n+2, …); the new units are inserted after the cursor in one pass, the done prefix is never
+/// touched, and a revision the approval matrix holds leaves the plan pending, so the run pauses
+/// `plan_approval` before its next unit (the caller's `advance_or_pause`).
+pub(super) fn revise_at_boundary(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    output: &crate::workflow::StepOutput,
+) -> anyhow::Result<()> {
+    if !run_id.is_empty() {
+        return Ok(()); // T4 red: the boundary does not revise yet
+    }
+    let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    let Some(prior) = session
+        .team_plan
+        .clone()
+        .filter(|t| t.accepted_rev > 0 && t.pending.is_none())
+    else {
+        return Ok(());
+    };
+    let units = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(units.len());
+    let done: Vec<String> = units[..cursor]
+        .iter()
+        .map(|u| u.phase_id().unwrap_or_default().to_string())
+        .collect();
+    let finished = units.get(output.unit_ix);
+    let mut changes = Vec::new();
+    if let Some(r) = prior.rescored.clone() {
+        changes.push(crate::plan_gate::Change::Floor(r));
+    }
+    // Only the PA's own turn speaks for the plan (§8.8: the PA owns a member's step): its step,
+    // or its review of a member's step.
+    let pa = session.clis.first().cloned().unwrap_or_default();
+    if let Some(u) = finished.filter(|_| output.status == crate::workflow::StepStatus::Ok) {
+        let reviewing = u.member_step.as_ref().is_some_and(|m| m.reviewing.is_some());
+        if u.assigned_cli.as_deref() == Some(pa.as_str()) || reviewing {
+            changes.extend(crate::plan_gate::changes_from_output(
+                &output.output,
+                &pa,
+                u.ord,
+                output.attempt,
+            ));
+        }
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    if done.iter().any(|d| d == "deliver") {
+        // Nothing runs after the push: a revision there would ship unreviewed. Say so; the plan
+        // stays as it is.
+        anyhow::bail!("the plan was not revised: its deliver step already ran");
+    }
+    let mut state = prior.clone();
+    state.rescored = None;
+    let mut facts = Vec::new();
+    let mut def = None;
+    let now = crate::interaction::now_millis();
+    let reviewing_ord = finished.map(|u| u.ord);
+    for change in changes {
+        let r = match crate::plan_gate::revise(
+            run_id,
+            &state,
+            change,
+            &done,
+            &session.human_confirm,
+            reviewing_ord,
+            now,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                emit_run_error(subscribers, run_id, e);
+                continue;
+            }
+        };
+        facts.extend(r.events);
+        match r.outcome {
+            crate::plan_gate::Outcome::Accepted { def: d }
+            | crate::plan_gate::Outcome::Held { def: d } => {
+                state = r.state;
+                def = Some(d);
+            }
+            crate::plan_gate::Outcome::Refused { .. } => {}
+        }
+    }
+    session.team_plan = Some(state);
+    put_node(store, session.to_node())?;
+    if let Some(def) = def {
+        revise_units(store, subscribers, &session, def)?;
+    }
+    publish_plan_facts(&session, facts);
+    Ok(())
+}
+
+/// (T4, §8.7 "Mechanism") Insert a revision's units into the live run: plan the def (every
+/// synchronous planning check, the pins attached), distribute it on the launch roster (the whole
+/// plan, so evaluator ≠ creator holds against the done units too), and write ONLY the units after
+/// the cursor — renumbered from it — leaving every unit already dispatched or done untouched.
+/// The cursor unit's attempt is re-read: a new unit there is dispatched at attempt 0.
+pub(super) fn revise_units(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    session: &AgentSession,
+    def: crate::workflow::WorkflowDef,
+) -> anyhow::Result<()> {
+    let run_id = session.id.as_str();
+    let old = crate::domain::session_units(&*store, run_id)?;
+    let cursor = session.unit_ix.min(old.len());
+    let planned = super::check_def_plans(
+        store,
+        &def,
+        &session.problem,
+        run_id,
+        session.repo_ref.as_deref(),
+    )?;
+    for (o, n) in old[..cursor].iter().zip(&planned) {
+        if o.id != n.id || o.ord != n.ord {
+            anyhow::bail!(
+                "run {run_id}: the revised plan moves the unit `{}` that already ran",
+                o.id
+            );
+        }
+    }
+    let roster = super::launch_roster(session)?;
+    let dists = crate::distribute::distribute_units_on_benched(
+        &planned,
+        &roster,
+        run_id,
+        &session.benched_seats,
+    )?;
+    let old_ids: std::collections::HashSet<&str> = old.iter().map(|u| u.id.as_str()).collect();
+    let tail: Vec<WorkUnit> = planned.iter().skip(cursor).cloned().collect();
+    for u in tail.iter().filter(|u| !old_ids.contains(u.id.as_str())) {
+        emit(
+            subscribers,
+            CoreEvent::UnitPlanned {
+                session: run_id.to_string(),
+                ord: u.ord,
+                description: u.description.clone(),
+                stage: u.stage.label().to_string(),
+                role: match u.role {
+                    crate::workflow::PhaseRole::Neutral => "neutral",
+                    crate::workflow::PhaseRole::Creator => "creator",
+                    crate::workflow::PhaseRole::Evaluator => "evaluator",
+                }
+                .to_string(),
+                gate: match &u.gate {
+                    crate::workflow::GateSpec::Auto => "auto",
+                    crate::workflow::GateSpec::HumanConfirm { .. } => "human_confirm",
+                    crate::workflow::GateSpec::HumanConfirmIf(_) => "human_confirm_if",
+                }
+                .to_string(),
+                skill_ref: u.skill_ref.clone(),
+                has_validator_pin: u.validator.is_some(),
+                executor_type: if u.tool_cmd.is_some() { "tool" } else { "agent" }.to_string(),
+            },
+        );
+    }
+    let mut pre = crate::pipeline::PreDistributed {
+        session_id: run_id.to_string(),
+        session: session.clone(),
+        units: tail,
+        clis: roster,
+        workflow_id: session.workflow_id.clone(),
+        cli_keys: session.clis.clone(),
+    };
+    let tail_dists = dists.into_iter().skip(cursor).collect();
+    crate::pipeline::apply_distributions(store, &mut pre, tail_dists, &mut |ev| {
+        emit(subscribers, ev)
+    })?;
+    // The cursor unit may be new (a late floor phase lands at the cursor): its first dispatch is
+    // its own attempt 0, never the finished unit's.
+    let mut s = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let units = crate::domain::session_units(&*store, run_id)?;
+    s.attempt = units.get(s.unit_ix).map(super::next_attempt).unwrap_or(0);
+    put_node(store, s.to_node())
+}
+
 #[cfg(test)]
 #[path = "team_gate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "replan_tests.rs"]
+mod replan_tests;
