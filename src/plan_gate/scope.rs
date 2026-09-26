@@ -309,20 +309,32 @@ pub(crate) fn judged(baseline: u8, rating: u8, reasons: &[String]) -> Scored {
     }
 }
 
+/// The second reason of a repo run's scope that fails closed because nothing would correct it.
+pub(crate) const NO_DIFF_RESCORE: &str = "no diff re-score on an un-teamed run";
+
 /// Score the held plan from the PA's answer, and the touch set it declared (a repo run).
+/// `diff_rescored`: T4's diff re-score runs for this run (it is teamed: the supervisor measures
+/// each settled diff). Without it a declared touch set is never corrected, so an under-declared
+/// scope would stick: a repo run's `SCOPE` then fails closed at 100 (the answer is still
+/// recorded as the proposal's touch set). A repo-less run's `RISK` has no diff to correct.
 pub(crate) fn scope_score(
     hold: &ScopeHold,
     repo_root: Option<&std::path::Path>,
     base_commit: Option<&str>,
+    diff_rescored: bool,
 ) -> (Scored, Option<Vec<String>>) {
     let Some(answer) = hold.answer.as_ref() else {
-        return (no_scope("the scope step recorded no answer"), None);
+        return (
+            no_scope("the scope step recorded no answer from the PA seat"),
+            None,
+        );
     };
     match parse_answer(&answer.lines, hold.unbound) {
         Err(why) => (no_scope(&why), None),
         Ok(Declared::Risk { score, reasons }) => {
             (judged(THRESHOLDS.repo_less_baseline, score, &reasons), None)
         }
+        Ok(Declared::Touch(touch)) if !diff_rescored => (no_scope(NO_DIFF_RESCORE), Some(touch)),
         Ok(Declared::Touch(touch)) => {
             let plan = PlanSteps {
                 steps: hold.plan.steps.clone(),
@@ -376,6 +388,7 @@ pub(crate) fn decide_scoped(
     scope_attempt: u32,
     repo_root: Option<&std::path::Path>,
     base_commit: Option<&str>,
+    diff_rescored: bool,
     human_confirm: &HumanConfirm,
     now: i64,
 ) -> anyhow::Result<Decided> {
@@ -387,7 +400,7 @@ pub(crate) fn decide_scoped(
         .accepted
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no scope rev"))?;
-    let (scored, touch) = scope_score(&hold, repo_root, base_commit);
+    let (scored, touch) = scope_score(&hold, repo_root, base_commit, diff_rescored);
     let (by, ord, attempt) = match &hold.answer {
         Some(a) => (a.by.clone(), a.ord, a.attempt),
         None => (pa_seat.to_string(), scope_ord, scope_attempt),
@@ -538,7 +551,7 @@ mod tests {
             hold(Some("SCOPE nope"), false),
             hold(None, true),
         ] {
-            let (s, touch) = scope_score(&h, None, None);
+            let (s, touch) = scope_score(&h, None, None, true);
             assert_eq!(s.assessment.score, 100);
             assert_eq!(s.assessment.reasons[0], PA_DECLARED_NO_SCOPE);
             assert!(touch.is_none());
@@ -550,6 +563,7 @@ mod tests {
             ),
             None,
             None,
+            true,
         );
         assert_eq!(
             (s.assessment.deterministic, s.assessment.score),
@@ -565,6 +579,7 @@ mod tests {
             &hold(Some("SCOPE {\"touch\":[\"docs/guide.md\"]}"), false),
             None,
             None,
+            true,
         );
         assert_eq!(s.assessment.score, 0);
         assert_eq!(touch, Some(vec!["docs/guide.md".to_string()]));
@@ -573,8 +588,31 @@ mod tests {
             &hold(Some("SCOPE {\"touch\":[\"src/auth/login.rs\"]}"), false),
             None,
             None,
+            true,
         );
         assert_eq!(s.assessment.score, 100);
         assert_ne!(s.assessment.reasons[0], PA_DECLARED_NO_SCOPE);
+        // (round 2, M1) With no diff re-score (an un-teamed run) a declared scope is never
+        // corrected, so even a docs-only one fails closed — the touch set is still recorded.
+        let (s, touch) = scope_score(
+            &hold(Some("SCOPE {\"touch\":[\"docs/guide.md\"]}"), false),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(s.assessment.score, 100);
+        assert_eq!(
+            s.assessment.reasons,
+            [PA_DECLARED_NO_SCOPE, NO_DIFF_RESCORE]
+        );
+        assert_eq!(touch, Some(vec!["docs/guide.md".to_string()]));
+        // A repo-less rating has no diff to correct: it stands un-teamed.
+        let (s, _) = scope_score(
+            &hold(Some("RISK {\"score\":10,\"reasons\":[\"internal\"]}"), true),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(s.assessment.score, 10);
     }
 }

@@ -4633,7 +4633,9 @@ fn redrive_executing_sessions(
         // (T3 round 10) A run the dispatch guard holds (its plan held, or its accepted rev's
         // `plan.accepted` not landed) is not redriven onto its unit: it goes through the team gate
         // and the pauses (`advance_or_pause`), which open the gate or publish the fact it waits on.
-        if team_gate::dispatch_blocked(&s).is_some() {
+        // (X1 round 2, M2) Likewise a run whose PA scope step folded but whose scoped plan did
+        // not land before the restart: its boundary decides the plan, never a finalize.
+        if team_gate::dispatch_blocked(&s).is_some() || team_gate::scope_due(&*store, &s) {
             match advance_or_pause(
                 store,
                 subscribers,
@@ -8708,6 +8710,18 @@ fn finalize_run(
     run_id: &str,
 ) -> anyhow::Result<()> {
     if let Some(mut session) = crate::domain::get_session(store, run_id)? {
+        // (X1 round 2, M2) A run whose launch plan its PA has not scoped yet ran only its
+        // `pa-scope` step: it is never complete (the scope step's boundary decides the plan).
+        if session
+            .team_plan
+            .as_ref()
+            .is_some_and(|t| t.scope.is_some())
+        {
+            anyhow::bail!(
+                "run {run_id} still holds the launch plan its PA is scoping: it is not complete \
+                 (the scope step's boundary decides the plan)"
+            );
+        }
         session.status = SessionStatus::Completed;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;

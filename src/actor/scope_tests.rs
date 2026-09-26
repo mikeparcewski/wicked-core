@@ -466,3 +466,167 @@ fn x1_manual_mode_pauses_once_after_the_scope_step_and_edits_wait_for_the_plan()
     assert_eq!(e.awaiting("xm").len(), 1, "{:?}", e.awaiting("xm"));
     release_all(&w);
 }
+
+// ── core#633 round 2 ─────────────────────────────────────────────────────────────────────────────
+
+/// (round 2, M1) An UN-TEAMED run (no bus: `transport: none`) on a repo gets no diff re-score
+/// (the supervisor never measures its diffs), so a declared scope would never be corrected: even a
+/// docs-only `SCOPE` fails closed at 100 and pauses plan_approval as high risk.
+#[test]
+fn x1_r2_m1_an_unteamed_repo_run_fails_its_scope_closed() {
+    let w = by_unit(|phase| {
+        (phase == "pa-scope")
+            .then(|| turn(&pa_output("SCOPE {\"touch\":[\"docs/guide.md\"]}"), None))
+    });
+    let rig = rig("x1m1");
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    let cfg = TeamConfig::new(None, Some(rig.outbox.clone()))
+        .with_final_pass_budget(Duration::from_millis(300));
+    let core = Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), w.clone(), cfg);
+    let mut e = wire(core, w.clone(), rig);
+    let (repo_id, _) = repo(&e, "x1m1");
+    launch_preset(&e, "xm1", "feature", Some(&repo_id), HumanConfirm::None);
+    e.wait_awaiting("xm1", crate::plan_gate::GATE_KIND, 1);
+    let s = view(&e, "xm1").session;
+    assert!(
+        s.team.as_ref().is_some_and(|t| t.is_unteamed()),
+        "the run is un-teamed: {:?}",
+        s.team
+    );
+    let tp = s.team_plan.expect("plan state");
+    assert_eq!(tp.max_score, 100, "failed closed, not the docs-only 0");
+    let held = tp.pending.expect("held for approval");
+    assert_eq!((held.reason.as_str(), held.high_risk), ("high_risk", true));
+    assert_eq!(e.worker.calls().len(), 1, "only the scope step ran");
+    release_all(&w);
+}
+
+/// (round 2, L2) Only the PA seat's answer is the scope: the same `SCOPE` output from any other
+/// seat holding the scope unit is not recorded (so the boundary fails it closed).
+#[test]
+fn x1_r2_l2_only_the_pa_seat_answers_the_scope() {
+    let w = by_unit(|_| None);
+    let e = engine("x1l2", w.clone());
+    put(&e, "notes", json!([{"catalog": "produce", "id": "draft"}]));
+    launch_preset(&e, "xl2", "notes", None, HumanConfirm::None);
+    wait_for("the scope step to dispatch", || e.worker.calls().len() == 1);
+    let v = view(&e, "xl2");
+    let unit = v.units[0].clone();
+    assert_eq!(unit.assigned_cli.as_deref(), Some("a"));
+    let output = |attempt| StepOutput {
+        run_id: "xl2".into(),
+        unit_ix: 0,
+        attempt,
+        output: pa_output("RISK {\"score\":5,\"reasons\":[\"x\"]}"),
+        status: StepStatus::Ok,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    };
+    let mut other = unit.clone();
+    other.assigned_cli = Some("b".into());
+    let mut s = v.session.clone();
+    super::super::record_scope_answer(&mut s, &other, &output(0));
+    assert!(
+        s.team_plan
+            .as_ref()
+            .unwrap()
+            .scope
+            .as_ref()
+            .unwrap()
+            .answer
+            .is_none(),
+        "a non-PA seat's answer is not the scope"
+    );
+    super::super::record_scope_answer(&mut s, &unit, &output(0));
+    let a = s
+        .team_plan
+        .unwrap()
+        .scope
+        .unwrap()
+        .answer
+        .expect("the PA's answer");
+    assert_eq!(a.by, "a");
+    release_all(&w);
+}
+
+/// (round 2, M2) A restart between the scope step's fold and its boundary's write (the run
+/// persisted with the scope step Done, the cursor past it, and the plan still held) must not
+/// finalize the run with only `pa-scope` run: the exec-mode restart re-drive takes it through the
+/// boundary (`advance_or_pause`), which decides the plan and puts its units in. (The restarted
+/// engine has no team publisher, so the run then waits on its transport — never "completed".)
+#[test]
+fn x1_r2_m2_a_restart_after_the_scope_fold_decides_the_plan_not_completes_the_run() {
+    let w = by_unit(|_| None);
+    let e = engine("x1m2", w.clone());
+    put(&e, "notes", json!([{"catalog": "produce", "id": "draft"}]));
+    launch_preset(&e, "xm2", "notes", None, HumanConfirm::None);
+    wait_for("the scope step to dispatch", || e.worker.calls().len() == 1);
+    settled(&e, "xm2", tev::PLAN_ACCEPTED, 1);
+    let Engine {
+        core, worker, rig, ..
+    } = e;
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    drop(core);
+    std::thread::sleep(Duration::from_millis(500));
+    // The state a crash after the fold leaves: the scope unit Done with its answer recorded, the
+    // cursor past it, the plan still held (apply_scope's write never landed).
+    {
+        use wicked_apps_core::ToNode;
+        let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store");
+        let mut s = crate::domain::get_session(&store, "xm2").unwrap().unwrap();
+        let mut units = crate::domain::session_units(&store, "xm2").unwrap();
+        assert_eq!(units.len(), 1, "rev 1 is the scope step alone");
+        units[0].status = crate::domain::UnitStatus::Done;
+        units[0].last_attempt = Some(0);
+        crate::domain::put_node(&mut store, units[0].to_node()).unwrap();
+        s.unit_ix = 1;
+        s.status = SessionStatus::Executing;
+        s.team_plan.as_mut().unwrap().scope.as_mut().unwrap().answer =
+            Some(crate::plan_gate::ScopeAnswer {
+                ord: 1,
+                attempt: 0,
+                by: "a".into(),
+                lines: "RISK {\"score\":10,\"reasons\":[\"internal notes\"]}".into(),
+            });
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+    }
+    release_all(&worker);
+    drop(worker);
+    // The restart, in exec-mediation mode (the one mode that re-drives `Executing` runs at boot),
+    // with the team publisher on the same bus as before.
+    let w2 = by_unit(|_| None);
+    let exec_bus = rig.dir.join("exec-bus.db").to_string_lossy().into_owned();
+    let cfg = team_cfg(&rig, Duration::from_millis(300));
+    let core = Core::spawn_inner(
+        db,
+        Arc::new(StubDispatcher),
+        w2.clone(),
+        Some(exec_bus),
+        Some(cfg),
+    );
+    let e = wire(core, w2.clone(), rig);
+    wait_for(
+        "the re-drive to decide the plan (or finalize the run)",
+        || {
+            let v = view(&e, "xm2");
+            v.session.status == SessionStatus::Completed
+                || v.session
+                    .team_plan
+                    .as_ref()
+                    .is_some_and(|t| t.scope.is_none())
+        },
+    );
+    let v = view(&e, "xm2");
+    assert_ne!(
+        v.session.status,
+        SessionStatus::Completed,
+        "never completed with only pa-scope run"
+    );
+    let tp = v.session.team_plan.unwrap();
+    assert_eq!((tp.rev, tp.max_score), (2, 10), "the scoped plan is rev 2");
+    let ids: Vec<String> = v.units.iter().map(|u| u.id.clone()).collect();
+    assert_eq!(ids, ["xm2:pa-scope", "xm2:draft"]);
+    release_all(&w2);
+}

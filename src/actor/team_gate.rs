@@ -2628,8 +2628,8 @@ pub(super) fn is_scope_unit(session: &AgentSession, u: &WorkUnit) -> bool {
             .is_some_and(|t| t.scope.is_some())
 }
 
-/// Hold the scope step's answer (its `SCOPE` / `RISK` lines) for the boundary that scores the
-/// plan. A later attempt of the step replaces an earlier one's; a failed turn has no answer. An
+/// Hold the scope step's answer (its `SCOPE` / `RISK` lines, from the PA seat only) for the
+/// boundary that scores the plan. A later attempt of the step replaces an earlier one's; a failed turn has no answer. An
 /// answer with no such line is recorded empty, so the boundary fails it closed with its reason.
 /// Mutates `session` only; the caller persists it.
 pub(super) fn record_scope_answer(
@@ -2640,10 +2640,13 @@ pub(super) fn record_scope_answer(
     if output.status != crate::workflow::StepStatus::Ok || !is_scope_unit(session, unit) {
         return;
     }
-    let by = unit
-        .assigned_cli
-        .clone()
-        .unwrap_or_else(|| pa_seat(session));
+    // (round 2, L2) Only the PA speaks for the scope, as only the PA speaks for the plan
+    // (`record_plan_lines`): an answer from any other seat is not recorded, so the boundary fails
+    // it closed ("no answer from the PA seat").
+    let by = pa_seat(session);
+    if unit.assigned_cli.as_deref() != Some(by.as_str()) {
+        return;
+    }
     if let Some(hold) = session.team_plan.as_mut().and_then(|t| t.scope.as_mut()) {
         hold.answer = Some(crate::plan_gate::ScopeAnswer {
             ord: unit.ord,
@@ -2652,6 +2655,22 @@ pub(super) fn record_scope_answer(
             lines: crate::plan_gate::scope_lines_of(&output.output),
         });
     }
+}
+
+/// (round 2, M2) The run's scope step is done but its plan is still held: the scope step's
+/// boundary ([`apply_scope`]) has not landed (a restart between the fold and its write). Such a
+/// run is not complete — it goes through `advance_or_pause`, never straight to finalize.
+pub(super) fn scope_due(store: &dyn GraphStore, session: &AgentSession) -> bool {
+    if session.team_plan.as_ref().is_none_or(|t| t.scope.is_none()) {
+        return false;
+    }
+    let Ok(units) = crate::domain::session_units(store, &session.id) else {
+        return false;
+    };
+    let cursor = session.unit_ix.min(units.len());
+    units[..cursor]
+        .iter()
+        .any(|u| u.phase_id() == Some(crate::plan_gate::SCOPE_STEP_ID))
 }
 
 /// (X1) The scope step's boundary: once it is done and the unit after it has not run, score the
@@ -2704,6 +2723,9 @@ pub(super) fn apply_scope(
         scope.last_attempt.unwrap_or(0),
         root.as_deref(),
         session.base_commit.as_deref(),
+        // (round 2, M1) T4's diff re-score runs only for a teamed run (the supervisor measures
+        // the settled diff); an un-teamed repo run's declared scope would never be corrected.
+        session.team.as_ref().is_some_and(RunTeamState::is_teamed),
         &session.human_confirm,
         now,
     )?;
