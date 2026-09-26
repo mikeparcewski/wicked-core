@@ -1840,6 +1840,9 @@ impl WrappedCliStepRunner {
                 if !g.phase_id.is_empty() {
                     cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
                 }
+                if !g.catalog.is_empty() {
+                    cmd.env(crate::gate_hook::GATE_CATALOG_ENV, &g.catalog);
+                }
                 // Wire the worker's estate CLI channel (`wicked-core coverage` / `wicked-estate`) to
                 // the repo's OWN graph via `$WICKED_ESTATE_DB` — the completion of FINDING-069, which
                 // wired only the MCP channel. Repo store or nothing, NEVER the operational store; the
@@ -2545,6 +2548,9 @@ struct GovLaunch {
     /// The unit's WORKFLOW phase id (e.g. `review`) — set as `WICKED_GATE_PHASE_ID` so the hook's
     /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
     phase_id: String,
+    /// (DES-TEAMING-002 T3) The unit's phase-catalog id — set as `WICKED_GATE_CATALOG`, the
+    /// hook's third alias. Empty ⇒ unset.
+    catalog: String,
     /// The repo's code-graph store (engine-resolved: `<state home>/repo-graphs/<key>/estate.db`,
     /// never inside the checkout — see `code_graph.rs`, core#406), when this unit runs
     /// against a registered repo. Used to (a) point the worker's estate MCP at the repo-local
@@ -2835,6 +2841,7 @@ fn arm_input_governance(
         scope,
         phase,
         phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
+        catalog: input.unit.catalog.clone().unwrap_or_default(),
         code_graph_db: gov.code_graph_db.clone(),
         extra_write_roots: gov.extra_write_roots.clone(),
         extra_read_roots: gov.extra_read_roots.clone(),
@@ -7032,6 +7039,7 @@ mod tests {
                 scope: "s".to_string(),
                 phase: "unit-1".to_string(),
                 phase_id: String::new(),
+                catalog: String::new(),
                 code_graph_db: code_graph_db.map(str::to_string),
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
@@ -11028,6 +11036,8 @@ mod project_graph_end_to_end_tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: pg,
+            plan: None,
+            deliver_step: None,
         };
 
         // 1. BOUND.

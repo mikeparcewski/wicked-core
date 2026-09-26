@@ -163,6 +163,8 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
 
@@ -242,6 +244,8 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
 

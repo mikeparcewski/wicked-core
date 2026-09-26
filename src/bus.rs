@@ -1250,6 +1250,8 @@ fn launch_from_event(
         // workers get the run repo's own graph. Binding one would mean minting an estate label
         // here, and the label rule belongs to whoever owns the project graph — not the bus bridge.
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     };
 
     let (reply, rx) = channel();

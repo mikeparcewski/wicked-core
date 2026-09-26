@@ -145,6 +145,8 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     }
 }
 

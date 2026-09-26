@@ -134,6 +134,8 @@ fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     }
 }
 
@@ -192,18 +194,24 @@ fn r(
 }
 
 /// C1(a)'s `feature` composition as a unit list (fixed values: §11.2's row, with its two bold
-/// cells — `test` and `review` on the evaluator role).
+/// cells — `test` and `review` on the evaluator role), launched as a TEAM plan (DES-TEAMING-002
+/// T3): a preset declares no `touch`, so its creator plan scores 100 ("no declared scope") and
+/// floor fill inserts the 70-100 floor phases it lacks (`test_plan`, `architecture`,
+/// `security_review`; `deliver` only for a delivering run) at their catalog-order positions.
 fn feature_units() -> Vec<(String, String, String, String, Option<String>)> {
     let hc = r#"{"human_confirm":{"unconditional":false}}"#;
     let hci = r#"{"human_confirm_if":"verdict_not_pass"}"#;
     let f = Some(EVIDENCE_FLOOR_PIN);
     vec![
         r("clarify", "recon", "neutral", hc, None),
+        r("test_plan", "test", "neutral", "auto", None),
         r("design", "recon", "neutral", "auto", None),
+        r("architecture", "recon", "neutral", "auto", None),
         r("build", "build", "creator", "auto", f),
         r("adversarial-review", "review", "evaluator", hc, f),
         r("test", "test", "evaluator", hci, f),
         r("review", "review", "evaluator", "auto", None),
+        r("security_review", "review", "evaluator", "auto", f),
     ]
 }
 
@@ -229,12 +237,18 @@ fn my_flow_steps() -> Vec<PlanStep> {
     ]
 }
 
+/// `my-flow`'s units as a team plan (T3): the 70-100 floor fills `test_plan`, `design`,
+/// `architecture` and `security_review` around its three steps.
 fn my_flow_units() -> Vec<(String, String, String, String, Option<String>)> {
     let f = Some(EVIDENCE_FLOOR_PIN);
     vec![
         r("scope", "recon", "neutral", "auto", None),
+        r("test_plan", "test", "neutral", "auto", None),
+        r("design", "recon", "neutral", "auto", None),
+        r("architecture", "recon", "neutral", "auto", None),
         r("make", "build", "creator", "auto", f),
         r("check", "review", "evaluator", "auto", f),
+        r("security_review", "review", "evaluator", "auto", f),
     ]
 }
 

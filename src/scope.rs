@@ -60,10 +60,19 @@ pub fn unit_phase(ord: u32) -> String {
 /// reaches this function from an unset `WICKED_GATE_PHASE_ID` or a bare `--phase-id`, and admitting
 /// `""` would select any policy registered as `applies_to: [""]` on EVERY unit. Callers still
 /// filter, but the invariant belongs to the function that depends on it.
-pub fn phase_aliases<'a>(phase: &'a str, alias: Option<&'a str>) -> Vec<&'a str> {
+pub fn phase_aliases<'a>(
+    phase: &'a str,
+    alias: Option<&'a str>,
+    catalog: Option<&'a str>,
+) -> Vec<&'a str> {
     let mut tokens = vec![phase];
-    if let Some(alias) = alias.filter(|a| !a.is_empty() && *a != phase) {
-        tokens.push(alias);
+    // The workflow phase id, then (DES-TEAMING-002 T3) the catalog entry a composed phase
+    // instantiates — a plan's step ids are the author's, so `applies_to: ["review"]` must reach a
+    // `review` step authored as `check`. Absent/empty tokens add nothing: absence never widens.
+    for token in [alias, catalog].into_iter().flatten() {
+        if !token.is_empty() && !tokens.contains(&token) {
+            tokens.push(token);
+        }
     }
     tokens
 }
@@ -85,18 +94,38 @@ mod tests {
 
     /// The alias list is the two tokens a policy may name, deduplicated, `phase` first.
     #[test]
+    fn phase_aliases_add_the_catalog_id_and_never_widen_on_absence() {
+        assert_eq!(
+            phase_aliases("unit-3", Some("check"), Some("review")),
+            vec!["unit-3", "check", "review"]
+        );
+        assert_eq!(
+            phase_aliases("unit-3", Some("review"), Some("review")),
+            vec!["unit-3", "review"]
+        );
+        assert_eq!(
+            phase_aliases("unit-3", Some("check"), None),
+            vec!["unit-3", "check"]
+        );
+        assert_eq!(phase_aliases("unit-3", None, Some("")), vec!["unit-3"]);
+    }
+
+    #[test]
     fn phase_aliases_pairs_synthetic_and_workflow_tokens() {
         assert_eq!(
-            phase_aliases("unit-3", Some("review")),
+            phase_aliases("unit-3", Some("review"), None),
             vec!["unit-3", "review"]
         );
         // No alias (prose-planned or hand-built unit) ⇒ the synthetic token alone.
-        assert_eq!(phase_aliases("unit-3", None), vec!["unit-3"]);
+        assert_eq!(phase_aliases("unit-3", None, None), vec!["unit-3"]);
         // A workflow phase literally named `unit-3` must not be listed twice.
-        assert_eq!(phase_aliases("unit-3", Some("unit-3")), vec!["unit-3"]);
+        assert_eq!(
+            phase_aliases("unit-3", Some("unit-3"), None),
+            vec!["unit-3"]
+        );
         // An EMPTY alias is dropped, not selected on: a bare `--phase-id` or an unset
         // WICKED_GATE_PHASE_ID must not match a policy registered as `applies_to: [""]`.
-        assert_eq!(phase_aliases("unit-3", Some("")), vec!["unit-3"]);
+        assert_eq!(phase_aliases("unit-3", Some(""), None), vec!["unit-3"]);
     }
 
     /// `phase_id` recovers the workflow phase from the unit id, and refuses to guess when the id

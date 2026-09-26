@@ -229,6 +229,8 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     });
 
     assert!(
@@ -274,6 +276,8 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch the bug-shaped workflow");
 
@@ -336,6 +340,8 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch the bug-shaped workflow");
     assert!(
@@ -412,6 +418,8 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
 
@@ -528,6 +536,8 @@ fn a_triage_fail_rejection_persists_the_full_failure_transcript() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
 

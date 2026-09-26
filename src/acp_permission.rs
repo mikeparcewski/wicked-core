@@ -39,6 +39,9 @@ pub(crate) struct AcpGate<'a> {
     pub scope: &'a str,
     pub phase: &'a str,
     pub phase_alias: Option<&'a str>,
+    /// (DES-TEAMING-002 T3, #627) The unit's phase-CATALOG id — governance's third alias, passed as
+    /// data: this carrier is in-process and must never read the daemon's env.
+    pub catalog_alias: Option<&'a str>,
     pub db: Option<&'a str>,
     pub decisions_path: &'a str,
     /// The unit's filesystem boundary (core#260). This carrier evaluates IN-PROCESS, so the env
@@ -47,6 +50,13 @@ pub(crate) struct AcpGate<'a> {
     /// behavior only for callers that genuinely have no unit filesystem, e.g. tests of pure
     /// policy evaluation; the runner always supplies it for governed units.
     pub boundary: Option<crate::gate_hook::BoundaryCtx>,
+}
+
+/// The two policy aliases a unit contributes to an ACP gate (#627): its workflow phase id and its
+/// phase-catalog id — the same pair the wrapped path arms as `WICKED_GATE_PHASE_ID` /
+/// `WICKED_GATE_CATALOG` and every in-process gate passes to `scope::phase_aliases`.
+pub(crate) fn unit_aliases(unit: &crate::domain::WorkUnit) -> (Option<&str>, Option<&str>) {
+    (unit.phase_id(), unit.catalog.as_deref())
 }
 
 /// ACP permission option kinds, per the protocol's `PermissionOption.kind`.
@@ -392,6 +402,7 @@ pub(crate) fn permission_result(gate: &AcpGate<'_>, params: &Value) -> (Value, b
         gate.scope,
         gate.phase,
         gate.phase_alias,
+        gate.catalog_alias,
         gate.db,
         gate.decisions_path,
         &context,
@@ -543,6 +554,7 @@ mod tests {
             scope: "unit",
             phase: "unit-1",
             phase_alias: None,
+            catalog_alias: None,
             db: Some(db.to_str().unwrap()),
             decisions_path: decisions.to_str().unwrap(),
             boundary: None, // pure policy-evaluation test — no unit filesystem
@@ -657,6 +669,7 @@ mod tests {
             scope: "unit",
             phase: "unit-1",
             phase_alias: None,
+            catalog_alias: None,
             db: db.to_str(), // empty store — no policies; only the boundary can deny
             decisions_path: decisions.to_str().unwrap(),
             boundary: boundary(),
@@ -683,6 +696,7 @@ mod tests {
             scope: "unit",
             phase: "unit-1",
             phase_alias: None,
+            catalog_alias: None,
             db: db.to_str(),
             decisions_path: decisions_ok.to_str().unwrap(),
             boundary: boundary(),
@@ -763,6 +777,7 @@ mod tests {
             scope: "unit",
             phase: "unit-2",
             phase_alias: Some("design"),
+            catalog_alias: None,
             db: db.to_str(),
             decisions_path: denied_log.to_str().unwrap(),
             boundary: boundary(true),
@@ -809,6 +824,7 @@ mod tests {
             scope: "unit",
             phase: "unit-2",
             phase_alias: Some("design"),
+            catalog_alias: None,
             db: db.to_str(),
             decisions_path: ok_log.to_str().unwrap(),
             boundary: boundary(true),
@@ -826,6 +842,7 @@ mod tests {
             scope: "unit",
             phase: "unit-3",
             phase_alias: Some("build"),
+            catalog_alias: None,
             db: db.to_str(),
             decisions_path: build_log.to_str().unwrap(),
             boundary: boundary(false),
@@ -1191,5 +1208,83 @@ mod tests {
             execute_command(&colon_title).as_deref(),
             Some("gh pr merge 3")
         );
+    }
+
+    /// #627: the ACP carrier selects a tool-call policy on EVERY alias — `unit-<ord>`, the phase
+    /// id and the catalog id — exactly as the hook subprocess does. A review step authored as
+    /// `check` is caught by `applies_to: ["review"]`; so is a phase id `review`; a build step named
+    /// `review-notes` is not; no aliases is today's `unit-<ord>`-only behaviour.
+    #[test]
+    fn an_acp_tool_call_policy_selects_on_the_phase_and_catalog_aliases() {
+        use wicked_apps_core::open_store;
+        use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+        let dir = std::env::temp_dir().join(format!("wicked-acpalias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("gov.db");
+        let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+        register_policy(
+            &mut store,
+            &Policy {
+                id: "pol-review-tools".to_string(),
+                kind: "test".to_string(),
+                applies_to: vec!["review".to_string()],
+                effect: Effect::Deny,
+                trigger: Trigger {
+                    contains: Some("t3-alias-marker".to_string()),
+                },
+                obligations: vec![],
+                criteria: "no marker tool calls in review".to_string(),
+                severity: Severity::High,
+                rule: "Deny the marker command in a review phase.".to_string(),
+                retired: false,
+            },
+        )
+        .unwrap();
+        drop(store);
+        let params = json!({
+            "sessionId": "s1",
+            "toolName": "Bash",
+            "toolCall": {"toolCallId": "t1", "rawInput": {"command": "echo t3-alias-marker"}},
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "reject", "kind": "reject_once"},
+            ],
+        });
+        let allowed = |n: usize, phase_alias: Option<&str>, catalog_alias: Option<&str>| {
+            let log = dir.join(format!("decisions-{n}.jsonl"));
+            let gate = AcpGate {
+                scope: "unit",
+                phase: "unit-3",
+                phase_alias,
+                catalog_alias,
+                db: Some(db.to_str().unwrap()),
+                decisions_path: log.to_str().unwrap(),
+                boundary: None,
+            };
+            permission_result(&gate, &params).1
+        };
+        assert!(
+            !allowed(1, Some("check"), Some("review")),
+            "catalog review named check"
+        );
+        assert!(!allowed(2, Some("review"), None), "phase id review");
+        assert!(
+            allowed(3, Some("review-notes"), Some("build")),
+            "build named review-notes"
+        );
+        assert!(allowed(4, None, None), "no aliases: unit-<ord> only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #627: the runner builds its ACP gate from the unit's own aliases.
+    #[test]
+    fn a_unit_contributes_its_phase_id_and_catalog_id() {
+        let mut u = crate::domain::WorkUnit::pending("r:check", "r", 3, "d");
+        u.catalog = Some("review".into());
+        assert_eq!(unit_aliases(&u), (Some("check"), Some("review")));
+        let prose = crate::domain::WorkUnit::pending("r:u3", "r", 3, "d");
+        assert_eq!(unit_aliases(&prose), (Some("u3"), None));
     }
 }

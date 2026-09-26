@@ -203,6 +203,13 @@ pub struct AgentSession {
     /// and non-team sessions serialize byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<RunTeamState>,
+    /// (DES-TEAMING-002 §8.4-§8.6, T3) The run's plan state when it was launched from a plan or
+    /// a preset: the accepted rev, the plan awaiting approval, and the ratcheted score. `None`
+    /// for a run planned any other way (a registered def, the prose planner). Durable, so a
+    /// restart keeps a `plan_approval` gate open and answerable. The gate counter is
+    /// [`RunTeamState::gate_seq`] (one counter for every team gate). `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_plan: Option<crate::plan_gate::TeamPlanState>,
 }
 
 /// A team run's durable team state ([`AgentSession::team`], DES-TEAMING-002 §4.7). Written by the
@@ -266,6 +273,12 @@ pub struct PendingTeamFact {
     pub stage: PendingStage,
     /// What runs once the fact is acknowledged (or the run falls back to un-teamed).
     pub then: TeamBlocked,
+    /// (DES-TEAMING-002 T3, codex round 9 on #622) The plan-gate answer this fact's
+    /// acknowledgement COMMITS: decided and proven when the gate was answered, applied only once
+    /// the gate's required `gate.decided` is acknowledged (or the run continues un-teamed). Held
+    /// here, durably, so a restart finishes it; `None` for every other pending fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<Box<crate::plan_gate::StagedRelease>>,
 }
 
 /// Where a pending fact stands.
@@ -278,6 +291,10 @@ pub enum PendingStage {
     Paused,
     /// The operator chose continue-without-team or reject: the run tombstone is being written.
     Superseding,
+    /// (T3, codex round 9) The fact is acknowledged (or the run continues un-teamed) and the
+    /// staged plan-gate answer it gates is being applied. A restart finds this and applies it
+    /// once (idempotent: the state is absolute, the units are keyed by phase id).
+    Acknowledged,
 }
 
 /// The step a pending fact gates.
@@ -697,6 +714,13 @@ pub struct WorkUnit {
     /// serialize byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub team_run: bool,
+    /// (DES-TEAMING-002 T3) The phase-catalog entry this unit instantiates (`review`, `build`, …)
+    /// when it was planned from a catalog-composed def — a plan's step ids are the author's, so
+    /// governance selects on the catalog id too (a third `applies_to` alias, `scope::
+    /// phase_aliases`). `None` for every other unit, which keeps today's two aliases.
+    /// `#[serde(default)]` + skip-if-none: older rows deserialize and serialize byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     /// (DES-TEAMING-002 P1) The unit's team snapshot, stamped by the actor at dispatch for a team
     /// run ([`UnitTeamSnapshot`]). `None` for a non-team unit. Skip-if-none: non-team units
     /// serialize byte-identical.
@@ -959,6 +983,7 @@ impl WorkUnit {
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,
+            catalog: None,
             team: None,
             scope_warnings: Vec::new(),
             worktree_guarded: false,
@@ -1281,6 +1306,7 @@ mod tests {
             finished_at: None,
             benched_seats: Vec::new(),
             team: None,
+            team_plan: None,
         }
     }
 

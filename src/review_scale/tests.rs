@@ -1143,3 +1143,43 @@ fn t2_f_band_numbers_live_only_in_thresholds() {
         "band numbers outside THRESHOLDS: {hits:#?}"
     );
 }
+
+/// T2 (g) through T3's launch scorer (`plan_gate::intent_score`, the one the engine calls at
+/// launch): a creator plan with `touch: ["src/x.rs"]` scores from the graph (80, as
+/// `t2_g_a_declared_touch_set_scores_from_the_graph`), and the same plan without `touch` scores 100
+/// with "no declared scope"; an understand-only plan scores 0.
+#[test]
+fn t3_the_launch_scorer_reads_the_graph_for_a_declared_touch_set() {
+    let store = imported_file_graph("src/x.rs");
+    let plan =
+        |v: serde_json::Value| -> crate::plan::PlanSteps { serde_json::from_value(v).unwrap() };
+    let touched = crate::plan_gate::intent_score(
+        &plan(
+            serde_json::json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/x.rs"]}),
+        ),
+        ready(&store),
+    );
+    assert_eq!(touched.assessment.score, 80, "{:?}", touched.assessment);
+    assert!(touched.assessment.signals.is_some(), "the graph was read");
+    assert!(!touched.destructive);
+    let none = crate::plan_gate::intent_score(
+        &plan(serde_json::json!({"steps": [{"catalog": "build", "id": "build"}]})),
+        ready(&store),
+    );
+    assert_eq!(none.assessment.score, 100);
+    assert_eq!(none.assessment.reasons, [NO_DECLARED_SCOPE]);
+    let read_only = crate::plan_gate::intent_score(
+        &plan(serde_json::json!({"steps": [{"catalog": "understand", "id": "u"}]})),
+        Graph::Unavailable("none".into()),
+    );
+    assert_eq!(read_only.assessment.score, 0);
+    // A destructive touched path is high risk even when the graph is unusable (the signal is
+    // path-derived, positive evidence), so it never rides on the graph being readable.
+    let destructive = crate::plan_gate::intent_score(
+        &plan(
+            serde_json::json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["db/migrations/001_init.sql"]}),
+        ),
+        Graph::Unavailable("none".into()),
+    );
+    assert!(destructive.destructive);
+}

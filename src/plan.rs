@@ -185,6 +185,8 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // A unit of the run's catalog-composed per-run def belongs to a TEAM RUN (seam D1):
             // the def id is the marker, so no launch knob is needed.
             unit.team_run = is_per_run_def_id(&def.id, session_id);
+            // The catalog entry a composed phase instantiates: governance's third alias (T3).
+            unit.catalog = phase.catalog.clone();
             // Carry the DECLARED dependency graph (FINDING-024). The def states which phases this one
             // consumes; the engine honored that for ordering and dropped it for context, so an
             // Evaluator phase declared `.after("build")` still ran blind to the build. Carrying it
@@ -386,15 +388,32 @@ pub struct PlanSteps {
 }
 
 impl PlanSteps {
-    /// The plan has a creator step (`build` or `produce`, §8.5): the steps that change something.
+    /// The plan has a creator step (§8.5) against the phase catalog — see [`is_creator_step`].
     pub fn has_creator(&self) -> bool {
-        self.steps.iter().any(|s| is_creator_catalog(&s.catalog))
+        self.has_creator_in(crate::catalog::catalog())
+    }
+
+    /// [`Self::has_creator`] against `catalog` — the ONE creator predicate floor fill, the floor
+    /// types and the intent score share.
+    pub fn has_creator_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
+        self.steps.iter().any(|s| is_creator_step(catalog, s))
     }
 }
 
-/// `build` and `produce`: the catalog's creator entries (§8.5 "a plan with no creator step").
-fn is_creator_catalog(catalog: &str) -> bool {
-    matches!(catalog, "build" | "produce")
+/// (§8.5, T3 round 10) A step that CHANGES something, judged on the phase it COMPOSES to — never
+/// the catalog name alone: its entry is a creator (`build`, `produce`), or it is a non-Tool step
+/// whose composed `executes_code` is true (a step may raise `executes_code`, TightenOnly, and such
+/// a phase is unguarded — it writes the tree). A Tool step is the engine's own command. An
+/// unknown catalog id composes nothing (compose refuses it), so it is not a creator here.
+pub fn is_creator_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
+    let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
+        return false;
+    };
+    if entry.role == crate::workflow::PhaseRole::Creator {
+        return true;
+    }
+    let executes_code = step.executes_code.unwrap_or(entry.executes_code);
+    executes_code && !crate::catalog::is_tool_entry(entry)
 }
 
 /// A floor override (§8.5): the floor phase types the plan runs without, and why. Recorded on
@@ -423,6 +442,9 @@ pub struct PlanStep {
     /// The catalog id (`understand`, `build`, … — `crate::catalog::CATALOG_IDS`).
     pub catalog: String,
     /// The phase id in the composed def (unique within the plan; referenced by `depends_on`).
+    /// May be omitted on input (`{"catalog":"build"}`): the engine's plan pipeline gives it the
+    /// catalog id (`plan_gate::with_default_ids`).
+    #[serde(default)]
     pub id: String,
     /// Free text (§8.3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,7 +568,17 @@ pub enum PlanRefusal {
     /// An evaluator with no explicit `depends_on` has no creator before it but one after it: it
     /// would run before the work it evaluates. Refused, never reordered.
     EvaluatorPrecedesCreator { step: String, creator: String },
+    /// The id `deliver` is RESERVED for the one `deliver` step (codex round 6 on #622): the
+    /// engine's deliver protections — the human deliver gate and the lift + re-verify
+    /// (`deliver_lift::is_deliver_unit`) — key on the phase id, so a `deliver` step under another
+    /// id, or another step under `deliver`, would push or skip them unseen.
+    DeliverIdReserved { step: String, catalog: String },
+    /// More than one `deliver` step: a plan delivers once.
+    DeliverDuplicate { step: String },
 }
+
+/// The phase id the engine's deliver protections key on (`deliver_lift::DELIVER_PHASE_ID`).
+const DELIVER_ID: &str = "deliver";
 
 impl PlanRefusal {
     /// The stable reason token (what a caller, the studio, or a test matches on).
@@ -573,6 +605,8 @@ impl PlanRefusal {
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
             PlanRefusal::ProvenanceSupplied { .. } => "provenance_supplied",
             PlanRefusal::EvaluatorPrecedesCreator { .. } => "evaluator_precedes_creator",
+            PlanRefusal::DeliverIdReserved { .. } => "deliver_id_reserved",
+            PlanRefusal::DeliverDuplicate { .. } => "deliver_duplicate",
         }
     }
 }
@@ -674,6 +708,16 @@ impl std::fmt::Display for PlanRefusal {
                 "{r}: {step} evaluates work that is produced later ({creator}); move it after \
                  the creator"
             ),
+            PlanRefusal::DeliverIdReserved { step, catalog } => write!(
+                f,
+                "{r}: step {step} ({catalog}) — the id `deliver` belongs to the one `deliver` \
+                 step (the deliver gate and the lift key on it): name the deliver step \
+                 `deliver`, and no other step `deliver`"
+            ),
+            PlanRefusal::DeliverDuplicate { step } => write!(
+                f,
+                "{r}: step {step} is a second `deliver` step — a plan delivers once"
+            ),
         }
     }
 }
@@ -755,6 +799,24 @@ pub fn compose(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
 ) -> Result<WorkflowDef, PlanRefusal> {
+    // The reserved deliver id, one rule for every plan (user, preset, gate edit, re-plan):
+    // at most one `deliver` step, it is id `deliver`, and no other step takes the id.
+    let mut delivers = plan.steps.iter().filter(|s| s.catalog == DELIVER_ID);
+    if let (Some(_), Some(second)) = (delivers.next(), delivers.next()) {
+        return Err(PlanRefusal::DeliverDuplicate {
+            step: second.id.clone(),
+        });
+    }
+    if let Some(s) = plan
+        .steps
+        .iter()
+        .find(|s| (s.catalog == DELIVER_ID) != (s.id == DELIVER_ID))
+    {
+        return Err(PlanRefusal::DeliverIdReserved {
+            step: s.id.clone(),
+            catalog: s.catalog.clone(),
+        });
+    }
     let mut phases = Vec::with_capacity(plan.steps.len());
     for (i, step) in plan.steps.iter().enumerate() {
         let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
@@ -764,13 +826,14 @@ pub fn compose(
             });
         };
         let mut phase = apply_step(entry, step)?;
+        phase.catalog = Some(entry.id.clone());
         let (before, after) = (&plan.steps[..i], &plan.steps[i + 1..]);
         if step.depends_on.is_none()
             && entry.role == crate::workflow::PhaseRole::Evaluator
-            && !before.iter().any(|s| is_creator_catalog(&s.catalog))
+            && !before.iter().any(|s| is_creator_step(catalog, s))
         {
             // Fail closed: an evaluator whose creator comes later would run blind before it.
-            if let Some(creator) = after.iter().find(|s| is_creator_catalog(&s.catalog)) {
+            if let Some(creator) = after.iter().find(|s| is_creator_step(catalog, s)) {
                 return Err(PlanRefusal::EvaluatorPrecedesCreator {
                     step: step.id.clone(),
                     creator: creator.id.clone(),
@@ -778,7 +841,7 @@ pub fn compose(
             }
         }
         if step.depends_on.is_none() && phase.depends_on.is_empty() {
-            phase.depends_on = implicit_inputs(entry, &plan.steps[..i]);
+            phase.depends_on = implicit_inputs(catalog, entry, &plan.steps[..i]);
         }
         phases.push(phase);
     }
@@ -800,11 +863,15 @@ pub fn compose(
 /// carries it and dispatch hands the prior output (FINDING-024): an evaluator depends on every
 /// creator (`build`/`produce`) step before it, `deliver` on the step just before it, and any other
 /// step on nothing, as before.
-fn implicit_inputs(entry: &crate::workflow::PhaseDef, before: &[PlanStep]) -> Vec<String> {
+fn implicit_inputs(
+    catalog: &[crate::workflow::PhaseDef],
+    entry: &crate::workflow::PhaseDef,
+    before: &[PlanStep],
+) -> Vec<String> {
     if entry.role == crate::workflow::PhaseRole::Evaluator {
         before
             .iter()
-            .filter(|s| is_creator_catalog(&s.catalog))
+            .filter(|s| is_creator_step(catalog, s))
             .map(|s| s.id.clone())
             .collect()
     } else if entry.id == "deliver" {
@@ -963,6 +1030,53 @@ pub struct FloorFilled {
     pub floor_override: Option<FloorOverride>,
 }
 
+/// The floor phase types a plan owes for a band's `phases` (§8.5): empty for a plan with no creator
+/// step; on a non-code run (no step executes code) `produce` fills the build slot and `critique`
+/// the review slot; `deliver` only for a run that delivers. The one rule [`floor_fill`] and
+/// [`worst_case_floor_additions`] share.
+fn floor_types(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+    phases: &[&str],
+    delivers: bool,
+) -> Vec<String> {
+    if !plan.has_creator_in(catalog) {
+        return Vec::new();
+    }
+    let entry = |c: &str| catalog.iter().find(|e| e.id == c);
+    let code_run = plan.steps.iter().any(|s| {
+        s.executes_code == Some(true) || entry(&s.catalog).is_some_and(|e| e.executes_code)
+    });
+    phases
+        .iter()
+        .filter(|p| **p != "deliver" || delivers)
+        .map(|p| match (*p, code_run) {
+            ("build", false) => "produce",
+            ("review", false) => "critique",
+            (p, _) => p,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The phase types floor fill could insert into `plan` in the WORST case: the top band's floor
+/// (read from `THRESHOLDS` — the highest score any plan can reach, destructive or not) minus the
+/// types the plan already has. Floor fill inserts exactly one step per missing floor type and a
+/// ratchet never exceeds the top band, so `plan` units plus this count is an exact upper bound on
+/// what the run will plan — what a launch's synchronous unit limit checks (codex round 5 on #622)
+/// before any score exists.
+pub fn worst_case_floor_additions(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+    delivers: bool,
+) -> Vec<String> {
+    let top = crate::review_scale::floor_for(u8::MAX, true);
+    floor_types(catalog, plan, &top.phases, delivers)
+        .into_iter()
+        .filter(|ty| !plan.steps.iter().any(|s| &s.catalog == ty))
+        .collect()
+}
+
 /// Floor-fill a plan and compose it (DES-TEAMING-002 §8.5): every floor phase type missing from
 /// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
 /// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
@@ -986,27 +1100,9 @@ pub fn floor_fill(
     let row = crate::review_scale::floor_for(input.score, input.destructive);
     let entry = |c: &str| catalog.iter().find(|e| e.id == c);
     // §8.5: a plan with no creator step has an empty floor and is never high risk.
-    let creator = plan.has_creator();
+    let creator = plan.has_creator_in(catalog);
     let high_risk = creator && row.high_risk;
-    // §8.5 non-code runs: no step executes code ⇒ `produce` fills the build slot, `critique` the
-    // review slot. `deliver` is in the floor only for a run that delivers.
-    let code_run = plan.steps.iter().any(|s| {
-        s.executes_code == Some(true) || entry(&s.catalog).is_some_and(|e| e.executes_code)
-    });
-    let floor: Vec<String> = if !creator {
-        Vec::new()
-    } else {
-        row.phases
-            .iter()
-            .filter(|p| **p != "deliver" || input.deliver.is_some())
-            .map(|p| match (*p, code_run) {
-                ("build", false) => "produce",
-                ("review", false) => "critique",
-                (p, _) => p,
-            })
-            .map(str::to_string)
-            .collect()
-    };
+    let floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned phase
     // in a high-risk band. It exempts floor types from the fill; it removes no authored step.
     let mut exempt: Vec<&str> = Vec::new();
@@ -1949,7 +2045,7 @@ mod tests {
                 {"catalog": "produce", "id": "b"},
                 {"catalog": "test", "id": "test"},
                 {"catalog": "security_review", "id": "sec"},
-                {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": ["d"]}}
+                {"catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["d"]}}
             ]})),
             [
                 ("design".to_string(), s(&[])),
@@ -1957,7 +2053,7 @@ mod tests {
                 ("b".to_string(), s(&[])),
                 ("test".to_string(), s(&["a", "b"])),
                 ("sec".to_string(), s(&["a", "b"])),
-                ("ship".to_string(), s(&["sec"])),
+                ("deliver".to_string(), s(&["sec"])),
             ]
         );
         // domain_coverage is an evaluator: it depends on the produce step before it.
@@ -2032,6 +2128,77 @@ mod tests {
     }
 
     // ── T2 (DES-TEAMING-002 §8.5): floor fill ─────────────────────────────────────────────
+
+    /// codex round 6 on #622: the engine's deliver protections (the human deliver gate, the
+    /// lift + re-verify) key on the phase id `deliver`, so compose reserves it: a `deliver` step
+    /// MUST be id `deliver`, at most one exists, and no other step may take the id.
+    /// T3 (codex round 7): a unit planned from a catalog-composed def carries its catalog id; a
+    /// unit of a registered def carries none.
+    #[test]
+    fn composed_units_carry_their_catalog_id() {
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "make"}, {"catalog": "review", "id": "check"}
+        ]}))
+        .unwrap();
+        let def = compose(crate::catalog::catalog(), &plan).unwrap();
+        let units = plan_from_def(&def, "p", "s");
+        let cats: Vec<_> = units.iter().map(|u| u.catalog.as_deref()).collect();
+        assert_eq!(cats, [Some("build"), Some("review")]);
+        let bug = crate::workflow::bug_def();
+        assert!(plan_from_def(&bug, "p", "s")
+            .iter()
+            .all(|u| u.catalog.is_none()));
+    }
+
+    mod deliver_id_reserved {
+        use super::*;
+        use serde_json::json;
+
+        fn compose_json(v: serde_json::Value) -> Result<WorkflowDef, PlanRefusal> {
+            compose(
+                crate::catalog::catalog(),
+                &serde_json::from_value(v).unwrap(),
+            )
+        }
+        fn deliver(id: &str) -> serde_json::Value {
+            json!({"catalog": "deliver", "id": id, "executor": {"type": "tool", "cmd": ["gh", "pr", "create"]}})
+        }
+
+        #[test]
+        fn a_deliver_step_under_another_id_is_refused() {
+            let r = compose_json(
+                json!({"steps": [{"catalog": "build", "id": "build"}, deliver("ship")]}),
+            )
+            .expect_err("a renamed deliver step would skip the deliver gate");
+            assert_eq!(r.reason(), "deliver_id_reserved", "{r}");
+            assert!(r.to_string().contains("ship"), "{r}");
+        }
+
+        #[test]
+        fn a_second_deliver_step_is_refused() {
+            let r = compose_json(json!({"steps": [
+                {"catalog": "build", "id": "build"}, deliver("deliver"), deliver("deliver")
+            ]}))
+            .expect_err("two deliver steps");
+            assert_eq!(r.reason(), "deliver_duplicate", "{r}");
+        }
+
+        #[test]
+        fn a_non_deliver_step_cannot_take_the_deliver_id() {
+            let r = compose_json(json!({"steps": [{"catalog": "build", "id": "deliver"}]}))
+                .expect_err("the id is reserved");
+            assert_eq!(r.reason(), "deliver_id_reserved", "{r}");
+        }
+
+        #[test]
+        fn the_one_deliver_step_under_its_id_composes() {
+            let def = compose_json(
+                json!({"steps": [{"catalog": "build", "id": "build"}, deliver("deliver")]}),
+            )
+            .expect("composes");
+            assert_eq!(def.phases.last().unwrap().id, "deliver");
+        }
+    }
 
     mod floor_fill_t2 {
         use super::super::*;
@@ -2200,7 +2367,7 @@ mod tests {
                 {"catalog": "build", "id": "build"},
                 {"catalog": "review", "id": "review"},
                 {"catalog": "review", "id": "review-2"},
-                {"catalog": "deliver", "id": "ship", "executor": {"type": "tool", "cmd": cmd}}
+                {"catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": cmd}}
             ]}));
             let f = fill(&p, 30, &AUTO, Some(&cmd)).unwrap();
             let mut want = p.clone();
@@ -2208,7 +2375,7 @@ mod tests {
                 s.added_by = Some(AddedBy::Plan);
             }
             assert_eq!(f.steps, want);
-            assert_eq!(phase_ids(&f), ["build", "review", "review-2", "ship"]);
+            assert_eq!(phase_ids(&f), ["build", "review", "review-2", "deliver"]);
             assert_eq!(f.def, compose(crate::catalog::catalog(), &p).unwrap());
         }
 
@@ -2384,10 +2551,17 @@ mod tests {
                 assert_eq!(r.reason(), "provenance_supplied", "{step}: {r}");
                 assert!(r.to_string().contains("step build"), "{r}");
             }
-            // Codex's exact payload has no `id`, so it never parses at all.
+            // Codex's exact payload has no `id`. Since T3 an omitted id parses (the plan pipeline
+            // gives it the catalog id, T2 (g)'s `{"catalog":"build"}`), and the forged provenance
+            // is refused all the same.
             let exact = json!({"steps": [{"catalog": "build", "added_by": "floor",
                                           "floor_reason": "…"}]});
-            assert!(serde_json::from_value::<PlanSteps>(exact).is_err());
+            let exact = crate::plan_gate::with_default_ids(
+                &serde_json::from_value::<PlanSteps>(exact).expect("an omitted id parses"),
+            );
+            let r = fill(&exact, 30, &AUTO, None).expect_err("forged provenance is refused");
+            assert_eq!(r.reason(), "provenance_supplied", "{r}");
+            assert!(r.to_string().contains("step build"), "{r}");
         }
 
         /// codex on #619 (HIGH): a floor-inserted step gets compose's implicit inputs, like any
@@ -2482,6 +2656,40 @@ mod tests {
             );
             let read_only = plan(json!({"steps": [{"catalog": "understand", "id": "u"}]}));
             assert!(!read_only.has_creator());
+        }
+
+        /// (T3 round 10, HIGH 1) A creator is the COMPOSED value, not the catalog name: any
+        /// non-Tool step whose phase executes code changes the tree, so it scores as a creator
+        /// (100 with no declared scope), gets the floor and is high risk — a `review` authored
+        /// `executes_code: true`, or an `understand` with a pin and `executes_code: true`. A Tool
+        /// step and a plain evaluator stay non-creators (score 0, empty floor).
+        #[test]
+        fn a_step_that_executes_code_is_a_creator_whatever_its_catalog() {
+            let pin = crate::builtin_floors::EVIDENCE_FLOOR_PIN;
+            for body in [
+                json!({"steps": [{"catalog": "review", "id": "check", "executes_code": true}]}),
+                json!({"steps": [{"catalog": "understand", "id": "u", "executes_code": true,
+                                  "validator_pin": pin}]}),
+            ] {
+                let p = plan(body.clone());
+                let scored = crate::plan_gate::intent_score_for_run(&p, None, None);
+                assert_eq!(scored.assessment.score, 100, "{body}");
+                let f = fill(&p, 100, &AUTO, None).unwrap();
+                assert!(f.high_risk, "{body}");
+                assert!(!f.floor.is_empty(), "{body}");
+            }
+            for body in [
+                json!({"steps": [{"catalog": "review", "id": "check"}]}),
+                json!({"steps": [{"catalog": "run", "id": "r", "executes_code": true,
+                                  "executor": {"type": "tool", "cmd": ["true"]}}]}),
+            ] {
+                let p = plan(body.clone());
+                let scored = crate::plan_gate::intent_score_for_run(&p, None, None);
+                assert_eq!(scored.assessment.score, 0, "{body}");
+                let f = fill(&p, 100, &AUTO, None).unwrap();
+                assert!(!f.high_risk, "{body}");
+                assert!(f.floor.is_empty(), "{body}");
+            }
         }
     }
 }

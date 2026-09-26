@@ -80,6 +80,8 @@ fn spec(session_id: &str, problem: &str, human_confirm: HumanConfirm) -> LaunchS
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     }
 }
 

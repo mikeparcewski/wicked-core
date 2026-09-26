@@ -62,6 +62,11 @@ pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
 /// synthetic token alone, which is the pre-fix behaviour.
 pub const GATE_PHASE_ID_ENV: &str = "WICKED_GATE_PHASE_ID";
 
+/// (DES-TEAMING-002 T3) Environment variable carrying the unit's phase-CATALOG id (`review`, …)
+/// to the gate-hook subprocess — the third `applies_to` alias for a catalog-composed unit, whose
+/// phase id is the plan author's. Unset ⇒ no catalog alias (absence never widens).
+pub const GATE_CATALOG_ENV: &str = "WICKED_GATE_CATALOG";
+
 /// Environment variable carrying the operational store path to the gate-hook subprocess (the injected
 /// command drops `--db`). One exported const so the launcher setter + the bin resolver never drift on
 /// the name.
@@ -2346,7 +2351,13 @@ fn redirect_glob(tok: &str) -> Option<&str> {
 /// module-level note about the open path).
 /// Fails CLOSED (returns 2) if the decisions path is unset, the store can't be opened, or governance
 /// can't decide — an un-evaluable tool-call is never silently allowed.
-pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Option<&str>) -> i32 {
+pub fn run_gate_hook(
+    scope: &str,
+    phase: &str,
+    phase_alias: Option<&str>,
+    catalog_alias: Option<&str>,
+    db: Option<&str>,
+) -> i32 {
     // A store-unavailable DENY leaves no synthetic claim (there may be no resolvable decisions path yet),
     // unlike the store-open/select infra failures below. That is fine: in a GOVERNED run the launcher only
     // ever arms a file-backed store (`in_process_governance` filters `:memory:`/`postgres://`), so this
@@ -2383,6 +2394,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
         scope,
         phase,
         phase_alias,
+        catalog_alias,
         db,
         &decisions_path,
         &context,
@@ -2415,6 +2427,10 @@ pub(crate) fn evaluate_tool_call(
     scope: &str,
     phase: &str,
     phase_alias: Option<&str>,
+    // (DES-TEAMING-002 T3, #627) The unit's phase-catalog id, passed by EVERY carrier as data: the
+    // hook subprocess from its argv/env (resolved in the binary), the in-process ACP bridge from
+    // the unit — this function never reads env for it.
+    catalog_alias: Option<&str>,
     db: Option<&str>,
     decisions_path: &str,
     context: &serde_json::Value,
@@ -2648,7 +2664,7 @@ pub(crate) fn evaluate_tool_call(
         }
     };
 
-    let phases = crate::scope::phase_aliases(phase, phase_alias);
+    let phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias);
     let selected = match select_any(&store, scope, &phases, context) {
         Ok(s) => s,
         Err(e) => {
@@ -3950,6 +3966,7 @@ pub fn run_output_gate_hook(
     scope: &str,
     phase: &str,
     phase_alias: Option<&str>,
+    catalog_alias: Option<&str>,
     db: Option<&str>,
 ) -> i32 {
     if let Some(reason) = store_unavailable(db) {
@@ -3983,7 +4000,7 @@ pub fn run_output_gate_hook(
             return 2;
         }
     };
-    let phases = crate::scope::phase_aliases(phase, phase_alias);
+    let phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias);
     let selected = match select_any(&store, scope, &phases, &context) {
         Ok(s) => s,
         Err(e) => {
@@ -6234,16 +6251,19 @@ mod tests {
         assert!(store_unavailable(Some("/tmp/estate.db")).is_none());
         // The hook denies (exit 2) for each fail-open case BEFORE reading stdin — never mis-creates a store.
         assert_eq!(
-            run_gate_hook("s", "unit-1", None, Some("postgres://h/db")),
+            run_gate_hook("s", "unit-1", None, None, Some("postgres://h/db")),
             2
         );
-        assert_eq!(run_gate_hook("s", "unit-1", None, None), 2);
-        assert_eq!(run_gate_hook("s", "unit-1", None, Some(":memory:")), 2);
+        assert_eq!(run_gate_hook("s", "unit-1", None, None, None), 2);
         assert_eq!(
-            run_output_gate_hook("s", "unit-1", None, Some("postgres://h/db")),
+            run_gate_hook("s", "unit-1", None, None, Some(":memory:")),
             2
         );
-        assert_eq!(run_output_gate_hook("s", "unit-1", None, None), 2);
+        assert_eq!(
+            run_output_gate_hook("s", "unit-1", None, None, Some("postgres://h/db")),
+            2
+        );
+        assert_eq!(run_output_gate_hook("s", "unit-1", None, None, None), 2);
     }
 
     #[test]

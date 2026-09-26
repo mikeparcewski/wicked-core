@@ -272,6 +272,8 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_graph: None,
+            plan: None,
+            deliver_step: None,
         })
         .expect("launch");
     };
@@ -625,6 +627,8 @@ fn deliver_reverify_runs_the_baseline_diff_floor_against_the_run_base_2e() {
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
+        plan: None,
+        deliver_step: None,
     })
     .expect("launch");
     let status = wait_terminal(&core, run_id);
