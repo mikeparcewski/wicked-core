@@ -196,11 +196,25 @@ pub fn compose_preset(
 }
 
 /// Write the built-in presets to the store (boot). Idempotent by name: a row that already holds
-/// the built-in's steps is not rewritten. Returns the names written.
+/// the built-in's steps is not rewritten. A live global row a USER saved under a name that later
+/// became a built-in (e.g. `chat`, a built-in since DES-TEAMING-002 M3) is kept as saved and named
+/// on stderr — seeding never destroys a user's preset. Returns the names written.
 pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<Vec<String>> {
     let mut rows = Vec::new();
     for (name, steps) in crate::catalog::builtin_presets() {
         let current = get_row(store, GLOBAL_SCOPE, name)?;
+        if let Some(saved) = current
+            .as_ref()
+            .filter(|p| p.created_by != BUILTIN_CREATED_BY)
+        {
+            eprintln!(
+                "wicked-core: the saved global preset `{name}` (created_by `{}`) holds a built-in \
+                 preset's name; it is kept and launches as saved. Delete it to get the built-in \
+                 at the next boot.",
+                saved.created_by
+            );
+            continue;
+        }
         if current
             .as_ref()
             .is_some_and(|p| p.created_by == BUILTIN_CREATED_BY && p.steps == steps)
@@ -369,7 +383,10 @@ mod tests {
     #[test]
     fn seeding_is_idempotent_by_name() {
         let mut store = mem_store();
-        assert_eq!(seed_builtins(&mut store, 10).unwrap(), ["feature"]);
+        assert_eq!(
+            seed_builtins(&mut store, 10).unwrap(),
+            ["chat", "feature", "onboarding"]
+        );
         assert!(seed_builtins(&mut store, 20).unwrap().is_empty());
         let f = resolve(&store, None, "feature").unwrap().unwrap();
         assert_eq!((f.created_by.as_str(), f.updated_at), ("builtin", 10));
@@ -387,9 +404,46 @@ mod tests {
             deleted_at: None,
         };
         crate::domain::put_node(&mut store, stale.to_node()).unwrap();
-        assert_eq!(seed_builtins(&mut store, 5).unwrap(), ["feature"]);
+        assert_eq!(
+            seed_builtins(&mut store, 5).unwrap(),
+            ["chat", "feature", "onboarding"]
+        );
         let f = resolve(&store, None, "feature").unwrap().unwrap();
         assert_eq!(f.steps.len(), 6);
+    }
+
+    /// Review finding (codex, #639): a global preset a user saved as `chat` before `chat` became a
+    /// built-in is kept as saved, not overwritten into an undeletable built-in.
+    #[test]
+    fn seeding_keeps_a_saved_user_preset_under_a_new_builtin_name() {
+        let mut store = mem_store();
+        let saved = Preset {
+            name: "chat".into(),
+            scope: GLOBAL_SCOPE.into(),
+            steps: understand_only(),
+            created_by: "studio".into(),
+            updated_at: 1,
+            deleted_at: None,
+        };
+        crate::domain::put_node(&mut store, saved.to_node()).unwrap();
+        assert_eq!(
+            seed_builtins(&mut store, 5).unwrap(),
+            ["feature", "onboarding"]
+        );
+        assert_eq!(resolve(&store, None, "chat").unwrap(), Some(saved.clone()));
+        assert!(
+            delete_preset(&mut store, "chat", None, 6).unwrap(),
+            "still the user's to delete"
+        );
+        assert_eq!(
+            seed_builtins(&mut store, 7).unwrap(),
+            ["chat"],
+            "the built-in fills the freed name"
+        );
+        assert_eq!(
+            resolve(&store, None, "chat").unwrap().unwrap().created_by,
+            "builtin"
+        );
     }
 
     #[test]
@@ -488,7 +542,14 @@ mod tests {
             .into_iter()
             .map(|p| (p.name, p.scope))
             .collect();
-        assert_eq!(listed, [("feature".to_string(), format!("project:{pid}"))]);
+        assert_eq!(
+            listed,
+            [
+                ("chat".to_string(), GLOBAL_SCOPE.to_string()),
+                ("feature".to_string(), format!("project:{pid}")),
+                ("onboarding".to_string(), GLOBAL_SCOPE.to_string()),
+            ]
+        );
     }
 
     #[test]

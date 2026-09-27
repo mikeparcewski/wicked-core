@@ -8,7 +8,7 @@
 //! No registered repo ever got a graph.
 //!
 //! These tests go through the REAL engine (`Core::launch_run` → plan → distribute → dispatch),
-//! not the routing function alone: the seeded `onboarding` def, a registered repo, an empty seat
+//! not the routing function alone: the built-in `onboarding` preset, a registered repo, an empty seat
 //! pool, and a stub `wicked-estate` on `PATH` that records what it was handed.
 //!
 //! POSIX only (`#![cfg(unix)]` — the suite's idiom for script-driven tests: `p4a_wrapped`,
@@ -44,7 +44,7 @@ fn argv_log() -> PathBuf {
 }
 
 /// Pre-main (single-threaded, so no test thread can race the env writes): arm the hermetic emit
-/// spool (core#311), put a stub `wicked-estate` FIRST on `PATH` so the seeded onboarding def passes
+/// spool (core#311), put a stub `wicked-estate` FIRST on `PATH` so the onboarding preset passes
 /// the core#120 tool preflight and its two phases run to completion against this fixture (the stub
 /// logs its argv and exits 0), and pin the repo-graph root under the fixture.
 ///
@@ -226,7 +226,7 @@ fn errors(events: &[CoreEvent], sid: &str) -> Vec<String> {
         .collect()
 }
 
-/// (a) The SEEDED `onboarding` def, launched with `clis: []` against a registered repo, is not
+/// (a) The built-in `onboarding` preset, launched with `clis: []` against a registered repo, is not
 /// refused: both units are distributed `tool` to `wicked-estate`, the first tool unit is reached
 /// and spawned with the repo bound in, both phases actually run, and the run completes — with no
 /// council convened and no worker turn.
@@ -344,6 +344,60 @@ fn the_seeded_onboarding_workflow_launched_with_no_seats_runs_both_tool_units() 
         "no ballot dispatched"
     );
     assert_eq!(runner.0.load(Ordering::SeqCst), 0, "no worker turn");
+
+    // 6. (DES-TEAMING-002 M4) `onboarding` is the built-in PRESET now, not a registered def: the
+    //    launch is a team plan naming it, decided at launch. Tool-only, so no creator step — no
+    //    `pa-scope` step (X1 scopes creator plans only), score 0, nothing held — and the unit
+    //    list is the C1(a) one: index → annotate, both `run` (Tool) units, neutral, auto-gated,
+    //    unpinned. No unit is an evaluator, so evaluator ≠ creator has nothing to route: the
+    //    empty roster above is not refused `NoEligibleSeat` (§11.3 "Evaluator seat").
+    let view = core
+        .sessions_detail()
+        .expect("sessions")
+        .into_iter()
+        .find(|v| v.session.id == sid)
+        .expect("the run is on record");
+    let plan = view
+        .session
+        .team_plan
+        .as_ref()
+        .expect("a preset launch is a team plan");
+    assert_eq!(plan.preset.as_deref(), Some("onboarding"));
+    assert!(plan.scope.is_none() && plan.pending.is_none());
+    assert_eq!((plan.accepted_rev, plan.max_score), (1, 0));
+    let rows: Vec<(String, String, String, String, bool)> = view
+        .units
+        .iter()
+        .map(|u| {
+            (
+                u.id.strip_prefix(&format!("{sid}:"))
+                    .unwrap_or(&u.id)
+                    .to_string(),
+                serde_json::to_value(u.role)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                serde_json::to_value(u.gate)
+                    .unwrap()
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+                u.catalog.clone().unwrap_or_default(),
+                u.validator.is_none() && u.tool_cmd.is_some(),
+            )
+        })
+        .collect();
+    let row = |id: &str| {
+        (
+            id.to_string(),
+            "neutral".into(),
+            "auto".into(),
+            "run".into(),
+            true,
+        )
+    };
+    assert_eq!(rows, vec![row("index"), row("annotate")]);
 }
 
 /// (b) The refusal is unchanged the moment a planned unit NEEDS a seat: a tool phase beside an

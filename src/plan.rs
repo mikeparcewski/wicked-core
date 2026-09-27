@@ -107,7 +107,7 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
     // `executes_code` Creator phase. Phases BEFORE it that play neither creator nor evaluator are
     // the pre-build ladder (clarify/design/plan …): their prompts gain the scope preamble and
     // their units are marked `pre_build_scope` so the completion path can WARN when one implements
-    // anyway. `None` (a def with no code-executing creator, e.g. `collab`, `survey-repo`) ⇒ there
+    // anyway. `None` (a def with no code-executing creator, e.g. `chat`, `onboarding`) ⇒ there
     // is no ladder to protect and no phase gets the preamble.
     let first_code_creator = def
         .phases
@@ -1670,8 +1670,8 @@ mod tests {
     /// `executes_code` + declaration order — never of a workflow id. Three invariants: (1) the
     /// prompt carries the preamble IFF the unit carries the marker (the two halves never diverge);
     /// (2) no creator/evaluator-role unit and no unit at-or-after the first code-executing Creator
-    /// is ever scoped; (3) a def with NO code-executing Creator (`collab`, `survey-repo`,
-    /// `onboarding`…) gets no preamble anywhere — there is no later build rung to defer to, so the
+    /// is ever scoped; (3) a def with NO code-executing Creator (`chat`, `onboarding`…) gets no
+    /// preamble anywhere — there is no later build rung to defer to, so the
     /// preamble's promise would be a lie. Vacuity-guarded: the shipped defs must actually produce
     /// marked phases (feature: clarify+design, bug: triage+reproduce, migration: plan).
     #[test]
@@ -1866,17 +1866,26 @@ mod tests {
     /// description is the worker prompt and the PTY session runner submits a turn on the first
     /// newline — a `\n`-joined description would send only `<phase> — <intent>` (the near-identical
     /// prompt the fold exists to kill) and strand the instructions as a stray follow-up that desyncs
-    /// the reused session's result sentinel. Asserted against the SHIPPED `survey-repo` def (the one
-    /// carrying real multi-sentence instructions), not a fixture, so the guard tracks what ships.
+    /// the reused session's result sentinel. Asserted against a def whose phases carry real
+    /// multi-sentence instructions (the shape the retired `survey-repo` drop-in shipped).
     ///
     /// Falsifier: restore the `\n\n` join in `plan_from_def` — the folded descriptions regain a
     /// newline and the `contains('\n')` assert fires.
     #[test]
     fn folded_instructions_never_introduce_a_newline_into_the_prompt() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/survey-repo.json");
-        let def = crate::workflow::WorkflowRegistry::def_from_file(&path)
-            .expect("shipped survey-repo parses");
+        let def: crate::workflow::WorkflowDef = serde_json::from_value(serde_json::json!({
+            "id": "fold",
+            "phases": [
+                {"id": "structure", "kind": "recon",
+                 "instructions": "Map the layout only. Do not analyze the stack."},
+                {"id": "stack", "kind": "recon", "depends_on": ["structure"],
+                 "instructions": "Identify the stack from the manifests. Build on the layout."},
+                {"id": "synthesize", "kind": "recon", "depends_on": ["structure", "stack"],
+                 "instructions": "Do not re-survey. Merge the prior outputs into one answer."}
+            ]
+        }))
+        .expect("the fixture def parses");
+        def.validate().expect("the fixture def is valid");
         // Vacuity guard: the def must actually carry instructions on multiple phases, or a
         // single-line join proves nothing.
         let carrying = def
@@ -1891,7 +1900,7 @@ mod tests {
             .count();
         assert!(
             carrying >= 3,
-            "survey-repo must carry instructions on multiple phases or this guard is vacuous; \
+            "the fixture must carry instructions on multiple phases or this guard is vacuous; \
              found {carrying}"
         );
 
@@ -1923,6 +1932,19 @@ mod tests {
         }
     }
 
+    /// The built-in `onboarding` preset, composed (DES-TEAMING-002 M4: it replaced the def).
+    fn onboarding() -> crate::workflow::WorkflowDef {
+        let steps = crate::catalog::builtin_preset("onboarding").expect("built-in onboarding");
+        compose(
+            crate::catalog::catalog(),
+            &PlanSteps {
+                steps,
+                ..PlanSteps::default()
+            },
+        )
+        .expect("onboarding composes")
+    }
+
     fn repo_at(id: &str, root: &str) -> crate::repo::RepoEntry {
         crate::repo::RepoEntry {
             id: id.to_string(),
@@ -1946,7 +1968,7 @@ mod tests {
     /// registrations resolved whichever write landed last and two of them indexed a third repo.
     #[test]
     fn two_runs_of_one_def_bind_their_own_repos() {
-        let def = crate::workflow::onboarding_def();
+        let def = onboarding();
         let mut a = plan_from_def(&def, "onboard a", "sa");
         let mut b = plan_from_def(&def, "onboard b", "sb");
         let alpha = repo_at("alpha", "/repos/alpha");
@@ -1986,7 +2008,7 @@ mod tests {
 
     #[test]
     fn binding_leaves_no_placeholder_behind() {
-        let def = crate::workflow::onboarding_def();
+        let def = onboarding();
         let mut units = plan_from_def(&def, "onboard", "s1");
         assert!(
             !unbound_repo_tokens(&units).is_empty(),
@@ -2003,7 +2025,7 @@ mod tests {
     /// A phase with no repo placeholders is untouched — binding is not a blanket rewrite.
     #[test]
     fn binding_does_not_touch_commands_that_declare_nothing() {
-        let mut units = plan_from_def(&crate::workflow::onboarding_def(), "x", "s1");
+        let mut units = plan_from_def(&onboarding(), "x", "s1");
         units[0].tool_cmd = Some(vec![
             "wicked-estate".into(),
             "index".into(),

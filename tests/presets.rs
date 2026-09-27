@@ -600,11 +600,74 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     )
     .unwrap();
     let maps: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let want: Vec<PlanStep> = serde_json::from_value(maps["feature"]["steps"].clone()).unwrap();
     let builtins = wicked_core::builtin_presets();
     let names: Vec<&str> = builtins.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["feature"]);
-    assert_eq!(builtins[0].1, want);
+    assert_eq!(names, ["chat", "feature", "onboarding"]);
+    for (name, steps) in builtins {
+        let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(steps, want, "the built-in `{name}` is its C1 mapping");
+    }
+}
+
+/// M3 (DES-TEAMING-002 §14 (ii)): a launch naming `chat` runs the built-in preset and plans the
+/// C1(a) unit list for chat — explore → `understand`, identical to the deleted def (§11.2 has no
+/// bold cell for chat). Chat is NOT a creator plan (one read-only step), so X1 adds no `pa-scope`
+/// step: the plan is decided at launch as rev 1 (`preset: "chat"`, nothing held for the PA), the
+/// floor is empty (no phase added) and nothing pauses in auto mode.
+///
+/// Evaluator ≠ creator (§11.3 "Evaluator seat"): chat has no evaluator unit, so there is nothing
+/// to move off the creator seat — a ONE-seat roster launches and plans, it is not refused
+/// `NoEligibleSeat`.
+#[test]
+fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
+    let dir = tmp_dir("chat");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let chat = rig
+        .core
+        .list_presets(None)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "chat")
+        .expect("the built-in chat preset is listed");
+    assert_eq!(
+        (chat.scope.as_str(), chat.created_by.as_str()),
+        ("global", "builtin")
+    );
+
+    let mut one_seat = spec("rchat", "chat", None);
+    one_seat.clis = vec![cli("a")];
+    rig.core.launch_run(one_seat).unwrap();
+    let units = units_of(&rig.core, "rchat");
+    assert_eq!(
+        rows("rchat", &units),
+        vec![r("explore", "recon", "neutral", "auto", None)]
+    );
+    assert!(units.iter().all(|u| !u.executes_code), "chat is read-only");
+    let view = rig
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "rchat")
+        .unwrap();
+    let plan = view
+        .session
+        .team_plan
+        .expect("a preset launch is a team plan");
+    assert_eq!(plan.preset.as_deref(), Some("chat"));
+    assert!(
+        plan.scope.is_none(),
+        "no PA scope step for a read-only plan"
+    );
+    assert!(plan.pending.is_none(), "nothing held for approval");
+    assert_eq!((plan.rev, plan.accepted_rev), (1, 1));
+    assert!(!plan.accepted_high_risk);
+    assert_eq!(
+        plan.max_score, 0,
+        "a plan with no creator step scores 0 at launch"
+    );
 }
 
 /// Arm the hermetic emit spool (core#311) before `main`.

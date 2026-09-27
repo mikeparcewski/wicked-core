@@ -127,10 +127,89 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature`, the one C2's acceptance names. Every other consumer's preset is added
-/// by its migration seam (§14 M1–M10), which also deletes the def it replaces.
+/// Seeded here: `feature` (C2's acceptance), `chat` (M3) and `onboarding` (M4). Every other
+/// consumer's preset is added by its migration seam (§14 M1–M10), which also deletes the def it
+/// replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
-    vec![("feature", feature_preset())]
+    vec![
+        ("chat", chat_preset()),
+        ("feature", feature_preset()),
+        ("onboarding", onboarding_preset()),
+    ]
+}
+
+/// One built-in preset's steps by name (`None` for a name that is not a built-in). Test fixtures.
+#[cfg(test)]
+pub(crate) fn builtin_preset(name: &str) -> Option<Vec<PlanStep>> {
+    builtin_presets()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, steps)| steps)
+}
+
+/// `chat` (§11.2, seam M3): explore → `understand`. One read-only step: no creator step, so the
+/// floor is empty, it is never high risk, and the PA does not scope it (X1 scopes creator plans
+/// only). The launch is decided at once, `plan.proposed{by:"human", preset:"chat"}`.
+fn chat_preset() -> Vec<PlanStep> {
+    vec![PlanStep {
+        catalog: "understand".to_string(),
+        id: "explore".to_string(),
+        ..PlanStep::default()
+    }]
+}
+
+/// `onboarding` (§11.2, seam M4): index → annotate, both `run` (a Tool step), the repo bound per
+/// run through the `{repo_root}` / `{code_graph_db}` placeholders (`crate::plan::bind_repo_paths`,
+/// wicked-core#179 — never a baked path, FINDING-075). Tool-only: no seat, no creator step, an
+/// empty floor, never high risk, and no PA scope step. `gate_type` is cleared, as today's def
+/// carried none (it has no production reader).
+///
+/// # What this deliberately does NOT do
+///
+/// It does not produce `requirements_graph.json`. A third phase used to run `wicked-core
+/// domain-graph` here, and it could never succeed: that command gates fail-closed on front-half
+/// coverage == 1.0, and `wicked-estate clusters --annotate` is CLUSTERING — it annotates no symbol
+/// with a requirement. On AutoGPT, after exactly these two steps, 28,885 of 28,885
+/// behavior-bearing nodes were unaccounted, so every registration ended `sessionFailed` after the
+/// work that mattered had succeeded (FINDING-068). `domain-graph` belongs to `domain-extraction`,
+/// downstream of the `extract` + `coverage` phases that produce its precondition. Do not relax
+/// that gate to make it pass here (DES-OUTGOV-001/005).
+fn onboarding_preset() -> Vec<PlanStep> {
+    use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
+    let tool = |id: &str, cmd: &[&str], after: Option<&str>| PlanStep {
+        catalog: "run".to_string(),
+        id: id.to_string(),
+        gate_type: Some(None),
+        depends_on: after.map(|a| vec![a.to_string()]),
+        executor: Some(PhaseExecutor::Tool {
+            cmd: cmd.iter().map(|a| a.to_string()).collect(),
+        }),
+        ..PlanStep::default()
+    };
+    vec![
+        tool(
+            "index",
+            &[
+                "wicked-estate",
+                "index",
+                REPO_ROOT_TOKEN,
+                "--db",
+                CODE_GRAPH_DB_TOKEN,
+            ],
+            None,
+        ),
+        tool(
+            "annotate",
+            &[
+                "wicked-estate",
+                "clusters",
+                "--annotate",
+                "--db",
+                CODE_GRAPH_DB_TOKEN,
+            ],
+            Some("index"),
+        ),
+    ]
 }
 
 /// `feature` (§11.2): clarify → `understand` (gate raised to `human_confirm`); design → `design`;
@@ -382,6 +461,83 @@ mod tests {
             .map(|e| e["id"].as_str().unwrap())
             .collect();
         assert_eq!(verified, ["test", "domain_coverage"]);
+    }
+
+    fn composed(name: &str) -> crate::workflow::WorkflowDef {
+        let steps = builtin_preset(name).unwrap_or_else(|| panic!("no built-in preset `{name}`"));
+        crate::plan::compose(
+            catalog(),
+            &crate::plan::PlanSteps {
+                steps,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("built-in `{name}` composes: {e}"))
+    }
+
+    /// M3/M4: `chat` (read-only) and `onboarding` (tool-only) have no creator step, so the PA does
+    /// not scope them (X1: `needs_pa_scope` is false with no `touch`), and no evaluator either, so
+    /// evaluator ≠ creator has no unit to move off the creator seat.
+    #[test]
+    fn chat_and_onboarding_are_neither_creator_nor_evaluator_plans() {
+        for name in ["chat", "onboarding"] {
+            let plan = crate::plan::PlanSteps {
+                steps: builtin_preset(name).unwrap(),
+                ..Default::default()
+            };
+            assert!(!plan.has_creator(), "{name} has a creator step");
+            assert!(
+                !crate::plan_gate::needs_pa_scope(&plan),
+                "{name} would be scoped"
+            );
+            let def = composed(name);
+            assert!(
+                def.phases.iter().all(|p| p.role == PhaseRole::Neutral),
+                "{name}: every step is neutral"
+            );
+        }
+        let chat = composed("chat");
+        assert_eq!(
+            chat.phases
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["explore"]
+        );
+        assert!(!chat.phases[0].executes_code, "chat is read-only");
+        assert!(composed("onboarding").phases.iter().all(is_tool_entry));
+    }
+
+    /// Onboarding runs the two deterministic steps and stops (FINDING-068), moved here from the
+    /// deleted `onboarding_def` with the def (DES-TEAMING-002 M4). Stated as "no step shells out to
+    /// domain-graph", because the defect is that COMMAND's unmeetable coverage precondition; and
+    /// every step reads the graph by placeholder, never a baked path (FINDING-075).
+    #[test]
+    fn onboarding_runs_only_what_it_can_actually_finish() {
+        let def = composed("onboarding");
+        assert_eq!(
+            def.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["index", "annotate"]
+        );
+        for phase in &def.phases {
+            let PhaseExecutor::Tool { cmd } = &phase.executor else {
+                panic!("onboarding step `{}` is not a tool step", phase.id);
+            };
+            assert!(
+                !cmd.iter().any(|a| a == "domain-graph"),
+                "onboarding step `{}` runs `{}` — see FINDING-068",
+                phase.id,
+                cmd.join(" ")
+            );
+            let db = cmd.iter().position(|a| a == "--db").expect("names --db");
+            assert_eq!(cmd[db + 1], crate::workflow::CODE_GRAPH_DB_TOKEN);
+            assert!(!cmd.iter().any(|a| a.starts_with('/')), "{cmd:?}");
+        }
+        let PhaseExecutor::Tool { cmd } = &def.phases[0].executor else {
+            unreachable!()
+        };
+        assert!(cmd.iter().any(|a| a == crate::workflow::REPO_ROOT_TOKEN));
+        assert_eq!(def.phases[1].depends_on, ["index"]);
     }
 
     /// The evidence floor moved onto the catalog (DES-TEAMING-002 §10): exactly the entries whose

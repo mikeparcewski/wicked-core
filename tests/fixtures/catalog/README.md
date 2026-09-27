@@ -11,11 +11,17 @@ Read by `tests/catalog_compose.rs`.
   `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
   engine sees a def. The consumers core owns are not here: the test reads them live from
   `WorkflowRegistry::with_defaults()` overlaid with `workflows/*.json`.
-- `mappings.json`: for each of the 19 §11.2 consumers, `steps` (the plan that maps today's phases
+- `mappings.json`: for each of the 15 remaining §11.2 consumers, `steps` (the plan that maps today's phases
   onto catalog entries) and `bold` (§11.2's bold cells as `"<phase>.<field>": <composed value>`).
   A step carries a field only where today's phase differs from its catalog entry and the cell is
   not bold. `compose` enforces the step rules, so a step that weakened an entry would be refused.
   The bold values are fixed. They are not derived.
+
+- `migrated-defs.json`: the today-defs of the consumers whose def a migration seam deleted: `chat`
+  (M3, the deleted `workflows/chat.json`) and `onboarding` (M4, the deleted `onboarding_def()`,
+  serialized with every field spelled). They keep pinning the built-in presets that replaced them.
+  `survey-repo`, `memories`, `domain-graph-slice` and `collab` were deleted outright with no preset
+  (operator decision, 2026-09-26), so they have no fixture and no mapping.
 
 When an M-seam deletes a consumer's def, it moves that consumer's today-def into this directory
 before deleting it, so the fixture keeps pinning the preset.

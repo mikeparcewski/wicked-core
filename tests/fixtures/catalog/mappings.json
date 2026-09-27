@@ -208,42 +208,6 @@
   ],
   "bold": {}
  },
- "survey-repo": {
-  "steps": [
-   {
-    "catalog": "understand",
-    "id": "structure",
-    "instructions": "Map the repository layout only: top-level directories, entry points, and where source, tests, config, and docs live. Do not analyze languages, dependencies, or conventions — later phases cover those."
-   },
-   {
-    "catalog": "understand",
-    "id": "stack",
-    "instructions": "Identify the technology stack from the manifests (package.json, Cargo.toml, pyproject.toml, ...): languages, frameworks, build tools, key dependencies. Build on the structure summary provided as prior context; do not re-map the layout.",
-    "depends_on": [
-     "structure"
-    ]
-   },
-   {
-    "catalog": "understand",
-    "id": "conventions",
-    "instructions": "Identify the working conventions: naming, module boundaries, test placement and style, lint/format configuration, CI expectations. Build on the prior phases' outputs provided as context; do not re-survey structure or stack.",
-    "depends_on": [
-     "stack"
-    ]
-   },
-   {
-    "catalog": "understand",
-    "id": "synthesize",
-    "instructions": "Do not re-survey the repository. Merge the three prior phase outputs provided as context into one coherent survey — structure, then stack, then conventions — resolving overlaps and flagging any contradictions between them.",
-    "depends_on": [
-     "structure",
-     "stack",
-     "conventions"
-    ]
-   }
-  ],
-  "bold": {}
- },
  "capture-learnings": {
   "steps": [
    {
@@ -269,46 +233,6 @@
      "hotspots"
     ],
     "skill_ref": "wicked-garden-repo-learn"
-   }
-  ],
-  "bold": {}
- },
- "memories": {
-  "steps": [
-   {
-    "catalog": "understand",
-    "id": "gather"
-   },
-   {
-    "catalog": "produce",
-    "id": "store",
-    "depends_on": [
-     "gather"
-    ]
-   }
-  ],
-  "bold": {}
- },
- "domain-graph-slice": {
-  "steps": [
-   {
-    "catalog": "understand",
-    "id": "identify"
-   },
-   {
-    "catalog": "produce",
-    "id": "extract",
-    "depends_on": [
-     "identify"
-    ]
-   },
-   {
-    "catalog": "critique",
-    "id": "validate",
-    "gate_type": "value",
-    "depends_on": [
-     "extract"
-    ]
    }
   ],
   "bold": {}
@@ -404,47 +328,6 @@
   ],
   "bold": {
    "propose.kind": "build"
-  }
- },
- "collab": {
-  "steps": [
-   {
-    "catalog": "produce",
-    "id": "propose"
-   },
-   {
-    "catalog": "critique",
-    "id": "critique",
-    "gate_type": "value",
-    "depends_on": [
-     "propose"
-    ]
-   },
-   {
-    "catalog": "produce",
-    "id": "revise",
-    "gate_type": "strategy",
-    "depends_on": [
-     "critique"
-    ]
-   },
-   {
-    "catalog": "critique",
-    "id": "verdict",
-    "gate_type": "value",
-    "gate": {
-     "human_confirm": {
-      "unconditional": false
-     }
-    },
-    "depends_on": [
-     "revise"
-    ]
-   }
-  ],
-  "bold": {
-   "propose.kind": "build",
-   "revise.kind": "build"
   }
  },
  "interactive-chat": {

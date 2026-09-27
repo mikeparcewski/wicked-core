@@ -12,7 +12,7 @@
 //! | 2 — agent semantic judge | `unit.validator.filter(\|v\| v.approved)` | judge never runs, `agent_verdict: null` |
 //! | 3 — evaluator≠creator pass | policy engine `select` + `decide_as` | runs, selects nothing, **default-allow** |
 //!
-//! So a shipped `feature`/`bug`/`migration`/`collab` run passed every gate without anything ever
+//! So a shipped `feature`/`bug`/`migration` run passed every gate without anything ever
 //! being checked against a criterion. Pinning a floor onto the Evaluator phases engages layers 1
 //! and 2 together — layer 2 is gated on the same `Option` layer 1 is.
 //!
@@ -330,8 +330,9 @@ mod tests {
     /// The floor asserts over a worktree DIFF, so it is the right instrument exactly when the
     /// workflow is expected to produce one — i.e. when a code-writing (`executes_code`) Creator runs
     /// before the Evaluator. Pinning it more widely than that would not be stricter governance, it
-    /// would be a FALSE gate: `collab` (propose → critique → revise → verdict) never writes code, so
-    /// a diff floor would deny every one of its runs for the wrong reason.
+    /// would be a FALSE gate: an Evaluator that judges prose (no code-writing Creator upstream)
+    /// would be denied on every run for the wrong reason. No compiled built-in has one since
+    /// `collab` was deleted (DES-TEAMING-002, 2026-09-26), and the exempt list is pinned empty.
     ///
     /// Both halves are asserted because each catches a different regression: a new code workflow
     /// that ships an ungated Evaluator re-opens the finding, and a floor pinned onto a non-code
@@ -395,11 +396,10 @@ mod tests {
             ],
             "the code-writing built-ins are the ones that must be gated"
         );
-        assert_eq!(
-            exempt,
-            vec!["collab/critique", "collab/verdict"],
-            "collab is the only built-in whose Evaluators judge prose rather than a diff; if this \
-             list grows, those workflows are shipping ungated and need their own floor"
+        assert!(
+            exempt.is_empty(),
+            "no compiled built-in has an Evaluator that judges prose rather than a diff; one that \
+             appears ships ungated and needs a floor suited to its own evidence: {exempt:?}"
         );
         assert_eq!(
             code_creators,
@@ -413,9 +413,8 @@ mod tests {
     /// The test above reads `WorkflowRegistry::with_defaults()` — the COMPILED defs. `workflows/`
     /// ships JSON, and a same-id file replaces the compiled def wholesale (`load_dir` runs after
     /// `with_defaults`), so those files are what actually reach the engine. Some are copies of a
-    /// compiled built-in (`feature`, `bug`, `migration`); the rest exist only as JSON (`chat`,
-    /// `survey-repo`, `domain-extraction`, `domain-graph-slice`, `memories`) and the compiled test
-    /// never saw any of them. An Evaluator could ship there with no floor and nothing would notice
+    /// compiled built-in (`feature`, `bug`, `migration`); `domain-extraction` exists only as JSON,
+    /// and the compiled test never saw it. An Evaluator could ship there with no floor and nothing would notice
     /// (FINDING-074, #176).
     ///
     /// The rule differs from the built-in one in the negative branch. A built-in Evaluator with no
@@ -425,13 +424,10 @@ mod tests {
     /// `coverage-report.json` deliverable. So the assertion here is "must not carry the DIFF floor",
     /// plus an exact classification of which drop-in Evaluators are floored and which are not.
     ///
-    /// `ungated` is pinned rather than asserted empty. `domain-graph-slice/validate` genuinely has
-    /// no floor today, and inventing one here would be worse than naming it: the slice workflow
-    /// declares no deliverables at all, so a floor would have nothing to read, and #131 (coverage
-    /// accepts content-free requirement claims — 46 distinct strings across 34,897 nodes, every gate
-    /// green) is the open design work that says what "substance" has to mean before any such floor
-    /// is written. Pinning the list keeps the hole from GROWING while that is settled: a second
-    /// ungated Evaluator fails here.
+    /// `ungated` is asserted empty. Its one entry, `domain-graph-slice/validate` (an Evaluator with
+    /// no floor, no deliverable and an `auto` gate — nothing it could deny on), left with the
+    /// workflow when it was deleted (DES-TEAMING-002, 2026-09-26). An ungated Evaluator that
+    /// appears fails here.
     #[test]
     fn no_shipped_drop_in_ships_an_evaluator_nobody_checked() {
         let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
@@ -515,13 +511,10 @@ mod tests {
             vec!["domain-extraction/coverage"],
             "the drop-in Evaluators that carry a floor suited to their own evidence"
         );
-        assert_eq!(
-            ungated,
-            vec!["domain-graph-slice/validate"],
-            "KNOWN GAP, pinned so it cannot grow: an Evaluator with no floor, no deliverable and an \
-             `auto` gate has nothing it can deny on. Tracked by #176; the substance rule it needs is \
-             #131. If this list grew, a new workflow just shipped an unfalsifiable review step — \
-             give it a floor rather than adding it here."
+        assert!(
+            ungated.is_empty(),
+            "an Evaluator with no floor has nothing it can deny on (#176): a shipped workflow \
+             carries an unfalsifiable review step — give it a floor: {ungated:?}"
         );
     }
 }

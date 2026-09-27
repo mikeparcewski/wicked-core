@@ -7318,8 +7318,8 @@ mod tests {
         // (7) EVERY shipped Evaluator agent unit — the drop-in `workflows/*.json` are what reach the
         // engine (a same-id file replaces the compiled def; `builtin_floors` tests the same set) —
         // planned as the planner plans it, carries the line on all three forms and fits a pty turn
-        // newline-free. The set is PINNED (review-L1-513: a FIFTH evaluator, `domain-graph-slice/
-        // validate`, was not in the DES's list) so a sixth shipped evaluator fails here by name.
+        // newline-free. The set is PINNED (review-L1-513) so a new shipped evaluator fails here by
+        // name.
         let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
         let mut evaluators: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
@@ -7375,7 +7375,6 @@ mod tests {
             vec![
                 "bug/verify",
                 "domain-extraction/coverage",
-                "domain-graph-slice/validate",
                 "feature/adversarial-review",
                 "migration/verify",
             ],
