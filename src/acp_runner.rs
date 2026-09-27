@@ -7741,7 +7741,10 @@ impl AcpStepRunner {
                             .join(", ")
                     },
                 ),
-                _ => eprintln!(
+                // No phase fence: `judge` allows every write (a code phase, a creator — D14 —, an
+                // unbound seam), so there is no posture to disclose.
+                crate::write_posture::WritePosture::Full => {}
+                crate::write_posture::WritePosture::ReadOnly => eprintln!(
                     "wicked-core: unit {} (phase `{}`, {}, executes_code:false) runs on ACP seat \
                      '{cli_key}' with the read-only posture: write-class tool calls (edit/write/\
                      delete/move) are refused at the permission boundary; bash stays — the \
