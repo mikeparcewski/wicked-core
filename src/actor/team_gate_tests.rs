@@ -989,7 +989,23 @@ fn no_bus(rig: &Rig) -> TeamConfig {
 /// Replace the outbox file with a directory (every write to it fails), keeping the file aside.
 fn break_outbox(rig: &Rig) -> std::path::PathBuf {
     let aside = rig.outbox.with_extension("aside");
-    let _ = std::fs::rename(&rig.outbox, &aside);
+    // Windows refuses to rename a file another handle still has open (a publisher may be mid-append);
+    // retry briefly instead of ignoring the error and then failing to create the directory over it.
+    let mut moved = !rig.outbox.exists();
+    for _ in 0..50 {
+        if moved {
+            break;
+        }
+        moved = std::fs::rename(&rig.outbox, &aside).is_ok();
+        if !moved {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    assert!(
+        moved,
+        "could not move the outbox aside: {}",
+        rig.outbox.display()
+    );
     std::fs::create_dir_all(&rig.outbox).unwrap();
     aside
 }
