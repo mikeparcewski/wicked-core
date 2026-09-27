@@ -68,7 +68,7 @@ Only `id` is required on a phase — everything else defaults:
 | `gate` | `"auto"` | Confirm policy — see below. |
 | `executes_code` | `false` | Phase changes the tree under review (provisions a git worktree, enables code tools). `false` means the phase does NOT change that tree — it is worktree-guarded and, unless it plays `creator`, read-only at the tool boundary. A `creator` phase with `executes_code: false` (a document/proposal deliverable) still writes into the run's declared `extra_write_roots` (F-4R2-004); a phase that must leave a file IN the tree declares `true`. |
 | `verified_evidence` | `false` | Phase verdict must re-run the pinned verifier (re-verified evidence). |
-| `required_deliverables` | `[]` | Files that MUST exist for the structural gate (fail-closed if missing). |
+| `required_deliverables` | `[]` | Files that MUST exist for the structural gate (fail-closed if missing). A zero-byte file or an empty directory counts as missing, and so does a symlink that resolves outside the run's cwd or declared write roots. |
 | `depends_on` | `[]` | Phase ids that must finish first (intra-workflow DAG; validated acyclic). |
 | `role` | `"neutral"` | `creator` (does the work) \| `evaluator` (reviews a creator's output cold) \| `neutral`. |
 | `skill_ref` | `null` | Skill that drives the phase, headless (e.g. `wicked-testing-semantic-reviewer`). |
