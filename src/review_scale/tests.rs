@@ -1197,7 +1197,8 @@ fn d9_a_docs_only_design_scope_never_reads_a_stale_graph() {
         "docs/design/studio-redesign/spec.md",
         "docs/design/studio-redesign/prototype.html",
         "docs/design/studio-redesign/hero.PNG",
-        "assets/logo.svg",
+        "docs/design/studio-redesign/flow.svg",
+        "assets/logo.png",
     ];
     assert!(!signals_from_paths(docs).behavioural());
     let a = assess_intent(true, Some(docs), ready(&stale), None);
@@ -1217,8 +1218,13 @@ fn d9_a_docs_only_design_scope_never_reads_a_stale_graph() {
             "{a:?}"
         );
     }
-    // HTML outside a docs directory is still code (a web app's entry page).
-    for code in ["index.html", "src/index.html", "public/docsy.html"] {
+    // HTML or SVG outside a docs directory is still code (a web app's entry page, an asset).
+    for code in [
+        "index.html",
+        "src/index.html",
+        "public/docsy.html",
+        "public/logo.svg",
+    ] {
         assert!(signals_from_paths(&[code]).behavioural(), "{code}");
     }
 }

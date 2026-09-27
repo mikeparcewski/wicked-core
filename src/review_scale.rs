@@ -209,7 +209,8 @@ pub(crate) struct Thresholds {
     /// File extensions that are prose or images: never behavioural, wherever they live.
     pub docs_exts: &'static [&'static str],
     /// File extensions that are docs only under a [`Thresholds::docs_dirs`] directory (an HTML
-    /// design doc or prototype); anywhere else they are code (a web app's `index.html`).
+    /// design doc or prototype, a diagram); anywhere else they are code (a web app's
+    /// `index.html`, an SVG asset, which is markup and can carry script).
     pub docs_dir_exts: &'static [&'static str],
     /// Path components that mark a docs directory.
     pub docs_dirs: &'static [&'static str],
@@ -349,9 +350,9 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
         },
     ],
     docs_exts: &[
-        "md", "mdx", "markdown", "rst", "adoc", "txt", "png", "jpg", "jpeg", "gif", "svg", "webp",
+        "md", "mdx", "markdown", "rst", "adoc", "txt", "png", "jpg", "jpeg", "gif", "webp",
     ],
-    docs_dir_exts: &["html", "htm"],
+    docs_dir_exts: &["html", "htm", "svg"],
     docs_dirs: &["docs", "doc"],
     config_exts: &["toml", "json", "yaml", "yml", "lock", "ini", "cfg", "env"],
     critical_path_markers: &[
