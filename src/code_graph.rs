@@ -887,6 +887,100 @@ fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<Install
     result
 }
 
+/// How long a launch waits for its repo graph to be re-indexed at the run's base (D8).
+pub(crate) const BASE_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One base re-index at a time in this process: two launches on one repo never write its graph at
+/// once, and concurrent indexers never stack up on the host.
+static BASE_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What [`index_at_base`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BaseIndex {
+    /// The repo was never indexed: onboarding builds the first graph, a launch does not.
+    NoGraph,
+    /// The graph is already indexed at the base.
+    Current,
+    /// The graph was stale and is now indexed at the base.
+    Indexed,
+}
+
+/// D8: bring an indexed repo's code graph to the run's base before the run is scored. A launch
+/// fetches and starts from the remote tip (`repo::create_worktree_based`), while the graph stays
+/// at whatever commit onboarding indexed; the scorer reads the graph only at the base
+/// (`review_scale::graph_age`), so every behavioural run on a repo whose remote had moved scored
+/// 100 and paid the full floor. The fresh worktree IS the base tree, so indexing it into the
+/// repo's graph (incremental: only changed files are re-extracted) records exactly the base.
+/// Runs on the launch's worktree thread, off the actor, bounded by `BASE_INDEX_TIMEOUT`. `root` is
+/// the repo-graph root the actor resolved (the thread has no state-home binding). `Err` says why
+/// it did not happen; the run then scores as before (a stale graph fails closed).
+pub(crate) fn index_at_base(
+    repo: &Path,
+    worktree: &Path,
+    base_commit: &str,
+    root: Option<&Path>,
+) -> Result<BaseIndex, String> {
+    index_at_base_with(
+        &indexer_bin(),
+        repo,
+        worktree,
+        base_commit,
+        root,
+        BASE_INDEX_TIMEOUT,
+    )
+}
+
+fn index_at_base_with(
+    bin: &str,
+    repo: &Path,
+    worktree: &Path,
+    base_commit: &str,
+    root: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<BaseIndex, String> {
+    let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(db) = existing_code_graph_at(repo, root) else {
+        return Ok(BaseIndex::NoGraph);
+    };
+    let current = wicked_apps_core::open_store_ro(Some(&db.to_string_lossy()))
+        .map(|s| crate::review_scale::graph_age(&s, base_commit))
+        .is_ok_and(|age| age == crate::review_scale::GraphAge::Current);
+    if current {
+        return Ok(BaseIndex::Current);
+    }
+    let mut child = Command::new(bin)
+        .hardened()
+        .arg("index")
+        .arg(worktree)
+        .arg("--db")
+        .arg(&db)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not run the `{bin}` indexer: {e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the indexer exceeded {}s and was killed",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => return Err(format!("the indexer could not be waited on: {e}")),
+        }
+    };
+    if !status.success() {
+        return Err(format!("the indexer failed ({status})"));
+    }
+    Ok(BaseIndex::Indexed)
+}
+
 /// Index `repo` into its code graph via the wicked-estate indexer subprocess. Returns the db path.
 pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
     let graph = code_graph_path_for_write(repo)?;
@@ -1038,6 +1132,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A repo graph at `db` recording `commit` as the indexed commit.
+    #[cfg(unix)]
+    fn graph_at(db: &Path, commit: &str) {
+        use wicked_apps_core::GraphWrite;
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let mut g = open_store(Some(&db.to_string_lossy())).unwrap();
+        g.set_repo_info(&wicked_estate_core::RepoInfo {
+            commit: Some(commit.to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn age(db: &Path, base: &str) -> crate::review_scale::GraphAge {
+        let s = wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())).unwrap();
+        crate::review_scale::graph_age(&s, base)
+    }
+
+    /// D8 (rig run 1a22f803): the launch started from the fetched remote tip e9d64e7 while the
+    /// repo graph stayed at onboarding's 3071a76, so a behavioural scope failed closed at 100 on
+    /// every run. A stale graph is re-indexed from the run's worktree (the base tree) into the
+    /// repo's graph, and then reads as current; a current graph and a never-indexed repo are left
+    /// alone (the indexer is not run); a failing or hung indexer is an `Err`, bounded.
+    #[cfg(unix)]
+    #[test]
+    fn d8_a_stale_repo_graph_is_reindexed_at_the_run_base() {
+        use std::os::unix::fs::PermissionsExt;
+        const OLD: &str = "3071a7632882ade840e3c73772eaf44288c6b4c3";
+        const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
+        let dir = scratch("d8-base-index");
+        let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let never = dir.join("never-run").to_string_lossy().into_owned();
+        let run = |bin: &str, timeout: u64| {
+            index_at_base_with(
+                bin,
+                &repo,
+                &wt,
+                BASE,
+                Some(&root),
+                std::time::Duration::from_secs(timeout),
+            )
+        };
+
+        // Never indexed: onboarding's job, not the launch's.
+        assert_eq!(run(&never, 5), Ok(BaseIndex::NoGraph));
+
+        // Stale: the scorer would fail closed at 100 ...
+        let db = repo_graph_db_at(&root, &repo);
+        graph_at(&db, OLD);
+        assert!(matches!(
+            age(&db, BASE),
+            crate::review_scale::GraphAge::Stale { .. }
+        ));
+        // ... so the indexer runs over the WORKTREE into the repo's graph. The stand-in copies a
+        // graph indexed at the base over `--db` and records its argv.
+        let fresh = dir.join("fresh.db");
+        graph_at(&fresh, BASE);
+        let argv = dir.join("argv");
+        let indexer = script(
+            "indexer",
+            &format!(
+                "echo \"$@\" > '{}'\ncp '{}' \"$4\"",
+                argv.display(),
+                fresh.display()
+            ),
+        );
+        assert_eq!(run(&indexer, 30), Ok(BaseIndex::Indexed));
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap().trim(),
+            format!("index {} --db {}", wt.display(), db.display())
+        );
+        assert_eq!(age(&db, BASE), crate::review_scale::GraphAge::Current);
+
+        // Current: nothing runs.
+        assert_eq!(run(&never, 5), Ok(BaseIndex::Current));
+
+        // A failing or hung indexer is an error, and the hung one is killed at the bound.
+        graph_at(&db, OLD);
+        assert!(run(&script("fails", "exit 3"), 30)
+            .unwrap_err()
+            .contains("failed"));
+        let started = std::time::Instant::now();
+        assert!(run(&script("hangs", "sleep 30"), 1)
+            .unwrap_err()
+            .contains("exceeded 1s"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The consumer-facing literals, pinned. The in-tree spelling is what a checkout's `.codegraph/`

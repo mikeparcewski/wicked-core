@@ -1555,6 +1555,8 @@ pub(crate) fn run(
                     if let (Some(root), Some(ref_id)) = (repo_root, repo_ref) {
                         let tx = self_tx.clone();
                         let rid = run_id.clone();
+                        // D8: resolved here, where the thread's state home is bound.
+                        let graph_root = crate::code_graph::repo_graph_root();
                         std::thread::spawn(move || {
                             // (DES-L9 / crew#550) An explicit base — the open PR's head branch a
                             // revision run starts from — reaches the mint here; `None` keeps the
@@ -1571,6 +1573,22 @@ pub(crate) fn run(
                                     let base_commit = base.as_ref().map(|b| b.commit.clone());
                                     if let Some(b) = &base {
                                         let _ = tx.send(Command::EmitEvent(b.to_event(&rid)));
+                                        // D8: the run is scored against the repo graph AT this
+                                        // base; re-index a stale graph from the fresh worktree
+                                        // (the base tree) before the run starts.
+                                        if let Err(e) = crate::code_graph::index_at_base(
+                                            std::path::Path::new(&root),
+                                            &wt,
+                                            &b.commit,
+                                            graph_root.as_deref(),
+                                        ) {
+                                            tracing::warn!(
+                                                run_id = %rid,
+                                                "repo graph not re-indexed at the run base {}: {e}; \
+                                                 a behavioural scope fails closed",
+                                                b.commit
+                                            );
+                                        }
                                     }
                                     Command::WorktreeReady {
                                         spec,
