@@ -635,11 +635,13 @@ fn x1_r2_m2_a_restart_after_the_scope_fold_decides_the_plan_not_completes_the_ru
 
 /// The per-run inbox an X3 run declares as its write root (crew's interactive shape: an UNBOUND
 /// run whose deliverable is a file in a launch-declared root, `extra_write_roots`).
+#[cfg(unix)]
 fn x3_inbox(run: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("wicked-x3-inbox-{}-{run}", std::process::id()))
 }
 
 /// Launch the preset `workflow` repo-less with `inbox` declared as the run's write root.
+#[cfg(unix)]
 fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::Path) {
     e.core
         .launch_run(LaunchSpec {
@@ -672,6 +674,11 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
 ///   floor, `packages/crew/src/core/deliverable-floor.ts`, already refuses it, so the engine must
 ///   too before M9 deletes crew's);
 /// - `x3p` writes the document: the step is Done and the run completes.
+///
+/// Unix only: a launch that declares a write root validates it against `$HOME`'s engine config
+/// tree and refuses without `$HOME` (`path_policy::validate_extra_roots`), which windows-latest
+/// does not set. The floor itself is platform-neutral and its unit tests run everywhere.
+#[cfg(unix)]
 #[test]
 fn x3_a_preset_steps_declared_deliverable_is_the_engines_floor() {
     let w = Worker::scripted(|i, _| {
@@ -744,6 +751,7 @@ fn x3_a_preset_steps_declared_deliverable_is_the_engines_floor() {
     }
 }
 
+#[cfg(unix)]
 fn wait_status_done(e: &Engine, run: &str) {
     wait_for(&format!("{run} to complete"), || {
         view(e, run).session.status == SessionStatus::Completed
