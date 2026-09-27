@@ -592,6 +592,20 @@ mod tests {
         );
         assert_eq!(s.assessment.score, 0);
         assert_eq!(touch, Some(vec!["docs/guide.md".to_string()]));
+        // (D9, rig run 1a22f803) A design doc and its HTML prototype under docs/ is docs-only too.
+        let (s, _) = scope_score(
+            &hold(
+                Some(
+                    "SCOPE {\"touch\":[\"docs/design/studio-redesign/spec.md\",\
+                     \"docs/design/studio-redesign/prototype.html\"]}",
+                ),
+                false,
+            ),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(s.assessment.score, 0, "{:?}", s.assessment.reasons);
         // A behavioural one with no graph fails closed as a user plan's declared touch does.
         let (s, _) = scope_score(
             &hold(Some("SCOPE {\"touch\":[\"src/auth/login.rs\"]}"), false),
