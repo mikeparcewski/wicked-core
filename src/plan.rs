@@ -215,18 +215,25 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Write/Edit before it lands. One field, so the prompt, the gate and the warning can
             // never disagree about which phases are pre-build.
             unit.pre_build_scope = pre_build_scope;
-            // F-036 — the WORKTREE GUARD marker. A def-driven, AGENT-executed phase that declared
-            // `executes_code: false` (an evaluator, a recon rung, a review — or a creator whose
-            // deliverable is a document outside the tree) may not change the tree it works in:
-            // the actor snapshots the worktree at dispatch and the gate denies any non-exempt
-            // change when the work ends (`worktree_guard`). Read off the def, not guessed — a
-            // prose-planned unit carries no declaration and is never guarded; a Tool phase is the
-            // engine's own command (a `deliver` push MOVES HEAD on purpose). What the unit may
-            // WRITE is NOT decided here: the carriers derive that from this marker together with
-            // `role` and the run's tree (`write_posture`, F-4R2-004), so a creator keeps its
-            // declared write roots.
+            // F-036 — the WORKTREE GUARD marker. A def-driven, AGENT-executed, NON-CREATOR phase
+            // that declared `executes_code: false` (an evaluator, a recon rung, a review) may not
+            // change the tree it works in: the actor snapshots the worktree at dispatch and the
+            // gate denies (and discards) any non-exempt change when the work ends
+            // (`worktree_guard`). Read off the def, not guessed — a prose-planned unit carries no
+            // declaration and is never guarded; a Tool phase is the engine's own command (a
+            // `deliver` push MOVES HEAD on purpose).
+            //
+            // D14 — a CREATOR may change its own tree. `executes_code: false` on a creator (the
+            // catalog `produce` step) says its deliverable is not code, NOT that it writes nothing:
+            // its documents land in the worktree and are the change the later review and critique
+            // steps judge, on distinct seats (evaluator ≠ creator holds there). Guarding it
+            // discarded the very documents it exists to write (dogfood run 1a22f803). Unguarded,
+            // the carriers give it the ordinary write posture (`write_posture`), and
+            // `executes_code` still alone decides the repo-checks floor and the evidence pin.
             let is_tool = matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
-            unit.worktree_guarded = !phase.executes_code && !is_tool;
+            unit.worktree_guarded = !phase.executes_code
+                && !is_tool
+                && phase.role != crate::workflow::PhaseRole::Creator;
             // F-7R2-005 — the DEFAULT floor marker for an agent phase that NO LATER phase
             // verifies: when no `verified_evidence` phase follows this one, no `repo_checks_floor`
             // will ever re-derive its work, so a unit that changes the tree owes the repository's
@@ -1492,6 +1499,57 @@ mod tests {
             (true, true),
             "verify keeps its declared floor"
         );
+    }
+
+    /// D14: a CREATOR step may change its own tree. The catalog `produce` step is role creator with
+    /// `executes_code: false` (its deliverable is a document, not code); the worktree guard used to
+    /// treat it like a reviewer and DISCARD the documents it wrote into the worktree (dogfood run
+    /// 1a22f803). Only the non-creator read-only steps are guarded, and they alone get the
+    /// read-only write posture; a creator's tree write is ordinary work on BOTH carriers.
+    /// `executes_code` still decides the repo-checks floor and the evidence pin — unchanged here.
+    #[test]
+    fn a_non_code_creator_step_is_not_worktree_guarded_and_the_read_only_steps_are() {
+        use crate::write_posture::WritePosture;
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "understand", "id": "understand"},
+            {"catalog": "produce", "id": "produce"},
+            {"catalog": "review", "id": "review"},
+            {"catalog": "critique", "id": "critique"}
+        ]}))
+        .unwrap();
+        let def = compose(crate::catalog::catalog(), &plan).unwrap();
+        let units = plan_from_def(&def, "redesign the studio", "s");
+        let unit = |id: &str| {
+            units
+                .iter()
+                .find(|u| u.id == format!("s:{id}"))
+                .unwrap_or_else(|| panic!("the plan has a `{id}` step"))
+        };
+        let produce = unit("produce");
+        assert_eq!(produce.role, crate::workflow::PhaseRole::Creator);
+        assert!(!produce.executes_code, "produce still declares no code");
+        assert!(
+            !produce.worktree_guarded,
+            "a creator may change its own tree: produce is not guarded"
+        );
+        assert!(!crate::worktree_guard::applies_to(produce));
+        for bound in [true, false] {
+            assert_eq!(
+                WritePosture::of(produce, bound),
+                WritePosture::Full,
+                "produce may write its documents into the tree (bound={bound})"
+            );
+        }
+        assert!(
+            !produce.repo_checks_floor,
+            "executes_code still controls the repo-checks floor"
+        );
+        for id in ["understand", "review", "critique"] {
+            let u = unit(id);
+            assert!(u.worktree_guarded, "`{id}` is a read-only step: guarded");
+            assert!(crate::worktree_guard::applies_to(u), "{id}");
+            assert_eq!(WritePosture::of(u, true), WritePosture::ReadOnly, "{id}");
+        }
     }
 
     /// FINDING-024, the join that makes the fix work at all. `prior_context_label` matches a prior's

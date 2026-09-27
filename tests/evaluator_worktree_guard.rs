@@ -176,6 +176,21 @@ impl StepRunner for ScriptedSeat {
                         .unwrap();
                     }
                 }
+                // D14: the catalog `produce` step (creator, `executes_code: false`) writes its
+                // documents INTO the worktree — its deliverable.
+                "produce" => {
+                    std::fs::create_dir_all(wd.join("docs/design")).unwrap();
+                    std::fs::write(wd.join("docs/design/spec.md"), "# spec\n").unwrap();
+                    std::fs::write(wd.join("docs/design/prototype.html"), "<p>proto</p>\n")
+                        .unwrap();
+                }
+                // D14: a read-only catalog step that changes the tree when the fixture asks for
+                // it (a `.readonly-writes` marker committed in the repo), on its first attempt.
+                "understand" | "critique" | "review" => {
+                    if wd.join(".readonly-writes").is_file() && input.attempt == 0 {
+                        std::fs::write(wd.join("NOTES.md"), format!("# {phase}\n")).unwrap();
+                    }
+                }
                 "verify" => {
                     if let VerifyBehaviour::RewritesTheFix = self.verify {
                         // Exactly F-036: the evaluator "improves" the fix under review.
@@ -1523,5 +1538,153 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
             );
         }
     }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A catalog-plan run (DES-TEAMING-002) bound to `repo_ref`, with a docs-only touch set so the
+/// launch is scored from the plan (no PA scope step) and accepted by the engine.
+fn plan_run(session_id: &str, repo_ref: &str, steps: serde_json::Value) -> LaunchSpec {
+    LaunchSpec {
+        workflow: None,
+        problem: "Write the redesign spec under docs/design".into(),
+        plan: Some(serde_json::from_value(steps).expect("a plan")),
+        ..bug_run(session_id, repo_ref)
+    }
+}
+
+/// D14: a CREATOR step may change its own tree. The catalog `produce` step (creator,
+/// `executes_code: false`) writes its documents into the worktree; the guard used to treat it
+/// like a reviewer and DISCARD them (dogfood run 1a22f803). The documents are now KEPT: no
+/// mutation event, no worktree-guard denial, the files are in the worktree after the unit.
+#[test]
+fn a_produce_step_that_writes_docs_into_the_tree_keeps_them() {
+    let repo = make_git_repo("produce-docs", None);
+    let (core, ran, _inputs) = core_with(
+        "produce-docs",
+        VerifyBehaviour::LeavesTreeAlone,
+        ReproduceBehaviour::LeavesTreeAlone,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "produce-docs".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(plan_run(
+        "r-produce-docs",
+        &entry.id,
+        serde_json::json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                           "touch": ["docs/design/spec.md"]}),
+    ))
+    .expect("launch");
+    let evs = wait_for_event(&events, |e| {
+        matches!(e, CoreEvent::GateEvaluated { ord: 1, .. })
+    })
+    .expect("the produce unit was gated");
+    assert!(
+        ran.lock().unwrap().iter().any(|p| p == "produce"),
+        "{:?}",
+        ran.lock().unwrap()
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, CoreEvent::EvaluatorMutatedWorktree { ord: 1, .. })),
+        "a creator's own documents are not an evaluator mutation"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, CoreEvent::WorktreeRestored { ord: 1, .. })),
+        "nothing of the creator's was restored away"
+    );
+    let produce = gate_for(&evs, 1);
+    assert_ne!(
+        produce.denial_source.as_deref(),
+        Some("worktree_guard"),
+        "{:?}",
+        produce.denial_reason
+    );
+    let wt = repo.join("wicked-worktrees").join("r-produce-docs");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("docs/design/spec.md")).unwrap(),
+        "# spec\n",
+        "the produce step's spec is KEPT in the worktree"
+    );
+    assert!(wt.join("docs/design/prototype.html").is_file());
+    if checks_refused_without_a_boundary(&produce) {
+        // A bare Linux runner cannot arm the default repo-checks floor the tree change owes; that
+        // fail-closed contract is covered above. The guard verdict is what this test is about.
+        assert_fail_closed_without_boundary(&evs, &produce, 1);
+    } else {
+        assert!(produce.combined, "{:?}", produce.denial_reason);
+        assert!(
+            wait_status(&core, "r-produce-docs", SessionStatus::Completed),
+            "the run completes past the critique"
+        );
+        assert!(ran.lock().unwrap().iter().any(|p| p == "critique"));
+        assert!(
+            wt.join("docs/design/spec.md").is_file(),
+            "still there at the end"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// D14, the other half: a read-only catalog step (`understand`, role neutral, `executes_code:
+/// false`) that changes the tree is still DISCARDED by the worktree guard.
+#[test]
+fn a_read_only_understand_step_that_changes_the_tree_is_still_discarded() {
+    let repo = make_git_repo("understand-note", None);
+    std::fs::write(repo.join(".readonly-writes"), "").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "the read-only step writes"]);
+    let (core, ran, _inputs) = core_with(
+        "understand-note",
+        VerifyBehaviour::LeavesTreeAlone,
+        ReproduceBehaviour::LeavesTreeAlone,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "understand-note".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(plan_run(
+        "r-understand-note",
+        &entry.id,
+        serde_json::json!({"steps": [{"catalog": "understand"}, {"catalog": "produce"}],
+                           "touch": ["docs/design/spec.md"]}),
+    ))
+    .expect("launch");
+    assert!(
+        wait_status(&core, "r-understand-note", SessionStatus::AwaitingHuman),
+        "a guard denial on the read-only step pauses the run"
+    );
+    let evs = drain(&events);
+    assert!(
+        ran.lock().unwrap().iter().all(|p| p != "produce"),
+        "{:?}",
+        ran.lock().unwrap()
+    );
+    assert_eq!(
+        gate_for(&evs, 1).denial_source.as_deref(),
+        Some("worktree_guard")
+    );
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            CoreEvent::EvaluatorMutatedWorktree { ord: 1, phase, restored: true, .. }
+                if phase == "understand"
+        )),
+        "the mutation event names the read-only step and the restore"
+    );
+    let wt = repo.join("wicked-worktrees").join("r-understand-note");
+    assert!(
+        !wt.join("NOTES.md").exists(),
+        "the read-only step's write was DISCARDED"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }

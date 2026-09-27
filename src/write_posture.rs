@@ -7,7 +7,7 @@
 //! the wrapped carrier's `--sandbox read-only` / `--exclude-tools edit,write`, the gate hook's
 //! NO-CODE scope, the ACP carrier's refusal of every write-class `session/request_permission`. The
 //! posture was keyed on the one marker the worktree guard reads
-//! ([`crate::domain::WorkUnit::worktree_guarded`] = `!executes_code && !tool`), and the guard's
+//! ([`crate::domain::WorkUnit::worktree_guarded`], then `!executes_code && !tool`), and the guard's
 //! marker is a SUPERSET of "evaluator": a CREATOR phase whose deliverable is a document outside
 //! the tree also declares `executes_code: false` — every wicked-crew interactive seam
 //! (`interactive-draft/edit/chat`: `draft`, `edit`, `revise`), the steering `propose`, repo-learn's
@@ -38,6 +38,13 @@
 //! deliverable a file in a declared root, so the ordinary filesystem boundary (cwd + the
 //! launch-validated extras) is the whole posture. Evaluators and recon rungs stay read-only: their
 //! verdict is their output.
+//!
+//! D14: since the plan stopped guarding creators (`worktree_guarded = !executes_code && !tool &&
+//! role != Creator`), a creator planned by this engine is never guarded and so gets
+//! [`WritePosture::Full`] bound or not — its documents land in the worktree and the later review
+//! steps judge them on distinct seats. [`WritePosture::DeliverableRoots`] is still what a creator
+//! unit PERSISTED with the old marker (`worktree_guarded: true`) gets, consistently with the guard
+//! that still covers it.
 //!
 //! One derivation, read by every carrier (wrapped argv lever, gate-hook env, ACP permission
 //! bridge, PTY session) so they cannot disagree about who may write what — the same reason
@@ -262,8 +269,8 @@ mod tests {
         let mut u = WorkUnit::pending("r:phase", "r", 2, "do it");
         u.role = role;
         u.executes_code = executes_code;
-        // The plan-time marker (`plan_from_def`): a def-driven agent phase that said it would not
-        // change the tree.
+        // The marker a unit persisted before D14 carried (`plan_from_def` then guarded every
+        // def-driven agent phase that said it would not change the tree, creators included).
         u.worktree_guarded = !executes_code;
         u
     }
