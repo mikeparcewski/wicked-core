@@ -1868,6 +1868,12 @@ impl WrappedCliStepRunner {
                     crate::gate_hook::WRITE_ROOTS_ENV,
                     armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref()),
                 );
+                // The EXACT graph dir just armed, so the hook's write-root witness skips the
+                // engine's store and nothing else (a root that merely LOOKS like a graph dir —
+                // `/tmp/repo-graphs/app` — stays witnessed).
+                if let Some(dir) = &graph_write {
+                    cmd.env(crate::gate_hook::GRAPH_WRITE_DIR_ENV, dir);
+                }
                 // Arm the unit's PHASE SCOPE (core#296) — the SECOND boundary, orthogonal to the
                 // roots above. The write roots answer "where may this unit write" and the worktree
                 // is inside its own roots, so they had nothing to say about run d1bc72c2's recon

@@ -661,6 +661,7 @@ mod tests {
                 write_posture: crate::write_posture::WritePosture::Full,
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
+                graph_write_dir: None,
             })
         };
 
@@ -769,6 +770,7 @@ mod tests {
                 write_posture: crate::write_posture::WritePosture::Full,
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
+                graph_write_dir: None,
             })
         };
         // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.

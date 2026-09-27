@@ -5808,6 +5808,7 @@ fn chat_boundary(
         // chat (formerly hard-coded `false`: the strict argv-only spelling).
         estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child()
             || scope.code_graph_db.is_some(),
+        graph_write_dir: None,
     }
 }
 
@@ -7110,6 +7111,10 @@ impl AcpStepRunner {
                 // the shared assembly (skills dir + repo root + the launch-validated
                 // extra_read_roots, core#294). Built HERE, on the runner with the governance
                 // context in hand — the in-process evaluation cannot read it from any env.
+                let graph_write = crate::execute_wrapped::graph_write_dir(
+                    g.code_graph_db.as_deref(),
+                    self.operational_home.as_deref(),
+                );
                 let boundary = crate::gate_hook::BoundaryCtx {
                     roots: crate::path_policy::AllowedRoots {
                         // WRITE mirrors the wrapped carrier's `armed_write_roots`: cwd, the
@@ -7119,10 +7124,7 @@ impl AcpStepRunner {
                         // shape, an in-tree path included; core#406).
                         write: std::iter::once(unit_cwd.clone())
                             .chain(g.extra_write_roots.iter().map(std::path::PathBuf::from))
-                            .chain(crate::execute_wrapped::graph_write_dir(
-                                g.code_graph_db.as_deref(),
-                                self.operational_home.as_deref(),
-                            ))
+                            .chain(graph_write.clone())
                             .collect(),
                         // READ = the shared assembly: evidence-derived roots + the
                         // launch-validated `extra_read_roots` (core#294) + the skills snapshot
@@ -7179,6 +7181,8 @@ impl AcpStepRunner {
                     // carrier's hook reads its own environment instead.
                     estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child()
                         || g.code_graph_db.is_some(),
+                    // The exact graph dir in `write` above — the witness skips it and only it.
+                    graph_write_dir: graph_write,
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -7679,6 +7683,7 @@ impl AcpStepRunner {
                         write_posture: boundary.write_posture,
                         deliverable_roots: boundary.deliverable_roots.clone(),
                         estate_store_pinned: boundary.estate_store_pinned,
+                        graph_write_dir: boundary.graph_write_dir.clone(),
                     }),
                 }
             },
@@ -20183,6 +20188,7 @@ transport = "stdio"
             pre_build_scope: false,
             write_posture: crate::write_posture::WritePosture::Full,
             estate_store_pinned: false,
+            graph_write_dir: None,
         };
         let lock = std::sync::Mutex::new(());
         let ask = |cmd: &str, id: u64| -> serde_json::Value {

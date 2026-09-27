@@ -155,6 +155,18 @@ pub const WICKED_CORE_EXE_ENV: &str = "WICKED_CORE_EXE";
 /// of where the unit was scoped.
 pub const WRITE_ROOTS_ENV: &str = "WICKED_WRITE_ROOTS";
 
+/// The EXACT repo-graph key dir the launcher added to [`WRITE_ROOTS_ENV`]
+/// (`execute_wrapped::graph_write_dir`), so the hook subprocess can drop it — and only it — from
+/// the write-root witness ([`compute_witness_roots`]). Unset when the unit was handed no graph.
+pub const GRAPH_WRITE_DIR_ENV: &str = "WICKED_GRAPH_WRITE_DIR";
+
+/// Read [`GRAPH_WRITE_DIR_ENV`] off the hook subprocess's own environment (empty ⇒ none).
+fn graph_write_dir_from_env() -> Option<std::path::PathBuf> {
+    std::env::var_os(GRAPH_WRITE_DIR_ENV)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// Absolute roots this unit may READ but not write, `PATH`-separator joined. Evidence-derived (skill
 /// definitions, language runtimes, package caches) — see [`crate::path_policy`] — plus the
 /// LAUNCH-declared `extra_read_roots` (core#294, validated at launch like the write extras). A
@@ -349,6 +361,10 @@ pub(crate) struct BoundaryCtx {
     /// from ([`estate_store_pinned_for_child`] derives it on the runner); the subprocess carrier
     /// reads its own environment ([`estate_store_pinned_from_env`]).
     pub estate_store_pinned: bool,
+    /// The EXACT repo-graph key dir in `roots.write` (`execute_wrapped::graph_write_dir`), or
+    /// `None`. It is the engine's store, in the write set only for SQLite's WAL files, so the
+    /// write-root witness skips it; the subprocess carrier reads [`GRAPH_WRITE_DIR_ENV`].
+    pub graph_write_dir: Option<std::path::PathBuf>,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -658,25 +674,38 @@ fn write_write_root_witness(path: &std::path::Path, snapshot: &WitnessSnapshot) 
     let _ = std::fs::write(path, payload.to_string());
 }
 
-/// Compute the write-root witness roots: the unit's write set minus the notes root.
+/// Compute the write-root witness roots: the unit's write set minus the notes root and minus the
+/// engine's own code-graph store.
 ///
 /// A ReadOnly evaluator may write to its notes root — that is an EXPECTED write, not a fence
-/// violation. The witness fingerprints everything ELSE in the write set (the tree and any extra
-/// roots) so a mutation there proves an unwanted write escaped the phase-scope fence (item 1).
+/// violation. The repo-graph key dir — EXACTLY the one the engine computed and handed over
+/// ([`BoundaryCtx::graph_write_dir`] / [`GRAPH_WRITE_DIR_ENV`]), never a path that merely looks
+/// like one — is in the write set only so SQLite can create its WAL files;
+/// it is the engine's store, changed by the read-only estate shim's open/close checkpoint and by
+/// the daemon's indexer, so a change there proves nothing about the unit (a `pa-scope` unit that
+/// grounded on the graph was denied for exactly that). The witness fingerprints everything ELSE in
+/// the write set (the tree and any extra roots) so a mutation there proves an unwanted write
+/// escaped the phase-scope fence (item 1).
 fn compute_witness_roots(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathBuf> {
-    let (write_roots, notes_roots) = match boundary {
-        Some(b) => (b.roots.write.clone(), b.deliverable_roots.clone()),
+    let (write_roots, notes_roots, graph_dir) = match boundary {
+        Some(b) => (
+            b.roots.write.clone(),
+            b.deliverable_roots.clone(),
+            b.graph_write_dir.clone(),
+        ),
         None => (
             allowed_roots_from_env()
                 .map(|r| r.write)
                 .unwrap_or_default(),
             deliverable_roots_from_env(),
+            graph_write_dir_from_env(),
         ),
     };
     let notes_root = notes_roots.first().cloned();
     write_roots
         .into_iter()
         .filter(|r| notes_root.as_ref() != Some(r))
+        .filter(|r| graph_dir.as_ref() != Some(r))
         .collect()
 }
 
@@ -5345,6 +5374,7 @@ mod tests {
             write_posture: WritePosture::ReadOnly,
             deliverable_roots: vec![notes.clone()], // notes root
             estate_store_pinned: false,
+            graph_write_dir: None,
         };
         let wr = compute_witness_roots(Some(&boundary));
         assert_eq!(wr, vec![wt.clone()], "witness roots = write minus notes");
@@ -5412,6 +5442,135 @@ mod tests {
         assert!(
             reason.contains("post-mutation.rs") || reason.contains("write-root mutated"),
             "fold names the changed path: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression (codex review of #642): only the EXACT graph dir the engine handed over is
+    /// skipped. A worktree or declared root that merely has the shape `<…>/repo-graphs/<key>` —
+    /// `/tmp/repo-graphs/app` — stays witnessed, with or without a real graph dir alongside it.
+    #[test]
+    fn witness_keeps_a_root_that_only_looks_like_a_graph_dir() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let app = std::path::PathBuf::from("/tmp/repo-graphs/app");
+        let outbox = std::path::PathBuf::from("/tmp/repo-graphs/outbox");
+        let graph = std::path::PathBuf::from("/srv/state/repo-graphs/app-0123456789ab");
+        let ctx = |write: Vec<std::path::PathBuf>, graph_write_dir| BoundaryCtx {
+            roots: AllowedRoots {
+                write,
+                read: vec![],
+            },
+            cwd: app.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir,
+        };
+        let no_graph = ctx(vec![app.clone(), outbox.clone()], None);
+        assert_eq!(
+            compute_witness_roots(Some(&no_graph)),
+            vec![app.clone(), outbox.clone()],
+            "lookalike roots stay witnessed when no graph was handed over"
+        );
+        let with_graph = ctx(
+            vec![app.clone(), outbox.clone(), graph.clone()],
+            Some(graph.clone()),
+        );
+        assert_eq!(
+            compute_witness_roots(Some(&with_graph)),
+            vec![app, outbox],
+            "only the exact graph dir is dropped"
+        );
+    }
+
+    /// A read-only unit that grounds on the code graph (run 1a22f803's `pa-scope`: the estate
+    /// shim's SearchEntity) moves the graph's `estate.db` — the engine's store, not the unit's
+    /// write — and must NOT be denied; the same unit writing into its worktree still IS. Driven
+    /// through `evaluate_tool_call` end to end: allowed Bash (snapshot), mutate, next Bash.
+    #[test]
+    fn witness_ignores_engine_graph_store_but_catches_worktree_write() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-witness-graph-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let graph_dir = base.join("repo-graphs").join("wicked-studio-c79949084bda");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        std::fs::write(graph_dir.join("estate.db"), "v1").unwrap();
+        let policy_db = base.join("policy.db");
+        drop(open_store(Some(&policy_db.to_string_lossy())).unwrap());
+        let policy_db = policy_db.to_string_lossy().into_owned();
+
+        let run_id = format!("witness-graph-{}-{tid}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0)
+            .to_string_lossy()
+            .into_owned();
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone(), graph_dir.clone()],
+                read: vec![graph_dir.clone()],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: Some(graph_dir.clone()),
+        };
+        let bash = || {
+            evaluate_tool_call(
+                "wicked-agent/witness-graph/shared",
+                "unit-1",
+                None,
+                None,
+                Some(&policy_db),
+                &dpath,
+                &serde_json::json!({ "command": "ls" }),
+                "Bash",
+                Some(&boundary),
+            )
+        };
+
+        assert_eq!(
+            bash(),
+            0,
+            "first Bash is admitted and snapshots the witness"
+        );
+        // The shim / indexer rewrites the graph store (size moves too, beating mtime granularity).
+        std::fs::write(graph_dir.join("estate.db"), "v2-checkpointed").unwrap();
+        std::fs::write(graph_dir.join("estate.db-wal"), "").unwrap();
+        assert_eq!(
+            bash(),
+            0,
+            "a change in the engine's graph store is not a read-only unit's write"
+        );
+        // The unit itself writes into its worktree: still caught.
+        std::fs::write(wt.join("leaked.rs"), "oops").unwrap();
+        assert_eq!(bash(), 2, "a worktree write under ReadOnly is still denied");
+        let log = std::fs::read_to_string(&dpath).unwrap();
+        let deny = log
+            .lines()
+            .find(|l| l.contains(WITNESS_DENY_PREFIX))
+            .expect("witness deny recorded");
+        assert!(
+            deny.contains("leaked.rs"),
+            "deny names the worktree file: {deny}"
+        );
+        assert!(
+            !deny.contains("estate.db"),
+            "deny never names the graph store: {deny}"
         );
 
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
