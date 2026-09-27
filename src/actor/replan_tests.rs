@@ -488,11 +488,9 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
             ("security_review".to_string(), false),
         ]
     );
-    // The gate: `plan_approval`, before the first new unit, reviewing the creator.
-    let gate = payloads(&e, "op", tev::GATE_OPENED)
-        .into_iter()
-        .find(|p| p["kind"] == "plan_approval")
-        .expect("gate.opened{plan_approval}");
+    // The gate: `plan_approval`, before the first new unit, reviewing the creator. Its
+    // gate.opened is published fire-and-forget, so it can land after the pause that follows it.
+    let gate = wait_plan_gate(&e, "op", 1);
     assert_eq!(gate["reason"], "into_high_risk");
     assert_eq!(gate["ord"], 2);
     assert_eq!(gate["reviewing_ord"], 1);
