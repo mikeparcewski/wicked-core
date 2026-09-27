@@ -886,10 +886,13 @@ pub(crate) fn run(
     // re-reading the directory per call.
     // Built-in presets (DES-TEAMING-002 §8.4, seam C2): written to the store once per boot,
     // idempotent by name, so `list_presets` shows them and a launch naming one resolves it. A
-    // failed seed is loud and non-fatal: the named workflows keep launching their registered defs.
+    // failed seed is loud and non-fatal. `feature` still launches its registered def; `chat` and
+    // `onboarding` have no def (DES-TEAMING-002 M3/M4), so a launch naming them is refused
+    // `unknown workflow` until a boot seeds them.
     if let Err(e) = crate::preset::seed_builtins(&mut store, crate::interaction::now_millis()) {
         eprintln!(
-            "wicked-core: built-in presets not seeded ({e}); their workflows launch their defs"
+            "wicked-core: built-in presets not seeded ({e}); `feature` launches its registered \
+             def, but `chat` and `onboarding` have none and are refused until a boot seeds them"
         );
     }
     // DES-TEAMING-002 P1 boot reconcile, BEFORE anything can dispatch or drain: a live team run
