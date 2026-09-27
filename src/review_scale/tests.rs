@@ -1183,3 +1183,42 @@ fn t3_the_launch_scorer_reads_the_graph_for_a_declared_touch_set() {
     );
     assert!(destructive.destructive);
 }
+
+/// Rig run 1a22f803 (D9): the PA scoped a docs-only design as
+/// `docs/design/studio-redesign/{spec.md,prototype.html}`. `.html` read as CODE, so the touch set
+/// was behavioural, read a graph indexed at another commit, and failed closed at 100 (the full
+/// floor for a design doc). A design doc or prototype under a docs directory, and an image
+/// anywhere, is docs: the graph is not consulted, so a stale one cannot fail it closed.
+#[test]
+fn d9_a_docs_only_design_scope_never_reads_a_stale_graph() {
+    let mut stale = imported_file_graph("src/x.rs");
+    indexed_at(&mut stale, HEAD); // not the run base
+    let docs: &[&str] = &[
+        "docs/design/studio-redesign/spec.md",
+        "docs/design/studio-redesign/prototype.html",
+        "docs/design/studio-redesign/hero.PNG",
+        "assets/logo.svg",
+    ];
+    assert!(!signals_from_paths(docs).behavioural());
+    let a = assess_intent(true, Some(docs), ready(&stale), None);
+    assert_eq!((a.deterministic, a.score), (0, 0), "{a:?}");
+    assert_eq!(a.reasons, ["docs-only: no symbols"]);
+    let floor = floor_for(a.score, false);
+    assert_eq!(
+        (floor.phases, floor.high_risk),
+        (vec!["build", "deliver"], false)
+    );
+    // A behavioural file on the same stale graph still fails closed at 100.
+    for code in [&["src/x.rs"][..], &["src/app.ts", "docs/a.md"][..]] {
+        let a = assess_intent(true, Some(code), ready(&stale), None);
+        assert_eq!(a.score, 100, "{code:?}: {a:?}");
+        assert!(
+            a.reasons[0].starts_with("fail closed at 100: graph indexed at"),
+            "{a:?}"
+        );
+    }
+    // HTML outside a docs directory is still code (a web app's entry page).
+    for code in ["index.html", "src/index.html", "public/docsy.html"] {
+        assert!(signals_from_paths(&[code]).behavioural(), "{code}");
+    }
+}

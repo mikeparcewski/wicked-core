@@ -206,8 +206,13 @@ pub(crate) struct Thresholds {
     /// The floor of each band (DES-TEAMING-002 §8.5): one row per [`Thresholds::bands`] row, in
     /// the same order, so the monitor count, the floor and the high-risk rule are tuned together.
     pub floors: &'static [FloorRow],
-    /// File extensions that are prose.
+    /// File extensions that are prose or images: never behavioural, wherever they live.
     pub docs_exts: &'static [&'static str],
+    /// File extensions that are docs only under a [`Thresholds::docs_dirs`] directory (an HTML
+    /// design doc or prototype); anywhere else they are code (a web app's `index.html`).
+    pub docs_dir_exts: &'static [&'static str],
+    /// Path components that mark a docs directory.
+    pub docs_dirs: &'static [&'static str],
     /// File extensions that are configuration.
     pub config_exts: &'static [&'static str],
     /// Path-token prefixes of critical subsystems.
@@ -343,7 +348,11 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
             high_risk: true,
         },
     ],
-    docs_exts: &["md", "mdx", "markdown", "rst", "adoc", "txt"],
+    docs_exts: &[
+        "md", "mdx", "markdown", "rst", "adoc", "txt", "png", "jpg", "jpeg", "gif", "svg", "webp",
+    ],
+    docs_dir_exts: &["html", "htm"],
+    docs_dirs: &["docs", "doc"],
     config_exts: &["toml", "json", "yaml", "yml", "lock", "ini", "cfg", "env"],
     critical_path_markers: &[
         "memory",
@@ -965,7 +974,10 @@ fn classify(path: &str) -> Kind {
     let t = &THRESHOLDS;
     let name = path.rsplit('/').next().unwrap_or(path);
     let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
-    if t.docs_exts.contains(&ext) {
+    let ext = ext.to_ascii_lowercase();
+    let ext = ext.as_str();
+    let in_docs_dir = || path.split('/').any(|c| t.docs_dirs.contains(&c));
+    if t.docs_exts.contains(&ext) || (t.docs_dir_exts.contains(&ext) && in_docs_dir()) {
         Kind::Docs
     } else if path
         .split('/')
