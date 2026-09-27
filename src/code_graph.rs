@@ -1135,6 +1135,7 @@ mod tests {
     }
 
     /// A repo graph at `db` recording `commit` as the indexed commit.
+    #[cfg(unix)]
     fn graph_at(db: &Path, commit: &str) {
         use wicked_apps_core::GraphWrite;
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
@@ -1146,6 +1147,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn age(db: &Path, base: &str) -> crate::review_scale::GraphAge {
         let s = wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())).unwrap();
         crate::review_scale::graph_age(&s, base)
