@@ -205,6 +205,15 @@ fn two_consecutive_environment_refusals_open_two_gates() {
         p2.contains("refused its environment on attempt 2") && p2.contains("CLI requires a TTY"),
         "the second gate names the cause and the attempt: {p2}"
     );
+    // A refusal is the environment's, not the seat's: the prompt never offers the reassign lever
+    // the gate card hides for it (studio#315), and says why.
+    for p in [&p1, &p2] {
+        assert!(
+            !p.contains("different CLI"),
+            "no reassign lever on a refusal: {p}"
+        );
+        assert!(p.contains("Another CLI meets the same environment"), "{p}");
+    }
     assert_eq!(runner.dispatches.load(Ordering::SeqCst), 2);
 }
 
@@ -233,6 +242,14 @@ fn an_unclassified_refusal_on_a_retried_attempt_gates() {
     assert!(
         p2.contains("failed again on attempt 2") && p2.contains("skills snapshot fence"),
         "the gate names the cause and the attempt: {p2}"
+    );
+    assert!(
+        !p2.contains("different CLI"),
+        "no reassign lever on a launch refusal: {p2}"
+    );
+    assert!(
+        p2.contains("Another CLI meets the same environment"),
+        "{p2}"
     );
     // The retry is still a decision: approving it dispatches a third attempt.
     core.confirm_gate(sid, approve()).expect("approve again");

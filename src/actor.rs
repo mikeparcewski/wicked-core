@@ -5481,8 +5481,9 @@ fn apply_step_result(
                     put_node(store, unit.to_node())?;
                     let prompt = format!(
                         "Unit {ord} ({cli}) refused its environment on attempt {}: {} — \
-                         \"{raw_excerpt}\". Approve to retry (optionally amend), reject to stop \
-                         the run, or reassign the unit to a different CLI first.",
+                         \"{raw_excerpt}\". Fix the cause, then approve to retry (optionally \
+                         amend), or reject to stop the run. Another CLI meets the same \
+                         environment, so reassigning does not fix a refusal.",
                         output.attempt + 1,
                         refusal.reason
                     );
@@ -5531,8 +5532,9 @@ fn apply_step_result(
                     },
                 );
                 let prompt = format!(
-                    "{why}. Approve to retry (optionally amend), reject to stop the run, or \
-                     reassign the unit to a different CLI first."
+                    "{why}. Fix the cause, then approve to retry (optionally amend), or reject \
+                     to stop the run. Another CLI meets the same environment, so reassigning \
+                     does not fix a launch refusal."
                 );
                 pause_for_human(
                     store,
