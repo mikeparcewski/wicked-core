@@ -384,36 +384,6 @@
   ],
   "bold": {}
  },
- "interactive-demo": {
-  "steps": [
-   {
-    "catalog": "understand",
-    "id": "scenes",
-    "instructions": "Plan the demo — and in this phase USE NO TOOLS AT ALL: no web fetch, no shell, no file reads, no writes. Work from the task text alone (the target application URL and the user's brief); inspecting the app is the NEXT phase's job, and a tool use here breaks that phase's ability to write the spec, which kills the whole demo. Decompose the brief into 3-6 named scenes — each a short capability label stating what the viewer should take away (good: \"Create a document\"; bad: \"Click the New button\"), covering setup/context beats, the main value moments, and the payoff. Merge trivial setup steps, split compound flows — a demo that is one scene for a multi-step brief is not a demo. For each scene note the click-path you EXPECT (navigation, the kind of control to look for, waits) and a one-sentence narration line that states the capability, not the on-screen data; say plainly that the selectors are expectations for the next phase to confirm against the live page. Never invent app features the brief and the URL do not support. Output the scene plan as plain text."
-   },
-   {
-    "catalog": "produce",
-    "id": "spec",
-    "instructions": "FIRST inspect the live target application yourself: curl the HTML of the URL named in the task and of every further page the scene plan visits (use curl — the target is often a plain-HTTP or localhost app a web-fetch tool cannot reach), so every selector you use provably exists on the page; never guess a selector, and correct the scene plan wherever the real page contradicts it. THEN, using the scene plan from the prior phase, write the COMPLETE Playwright demo spec and SAVE it to the absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish. THEN REPORT IN PROSE, in at least 120 words, what you inspected and what you wrote: name the pages you fetched and the selectors they gave you, walk the reader through every step in order (its label, the selectors and waits it uses, and the capability its narration states), call out any scene-plan beat you merged, split, or dropped and why, and end with the absolute path you wrote — a reply that is only the path is an unreviewable phase and will be rejected. Contract (wicked-interactive demo.spec.mjs): a plain, standalone ES module with NO imports that exports const meta = { url, title, and optionally steps, captions, captionHoldMs } and export async function run({ page, step, meta }) — the service supplies page (Playwright) and step; begin run() with await page.goto(meta.url); wrap EVERY meaningful action in await step(label, async () => { ... }, { say, holdMs }) with one step per scene and the scene's capability name as the label; narrate the meaningful beats via say (the capability, not the on-screen data); prefer stable selectors (roles, text, ids) and await your waits (waitForURL, waitForSelector) so the recording captures settled UI; NEVER write credentials or secrets into the spec — read them from process.env at run time.",
-    "gate_type": "execution",
-    "depends_on": [
-     "scenes"
-    ]
-   }
-  ],
-  "bold": {}
- },
- "interactive-demo-reauthor": {
-  "steps": [
-   {
-    "catalog": "produce",
-    "id": "respec",
-    "instructions": "Read the current demo spec and the feedback JSON named in the task; re-author the spec so the recorded demo fulfils every feedback item, and SAVE the complete revised spec to the exact absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish. Work from the two files and the current spec's own selectors — do NOT fetch the live application in this phase; if a feedback item needs a control the current spec never touches, choose the most robust selector the item's storyboard fragment supports and say so in your report rather than guessing silently. THEN REPORT IN PROSE, in at least 120 words, what changed: take each feedback item in turn, say which step(s) you altered and how the revised selectors/waits/narration answer it, note anything you deliberately left untouched, and end with the absolute path you wrote — a reply that is only the path is an unreviewable phase and will be rejected. Each feedback item carries the user's instruction plus the storyboard fragment of the step it targets (the step's label appears in the fragment text) — change the matching step(s) and leave unrelated steps untouched unless the instruction asks for a restructure. Keep the same executable contract as the current spec: a plain, standalone ES module with NO imports exporting const meta = { url, title, ... } and export async function run({ page, step, meta }); begin run() with await page.goto(meta.url); wrap every meaningful action in await step(label, fn, { say, holdMs }); narrate capabilities via say; prefer stable selectors and await your waits; NEVER write credentials or secrets into the spec — read them from process.env at run time.",
-    "gate_type": "execution"
-   }
-  ],
-  "bold": {}
- },
  "qe-author-tests": {
   "steps": [
    {

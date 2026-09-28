@@ -602,8 +602,10 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     let maps: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let builtins = wicked_core::builtin_presets();
     let names: Vec<&str> = builtins.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["chat", "feature", "onboarding"]);
-    for (name, steps) in builtins {
+    assert_eq!(names, ["chat", "demo", "feature", "onboarding"]);
+    // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
+    // its phases, so it has no §11.2 row; `m9b_demo_*` pins its steps.
+    for (name, steps) in builtins.into_iter().filter(|(n, _)| *n != "demo") {
         let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(steps, want, "the built-in `{name}` is its C1 mapping");
@@ -667,6 +669,119 @@ fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
     assert_eq!(
         plan.max_score, 0,
         "a plan with no creator step scores 0 at launch"
+    );
+}
+
+/// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
+/// skill's plan → record → review, meant for the launch's one declared write root. `plan` and `review`
+/// are the plan gate and the review gate (`human_confirm`); `plan` and `record` are creators and
+/// `review` is an evaluator, so evaluator ≠ creator puts the reviewer on another seat; every
+/// deliverable is relative, so it resolves inside the demo root; nothing executes code.
+#[test]
+fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
+    let dir = tmp_dir("demo");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let demo = rig
+        .core
+        .list_presets(None)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "demo")
+        .expect("the built-in demo preset is listed");
+    assert_eq!(
+        (demo.scope.as_str(), demo.created_by.as_str()),
+        ("global", "builtin")
+    );
+
+    let mut launch = spec("rdemo", "demo", None);
+    launch.problem = "Make a demo of http://127.0.0.1:5173 for new users".into();
+    // No declared root here: the demo root is the launcher's (crew mints one per run), and a root
+    // needs $HOME to validate, which a Windows runner lacks. The steps are what this pins.
+    rig.core.launch_run(launch).unwrap();
+    let units = units_of(&rig.core, "rdemo");
+    let hc = r#"{"human_confirm":{"unconditional":false}}"#;
+    let got = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("rdemo:{id}"))
+            .unwrap_or_else(|| panic!("no `{id}` unit in {:?}", rows("rdemo", &units)))
+    };
+    let (plan, record, review) = (got("plan"), got("record"), got("review"));
+    assert_eq!(row("rdemo", plan), r("plan", "build", "creator", hc, None));
+    assert_eq!(
+        row("rdemo", record),
+        r("record", "build", "creator", "auto", None)
+    );
+    assert_eq!(
+        row("rdemo", review),
+        r("review", "review", "evaluator", hc, None)
+    );
+    for u in [plan, record, review] {
+        assert_eq!(
+            u.skill_ref.as_deref(),
+            Some("wicked-garden-demo"),
+            "{}",
+            u.id
+        );
+        assert!(!u.executes_code, "{} changes no tree", u.id);
+    }
+    assert!(
+        plan.ord < record.ord && record.ord < review.ord,
+        "plan, then record, then review"
+    );
+    assert_eq!(
+        plan.required_deliverables,
+        ["script.md", "chapters.json", "storyline.mjs"]
+    );
+    assert!(record
+        .required_deliverables
+        .iter()
+        .any(|d| d == "demo-video/demo.mp4"));
+    assert!(record
+        .required_deliverables
+        .iter()
+        .any(|d| d == "review/chapters.png"));
+    assert!(
+        review.required_deliverables.is_empty(),
+        "the reviewer writes nothing: its verdict is its output"
+    );
+    let all = plan
+        .required_deliverables
+        .iter()
+        .chain(&record.required_deliverables);
+    for d in all {
+        assert!(
+            !std::path::Path::new(d).is_absolute() && !d.contains(".."),
+            "{d} resolves inside the demo root"
+        );
+    }
+    for (u, action) in [(plan, "`plan`"), (record, "`record`"), (review, "`review`")] {
+        assert!(
+            u.description.contains(action),
+            "{} names the skill's {action} action: {}",
+            u.id,
+            u.description
+        );
+    }
+    assert!(
+        record.description.contains("read-only"),
+        "the recorder is read-only against the app"
+    );
+    let view = rig
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "rdemo")
+        .unwrap();
+    assert_eq!(
+        view.session
+            .team_plan
+            .expect("a preset launch is a team plan")
+            .preset
+            .as_deref(),
+        Some("demo")
     );
 }
 
