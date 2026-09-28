@@ -1166,11 +1166,12 @@ impl Core {
     }
 
     /// Every chat currently holding pool state — JSON array of
-    /// `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots}]`, sorted by id. `cwd` /
+    /// `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots, heldBy}]`, sorted by id. `cwd` /
     /// `codeGraphDb` / `readRoots` are the scope recorded at `chatOpen` (wicked-core#410): where the
     /// seats run, the estate graph their read-only estate MCP is bound to (`null` ⇒ none), and the
     /// repository roots in scope (`[]` when none); `cwd` is `null` only for a pool entry whose scope
-    /// is gone (a chat mid-close).
+    /// is gone (a chat mid-close). `heldBy` lists the runs launched from the chat that keep it
+    /// warm (`chatHold`, crew#619).
     ///
     /// Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
     /// chat ids freely, so without this an accumulation is invisible until the host runs out of
@@ -1199,10 +1200,25 @@ impl Core {
                         "cwd": scope.map(|s| s.cwd.to_string_lossy().into_owned()),
                         "codeGraphDb": scope.and_then(|s| s.code_graph_db.clone()),
                         "readRoots": scope.map(|s| s.read_roots.clone()).unwrap_or_default(),
+                        // crew#619: the runs launched from this chat that keep it warm.
+                        "heldBy": c.held_by,
                     })
                 })
                 .collect();
             serde_json::to_string(&arr).map_err(err)
+        })
+    }
+
+    /// Hold a chat warm for a run launched from it (crew#619): the engine's idle reaper passes the
+    /// chat over until that run is terminal, and its idle clock restarts then. Resolves `"true"`,
+    /// or `"false"` when the chat is not open on this engine (nothing held). Call it right after
+    /// `launchRun` resolves the run id.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn chat_hold(&self, chat_id: String, run_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let held = core.chat_hold(&chat_id, &run_id).map_err(err)?;
+            Ok(held.to_string())
         })
     }
 

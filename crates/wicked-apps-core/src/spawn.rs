@@ -87,6 +87,11 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
     // non-documentation path. Inherited at an unrelated spawn site it would scope a phase that is
     // supposed to write code away from writing it, which is the INVERSE failure and a louder one.
     "WICKED_PRE_BUILD_SCOPE",
+    // The garden generation a seat's `wicked-garden` launcher resolves (core#588). The launcher sets
+    // it per spawn from the run's PINNED snapshot, and only when it delivers one. Inherited instead,
+    // it is the daemon's own value, typically the operator's live checkout exported by the Claude
+    // Code garden plugin, so a seat nothing was delivered to would run unpinned skills.
+    "WICKED_GARDEN_ROOT",
 ];
 
 /// The env var the engine's ACP spawn path resolves the persistent worker config home from
@@ -1265,7 +1270,7 @@ pub fn seat_instance_suffix(seat_key: &str) -> Option<&str> {
 /// - an operator alias (`my-claude#2` running `claude`) → `claude-my-claude` → `claude-my-claude-2`.
 ///
 /// Injective, so two seat keys never share one configuration home: a plain instance suffix is
-/// `[A-Za-z0-9_]+` (no `-`), so a plain root has exactly one `-` after the CLI name and an alias
+/// `[a-z0-9_]+` (no `-`), so a plain root has exactly one `-` after the CLI name and an alias
 /// root at least two; distinct aliases differ in the prefix, split off at the last `-`. The alias
 /// is `[a-z0-9_-]+` and nothing else: lowercase so a case-insensitive filesystem cannot fold two
 /// keys together, and no separators, so it cannot re-aim the root. An empty alias (`#2`) is
@@ -1297,8 +1302,8 @@ fn instance_root_base(
 /// The seat root's DIRECTORY NAME for one instance (core#591): `root_name` itself for the CLI's
 /// only instance, else `<root_name>-<suffix>` — `claude#2` → `claude-2`.
 ///
-/// The suffix is `[A-Za-z0-9_]+` and nothing else, and an unacceptable one is REFUSED rather than
-/// sanitized. Two reasons, both load-bearing:
+/// The suffix is `[a-z0-9_]+` and nothing else, and an unacceptable one is REFUSED rather than
+/// sanitized. Three reasons, all load-bearing:
 ///
 /// 1. A sanitizing map is not injective — `claude#2` and `claude#/2` would both fold to
 ///    `claude-2`, and two roster seats sharing ONE configuration home is the isolation this
@@ -1307,18 +1312,23 @@ fn instance_root_base(
 ///    empty suffix (`claude#`) are all spellable and all re-aim or collapse the root. No seat
 ///    root's `root_name` contains `-`, so `<root_name>-<suffix>` can collide with neither another
 ///    CLI's root nor a bare `root_name`.
+/// 3. (core#597) Case-insensitive filesystems (APFS, NTFS by default) fold `claude#A` and
+///    `claude#a` onto one directory. Lowercasing would make that collision universal, so an
+///    uppercase letter is refused like any other character outside the set.
 fn seat_instance_root_name(root_name: &str, suffix: Option<&str>) -> anyhow::Result<String> {
     let Some(suffix) = suffix else {
         return Ok(root_name.to_string());
     };
+    // Lowercase only (core#597): on a case-insensitive filesystem (APFS, NTFS by default)
+    // `claude#A` and `claude#a` would share one directory.
     if suffix.is_empty()
         || !suffix
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     {
         anyhow::bail!(
             "seat instance suffix {suffix:?} after `{SEAT_INSTANCE_SEP}` is not \
-             [A-Za-z0-9_]+; a seat key spells one instance as `{root_name}{SEAT_INSTANCE_SEP}2` \
+             [a-z0-9_]+; a seat key spells one instance as `{root_name}{SEAT_INSTANCE_SEP}2` \
              (anything else is refused rather than sanitized — two seat keys must never resolve \
              to one configuration home)"
         );
@@ -3117,7 +3127,7 @@ rebase.autosquash\0";
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// (core#591) The instance suffix is REFUSED unless it is `[A-Za-z0-9_]+` — never sanitized.
+    /// (core#591) The instance suffix is REFUSED unless it is `[a-z0-9_]+` — never sanitized.
     /// A sanitizing map would fold two roster keys onto one configuration home; a traversal
     /// suffix would re-aim the root out of the worker home entirely. Fail CLOSED, as every other
     /// failure of this resolver does.
@@ -3136,6 +3146,7 @@ rebase.autosquash\0";
             "claude#a b",       // whitespace
             "claude#a-b",       // `-` is the JOINER, so it must not also be legal in a suffix
             "claude#2#3",       // a second separator
+            "claude#A", // uppercase: `claude-A` and `claude-a` are one dir on APFS/NTFS (core#597)
         ] {
             let err = seat_config_in(|| Ok(base.clone()), SeatCli::Claude, bad)
                 .expect_err("an unacceptable instance suffix must be refused");
@@ -3306,5 +3317,23 @@ rebase.autosquash\0";
                 assert!(seen.insert(name.clone()), "{name} was produced twice");
             }
         }
+    }
+
+    /// (core#597) APFS and NTFS are case-insensitive by default, so `claude#A` and `claude#a`
+    /// would name ONE directory there — the two seats would share a configuration home. An
+    /// uppercase suffix is REFUSED, never folded: folding would make the two keys collide on
+    /// every filesystem instead of only on some.
+    #[test]
+    fn an_instance_suffix_with_an_uppercase_letter_is_refused_not_folded() {
+        for bad in ["A", "Cheap", "x2Y"] {
+            let err = seat_instance_root_name("claude", Some(bad))
+                .expect_err("an uppercase suffix must be refused")
+                .to_string();
+            assert!(err.contains("[a-z0-9_]+"), "names the accepted set: {err}");
+        }
+        assert_eq!(
+            seat_instance_root_name("claude", Some("a_2")).expect("lowercase is accepted"),
+            "claude-a_2"
+        );
     }
 }
