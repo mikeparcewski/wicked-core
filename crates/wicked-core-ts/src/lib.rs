@@ -2346,6 +2346,20 @@ impl Core {
         task(move || wicked_core::evaluate_mcp_call_json(&request_json).map_err(err))
     }
 
+    /// The MCP policy PREVIEW (DES-MCP-TOOLS-001 §4.7, §8 `POST /mcp/policies/preview`; slice
+    /// S6): judge each call for each synthetic unit cell with the SAME evaluation
+    /// `evaluateMcpCall` runs, over this Core's policy store, and record NOTHING. `request_json`
+    /// is `{ calls: [{ server, tool, args?, annotations?, classOverride?, registered, kind? }],
+    /// cells: [{ role: "creator"|"evaluator"|"recon", seat, mode: "ask"|"balanced"|"autonomous",
+    /// phaseId? }] }`. Resolves to `[{ subject, cells: [{ role, seat, mode, phaseId?, decision,
+    /// class, ruleIds, obligations, reason? }] }]`. Rejects with `bad_request: …` or
+    /// `guard_error: …`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn preview_mcp_calls(&self, request_json: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || wicked_core::preview_mcp_calls_json(&db_path, &request_json).map_err(err))
+    }
+
     /// The ONE MCP tool class derivation (D-4): `annotations_json` is the tool's `tools/list`
     /// annotations object (or `null`), `class_override` an operator override (`read` | `write` |
     /// `destructive`). Returns the class; a tool with no annotations is `write`.

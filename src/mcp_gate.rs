@@ -848,6 +848,189 @@ pub fn evaluate_mcp_call_json(request_json: &str) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The policy preview (S6): the same evaluation over synthetic units, never recorded
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The phase role a preview cell stands for. Each maps to the (role, write posture) pair a real
+/// unit of that kind carries, so the preview's D-1 gate reads exactly what the carriers read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpPreviewRole {
+    /// A creator phase with full write posture (build, fix).
+    Creator,
+    /// An evaluator phase (review, verify): read-only.
+    Evaluator,
+    /// A recon unit: a neutral phase with a read-only posture.
+    Recon,
+}
+
+impl McpPreviewRole {
+    fn role_and_posture(self) -> (PhaseRole, WritePosture) {
+        match self {
+            McpPreviewRole::Creator => (PhaseRole::Creator, WritePosture::Full),
+            McpPreviewRole::Evaluator => (PhaseRole::Evaluator, WritePosture::ReadOnly),
+            McpPreviewRole::Recon => (PhaseRole::Neutral, WritePosture::ReadOnly),
+        }
+    }
+}
+
+/// One cell of the operator's policy matrix: a phase role, a seat and a run mode, plus the
+/// workflow phase id a policy may name (`review`, `build`, ...), when the operator picks one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpPreviewCell {
+    pub role: McpPreviewRole,
+    pub seat: String,
+    /// `ask` | `balanced` | `autonomous`.
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_id: Option<String>,
+}
+
+/// The unit a real run of that cell's shape carries: the preview judges this, never a stand-in.
+/// Its decisions path is never written (the preview records nothing).
+pub(crate) fn preview_unit(cell: &McpPreviewCell, db_path: &str) -> Result<McpUnit, McpCallError> {
+    if !valid_name(&cell.seat) {
+        return Err(McpCallError::BadRequest(format!(
+            "a seat is a name of [A-Za-z0-9_.-] (got {:?})",
+            cell.seat
+        )));
+    }
+    let mode = match cell.mode.as_str() {
+        "ask" => McpMode::Ask,
+        "balanced" => McpMode::Balanced,
+        "autonomous" => McpMode::Autonomous,
+        other => {
+            return Err(McpCallError::BadRequest(format!(
+                "mode must be ask, balanced or autonomous (got {other:?})"
+            )))
+        }
+    };
+    let phase_id = cell.phase_id.clone().unwrap_or_default();
+    if !phase_id.is_empty() && !valid_name(&phase_id) {
+        return Err(McpCallError::BadRequest(format!(
+            "a phase id is a name of [A-Za-z0-9_.-] (got {phase_id:?})"
+        )));
+    }
+    let (role, posture) = cell.role.role_and_posture();
+    let run_id = "mcp-policy-preview".to_string();
+    Ok(McpUnit {
+        scope: format!("wicked-agent/{run_id}/shared"),
+        run_id,
+        attempt: 0,
+        ord: 0,
+        phase: crate::scope::unit_phase(0),
+        phase_id,
+        catalog: String::new(),
+        role,
+        posture,
+        seat: cell.seat.clone(),
+        mode,
+        decisions_path: PathBuf::new(),
+        db_path: db_path.to_string(),
+    })
+}
+
+/// One cell's answer: what a call of that shape would get if it were made now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPreviewVerdict {
+    #[serde(flatten)]
+    pub cell: McpPreviewCell,
+    /// `allow` | `ask` | `deny`.
+    pub decision: &'static str,
+    pub class: McpClass,
+    pub rule_ids: Vec<String>,
+    pub obligations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The preview for one call across every cell.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPreviewResult {
+    pub subject: String,
+    pub cells: Vec<McpPreviewVerdict>,
+}
+
+/// Most cells one preview judges (6 seats x 3 roles x 3 modes is 54 per call).
+const PREVIEW_MAX_CELLS: usize = 256;
+/// Most calls one preview judges (a server's whole tool list).
+const PREVIEW_MAX_CALLS: usize = 512;
+
+/// Judge each call for each cell with [`evaluate`], the same function [`evaluate_mcp_call`] runs,
+/// over the policies in `store`. PURE: no token, no claim appended, nothing recorded.
+pub(crate) fn preview_mcp_calls(
+    store: &dyn GraphRead,
+    db_path: &str,
+    calls: &[McpCall],
+    cells: &[McpPreviewCell],
+) -> Result<Vec<McpPreviewResult>, McpCallError> {
+    if cells.is_empty() || cells.len() > PREVIEW_MAX_CELLS {
+        return Err(McpCallError::BadRequest(format!(
+            "a preview judges 1 to {PREVIEW_MAX_CELLS} cells (got {})",
+            cells.len()
+        )));
+    }
+    if calls.len() > PREVIEW_MAX_CALLS {
+        return Err(McpCallError::BadRequest(format!(
+            "a preview judges at most {PREVIEW_MAX_CALLS} calls (got {})",
+            calls.len()
+        )));
+    }
+    let units = cells
+        .iter()
+        .map(|c| preview_unit(c, db_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let now = crate::clock::eval_now();
+    calls
+        .iter()
+        .map(|call| {
+            let cells = cells
+                .iter()
+                .zip(&units)
+                .map(|(cell, unit)| {
+                    let (v, _claim) = evaluate(store, unit, call, now)?;
+                    Ok(McpPreviewVerdict {
+                        cell: cell.clone(),
+                        decision: v.decision,
+                        class: v.class,
+                        rule_ids: v.rule_ids,
+                        obligations: v.obligations,
+                        reason: v.reason,
+                    })
+                })
+                .collect::<Result<Vec<_>, McpCallError>>()?;
+            Ok(McpPreviewResult {
+                subject: subject_of(&call.server, &call.tool),
+                cells,
+            })
+        })
+        .collect()
+}
+
+/// The JSON face of the preview for the core-ts binding: `{calls, cells}` in, `[{subject, cells}]`
+/// out, judged over the store at `db_path` (opened read-only). An error string is
+/// `<code>: <message>`.
+pub fn preview_mcp_calls_json(db_path: &str, request_json: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        calls: Vec<McpCall>,
+        cells: Vec<McpPreviewCell>,
+    }
+    let req: Request = serde_json::from_str(request_json)
+        .map_err(|e| McpCallError::BadRequest(format!("request: {e}")).to_string())?;
+    let store = open_store_ro(Some(db_path)).map_err(|e| {
+        McpCallError::GuardError(format!("policy store open failed: {e}")).to_string()
+    })?;
+    let results =
+        preview_mcp_calls(&store, db_path, &req.calls, &req.cells).map_err(|e| e.to_string())?;
+    serde_json::to_string(&results).map_err(|e| format!("guard_error: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The mcp-defaults policy pack
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1663,6 +1846,193 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.starts_with("invalid_token"), "{err}");
+    }
+
+    /// Every cell of the preview matrix, the way crew's `/mcp/policies/preview` asks for it.
+    fn all_cells() -> Vec<McpPreviewCell> {
+        let mut cells = Vec::new();
+        for role in [
+            McpPreviewRole::Creator,
+            McpPreviewRole::Evaluator,
+            McpPreviewRole::Recon,
+        ] {
+            for seat in SEATS {
+                for mode in ["ask", "balanced", "autonomous"] {
+                    cells.push(McpPreviewCell {
+                        role,
+                        seat: seat.to_string(),
+                        mode: mode.to_string(),
+                        phase_id: None,
+                    });
+                }
+            }
+        }
+        cells
+    }
+
+    /// PROVING TEST (S6 row): the preview matrix EQUALS `evaluate_mcp_call` over the same fixture
+    /// rules, cell by cell — decision, class, rule ids, obligations and reason — for approved and
+    /// unapproved, read, write and destructive, allowed, asked and denied calls; and the preview
+    /// records nothing.
+    #[test]
+    fn the_preview_matrix_equals_evaluate_mcp_call_over_the_same_fixture_rules() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-mcp-preview-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db = base.join("policy.db");
+        let db_path = db.to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&db_path)).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+            approve(&mut store, "MCP-FIRST-USE", "mcp:jira");
+            approve(&mut store, "MCP-POSTURE-WRITE", "mcp:jira/create_issue");
+            // Fixture policies: a deny by name, and a seat-narrowed deny via the trigger.
+            wicked_governance::register_rule(
+                &mut store,
+                &rule(serde_json::json!({
+                    "id": "SEC-MCP-NO-DELETE", "rule_type": "policy",
+                    "statement": "never delete a jira project", "severity": "critical",
+                    "confidence": 1.0, "steering_type": "security",
+                    "applies_to": ["mcp:jira/delete_project"], "effect": "deny",
+                    "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                })),
+            )
+            .unwrap();
+            wicked_governance::register_rule(
+                &mut store,
+                &rule(serde_json::json!({
+                    "id": "SEC-MCP-NO-CODEX-JIRA", "rule_type": "policy",
+                    "statement": "codex may not use jira", "severity": "error",
+                    "confidence": 1.0, "steering_type": "security",
+                    "applies_to": ["mcp:jira"], "effect": "deny",
+                    "trigger": {"contains": "\"seat\":\"codex\""},
+                    "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                })),
+            )
+            .unwrap();
+        }
+        let mut sentry = call("list_events", read_only());
+        sentry.server = "sentry".to_string(); // never approved: first use asks
+        let mut unregistered = call("ghost", None);
+        unregistered.registered = false;
+        let calls = vec![
+            call("get_issue", read_only()),
+            call("create_issue", None),
+            call(
+                "update_issue",
+                Some(McpAnnotations {
+                    destructive_hint: Some(false),
+                    ..Default::default()
+                }),
+            ),
+            call("delete_project", None),
+            sentry,
+            unregistered,
+        ];
+        let cells = all_cells();
+        let store = open_store_ro(Some(&db_path)).unwrap();
+        let preview = preview_mcp_calls(&store, &db_path, &calls, &cells).unwrap();
+        drop(store);
+        assert!(
+            std::fs::read_dir(&base)
+                .unwrap()
+                .flatten()
+                .all(|e| e.file_name().to_string_lossy().starts_with("policy.db")),
+            "the preview recorded nothing"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (c, result) in calls.iter().zip(&preview) {
+            assert_eq!(result.subject, subject_of(&c.server, &c.tool));
+            assert_eq!(result.cells.len(), cells.len());
+            for (cell, got) in cells.iter().zip(&result.cells) {
+                let mut u = preview_unit(cell, &db_path).unwrap();
+                u.decisions_path = base.join("live").join("decisions.ndjson");
+                let token = McpToken::mint();
+                let _binding = token.bind(u);
+                let live = evaluate_mcp_call(&token.value, c).unwrap();
+                let ctx = format!("{} {cell:?}", result.subject);
+                assert_eq!(&got.cell, cell, "{ctx}");
+                assert_eq!(got.decision, live.decision, "{ctx}");
+                assert_eq!(got.class, live.class, "{ctx}");
+                assert_eq!(got.rule_ids, live.rule_ids, "{ctx}");
+                assert_eq!(got.obligations, live.obligations, "{ctx}");
+                assert_eq!(got.reason, live.reason, "{ctx}");
+                seen.insert(got.decision);
+            }
+        }
+        // The fixture exercises all three answers.
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec!["allow", "ask", "deny"]
+        );
+        // Spot checks a reader can hold the matrix to.
+        let cell = |r: &McpPreviewResult, role, seat: &str, mode: &str| {
+            r.cells
+                .iter()
+                .find(|v| v.cell.role == role && v.cell.seat == seat && v.cell.mode == mode)
+                .unwrap()
+                .clone()
+        };
+        let create = &preview[1];
+        let c = cell(create, McpPreviewRole::Creator, "claude", "balanced");
+        assert_eq!(c.decision, "allow", "approved write in balanced mode runs");
+        let c = cell(create, McpPreviewRole::Creator, "claude", "ask");
+        assert_eq!(c.decision, "ask", "ask mode asks for every write");
+        let c = cell(create, McpPreviewRole::Evaluator, "claude", "autonomous");
+        assert_eq!(c.rule_ids, vec![RULE_PHASE_ROLE.to_string()]);
+        let c = cell(create, McpPreviewRole::Creator, "codex", "autonomous");
+        assert_eq!(c.rule_ids, vec!["SEC-MCP-NO-CODEX-JIRA".to_string()]);
+        let c = cell(&preview[2], McpPreviewRole::Creator, "pi", "balanced");
+        assert_eq!(
+            c.decision, "ask",
+            "an unapproved write asks in balanced mode"
+        );
+        let c = cell(&preview[4], McpPreviewRole::Recon, "pi", "autonomous");
+        assert_eq!(c.decision, "ask", "first use asks even for a read");
+        assert_eq!(c.rule_ids[0], RULE_FIRST_USE);
+        let c = cell(&preview[5], McpPreviewRole::Creator, "claude", "autonomous");
+        assert_eq!(c.rule_ids, vec![RULE_UNREGISTERED.to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_preview_json_face_is_camel_case_and_refuses_bad_cells() {
+        let base =
+            std::env::temp_dir().join(format!("wicked-mcp-preview-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db = base.join("policy.db").to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&db)).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+        }
+        let out = preview_mcp_calls_json(
+            &db,
+            r#"{"calls":[{"server":"jira","tool":"t","registered":true,"annotations":{"readOnlyHint":true}}],
+                "cells":[{"role":"recon","seat":"pi","mode":"balanced","phaseId":"review"}]}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0]["subject"], "mcp:jira/t");
+        let c = &v[0]["cells"][0];
+        assert_eq!(c["role"], "recon");
+        assert_eq!(c["phaseId"], "review");
+        assert_eq!(c["decision"], "ask", "first use: {c}");
+        assert_eq!(c["ruleIds"][0], RULE_FIRST_USE);
+        for bad in [
+            r#"{"calls":[],"cells":[]}"#,
+            r#"{"calls":[],"cells":[{"role":"creator","seat":"pi","mode":"yolo"}]}"#,
+            r#"{"calls":[],"cells":[{"role":"creator","seat":"p i","mode":"ask"}]}"#,
+            r#"{"calls":[],"cells":[{"role":"owner","seat":"pi","mode":"ask"}]}"#,
+            r#"{"calls":[],"cells":[],"token":"x"}"#,
+        ] {
+            let err = preview_mcp_calls_json(&db, bad).unwrap_err();
+            assert!(err.starts_with("bad_request:"), "{bad}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
