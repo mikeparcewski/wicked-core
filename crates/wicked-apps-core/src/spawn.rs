@@ -423,6 +423,11 @@ pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 /// 1.17.18 (independent review, C2) and both stripped from every isolated seat like the other seat
 /// variables.
 pub const OPENCODE_CONFIG_FILE_ENV: &str = "OPENCODE_CONFIG";
+/// The claude CLI's claude.ai-connector switch: `false` (or `0`/`no`/`off`) disables loading the
+/// signed-in account's claude.ai MCP connectors ("[claudeai-mcp] Disabled via env var", claude
+/// 2.1.283). Set to `false` on EVERY seat spawn by [`SeatConfig::apply`] (core#657): governed
+/// workers load no ambient MCP. Harmless to a CLI that does not read it.
+pub const CLAUDEAI_MCP_SERVERS_ENV: &str = "ENABLE_CLAUDEAI_MCP_SERVERS";
 /// See [`OPENCODE_CONFIG_FILE_ENV`].
 pub const OPENCODE_AUTH_CONTENT_ENV: &str = "OPENCODE_AUTH_CONTENT";
 /// The process home directory — agy's ONLY configuration-home lever, and the one variable a seat
@@ -1080,6 +1085,8 @@ impl SeatConfig {
     /// Apply this decision to `cmd` — AFTER `hardened()`: strip the foreign variables, then set
     /// this seat's own. `Inherit` touches no CLI configuration.
     ///
+    /// BOTH variants also set [`CLAUDEAI_MCP_SERVERS_ENV`]` = false` (core#657).
+    ///
     /// BOTH variants apply the remote-write credential fence ([`fence_remote_credentials`],
     /// F-7R2-012): a seat is a creator or an evaluator, never the deliverer, so it runs without
     /// the daemon's `GH_TOKEN`/`GITHUB_TOKEN` and with `gh` aimed at a credential-less config
@@ -1104,6 +1111,10 @@ impl SeatConfig {
             }
         }
         fence_remote_credentials(cmd);
+        // core#657 (F-11): no seat loads the signed-in account's claude.ai MCP connectors — both
+        // variants, like the credential fence: the hatch inherits the operator's configuration,
+        // never an ungoverned tool channel. Harmless to a CLI that does not read it.
+        cmd.env(CLAUDEAI_MCP_SERVERS_ENV, "false");
     }
 
     /// The seat root this decision runs the CLI under, when isolated with a known root.
@@ -1978,6 +1989,40 @@ mod tests {
     /// `apply` strips the foreign seat variables and sets the seat's own — after `hardened()`,
     /// over an explicit decision (no environment read), so the mechanism is what is asserted:
     /// a daemon carrying a decoy for EVERY seat variable hands a pi seat exactly one of them.
+    /// core#657 (F-11): EVERY seat spawn — both variants, the inherit hatch included — runs with
+    /// the claude CLI's claude.ai-connector off-switch set, so a signed-in worker home cannot hand
+    /// a governed worker its account's connectors. Belt and braces with `--strict-mcp-config`,
+    /// which already reports connectors as "restricted to explicitly passed config" (claude
+    /// 2.1.283); an operator's own `ENABLE_CLAUDEAI_MCP_SERVERS=true` does not survive.
+    #[test]
+    fn every_seat_spawn_turns_the_claude_ai_connectors_off() {
+        for decision in [
+            SeatConfig::Inherit,
+            SeatConfig::Isolated {
+                cli: SeatCli::Claude,
+                root: None,
+                set: vec![],
+                strip: SEAT_CONFIG_ENV.to_vec(),
+            },
+            SeatConfig::Isolated {
+                cli: SeatCli::Opencode,
+                root: None,
+                set: vec![],
+                strip: SEAT_CONFIG_ENV.to_vec(),
+            },
+        ] {
+            let mut cmd = Command::new("true");
+            cmd.env(CLAUDEAI_MCP_SERVERS_ENV, "true");
+            decision.apply(&mut cmd);
+            let value = cmd
+                .get_envs()
+                .find(|(k, _)| k.to_string_lossy() == CLAUDEAI_MCP_SERVERS_ENV)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+            assert_eq!(value.as_deref(), Some("false"), "{decision:?}");
+        }
+        assert_eq!(CLAUDEAI_MCP_SERVERS_ENV, "ENABLE_CLAUDEAI_MCP_SERVERS");
+    }
+
     #[test]
     fn apply_strips_every_foreign_seat_variable_and_sets_the_seats_own() {
         use std::path::PathBuf;

@@ -446,8 +446,29 @@ pub(crate) fn inject_isolation_flags(
             ));
         }
     }
+    // core#657 (F-11): the engine owns which MCP servers a worker loads — none. A template
+    // `--mcp-config` would load its servers even under `--strict-mcp-config`, so a template that
+    // states either flag is refused like the two above; the hatch does not lift this.
+    for flag in crate::mcp_isolation::CLAUDE_ENGINE_OWNED_MCP_FLAGS {
+        if argv_states(&stated, &[flag]) {
+            return Err(format!(
+                "the invocation template `{invocation}` states `{flag}`, which the engine owns: \
+                 governed workers load no MCP server the engine did not hand them (every launch \
+                 carries `--strict-mcp-config` with an empty MCP config, core#657) — remove the \
+                 flag from clis.toml"
+            ));
+        }
+    }
     let prompt_ix = prompt.and_then(|p| argv.iter().position(|a| a == p));
     let mut flags: Vec<String> = Vec::new();
+    // core#657: no ambient MCP — ALWAYS, hatch or not (the hatch inherits the operator's scopes,
+    // never an ungoverned tool channel). Drops the repository's `.mcp.json`, the config home's
+    // local/user-scope entries, plugin servers and the claude.ai connectors.
+    flags.extend(
+        crate::mcp_isolation::CLAUDE_STRICT_MCP_ARGS
+            .iter()
+            .map(|a| a.to_string()),
+    );
     if !inherits_operator_config() {
         flags.push("--setting-sources".into());
         flags.push("project,local".into());
@@ -1766,11 +1787,32 @@ impl WrappedCliStepRunner {
             // daemon's environment already carries (the operator's own content, if any), gaining
             // `skills.paths` — one path per portable skill in the snapshot. Set AFTER `hardened()`
             // (which strips only the engine's internal variables) so it reaches the child.
-            match delivery.opencode_config(
-                std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV)
-                    .ok()
-                    .as_deref(),
-            ) {
+            // core#657 (F-11): an opencode seat loads no ambient MCP tool — its inline config
+            // denies and hides every `<server>_<tool>`, composed onto the skills document, else
+            // (under the hatch, which inherits the operator's variable) the daemon's own, else a
+            // bare document. A value the deny cannot be composed into refuses the launch.
+            let is_opencode = wicked_apps_core::spawn::SeatCli::from_binary(&binary)
+                == wicked_apps_core::spawn::SeatCli::Opencode;
+            let composed = delivery
+                .opencode_config(
+                    std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV)
+                        .ok()
+                        .as_deref(),
+                )
+                .and_then(|skills| {
+                    if !is_opencode {
+                        return Ok(skills);
+                    }
+                    let base = skills.or_else(|| {
+                        inherits_operator_config()
+                            .then(|| {
+                                std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok()
+                            })
+                            .flatten()
+                    });
+                    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
+                });
+            match composed {
                 Ok(Some(content)) => {
                     cmd.env(crate::skills_snapshot::OPENCODE_CONFIG_ENV, content);
                 }
@@ -8761,6 +8803,50 @@ mod tests {
         );
     }
 
+    /// core#657 (F-11): a wrapped claude worker loads NO ambient MCP server — not a repository
+    /// `.mcp.json`, not a local- or user-scope entry of the worker home, not a claude.ai
+    /// connector. `--strict-mcp-config` with NO `--mcp-config` (the empty MCP config) rides every
+    /// launch, hatch or not, before the `--` guard; a template that states either flag is refused
+    /// (a template `--mcp-config` would load even under strict). Measured on claude 2.1.283 with
+    /// the fake model (lane evidence `b-project-*`, `b-local-*`): without the flag the ambient
+    /// server spawned and its three tools were offered; with it the server never spawned.
+    #[test]
+    fn a_wrapped_claude_worker_loads_no_ambient_mcp_server() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        for hatch in [false, true] {
+            let _hatch = hatch
+                .then(|| VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1")));
+            for inv in ["claude {PROMPT}", "claude -p {PROMPT}"] {
+                let mut argv = build_argv(inv, "hi", &[]);
+                inject_isolation_flags(&mut argv, inv, None);
+                let strict = argv
+                    .iter()
+                    .position(|a| a == "--strict-mcp-config")
+                    .unwrap_or_else(|| {
+                        panic!("hatch={hatch} {inv}: no --strict-mcp-config: {argv:?}")
+                    });
+                assert!(
+                    !argv.iter().any(|a| a.starts_with("--mcp-config")),
+                    "no MCP config is handed: {argv:?}"
+                );
+                if let Some(guard) = argv.iter().position(|a| a == "--") {
+                    assert!(strict < guard, "before the guard: {argv:?}");
+                }
+            }
+        }
+        for stated in [
+            "--mcp-config /tmp/servers.json",
+            "--mcp-config=/tmp/servers.json",
+            "--strict-mcp-config",
+        ] {
+            let inv = format!("claude {stated} -p {{PROMPT}}");
+            let mut argv = build_argv(&inv, "hi", &[]);
+            let err = super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None)
+                .expect_err("a template stating an engine-owned MCP flag is refused");
+            assert!(err.contains(&inv) && err.contains("MCP"), "{err}");
+        }
+    }
+
     /// FINDING-045: 41 of 331 path-bearing tool calls left the worktree — into the operator's
     /// brain index, their CLI config, and twice into whole-filesystem scans.
     #[test]
@@ -10489,6 +10575,65 @@ mod tests {
             serde_json::json!([snapshot.join("skills").join("domain").to_string_lossy()]),
             "{composed}"
         );
+        // core#657: the skills-composed document also hides every MCP tool.
+        assert_eq!(composed["permission"]["*_*"], "deny", "{composed}");
+        assert_eq!(
+            composed["agent"]["build"]["permission"]["*_*"], "deny",
+            "{composed}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// core#657 (F-11), opencode on the WRAPPED carrier (`opencode run`): a unit handed no skills
+    /// and a daemon with no `OPENCODE_CONFIG_CONTENT` still launches with every MCP tool denied
+    /// and hidden — before this it launched with no inline config at all, so an ambient
+    /// worker-home, `~/.opencode` or repository server's tools ran with no ask (evidence e6).
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapped_opencode_unit_launches_with_every_mcp_tool_denied() {
+        use crate::skills_snapshot::test_support::scratch;
+        use crate::skills_snapshot::OPENCODE_CONFIG_ENV;
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = scratch("opencode-mcp-home");
+        let _home = HomeGuard::pin(&home);
+        let _no_snap = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let _no_content = VarGuard::unset(OPENCODE_CONFIG_ENV);
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let argv_file = wt.join("argv-opencode.txt");
+        let bin = fake_recorder(&home.join("bin"), "opencode", &argv_file);
+        let input = {
+            let mut u = WorkUnit::pending("s:opencode", "s", 1, "review the change");
+            u.assigned_cli = Some("opencode".to_string());
+            u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
+            StepInput {
+                run_id: "run-opencode-mcp".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = std::fs::read_to_string(&argv_file).expect("opencode was launched");
+        let doc: serde_json::Value = serde_json::from_str(
+            argv.lines()
+                .find_map(|l| l.strip_prefix("ENV OPENCODE_CONFIG_CONTENT="))
+                .expect("the inline config is set"),
+        )
+        .unwrap();
+        assert_eq!(doc["permission"]["*_*"], "deny", "{doc}");
+        assert_eq!(doc["agent"]["build"]["permission"]["*_*"], "deny", "{doc}");
+        assert_eq!(doc["default_agent"], "build", "{doc}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

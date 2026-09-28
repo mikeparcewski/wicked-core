@@ -172,7 +172,10 @@ pub(crate) fn write_class_call(params: &Value) -> Option<WriteClassCall> {
         None if by_kind => "(unnamed)".to_string(),
         None => return None,
     };
-    let by_name = is_write_tool_name(&tool);
+    // core#657: an MCP call is write-class — no MCP tool is registered read-only (the runner's MCP
+    // fence refuses every MCP call before this is consulted; this keeps the posture fence honest
+    // on its own).
+    let by_name = is_write_tool_name(&tool) || crate::mcp_isolation::has_mcp_prefix(&tool);
     if !(by_kind || by_name) {
         return None;
     }

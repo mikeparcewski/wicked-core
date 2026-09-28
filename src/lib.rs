@@ -43,6 +43,7 @@ mod interaction;
 mod knowledge;
 #[cfg(test)]
 mod lockstep;
+mod mcp_isolation;
 mod memory;
 mod output_throttle;
 mod outstanding_work;

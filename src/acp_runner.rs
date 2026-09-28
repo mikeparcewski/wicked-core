@@ -922,6 +922,10 @@ struct AcpProcess {
     /// `cli_key`, so the stock `claude` seat — key `claude`, binary `claude-agent-acp` —
     /// advertised the capability and then cancelled every `elicitation/create`).
     elicitation_advertised: bool,
+    /// The CLI this bridge carries (the seat's own binary, `seat_cli_of`) — decided at spawn and
+    /// read by the permission bridge's MCP fence (core#657), which judges opencode's
+    /// `<server>_<tool>` MCP titles on an opencode seat only.
+    seat_cli: wicked_apps_core::spawn::SeatCli,
     /// Whether this process's `initialize` result advertised the adapter's mid-turn steering
     /// request (`result._meta.steering.supported == true`; claude-agent-acp 0.73.0
     /// `acp-agent.js:853-859`). Read ONCE from the captured result in `start_acp_process`, never
@@ -1989,6 +1993,38 @@ fn opencode_existing_config(config: &AcpConfig) -> Option<String> {
         .or_else(|| std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok())
 }
 
+/// The `OPENCODE_CONFIG_CONTENT` an ACP launch sets, or `None` for "set nothing": the skills paths
+/// composed onto [`opencode_existing_config`] (v3.2), then, for an opencode seat, the MCP deny
+/// composed onto that (core#657). For an opencode seat with no skills document the base is the
+/// seat's registry governance content, else (under the hatch, which inherits the operator's
+/// variable) the daemon's own, else nothing. ONE resolution shared by the pre-spawn admission in
+/// `exec_turn_inner` and the spawn chokepoint (review of #659): a value either step cannot compose
+/// is refused as a LAUNCH ERROR before the spawn, never a spawn failure that falls back to the
+/// wrapped carrier.
+fn opencode_launch_config(
+    config: &AcpConfig,
+    delivery: &crate::skills_snapshot::SkillsDelivery,
+    seat_cli: wicked_apps_core::spawn::SeatCli,
+) -> Result<Option<String>, String> {
+    let skills = delivery.opencode_config(opencode_existing_config(config).as_deref())?;
+    if seat_cli != wicked_apps_core::spawn::SeatCli::Opencode {
+        return Ok(skills);
+    }
+    let base = skills.or_else(|| {
+        config
+            .acp_governance_env
+            .as_ref()
+            .filter(|(k, _)| k == crate::skills_snapshot::OPENCODE_CONFIG_ENV)
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                crate::execute_wrapped::inherits_operator_config()
+                    .then(|| std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok())
+                    .flatten()
+            })
+    });
+    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
+}
+
 /// The per-session Claude configuration carried in `session/new` under
 /// `_meta.claudeCode.options` — the object the bridge spreads into the Agent SDK's `Options`
 /// (`@agentclientprotocol/claude-agent-acp` 0.73.0, acp-agent.js `userProvidedOptions` :5209,
@@ -2055,8 +2091,13 @@ fn session_new_params(
 /// replace: every object on the way down is created only where absent, sibling keys
 /// (`settingSources`, a future permission option) are kept, an existing `plugins` or
 /// `disallowedTools` list gains our entries rather than losing its own. Nothing is attached for
-/// an empty option, so a frame with no options carries no `_meta` at all.
+/// an empty option — except the one pin every frame carries: `strictMcpConfig: true` (core#657),
+/// SET rather than merged, so a caller's `false` cannot survive. With it the Claude bridge loads
+/// only the frame's `mcpServers` (always `[]`), never the worker home's local/user-scope servers,
+/// the repository's `.mcp.json` or the claude.ai connectors. The other bridges ignore the
+/// `claudeCode` extension.
 fn attach_session_options(params: &mut Value, options: &SessionOptions<'_>) {
+    claude_code_options(params)[crate::mcp_isolation::ACP_STRICT_MCP_OPTION] = json!(true);
     if let Some(root) = options.skills_plugin {
         attach_skills_plugin(params, root);
     }
@@ -2330,12 +2371,11 @@ fn start_acp_process_with_write_roots(
     // whatever the daemon's own environment carries (the operator's content), else a bare doc.
     // A malformed base FAILS the spawn (codex round 3) — `exec_turn_inner` refuses the unit
     // before reaching here; this is the chokepoint's own guarantee for every other caller.
-    let opencode_config: Option<String> = delivery
-        .opencode_config(opencode_existing_config(config).as_deref())
+    let opencode_config: Option<String> = opencode_launch_config(config, delivery, seat_cli)
         .map_err(|why| {
             anyhow::anyhow!(
                 "refusing to start '{}': {why}; the seat's governance content is never replaced \
-                 with defaults",
+                 with defaults, and an opencode seat never starts with its MCP tools visible",
                 config.binary
             )
         })?;
@@ -2788,6 +2828,7 @@ fn start_acp_process_with_write_roots(
         session_id,
         next_id,
         elicitation_advertised: form_enabled,
+        seat_cli,
         steering_supported: steering_advertised(&init),
         governance_verified,
         sandbox_downgrade,
@@ -4330,6 +4371,7 @@ fn exec_turn_acp_posture(
                                                 gate,
                                                 proc.chat_boundary.as_ref(),
                                                 posture,
+                                                proc.seat_cli,
                                                 &v2,
                                                 &mut output,
                                                 MAX_OUT,
@@ -4481,6 +4523,7 @@ fn exec_turn_acp_posture(
                                 gate,
                                 proc.chat_boundary.as_ref(),
                                 posture,
+                                proc.seat_cli,
                                 &v,
                                 &mut output,
                                 MAX_OUT,
@@ -4643,6 +4686,9 @@ fn answer_permission_request<W: Write>(
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
     chat_boundary: Option<&crate::gate_hook::BoundaryCtx>,
     posture: Option<&AcpWritePosture>,
+    // core#657: the CLI the bridge carries — opencode's `<server>_<tool>` MCP title is judged on
+    // an opencode seat only (`mcp_isolation::is_mcp_call`).
+    seat: wicked_apps_core::spawn::SeatCli,
     frame: &Value,
     output: &mut String,
     max_out: usize,
@@ -4654,6 +4700,50 @@ fn answer_permission_request<W: Write>(
         return; // a permission NOTIFICATION is not a thing; nothing to answer.
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    // core#657 (F-11): the MCP FENCE, judged FIRST and on EVERY turn — governed or not, unit or
+    // chat, any posture. No MCP server is registered for workers (nothing ambient loads: the
+    // claude bridge runs `strictMcpConfig`, opencode hides `<server>_<tool>`), so an MCP call that
+    // arrives anyway is refused with the agent's own reject option. Before this it arrived as
+    // `kind: "other"`, was not write-class, and the policy engine allowed it even for a read-only
+    // evaluator. Recorded: an advisory `mcp-deny:` claim (with the hook-fired sentinel) for a
+    // governed unit, `workerToolCallDenied` for a fenced one, a note in the turn output always.
+    if let Some(tool) = crate::mcp_isolation::acp_mcp_tool(&params, seat) {
+        let reason = crate::mcp_isolation::denial_reason(&tool);
+        if let Some(g) = gate {
+            crate::gate_hook::record_mcp_denial(g.decisions_path, g.scope, g.phase, &tool, &reason);
+        }
+        if let Some(fence) = posture {
+            let _ = fence
+                .tx
+                .send(Command::EmitEvent(CoreEvent::WorkerToolCallDenied {
+                    session: fence.run_id.clone(),
+                    ord: fence.ord,
+                    attempt: fence.attempt,
+                    cli: fence.cli.clone(),
+                    carrier: "acp".to_string(),
+                    role: crate::write_posture::role_wire(fence.role).to_string(),
+                    tool: tool.clone(),
+                    command: String::new(),
+                    reason: reason.clone(),
+                    remedy: crate::mcp_isolation::REMEDY.to_string(),
+                }));
+        }
+        eprintln!("wicked-core: DENY (mcp fence, {seat:?} seat): `{tool}`");
+        let note = format!("\n[wicked-core] refused tool call `{tool}`: {reason}\n");
+        if output.len() + note.len() <= max_out {
+            output.push_str(&note);
+        }
+        respond_or_note(
+            stdin,
+            write_lock,
+            &req_id,
+            crate::acp_permission::reject_result(&params),
+            "a permission request (mcp fence)",
+            output,
+            max_out,
+        );
+        return;
+    }
     // Where the seat's shell will stand IF this call is allowed (install fence, F1) — applied
     // only at the final ALLOW response below, never here: a call the governance verdict refuses
     // never ran, so its `cd` never moved the real shell (review r2-N1).
@@ -7221,11 +7311,11 @@ impl AcpStepRunner {
         };
 
         // v3.2 × codex round 3: an opencode seat whose governance content cannot take the skills
-        // paths (not a JSON object) is a LAUNCH ERROR here — a refused unit naming the variable
+        // paths (not a JSON object), or the MCP deny (core#657, review of #659), is a LAUNCH
+        // ERROR here — a refused unit naming the variable
         // — not a spawn failure that would fall back to the wrapped carrier and fail there with
         // the same defect. Judged on the same resolved value the spawn composes into.
-        if let Err(why) = delivery.opencode_config(opencode_existing_config(&acp_config).as_deref())
-        {
+        if let Err(why) = opencode_launch_config(&acp_config, &delivery, seat_cli) {
             return crate::execute_wrapped::skills_refusal(
                 input,
                 &crate::skills_snapshot::SkillsError::LeverConfig {
@@ -11085,6 +11175,17 @@ sleep 30
                 if own_names.contains(var) {
                     continue;
                 }
+                // core#657: an opencode seat's inline config is the ENGINE's MCP deny — set, and
+                // still never the daemon's decoy.
+                if *seat_cli == SeatCli::Opencode
+                    && *var == wicked_apps_core::spawn::OPENCODE_CONFIG_CONTENT_ENV
+                {
+                    let doc: Value =
+                        serde_json::from_str(seen.get(*var).map(String::as_str).unwrap_or("UNSET"))
+                            .unwrap_or_else(|e| panic!("{var} is the engine's JSON document: {e}"));
+                    assert_eq!(doc["permission"]["*_*"], "deny", "{doc}");
+                    continue;
+                }
                 assert_eq!(
                     seen.get(*var).map(String::as_str),
                     Some("UNSET"),
@@ -11539,6 +11640,41 @@ sleep 30
     /// list survive), never replacing them; the spec fields every agent reads stay put; and with no
     /// snapshot the frame carries no `_meta` at all. Two generations yield two frames naming their
     /// own roots.
+    /// core#657 (F-11): EVERY `session/new` pins the Agent SDK's `strictMcpConfig: true` — the
+    /// ACP analog of the wrapped carrier's `--strict-mcp-config` — so the claude bridge loads only
+    /// the `mcpServers` in the frame (always `[]`) and none of the worker home's local/user-scope
+    /// entries, the repository's `.mcp.json` or the claude.ai connectors. Unconditional: no option
+    /// can leave it off, the hatch included, and a caller's `false` is overwritten. Measured on
+    /// claude-agent-acp 0.73.0 (lane evidence `c-local-base` vs `c-*-strict`): without it the
+    /// ambient server spawned and its three calls ran; with it the server never spawned.
+    #[test]
+    fn every_session_new_pins_strict_mcp_config() {
+        let cwd = std::path::Path::new("/wt");
+        let bare = session_new_params(cwd, serde_json::json!([]), &SessionOptions::NONE);
+        assert_eq!(bare["mcpServers"], serde_json::json!([]));
+        assert_eq!(
+            bare["_meta"]["claudeCode"]["options"]["strictMcpConfig"],
+            serde_json::json!(true),
+            "{bare}"
+        );
+        let mut params = serde_json::json!({
+            "cwd": "/wt", "mcpServers": [],
+            "_meta": {"claudeCode": {"options": {"strictMcpConfig": false, "tools": []}}}
+        });
+        attach_session_options(&mut params, &SessionOptions::NONE);
+        let options = &params["_meta"]["claudeCode"]["options"];
+        assert_eq!(
+            options["strictMcpConfig"],
+            serde_json::json!(true),
+            "{params}"
+        );
+        assert_eq!(
+            options["tools"],
+            serde_json::json!([]),
+            "siblings kept: {params}"
+        );
+    }
+
     #[test]
     fn session_new_merges_the_snapshot_into_the_claude_code_options_as_a_local_plugin() {
         let cwd = std::path::Path::new("/wt");
@@ -11547,9 +11683,12 @@ sleep 30
         let bare = session_new_params(cwd, servers.clone(), &SessionOptions::NONE);
         assert_eq!(bare["cwd"], "/wt");
         assert_eq!(bare["mcpServers"], servers);
-        assert!(
-            bare.get("_meta").is_none(),
-            "no options ⇒ no extension: {bare}"
+        // core#657: the one option every frame carries is the MCP pin; nothing else is attached
+        // for empty options.
+        assert_eq!(
+            bare["_meta"]["claudeCode"]["options"],
+            serde_json::json!({"strictMcpConfig": true}),
+            "no options ⇒ only the MCP pin: {bare}"
         );
 
         let gen7 = std::path::Path::new("/snapshots/7");
@@ -12231,6 +12370,64 @@ cat >/dev/null
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#657 (F-11), opencode on the ACP carrier: opencode has no strict-MCP switch, so its
+    /// inline config HIDES every MCP tool — `permission["*_*"] = "deny"`, restated on the pinned
+    /// `build` agent — composed onto the seat's governance content (kept) or onto nothing when the
+    /// seat names none. Measured on opencode 1.18.31 (lane evidence `d-base` vs `d-deny`): with
+    /// the seat's content alone an ambient worker-home server's three tools ran with zero asks;
+    /// with the deny they are not offered to the model at all, while the nine built-ins are.
+    #[test]
+    #[cfg(unix)]
+    fn an_opencode_acp_seat_starts_with_every_mcp_tool_denied() {
+        use crate::skills_snapshot::{SkillsDelivery, OPENCODE_CONFIG_ENV};
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("opencode-acp-mcp");
+        let env_dump = dir.join("env.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > \"{dump}\"\nread _init\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\nread _new\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"s\"}}}}'\ncat >/dev/null\n",
+                dump = env_dump.display()
+            ),
+        );
+        for governance in [
+            Some(r#"{"permission":{"read":"ask","edit":"ask","bash":"ask","task":"deny"}}"#),
+            None,
+        ] {
+            let _ = std::fs::remove_file(&env_dump);
+            let mut config = stub_config(&script, None);
+            config.acp_governance_env =
+                governance.map(|g| (OPENCODE_CONFIG_ENV.to_string(), g.to_string()));
+            let proc = super::start_acp_process_with_write_roots(
+                &config,
+                &dir,
+                None,
+                None,
+                &[],
+                &[],
+                &[],
+                &SkillsDelivery::None,
+                wicked_apps_core::spawn::SeatCli::Opencode,
+                "",
+                Some(("r", "opencode")),
+                None,
+            )
+            .expect("the opencode seat starts");
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&env_dump).unwrap()).unwrap();
+            assert_eq!(doc["permission"]["*_*"], "deny", "{governance:?}: {doc}");
+            assert_eq!(doc["agent"]["build"]["permission"]["*_*"], "deny", "{doc}");
+            assert_eq!(doc["default_agent"], "build", "{doc}");
+            if governance.is_some() {
+                assert_eq!(doc["permission"]["task"], "deny", "governance kept: {doc}");
+                assert_eq!(doc["permission"]["read"], "ask", "governance kept: {doc}");
+            }
+            drop(proc);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (v3.2 × codex round 3, the ACP carrier through `run_unit`) The malformed value is a LAUNCH
     /// ERROR — the unit is refused naming the variable and the seat, no frame reaches the bridge,
     /// and no wrapped fallback runs — not a spawn failure that would fall back to the wrapped
@@ -12335,6 +12532,114 @@ transport = "stdio"
             "session/new + one prompt over ACP"
         );
         runner.drop_session("run-oc");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Review of #659 (codex, HIGH): an opencode seat whose inline config cannot take the MCP deny
+    /// (`permission` is not an object), on a unit handed NO skills, is refused BEFORE the spawn as
+    /// a launch error naming the variable and the seat. The reachable source is the inherit hatch,
+    /// where the operator's own `OPENCODE_CONFIG_CONTENT` is the base (a user `clis.toml` cannot
+    /// set `acp_governance_env`). Before the shared resolver the pre-spawn check composed only the
+    /// skills paths (a no-op without a delivery), the spawn failed in the MCP composition, and
+    /// that failure took the generic "ACP unavailable" branch to the wrapped fallback.
+    #[test]
+    #[cfg(unix)]
+    fn an_opencode_seat_whose_governance_cannot_take_the_mcp_deny_is_refused_not_fallen_back() {
+        use crate::skills_snapshot::test_support::scratch as canonical_scratch;
+        use crate::skills_snapshot::OPENCODE_CONFIG_ENV;
+        use crate::workflow::{StepInput, StepRunner};
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-opencode-mcp");
+        let _home = EnvPin::set("HOME", &home);
+        let _no_snap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let ledger = home.join("ledger.ndjson");
+        let bridge_src = write_recording_bridge(&home);
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bridge = bin.join("opencode");
+        std::fs::rename(&bridge_src, &bridge).unwrap();
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "opencode-seat"
+display_name = "opencode seat"
+binary = "opencode"
+headless_invocation = "opencode run {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let _hatch = EnvPin::set(
+            crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
+            std::path::Path::new("1"),
+        );
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let input = {
+            let mut u = crate::domain::WorkUnit::pending("run-ocm:u1", "run-ocm", 1, "review it");
+            u.assigned_cli = Some("opencode-seat".to_string());
+            StepInput {
+                run_id: "run-ocm".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-ocm".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+
+        let bad = EnvPin::set(
+            OPENCODE_CONFIG_ENV,
+            std::path::Path::new(r#"{"permission":"allow"}"#),
+        );
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains(OPENCODE_CONFIG_ENV)
+                && out.output.contains("'opencode-seat'")
+                && out.output.contains("MCP deny"),
+            "{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("single-shot fallback"),
+            "refused, never fallen back: {}",
+            out.output
+        );
+        assert!(
+            ledger_entries(&ledger).is_empty(),
+            "no frame reached the bridge"
+        );
+
+        drop(bad);
+        let _good = EnvPin::set(
+            OPENCODE_CONFIG_ENV,
+            std::path::Path::new(r#"{"permission":{"read":"ask"}}"#),
+        );
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        runner.drop_session("run-ocm");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -16311,6 +16616,171 @@ No further next steps — both questions fully answered.";
         assert!(!super::acp_read_only_unproven_at_spawn(false, &tool, true));
     }
 
+    /// core#657 (F-11): an MCP call that reaches the ACP permission bridge anyway — claude's
+    /// `mcp__<server>__<tool>` (evidence e2) or opencode's `<server>_<tool>` title (e7b), both
+    /// `kind: "other"` — is REFUSED with the agent's reject option on every turn: an evaluator's
+    /// read-only posture, a governed creator (recorded as an advisory `mcp-deny:` claim beside the
+    /// hook-fired sentinel, so the fold sees a live gate), a chat and an ungoverned turn alike —
+    /// no MCP server is registered for workers. Normal tools are unaffected, and opencode's title
+    /// shape is judged on the opencode seat only.
+    #[test]
+    fn an_mcp_call_is_refused_on_every_acp_turn_and_the_refusal_is_recorded() {
+        use wicked_apps_core::spawn::SeatCli;
+        let frame = |name: Option<&str>, title: &str, kind: &str, id: u64| {
+            let mut call = serde_json::json!({"toolCallId": "t1", "title": title, "kind": kind,
+                                              "rawInput": {"text": "hello"}});
+            if let Some(n) = name {
+                call["name"] = serde_json::json!(n);
+            }
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1", "toolCall": call,
+                    "options": [
+                        {"optionId": "allow", "kind": "allow_once"},
+                        {"optionId": "reject", "kind": "reject_once"},
+                    ],
+                },
+            })
+        };
+        let claude_mcp = frame(Some("mcp__wt__wt_note"), "mcp__wt__wt_note", "other", 1);
+        let opencode_mcp = frame(None, "wt_wt_note", "other", 2);
+        let answer = |gate: Option<&crate::acp_permission::AcpGate<'_>>,
+                      posture: Option<&super::AcpWritePosture>,
+                      seat: SeatCli,
+                      f: &serde_json::Value| {
+            let lock = std::sync::Mutex::new(());
+            let mut sink: Vec<u8> = Vec::new();
+            let mut output = String::new();
+            super::answer_permission_request(
+                &mut sink,
+                &lock,
+                gate,
+                None,
+                posture,
+                seat,
+                f,
+                &mut output,
+                4096,
+            );
+            let line = std::str::from_utf8(&sink)
+                .unwrap()
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response frame")
+                .to_string();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            (
+                v["result"]["outcome"]["optionId"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                output,
+            )
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let posture = |p: crate::write_posture::WritePosture| super::AcpWritePosture {
+            posture: p,
+            role: crate::workflow::PhaseRole::Evaluator,
+            run_id: "run-1".into(),
+            ord: 4,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: "verify".into(),
+            cwd: std::path::PathBuf::from("/wt"),
+            deliverable_roots: vec![],
+            home: None,
+            tx: tx.clone(),
+            fence_cwd: std::sync::Mutex::new(None),
+        };
+        let ro = posture(crate::write_posture::WritePosture::ReadOnly);
+        let full = posture(crate::write_posture::WritePosture::Full);
+
+        // 1. The evaluator (read-only posture): refused, the turn says why, disclosed.
+        for (seat, f) in [
+            (SeatCli::Claude, &claude_mcp),
+            (SeatCli::Opencode, &opencode_mcp),
+        ] {
+            let (opt, output) = answer(None, Some(&ro), seat, f);
+            assert_eq!(opt, "reject", "{seat:?}: {output}");
+            assert!(output.contains("mcp fence"), "{seat:?}: {output}");
+            match rx.try_recv() {
+                Ok(crate::command::Command::EmitEvent(
+                    crate::event::CoreEvent::WorkerToolCallDenied {
+                        tool,
+                        reason,
+                        carrier,
+                        role,
+                        ..
+                    },
+                )) => {
+                    assert!(tool == "mcp__wt__wt_note" || tool == "wt_wt_note", "{tool}");
+                    assert_eq!((carrier.as_str(), role.as_str()), ("acp", "evaluator"));
+                    assert!(reason.contains("mcp fence"), "{reason}");
+                }
+                other => panic!(
+                    "{seat:?}: expected workerToolCallDenied, got {:?}",
+                    other.is_ok()
+                ),
+            }
+        }
+
+        // 2. A GOVERNED creator on the full posture: refused AND recorded in the decisions log.
+        let dir = std::env::temp_dir().join(format!("wicked-mcpdeny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("gov.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+        let decisions = dir.join("decisions.jsonl");
+        let gate = crate::acp_permission::AcpGate {
+            scope: "unit",
+            phase: "unit-4",
+            phase_alias: None,
+            catalog_alias: None,
+            db: Some(db.to_str().unwrap()),
+            decisions_path: decisions.to_str().unwrap(),
+            boundary: None,
+        };
+        let (opt, _) = answer(Some(&gate), Some(&full), SeatCli::Claude, &claude_mcp);
+        assert_eq!(opt, "reject");
+        let log = std::fs::read_to_string(&decisions).expect("the refusal is recorded");
+        assert!(log.contains(r#""claim_id":"mcp-deny:unit-4""#), "{log}");
+        assert!(log.contains(r#""decision":"deny""#), "{log}");
+        assert!(
+            log.contains(r#""_wicked_tool_call":"mcp__wt__wt_note""#),
+            "{log}"
+        );
+        assert!(
+            log.contains(r#""_wicked_hook_fired":"unit-4""#),
+            "the sentinel rides with the claim, or the fold reads a suppressed gate: {log}"
+        );
+        while rx.try_recv().is_ok() {}
+
+        // 3. Chat / ungoverned turns (no gate, no posture): refused too.
+        assert_eq!(answer(None, None, SeatCli::Claude, &claude_mcp).0, "reject");
+        assert_eq!(
+            answer(None, None, SeatCli::Opencode, &opencode_mcp).0,
+            "reject"
+        );
+
+        // 4. Normal tools are unaffected: a governed Read, opencode's `todowrite`, and another
+        //    seat's underscore built-in (copilot's `write_bash` is not an MCP title).
+        let read = frame(Some("Read"), "Read /wt/src/lib.rs", "read", 3);
+        assert_eq!(
+            answer(Some(&gate), Some(&ro), SeatCli::Claude, &read).0,
+            "allow"
+        );
+        let todo = frame(None, "todowrite", "other", 4);
+        assert_eq!(answer(None, Some(&ro), SeatCli::Opencode, &todo).0, "allow");
+        let copilot = frame(None, "report_intent", "other", 5);
+        assert_eq!(answer(None, None, SeatCli::Copilot, &copilot).0, "allow");
+        assert!(
+            rx.try_recv().is_err(),
+            "no refusal disclosed for a normal tool"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// core#431 (F-3R2-009): an `executes_code: false` unit on the ACP carrier is READ-ONLY even
     /// with NO governance gate (the unadmitted-seat shape that let pi rewrite the fix under
     /// review). A write-class request is answered with the agent's REJECT option and disclosed as
@@ -16366,6 +16836,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             Some(&ro),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame("edit", "edit", 7),
             &mut output,
             4096,
@@ -16425,6 +16896,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             Some(&ro),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame("read", "read", 8),
             &mut output,
             4096,
@@ -16442,6 +16914,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             None,
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame("edit", "edit", 9),
             &mut output,
             4096,
@@ -16521,6 +16994,7 @@ No further next steps — both questions fully answered.";
                 None,
                 None,
                 Some(fence),
+                wicked_apps_core::spawn::SeatCli::Other,
                 &frame(path, id),
                 &mut output,
                 8192,
@@ -16590,6 +17064,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             Some(&creator),
+            wicked_apps_core::spawn::SeatCli::Other,
             &serde_json::json!({
                 "jsonrpc": "2.0", "id": 4, "method": "session/request_permission",
                 "params": {
@@ -16914,6 +17389,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             None,
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame,
             &mut output,
             8192,
@@ -16959,6 +17435,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             Some(&fence),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame,
             &mut output,
             8192,
@@ -16976,6 +17453,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             Some(&fence),
+            wicked_apps_core::spawn::SeatCli::Other,
             &in_tree,
             &mut output,
             8192,
@@ -17088,6 +17566,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             None,
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame,
             &mut output,
             4096,
@@ -17108,6 +17587,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             None,
+            wicked_apps_core::spawn::SeatCli::Other,
             &note_frame,
             &mut output,
             4096,
@@ -17133,6 +17613,7 @@ No further next steps — both questions fully answered.";
             None,
             None,
             None,
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame,
             &mut output,
             4096,
@@ -20496,6 +20977,7 @@ transport = "stdio"
                 None,
                 Some(&boundary),
                 Some(&full),
+                wicked_apps_core::spawn::SeatCli::Other,
                 &frame(cmd, id),
                 &mut output,
                 4096,
@@ -20601,6 +21083,7 @@ transport = "stdio"
                 None,
                 None,
                 Some(&full),
+                wicked_apps_core::spawn::SeatCli::Other,
                 &frame(cmd, id),
                 &mut output,
                 4096,
@@ -20704,6 +21187,7 @@ transport = "stdio"
             None,
             None,
             Some(&full),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame(
                 "Bash",
                 "execute",
@@ -20763,6 +21247,7 @@ transport = "stdio"
             None,
             None,
             Some(&full),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame(
                 "bash",
                 "other",
@@ -20789,6 +21274,7 @@ transport = "stdio"
             None,
             None,
             Some(&full),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame(
                 "Bash",
                 "execute",
@@ -20811,6 +21297,7 @@ transport = "stdio"
             None,
             None,
             Some(&full),
+            wicked_apps_core::spawn::SeatCli::Other,
             &frame("Edit", "edit", json!({"file_path": "/wt/src/a.rs"}), 4),
             &mut output,
             4096,
@@ -20964,6 +21451,7 @@ transport = "stdio"
                     None,
                     None,
                     Some(&full),
+                    wicked_apps_core::spawn::SeatCli::Other,
                     &frame,
                     &mut output,
                     8192,
