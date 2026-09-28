@@ -1287,6 +1287,32 @@ pub(crate) fn apply_and_finish_unit(
     // Only runs for governed units (ungoverned units have no log). Reads the log once more (cheap;
     // tiny NDJSON files) so fold_input_denial's signature is unchanged. Emits one event per claim
     // entry for this unit's phase, in log order.
+    // (DES-MCP-TOOLS-001 §4.4) A brokered MCP call the gate refused: blocked, the seat continued.
+    // Disclosed for EVERY unit, governed by its runner or not — the broker, not the carrier, is
+    // what governs an MCP call, so a codex or pi unit's refusals are as real as a claude one's.
+    for rec in crate::gate_hook::collect_hook_decisions(
+        session_id,
+        attempt,
+        &crate::scope::unit_phase(unit.ord),
+    ) {
+        if let Some((reason, subject, remedy)) = rec.mcp_refusal() {
+            emit(CoreEvent::WorkerToolCallDenied {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+                carrier: crate::mcp_gate::CARRIER_SHIM.to_string(),
+                role: crate::write_posture::role_wire(unit.role).to_string(),
+                tool: rec.tool_name.clone(),
+                command: subject,
+                reason,
+                remedy,
+            });
+        }
+    }
     if governed {
         let phase = crate::scope::unit_phase(unit.ord);
         for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {

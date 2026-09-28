@@ -3064,28 +3064,37 @@ pub fn write_armed_marker_for(
 /// path and `append_estate_deny`: one small `write_all` under the advisory lock cannot be
 /// interleaved by a concurrent hook subprocess even if the lock degrades.
 fn append_annotated_claim(decisions_path: &str, phase: &str, tool: &str, claim: &ConformanceClaim) {
+    let _ = append_annotated_claim_checked(decisions_path, phase, tool, claim);
+}
+
+/// [`append_annotated_claim`] that reports a failed write, for a recorder that must refuse the call
+/// it cannot record (the MCP broker's D-3, `mcp_gate::evaluate_mcp_call`).
+pub(crate) fn append_annotated_claim_checked(
+    decisions_path: &str,
+    phase: &str,
+    tool: &str,
+    claim: &ConformanceClaim,
+) -> std::io::Result<()> {
     let annotation = serde_json::json!({
         TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
         TOOL_CALL_PHASE_KEY: phase,
     })
     .to_string()
         + "\n";
-    let Ok(mut claim_line) = serde_json::to_string(claim) else {
-        return;
-    };
+    let mut claim_line = serde_json::to_string(claim).map_err(std::io::Error::other)?;
     claim_line.push('\n');
     let combined = annotation + &claim_line;
     let path = Path::new(decisions_path);
     if let Some(parent) = path.parent() {
-        let _ = create_dir_all_private(parent);
+        create_dir_all_private(parent)?;
     }
-    let _ = with_append_lock(path, || {
+    with_append_lock(path, || {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
         f.write_all(combined.as_bytes())
-    });
+    })
 }
 
 fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str, reason: &str) {
@@ -3242,10 +3251,13 @@ pub(crate) const REMOTE_WRITE_DENY_PREFIX: &str = "remote-write-deny:";
 /// [`append_remote_write_deny`] instead of the boundary recorder.
 pub(crate) const REMOTE_WRITE_REASON_PREFIX: &str = "remote-write fence:";
 
-/// (core#657, F-11) Claim-id prefix of an MCP refusal: a tool call to an MCP server
-/// (`mcp_isolation::is_mcp_call`) on a governed unit. No MCP server is registered for workers, so
-/// every such call is refused on every posture. ADVISORY by the allowlist ([`is_advisory_deny`]):
-/// the call never ran and the seat continues without the tool.
+/// (core#657, F-11) Claim-id prefix of an MCP refusal, from either recorder, both ADVISORY by the
+/// allowlist ([`is_advisory_deny`]): the call never ran and the seat continues without it.
+/// - the carrier fence: a native `mcp__*` call (`mcp_isolation::is_mcp_call`) on a governed unit —
+///   no native MCP server is ever registered for a worker, so every such call is refused
+///   ([`BOUNDARY_EVALUATOR`], `obligations = [reason, tool]`);
+/// - the broker gate (DES-MCP-TOOLS-001 §4.4): a brokered call denied by an engine gate or a
+///   policy (`mcp_gate`, its own evaluator, `obligations = [reason, subject, remedy]`).
 pub(crate) const MCP_DENY_PREFIX: &str = "mcp-deny:";
 
 /// (issue #463) Claim-id prefix of the ADVISORY arm of an ESTATE-DENY refusal — a Bash invocation
@@ -3475,7 +3487,7 @@ fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: 
 /// boundary write escape, or an infra deny can never be mistaken for advisory; anything the
 /// fold/drain has not been taught here is fatal by omission. The worker cannot forge either: the
 /// decisions log lives outside its write boundary and is written only by the gate-hook.
-fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
+pub(crate) fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
     if claim.decision != Decision::Deny {
         return false;
     }
@@ -3494,6 +3506,10 @@ fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
             || claim.claim_id.starts_with(MCP_DENY_PREFIX)))
         || (claim.evaluator_identity == PHASE_SCOPE_EVALUATOR
             && claim.claim_id.starts_with(PHASE_SCOPE_DENY_PREFIX))
+        // A denied MCP call (DES-MCP-TOOLS-001 §4.4, operator decision 2): blocked before anything
+        // ran, disclosed, the unit continues.
+        || (claim.evaluator_identity == crate::mcp_gate::MCP_EVALUATOR
+            && claim.claim_id.starts_with(MCP_DENY_PREFIX))
 }
 
 /// If `v` is an armed-marker object, the phase it marks; else `None`. Checks the ROOT key
@@ -3547,6 +3563,9 @@ pub struct HookDecisionRecord {
     /// [`CARRIER_ACP`] — read off the phase's ARMED marker, so a refusal the fold replays from the
     /// log is attributed to the carrier that recorded it. `None` for a log an older launcher wrote.
     pub carrier: Option<String>,
+    /// The recording claim's evaluator identity — with the claim-id prefix, what names the recorder
+    /// (DES-MCP-TOOLS-001: only the broker gate's own evaluator is a brokered MCP refusal).
+    pub evaluator: String,
 }
 
 impl HookDecisionRecord {
@@ -3572,6 +3591,23 @@ impl HookDecisionRecord {
         Some((
             self.obligations.first().cloned().unwrap_or_default(),
             self.obligations.get(1).cloned().unwrap_or_default(),
+        ))
+    }
+
+    /// (DES-MCP-TOOLS-001 §4.4) Whether this record is a brokered MCP refusal the fold discloses as
+    /// `workerToolCallDenied`: `(reason, subject, remedy)` when it is.
+    pub fn mcp_refusal(&self) -> Option<(String, String, String)> {
+        if self.decision != "deny"
+            || self.evaluator != crate::mcp_gate::MCP_EVALUATOR
+            || !self.claim_id.starts_with(MCP_DENY_PREFIX)
+            || self.obligations.len() < 3
+        {
+            return None;
+        }
+        Some((
+            self.obligations[0].clone(),
+            self.obligations[1].clone(),
+            self.obligations[2].clone(),
         ))
     }
 
@@ -3674,6 +3710,7 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
             claim_id: claim.claim_id,
             obligations: claim.obligations,
             carrier: carrier.clone(),
+            evaluator: claim.evaluator_identity,
         });
     }
     records
@@ -4002,17 +4039,23 @@ pub fn apply_hook_decisions(
         // gate; exclude them from the deny-dominating verdict at every tier. A phase whose ONLY
         // claims are advisory has nothing gate-affecting to resolve, so it is skipped (no spurious
         // veto).
+        // MCP claims never resolve the phase gate either: an allowed call ran, an asked one waits
+        // for the operator and a denied one is advisory — none is the unit's verdict (§4.4). An
+        // `ask` recorded as `allow_with_conditions` must not turn the phase conditional.
+        let gate_bearing = |c: &&ConformanceClaim| {
+            !is_advisory_deny(c) && c.evaluator_identity != crate::mcp_gate::MCP_EVALUATOR
+        };
         let verdict = match claims
             .iter()
-            .filter(|c| !is_advisory_deny(c))
+            .filter(gate_bearing)
             .find(|c| c.decision == Decision::Deny)
             .or_else(|| {
                 claims
                     .iter()
-                    .filter(|c| !is_advisory_deny(c))
+                    .filter(gate_bearing)
                     .find(|c| c.decision == Decision::AllowWithConditions)
             })
-            .or_else(|| claims.iter().find(|c| !is_advisory_deny(c)))
+            .or_else(|| claims.iter().find(gate_bearing))
         {
             Some(v) => v,
             None => continue,

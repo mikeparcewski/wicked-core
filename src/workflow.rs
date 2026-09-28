@@ -167,6 +167,12 @@ pub struct GovernanceContext {
     /// `DispatchedTask` from an older peer still deserializes (as `None`).
     #[serde(default)]
     pub project_id: Option<String>,
+    /// The run-level autonomy (`AgentSession::human_confirm`), from which the unit's MCP posture
+    /// mode is read (`mcp_gate::McpMode::of`, DES-MCP-TOOLS-001 operator decision 1). Filled per
+    /// unit from the session like the fields above; `#[serde(default)]` (none ⇒ autonomous) so an
+    /// older peer's `DispatchedTask` still deserializes.
+    #[serde(default)]
+    pub human_confirm: crate::domain::HumanConfirm,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

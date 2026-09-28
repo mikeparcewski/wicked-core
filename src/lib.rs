@@ -43,6 +43,7 @@ mod interaction;
 mod knowledge;
 #[cfg(test)]
 mod lockstep;
+mod mcp_gate;
 mod mcp_isolation;
 mod memory;
 mod output_throttle;
@@ -132,6 +133,11 @@ pub use gate_hook::{
     run_gate_hook, run_output_gate_hook, HookDrainSummary, COVERAGE_DB_ENV, DECISIONS_PATH_ENV,
     ESTATE_DB_ENV, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV,
     GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
+};
+pub use mcp_gate::{
+    classify as mcp_tool_class, evaluate_mcp_call_json, McpAnnotations, McpClass,
+    APPROVAL_OBLIGATION as MCP_APPROVAL_OBLIGATION, CREW_URL_ENV as MCP_CREW_URL_ENV,
+    TOKEN_ENV as MCP_TOKEN_ENV,
 };
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;

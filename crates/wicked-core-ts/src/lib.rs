@@ -2331,6 +2331,46 @@ impl Core {
         })
     }
 
+    /// Judge and record ONE brokered MCP call (DES-MCP-TOOLS-001 §6 step 3; crew's broker calls
+    /// this before it invokes anything). `request_json` is `{ token, call: { server, tool, args?,
+    /// annotations?, classOverride?, registered, kind?, carrier? } }` — `token` is the worker's
+    /// `WICKED_MCP_TOKEN`, the rest is the broker's registry resolution. Resolves to the verdict
+    /// JSON `{ decision: "allow"|"ask"|"deny", subject, class, ruleIds, obligations, reason?,
+    /// remedy?, claimId, unit: { runId, ord, attempt, phase, seat } }`; the decision is already
+    /// recorded in the unit's decisions log. Rejects with `invalid_token: …`, `bad_request: …` or
+    /// `guard_error: …` — every rejection is a refusal (a `guard_error` means the call could not be
+    /// recorded, D-3: fail closed). Static: the token registry is process-global, so the broker
+    /// needs no `Core` handle.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn evaluate_mcp_call(request_json: String) -> AsyncTask<CoreTask> {
+        task(move || wicked_core::evaluate_mcp_call_json(&request_json).map_err(err))
+    }
+
+    /// The ONE MCP tool class derivation (D-4): `annotations_json` is the tool's `tools/list`
+    /// annotations object (or `null`), `class_override` an operator override (`read` | `write` |
+    /// `destructive`). Returns the class; a tool with no annotations is `write`.
+    #[napi]
+    pub fn mcp_tool_class(
+        annotations_json: Option<String>,
+        class_override: Option<String>,
+    ) -> napi::Result<String> {
+        let annotations: Option<wicked_core::McpAnnotations> = match annotations_json.as_deref() {
+            None => None,
+            Some(j) => serde_json::from_str(j).map_err(err)?,
+        };
+        let over: Option<wicked_core::McpClass> = match class_override.as_deref() {
+            None => None,
+            Some(c) => Some(
+                serde_json::from_value(serde_json::Value::String(c.to_string())).map_err(err)?,
+            ),
+        };
+        let class = wicked_core::mcp_tool_class(annotations.as_ref(), over);
+        Ok(serde_json::to_value(class)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default())
+    }
+
     /// Front-half coverage gate report — JSON-serialized `CoverageReport`, or the JSON literal
     /// `null` when the store has no domain-model nodes yet. Opens a read-only connection so it
     /// never blocks the single-writer actor.
@@ -4255,8 +4295,24 @@ mod tests {
             .map(|r| r["id"].as_str().expect("rows carry an id"))
             .collect();
         ids.sort_unstable();
-        assert_eq!(ids, ["PAT-100", "PAT-101", "SEC-CUSTOM-1"]);
-        for row in &listed {
+        // The engine seeds the `mcp-defaults` posture rules (steering_type security) at boot
+        // (DES-MCP-TOOLS-001 §4.3); they list beside the imported ones.
+        assert_eq!(
+            ids,
+            [
+                "MCP-FIRST-USE",
+                "MCP-MODE-ASK-WRITE",
+                "MCP-POSTURE-READ",
+                "MCP-POSTURE-WRITE",
+                "PAT-100",
+                "PAT-101",
+                "SEC-CUSTOM-1"
+            ]
+        );
+        for row in listed
+            .iter()
+            .filter(|r| !r["id"].as_str().unwrap_or("").starts_with("MCP-"))
+        {
             assert_eq!(
                 row["steering_type"], "security",
                 "the batch default_type landed on {}",
