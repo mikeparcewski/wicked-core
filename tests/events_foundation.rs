@@ -736,7 +736,7 @@ fn unit_distributed_teamed_routing_carries_no_council_fields() {
             None,
             None,
             None,
-            None
+            Some(ungoverned_build("a"))
         )]
     );
 }
@@ -862,9 +862,24 @@ fn unit_distributed_names_the_bench_on_the_teamed_arm() {
         vec![(
             "b".to_string(),
             "teamed".to_string(),
-            Some("1 of 2 seats benched: a (signed out — launcher)".to_string())
+            // (crew#477) The stub seats enforce no input governance, so the build unit's
+            // degrade names that too, after the bench.
+            Some(format!(
+                "1 of 2 seats benched: a (signed out — launcher); {}",
+                ungoverned_build("b")
+            ))
         )]
     );
+}
+
+/// (crew#477) The degrade a build unit on a stub seat carries: `cli()` records have no ACP
+/// adapter and no claude template, so they enforce no input governance.
+fn ungoverned_build(seat: &str) -> String {
+    format!(
+        "unit 1 (build) runs on '{seat}', which does not enforce input governance \
+         (acp_input_governance=false or no gate-hook adapter): no eligible seat that enforces it \
+         admits this unit, so its tool calls run unchecked"
+    )
 }
 
 // ── StepFailed tests ─────────────────────────────────────────────────────────────────────────────
