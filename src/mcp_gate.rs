@@ -605,20 +605,12 @@ fn rule_row(
     id: &str,
 ) -> Result<Option<wicked_governance::ConformanceRule>, McpCallError> {
     use wicked_apps_core::FromNode;
-    let query = wicked_estate_core::SymbolQuery {
-        kinds: vec![wicked_apps_core::NodeKind::Rule],
-        exact_name: Some(id.to_string()),
-        ..Default::default()
-    };
     let symbol = synthetic_symbol(wicked_governance::CONFORMANCE_RULE, id);
-    let nodes = store
-        .find_symbols(&query)
-        .map_err(|e| McpCallError::GuardError(format!("rule read failed: {e}")))?;
-    nodes
-        .iter()
-        .find(|n| n.symbol == symbol)
+    store
+        .get_node(&symbol)
+        .map_err(|e| McpCallError::GuardError(format!("rule read failed: {e}")))?
         .map(|n| {
-            wicked_governance::ConformanceRule::from_node(n)
+            wicked_governance::ConformanceRule::from_node(&n)
                 .map_err(|e| McpCallError::GuardError(format!("rule {id} unreadable: {e}")))
         })
         .transpose()
@@ -863,28 +855,35 @@ pub(crate) fn mcp_default_rules() -> anyhow::Result<Vec<wicked_governance::Confo
 /// Seed the posture rules into the store, INSERT-ONLY: a rule already present (edited by an
 /// approval, or retired by the operator) is left exactly as it is, so a restart never undoes an
 /// approval or resurrects a retired rule. Returns how many rules were inserted.
+///
+/// Written straight to the store in one batch, NOT through `register_rule`: that path also emits
+/// `wicked.estate.rule.ingested` on the bus, synchronously, and this runs on the actor's boot path,
+/// which must never wait on a busy or locked bus (`tests/bus_handoff.rs`).
 pub(crate) fn seed_mcp_defaults(
     store: &mut dyn wicked_apps_core::GraphStore,
 ) -> anyhow::Result<usize> {
-    let mut inserted = 0;
-    for rule in mcp_default_rules()? {
-        let query = wicked_estate_core::SymbolQuery {
-            kinds: vec![wicked_apps_core::NodeKind::Rule],
-            exact_name: Some(rule.id.clone()),
-            ..Default::default()
-        };
+    use wicked_apps_core::ToNode;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut nodes = Vec::new();
+    for mut rule in mcp_default_rules()? {
         let symbol = synthetic_symbol(wicked_governance::CONFORMANCE_RULE, &rule.id);
-        if store
-            .find_symbols(&query)?
-            .iter()
-            .any(|n| n.symbol == symbol)
-        {
+        if store.get_node(&symbol)?.is_some() {
             continue;
         }
-        wicked_governance::register_rule(store, &rule)?;
-        inserted += 1;
+        rule.validate()?;
+        rule.created_at = Some(now);
+        nodes.push(rule.to_node());
     }
-    Ok(inserted)
+    if nodes.is_empty() {
+        return Ok(0);
+    }
+    store.begin_batch()?;
+    store.upsert_nodes(&nodes)?;
+    store.commit_batch()?;
+    Ok(nodes.len())
 }
 
 #[cfg(test)]
