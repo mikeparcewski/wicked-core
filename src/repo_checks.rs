@@ -2628,7 +2628,7 @@ fn rerun_flakes(
             sandbox,
             scratch,
             Tree::Head,
-            &[name.clone()],
+            std::slice::from_ref(&name),
         );
         let ok = r.passed() && passed.iter().any(|p| p == &name);
         eprintln!(
