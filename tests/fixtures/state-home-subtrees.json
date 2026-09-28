@@ -133,6 +133,13 @@
       "worker_read": "none"
     },
     {
+      "name": "mcp",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/mcp/registry-store.ts mcpStateDir — join(crewStateHome(), 'mcp'): the MCP tools registry (registry.json: upstreams and tools, secret REFERENCES only) and, from the broker slice on, the call records",
+      "worker_read": "none (a worker reaches MCP tools only through the broker, never by reading the registry; upstream secrets live in the OS keychain, never here)"
+    },
+    {
       "name": "workflows",
       "kind": "dir",
       "owner": "crew",
