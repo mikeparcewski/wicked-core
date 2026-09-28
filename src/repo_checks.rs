@@ -617,8 +617,9 @@ impl RepoChecksReport {
     /// failing ids that carry a nested-sandbox launcher signature. A NON-denying set ("the floor
     /// could not run N tests; external CI is the test gate for them"), and — the advisory — a
     /// head-only failure with the same signature, which still denies (fail-closed) but names the
-    /// likely cause so a `request_changes` can too. `None` when no check carried the signature.
-    pub fn env_note(&self) -> Option<String> {
+    /// likely cause so a `request_changes` can too; plus (core#553) each `flaky_under_load` check,
+    /// named. `None` when there is nothing of either kind to say.
+    pub fn classification_note(&self) -> Option<String> {
         let mut notes: Vec<String> = Vec::new();
         for c in &self.checks {
             if c.env_cannot_run.is_empty() {
@@ -653,6 +654,19 @@ impl RepoChecksReport {
                         .join(", "),
                     if head_only.len() == 1 { "ies" } else { "y" },
                     if shared == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        // (core#553) A failure that passed alone is not a denial, but it is not silent either: an
+        // order-dependent failure the change introduced reads the same way.
+        for c in &self.checks {
+            if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) {
+                notes.push(format!(
+                    "`{}`: {} failed in the full run and passed re-run alone — classed \
+                     flaky_under_load (host load), not denied; an order-dependent failure reads \
+                     the same way",
+                    c.name,
+                    c.regressions.join(", ")
                 ));
             }
         }
@@ -2367,6 +2381,12 @@ impl BaseTree {
     fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseRun> {
         let raw = std::fs::read_to_string(Self::cache_path(scratch, head, &check.name)).ok()?;
         let run = serde_json::from_str::<CheckRun>(&raw).ok()?;
+        // A targeted command is the head's argv run on the base, and it changes with the files a
+        // rework touches (`{files}`, the derived `-p <crate>`): a cached run of ANOTHER argv is
+        // not this comparison.
+        if check.name == "test_targeted" && run.argv != check.argv {
+            return None;
+        }
         Some(BaseRun {
             head: head.to_string(),
             cached: true,
@@ -5637,7 +5657,9 @@ mod tests {
         );
         let report = report_of(vec![head], &[]);
         assert!(report.passed && report.env_mismatch());
-        let note = report.env_note().expect("the env count is on the note");
+        let note = report
+            .classification_note()
+            .expect("the env count is on the note");
         assert!(
             note.contains("could not run 2 tests on this host")
                 && note.contains("external CI is the test gate"),
@@ -5672,7 +5694,9 @@ mod tests {
         assert_eq!(head.classification.as_deref(), Some(REGRESSION));
         assert!(head.denies());
         let report = report_of(vec![head], &[]);
-        let note = report.env_note().expect("the advisory rides the note");
+        let note = report
+            .classification_note()
+            .expect("the advisory rides the note");
         assert!(
             note.contains("test a::new_jail [--lib]")
                 && note.contains("same env class as 1 pre-existing id;")
@@ -5680,7 +5704,7 @@ mod tests {
             "{note}"
         );
         assert!(report_of(vec![failed_run(&["test x"], &[])], &[])
-            .env_note()
+            .classification_note()
             .is_none());
     }
 
@@ -5788,6 +5812,11 @@ mod tests {
         assert!(c.reruns[0]
             .argv
             .ends_with(&s(&["--lib", "--", "--exact", "t::flaky"])));
+        let note = report.classification_note().expect("a flake is disclosed");
+        assert!(
+            note.contains("test t::flaky [--lib]") && note.contains("flaky_under_load"),
+            "{note}"
+        );
 
         // Always red ⇒ one re-run, still a regression, still denies.
         std::fs::write(
@@ -5925,5 +5954,34 @@ mod tests {
         let d = detect_with(&repo, &ctx).unwrap();
         assert!(names(&d).contains(&"test") && !names(&d).contains(&"test_targeted"));
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A cached base run of a targeted command answers only the SAME argv: a rework that touches
+    /// another crate derives another `-p`, and must not be compared against the first one's base.
+    #[test]
+    fn a_cached_targeted_base_run_answers_only_its_own_argv() {
+        let wt = scratch("cache-argv");
+        let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
+        let head = "0123456789abcdef0123";
+        let mut ran = failed_run(&["test t::x [-p b --lib]"], &[]);
+        ran.name = "test_targeted".into();
+        ran.argv = s(&["cargo", "test", "-p", "b"]);
+        let path = BaseTree::cache_path(&scratch_dir, head, "test_targeted");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&ran).unwrap()).unwrap();
+        let check = |argv: &[&str]| RepoCheck {
+            name: "test_targeted".into(),
+            argv: s(argv),
+            source: DERIVED_TARGETED_SOURCE.into(),
+            timeout_s: None,
+        };
+        assert!(
+            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
+        );
+        assert!(
+            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "a"])).is_none()
+        );
+        drop(scratch_dir);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }
