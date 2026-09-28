@@ -1605,6 +1605,17 @@ impl WrappedCliStepRunner {
         // Non-claude CLIs + ungoverned internal calls (`governance: None`) are untouched.
         let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
             (Some(gov), true) => {
+                // #653: an org `allowManagedHooksOnly` setting drops every `--settings` hook, so
+                // arming here would announce a gate that never fires. The unit is on this carrier
+                // because ACP is unavailable for it (no `[cli.acp]` record, bridge missing, session
+                // died) — refuse it, never run it ungoverned.
+                if let Some(source) =
+                    managed_hooks_only_source(&claude_settings_candidates(seat_config.claude_dir()))
+                {
+                    let why = managed_hooks_only_refusal_reason(&source);
+                    eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
+                    return governance_refusal(input, &why);
+                }
                 match arm_input_governance(
                     input,
                     gov,
@@ -3381,6 +3392,105 @@ pub(crate) fn apply_no_code_posture(
 
 /// The [`StepOutput`] for a unit whose launch [`no_code_posture`] REFUSED: nothing ran, nothing was
 /// governed, and the reason is the whole output — the same shape as [`skills_refusal`].
+/// The settings files that can carry an org `allowManagedHooksOnly` for a claude worker (#653),
+/// in the order they are checked: the worker home's server-managed cache (`remote-settings.json`,
+/// fetched from the claude.ai console), then the system `managed-settings.json` and its
+/// `managed-settings.d/*.json` drop-ins. `claude_dir` is the worker's `CLAUDE_CONFIG_DIR` — the
+/// seat's isolated home; `None` (the operator-inherit hatch) resolves the worker's own
+/// `CLAUDE_CONFIG_DIR`, else `~/.claude`. MDM profiles are not read here; the input fold's
+/// `governance_unproven` arm is the backstop for any source this misses.
+pub(crate) fn claude_settings_candidates(
+    claude_dir: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let dir = claude_dir.map(std::path::Path::to_path_buf).or_else(|| {
+        std::env::var_os("CLAUDE_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| std::path::PathBuf::from(h).join(".claude"))
+            })
+    });
+    if let Some(d) = dir {
+        out.push(d.join("remote-settings.json"));
+    }
+    if let Some(sys) = system_managed_settings_dir() {
+        out.push(sys.join("managed-settings.json"));
+        if let Ok(rd) = std::fs::read_dir(sys.join("managed-settings.d")) {
+            let mut dropins: Vec<_> = rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            dropins.sort();
+            out.extend(dropins);
+        }
+    }
+    out
+}
+
+/// Claude Code's system managed-settings directory for this OS.
+fn system_managed_settings_dir() -> Option<std::path::PathBuf> {
+    if cfg!(target_os = "macos") {
+        Some("/Library/Application Support/ClaudeCode".into())
+    } else if cfg!(windows) {
+        Some(r"C:\Program Files\ClaudeCode".into())
+    } else if cfg!(unix) {
+        Some("/etc/claude-code".into())
+    } else {
+        None
+    }
+}
+
+/// The first of `candidates` whose top-level `allowManagedHooksOnly` is `true` (#653). A missing
+/// or unparsable file is skipped: this is the early refusal, and the fold's `governance_unproven`
+/// arm still fails a unit closed if a hook the launch armed never runs.
+pub(crate) fn managed_hooks_only_source(
+    candidates: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    candidates
+        .iter()
+        .find(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some_and(|v| {
+                    v.get("allowManagedHooksOnly") == Some(&serde_json::Value::Bool(true))
+                })
+        })
+        .cloned()
+}
+
+/// Stable prefix of the #653 spawn refusal — the escalation an operator and crew read.
+pub(crate) const MANAGED_HOOKS_ONLY_REFUSAL: &str =
+    "claude can't be governed on the wrapped path on this machine";
+
+fn managed_hooks_only_refusal_reason(source: &std::path::Path) -> String {
+    format!(
+        "{MANAGED_HOOKS_ONLY_REFUSAL}: org settings allow only managed hooks \
+         (`allowManagedHooksOnly: true` in {}); ACP is unavailable — refusing the governed unit \
+         rather than running it ungoverned. Configure the seat's ACP bridge (`[cli.acp]`) so it \
+         runs on the ACP carrier (core#653)",
+        source.display()
+    )
+}
+
+/// A governed unit the wrapped carrier cannot govern (#653): nothing ran, no gate was armed.
+pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!("(input governance refused the launch: {why})"),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    }
+}
+
 pub(crate) fn posture_refusal(input: &StepInput, why: &str) -> StepOutput {
     StepOutput {
         run_id: input.run_id.clone(),
@@ -5646,6 +5756,119 @@ mod tests {
             worker_home.join("claude"),
             "the wrapped claude worker runs on the worker home — the same dir the ACP spawn and the \
              ballot use"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#653: `allowManagedHooksOnly: true` is found in whichever candidate carries it; absent,
+    /// false, a non-bool, or an unparsable file never trips the refusal.
+    #[test]
+    fn managed_hooks_only_is_read_from_the_candidate_that_sets_it() {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-653-candidates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let off = w("off.json", r#"{"allowManagedHooksOnly": false}"#);
+        let stringy = w("stringy.json", r#"{"allowManagedHooksOnly": "true"}"#);
+        let broken = w("broken.json", "{not json");
+        let missing = dir.join("missing.json");
+        let on = w(
+            "remote-settings.json",
+            r#"{"allowManagedHooksOnly": true, "x": 1}"#,
+        );
+        assert_eq!(
+            managed_hooks_only_source(&[missing.clone(), off.clone(), stringy, broken.clone()]),
+            None
+        );
+        assert_eq!(
+            managed_hooks_only_source(&[missing, off, broken, on.clone()]),
+            Some(on)
+        );
+        // The worker home's server-managed cache is the first candidate for the seat's dir.
+        let c = claude_settings_candidates(Some(&dir));
+        assert_eq!(c.first(), Some(&dir.join("remote-settings.json")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#653 (red on main): a GOVERNED claude unit on the wrapped carrier whose worker home
+    /// carries `allowManagedHooksOnly: true` is REFUSED before spawn with the escalation — the
+    /// `--settings` gate-hook would never run. The fake claude must never start, and no armed
+    /// marker is written (nothing announces a gate that cannot fire).
+    #[cfg(unix)]
+    #[test]
+    fn a_governed_claude_unit_is_refused_on_the_wrapped_carrier_under_managed_hooks_only() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-653-wrapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let worker_home = dir.join("worker");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(worker_home.join("claude")).unwrap();
+        std::fs::write(
+            worker_home.join("claude").join("remote-settings.json"),
+            r#"{"allowManagedHooksOnly": true}"#,
+        )
+        .unwrap();
+        let ran = dir.join("ran.txt");
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!("#!/bin/sh\necho ran > \"{}\"\nexit 0\n", ran.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("claude".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
+        let run_id = format!("run-653-wrapped-{}", std::process::id());
+        let input = StepInput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains(MANAGED_HOOKS_ONLY_REFUSAL)
+                && out.output.contains("ACP is unavailable")
+                && out.output.contains("allowManagedHooksOnly"),
+            "the refusal names the escalation: {}",
+            out.output
+        );
+        assert!(!out.governed, "nothing was armed");
+        assert!(!ran.exists(), "the worker must never start ungoverned");
+        assert!(
+            !crate::gate_hook::decisions_path_for(&run_id, 0).exists(),
+            "no armed marker for a gate that cannot fire"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

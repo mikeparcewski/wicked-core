@@ -5068,6 +5068,9 @@ fn apply_step_result(
     // "adapter saw ≥1" gate as DataUsed above — deliberately NOT gated on `governed`, because an operator
     // watching an ungoverned run was just as blind to a unit's tool activity as a governed one. Passthrough
     // seats report no tools, so the default path stays silent.
+    // (#653) Captured before the list is moved into `ToolInvoked`: the input fold needs to know
+    // the agent made tool calls, so a wrapped unit whose gate-hook never ran cannot pass governed.
+    let tool_activity = !output.tools.is_empty();
     if !output.tools.is_empty() {
         emit(
             subscribers,
@@ -6078,6 +6081,8 @@ fn apply_step_result(
         output.attempt,
         // The runner's authority on whether IT armed input governance (wrote the marker).
         output.governed,
+        // (#653) Whether the agent made tool calls (captured before `ToolInvoked` took the list).
+        tool_activity,
         &cli_keys,
         agent_verdict.as_ref(),
         // The worker-thread evidence (F-036 guard outcome, F-039 repo checks) — folded as
@@ -11934,6 +11939,87 @@ mod substance_gate_tests {
             unit.denial_reason.as_deref(),
             Some(NO_SUBSTANCE),
             "200 trimmed chars of prose must clear the substance gate"
+        );
+    }
+
+    /// core#653, through the REAL fold: a governed wrapped unit whose gate-hook never ran (armed
+    /// marker only — `allowManagedHooksOnly` dropped the `--settings` hook) but whose CLI reported
+    /// tool calls must be denied `governance_unproven`. The actor captures the tool list BEFORE it
+    /// moves it into `ToolInvoked`; a regression that loses it would pass the unit as governed.
+    #[test]
+    fn a_governed_wrapped_unit_with_tool_calls_and_a_silent_hook_is_denied_unproven() {
+        let fold_tools = |run_id: &str, tools: Vec<String>, hook_fired: bool| {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(&mut store, run_id, PhaseRole::Creator);
+            let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(run_id));
+            let log = crate::gate_hook::decisions_path_for(run_id, 0);
+            let phase = crate::scope::unit_phase(1);
+            crate::gate_hook::write_armed_marker_for(
+                &log,
+                &phase,
+                Some(crate::gate_hook::CARRIER_WRAPPED_CLI),
+            )
+            .unwrap();
+            if hook_fired {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+                writeln!(f, "{}", serde_json::json!({ "_wicked_hook_fired": phase })).unwrap();
+            }
+            let mut subs = crate::event_log::EventSink::default();
+            let (tx, _rx) = channel::<Command>();
+            let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+            let out = StepOutput {
+                run_id: run_id.into(),
+                unit_ix: 0,
+                attempt: 0,
+                output: "a".repeat(260),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools,
+                governed: true,
+            };
+            apply_step_result(
+                &mut store,
+                &mut subs,
+                &runner,
+                &tx,
+                out,
+                None,
+                crate::workflow::UnitEvidence::default(),
+                "",
+                &None,
+                &None,
+                uuid::Uuid::nil(),
+                false,
+            )
+            .unwrap();
+            let unit = crate::domain::session_units(&store, run_id)
+                .unwrap()
+                .remove(0);
+            let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(run_id));
+            unit.denial_reason.unwrap_or_default()
+        };
+        let pid = std::process::id();
+        let silent = fold_tools(
+            &format!("unproven-silent-{pid}"),
+            vec!["Read".into(), "Bash".into()],
+            false,
+        );
+        assert!(
+            silent.starts_with(crate::gate_hook::GOVERNANCE_UNPROVEN),
+            "tool calls with no hook proof must fail the gate governance_unproven, got: {silent:?}"
+        );
+        // Controls: no tool calls, or a hook that DID fire, are not governance_unproven.
+        let idle = fold_tools(&format!("unproven-idle-{pid}"), Vec::new(), false);
+        assert!(
+            !idle.contains(crate::gate_hook::GOVERNANCE_UNPROVEN),
+            "{idle}"
+        );
+        let fired = fold_tools(&format!("unproven-fired-{pid}"), vec!["Read".into()], true);
+        assert!(
+            !fired.contains(crate::gate_hook::GOVERNANCE_UNPROVEN),
+            "{fired}"
         );
     }
 
