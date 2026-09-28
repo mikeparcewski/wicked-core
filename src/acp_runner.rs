@@ -1993,6 +1993,38 @@ fn opencode_existing_config(config: &AcpConfig) -> Option<String> {
         .or_else(|| std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok())
 }
 
+/// The `OPENCODE_CONFIG_CONTENT` an ACP launch sets, or `None` for "set nothing": the skills paths
+/// composed onto [`opencode_existing_config`] (v3.2), then, for an opencode seat, the MCP deny
+/// composed onto that (core#657). For an opencode seat with no skills document the base is the
+/// seat's registry governance content, else (under the hatch, which inherits the operator's
+/// variable) the daemon's own, else nothing. ONE resolution shared by the pre-spawn admission in
+/// `exec_turn_inner` and the spawn chokepoint (review of #659): a value either step cannot compose
+/// is refused as a LAUNCH ERROR before the spawn, never a spawn failure that falls back to the
+/// wrapped carrier.
+fn opencode_launch_config(
+    config: &AcpConfig,
+    delivery: &crate::skills_snapshot::SkillsDelivery,
+    seat_cli: wicked_apps_core::spawn::SeatCli,
+) -> Result<Option<String>, String> {
+    let skills = delivery.opencode_config(opencode_existing_config(config).as_deref())?;
+    if seat_cli != wicked_apps_core::spawn::SeatCli::Opencode {
+        return Ok(skills);
+    }
+    let base = skills.or_else(|| {
+        config
+            .acp_governance_env
+            .as_ref()
+            .filter(|(k, _)| k == crate::skills_snapshot::OPENCODE_CONFIG_ENV)
+            .map(|(_, v)| v.clone())
+            .or_else(|| {
+                crate::execute_wrapped::inherits_operator_config()
+                    .then(|| std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok())
+                    .flatten()
+            })
+    });
+    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
+}
+
 /// The per-session Claude configuration carried in `session/new` under
 /// `_meta.claudeCode.options` — the object the bridge spreads into the Agent SDK's `Options`
 /// (`@agentclientprotocol/claude-agent-acp` 0.73.0, acp-agent.js `userProvidedOptions` :5209,
@@ -2339,46 +2371,14 @@ fn start_acp_process_with_write_roots(
     // whatever the daemon's own environment carries (the operator's content), else a bare doc.
     // A malformed base FAILS the spawn (codex round 3) — `exec_turn_inner` refuses the unit
     // before reaching here; this is the chokepoint's own guarantee for every other caller.
-    let opencode_config: Option<String> = delivery
-        .opencode_config(opencode_existing_config(config).as_deref())
+    let opencode_config: Option<String> = opencode_launch_config(config, delivery, seat_cli)
         .map_err(|why| {
             anyhow::anyhow!(
                 "refusing to start '{}': {why}; the seat's governance content is never replaced \
-                 with defaults",
+                 with defaults, and an opencode seat never starts with its MCP tools visible",
                 config.binary
             )
         })?;
-    // core#657 (F-11): an opencode seat loads no ambient MCP tool. opencode has no strict switch,
-    // so its inline config denies and hides every `<server>_<tool>` on top of whatever it would
-    // otherwise carry — the skills-composed document, else the seat's registry governance content,
-    // else (under the hatch, which inherits the operator's variable) the daemon's own. Fails the
-    // spawn on a value the deny cannot be composed into.
-    let opencode_config: Option<String> = if seat_cli == wicked_apps_core::spawn::SeatCli::Opencode
-    {
-        let base = opencode_config.or_else(|| {
-            config
-                .acp_governance_env
-                .as_ref()
-                .filter(|(k, _)| k == crate::skills_snapshot::OPENCODE_CONFIG_ENV)
-                .map(|(_, v)| v.clone())
-                .or_else(|| {
-                    inherit
-                        .then(|| std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok())
-                        .flatten()
-                })
-        });
-        Some(
-            crate::mcp_isolation::opencode_config(base.as_deref()).map_err(|why| {
-                anyhow::anyhow!(
-                    "refusing to start '{}': {why}; an opencode seat never starts with its MCP \
-                     tools visible (core#657)",
-                    config.binary
-                )
-            })?,
-        )
-    } else {
-        opencode_config
-    };
     // F-079 (core#441): how the delivery rides THIS carrier — pi's / copilot's flags on the
     // carrier's own argv when the carrier IS that CLI, pi's `WICKED_PI_SKILL_DIRS` in the
     // environment when the carrier is a separate bridge program (`pi-acp`), which forwards it as
@@ -7311,11 +7311,11 @@ impl AcpStepRunner {
         };
 
         // v3.2 × codex round 3: an opencode seat whose governance content cannot take the skills
-        // paths (not a JSON object) is a LAUNCH ERROR here — a refused unit naming the variable
+        // paths (not a JSON object), or the MCP deny (core#657, review of #659), is a LAUNCH
+        // ERROR here — a refused unit naming the variable
         // — not a spawn failure that would fall back to the wrapped carrier and fail there with
         // the same defect. Judged on the same resolved value the spawn composes into.
-        if let Err(why) = delivery.opencode_config(opencode_existing_config(&acp_config).as_deref())
-        {
+        if let Err(why) = opencode_launch_config(&acp_config, &delivery, seat_cli) {
             return crate::execute_wrapped::skills_refusal(
                 input,
                 &crate::skills_snapshot::SkillsError::LeverConfig {
@@ -12532,6 +12532,114 @@ transport = "stdio"
             "session/new + one prompt over ACP"
         );
         runner.drop_session("run-oc");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Review of #659 (codex, HIGH): an opencode seat whose inline config cannot take the MCP deny
+    /// (`permission` is not an object), on a unit handed NO skills, is refused BEFORE the spawn as
+    /// a launch error naming the variable and the seat. The reachable source is the inherit hatch,
+    /// where the operator's own `OPENCODE_CONFIG_CONTENT` is the base (a user `clis.toml` cannot
+    /// set `acp_governance_env`). Before the shared resolver the pre-spawn check composed only the
+    /// skills paths (a no-op without a delivery), the spawn failed in the MCP composition, and
+    /// that failure took the generic "ACP unavailable" branch to the wrapped fallback.
+    #[test]
+    #[cfg(unix)]
+    fn an_opencode_seat_whose_governance_cannot_take_the_mcp_deny_is_refused_not_fallen_back() {
+        use crate::skills_snapshot::test_support::scratch as canonical_scratch;
+        use crate::skills_snapshot::OPENCODE_CONFIG_ENV;
+        use crate::workflow::{StepInput, StepRunner};
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-opencode-mcp");
+        let _home = EnvPin::set("HOME", &home);
+        let _no_snap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let ledger = home.join("ledger.ndjson");
+        let bridge_src = write_recording_bridge(&home);
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bridge = bin.join("opencode");
+        std::fs::rename(&bridge_src, &bridge).unwrap();
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "opencode-seat"
+display_name = "opencode seat"
+binary = "opencode"
+headless_invocation = "opencode run {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let _hatch = EnvPin::set(
+            crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
+            std::path::Path::new("1"),
+        );
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let input = {
+            let mut u = crate::domain::WorkUnit::pending("run-ocm:u1", "run-ocm", 1, "review it");
+            u.assigned_cli = Some("opencode-seat".to_string());
+            StepInput {
+                run_id: "run-ocm".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-ocm".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+
+        let bad = EnvPin::set(
+            OPENCODE_CONFIG_ENV,
+            std::path::Path::new(r#"{"permission":"allow"}"#),
+        );
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains(OPENCODE_CONFIG_ENV)
+                && out.output.contains("'opencode-seat'")
+                && out.output.contains("MCP deny"),
+            "{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("single-shot fallback"),
+            "refused, never fallen back: {}",
+            out.output
+        );
+        assert!(
+            ledger_entries(&ledger).is_empty(),
+            "no frame reached the bridge"
+        );
+
+        drop(bad);
+        let _good = EnvPin::set(
+            OPENCODE_CONFIG_ENV,
+            std::path::Path::new(r#"{"permission":{"read":"ask"}}"#),
+        );
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        runner.drop_session("run-ocm");
         let _ = std::fs::remove_dir_all(&home);
     }
 
