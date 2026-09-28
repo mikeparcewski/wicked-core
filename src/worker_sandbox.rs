@@ -72,13 +72,18 @@ pub(crate) fn seat_arms_its_own_os_sandbox(name: &str) -> bool {
     base == "codex" || base == "codex-acp" || base.starts_with("codex:")
 }
 
-/// Read a linked worktree's gitdir from its `.git` FILE (`gitdir: <path>`). `None` for a plain
-/// directory (`.git` is a directory ⇒ not a run worktree) or anything unreadable.
-fn linked_gitdir(worktree: &Path) -> Option<PathBuf> {
-    let dot_git = worktree.join(".git");
+/// The linked worktree `dir` belongs to — `dir` itself or its nearest ancestor holding a `.git`
+/// entry — with that worktree's gitdir read from its `.git` FILE (`gitdir: <path>`). A unit may
+/// run in a package directory below its worktree root, so the walk matters. `None` when the
+/// nearest `.git` is a directory (a main checkout, not a run worktree), when there is none, or
+/// when it is unreadable.
+fn linked_worktree(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = dir.ancestors().find(|a| a.join(".git").exists())?;
+    let dot_git = root.join(".git");
     if !dot_git.is_file() {
         return None;
     }
+    let worktree = root;
     let text = std::fs::read_to_string(&dot_git).ok()?;
     let raw = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
     let path = Path::new(raw);
@@ -87,15 +92,14 @@ fn linked_gitdir(worktree: &Path) -> Option<PathBuf> {
     } else {
         worktree.join(path)
     };
-    path.canonicalize().ok()
+    Some((worktree.to_path_buf(), path.canonicalize().ok()?))
 }
 
 /// The repository boundary for a worker whose cwd is `worktree`, admitting `write_roots` too
 /// when they lie inside the clone. `None` when `worktree` is not a linked git worktree (a
 /// repo-less scratch dir, a clone root itself) — there is no sibling to protect.
-pub(crate) fn repo_boundary(worktree: &Path, write_roots: &[PathBuf]) -> Option<RepoBoundary> {
-    let tree = worktree.canonicalize().ok()?;
-    let gitdir = linked_gitdir(&tree)?;
+pub(crate) fn repo_boundary(cwd: &Path, write_roots: &[PathBuf]) -> Option<RepoBoundary> {
+    let (tree, gitdir) = linked_worktree(&cwd.canonicalize().ok()?)?;
     let common = std::fs::read_to_string(gitdir.join("commondir"))
         .ok()
         .map(|c| {
@@ -224,38 +228,35 @@ pub(crate) fn bwrap_argv(tool: &Path, b: &RepoBoundary) -> Vec<String> {
     w
 }
 
-/// Whether `launcher` can arm on this host, probed once per process with the boundary's own
-/// shape against a throwaway path (a daemon already inside a sandbox, or a kernel refusing
-/// unprivileged user namespaces, fails here and the worker runs as before).
+/// Whether `tool` can arm on this host: one run of the boundary's own shape against a throwaway
+/// path (a daemon already inside a sandbox, or a kernel refusing unprivileged user namespaces,
+/// fails here and the worker runs as before).
 fn launcher_arms(tool: &Path) -> bool {
-    static ARMS: OnceLock<bool> = OnceLock::new();
-    *ARMS.get_or_init(|| {
-        let probe = std::env::temp_dir().join(format!("wicked-wsb-probe-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&probe);
-        let Ok(dir) = probe.canonicalize() else {
-            return false;
-        };
-        let b = RepoBoundary {
-            protected: vec![dir.clone()],
-            admitted: vec![dir.clone()],
-            admitted_files: Vec::new(),
-        };
-        let mut argv = launcher_argv(tool, &b);
-        argv.extend([
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "exit 0".to_string(),
-        ]);
-        let ok = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        let _ = std::fs::remove_dir_all(&dir);
-        ok
-    })
+    let probe = std::env::temp_dir().join(format!("wicked-wsb-probe-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&probe);
+    let Ok(dir) = probe.canonicalize() else {
+        return false;
+    };
+    let b = RepoBoundary {
+        protected: vec![dir.clone()],
+        admitted: vec![dir.clone()],
+        admitted_files: Vec::new(),
+    };
+    let mut argv = launcher_argv(tool, &b);
+    argv.extend([
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "exit 0".to_string(),
+    ]);
+    let ok = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
 }
 
 fn launcher_argv(tool: &Path, b: &RepoBoundary) -> Vec<String> {
@@ -270,11 +271,18 @@ fn launcher_argv(tool: &Path, b: &RepoBoundary) -> Vec<String> {
     }
 }
 
-/// The launcher this host would use for the repository boundary (`sandbox-exec`, then `bwrap`).
-fn boundary_tool() -> Option<PathBuf> {
-    ["sandbox-exec", "bwrap"]
-        .iter()
-        .find_map(|t| crate::validator::find_on_path(t))
+/// The launcher this host arms the repository boundary with (`sandbox-exec`, then `bwrap`),
+/// resolved AND probed once per process — the cached value is the tool that armed, so a later
+/// call can never reuse one launcher's probe for another.
+fn boundary_tool() -> Option<&'static PathBuf> {
+    static TOOL: OnceLock<Option<PathBuf>> = OnceLock::new();
+    TOOL.get_or_init(|| {
+        ["sandbox-exec", "bwrap"]
+            .iter()
+            .find_map(|t| crate::validator::find_on_path(t))
+            .filter(|tool| launcher_arms(tool))
+    })
+    .as_ref()
 }
 
 /// The default worker wrapper for a spawn in `cwd` for seat/CLI `seat`: the repository boundary
@@ -290,11 +298,8 @@ pub(crate) fn default_worker_sandbox(
     }
     let boundary = repo_boundary(cwd, write_roots)?;
     let tool = boundary_tool()?;
-    if !launcher_arms(&tool) {
-        return None;
-    }
     Some(crate::validator::WorkerSandbox {
-        wrapper: launcher_argv(&tool, &boundary),
+        wrapper: launcher_argv(tool, &boundary),
         level: crate::validator::SandboxLevel::Sandboxed,
         downgrade_reason: None,
     })
@@ -367,6 +372,16 @@ mod tests {
         assert!(!seat_arms_its_own_os_sandbox("claude"));
         assert!(!seat_arms_its_own_os_sandbox("claude-agent-acp"));
         assert!(!seat_arms_its_own_os_sandbox("opencode"));
+    }
+
+    #[test]
+    fn a_unit_in_a_package_dir_below_its_worktree_gets_the_same_boundary() {
+        let (base, _clone, own, _sibling) = clone_with_two_runs("subdir");
+        let pkg = own.join("packages").join("api");
+        std::fs::create_dir_all(&pkg).unwrap();
+        assert_eq!(repo_boundary(&pkg, &[]), repo_boundary(&own, &[]));
+        assert!(repo_boundary(&pkg, &[]).is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
