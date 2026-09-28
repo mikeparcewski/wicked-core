@@ -9375,6 +9375,7 @@ sleep 30
         std::fs::create_dir_all(&clone).unwrap();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
+                .hardened()
                 .args(args)
                 .current_dir(&clone)
                 .env("GIT_AUTHOR_NAME", "t")

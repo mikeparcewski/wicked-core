@@ -42,6 +42,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use wicked_apps_core::HardenedCommand;
 
 /// The repository boundary for one worker spawn, before it is rendered for a launcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +250,7 @@ fn launcher_arms(tool: &Path) -> bool {
         "exit 0".to_string(),
     ]);
     let ok = std::process::Command::new(&argv[0])
+        .hardened()
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -312,6 +314,7 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
+            .hardened()
             .args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "t")
@@ -381,6 +384,44 @@ mod tests {
         std::fs::create_dir_all(&pkg).unwrap();
         assert_eq!(repo_boundary(&pkg, &[]), repo_boundary(&own, &[]));
         assert!(repo_boundary(&pkg, &[]).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The #548 proofs skip where no launcher arms, so a CI leg that silently stopped arming would
+    /// read green. Pin it: wherever the platform launcher itself runs a trivial command, the
+    /// repository boundary must arm for a run worktree.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_boundary_arms_wherever_the_platform_launcher_runs() {
+        let (tool, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            (
+                "sandbox-exec",
+                &["-p", "(version 1)(allow default)", "/usr/bin/true"],
+            )
+        } else {
+            (
+                "bwrap",
+                &["--ro-bind", "/", "/", "--dev", "/dev", "--", "/bin/true"],
+            )
+        };
+        let Some(path) = crate::validator::find_on_path(tool) else {
+            eprintln!("worker_sandbox: {tool} not on PATH — nothing to pin here");
+            return;
+        };
+        let runs = Command::new(path)
+            .hardened()
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !runs {
+            eprintln!("worker_sandbox: {tool} cannot run here — nothing to pin");
+            return;
+        }
+        let (base, _clone, own, _sibling) = clone_with_two_runs("arms");
+        assert!(
+            default_worker_sandbox(&own, &[], "claude").is_some(),
+            "{tool} runs on this host, so the repository boundary must arm"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -466,6 +507,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
             ])
             .collect();
         let out = Command::new(&argv[0])
+            .hardened()
             .args(&argv[1..])
             .current_dir(&own)
             .env("GIT_AUTHOR_NAME", "t")

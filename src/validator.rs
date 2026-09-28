@@ -3496,6 +3496,7 @@ mod tests {
         std::fs::create_dir_all(&clone).unwrap();
         let git = |dir: &Path, args: &[&str]| {
             let out = Command::new("git")
+                .hardened()
                 .args(args)
                 .current_dir(dir)
                 .env("GIT_AUTHOR_NAME", "t")
