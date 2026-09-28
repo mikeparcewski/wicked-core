@@ -9954,19 +9954,25 @@ fn floor_rerun_request(
     })
 }
 
-/// (core#467) The evaluator's edit `unit`'s gate can adopt: the worktree guard denied the unit,
-/// RESTORED the creator's tree and pinned the discarded edit (`suggestion_ref`). Anything else
-/// is refused — there is no pinned tree to apply, or the tree under review is not the creator's.
+/// (core#467) The evaluator's edit `unit`'s gate can adopt: `unit` is an EVALUATOR the worktree
+/// guard denied, and the guard RESTORED the creator's tree and pinned the discarded edit
+/// (`suggestion_ref`). Anything else is refused — a recon rung's discarded note is not a
+/// suggestion, and without a pinned tree there is nothing to apply.
 fn adoptable_suggestion(
     unit: &crate::domain::WorkUnit,
 ) -> anyhow::Result<&crate::worktree_guard::WorktreeMutation> {
+    let guard_denied = unit
+        .denial
+        .as_ref()
+        .is_some_and(|d| d.source == "worktree_guard");
     unit.worktree_mutation
         .as_ref()
         .filter(|m| m.restored && m.suggestion_ref.is_some() && !m.after.tree.is_empty())
+        .filter(|_| guard_denied && unit.role == crate::workflow::PhaseRole::Evaluator)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "unit {} carries no evaluator suggestion to adopt (the worktree guard must have \
-                 restored the creator's tree and pinned the discarded edit) — approve (retry), \
+                "unit {} carries no evaluator suggestion to adopt (an evaluator the worktree guard \
+                 denied, whose edit was discarded, restored and pinned) — approve (retry), \
                  request changes, or reject",
                 unit.ord
             )

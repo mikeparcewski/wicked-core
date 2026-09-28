@@ -1518,8 +1518,17 @@ pub(crate) fn apply_and_finish_unit(
     let rested_note: Option<String> = match (&carried, &evidence.repo_checks) {
         (Some(r), _) => Some(format!(
             "the rework made no change to the tree; this unit's last floor result on this tree \
-             stands ({})",
-            r.outcome()
+             stands ({}){}",
+            r.outcome(),
+            if r.waived.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " — that floor waived {} (the operator's `{}` re-run)",
+                    r.waived.join(", "),
+                    r.rerun.map(|m| m.as_wire()).unwrap_or("floor")
+                )
+            }
         )),
         (None, Some(r)) if !r.waived.is_empty() => Some(format!(
             "the operator's `{}` re-run waived {} for this unit — unverified by the floor, not \
