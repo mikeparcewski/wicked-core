@@ -41,7 +41,7 @@ const FIELDS: [&str; 9] = [
 /// Every §11.2 consumer row that still exists. `survey-repo`, `memories`, `domain-graph-slice`
 /// and `collab` were deleted outright (operator decision, 2026-09-26: nothing launched them), so
 /// they have no preset and no fixture.
-const CONSUMERS: [&str; 15] = [
+const CONSUMERS: [&str; 13] = [
     "feature",
     "bug",
     "migration",
@@ -54,8 +54,6 @@ const CONSUMERS: [&str; 15] = [
     "interactive-chat",
     "interactive-draft",
     "interactive-edit",
-    "interactive-demo",
-    "interactive-demo-reauthor",
     "qe-author-tests",
 ];
 

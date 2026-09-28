@@ -127,12 +127,14 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature` (C2's acceptance), `chat` (M3) and `onboarding` (M4). Every other
+/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4) and `demo` (M9b, which
+/// replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other
 /// consumer's preset is added by its migration seam (§14 M1–M10), which also deletes the def it
 /// replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
         ("chat", chat_preset()),
+        ("demo", demo_preset()),
         ("feature", feature_preset()),
         ("onboarding", onboarding_preset()),
     ]
@@ -211,6 +213,107 @@ fn onboarding_preset() -> Vec<PlanStep> {
         ),
     ]
 }
+
+/// The wicked-garden skill every `demo` step runs: `skills/demo/SKILL.md`, actions plan / record /
+/// review.
+pub const DEMO_SKILL: &str = "wicked-garden-demo";
+
+/// `demo` (M9b, studio#373): the wicked-garden demo skill's three actions as a team plan over the
+/// DEMO ROOT — the one launch-declared write root (`LaunchSpec.extra_write_roots`) the launcher
+/// names in the task. Every deliverable is relative, so it resolves inside that root
+/// (`path_policy::missing_deliverables`) and nothing is written anywhere else.
+///
+/// - `plan` → `produce` (creator), gated `human_confirm`: THE PLAN GATE. The presenter script and
+///   the chapter list are reviewed before anything records; approve moves on, `request_changes`
+///   re-runs `plan` with the note.
+/// - `record` → `produce` (creator): records every chapter as its own segment, stitches the MP4,
+///   then writes the three contact sheets the review reads. The sheets are the recorder's work
+///   product, so an evaluator never has to write (its posture is read-only).
+/// - `review` → `critique` (evaluator), gated `human_confirm`: THE REVIEW GATE. A seat other than
+///   the recorder's (evaluator ≠ creator) judges the sheets and reports one verdict per finding;
+///   `request_changes` rewinds to `record`, which re-records only the named chapter.
+///
+/// The recorder is read-only against the app (the garden recorder refuses every non-GET request
+/// to the target unless the storyline's target is disposable), and synthetic data is labelled.
+fn demo_preset() -> Vec<PlanStep> {
+    let confirm = Some(GateSpec::HumanConfirm {
+        unconditional: false,
+    });
+    let files = |f: &[&str]| Some(f.iter().map(|s| s.to_string()).collect());
+    vec![
+        PlanStep {
+            catalog: "produce".to_string(),
+            id: "plan".to_string(),
+            gate: confirm,
+            skill_ref: Some(DEMO_SKILL.to_string()),
+            instructions: Some(DEMO_PLAN_INSTRUCTIONS.to_string()),
+            required_deliverables: files(&["script.md", "chapters.json", "storyline.mjs"]),
+            ..PlanStep::default()
+        },
+        PlanStep {
+            catalog: "produce".to_string(),
+            id: "record".to_string(),
+            skill_ref: Some(DEMO_SKILL.to_string()),
+            instructions: Some(DEMO_RECORD_INSTRUCTIONS.to_string()),
+            required_deliverables: files(&[
+                "demo-video/demo.mp4",
+                "demo-video/chapters.md",
+                "demo-video/timings.json",
+                "demo-video/segments",
+                "review/chapters.png",
+                "review/joins.png",
+                "review/end.png",
+            ]),
+            depends_on: Some(vec!["plan".to_string()]),
+            ..PlanStep::default()
+        },
+        PlanStep {
+            catalog: "critique".to_string(),
+            id: "review".to_string(),
+            gate: confirm,
+            skill_ref: Some(DEMO_SKILL.to_string()),
+            instructions: Some(DEMO_REVIEW_INSTRUCTIONS.to_string()),
+            depends_on: Some(vec!["record".to_string()]),
+            ..PlanStep::default()
+        },
+    ]
+}
+
+/// The `plan` step's instructions. Every path is relative to the demo root the task names.
+pub const DEMO_PLAN_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `plan` action for \
+the app and audience the task names. Work in the demo root the task names and write exactly: \
+`script.md` (the presenter script from the skill's template: audience, pitch, run of show, case \
+bank, measured vs estimate labelled), `chapters.json` (a JSON array, one object per chapter: \
+{\"key\": \"NN-slug\", \"title\", \"blurb\", \"tags\": [..], \"resets\": [..]}) and \
+`storyline.mjs` (the record action's storyline: `title: \"demo\"`, `baseUrl` = the app URL, one \
+segment per chapter with the same keys). Rehearse against the running app READ-ONLY: navigate, \
+hover, scroll, open panels and type into fields, but never submit, launch, approve, delete, \
+create, cancel or save — show a control without pressing it. Say plainly in the script which \
+data is synthetic and which systems are simulated. Write nothing outside the demo root.";
+
+/// The `record` step's instructions.
+pub const DEMO_RECORD_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `record` action \
+on `storyline.mjs` in the demo root the task names: `wicked-garden run scripts/demo/record.mjs \
+<root>/storyline.mjs --out <root>/demo-video` (inside a crew run the launcher is \
+\"$WICKED_GARDEN_ROOT/scripts/wicked-garden\"). It records every missing segment, then stitches \
+`demo-video/demo.mp4` with chapters. The recorder is read-only against the app: it blocks every \
+non-GET request and fails the segment `side_effect_blocked`; never set DEMO_ALLOW_WRITES. When a \
+note asks to re-record one chapter, delete only `demo-video/segments/<key>/`, fix that segment \
+in the storyline if the note says why, and run record.mjs with that key alone. Then write the \
+review's contact sheets with the skill's contact_sheet.py: `--chapters --out \
+<root>/review/chapters.png`, `--joins --out <root>/review/joins.png` and `--end --out \
+<root>/review/end.png`, each on `demo-video/demo.mp4`. Write nothing outside the demo root.";
+
+/// The `review` step's instructions (an evaluator: it reads and judges, it writes nothing).
+pub const DEMO_REVIEW_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `review` action \
+on the recording in the demo root the task names: look at `review/chapters.png`, \
+`review/joins.png` and `review/end.png`, and ffprobe `demo-video/demo.mp4` for chapters, size \
+and codec. You judge work another seat recorded; change no file. Check every caption against \
+its picture, the joins, the held closing card, and that synthetic data is labelled. Report \
+every finding as `timestamp · chapter · what's wrong · verdict` (verdict: re-encode, \
+re-record, or fix-app), then end with one fenced ```json block: {\"verdict\": \"accept\" or \
+\"changes\", \"findings\": [{\"at\": \"m:ss\", \"chapter\": \"<key>\", \"issue\": \"..\", \
+\"verdict\": \"re-encode|re-record|fix-app\"}]}.";
 
 /// `feature` (§11.2): clarify → `understand` (gate raised to `human_confirm`); design → `design`;
 /// build → `build`; adversarial-review → `review` (gate raised); test → `test`; review →
