@@ -468,6 +468,7 @@ pub(crate) fn evaluate(
         ));
     }
 
+    require_defaults(store)?;
     let mcp_tokens = subject_tokens(&call.server, &call.tool, unit.mode);
     let mut phases: Vec<&str> =
         crate::scope::phase_aliases(&unit.phase, Some(&unit.phase_id), Some(&unit.catalog));
@@ -587,27 +588,66 @@ fn first_use_approved(
     server: &str,
     tool: &str,
 ) -> Result<bool, McpCallError> {
-    use wicked_apps_core::FromNode;
-    let query = wicked_estate_core::SymbolQuery {
-        kinds: vec![wicked_apps_core::NodeKind::Rule],
-        exact_name: Some(FIRST_USE_LEDGER.to_string()),
-        ..Default::default()
-    };
-    let symbol = synthetic_symbol(wicked_governance::CONFORMANCE_RULE, FIRST_USE_LEDGER);
-    let nodes = store
-        .find_symbols(&query)
-        .map_err(|e| McpCallError::GuardError(format!("approvals read failed: {e}")))?;
-    let Some(node) = nodes.iter().find(|n| n.symbol == symbol) else {
+    let Some(rule) = rule_row(store, FIRST_USE_LEDGER)? else {
         return Ok(false);
     };
-    let rule = wicked_governance::ConformanceRule::from_node(node)
-        .map_err(|e| McpCallError::GuardError(format!("approvals ledger unreadable: {e}")))?;
     let server_token = format!("mcp:{server}");
     let tool_token = subject_of(server, tool);
     Ok(rule
         .excludes
         .iter()
         .any(|x| *x == server_token || *x == tool_token))
+}
+
+/// The store's row for rule `id`, active or retired, or `None`.
+fn rule_row(
+    store: &dyn GraphRead,
+    id: &str,
+) -> Result<Option<wicked_governance::ConformanceRule>, McpCallError> {
+    use wicked_apps_core::FromNode;
+    let query = wicked_estate_core::SymbolQuery {
+        kinds: vec![wicked_apps_core::NodeKind::Rule],
+        exact_name: Some(id.to_string()),
+        ..Default::default()
+    };
+    let symbol = synthetic_symbol(wicked_governance::CONFORMANCE_RULE, id);
+    let nodes = store
+        .find_symbols(&query)
+        .map_err(|e| McpCallError::GuardError(format!("rule read failed: {e}")))?;
+    nodes
+        .iter()
+        .find(|n| n.symbol == symbol)
+        .map(|n| {
+            wicked_governance::ConformanceRule::from_node(n)
+                .map_err(|e| McpCallError::GuardError(format!("rule {id} unreadable: {e}")))
+        })
+        .transpose()
+}
+
+/// Refuse to judge a call on a store the `mcp-defaults` pack was never seeded into: without the
+/// posture rules a balanced or ask-mode write would run unasked, so an unseeded store is a guard
+/// error (fail closed), never a quieter posture. A rule the operator retired still counts as
+/// present — retiring is their decision.
+fn require_defaults(store: &dyn GraphRead) -> Result<(), McpCallError> {
+    static IDS: OnceLock<Vec<String>> = OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        mcp_default_rules()
+            .map(|rules| rules.into_iter().map(|r| r.id).collect())
+            .unwrap_or_default()
+    });
+    if ids.is_empty() {
+        return Err(McpCallError::GuardError(
+            "the embedded mcp-defaults pack does not parse".to_string(),
+        ));
+    }
+    for id in ids {
+        if rule_row(store, id)?.is_none() {
+            return Err(McpCallError::GuardError(format!(
+                "the mcp-defaults posture rule {id} is not in the store (seed failed at boot)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A deny verdict and its advisory claim. `obligations` carries `[reason, subject, remedy]`, the
@@ -1101,12 +1141,23 @@ mod tests {
             "codex",
             McpMode::Autonomous,
         );
+        // An unseeded store is refused, never judged by a quieter posture; the engine gates still
+        // deny on it.
         let empty = open_store(Some(":memory:")).unwrap();
-        let (v, _) = evaluate(&empty, &creator, &call("get_issue", read_only()), 1).unwrap();
+        assert!(matches!(
+            evaluate(&empty, &creator, &call("get_issue", read_only()), 1),
+            Err(McpCallError::GuardError(_))
+        ));
+        let evaluator = unit(
+            WritePosture::ReadOnly,
+            PhaseRole::Evaluator,
+            "codex",
+            McpMode::Ask,
+        );
+        let (v, _) = evaluate(&empty, &evaluator, &call("create_issue", None), 1).unwrap();
         assert_eq!(
             (v.decision, v.rule_ids[0].as_str()),
-            ("ask", RULE_FIRST_USE),
-            "no ledger: {v:?}"
+            ("deny", RULE_PHASE_ROLE)
         );
         let mut store = seeded_store();
         let mut ledger = mcp_default_rules()
@@ -1555,6 +1606,47 @@ mod tests {
             0,
             "an ungoverned worker gets no MCP env"
         );
+    }
+
+    /// The binding's wire shape is camelCase both ways (the broker is JS): `classOverride` is
+    /// read, an unknown key is refused, and the verdict names `ruleIds` / `claimId` / `unit.runId`.
+    #[test]
+    fn the_wire_shape_is_camel_case_both_ways() {
+        let c: McpCall = serde_json::from_value(serde_json::json!({
+            "server": "jira", "tool": "t", "registered": true,
+            "annotations": {"readOnlyHint": true}, "classOverride": "destructive"
+        }))
+        .unwrap();
+        assert_eq!(
+            classify(c.annotations.as_ref(), c.class_override),
+            McpClass::Destructive
+        );
+        assert!(serde_json::from_value::<McpCall>(serde_json::json!({
+            "server": "jira", "tool": "t", "registered": true, "class_override": "read"
+        }))
+        .is_err());
+        let store = seeded_store();
+        let u = unit(
+            WritePosture::Full,
+            PhaseRole::Creator,
+            "claude",
+            McpMode::Autonomous,
+        );
+        let (v, _) = evaluate(&store, &u, &c, 1).unwrap();
+        let wire = serde_json::to_value(&v).unwrap();
+        for key in [
+            "decision",
+            "subject",
+            "class",
+            "ruleIds",
+            "obligations",
+            "claimId",
+            "unit",
+        ] {
+            assert!(wire.get(key).is_some(), "{key}: {wire}");
+        }
+        assert_eq!(wire["unit"]["runId"], "mcp-test");
+        assert_eq!(wire["class"], "destructive");
     }
 
     #[test]

@@ -837,9 +837,10 @@ pub(crate) fn run(
     }
 
     // Seed the MCP posture rules (DES-MCP-TOOLS-001 §4.3, the `mcp-defaults` pack) INSERT-ONLY, so
-    // a restart never undoes an approval or resurrects a retired rule. Best-effort like the floor
-    // above: a store that cannot hold them leaves MCP calls judged by the engine gates alone
-    // (unregistered and read-only-unit writes still denied) and says so once, here.
+    // a restart never undoes an approval or resurrects a retired rule. A store that cannot hold them
+    // fails CLOSED at the call, not here: `mcp_gate::evaluate` refuses every call it would judge by
+    // policy (`guard_error`) while the engine gates still deny, so the engine comes up either way
+    // and says why once, here.
     if let Err(e) = crate::mcp_gate::seed_mcp_defaults(&mut store) {
         eprintln!("wicked-core: could not seed the MCP posture rules ({e})");
     }
