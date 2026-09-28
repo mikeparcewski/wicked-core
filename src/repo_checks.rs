@@ -1460,7 +1460,9 @@ pub const DERIVED_TARGETED_SOURCE: &str =
 /// touched files, or `None` to keep the full set:
 /// * cargo — `cargo test … -p <crate>` for each package owning a touched file (the nearest
 ///   `Cargo.toml` with a `[package]` name); a touched `Cargo.lock`, `.cargo/…`, `rust-toolchain*`
-///   or workspace-only manifest can affect every crate ⇒ full;
+///   or a path no package owns (a workspace manifest, a shared file, docs beside a virtual
+///   workspace) can affect every crate ⇒ full. The narrowing stops at the owning crates — their
+///   dependents are the verify floor's full suite to test;
 /// * any deleted (or renamed-away) tracked file ⇒ full: what it left behind cannot be mapped;
 /// * vitest — a `test` script that is exactly `vitest` / `vitest run` ⇒ `vitest related --run
 ///   --passWithNoTests <files>` (the touched test files and the tests importing touched modules);
@@ -1493,14 +1495,15 @@ fn derive_targeted(
                 {
                     return Ok(None);
                 }
+                // A path no package owns (a workspace manifest, a shared `include!`d file, docs
+                // beside a virtual workspace) can reach any crate: never narrow past it.
                 match cargo_package_of(worktree, f)? {
-                    PackageOf::Package(p) => {
+                    Some(p) => {
                         if !crates.contains(&p) {
                             crates.push(p);
                         }
                     }
-                    PackageOf::WorkspaceManifest => return Ok(None),
-                    PackageOf::None => {}
+                    None => return Ok(None),
                 }
             }
             if crates.is_empty() {
@@ -1551,19 +1554,10 @@ fn derive_targeted(
     }))
 }
 
-/// Which cargo package a touched path belongs to.
-enum PackageOf {
-    Package(String),
-    /// The path IS a manifest that declares no package (a virtual workspace root) — it can change
-    /// every member.
-    WorkspaceManifest,
-    /// No manifest above it declares a package (docs beside a virtual workspace).
-    None,
-}
-
 /// The package owning `rel`: the nearest `Cargo.toml` at or above its directory, read without
-/// following links; a manifest with no `[package]` name ends the walk.
-fn cargo_package_of(worktree: &Path, rel: &str) -> Result<PackageOf, String> {
+/// following links; `None` when that manifest declares no `[package]` (a virtual workspace root)
+/// or there is none.
+fn cargo_package_of(worktree: &Path, rel: &str) -> Result<Option<String>, String> {
     let mut dir: Option<&str> = Some(rel.rsplit_once('/').map(|(d, _)| d).unwrap_or(""));
     while let Some(d) = dir {
         let manifest = if d.is_empty() {
@@ -1579,11 +1573,7 @@ fn cargo_package_of(worktree: &Path, rel: &str) -> Result<PackageOf, String> {
             let mut raw = String::new();
             file.read_to_string(&mut raw)
                 .map_err(|e| format!("`{manifest}` could not be read: {e}"))?;
-            return Ok(match cargo_package_name(&raw) {
-                Some(p) => PackageOf::Package(p),
-                None if manifest == rel => PackageOf::WorkspaceManifest,
-                None => PackageOf::None,
-            });
+            return Ok(cargo_package_name(&raw));
         }
         dir = if d.is_empty() {
             None
@@ -1591,7 +1581,7 @@ fn cargo_package_of(worktree: &Path, rel: &str) -> Result<PackageOf, String> {
             Some(d.rsplit_once('/').map(|(p, _)| p).unwrap_or(""))
         };
     }
-    Ok(PackageOf::None)
+    Ok(None)
 }
 
 /// `[package] name = "…"` off a manifest — a line scan, enough for the one key; a name that is not
@@ -5878,8 +5868,10 @@ mod tests {
             &repo,
             &["checkout", "-q", "--", "a/src/lib.rs", "b/src/lib.rs"],
         );
-        // Docs beside a virtual workspace touch no crate ⇒ full (nothing to narrow to).
+        // A path no package owns beside a crate change (a shared file any crate may
+        // `include!`) ⇒ full.
         std::fs::write(repo.join("README.md"), "y\n").unwrap();
+        std::fs::write(repo.join("b/src/lib.rs"), "pub fn x() {}\n").unwrap();
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
         assert_eq!(t.name, "cargo-test");
         // A configured test command is the repo's own choice — never overridden.
