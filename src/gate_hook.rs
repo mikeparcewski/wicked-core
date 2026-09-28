@@ -2476,28 +2476,22 @@ pub(crate) fn evaluate_tool_call(
     // below. This proves the hook BINARY was invoked for this phase (not just that the launcher
     // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
     // lines means the hook was bypassed (hook process suppressed while tool calls still ran) → DENY.
-    {
-        let sentinel_line = serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
-        let sentinel_path = Path::new(&decisions_path);
-        // In a launcher-managed run the dir already exists (write_armed_marker ran first); in a
-        // standalone / test invocation it may not. Create it here so the sentinel write never fails
-        // with a spurious DENY on a missing parent directory.
-        if let Some(parent) = sentinel_path.parent() {
-            if let Err(e) = create_dir_all_private(parent) {
-                eprintln!("wicked-governance: DENY (could not create governance dir: {e})");
-                return 2;
-            }
-        }
-        if let Err(e) = with_append_lock(sentinel_path, || {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(decisions_path)?;
-            f.write_all(sentinel_line.as_bytes())
-        }) {
-            eprintln!("wicked-governance: DENY (could not write hook-fired sentinel: {e})");
-            return 2;
-        }
+    if let Err(why) = write_hook_fired_sentinel(decisions_path, phase) {
+        eprintln!("wicked-governance: DENY ({why})");
+        return 2;
+    }
+
+    // MCP FENCE (core#657, F-11) — before everything else that needs no store: a governed worker
+    // loads no MCP server (wrapped claude runs `--strict-mcp-config`), so an `mcp__<server>__<tool>`
+    // call that reaches the hook anyway is from a server nobody registered. Refused on every
+    // posture — MCP calls count as writes, and none is registered read-only — and recorded as an
+    // ADVISORY claim naming the tool: the call never ran, the seat continues without it. Before
+    // this, with no MCP-aware policy, `decide` allowed it even for a read-only evaluator.
+    if crate::mcp_isolation::has_mcp_prefix(tool) {
+        let reason = crate::mcp_isolation::denial_reason(tool);
+        append_mcp_deny(decisions_path, scope, phase, tool, &reason);
+        eprintln!("wicked-governance: DENY ({reason})");
+        return 2;
     }
 
     // Read-only use of the store: select reads policies, decide is pure. NO store write here.
@@ -3248,6 +3242,12 @@ pub(crate) const REMOTE_WRITE_DENY_PREFIX: &str = "remote-write-deny:";
 /// [`append_remote_write_deny`] instead of the boundary recorder.
 pub(crate) const REMOTE_WRITE_REASON_PREFIX: &str = "remote-write fence:";
 
+/// (core#657, F-11) Claim-id prefix of an MCP refusal: a tool call to an MCP server
+/// (`mcp_isolation::is_mcp_call`) on a governed unit. No MCP server is registered for workers, so
+/// every such call is refused on every posture. ADVISORY by the allowlist ([`is_advisory_deny`]):
+/// the call never ran and the seat continues without the tool.
+pub(crate) const MCP_DENY_PREFIX: &str = "mcp-deny:";
+
 /// (issue #463) Claim-id prefix of the ADVISORY arm of an ESTATE-DENY refusal — a Bash invocation
 /// the estate fence ([`classify_estate_command`]) caught on a unit whose posture fences writes
 /// (recon / pre-build): a `wicked-estate` write subcommand, or the shim / MCP without `--readonly`
@@ -3269,6 +3269,67 @@ pub(crate) const ESTATE_DENY_REMEDY: &str =
      `wicked-estate-mcp` with `--readonly` AND a pinned store (`--db <path>`, or \
      WICKED_ESTATE_DB / WICKED_HOME / WICKED_MEMORY_DB in the worker environment); indexing and \
      every other graph write belong to repo onboarding, never to a governed unit";
+
+/// Append the hook-fired liveness sentinel for `phase` (see `evaluate_tool_call`): the proof the
+/// gate RAN for this phase, which `fold_input_denial` requires beside any claim. Creates the
+/// governance dir when absent (a standalone / test invocation). `Err` names what failed; the
+/// caller denies.
+fn write_hook_fired_sentinel(decisions_path: &str, phase: &str) -> Result<(), String> {
+    let sentinel_line = serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
+    let sentinel_path = Path::new(&decisions_path);
+    // In a launcher-managed run the dir already exists (write_armed_marker ran first); in a
+    // standalone / test invocation it may not. Create it here so the sentinel write never fails
+    // with a spurious DENY on a missing parent directory.
+    if let Some(parent) = sentinel_path.parent() {
+        create_dir_all_private(parent)
+            .map_err(|e| format!("could not create governance dir: {e}"))?;
+    }
+    with_append_lock(sentinel_path, || {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(decisions_path)?;
+        f.write_all(sentinel_line.as_bytes())
+    })
+    .map_err(|e| format!("could not write hook-fired sentinel: {e}"))
+}
+
+/// (core#657) Record an MCP refusal the in-process ACP permission bridge made BEFORE reaching
+/// [`evaluate_tool_call`]: the hook-fired sentinel for `phase` first (a claim without it reads as
+/// a suppressed gate to the fold), then the advisory [`append_mcp_deny`] claim. Best-effort like
+/// the other recorders: the call is refused either way.
+pub(crate) fn record_mcp_denial(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+) {
+    if let Err(why) = write_hook_fired_sentinel(decisions_path, phase) {
+        eprintln!("wicked-governance: mcp refusal not fully recorded ({why})");
+    }
+    append_mcp_deny(decisions_path, scope, phase, tool, reason);
+}
+
+/// Record an MCP refusal (core#657) under [`MCP_DENY_PREFIX`] — advisory by the allowlist,
+/// `obligations[0]` the reason, `obligations[1]` the MCP TOOL — annotated with the tool name so
+/// the record never reads `(unknown)`.
+fn append_mcp_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str, reason: &str) {
+    let claim = ConformanceClaim {
+        // Keyed on `phase` only, for the same reason `append_infra_deny` is.
+        claim_id: format!("{MCP_DENY_PREFIX}{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec![],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string(), tool.to_string()],
+        evaluated_context_ref: "sha256:mcp-fence".to_string(),
+        criteria: format!("mcp fence (advisory: blocked, worker continues): {reason}"),
+        evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    append_annotated_claim(decisions_path, phase, tool, &claim);
+}
 
 /// Record a remote-write refusal: `obligations[0]` is the reason (with the remedy), `obligations[1]`
 /// the OFFENDING COMMAND, so the fold can name what the seat tried without re-parsing prose.
@@ -3428,7 +3489,9 @@ fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
     (claim.evaluator_identity == BOUNDARY_EVALUATOR
         && (claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX)
             || claim.claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX)
-            || claim.claim_id.starts_with(ESTATE_DENY_PREFIX)))
+            || claim.claim_id.starts_with(ESTATE_DENY_PREFIX)
+            // core#657: a refused MCP call never ran; the seat continues without the tool.
+            || claim.claim_id.starts_with(MCP_DENY_PREFIX)))
         || (claim.evaluator_identity == PHASE_SCOPE_EVALUATOR
             && claim.claim_id.starts_with(PHASE_SCOPE_DENY_PREFIX))
 }
@@ -5620,6 +5683,95 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#657 (F-11), the wrapped carrier: the `PreToolUse` hook (matcher `*`) sees an MCP call
+    /// as `tool_name: "mcp__<server>__<tool>"` (evidence e1). It is REFUSED on every posture — a
+    /// read-only evaluator and a code-writing creator alike, with no policy in the store (the gap:
+    /// `decide` allowed it) — and recorded as an ADVISORY `mcp-deny:` claim naming the tool, so the
+    /// seat continues without it. A normal tool on the same unit is still allowed.
+    #[test]
+    fn an_mcp_call_is_refused_by_the_gate_hook_on_every_posture_and_recorded_advisory() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-mcp-hook-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let policy_db = base.join("policy.db");
+        drop(open_store(Some(&policy_db.to_string_lossy())).unwrap());
+        let policy_db = policy_db.to_string_lossy().into_owned();
+        for posture in [WritePosture::ReadOnly, WritePosture::Full] {
+            let run_id = format!("mcp-hook-{}-{tid}-{}", std::process::id(), posture.label());
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+            let dpath = decisions_path_for(&run_id, 0)
+                .to_string_lossy()
+                .into_owned();
+            let boundary = BoundaryCtx {
+                roots: AllowedRoots {
+                    write: vec![wt.clone()],
+                    read: vec![],
+                },
+                cwd: wt.clone(),
+                home: None,
+                claude_config_dir: None,
+                pre_build_scope: false,
+                write_posture: posture,
+                deliverable_roots: vec![],
+                estate_store_pinned: false,
+                graph_write_dir: None,
+            };
+            let call = |tool: &str, input: serde_json::Value| {
+                evaluate_tool_call(
+                    "wicked-agent/mcp-hook/shared",
+                    "unit-2",
+                    None,
+                    None,
+                    Some(&policy_db),
+                    &dpath,
+                    &input,
+                    tool,
+                    Some(&boundary),
+                )
+            };
+            assert_eq!(
+                call("mcp__wt__wt_note", serde_json::json!({"text": "x"})),
+                2,
+                "{posture:?}: an MCP call is refused"
+            );
+            assert_eq!(
+                call("mcp__claude_ai_Linear__search", serde_json::json!({})),
+                2,
+                "{posture:?}: a claude.ai connector call is refused"
+            );
+            let src = wt.join("lib.rs").to_string_lossy().into_owned();
+            assert_eq!(
+                call("Read", serde_json::json!({"file_path": src, "path": src})),
+                0,
+                "{posture:?}: a normal read is unaffected"
+            );
+            let log = std::fs::read_to_string(&dpath).unwrap();
+            let claims: Vec<ConformanceClaim> = log
+                .lines()
+                .filter_map(|l| serde_json::from_str::<ConformanceClaim>(l).ok())
+                .filter(|c| c.claim_id.starts_with(MCP_DENY_PREFIX))
+                .collect();
+            assert_eq!(claims.len(), 2, "{posture:?}: one claim per refusal: {log}");
+            assert!(claims.iter().all(is_advisory_deny), "advisory: {log}");
+            assert!(
+                claims[0].obligations[0].contains("mcp__wt__wt_note")
+                    && claims[0].obligations[0].contains("mcp fence"),
+                "{log}"
+            );
+            assert!(
+                log.contains(r#""_wicked_tool_call":"mcp__wt__wt_note""#),
+                "{log}"
+            );
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
