@@ -64,10 +64,19 @@
 //! the two runs' failure identifiers (streamed
 //! off the runner's output — `test x ... FAILED`, ` FAIL  file > name`, `path(l,c): error TS…`,
 //! `FAILED tests/x.py::y`, `--- FAIL: TestX`, eslint stylish): failures that also fail on the base
-//! are `pre_existing_in_sandbox` and never deny; identical base and head failure sets are a
-//! `floor_env_mismatch` (the floor's environment, not the change, is the likely cause — recorded
-//! with the floor's env so a CI mismatch is visible; the sandbox itself is NOT widened here); only
-//! head-only failures are `regression`s and deny. A base that cannot be run or compared leaves the
+//! — a subset or the identical set — are `pre_existing_in_sandbox` and never deny; only head-only
+//! failures are `regression`s and deny. libtest ids are QUALIFIED by their test binary
+//! (`test t::x [-p b --lib]`, from cargo's per-binary `to rerun pass` line — core#481), so the
+//! same test name red in crate A on the base cannot mask a regression in crate B; the
+//! auto-detected `cargo test` runs `--no-fail-fast` for the same reason. Positive evidence of the
+//! environment is its own class (core#546): failures whose captured output carries a
+//! nested-sandbox launcher signature on both trees are `env_cannot_run` (never deny; the count is
+//! on the gate's `floorNote` — external CI is the test gate for them), and a head-only failure
+//! with the signature still denies with an advisory naming the likely cause. A head-only set of
+//! at most [`MAX_FLAKE_RERUN`] libtest ids, read on an oversubscribed host (1-min load above the
+//! CPU count — the evidence it was load), is re-run ONCE, each alone (core#553): if every one
+//! passes it is `flaky_under_load` (never denies; both attempts and the load at each are on the
+//! record), else a `regression`. A base that cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
 //! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
 //! ([`ClaimCheck`]: `claim_rejected` when the base is green).
@@ -86,6 +95,10 @@
 //! substituting `{files}` (the paths the change touched relative to the base commit, one argv
 //! element each) and `{base}` (the base commit id) so a runner's own change-aware mode can be used
 //! (`vitest run --changed {base}`, `jest --changedSince {base}`, `cargo test -p <crate>`).
+//! A repo that configures NO test command gets one derived from the touched files at the
+//! creator floor (core#482, [`derive_targeted`]): `cargo test -p <owning crates>`, or
+//! `vitest related --run <files>` for a plain `vitest` test script; the verify floor keeps the
+//! full suite, so an unconfigured repo pays for one full run per governed run, not three.
 //!
 //! ## Load-aware bound
 //!
@@ -190,12 +203,28 @@ pub const CONFIG_PATH: &str = ".wicked/checks.json";
 /// Check classifications on the wire (`CheckRun::classification`).
 /// The head failure is absent on the base: the change broke it — denies.
 pub const REGRESSION: &str = "regression";
-/// Every head failure also fails on the base (and the base fails more): not this change's doing —
-/// never denies.
+/// Every head failure also fails on the base (a subset, or the identical set): not this change's
+/// doing — never denies. A FACT: the floor saw the base fail the same ids.
 pub const PRE_EXISTING_IN_SANDBOX: &str = "pre_existing_in_sandbox";
-/// Base and head fail IDENTICALLY in the floor's sandbox: the floor's environment, not the
-/// change, is the likely cause — never denies; recorded with the floor's env.
+/// Retired (core#481): equal base and head failure sets used to be called a floor-environment
+/// mismatch, an inference the comparison cannot establish (any genuinely red base yields the same
+/// signal). The floor no longer produces it — equal sets are [`PRE_EXISTING_IN_SANDBOX`] and the
+/// positive-evidence environment case is [`ENV_CANNOT_RUN`]. Kept so a stored record still reads
+/// as non-denying.
 pub const FLOOR_ENV_MISMATCH: &str = "floor_env_mismatch";
+/// (core#546) Every head failure is a test the floor's host CANNOT run — its captured output
+/// carries a nested-sandbox launcher signature ([`LAUNCHER_SIGNATURES`]) on BOTH trees. Positive
+/// evidence of the environment, never denies, and the count is on the card: external CI is the
+/// test gate for those ids.
+pub const ENV_CANNOT_RUN: &str = "env_cannot_run";
+/// (core#553) Every head-only failure (at most [`MAX_FLAKE_RERUN`]) of a floor that ran on an
+/// OVERSUBSCRIBED host (1-min load above the CPU count) PASSED when re-run once, alone, in the
+/// same worktree: a host-load flake, not a regression — never denies, named on the gate's
+/// `floorNote`; both attempts (and the load at each) are on the record (`reruns`).
+pub const FLAKY_UNDER_LOAD: &str = "flaky_under_load";
+/// The largest head-only failure set the floor re-runs in isolation before calling it a
+/// regression (core#553). Larger sets are regressions as before.
+pub const MAX_FLAKE_RERUN: usize = 2;
 /// Both base and head fail with NO parseable failure identifiers (unknown runner output format,
 /// e.g. node:test without a TAP-aware parser). Cannot determine if pre-existing or a regression —
 /// fail-closed: always denies (#538).
@@ -359,6 +388,13 @@ pub struct CheckRun {
     /// The same check run on the run base, when the floor ran it (see [`BaseRun`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<Box<BaseRun>>,
+    /// (core#546) Failing ids whose captured output carries a nested-sandbox launcher signature —
+    /// tests this host cannot run under the floor, whatever the change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_cannot_run: Vec<String>,
+    /// (core#553) The isolated re-runs of a small head-only failure set, one per id, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reruns: Vec<CheckRun>,
 }
 
 impl CheckRun {
@@ -380,14 +416,18 @@ impl CheckRun {
         }
     }
 
-    /// Does this check deny the unit? A failure the base shares (`pre_existing_in_sandbox`) or
-    /// that the floor's environment produced on both trees (`floor_env_mismatch`) does NOT; a
-    /// regression, a timeout, a spawn failure and an un-compared failure do.
+    /// Does this check deny the unit? A failure the base shares (`pre_existing_in_sandbox`), a
+    /// test the host cannot run on either tree (`env_cannot_run`) and a head-only failure that
+    /// passed its isolated re-run (`flaky_under_load`) do NOT (nor a stored `floor_env_mismatch`);
+    /// a regression, a timeout, a spawn failure and an un-compared failure do.
     pub fn denies(&self) -> bool {
         !self.passed()
             && !matches!(
                 self.classification.as_deref(),
-                Some(PRE_EXISTING_IN_SANDBOX) | Some(FLOOR_ENV_MISMATCH)
+                Some(PRE_EXISTING_IN_SANDBOX)
+                    | Some(FLOOR_ENV_MISMATCH)
+                    | Some(ENV_CANNOT_RUN)
+                    | Some(FLAKY_UNDER_LOAD)
             )
     }
 
@@ -409,6 +449,15 @@ impl CheckRun {
             );
         }
         let cls = match self.classification.as_deref() {
+            Some(ENV_CANNOT_RUN) if !self.passed() => format!(
+                " [env_cannot_run: {} tests cannot run under the floor's nested sandbox on this \
+                 host]",
+                self.env_cannot_run.len()
+            ),
+            Some(FLAKY_UNDER_LOAD) if !self.passed() => format!(
+                " [flaky_under_load: {} passed re-run alone]",
+                self.regressions.join(", ")
+            ),
             Some(c) if !self.passed() => format!(" [{c}]"),
             _ => String::new(),
         };
@@ -558,9 +607,72 @@ impl RepoChecksReport {
     /// Any check whose base and head failures were identical — the floor's environment is the
     /// likely cause (F-RC2-009). Surfaced so the studio can show the recorded env beside it.
     pub fn env_mismatch(&self) -> bool {
-        self.checks
-            .iter()
-            .any(|c| c.classification.as_deref() == Some(FLOOR_ENV_MISMATCH))
+        self.checks.iter().any(|c| {
+            matches!(
+                c.classification.as_deref(),
+                Some(FLOOR_ENV_MISMATCH) | Some(ENV_CANNOT_RUN)
+            )
+        })
+    }
+
+    /// (core#546) What the floor could not test on this host, for the gate's `floorNote`: the
+    /// failing ids that carry a nested-sandbox launcher signature. A NON-denying set ("the floor
+    /// could not run N tests; external CI is the test gate for them"), and — the advisory — a
+    /// head-only failure with the same signature, which still denies (fail-closed) but names the
+    /// likely cause so a `request_changes` can too; plus (core#553) each `flaky_under_load` check,
+    /// named. `None` when there is nothing of either kind to say.
+    pub fn classification_note(&self) -> Option<String> {
+        let mut notes: Vec<String> = Vec::new();
+        for c in &self.checks {
+            if c.env_cannot_run.is_empty() {
+                continue;
+            }
+            let head_only: Vec<&String> = c
+                .env_cannot_run
+                .iter()
+                .filter(|id| c.regressions.contains(id))
+                .collect();
+            let shared = c.env_cannot_run.len() - head_only.len();
+            if head_only.is_empty() || !c.denies() {
+                notes.push(format!(
+                    "`{}`: the floor could not run {} test{} on this host (the nested OS sandbox \
+                     refused to arm inside the floor's own); external CI is the test gate for \
+                     them",
+                    c.name,
+                    c.env_cannot_run.len(),
+                    if c.env_cannot_run.len() == 1 { "" } else { "s" }
+                ));
+            } else {
+                notes.push(format!(
+                    "`{}`: head-only failure{} {} carr{} the nested-sandbox launcher signature — \
+                     the same env class as {shared} pre-existing id{}; likely the floor's nested \
+                     sandbox, not the change (still denied, fail-closed)",
+                    c.name,
+                    if head_only.len() == 1 { "" } else { "s" },
+                    head_only
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if head_only.len() == 1 { "ies" } else { "y" },
+                    if shared == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        // (core#553) A failure that passed alone is not a denial, but it is not silent either: an
+        // order-dependent failure the change introduced reads the same way.
+        for c in &self.checks {
+            if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) {
+                notes.push(format!(
+                    "`{}`: {} failed in the full run on an oversubscribed host and passed \
+                     re-run alone — classed flaky_under_load (host load), not denied; an \
+                     order-dependent failure reads the same way",
+                    c.name,
+                    c.regressions.join(", ")
+                ));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// The operator-facing denial when `!passed`.
@@ -1065,6 +1177,28 @@ fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
     Ok(files)
 }
 
+/// Did the change delete a tracked file relative to the base — renames counted as a deletion of
+/// the old path (`--no-renames`)? A derived targeted set cannot see what a missing file broke.
+fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
+    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
+        return Ok(false);
+    };
+    let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+    let deleted = crate::worktree_guard::git_string(
+        worktree,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=D",
+            base,
+        ],
+        &env,
+    )
+    .map_err(|e| format!("the change's deleted files could not be listed: {e}"))?;
+    Ok(deleted.lines().any(|l| !l.trim().is_empty()))
+}
+
 /// Substitute `{files}` / `{base}` into a targeted command: a standalone `{files}` element expands
 /// to one element per touched path; embedded, the placeholders are replaced in place.
 fn substitute_placeholders(
@@ -1140,6 +1274,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let mut test: Option<RepoCheck> = None;
     let mut cargo_fmt: Option<RepoCheck> = None;
     let mut cargo: Option<RepoCheck> = None;
+    let mut node_test_script: Option<(&'static str, String)> = None;
     if let Some(probed) = probe(worktree, "package.json")? {
         let is_file = probed.is_file();
         let Some(mut file) = probed.file.filter(|_| is_file) else {
@@ -1157,6 +1292,10 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             Some(_) => return Err("`package.json` `scripts` is not an object".to_string()),
         };
         let pm = package_manager(worktree)?;
+        node_test_script = scripts
+            .and_then(|m| m.get("test"))
+            .and_then(|v| v.as_str())
+            .map(|v| (pm, v.trim().to_string()));
         let wanted: Vec<&str> = ["typecheck", "lint", "test"]
             .into_iter()
             .filter(|k| scripts.is_some_and(|m| m.get(*k).and_then(|v| v.as_str()).is_some()))
@@ -1241,12 +1380,15 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             source: "Cargo.toml".into(),
             timeout_s: None,
         });
+        // `--no-fail-fast` (core#481): cargo otherwise stops at the first failing test binary, so
+        // a crate whose red test the base shares would hide every later crate from the baseline
+        // diff — on both trees, which then compare equal.
         cargo = Some(RepoCheck {
             name: "cargo-test".into(),
             argv: if has_lock {
-                s(&["cargo", "test", "--locked"])
+                s(&["cargo", "test", "--locked", "--no-fail-fast"])
             } else {
-                s(&["cargo", "test"])
+                s(&["cargo", "test", "--no-fail-fast"])
             },
             source: "Cargo.toml".into(),
             timeout_s: None,
@@ -1258,7 +1400,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     apply(&mut cargo_fmt, r_formatter, "formatter");
     // A configured `test` replaces EVERY auto-detected test check (`test` and `cargo-test`);
     // `false` removes them.
-    match r_test {
+    match &r_test {
         Resolved::Default => {}
         Resolved::Disabled => {
             test = None;
@@ -1267,7 +1409,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
         Resolved::Command(argv) => {
             test = Some(RepoCheck {
                 name: "test".into(),
-                argv,
+                argv: argv.clone(),
                 source: format!("{CONFIG_PATH} test"),
                 timeout_s: None,
             });
@@ -1277,7 +1419,8 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     // TARGETED FIRST (core#469): the declared change-scoped command stands in for the full test
     // set at the creator stage always, and at verify unless the repo says `full: true`. A command
     // anchored on `{files}` / `{base}` needs a known base; without one the full set runs.
-    if let Resolved::Command(argv) = r_targeted {
+    if let Resolved::Command(argv) = &r_targeted {
+        let argv = argv.clone();
         let full_here = ctx.stage == FloorStage::Verify && cfg.full;
         let anchored = argv
             .iter()
@@ -1291,6 +1434,20 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                 source: format!("{CONFIG_PATH} test_targeted"),
                 timeout_s: None,
             });
+            cargo = None;
+        }
+    }
+    // DERIVED TARGETED (core#482): a repo that declares no test commands of its own gets a
+    // change-scoped set derived from the touched files at the CREATOR stage — the verify floor
+    // keeps the full suite, so an unconfigured repo pays for one full run, not three.
+    if ctx.stage == FloorStage::Creator
+        && matches!(r_targeted, Resolved::Default)
+        && matches!(r_test, Resolved::Default)
+        && ctx.base_head.is_some()
+        && ctx.git_dir.is_some()
+    {
+        if let Some(derived) = derive_targeted(worktree, ctx, &test, &cargo, &node_test_script)? {
+            test = Some(derived);
             cargo = None;
         }
     }
@@ -1308,6 +1465,173 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
         }
     }
     Ok(out)
+}
+
+/// The derived source string on a [`derive_targeted`] check.
+pub const DERIVED_TARGETED_SOURCE: &str =
+    "derived from the touched files (no `.wicked/checks.json` \
+                                           test commands; core#482)";
+
+/// (core#482) The change-scoped test command for a repo that configures none, derived from the
+/// touched files, or `None` to keep the full set:
+/// * cargo — `cargo test … -p <crate>` for each package owning a touched file (the nearest
+///   `Cargo.toml` with a `[package]` name); a touched `Cargo.lock`, `.cargo/…`, `rust-toolchain*`
+///   or a path no package owns (a workspace manifest, a shared file, docs beside a virtual
+///   workspace) can affect every crate ⇒ full. The narrowing stops at the owning crates — their
+///   dependents are the verify floor's full suite to test;
+/// * any deleted (or renamed-away) tracked file ⇒ full: what it left behind cannot be mapped;
+/// * vitest — a `test` script that is exactly `vitest` / `vitest run` ⇒ `vitest related --run
+///   --passWithNoTests <files>` (the touched test files and the tests importing touched modules);
+///   a touched manifest, lockfile, vite/vitest/ts config or test setup file ⇒ full.
+///
+/// Only when exactly ONE auto-detected test set exists (a mixed Node + cargo repo keeps both
+/// full), and never with no touched file.
+fn derive_targeted(
+    worktree: &Path,
+    ctx: &FloorContext,
+    test: &Option<RepoCheck>,
+    cargo: &Option<RepoCheck>,
+    node_test_script: &Option<(&'static str, String)>,
+) -> Result<Option<RepoCheck>, String> {
+    let files = touched_files(worktree, ctx)?;
+    if files.is_empty() || deletes_a_file(worktree, ctx)? {
+        // A deleted (or renamed-away) path is not in `files`, and the crate or test it left can
+        // break without being named — never narrow past it.
+        return Ok(None);
+    }
+    let base_name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
+    let argv = match (test, cargo) {
+        (None, Some(c)) => {
+            let mut crates: Vec<String> = Vec::new();
+            for f in &files {
+                let name = base_name(f);
+                if name == "Cargo.lock"
+                    || f.starts_with(".cargo/")
+                    || name.starts_with("rust-toolchain")
+                {
+                    return Ok(None);
+                }
+                // A path no package owns (a workspace manifest, a shared `include!`d file, docs
+                // beside a virtual workspace) can reach any crate: never narrow past it.
+                match cargo_package_of(worktree, f)? {
+                    Some(p) => {
+                        if !crates.contains(&p) {
+                            crates.push(p);
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            }
+            if crates.is_empty() {
+                return Ok(None);
+            }
+            let mut argv = c.argv.clone();
+            for p in crates {
+                argv.push("-p".into());
+                argv.push(p);
+            }
+            argv
+        }
+        (Some(_), None) => {
+            let Some((pm, script)) = node_test_script else {
+                return Ok(None);
+            };
+            if script != "vitest" && script != "vitest run" {
+                return Ok(None);
+            }
+            let wide = |f: &str| {
+                let n = base_name(f);
+                matches!(
+                    n.as_str(),
+                    "package.json" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock"
+                ) || n.starts_with("vitest.config")
+                    || n.starts_with("vite.config")
+                    || n.starts_with("tsconfig")
+                    // A setup file (`tests/setup.ts`) is loaded by the config, never imported, so
+                    // `related` cannot see what it reaches.
+                    || n.to_ascii_lowercase().contains("setup")
+            };
+            if files.iter().any(|f| wide(f)) {
+                return Ok(None);
+            }
+            let mut argv = match *pm {
+                "pnpm" => s(&["pnpm", "exec", "vitest"]),
+                "yarn" => s(&["yarn", "vitest"]),
+                _ => s(&["npx", "--no-install", "vitest"]),
+            };
+            argv.extend(s(&["related", "--run", "--passWithNoTests"]));
+            argv.extend(files);
+            argv
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(RepoCheck {
+        name: "test_targeted".into(),
+        argv,
+        source: DERIVED_TARGETED_SOURCE.into(),
+        timeout_s: None,
+    }))
+}
+
+/// The package owning `rel`: the nearest `Cargo.toml` at or above its directory, read without
+/// following links; `None` when that manifest declares no `[package]` (a virtual workspace root)
+/// or there is none.
+fn cargo_package_of(worktree: &Path, rel: &str) -> Result<Option<String>, String> {
+    let mut dir: Option<&str> = Some(rel.rsplit_once('/').map(|(d, _)| d).unwrap_or(""));
+    while let Some(d) = dir {
+        let manifest = if d.is_empty() {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{d}/Cargo.toml")
+        };
+        if let Some(probed) = probe(worktree, &manifest)? {
+            let is_file = probed.is_file();
+            let Some(mut file) = probed.file.filter(|_| is_file) else {
+                return Err(format!("`{manifest}` is not a regular file"));
+            };
+            let mut raw = String::new();
+            file.read_to_string(&mut raw)
+                .map_err(|e| format!("`{manifest}` could not be read: {e}"))?;
+            return Ok(cargo_package_name(&raw));
+        }
+        dir = if d.is_empty() {
+            None
+        } else {
+            Some(d.rsplit_once('/').map(|(p, _)| p).unwrap_or(""))
+        };
+    }
+    Ok(None)
+}
+
+/// `[package] name = "…"` off a manifest — a line scan, enough for the one key; a name that is not
+/// a plain crate name is refused (it becomes an argv element).
+fn cargo_package_name(raw: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in raw.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_package = l == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = l.strip_prefix("name") else {
+            continue;
+        };
+        let Some(v) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let v = v.split('#').next().unwrap_or("").trim().trim_matches('"');
+        if !v.is_empty()
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Some(v.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 /// Why the worktree's `node_modules/` does NOT provision the checks, or `None` when it does.
@@ -1374,10 +1698,9 @@ fn node_modules_gap(
 /// file that appears between detection and the end of the checks was written by the checks.
 fn engine_generated_candidates(worktree: &Path, detected: &[RepoCheck]) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if detected
-        .iter()
-        .any(|c| c.name == "cargo-test" && !c.argv.iter().any(|a| a == "--locked"))
-        && !worktree.join("Cargo.lock").exists()
+    if detected.iter().any(|c| {
+        c.argv.first().is_some_and(|b| b == "cargo") && !c.argv.iter().any(|a| a == "--locked")
+    }) && !worktree.join("Cargo.lock").exists()
     {
         out.push("Cargo.lock");
     }
@@ -1888,6 +2211,7 @@ pub(crate) fn run_with_sandbox_ctx(
                         }
                     };
                     classify(&mut run, base_run);
+                    rerun_flakes(worktree, check, &mut run, &sandbox, &scratch);
                 }
                 _ => {}
             }
@@ -2062,6 +2386,12 @@ impl BaseTree {
     fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseRun> {
         let raw = std::fs::read_to_string(Self::cache_path(scratch, head, &check.name)).ok()?;
         let run = serde_json::from_str::<CheckRun>(&raw).ok()?;
+        // The base runs the head's argv, and it can change within a run (a targeted command with
+        // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
+        // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
+        if run.argv != check.argv {
+            return None;
+        }
         Some(BaseRun {
             head: head.to_string(),
             cached: true,
@@ -2106,9 +2436,11 @@ impl BaseTree {
         })
     }
 
-    /// Run `check` on the base — by NAME, as the base's own detection spells it (a targeted
-    /// command keeps the head's substituted argv: it is the same change-scoped set on both
-    /// trees) — and cache the result under `base-cache/<head>-<name>.json` for the rest of the
+    /// Run `check` on the base with the HEAD's argv, once the base declares a check of that name
+    /// (a baseline diff compares one command on two trees: a change that edits the command — say
+    /// adds `--no-fail-fast` — would otherwise read the base's shorter failure list as the head's
+    /// regressions; a targeted command is the same change-scoped set on both trees) — and cache
+    /// the result under `base-cache/<head>-<name>.json` for the rest of the
     /// run ([`Self::cached`]). The base's install step runs first when its tree needs
     /// provisioning (the same frozen, scripts-off install the head got, out of the same scratch
     /// cache).
@@ -2136,19 +2468,13 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        let target = if check.name == "test_targeted" {
-            check.clone()
-        } else {
-            match detected.iter().find(|c| c.name == check.name) {
-                Some(c) => c.clone(),
-                None => {
-                    return fail(format!(
-                        "the run base declares no `{}` check (the change introduced it)",
-                        check.name
-                    ))
-                }
-            }
-        };
+        if check.name != "test_targeted" && !detected.iter().any(|c| c.name == check.name) {
+            return fail(format!(
+                "the run base declares no `{}` check (the change introduced it)",
+                check.name
+            ));
+        }
+        let target = check.clone();
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
             let r = run_one(&self.dir, install, sandbox, scratch, Tree::Base);
             if !r.passed() {
@@ -2176,11 +2502,12 @@ impl BaseTree {
 ///
 /// * base passed ⇒ `regression` (every head failure is head-only);
 /// * base did not finish or could not run ⇒ no classification (denies, fail-closed);
-/// * both failed with identifiers on both sides ⇒ set arithmetic: any head-only identifier ⇒
-///   `regression` (the shared ones listed as `pre_existing`); equal sets ⇒ `floor_env_mismatch`;
-///   head ⊂ base ⇒ `pre_existing_in_sandbox`;
-/// * both failed with NO identifiers on either side ⇒ compared by exit code: equal ⇒
-///   `floor_env_mismatch` (the observable failure is identical), else `regression`;
+/// * both failed with identifiers on both sides ⇒ set arithmetic over binary-QUALIFIED ids
+///   (core#481): any head-only identifier ⇒ `regression` (the shared ones listed as
+///   `pre_existing`); otherwise (head ⊆ base, equal sets included) ⇒ `env_cannot_run` when every
+///   head failure carries the nested-sandbox launcher signature on both trees (core#546, positive
+///   evidence), else `pre_existing_in_sandbox` (the fact the comparison establishes);
+/// * both failed with NO identifiers on either side ⇒ `unclassified_red_base` (denies, #538);
 /// * identifiers on ONE side only ⇒ `regression` (cannot be compared — fail-closed).
 fn classify(head: &mut CheckRun, base: BaseRun) {
     use std::collections::BTreeSet;
@@ -2207,10 +2534,14 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
                         .difference(&base_ids)
                         .map(|s| s.to_string())
                         .collect();
+                    let env_on_both = |id: &str| {
+                        head.env_cannot_run.iter().any(|e| e == id)
+                            && b.env_cannot_run.iter().any(|e| e == id)
+                    };
                     if !head.regressions.is_empty() {
                         Some(REGRESSION)
-                    } else if head_ids == base_ids {
-                        Some(FLOOR_ENV_MISMATCH)
+                    } else if head_ids.iter().all(|id| env_on_both(id)) {
+                        Some(ENV_CANNOT_RUN)
                     } else {
                         Some(PRE_EXISTING_IN_SANDBOX)
                     }
@@ -2221,6 +2552,151 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
     };
     head.classification = verdict.map(str::to_string);
     head.base = Some(Box::new(base));
+}
+
+/// (core#553) The argv that re-runs ONE libtest id alone: the check's own `cargo test` with the
+/// workspace/target selection replaced by the id's binary (`-p b --test common`, when the id is
+/// qualified) and `-- --exact <name>`. `None` for any other runner or id shape — the floor then
+/// does not re-run and the classification stands.
+fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String)> {
+    let (name, target) = libtest_parts(id)?;
+    let bin = argv.first()?;
+    let is_cargo = Path::new(bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "cargo" || n == "cargo.exe");
+    let sub = match argv.get(1) {
+        Some(t) if t.starts_with('+') => 2,
+        _ => 1,
+    };
+    if !is_cargo || argv.get(sub).map(String::as_str) != Some("test") {
+        return None;
+    }
+    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
+    let mut out: Vec<String> = Vec::new();
+    let mut skip_value = false;
+    for a in cargo_args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if target.is_some() {
+            // The id names its binary: every selection of the original command gives way to it.
+            if matches!(
+                a.as_str(),
+                "-p" | "--package" | "--test" | "--bin" | "--example" | "--bench" | "--exclude"
+            ) {
+                skip_value = true;
+                continue;
+            }
+            if matches!(
+                a.as_str(),
+                "--workspace"
+                    | "--all"
+                    | "--lib"
+                    | "--bins"
+                    | "--tests"
+                    | "--doc"
+                    | "--examples"
+                    | "--benches"
+                    | "--all-targets"
+                    | "--no-fail-fast"
+            ) || a.starts_with("--package=")
+                || a.starts_with("--test=")
+                || a.starts_with("--bin=")
+                || a.starts_with("--exclude=")
+                || (a.starts_with("-p") && a.len() > 2)
+            {
+                continue;
+            }
+        }
+        out.push(a.clone());
+    }
+    if let Some(t) = target {
+        out.extend(t.split_whitespace().map(String::from));
+    }
+    out.push("--".into());
+    out.extend(test_args.iter().cloned());
+    out.push("--exact".into());
+    out.push(name.to_string());
+    Some((out, name.to_string()))
+}
+
+/// (core#553) Is the host oversubscribed — its 1-min load above its logical CPU count? The one
+/// condition under which a head-only failure that passes alone is read as a load flake.
+pub(crate) fn oversubscribed(load1: Option<f64>, cpus: usize) -> bool {
+    matches!(load1, Some(l) if l.is_finite() && cpus > 0 && l > cpus as f64)
+}
+
+/// (core#553) Re-run each head-only failure of a small `regression` set ONCE, alone, in the same
+/// worktree; when every one PASSES (exit 0 and libtest printed `test <name> ... ok` — a filter
+/// that matched nothing is not a pass) the check is `flaky_under_load`. Each re-run's own
+/// `bound_note` carries the host load at that attempt, beside the first attempt's. Anything else —
+/// a larger set, a runner the floor cannot filter, a re-run that fails — leaves `regression`.
+fn rerun_flakes(
+    worktree: &Path,
+    check: &RepoCheck,
+    run: &mut CheckRun,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) {
+    if run.classification.as_deref() != Some(REGRESSION)
+        || run.regressions.is_empty()
+        || run.regressions.len() > MAX_FLAKE_RERUN
+    {
+        return;
+    }
+    // The evidence that it was LOAD: the host is oversubscribed as the failure is read. On a host
+    // with headroom a failure that passes alone is as likely an order-dependent regression the
+    // change introduced — it stays a regression, and nothing is re-run.
+    let (load1, cpus) = host_load();
+    if !oversubscribed(load1, cpus) {
+        return;
+    }
+    let plans: Option<Vec<(Vec<String>, String)>> = run
+        .regressions
+        .iter()
+        .map(|id| isolated_rerun_argv(&check.argv, id))
+        .collect();
+    let Some(plans) = plans else {
+        return;
+    };
+    let mut all_passed = true;
+    for (argv, name) in plans {
+        let one = RepoCheck {
+            name: check.name.clone(),
+            argv,
+            source: format!("isolated re-run of `{name}` (core#553)"),
+            timeout_s: check.timeout_s,
+        };
+        let (r, passed) = run_one_watching(
+            worktree,
+            &one,
+            sandbox,
+            scratch,
+            Tree::Head,
+            std::slice::from_ref(&name),
+        );
+        let ok = r.passed() && passed.iter().any(|p| p == &name);
+        eprintln!(
+            "wicked-core: repo checks floor — isolated re-run of `{name}` {} ({:.1}s{})",
+            if ok { "passed" } else { "did not pass" },
+            r.duration_ms as f64 / 1000.0,
+            r.bound_note
+                .as_deref()
+                .map(|n| format!(", bound {n}"))
+                .unwrap_or_default()
+        );
+        all_passed &= ok;
+        run.reruns.push(r);
+        if !all_passed {
+            break;
+        }
+    }
+    if all_passed {
+        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
+    }
 }
 
 /// Phrases a creator uses to wave a failure away, and the check-shaped words one of them must
@@ -2321,7 +2797,11 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
     let failing = checks.iter().find(|c| !c.passed() && c.name != "install")?;
     let verdict = match failing.classification.as_deref() {
         Some(REGRESSION) => CLAIM_REJECTED,
-        Some(PRE_EXISTING_IN_SANDBOX) | Some(FLOOR_ENV_MISMATCH) => CLAIM_CONFIRMED,
+        Some(PRE_EXISTING_IN_SANDBOX) | Some(FLOOR_ENV_MISMATCH) | Some(ENV_CANNOT_RUN) => {
+            CLAIM_CONFIRMED
+        }
+        // The base passes it: a flake is not a pre-existing failure.
+        Some(FLAKY_UNDER_LOAD) => CLAIM_REJECTED,
         _ => CLAIM_UNVERIFIED,
     };
     Some(ClaimCheck {
@@ -2382,27 +2862,215 @@ fn effective_bound(check: &RepoCheck) -> (Duration, Option<String>) {
 const DRAIN_CAP: Duration = Duration::from_secs(5);
 
 /// A stdout/stderr drain: the bounded tail accumulates in `buf` (shared, so a drain that never
-/// reaches EOF still yields what it saw), failure identifiers scanned off complete lines
-/// accumulate in `ids`, `done` fires at EOF.
+/// reaches EOF still yields what it saw), the [`LineScan`] of complete lines accumulates in `scan`,
+/// `done` fires at EOF.
 struct Drain {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    ids: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    scan: std::sync::Arc<std::sync::Mutex<LineScan>>,
     done: std::sync::mpsc::Receiver<()>,
 }
 
 impl Drain {
-    /// The tail read so far and the failure identifiers seen, waiting at most `cap` for EOF; on
-    /// timeout the reader thread is left to die with the pipe (it holds only its own handles).
-    fn finish(self, cap: Duration) -> (Vec<u8>, Vec<String>) {
+    /// The tail read so far and the line scan, waiting at most `cap` for EOF; on timeout the
+    /// reader thread is left to die with the pipe (it holds only its own handles).
+    fn finish(self, cap: Duration) -> (Vec<u8>, LineScan) {
         let _ = self.done.recv_timeout(cap);
         let mut tail = std::mem::take(&mut *self.buf.lock().unwrap_or_else(|p| p.into_inner()));
         if tail.len() > TAIL_BYTES {
             let cut = tail.len() - TAIL_BYTES;
             tail.drain(..cut);
         }
-        let ids = std::mem::take(&mut *self.ids.lock().unwrap_or_else(|p| p.into_inner()));
-        (tail, ids)
+        let scan = std::mem::take(&mut *self.scan.lock().unwrap_or_else(|p| p.into_inner()));
+        (tail, scan)
     }
+}
+
+/// The launcher signatures a test's own captured output carries when the test tried to arm an OS
+/// sandbox INSIDE the floor's sandbox (core#546): macOS cannot nest `sandbox-exec`, and an
+/// unprivileged `bwrap` inside `bwrap` cannot create its namespaces. A fact about the host, not
+/// about the change.
+const LAUNCHER_SIGNATURES: &[&str] = &[
+    "sandbox-exec: sandbox_apply: Operation not permitted",
+    "bwrap: No permissions to create",
+    "bwrap: Creating new namespace failed",
+    "bwrap: setting up uid map",
+    "bwrap: loopback: Failed RTM_NEWADDR",
+];
+
+/// Does `line` carry a nested-sandbox launcher signature ([`LAUNCHER_SIGNATURES`])?
+pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
+    LAUNCHER_SIGNATURES
+        .iter()
+        .copied()
+        .find(|sig| line.contains(sig))
+}
+
+/// The line-level state of one output stream's failure scan.
+///
+/// libtest ids are not qualified by binary (core#481): `test shared ... FAILED` from crate A and
+/// from crate B are the same string. The scan therefore tags each libtest id with the index of the
+/// FAILING test binary it came from (the count of `test result: FAILED` lines seen before it), and
+/// collects cargo's per-binary `to rerun pass `-p b --test common`` lines (stderr) in order: the
+/// k-th failing binary is the k-th such line, so [`qualify`] can name the target exactly — and
+/// falls back to the bare id when the two counts disagree (a binary that crashed without a result
+/// line, a custom harness).
+#[derive(Debug, Default)]
+struct LineScan {
+    eslint_file: Option<String>,
+    /// libtest: `test result: FAILED` lines seen so far.
+    failed_blocks: usize,
+    /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
+    section: Option<String>,
+    /// Failure ids in order of first sight; libtest ids carry their failing-binary index.
+    ids: Vec<(String, Option<usize>)>,
+    /// libtest tests whose captured output carries a launcher signature (core#546), with their
+    /// failing-binary index.
+    env: Vec<(String, usize)>,
+    /// cargo's `to rerun pass `…`` target selectors, one per failing test binary, in order.
+    targets: Vec<String>,
+    /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
+    passed: Vec<String>,
+    watch: Vec<String>,
+}
+
+impl LineScan {
+    fn watching(watch: &[String]) -> Self {
+        Self {
+            watch: watch.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    fn line(&mut self, line: &str) {
+        let s = line.trim();
+        if s.starts_with("test result: FAILED") {
+            self.failed_blocks += 1;
+            self.section = None;
+            return;
+        }
+        if let Some(name) = s
+            .strip_prefix("---- ")
+            .and_then(|r| r.strip_suffix(" stdout ----"))
+        {
+            self.section = Some(name.to_string());
+            return;
+        }
+        if s == "failures:" {
+            self.section = None;
+            return;
+        }
+        if let Some(name) = self.section.clone() {
+            // A test's captured output: only the launcher signature is read here — a nested
+            // runner's own `test x ... FAILED` inside it is not a failure of THIS suite.
+            if launcher_signature(s).is_some()
+                && !self
+                    .env
+                    .iter()
+                    .any(|(n, b)| n == &name && *b == self.failed_blocks)
+            {
+                self.env.push((name, self.failed_blocks));
+            }
+            return;
+        }
+        if let Some(target) = rerun_target_of_line(s) {
+            self.targets.push(target);
+            return;
+        }
+        if !self.watch.is_empty() {
+            if let Some(name) = s
+                .strip_prefix("test ")
+                .and_then(|r| r.strip_suffix(" ... ok"))
+            {
+                let name = name.trim();
+                if self.watch.iter().any(|w| w == name) && !self.passed.iter().any(|p| p == name) {
+                    self.passed.push(name.to_string());
+                }
+                return;
+            }
+        }
+        if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
+            let block = id.starts_with("test ").then_some(self.failed_blocks);
+            if self.ids.len() < MAX_FAILURE_IDS
+                && !self.ids.iter().any(|(i, b)| i == &id && *b == block)
+            {
+                self.ids.push((id, block));
+            }
+        }
+    }
+}
+
+/// cargo's per-failing-binary selector: `error: test failed, to rerun pass `-p b --test common``
+/// (older cargo quotes with `'`) → `-p b --test common`.
+fn rerun_target_of_line(s: &str) -> Option<String> {
+    let (_, rest) = s.split_once("to rerun pass ")?;
+    let q = rest.chars().next().filter(|c| *c == '`' || *c == '\'')?;
+    let inner = &rest[1..];
+    let end = inner.find(q)?;
+    let target = inner[..end].trim();
+    (!target.is_empty()).then(|| target.to_string())
+}
+
+/// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
+fn qualified(id: &str, target: Option<&str>) -> String {
+    match target {
+        Some(t) => format!("{id} [{t}]"),
+        None => id.to_string(),
+    }
+}
+
+/// Split a (possibly qualified) libtest id into its test name and cargo target selector.
+fn libtest_parts(id: &str) -> Option<(&str, Option<&str>)> {
+    let rest = id.strip_prefix("test ")?;
+    match rest.strip_suffix(']').and_then(|r| r.rsplit_once(" [")) {
+        Some((name, target)) => Some((name, Some(target))),
+        None => Some((rest, None)),
+    }
+}
+
+/// The scanned ids of one check run, qualified: the failure ids (stdout first, then stderr), the
+/// ids whose captured output carries a launcher signature, and the watched names seen passing.
+fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>) {
+    // cargo prints the per-binary selector on stderr, libtest its results on stdout.
+    let targets: Vec<String> = out
+        .targets
+        .iter()
+        .chain(err.targets.iter())
+        .cloned()
+        .collect();
+    let label = |scan: &LineScan, block: Option<usize>| -> Option<String> {
+        let b = block?;
+        (scan.failed_blocks == targets.len())
+            .then(|| targets.get(b).cloned())
+            .flatten()
+    };
+    let mut ids: Vec<String> = Vec::new();
+    let mut env: Vec<String> = Vec::new();
+    for scan in [&out, &err] {
+        for (id, block) in &scan.ids {
+            let q = qualified(id, label(scan, *block).as_deref());
+            if !ids.contains(&q) && ids.len() < MAX_FAILURE_IDS {
+                ids.push(q);
+            }
+        }
+        for (name, block) in &scan.env {
+            let q = qualified(
+                &format!("test {name}"),
+                label(scan, Some(*block)).as_deref(),
+            );
+            if !env.contains(&q) {
+                env.push(q);
+            }
+        }
+    }
+    // Only a FAILING test is in the env class.
+    env.retain(|e| ids.contains(e));
+    let mut passed = out.passed;
+    for p in err.passed {
+        if !passed.contains(&p) {
+            passed.push(p);
+        }
+    }
+    (ids, env, passed)
 }
 
 /// The failure identifier one complete output line carries, for the runners the floor knows —
@@ -2507,24 +3175,21 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
     None
 }
 
-fn drain_tail<R: Read + Send + 'static>(mut r: R) -> Drain {
+fn drain_tail<R: Read + Send + 'static>(mut r: R, watch: &[String]) -> Drain {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(TAIL_BYTES * 2)));
-    let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let scan = std::sync::Arc::new(std::sync::Mutex::new(LineScan::watching(watch)));
     let (done_tx, done) = std::sync::mpsc::channel();
     let shared = std::sync::Arc::clone(&buf);
-    let shared_ids = std::sync::Arc::clone(&ids);
+    let shared_scan = std::sync::Arc::clone(&scan);
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         let mut pending: Vec<u8> = Vec::new();
-        let mut eslint_file: Option<String> = None;
-        let scan = |line: &[u8], eslint_file: &mut Option<String>| {
+        let scan = |line: &[u8]| {
             let line = String::from_utf8_lossy(line);
-            if let Some(id) = failure_id_of_line(&line, eslint_file) {
-                let mut ids = shared_ids.lock().unwrap_or_else(|p| p.into_inner());
-                if ids.len() < MAX_FAILURE_IDS && !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
+            shared_scan
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .line(&line);
         };
         loop {
             match r.read(&mut chunk) {
@@ -2543,7 +3208,7 @@ fn drain_tail<R: Read + Send + 'static>(mut r: R) -> Drain {
                     pending.extend_from_slice(&chunk[..n]);
                     while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = pending.drain(..=nl).collect();
-                        scan(&line[..line.len() - 1], &mut eslint_file);
+                        scan(&line[..line.len() - 1]);
                     }
                     if pending.len() > TAIL_BYTES {
                         let cut = pending.len() - TAIL_BYTES;
@@ -2553,11 +3218,11 @@ fn drain_tail<R: Read + Send + 'static>(mut r: R) -> Drain {
             }
         }
         if !pending.is_empty() {
-            scan(&pending, &mut eslint_file);
+            scan(&pending);
         }
         let _ = done_tx.send(());
     });
-    Drain { buf, ids, done }
+    Drain { buf, scan, done }
 }
 
 fn lossy(bytes: Vec<u8>) -> String {
@@ -2575,6 +3240,20 @@ pub(crate) fn run_one(
     scratch: &CheckScratch,
     tree: Tree,
 ) -> CheckRun {
+    run_one_watching(worktree, check, sandbox, scratch, tree, &[]).0
+}
+
+/// [`run_one`], also reporting which of the libtest names in `watch` the run printed as PASSING
+/// (`test name ... ok`) — the witness an isolated re-run needs (core#553): exit 0 alone could be a
+/// filter that matched nothing.
+fn run_one_watching(
+    worktree: &Path,
+    check: &RepoCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+    watch: &[String],
+) -> (CheckRun, Vec<String>) {
     let started = Instant::now();
     let mut result = CheckRun {
         name: check.name.clone(),
@@ -2593,6 +3272,8 @@ pub(crate) fn run_one(
         pre_existing: Vec::new(),
         regressions: Vec::new(),
         base: None,
+        env_cannot_run: Vec::new(),
+        reruns: Vec::new(),
     };
     // LOAD-AWARE BOUND (core#469): base × clamp(load1/ncpu, 1, 3), recorded on the run and
     // logged before the check starts so the observed duration can be read against it.
@@ -2612,14 +3293,14 @@ pub(crate) fn run_one(
     );
     let Some(bin) = check.argv.first() else {
         result.spawn_error = Some("empty argv".into());
-        return result;
+        return (result, Vec::new());
     };
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
     // rather than a bare OS code.
     let Some(exe) = crate::validator::find_on_path(bin) else {
         result.spawn_error = Some(format!("`{bin}` is not on PATH"));
         result.duration_ms = started.elapsed().as_millis() as u64;
-        return result;
+        return (result, Vec::new());
     };
     // `[<sandbox wrapper…>] <exe> <args…>` — an empty wrapper is the disclosed best-effort floor.
     let mut full: Vec<String> = sandbox.wrapper.clone();
@@ -2646,11 +3327,11 @@ pub(crate) fn run_one(
         Err(e) => {
             result.spawn_error = Some(e.to_string());
             result.duration_ms = started.elapsed().as_millis() as u64;
-            return result;
+            return (result, Vec::new());
         }
     };
-    let out_h = child.stdout.take().map(drain_tail);
-    let err_h = child.stderr.take().map(drain_tail);
+    let out_h = child.stdout.take().map(|r| drain_tail(r, watch));
+    let err_h = child.stderr.take().map(|r| drain_tail(r, watch));
     let status = loop {
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
@@ -2682,8 +3363,8 @@ pub(crate) fn run_one(
     result.exit_code = status.and_then(|st| st.code());
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
     // was read and move on rather than wait for an EOF that may never come.
-    let (out_tail, out_ids) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    let (err_tail, err_ids) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
+    let (out_tail, out_scan) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
+    let (err_tail, err_scan) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
     result.stdout_tail = lossy(out_tail);
     result.stderr_tail = lossy(err_tail);
     // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
@@ -2701,16 +3382,12 @@ pub(crate) fn run_one(
         }
     }
     // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
-    // stderr), de-duplicated, in order of first sight.
-    let mut ids = out_ids;
-    for id in err_ids {
-        if !ids.contains(&id) && ids.len() < MAX_FAILURE_IDS {
-            ids.push(id);
-        }
-    }
+    // stderr), de-duplicated, in order of first sight; libtest ids qualified by their binary.
+    let (ids, env, passed) = qualify(out_scan, err_scan);
     result.failure_ids = ids;
+    result.env_cannot_run = env;
     result.duration_ms = started.elapsed().as_millis() as u64;
-    result
+    (result, passed)
 }
 
 #[cfg(test)]
@@ -2896,6 +3573,8 @@ mod tests {
                 pre_existing: Vec::new(),
                 regressions: Vec::new(),
                 base: None,
+                env_cannot_run: Vec::new(),
+                reruns: Vec::new(),
             }],
             skipped: vec!["typecheck".into(), "test".into()],
             passed: false,
@@ -2953,7 +3632,7 @@ mod tests {
         assert_eq!(checks[0].argv, s(&["cargo", "fmt", "--all", "--check"]));
         assert_eq!(checks[1].argv, s(&["pnpm", "run", "lint"]));
         assert_eq!(checks[2].name, "cargo-test");
-        assert_eq!(checks[2].argv, s(&["cargo", "test"]));
+        assert_eq!(checks[2].argv, s(&["cargo", "test", "--no-fail-fast"]));
         // No manifests at all ⇒ nothing detected, and a run of it is a vacuous pass that SAYS so.
         let empty = scratch("detect-empty");
         assert!(detect(&empty).unwrap().is_empty());
@@ -3747,11 +4426,14 @@ mod tests {
         std::fs::write(wt.join("Cargo.lock"), "# lock\n").unwrap();
         let checks = detect(&wt).unwrap();
         assert_eq!(checks[0].name, "cargo-fmt-check");
-        assert_eq!(checks[1].argv, s(&["cargo", "test", "--locked"]));
+        assert_eq!(
+            checks[1].argv,
+            s(&["cargo", "test", "--locked", "--no-fail-fast"])
+        );
         assert!(engine_generated_candidates(&wt, &checks).is_empty());
         std::fs::remove_file(wt.join("Cargo.lock")).unwrap();
         let checks = detect(&wt).unwrap();
-        assert_eq!(checks[1].argv, s(&["cargo", "test"]));
+        assert_eq!(checks[1].argv, s(&["cargo", "test", "--no-fail-fast"]));
         assert_eq!(
             engine_generated_candidates(&wt, &checks),
             vec!["Cargo.lock"]
@@ -4218,6 +4900,8 @@ mod tests {
             pre_existing: vec![],
             regressions: vec![],
             base: None,
+            env_cannot_run: Vec::new(),
+            reruns: Vec::new(),
         };
         let make_base = |exit: i32| BaseRun {
             head: "abc1234567".to_string(),
@@ -4446,12 +5130,20 @@ mod tests {
             "formatter passes on formatted code"
         );
         let c = &report.checks[1];
-        assert_eq!(c.name, "cargo-test");
+        // core#482: the creator floor of an unconfigured repo runs the touched crate only.
+        assert_eq!(c.name, "test_targeted");
+        assert_eq!(c.source, DERIVED_TARGETED_SOURCE);
         assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:?}");
-        assert_eq!(c.regressions, vec!["test t::stable".to_string()]);
+        assert_eq!(
+            c.regressions,
+            vec!["test t::stable [-p basediff_fixture --lib]".to_string()]
+        );
         assert_eq!(
             c.pre_existing,
-            vec!["test t::other".to_string(), "test t::shared".to_string()]
+            vec![
+                "test t::other [-p basediff_fixture --lib]".to_string(),
+                "test t::shared [-p basediff_fixture --lib]".to_string()
+            ]
         );
         let b = c.base.as_deref().expect("the base run is attached");
         assert_eq!(b.head, base);
@@ -4467,7 +5159,10 @@ mod tests {
         base_ids.sort();
         assert_eq!(
             base_ids,
-            vec!["test t::other".to_string(), "test t::shared".to_string()]
+            vec![
+                "test t::other [-p basediff_fixture --lib]".to_string(),
+                "test t::shared [-p basediff_fixture --lib]".to_string()
+            ]
         );
         assert_eq!(
             report.claim.as_ref().map(|c| c.verdict.as_str()),
@@ -4482,8 +5177,8 @@ mod tests {
         let denial = report.denial_reason();
         assert!(
             denial.contains("[regression]")
-                && denial.contains("head-only failures test t::stable")
-                && denial.contains("also failing on the base: test t::other, test t::shared")
+                && denial.contains("head-only failures test t::stable [-p basediff_fixture --lib]")
+                && denial.contains("also failing on the base: test t::other [-p basediff_fixture --lib], test t::shared [-p basediff_fixture --lib]")
                 && denial.contains("REJECTED"),
             "{denial}"
         );
@@ -4503,13 +5198,15 @@ mod tests {
         assert!(
             scratch_root
                 .join("base-cache")
-                .join(format!("{}-cargo-test.json", &base[..12]))
+                .join(format!("{}-test_targeted.json", &base[..12]))
                 .is_file(),
             "the base run is cached by base sha + check name"
         );
 
-        // (2) FLOOR_ENV_MISMATCH: the head fails exactly what the base fails ⇒ the floor passes,
-        // the shared failures are listed, the base run comes back from the cache.
+        // (2) Identical failure sets: the FACT is that the base fails them too (core#481 —
+        // `pre_existing_in_sandbox`, never the inferred `floor_env_mismatch`) ⇒ the floor passes,
+        // the shared failures are listed. The tree equals the base, so no file is touched and the
+        // full `cargo-test` runs (no derived set to narrow to).
         std::fs::write(repo.join("src/lib.rs"), body(false, false, true)).unwrap();
         let report = run_floor(&repo, &ctx);
         assert!(report.passed, "{:?}", report.checks[1]);
@@ -4517,23 +5214,23 @@ mod tests {
         let c = &report.checks[1];
         assert!(!c.passed() && !c.denies());
         assert_eq!(c.outcome(), "failed");
-        assert_eq!(c.classification.as_deref(), Some(FLOOR_ENV_MISMATCH));
+        assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
         assert_eq!(
             c.pre_existing,
-            vec!["test t::other".to_string(), "test t::shared".to_string()]
+            vec![
+                "test t::other [--lib]".to_string(),
+                "test t::shared [--lib]".to_string()
+            ]
         );
+        assert_eq!(c.name, "cargo-test");
         assert!(c.regressions.is_empty());
-        assert!(
-            c.base.as_deref().is_some_and(|b| b.cached),
-            "the base run is paid for once per run"
-        );
-        assert!(report.env_mismatch());
+        assert!(!report.env_mismatch());
         assert_eq!(
             report.claim.as_ref().map(|c| c.verdict.as_str()),
             Some(CLAIM_CONFIRMED)
         );
         assert!(
-            c.summary().contains("[floor_env_mismatch]"),
+            c.summary().contains("[pre_existing_in_sandbox]"),
             "{}",
             c.summary()
         );
@@ -4544,8 +5241,15 @@ mod tests {
         assert!(report.passed, "{:?}", report.checks[1]);
         let c = &report.checks[1];
         assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
-        assert_eq!(c.pre_existing, vec!["test t::shared".to_string()]);
+        assert_eq!(
+            c.pre_existing,
+            vec!["test t::shared [-p basediff_fixture --lib]".to_string()]
+        );
         assert!(c.regressions.is_empty() && !c.denies());
+        assert!(
+            c.base.as_deref().is_some_and(|b| b.cached),
+            "the base run is paid for once per run"
+        );
         assert!(!report.env_mismatch());
 
         // (4) Opt-out: the plain denial, with the reason the base was not compared.
@@ -4698,6 +5402,8 @@ mod tests {
             pre_existing: Vec::new(),
             regressions: Vec::new(),
             base: None,
+            env_cannot_run: Vec::new(),
+            reruns: Vec::new(),
         }
     }
 
@@ -4819,6 +5525,551 @@ mod tests {
             apply_rerun(&wt, &ctx, &rerun(FloorRerunMode::Targeted, &[]), detected).unwrap();
         assert_eq!(names(&run), vec!["lint", "test_targeted"]);
         assert_eq!(waived, vec!["test"], "the replaced full set is disclosed");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    // ─── core#481 / core#546 / core#553 / core#482 ──────────────────────────────────────────────
+
+    /// A two-crate workspace's `cargo test --no-fail-fast` output, as cargo splits it: libtest's
+    /// results on stdout, cargo's `Running` / `to rerun pass` lines on stderr.
+    const WS_STDOUT: &str = "\nrunning 2 tests\ntest t::ok ... ok\ntest t::shared ... FAILED\n\n\
+        failures:\n\n---- t::shared stdout ----\n\nthread 't::shared' panicked at a/src/lib.rs:1:44:\n\
+        boom\n\n\nfailures:\n    t::shared\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\n\
+        running 2 tests\ntest t::ok ... ok\ntest t::shared ... FAILED\n\nfailures:\n\n\
+        ---- t::shared stdout ----\n\nthread 't::shared' panicked at b/src/lib.rs:1:44:\nboom\n\n\n\
+        failures:\n    t::shared\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\n\
+        running 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+        sandbox-exec: sandbox_apply: Operation not permitted\n\nthread 'shared' panicked at \
+        b/tests/common.rs:1:90:\nx\n\n\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 \
+        failed\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed\n";
+    const WS_STDERR: &str = "     Running unittests src/lib.rs (target/debug/deps/a-e4ae93d41f55510e)\n\
+        error: test failed, to rerun pass `-p a --lib`\n     Running unittests src/lib.rs \
+        (target/debug/deps/b-351d690dff5449db)\nerror: test failed, to rerun pass `-p b --lib`\n     \
+        Running tests/common.rs (target/debug/deps/common-8e62653fc2487ac4)\nerror: test failed, to \
+        rerun pass `-p b --test common`\n   Doc-tests a\nerror: 3 targets failed:\n    `-p a --lib`\n";
+
+    fn scan_of(text: &str) -> LineScan {
+        let mut scan = LineScan::default();
+        for line in text.lines() {
+            scan.line(line);
+        }
+        scan
+    }
+
+    /// core#481: a libtest id names its test binary, so the same test name failing in two crates
+    /// is two ids; and a nested sandbox's launcher line in a test's captured output marks that id
+    /// (core#546). With cargo's selectors missing, the ids stay bare (the historical form).
+    #[test]
+    fn libtest_ids_are_qualified_by_their_binary_481() {
+        let (ids, env, _) = qualify(scan_of(WS_STDOUT), scan_of(WS_STDERR));
+        assert_eq!(
+            ids,
+            vec![
+                "test t::shared [-p a --lib]".to_string(),
+                "test t::shared [-p b --lib]".to_string(),
+                "test shared [-p b --test common]".to_string(),
+            ]
+        );
+        assert_eq!(env, vec!["test shared [-p b --test common]".to_string()]);
+        // The summary block's trailing "`-p a --lib`" list line is not a second selector.
+        assert_eq!(scan_of(WS_STDERR).targets.len(), 3);
+        // No selectors (another runner wrapped cargo, or the stderr was lost): bare, de-duplicated.
+        let (ids, env, _) = qualify(scan_of(WS_STDOUT), LineScan::default());
+        assert_eq!(
+            ids,
+            vec!["test t::shared".to_string(), "test shared".to_string()]
+        );
+        assert_eq!(env, vec!["test shared".to_string()]);
+        assert_eq!(
+            rerun_target_of_line("error: test failed, to rerun pass '--lib'").as_deref(),
+            Some("--lib"),
+            "older cargo quotes with '"
+        );
+    }
+
+    fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
+        CheckRun {
+            name: "cargo-test".to_string(),
+            argv: s(&["cargo", "test", "--locked", "--workspace"]),
+            source: "Cargo.toml".to_string(),
+            exit_code: Some(101),
+            timed_out: false,
+            spawn_error: None,
+            duration_ms: 10,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            bound_s: 1200,
+            bound_note: None,
+            failure_ids: ids.iter().map(|x| x.to_string()).collect(),
+            classification: None,
+            pre_existing: Vec::new(),
+            regressions: Vec::new(),
+            base: None,
+            env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
+            reruns: Vec::new(),
+        }
+    }
+
+    fn base_of(run: CheckRun) -> BaseRun {
+        BaseRun {
+            head: "0123456789abcdef".to_string(),
+            cached: false,
+            run: Some(run),
+            error: None,
+        }
+    }
+
+    /// core#481: a regression in crate B is not masked by the same-named red test in crate A,
+    /// and an identical failure set is the FACT `pre_existing_in_sandbox` — never the inference
+    /// `floor_env_mismatch`.
+    #[test]
+    fn a_same_named_failure_in_another_crate_is_a_regression_481() {
+        let mut head = failed_run(&["test t::shared [-p b --lib]"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test t::shared [-p a --lib]"], &[])),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.regressions, vec!["test t::shared [-p b --lib]"]);
+        assert!(head.denies());
+
+        let mut head = failed_run(&["test t::shared [-p a --lib]"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test t::shared [-p a --lib]"], &[])),
+        );
+        assert_eq!(
+            head.classification.as_deref(),
+            Some(PRE_EXISTING_IN_SANDBOX)
+        );
+        assert!(!head.denies());
+        let report = report_of(vec![head], &[]);
+        assert!(
+            !report.env_mismatch(),
+            "equal sets assert no environment cause"
+        );
+    }
+
+    /// core#546: failures carrying the nested-sandbox launcher signature on BOTH trees are
+    /// `env_cannot_run` (non-denying, counted on the card); a head-only failure with the same
+    /// signature still denies but the floor note names the likely cause.
+    #[test]
+    fn a_launcher_signature_failure_is_env_cannot_run_546() {
+        let ids = [
+            "test validator::jail [-p wicked-core --lib]",
+            "test r::s [-p wicked-core --lib]",
+        ];
+        let mut head = failed_run(&ids, &ids);
+        classify(&mut head, base_of(failed_run(&ids, &ids)));
+        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
+        assert!(!head.denies());
+        assert!(
+            head.summary()
+                .contains("[env_cannot_run: 2 tests cannot run under the floor's nested sandbox"),
+            "{}",
+            head.summary()
+        );
+        let report = report_of(vec![head], &[]);
+        assert!(report.passed && report.env_mismatch());
+        let note = report
+            .classification_note()
+            .expect("the env count is on the note");
+        assert!(
+            note.contains("could not run 2 tests on this host")
+                && note.contains("external CI is the test gate"),
+            "{note}"
+        );
+
+        // Mixed: one genuinely pre-existing failure beside the env class ⇒ pre-existing, env
+        // still counted.
+        let mixed = ["test a::real [--lib]", "test a::jail [--lib]"];
+        let mut head = failed_run(&mixed, &["test a::jail [--lib]"]);
+        classify(
+            &mut head,
+            base_of(failed_run(&mixed, &["test a::jail [--lib]"])),
+        );
+        assert_eq!(
+            head.classification.as_deref(),
+            Some(PRE_EXISTING_IN_SANDBOX)
+        );
+
+        // A NEW sandbox-spawning test: head-only, signature on the head ⇒ still a regression.
+        let mut head = failed_run(
+            &["test a::jail [--lib]", "test a::new_jail [--lib]"],
+            &["test a::jail [--lib]", "test a::new_jail [--lib]"],
+        );
+        classify(
+            &mut head,
+            base_of(failed_run(
+                &["test a::jail [--lib]"],
+                &["test a::jail [--lib]"],
+            )),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert!(head.denies());
+        let report = report_of(vec![head], &[]);
+        let note = report
+            .classification_note()
+            .expect("the advisory rides the note");
+        assert!(
+            note.contains("test a::new_jail [--lib]")
+                && note.contains("same env class as 1 pre-existing id;")
+                && note.contains("still denied"),
+            "{note}"
+        );
+        assert!(report_of(vec![failed_run(&["test x"], &[])], &[])
+            .classification_note()
+            .is_none());
+    }
+
+    /// core#553: the isolated re-run is the check's own `cargo test`, narrowed to the id's binary
+    /// and `--exact` name; any other runner is not re-run.
+    #[test]
+    fn an_isolated_rerun_narrows_cargo_test_to_the_one_id_553() {
+        let argv = s(&["cargo", "test", "--locked", "--workspace", "--no-fail-fast"]);
+        assert_eq!(
+            isolated_rerun_argv(&argv, "test actor::t::a_stop [-p wicked-core --lib]"),
+            Some((
+                s(&[
+                    "cargo",
+                    "test",
+                    "--locked",
+                    "-p",
+                    "wicked-core",
+                    "--lib",
+                    "--",
+                    "--exact",
+                    "actor::t::a_stop"
+                ]),
+                "actor::t::a_stop".to_string()
+            ))
+        );
+        assert_eq!(
+            isolated_rerun_argv(
+                &s(&["cargo", "test", "-p", "x", "--", "--test-threads", "1"]),
+                "test t::y"
+            )
+            .map(|p| p.0),
+            Some(s(&[
+                "cargo",
+                "test",
+                "-p",
+                "x",
+                "--",
+                "--test-threads",
+                "1",
+                "--exact",
+                "t::y"
+            ])),
+            "an unqualified id keeps the command's own selection"
+        );
+        assert!(isolated_rerun_argv(&s(&["npm", "run", "test"]), "test t::y").is_none());
+        assert!(isolated_rerun_argv(&argv, "FAIL tests/x.test.ts > a").is_none());
+        assert!(isolated_rerun_argv(&s(&["cargo", "nextest", "run"]), "test t::y").is_none());
+        // Only an oversubscribed host earns the re-run: load above the CPU count.
+        assert!(oversubscribed(Some(15.0), 14));
+        assert!(!oversubscribed(Some(14.0), 14));
+        assert!(!oversubscribed(Some(3.0), 14));
+        assert!(!oversubscribed(None, 14), "an unknown load is no evidence");
+        assert!(!oversubscribed(Some(f64::NAN), 14));
+    }
+
+    /// core#553, end to end on a real cargo crate: a test that fails once and passes alone is
+    /// `flaky_under_load` (the floor passes, both attempts on the record); a test that fails
+    /// every time stays a `regression` after its one re-run.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_head_only_flake_is_rerun_alone_and_classed_flaky_553() {
+        let repo = scratch("flake553");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"flake_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n}\n",
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        // Fails the FIRST time in this floor (its private TMPDIR has no marker yet), then passes.
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n    #[test]\n    fn flaky() {\n        \
+             let m = std::env::temp_dir().join(\"flake-marker\");\n        if !m.exists() {\n            \
+             std::fs::write(&m, \"\").unwrap();\n            panic!(\"first attempt\");\n        \
+             }\n    }\n}\n",
+        )
+        .unwrap();
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+            return;
+        }
+        let (load1, cpus) = host_load();
+        if !oversubscribed(load1, cpus) {
+            // A host with headroom: no evidence of load, so no re-run — the failure stands.
+            let c = report
+                .checks
+                .iter()
+                .find(|c| c.name == "cargo-test")
+                .expect("cargo-test ran");
+            assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:#?}");
+            assert!(c.reruns.is_empty() && !report.passed);
+            eprintln!("repo_checks: host not oversubscribed — the flake re-run is not exercised");
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "cargo-test")
+            .expect("cargo-test ran");
+        assert_eq!(
+            c.classification.as_deref(),
+            Some(FLAKY_UNDER_LOAD),
+            "{c:#?}"
+        );
+        assert!(report.passed, "{report:#?}");
+        assert_eq!(c.regressions, vec!["test t::flaky [--lib]".to_string()]);
+        assert_eq!(c.reruns.len(), 1);
+        assert!(c.reruns[0].passed(), "{:?}", c.reruns[0]);
+        assert!(c.reruns[0]
+            .argv
+            .ends_with(&s(&["--lib", "--", "--exact", "t::flaky"])));
+        let note = report.classification_note().expect("a flake is disclosed");
+        assert!(
+            note.contains("test t::flaky [--lib]") && note.contains("flaky_under_load"),
+            "{note}"
+        );
+
+        // Always red ⇒ one re-run, still a regression, still denies.
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n    #[test]\n    fn broken() {\n        \
+             panic!(\"always\");\n    }\n}\n",
+        )
+        .unwrap();
+        let report = run_floor(&repo, &ctx);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "cargo-test")
+            .expect("cargo-test ran");
+        assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:#?}");
+        assert!(c.reruns.len() <= 1, "at most one re-run: {c:#?}");
+        assert!(c.reruns.iter().all(|r| !r.passed()));
+        assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// core#482: a repo with no configured test commands gets a derived change-scoped set at the
+    /// CREATOR floor — the crates owning the touched files, or `vitest related` over them — and
+    /// the full set wherever the change can reach every test (manifests, lockfiles, configs) and
+    /// at verify.
+    #[test]
+    fn an_unconfigured_repo_derives_its_targeted_set_from_the_touched_files_482() {
+        let repo = scratch("derive482");
+        for c in ["a", "b"] {
+            std::fs::create_dir_all(repo.join(c).join("src")).unwrap();
+            std::fs::write(
+                repo.join(c).join("Cargo.toml"),
+                format!("[package]\nname = \"{c}\" # the crate\nversion = \"0.0.0\"\n"),
+            )
+            .unwrap();
+            std::fs::write(repo.join(c).join("src/lib.rs"), "\n").unwrap();
+        }
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("README.md"), "x\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = |stage| FloorContext {
+            stage,
+            base_head: Some(base.clone()),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let test_of = |d: &[RepoCheck]| {
+            d.iter()
+                .find(|c| c.name == "cargo-test" || c.name == "test_targeted")
+                .cloned()
+                .expect("a test set")
+        };
+        std::fs::write(repo.join("b/src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "test_targeted");
+        assert_eq!(t.source, DERIVED_TARGETED_SOURCE);
+        assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast", "-p", "b"]));
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Verify)).unwrap());
+        assert_eq!(t.name, "cargo-test", "verify keeps the full suite");
+        // The workspace manifest can change every member ⇒ full.
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "cargo-test");
+        git(&repo, &["checkout", "-q", "--", "Cargo.toml"]);
+        // A deleted file elsewhere (crate `a`) could break what it left ⇒ full.
+        std::fs::remove_file(repo.join("a/src/lib.rs")).unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "cargo-test", "a deletion never narrows the set");
+        git(
+            &repo,
+            &["checkout", "-q", "--", "a/src/lib.rs", "b/src/lib.rs"],
+        );
+        // A path no package owns beside a crate change (a shared file any crate may
+        // `include!`) ⇒ full.
+        std::fs::write(repo.join("README.md"), "y\n").unwrap();
+        std::fs::write(repo.join("b/src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "cargo-test");
+        // A configured test command is the repo's own choice — never overridden.
+        std::fs::write(repo.join("a/src/lib.rs"), "pub fn y() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["cargo","test","--workspace"]}"#,
+        )
+        .unwrap();
+        let t = detect_with(&repo, &ctx(FloorStage::Creator)).unwrap();
+        assert!(names(&t).contains(&"test") && !names(&t).contains(&"test_targeted"));
+        let _ = std::fs::remove_dir_all(&repo);
+
+        // vitest: `vitest related` over the touched files; a touched lockfile ⇒ full.
+        let repo = scratch("derive482-node");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"scripts":{"test":"vitest run","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(repo.join("src/x.ts"), "export {}\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(repo.join("src/x.ts"), "export const x = 1\n").unwrap();
+        let d = detect_with(&repo, &ctx).unwrap();
+        let t = d
+            .iter()
+            .find(|c| c.name == "test_targeted")
+            .expect("derived");
+        assert_eq!(
+            t.argv,
+            s(&[
+                "npx",
+                "--no-install",
+                "vitest",
+                "related",
+                "--run",
+                "--passWithNoTests",
+                "src/x.ts"
+            ])
+        );
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("tests/setup.ts"), "export {}\n").unwrap();
+        let d = detect_with(&repo, &ctx).unwrap();
+        assert!(
+            names(&d).contains(&"test") && !names(&d).contains(&"test_targeted"),
+            "a config-loaded setup file reaches every test"
+        );
+        std::fs::remove_file(repo.join("tests/setup.ts")).unwrap();
+        std::fs::write(repo.join("package-lock.json"), "{ }").unwrap();
+        let d = detect_with(&repo, &ctx).unwrap();
+        assert!(names(&d).contains(&"test") && !names(&d).contains(&"test_targeted"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A cached base run of a targeted command answers only the SAME argv: a rework that touches
+    /// another crate derives another `-p`, and must not be compared against the first one's base.
+    /// A change that edits a configured command (fail-fast → `--no-fail-fast`) is compared on
+    /// the base with the SAME command: the base's shorter failure list is not read as the head's
+    /// regressions.
+    #[test]
+    fn the_base_runs_the_heads_command_when_the_change_edits_it() {
+        let repo = scratch("basecmd");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        let cfg = |script: &str| serde_json::json!({ "test": ["sh", "-c", script] }).to_string();
+        std::fs::write(
+            repo.join(".wicked/checks.json"),
+            cfg("echo 'test t::one ... FAILED'; exit 101"),
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::write(
+            repo.join(".wicked/checks.json"),
+            cfg("echo 'test t::one ... FAILED'; echo 'test t::two ... FAILED'; exit 101"),
+        )
+        .unwrap();
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the baseline diff cannot run");
+            return;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test")
+            .expect("test ran");
+        assert!(c.regressions.is_empty(), "{c:#?}");
+        let b = c
+            .base
+            .as_deref()
+            .and_then(|b| b.run.as_ref())
+            .expect("base ran");
+        assert_eq!(b.argv, c.argv, "the base ran the head's command");
+        assert!(report.passed, "{report:#?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_cached_targeted_base_run_answers_only_its_own_argv() {
+        let wt = scratch("cache-argv");
+        let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
+        let head = "0123456789abcdef0123";
+        let mut ran = failed_run(&["test t::x [-p b --lib]"], &[]);
+        ran.name = "test_targeted".into();
+        ran.argv = s(&["cargo", "test", "-p", "b"]);
+        let path = BaseTree::cache_path(&scratch_dir, head, "test_targeted");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&ran).unwrap()).unwrap();
+        let check = |argv: &[&str]| RepoCheck {
+            name: "test_targeted".into(),
+            argv: s(argv),
+            source: DERIVED_TARGETED_SOURCE.into(),
+            timeout_s: None,
+        };
+        assert!(
+            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
+        );
+        assert!(
+            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "a"])).is_none()
+        );
+        drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);
     }
 }

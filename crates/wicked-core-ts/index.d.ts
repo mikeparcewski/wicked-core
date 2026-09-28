@@ -951,6 +951,12 @@ export declare class Subscription {
  * entry carries `outcome`, `boundS`, `boundNote`, `failureIds`, `classification: 'regression' |
  * 'pre_existing_in_sandbox' | 'floor_env_mismatch' | null` (only a regression denies), `preExisting`,
  * `regressions` and `base: {head, cached, run, error} | null` (the same check run on the run base).
+ * core#481/#546/#553 (additive): `classification` gains `'env_cannot_run'` (every failure carries the
+ * nested-sandbox launcher signature on both trees) and `'flaky_under_load'` (a head-only set of ≤ 2
+ * that passed an isolated re-run) — neither denies; equal failure sets are now
+ * `'pre_existing_in_sandbox'` (`'floor_env_mismatch'` is no longer produced); libtest ids are
+ * qualified by binary (`test t::name [-p crate --lib]`); every `checks[]` entry carries
+ * `envCannotRun: string[]` and `reruns: CheckRun[]` (each re-run's `boundNote` carries the host load).
  * core#461/#591 (additive): unitDistributed.distinctnessFallback ('creator_seat' |
  * 'same_cli_instance' | null — the evaluator ≠ creator fallback as a field, see
  * UnitDistributedEventJson); gateEscalated.condition

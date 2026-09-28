@@ -1570,6 +1570,17 @@ pub(crate) fn apply_and_finish_unit(
         )),
         _ => None,
     };
+    // (core#546 / core#553) What the floor could not test on this host — the nested-sandbox env
+    // class — and any failure it excused as a load flake are said beside whatever else the note
+    // says: a floor that "passed" over tests it could not run is not a pass on them.
+    let env_note: Option<String> = carried
+        .as_ref()
+        .or(evidence.repo_checks.as_ref())
+        .and_then(|r| r.classification_note());
+    let rested_note: Option<String> = match (rested_note, env_note) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
     let floor_note: Option<String> = rested_note.or_else(|| {
         (unit.tool_cmd.is_none() && !has_deterministic_floor).then(|| {
             match (workdir.is_some(), evidence.tree_changed) {
