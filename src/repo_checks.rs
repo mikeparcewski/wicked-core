@@ -2386,10 +2386,10 @@ impl BaseTree {
     fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseRun> {
         let raw = std::fs::read_to_string(Self::cache_path(scratch, head, &check.name)).ok()?;
         let run = serde_json::from_str::<CheckRun>(&raw).ok()?;
-        // A targeted command is the head's argv run on the base, and it changes with the files a
-        // rework touches (`{files}`, the derived `-p <crate>`): a cached run of ANOTHER argv is
-        // not this comparison.
-        if check.name == "test_targeted" && run.argv != check.argv {
+        // The base runs the head's argv, and it can change within a run (a targeted command with
+        // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
+        // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
+        if run.argv != check.argv {
             return None;
         }
         Some(BaseRun {
@@ -2436,9 +2436,11 @@ impl BaseTree {
         })
     }
 
-    /// Run `check` on the base — by NAME, as the base's own detection spells it (a targeted
-    /// command keeps the head's substituted argv: it is the same change-scoped set on both
-    /// trees) — and cache the result under `base-cache/<head>-<name>.json` for the rest of the
+    /// Run `check` on the base with the HEAD's argv, once the base declares a check of that name
+    /// (a baseline diff compares one command on two trees: a change that edits the command — say
+    /// adds `--no-fail-fast` — would otherwise read the base's shorter failure list as the head's
+    /// regressions; a targeted command is the same change-scoped set on both trees) — and cache
+    /// the result under `base-cache/<head>-<name>.json` for the rest of the
     /// run ([`Self::cached`]). The base's install step runs first when its tree needs
     /// provisioning (the same frozen, scripts-off install the head got, out of the same scratch
     /// cache).
@@ -2466,19 +2468,13 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        let target = if check.name == "test_targeted" {
-            check.clone()
-        } else {
-            match detected.iter().find(|c| c.name == check.name) {
-                Some(c) => c.clone(),
-                None => {
-                    return fail(format!(
-                        "the run base declares no `{}` check (the change introduced it)",
-                        check.name
-                    ))
-                }
-            }
-        };
+        if check.name != "test_targeted" && !detected.iter().any(|c| c.name == check.name) {
+            return fail(format!(
+                "the run base declares no `{}` check (the change introduced it)",
+                check.name
+            ));
+        }
+        let target = check.clone();
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
             let r = run_one(&self.dir, install, sandbox, scratch, Tree::Base);
             if !r.passed() {
@@ -6004,6 +6000,52 @@ mod tests {
 
     /// A cached base run of a targeted command answers only the SAME argv: a rework that touches
     /// another crate derives another `-p`, and must not be compared against the first one's base.
+    /// A change that edits a configured command (fail-fast → `--no-fail-fast`) is compared on
+    /// the base with the SAME command: the base's shorter failure list is not read as the head's
+    /// regressions.
+    #[test]
+    fn the_base_runs_the_heads_command_when_the_change_edits_it() {
+        let repo = scratch("basecmd");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        let cfg = |script: &str| serde_json::json!({ "test": ["sh", "-c", script] }).to_string();
+        std::fs::write(
+            repo.join(".wicked/checks.json"),
+            cfg("echo 'test t::one ... FAILED'; exit 101"),
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::write(
+            repo.join(".wicked/checks.json"),
+            cfg("echo 'test t::one ... FAILED'; echo 'test t::two ... FAILED'; exit 101"),
+        )
+        .unwrap();
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the baseline diff cannot run");
+            return;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test")
+            .expect("test ran");
+        assert!(c.regressions.is_empty(), "{c:#?}");
+        let b = c
+            .base
+            .as_deref()
+            .and_then(|b| b.run.as_ref())
+            .expect("base ran");
+        assert_eq!(b.argv, c.argv, "the base ran the head's command");
+        assert!(report.passed, "{report:#?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn a_cached_targeted_base_run_answers_only_its_own_argv() {
         let wt = scratch("cache-argv");
