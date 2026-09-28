@@ -1298,6 +1298,9 @@ mod tests {
             // interactive bridge's docs root + recorder browser (`interactive`).
             "chats",
             "interactive",
+            // crew's MCP tools registry (`join(<state home>, 'mcp')`): fenced, never read by a
+            // worker — a worker reaches MCP tools only through the broker.
+            "mcp",
             // core#411 / wicked-crew#497: the two entries an OPERATOR variable can place under
             // the state home (`WICKED_WORKFLOWS_DIR`, `WICKED_STEERING_INBOX_DIR`) — fenced when
             // present, never a reason to refuse every launch; crew refuses to boot with the
