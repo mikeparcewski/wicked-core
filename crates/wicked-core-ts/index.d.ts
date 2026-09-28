@@ -302,6 +302,13 @@ export declare class Core {
    * (`action=request_changes` with `approve=true`, `action=approve` with `approve=false`, an
    * unknown token) rejects before the engine is asked.
    *
+   * (core#469 / core#467, additive.) Four more approve-shaped arms (`approve=true`, no `amend`
+   * / `amendScope`): `extend` | `targeted` | `accept_partial` answer the escalation gate of a
+   * repo-checks floor that did not finish (`repo_checks_timeout`) — the floor re-runs on the
+   * tree as it stands with 2× bounds, the targeted test set, or the unfinished checks waived —
+   * and `accept_suggestion` adopts the evaluator's discarded, pinned edit as the creator's
+   * amendment. The engine refuses each at any other gate.
+   *
    * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
    * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
    * as the next plan rev (floor phases added, never refused for being below the floor) or, if it

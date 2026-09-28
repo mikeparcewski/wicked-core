@@ -386,7 +386,9 @@ impl Campaign {
                     HumanDecision::Approve { amend, .. } => amend.clone(),
                     HumanDecision::RequestChanges { .. }
                     | HumanDecision::Reject
-                    | HumanDecision::EditPlan { .. } => None,
+                    | HumanDecision::EditPlan { .. }
+                    | HumanDecision::FloorRerun(_)
+                    | HumanDecision::AcceptSuggestion => None,
                 };
                 (k.clone(), amend)
             })

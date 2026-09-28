@@ -1249,6 +1249,13 @@ impl Core {
     /// (`action=request_changes` with `approve=true`, `action=approve` with `approve=false`, an
     /// unknown token) rejects before the engine is asked.
     ///
+    /// (core#469 / core#467, additive.) Four more approve-shaped arms (`approve=true`, no `amend`
+    /// / `amendScope`): `extend` | `targeted` | `accept_partial` answer the escalation gate of a
+    /// repo-checks floor that did not finish (`repo_checks_timeout`) — the floor re-runs on the
+    /// tree as it stands with 2× bounds, the targeted test set, or the unfinished checks waived —
+    /// and `accept_suggestion` adopts the evaluator's discarded, pinned edit as the creator's
+    /// amendment. The engine refuses each at any other gate.
+    ///
     /// (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
     /// edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
     /// as the next plan rev (floor phases added, never refused for being below the floor) or, if it
@@ -1302,15 +1309,38 @@ impl Core {
                 },
                 (None, false) | (Some("reject"), false) => HumanDecision::Reject,
                 (Some("request_changes"), false) => HumanDecision::RequestChanges { note: amend },
-                (Some(a @ ("approve" | "reject" | "request_changes")), _) => {
+                // (core#469) The timed-out floor's escalation arms; (core#467) adopt the
+                // evaluator's pinned edit. All approve-shaped, none takes an amendment.
+                (
+                    Some(a @ ("extend" | "targeted" | "accept_partial" | "accept_suggestion")),
+                    true,
+                ) => {
+                    if amend.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        || amend_scope.is_some()
+                    {
+                        return Err(err(anyhow::anyhow!(
+                            "action `{a}` takes no amend / amendScope"
+                        )));
+                    }
+                    HumanDecision::escalation_action(a).expect("an escalation action token")
+                }
+                (
+                    Some(
+                        a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
+                        | "accept_partial" | "accept_suggestion"),
+                    ),
+                    _,
+                ) => {
                     return Err(err(anyhow::anyhow!(
                         "action `{a}` disagrees with approve={approve} (request_changes and \
-                         reject require approve=false; approve requires approve=true)"
+                         reject require approve=false; approve, extend, targeted, accept_partial \
+                         and accept_suggestion require approve=true)"
                     )))
                 }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
-                        "unknown action `{other}` (expected approve | request_changes | reject)"
+                        "unknown action `{other}` (expected approve | request_changes | reject | \
+                         extend | targeted | accept_partial | accept_suggestion)"
                     )))
                 }
             };
