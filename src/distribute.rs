@@ -15,6 +15,11 @@
 //!   (`RoutingInfo::EvaluatorDistinct`), is disclosed when none exists on a bench-free roster, and
 //!   is REFUSED when a bench is what emptied the pool.
 //!
+//! * (crew#477) a BUILD unit — the unit that writes — prefers a seat that ENFORCES input
+//!   governance on its tool calls ([`seat_governs`]): with one available it is never routed to an
+//!   ungoverned seat (pi, codex, an unadmitted ACP adapter) just because that seat comes first in
+//!   the roster; with none, it is routed anyway and `degraded_reason` says so, by seat.
+//!
 //! The ONE thing distribution refuses — at plan time, before any unit runs — is a roster with no
 //! eligible seat for a unit ([`crate::skills_snapshot::SkillsError::NoEligibleSeat`],
 //! [`crate::NoEligibleSeat`]).
@@ -212,6 +217,45 @@ pub fn distribute_units_on_benched(
     distribute_units_against_benched(units, clis, session_id, snapshot.as_ref(), prior_benched)
 }
 
+/// (crew#477) Whether a seat ENFORCES input governance on a governed unit's tool calls: an ACP
+/// seat when its adapter is admitted (`acp_input_governance`, the flag `acp_runner` reads before
+/// it answers a tool call); a seat with no ACP adapter only when its wrapped template runs claude
+/// (the wrapped runner's PreToolUse gate-hook is claude-only and keys off the template's program —
+/// every other wrapped CLI runs with `governanceUnenforced`). Judged on the roster record the run
+/// was handed, so it is pure.
+pub(crate) fn seat_governs(seat: &AgenticCli) -> bool {
+    match &seat.acp {
+        Some(acp) => acp.acp_input_governance,
+        // The wrapped runner's own resolution, verbatim: the launch template (this record's, else
+        // the registry's) and its first token — never the record's `binary` field, which a
+        // template may contradict (codex review of #648).
+        None => {
+            let invocation =
+                Some(seat.headless_invocation.clone()).filter(|s| !s.trim().is_empty());
+            let template = crate::execute_wrapped::launch_invocation(&seat.key, invocation);
+            crate::execute_wrapped::binary_is_claude(&crate::execute_wrapped::template_binary(
+                &template,
+            ))
+        }
+    }
+}
+
+/// (crew#477) Is `unit` one whose seat must enforce governance — a seated BUILD unit, the stage
+/// that writes? Review/test units run read-only (the write posture), and a tool unit has no seat.
+fn needs_governed_seat(unit: &WorkUnit) -> bool {
+    unit.tool_cmd.is_none() && matches!(unit.stage, crate::domain::StageKind::Build)
+}
+
+/// `pool` with the seats that enforce governance first (stable, so roster order holds within
+/// each half) for a unit that [`needs_governed_seat`]; `pool` as is otherwise.
+fn governed_first(unit: &WorkUnit, pool: &[AgenticCli]) -> Vec<AgenticCli> {
+    let mut out = pool.to_vec();
+    if needs_governed_seat(unit) {
+        out.sort_by_key(|c| !seat_governs(c));
+    }
+    out
+}
+
 /// The candidate seats for one unit: the roster records routing picks among, and WHY they were
 /// narrowed — or `None` when every roster seat is a candidate.
 type Candidates = Option<(Vec<AgenticCli>, String)>;
@@ -376,9 +420,9 @@ pub(crate) fn distribute_units_against_benched(
             match candidates {
                 Some((admitted, why)) => Distribution {
                     seat_constraint: Some(why.clone()),
-                    ..teamed_distribution(admitted)
+                    ..teamed_distribution(&governed_first(unit, admitted))
                 },
-                None => teamed_distribution(clis),
+                None => teamed_distribution(&governed_first(unit, clis)),
             }
         })
         .collect();
@@ -415,10 +459,23 @@ pub(crate) fn distribute_units_against_benched(
                         None => true,
                     }
             };
+            // (crew#477) A member BUILD step takes a seat that enforces governance before one
+            // that does not; model-distinct first within each.
+            let governs = |k: &&String| {
+                !needs_governed_seat(u) || clis.iter().any(|c| &c.key == *k && seat_governs(c))
+            };
+            let model_distinct = |k: &&String| model_of(k) != model_of(pa);
             let pick = still_eligible
                 .iter()
                 .filter(admits)
-                .find(|k| model_of(k) != model_of(pa))
+                .find(|k| governs(k) && model_distinct(k))
+                .or_else(|| still_eligible.iter().filter(admits).find(|k| governs(k)))
+                .or_else(|| {
+                    still_eligible
+                        .iter()
+                        .filter(admits)
+                        .find(|k| model_distinct(k))
+                })
                 .or_else(|| still_eligible.iter().find(admits))
                 .cloned();
             match pick {
@@ -534,9 +591,25 @@ pub(crate) fn distribute_units_against_benched(
         } else {
             None
         };
-        d.degraded_reason = match &d.routing {
-            RoutingInfo::Tool => None,
-            _ => summary.clone(),
+        // (crew#477) A build unit left on a seat that does not enforce governance — no eligible
+        // seat that does admits it — is DEGRADED, by name: its tool calls run unchecked, and the
+        // operator reads that at the intake gate instead of after the unit has run.
+        let ungoverned = (needs_governed_seat(u)
+            && clis
+                .iter()
+                .any(|c| c.key == d.assigned_cli && !seat_governs(c)))
+        .then(|| {
+            format!(
+                "unit {} (build) runs on '{}', which does not enforce input governance \
+                 (acp_input_governance=false or no gate-hook adapter): no eligible seat that \
+                 enforces it admits this unit, so its tool calls run unchecked",
+                u.ord, d.assigned_cli
+            )
+        });
+        d.degraded_reason = match (&d.routing, summary.clone(), ungoverned) {
+            (RoutingInfo::Tool, _, _) => None,
+            (_, Some(bench), Some(gov)) => Some(format!("{bench}; {gov}")),
+            (_, bench, gov) => bench.or(gov),
         };
     }
     Ok(dists)
@@ -803,7 +876,19 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
-            acp: None,
+            // (crew#477) A stub seat ENFORCES input governance (an admitted ACP adapter), so the
+            // routing these tests pin is roster order; the governance preference has its own
+            // tests below, on seats that do not.
+            acp: Some(wicked_council::types::AcpConfig {
+                binary: format!("{key}-acp"),
+                start_args: vec![],
+                transport: Default::default(),
+                auth_method: None,
+                acp_input_governance: true,
+                os_sandbox: false,
+                acp_governance_env: None,
+                verified_version: None,
+            }),
             capabilities: Some(format!("{key} capabilities")),
             login_invocation: None,
             health: None,
@@ -2412,5 +2497,124 @@ mod tests {
             err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
             "{err:?}"
         );
+    }
+
+    // ── crew#477: a build unit is never routed to an ungoverned seat while a governed one is
+    //    eligible; with none, the plan is degraded with the reason ─────────────────────────────
+
+    /// A seat with an ACP adapter whose admission to input governance is `admitted`.
+    fn acp_seat(key: &str, admitted: bool) -> AgenticCli {
+        let mut c = seat_running(key, key);
+        c.acp = Some(wicked_council::types::AcpConfig {
+            binary: format!("{key}-acp"),
+            start_args: vec![],
+            transport: Default::default(),
+            auth_method: None,
+            acp_input_governance: admitted,
+            os_sandbox: false,
+            acp_governance_env: None,
+            verified_version: None,
+        });
+        c
+    }
+
+    /// A unit at `ord` whose description classifies to `stage`.
+    fn described(ord: u32, description: &str, stage: StageKind) -> WorkUnit {
+        let u = WorkUnit::pending(format!("u{ord}"), "s1", ord, description.to_string());
+        assert_eq!(
+            u.stage, stage,
+            "fixture description must classify as {stage:?}"
+        );
+        u
+    }
+
+    #[test]
+    fn seat_governs_reads_the_acp_admission_or_the_claude_gate_hook() {
+        assert!(seat_governs(&acp_seat("claude", true)));
+        assert!(!seat_governs(&acp_seat("pi", false)));
+        let wrapped = |key: &str| AgenticCli {
+            acp: None,
+            ..seat_running(key, key)
+        };
+        assert!(
+            seat_governs(&wrapped("claude")),
+            "wrapped claude arms the gate-hook"
+        );
+        assert!(
+            !seat_governs(&wrapped("codex")),
+            "wrapped codex has no gate-hook"
+        );
+        // The template decides, as it does for the wrapped runner — not the record's `binary`.
+        let mislabelled = AgenticCli {
+            binary: "claude".into(),
+            headless_invocation: "codex exec {PROMPT}".into(),
+            ..wrapped("claude")
+        };
+        assert!(
+            !seat_governs(&mislabelled),
+            "a codex template arms no gate-hook"
+        );
+    }
+
+    #[test]
+    fn a_build_unit_skips_an_ungoverned_seat_first_in_the_roster_for_a_governed_one() {
+        // crew#477's shape: "Present the proposed plan … launch nothing until it is approved"
+        // became its own BUILD unit and landed on pi (acp_input_governance=false), which then ran
+        // the whole test suite unchecked. With a governed seat eligible it must not.
+        let roster = [acp_seat("pi", false), acp_seat("claude", true)];
+        let units = [
+            described(1, "Research the repository layout", StageKind::Recon),
+            described(
+                2,
+                "Present the proposed plan at the intake gate and launch nothing until it is approved.",
+                StageKind::Build,
+            ),
+        ];
+        let dists = distribute_units_against(&units, &roster, "s1", None).unwrap();
+        assert_eq!(
+            dists[0].assigned_cli, "pi",
+            "a recon unit keeps roster order"
+        );
+        assert_eq!(dists[1].assigned_cli, "claude", "{:?}", dists[1]);
+        assert_eq!(dists[1].degraded_reason, None);
+    }
+
+    #[test]
+    fn a_build_unit_with_no_governed_seat_eligible_is_routed_degraded_by_name() {
+        // claude is on the roster but benched: pi is the only eligible seat.
+        let mut claude = acp_seat("claude", true);
+        claude.health = Some(wicked_council::types::SeatHealth {
+            usable: false,
+            reason: Some("signed out".into()),
+        });
+        let roster = [claude, acp_seat("pi", false)];
+        let units = [described(1, "Implement the fix", StageKind::Build)];
+        let dists = distribute_units_against(&units, &roster, "s1", None).unwrap();
+        assert_eq!(dists[0].assigned_cli, "pi");
+        let why = dists[0].degraded_reason.as_deref().expect("degraded");
+        assert!(
+            why.contains("1 of 2"),
+            "the bench summary still leads: {why}"
+        );
+        assert!(
+            why.contains("unit 1 (build) runs on 'pi', which does not enforce input governance"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn review_units_are_not_degraded_for_an_ungoverned_seat() {
+        // The evaluator≠creator fence moves the review OFF the governed builder seat by design;
+        // it runs read-only, so its seat is not a governance degrade.
+        let roster = [acp_seat("claude", true), acp_seat("pi", false)];
+        let units = [
+            described(1, "Implement the fix", StageKind::Build),
+            described(2, "Review the change", StageKind::Review),
+        ];
+        let dists = distribute_units_against(&units, &roster, "s1", None).unwrap();
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert_eq!(dists[1].assigned_cli, "pi");
+        assert_eq!(dists[0].degraded_reason, None);
+        assert_eq!(dists[1].degraded_reason, None);
     }
 }
