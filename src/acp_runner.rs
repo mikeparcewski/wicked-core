@@ -6150,12 +6150,12 @@ impl AcpStepRunner {
     /// `false` (and nothing recorded) when the chat holds no pool entry: a hold on a chat that is
     /// already gone would pin nothing and could only leak.
     pub fn chat_hold(&self, chat_id: &str, run_id: &str) -> bool {
-        let pooled = {
-            let prefix = Self::chat_pool_key(chat_id);
-            let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            guard.keys().any(|(rid, _)| rid == &prefix)
-        };
-        if !pooled {
+        // The pool check and the insert happen under the `sessions` lock, the lock `chat_close`
+        // holds while it drops the chat's holds (order: `sessions`, then `chat_holds`). A close
+        // cannot land between them and leave a hold on a chat that is gone.
+        let prefix = Self::chat_pool_key(chat_id);
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if !sessions.keys().any(|(rid, _)| rid == &prefix) {
             return false;
         }
         self.chat_holds
@@ -6809,6 +6809,12 @@ impl AcpStepRunner {
         {
             let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard.retain(|(rid, _), _| rid != &prefix);
+            // Its holds go under the same lock (crew#619): a closed chat has nothing left to keep
+            // warm, and `chat_hold` checks the pool under this lock, so none can land after.
+            self.chat_holds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(chat_id);
         }
         // Drop the activity entry too. It is small, but it is keyed by an unbounded stream of
         // client-minted chat ids — leaving it behind trades a 520 MB leak for a slower one.
@@ -6818,11 +6824,6 @@ impl AcpStepRunner {
             .remove(chat_id);
         // And the recorded scope (core#410): a closed chat holds no cwd/graph/roots either.
         self.chat_scopes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(chat_id);
-        // And its holds (crew#619): a closed chat has nothing left to keep warm.
-        self.chat_holds
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(chat_id);
