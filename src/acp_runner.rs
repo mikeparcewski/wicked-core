@@ -2471,8 +2471,12 @@ fn start_acp_process_with_write_roots(
     // turn. A chat session (`session: None`) gets none: it has no unit to judge a call for.
     // Known limit of a reused process: work an earlier unit backgrounded can still reach the
     // broker while a LATER unit of the same run, on the same seat, is bound, and is judged as that
-    // unit. Never across a posture change: a fenced unit never shares a process with a
-    // write-posture one (F-036), and a fenced unit's process is killed when its unit ends.
+    // unit. Never across a write-fence change: a fenced unit (read-only or deliverable-roots) never
+    // shares a process with a `Full` one (F-036), and a fenced unit's process is killed when its
+    // unit ends. It CAN cross a role change between two `Full` units (an `executes_code` evaluator
+    // and a creator): D-1 keys on the role too, so a call such an evaluator backgrounded is judged
+    // as the later creator. That evaluator already holds unfenced filesystem writes, so this
+    // widens nothing it could not do; the ACP env is fixed at spawn, so the token cannot rotate.
     let mcp_token = session
         .and(crate::mcp_gate::daemon_crew_url())
         .map(|url| (crate::mcp_gate::McpToken::mint(), url));

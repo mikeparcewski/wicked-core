@@ -513,6 +513,12 @@ pub(crate) fn evaluate(
                 })
                 .cloned()
                 .collect();
+            // Never a deny that names nothing: fall back to every rule the claim carries.
+            let denying = if denying.is_empty() {
+                claim.policy_ids.clone()
+            } else {
+                denying
+            };
             let reason = format!(
                 "mcp: `{subject}` is denied by policy {}",
                 denying.join(", ")
