@@ -256,11 +256,12 @@ export declare class Core {
   chatSeats(chatId: string): Promise<string>
   /**
    * Every chat currently holding pool state — JSON array of
-   * `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots}]`, sorted by id. `cwd` /
+   * `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots, heldBy}]`, sorted by id. `cwd` /
    * `codeGraphDb` / `readRoots` are the scope recorded at `chatOpen` (wicked-core#410): where the
    * seats run, the estate graph their read-only estate MCP is bound to (`null` ⇒ none), and the
    * repository roots in scope (`[]` when none); `cwd` is `null` only for a pool entry whose scope
-   * is gone (a chat mid-close).
+   * is gone (a chat mid-close). `heldBy` lists the runs launched from the chat that keep it
+   * warm (`chatHold`, crew#619).
    *
    * Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
    * chat ids freely, so without this an accumulation is invisible until the host runs out of
@@ -273,6 +274,13 @@ export declare class Core {
    * value that never meant a duration.
    */
   chatList(): Promise<string>
+  /**
+   * Hold a chat warm for a run launched from it (crew#619): the engine's idle reaper passes the
+   * chat over until that run is terminal, and its idle clock restarts then. Resolves `"true"`,
+   * or `"false"` when the chat is not open on this engine (nothing held). Call it right after
+   * `launchRun` resolves the run id.
+   */
+  chatHold(chatId: string, runId: string): Promise<string>
   /**
    * Close a chat's warm sessions (idempotent); emits
    * `chatClosed` with `reason: "requested"`.

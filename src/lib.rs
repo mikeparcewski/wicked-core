@@ -347,7 +347,10 @@ impl Drop for ShutdownGuard {
 ///
 /// `WICKED_CHAT_IDLE_SECS=0` disables it entirely, for a host that would rather pay the memory
 /// than ever have a chat reclaimed underneath it.
-fn spawn_chat_reaper(runner: &std::sync::Arc<AcpStepRunner>) {
+///
+/// A chat a run was launched from (crew#619, [`Core::chat_hold`]) is passed over while the STORE
+/// says that run is non-terminal: asked once per sweep over `tx`, and only when some chat is held.
+fn spawn_chat_reaper(runner: &std::sync::Arc<AcpStepRunner>, tx: Sender<Command>) {
     let ttl = AcpStepRunner::chat_idle_ttl();
     if ttl.is_zero() {
         return;
@@ -362,11 +365,40 @@ fn spawn_chat_reaper(runner: &std::sync::Arc<AcpStepRunner>) {
         // sleep would keep the runner (and its child processes) alive past the Core.
         match weak.upgrade() {
             Some(runner) => {
-                runner.chat_reap_idle(ttl);
+                let live = live_runs(&tx, &runner.chat_held_runs());
+                runner.chat_reap_idle(ttl, &|run| live.contains(run));
             }
             None => break,
         }
     });
+}
+
+/// Which of `runs` the store reports non-terminal (crew#619's chat holds). No query when `runs` is
+/// empty, the common case. A store that cannot answer keeps every hold: a chat kept warm one sweep
+/// too long costs memory, while a chat reclaimed under a live run loses the operator's thread.
+fn live_runs(tx: &Sender<Command>, runs: &[String]) -> std::collections::HashSet<String> {
+    if runs.is_empty() {
+        return Default::default();
+    }
+    let keep_all = || runs.iter().cloned().collect();
+    let (reply, rx) = channel();
+    if tx.send(Command::Projects(reply)).is_err() {
+        return keep_all();
+    }
+    match rx.recv() {
+        Ok(Ok(views)) => views
+            .into_iter()
+            .filter(|v| {
+                runs.contains(&v.session.id)
+                    && !matches!(
+                        v.session.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    )
+            })
+            .map(|v| v.session.id)
+            .collect(),
+        _ => keep_all(),
+    }
 }
 
 /// A handle to the core runtime. Clone freely — every clone funnels into the single store-owning
@@ -533,6 +565,13 @@ impl Core {
     /// host runs out of memory (FINDING-027).
     pub fn chat_list(&self) -> anyhow::Result<Vec<crate::acp_runner::ChatInfo>> {
         Ok(self.chat_runner()?.chat_list())
+    }
+
+    /// Hold `chat_id` warm for `run_id`, a run launched from it (crew#619): the idle reaper passes
+    /// the chat over until the run is terminal, then its idle clock restarts. `Ok(false)` when the
+    /// chat is not open on this engine (nothing to hold). Call it right after the launch returns.
+    pub fn chat_hold(&self, chat_id: &str, run_id: &str) -> anyhow::Result<bool> {
+        Ok(self.chat_runner()?.chat_hold(chat_id, run_id))
     }
 
     /// Close a chat's warm sessions (idempotent); emits `ChatClosed { reason: "requested" }`.
@@ -746,7 +785,7 @@ impl Core {
                 team_link,
             )
         });
-        spawn_chat_reaper(&runner);
+        spawn_chat_reaper(&runner, tx.clone());
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
         // it polls strictly after the bus tail as of now, or has reported itself not armed.
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
@@ -1884,6 +1923,103 @@ impl Core {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// crew#619: the reaper's liveness oracle reads the STORE. A run paused at a gate is live
+    /// (the operator is mid-run), a cancelled one is not, and an id the store has never heard of
+    /// is not live either, so a hold on it is released rather than kept forever.
+    #[test]
+    fn the_chat_reapers_liveness_oracle_reads_run_status_from_the_store() {
+        use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+        struct Ballot;
+        impl Dispatcher for Ballot {
+            fn dispatch(&self, cli: &AgenticCli, _t: &wicked_council::CouncilTask) -> Option<Vote> {
+                Some(Vote {
+                    cli: cli.key.clone(),
+                    recommendation: "x".into(),
+                    top_risk: "none".into(),
+                    change_my_mind: "no".into(),
+                    disqualifier: None,
+                    confidence: Confidence::default(),
+                    provenance: "stub".into(),
+                })
+            }
+        }
+        let cli = |key: &str| AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: "unused {PROMPT}".into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            health: None,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-chat-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("estate.db").display().to_string();
+        let core = Core::spawn_with_engine(db, Arc::new(Ballot), Arc::new(StubStepRunner));
+        core.register_workflow(
+            r#"{"id":"hold-2","phases":[{"id":"one","kind":"build","gate":"auto"},{"id":"two","kind":"build","gate":"auto","depends_on":["one"]}]}"#,
+        )
+        .expect("register");
+        core.launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "Do step one. Do step two".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: EntityMode::Shared,
+            session_id: "held".into(),
+            human_confirm: HumanConfirm::Before(1),
+            auto_deliver: false,
+            repo_ref: None,
+            workflow: Some("hold-2".into()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: None,
+            deliver_step: None,
+        })
+        .expect("launch");
+        let runs = vec!["held".to_string(), "ghost".to_string()];
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let paused = || {
+            core.sessions_detail().is_ok_and(|views| {
+                views.iter().any(|v| {
+                    v.session.id == "held" && v.session.status == SessionStatus::AwaitingHuman
+                })
+            })
+        };
+        while !paused() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(paused(), "the run reaches its gate");
+        let live = live_runs(&core.tx, &runs);
+        assert!(
+            live.contains("held"),
+            "a run paused at its gate is live: {live:?}"
+        );
+        assert!(
+            !live.contains("ghost"),
+            "an unknown run is not live: {live:?}"
+        );
+
+        assert_eq!(core.cancel_run("held").unwrap(), SessionStatus::Cancelled);
+        assert!(
+            live_runs(&core.tx, &runs).is_empty(),
+            "a cancelled run is not live"
+        );
+        assert!(live_runs(&core.tx, &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // Proves the P1 pattern end to end: one actor owns the store, serves a read, and fans events
     // out to subscribers — all in-process, no file polling, no second writer.

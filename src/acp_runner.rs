@@ -5626,6 +5626,11 @@ pub struct AcpStepRunner {
     /// the same scope — stamped with the OPEN GENERATION that recorded it, so an older open still
     /// finishing cannot drop a newer open's record (Copilot, #426). Removed with the chat.
     chat_scopes: Arc<Mutex<HashMap<String, RecordedScope>>>,
+    /// The runs each chat promoted (crew#619): chat id → run ids. A chat the operator used to
+    /// launch a run is still in use while that run executes, though nobody types into it, so the
+    /// idle reaper passes a held chat over until every run holding it is terminal. Removed with
+    /// the chat.
+    chat_holds: Arc<Mutex<HashMap<String, std::collections::BTreeSet<String>>>>,
     /// Monotonic open counter behind [`RecordedScope::gen`].
     chat_open_seq: Arc<std::sync::atomic::AtomicU64>,
     fallback: WrappedCliStepRunner,
@@ -5698,6 +5703,9 @@ pub struct ChatInfo {
     /// What the seats run against (core#410 / crew#502); `None` for a pool entry whose scope was
     /// never recorded (a chat mid-close).
     pub scope: Option<ChatScope>,
+    /// The runs this chat promoted that still hold it warm (crew#619), sorted. While any is
+    /// non-terminal the idle reaper passes the chat over; empty for a chat that promoted nothing.
+    pub held_by: Vec<String>,
 }
 
 /// What a chat's seats run against (core#410 / crew#502, F-067): the scratch directory they run
@@ -5984,6 +5992,7 @@ impl AcpStepRunner {
             auth_failed: Arc::new(Mutex::new(HashSet::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             chat_scopes: Arc::new(Mutex::new(HashMap::new())),
+            chat_holds: Arc::new(Mutex::new(HashMap::new())),
             chat_open_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             timeout: Duration::from_secs(secs),
             operational_home: None,
@@ -6102,6 +6111,11 @@ impl AcpStepRunner {
             .iter()
             .map(|(id, r)| (id.clone(), r.scope.clone()))
             .collect();
+        let holds = self
+            .chat_holds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let mut out: Vec<ChatInfo> = by_chat
             .into_iter()
             .map(|(chat_id, mut seats)| {
@@ -6115,6 +6129,10 @@ impl AcpStepRunner {
                     .unwrap_or(u64::MAX);
                 ChatInfo {
                     scope: scopes.get(&chat_id).cloned(),
+                    held_by: holds
+                        .get(&chat_id)
+                        .map(|runs| runs.iter().cloned().collect())
+                        .unwrap_or_default(),
                     chat_id,
                     seats,
                     idle_secs,
@@ -6125,13 +6143,67 @@ impl AcpStepRunner {
         out
     }
 
-    /// Close every chat idle longer than `ttl`. Returns the ids reaped, oldest first.
-    pub fn chat_reap_idle(&self, ttl: Duration) -> Vec<String> {
+    /// Hold `chat_id` warm for `run_id`, a run launched from it (crew#619). The idle reaper passes
+    /// a held chat over until every run holding it is terminal; the chat's TTL then restarts from
+    /// that moment, so an operator who comes back to review the run finds the chat still there.
+    ///
+    /// `false` (and nothing recorded) when the chat holds no pool entry: a hold on a chat that is
+    /// already gone would pin nothing and could only leak.
+    pub fn chat_hold(&self, chat_id: &str, run_id: &str) -> bool {
+        // The pool check and the insert happen under the `sessions` lock, the lock `chat_close`
+        // holds while it drops the chat's holds (order: `sessions`, then `chat_holds`). A close
+        // cannot land between them and leave a hold on a chat that is gone.
+        let prefix = Self::chat_pool_key(chat_id);
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if !sessions.keys().any(|(rid, _)| rid == &prefix) {
+            return false;
+        }
+        self.chat_holds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(chat_id.to_string())
+            .or_default()
+            .insert(run_id.to_string());
+        true
+    }
+
+    /// Every run holding a chat warm, deduplicated — what the reaper asks the store about.
+    pub fn chat_held_runs(&self) -> Vec<String> {
+        let holds = self.chat_holds.lock().unwrap_or_else(|p| p.into_inner());
+        let runs: std::collections::BTreeSet<String> = holds.values().flatten().cloned().collect();
+        runs.into_iter().collect()
+    }
+
+    /// Drop every hold whose run `run_live` no longer reports live, and touch each chat that
+    /// thereby lost its LAST hold: the run's end is the chat's last use.
+    fn release_ended_holds(&self, run_live: &dyn Fn(&str) -> bool) {
+        let released: Vec<String> = {
+            let mut holds = self.chat_holds.lock().unwrap_or_else(|p| p.into_inner());
+            let mut released = Vec::new();
+            holds.retain(|chat_id, runs| {
+                runs.retain(|run| run_live(run));
+                if runs.is_empty() {
+                    released.push(chat_id.clone());
+                }
+                !runs.is_empty()
+            });
+            released
+        };
+        for chat_id in released {
+            self.chat_touch(&chat_id);
+        }
+    }
+
+    /// Close every chat idle longer than `ttl`, except a chat a live run still holds (crew#619).
+    /// `run_live` answers whether a run is still non-terminal; a hold on a run it does not
+    /// report live is released first. Returns the ids reaped, oldest first.
+    pub fn chat_reap_idle(&self, ttl: Duration, run_live: &dyn Fn(&str) -> bool) -> Vec<String> {
+        self.release_ended_holds(run_live);
         let ttl_secs = ttl.as_secs();
         let mut victims: Vec<(u64, String)> = self
             .chat_list()
             .into_iter()
-            .filter(|c| c.idle_secs >= ttl_secs)
+            .filter(|c| c.idle_secs >= ttl_secs && c.held_by.is_empty())
             .map(|c| (c.idle_secs, c.chat_id))
             .collect();
         // Oldest first, so a caller reading the returned list sees them in the order they aged out.
@@ -6173,11 +6245,13 @@ impl AcpStepRunner {
         let Some(excess) = live.len().checked_sub(cap).filter(|n| *n > 0) else {
             return Vec::new();
         };
-        // Most idle first. The caller touches the chat it is opening BEFORE calling this, so that
-        // chat sorts last and opening a chat can never evict the chat being opened.
+        // Unheld before held (crew#619: a chat a live run holds goes last, only when nothing else
+        // can), then most idle first. The caller touches the chat it is opening BEFORE calling
+        // this, so that chat sorts last among its kind and opening a chat never evicts itself.
         live.sort_by(|a, b| {
-            b.idle_secs
-                .cmp(&a.idle_secs)
+            (!a.held_by.is_empty())
+                .cmp(&!b.held_by.is_empty())
+                .then_with(|| b.idle_secs.cmp(&a.idle_secs))
                 .then_with(|| a.chat_id.cmp(&b.chat_id))
         });
         live.into_iter()
@@ -6735,6 +6809,12 @@ impl AcpStepRunner {
         {
             let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard.retain(|(rid, _), _| rid != &prefix);
+            // Its holds go under the same lock (crew#619): a closed chat has nothing left to keep
+            // warm, and `chat_hold` checks the pool under this lock, so none can land after.
+            self.chat_holds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(chat_id);
         }
         // Drop the activity entry too. It is small, but it is keyed by an unbounded stream of
         // client-minted chat ids — leaving it behind trades a 520 MB leak for a slower one.
@@ -14816,7 +14896,7 @@ os_sandbox = true
         seed_chat(&r, "stale", MAX_BACKDATE);
         seed_chat(&r, "fresh", 0);
 
-        let reaped = r.chat_reap_idle(TEST_TTL);
+        let reaped = r.chat_reap_idle(TEST_TTL, &|_| false);
 
         assert_eq!(reaped, vec!["stale".to_string()]);
         assert_eq!(
@@ -14829,6 +14909,85 @@ os_sandbox = true
             vec![("stale".to_string(), "idle".to_string())],
             "a reclaim must be distinguishable from an operator's own close"
         );
+    }
+
+    /// crew#619: a chat that launched a run is still in use while that run executes, though
+    /// nobody types into it — the operator follows the run, then comes back to the chat for the
+    /// next launch. It must survive the reaper until the run is terminal, and then get a fresh
+    /// TTL rather than being reclaimed on the very next sweep.
+    #[test]
+    fn a_chat_held_by_a_live_run_survives_the_reaper_until_the_run_ends() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "promoted", MAX_BACKDATE);
+        seed_chat(&r, "abandoned", MAX_BACKDATE);
+        assert!(r.chat_hold("promoted", "run-1"));
+        assert!(
+            !r.chat_hold("never-opened", "run-2"),
+            "a hold on a chat with no pool entry is refused, not recorded"
+        );
+        assert_eq!(r.chat_held_runs(), vec!["run-1".to_string()]);
+
+        // run-1 executing: only the abandoned chat goes.
+        let live = |run: &str| run == "run-1";
+        assert_eq!(
+            r.chat_reap_idle(TEST_TTL, &live),
+            vec!["abandoned".to_string()]
+        );
+        let listed = r.chat_list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].chat_id, "promoted");
+        assert_eq!(listed[0].held_by, vec!["run-1".to_string()]);
+
+        // run-1 terminal: the hold is released and the chat's TTL restarts, so it survives this
+        // sweep and is reclaimed only once it has been idle a full TTL again.
+        assert!(r.chat_reap_idle(TEST_TTL, &|_| false).is_empty());
+        assert!(r.chat_list()[0].held_by.is_empty());
+        assert!(r.chat_held_runs().is_empty());
+        r.chat_activity
+            .lock()
+            .unwrap()
+            .insert("promoted".to_string(), backdated(MAX_BACKDATE));
+        assert_eq!(
+            r.chat_reap_idle(TEST_TTL, &|_| false),
+            vec!["promoted".to_string()]
+        );
+        assert_eq!(
+            closed_chats(&rx),
+            vec![
+                ("abandoned".to_string(), "idle".to_string()),
+                ("promoted".to_string(), "idle".to_string())
+            ]
+        );
+    }
+
+    /// The pool cap is the hard bound, so it may still take a held chat, but only when every
+    /// candidate is held. An unheld chat always goes first, however recently it was used.
+    #[test]
+    fn the_pool_cap_evicts_unheld_chats_before_a_held_one() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "held-oldest", 3);
+        seed_chat(&r, "unheld", 1);
+        seed_chat(&r, "newest", 0);
+        assert!(r.chat_hold("held-oldest", "run-1"));
+
+        assert_eq!(r.chat_enforce_cap(2), vec!["unheld".to_string()]);
+        assert_eq!(r.chat_enforce_cap(1), vec!["newest".to_string()]);
+    }
+
+    /// Closing a chat drops its holds: a closed chat has nothing to keep warm, and a hold left
+    /// behind would name a run to the reaper forever.
+    #[test]
+    fn closing_a_chat_drops_its_holds() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "c1", 0);
+        assert!(r.chat_hold("c1", "run-1"));
+
+        r.chat_close("c1", ChatCloseReason::Requested);
+
+        assert!(r.chat_held_runs().is_empty());
     }
 
     /// A touch is what proves a chat is still in use, and `chat_ensure` is the funnel every use
@@ -14847,7 +15006,7 @@ os_sandbox = true
         assert!(r.chat_ensure("c1", "no-such-cli-xyz").is_err());
 
         assert!(
-            r.chat_reap_idle(TEST_TTL).is_empty(),
+            r.chat_reap_idle(TEST_TTL, &|_| false).is_empty(),
             "a chat someone just tried to warm a seat on is not idle"
         );
     }
@@ -14917,7 +15076,7 @@ os_sandbox = true
             activity.insert("opening".to_string(), Instant::now());
         }
 
-        r.chat_reap_idle(TEST_TTL);
+        r.chat_reap_idle(TEST_TTL, &|_| false);
 
         let remaining: Vec<String> = r.chat_activity.lock().unwrap().keys().cloned().collect();
         assert_eq!(
@@ -14940,7 +15099,10 @@ os_sandbox = true
         );
 
         assert_eq!(r.chat_list()[0].idle_secs, u64::MAX);
-        assert_eq!(r.chat_reap_idle(TEST_TTL), vec!["orphan".to_string()]);
+        assert_eq!(
+            r.chat_reap_idle(TEST_TTL, &|_| false),
+            vec!["orphan".to_string()]
+        );
     }
 
     /// The enumerate surface (FINDING-027 gap 4): a leak nobody can list is a leak nobody can
@@ -20190,6 +20352,12 @@ transport = "stdio"
     /// `WICKED_GARDEN_ROOT=<root>` and `<root>/scripts` at the front of the daemon's `PATH`. A
     /// carrier that IS pi (the stub renamed `pi`) gets the flags instead and no path-list, and the
     /// launcher environment all the same. A delivery-less spawn gets none of the three.
+    ///
+    /// (core#588 / core#598) The daemon's OWN `WICKED_GARDEN_ROOT` is pinned to a decoy here, not
+    /// inherited from whoever runs the suite: the Claude Code garden plugin exports it, and a seat
+    /// that inherited it would run the operator's live checkout instead of the pinned generation
+    /// (the reading this settles — the spawn strips it via `ENGINE_INTERNAL_ENV`, the launcher sets
+    /// it only from the delivery). The decoy must never reach the bridge, delivered or not.
     #[test]
     #[cfg(unix)]
     fn a_separate_pi_bridge_is_handed_the_skill_dirs_and_launcher_env_not_flags() {
@@ -20197,9 +20365,11 @@ transport = "stdio"
             SkillsDelivery, GARDEN_ROOT_ENV, PATH_LIST_SEPARATOR, PI_SKILL_DIRS_ENV,
         };
         use std::ffi::OsString;
-        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
-        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("pi-acp-env");
+        let decoy = dir.join("operator-garden-checkout");
+        let _ambient = EnvPin::set(GARDEN_ROOT_ENV, &decoy);
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dump = dir.join("env.txt");
         let body = format!(
             "#!/bin/sh\n{{ for a in \"$@\"; do printf 'ARG %s\\n' \"$a\"; done; printf 'ENV \
@@ -20285,11 +20455,17 @@ transport = "stdio"
         assert_eq!(env[GARDEN_ROOT_ENV], snapshot.to_string_lossy());
         assert!(env["PATH"].starts_with(&scripts_prefix), "{}", env["PATH"]);
 
-        // Nothing delivered ⇒ none of the three.
+        // Nothing delivered ⇒ none of the three — and the daemon's own garden root does not leak
+        // in to fill the gap (core#588).
         let (args, env) = start(&bridge, &SkillsDelivery::None);
         assert!(!args.iter().any(|x| x == "--no-skills" || x == "--skill"));
         assert_eq!(env[PI_SKILL_DIRS_ENV], "UNSET");
-        assert_eq!(env[GARDEN_ROOT_ENV], "UNSET");
+        assert_eq!(
+            env[GARDEN_ROOT_ENV],
+            "UNSET",
+            "the daemon's ambient {GARDEN_ROOT_ENV} ({}) reached a seat nothing was delivered to",
+            decoy.display()
+        );
         assert!(!env["PATH"].starts_with(&scripts_prefix), "{}", env["PATH"]);
         assert_eq!(env["PATH"], daemon_path, "the daemon's PATH, untouched");
         let _ = std::fs::remove_dir_all(&dir);
