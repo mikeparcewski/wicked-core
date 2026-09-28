@@ -1730,7 +1730,11 @@ impl WrappedCliStepRunner {
                     Some(ws)
                 }
             } else {
-                None
+                // core#548: with no strict per-seat profile, every worker in a run worktree
+                // still gets the repository boundary — its own tree writable, the clone and its
+                // sibling worktrees read-only at the OS (`worker_sandbox`). `None` (not a run
+                // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
+                crate::worker_sandbox::default_worker_sandbox(&cwd, &worker_write_roots, &cli_key)
             };
             // `build_worker_command` HARDENS at construction (FINDING-067): no estate tool the worker
             // spawns may inherit a store from the environment. Stripped UNCONDITIONALLY — governed or

@@ -69,6 +69,7 @@ mod team;
 mod terminal;
 mod validator;
 mod validator_vault;
+mod worker_sandbox;
 mod workflow;
 mod worktree_guard;
 mod write_posture;

@@ -3479,6 +3479,84 @@ mod tests {
     /// tried to `mkdir` it under `--ro-bind / /` and died before exec (`Can't mkdir … Read-only
     /// file system`, exit 1) — every floor check and every pinned validator failed, blamed on the
     /// work. Prints its skip where bwrap is absent.
+    /// core#460 (F-SMOKE-001): the pinned floor runs inside the jail against a NESTED run worktree
+    /// whose `.git` is a FILE pointing at `<clone>/.git/worktrees/<name>` — outside the rw-bound
+    /// run dir — with the clone under the system temp dir (the CI and smoke layout). The floor must
+    /// see the worker's change and write its report in the tree, and PASS. Reproduced before the
+    /// C8 revision (#505): the whole-temp `--tmpfs` hid the gitdir, `git status` died with
+    /// "not a git repository", and the floor denied work that was plainly there. Runs under
+    /// whichever launcher arms (bwrap on the ubuntu CI leg, sandbox-exec on macOS); prints its skip
+    /// where none does.
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_passes_and_writes_its_report_in_a_nested_worktree_460() {
+        let base = std::env::temp_dir().join(format!("wicked-val-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&clone, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(clone.join("add.js"), "a\n").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-qm", "init"]);
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wicked/run",
+                "wicked-worktrees/run",
+            ],
+        );
+        let tree = clone.join("wicked-worktrees").join("run");
+        assert!(
+            tree.join(".git").is_file(),
+            "a nested worktree's .git is a file"
+        );
+        std::fs::write(tree.join("add.js"), "a\nb\n").unwrap();
+        let v = DeterministicValidator {
+            criterion: "the floor sees the change and writes its report".to_string(),
+            script: "git status --porcelain --untracked-files=no | grep -q . && touch report.json"
+                .to_string(),
+            approved: true,
+        };
+        let (outcome, level) = run_validator_reporting(&v, &tree, None).expect("validator runs");
+        if level != SandboxLevel::Sandboxed {
+            eprintln!(
+                "validator: no write boundary armed here — the #460 nested-worktree proof skips"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert_eq!(
+            outcome,
+            ValidatorOutcome::Passed,
+            "the jailed floor must see the worker's change"
+        );
+        assert!(
+            tree.join("report.json").is_file(),
+            "the report is written inside the tree"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bwrap_arms_on_a_home_lacking_secret_dirs_and_masks_only_those_that_exist_460() {
