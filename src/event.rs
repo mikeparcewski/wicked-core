@@ -1200,6 +1200,10 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         "preExisting": c.pre_existing,
         "regressions": c.regressions,
         "base": c.base.as_deref().map(base_run_json),
+        // core#546 / core#553 (additive): the ids the host cannot run under the floor, and the
+        // isolated re-runs of a small head-only failure set.
+        "envCannotRun": c.env_cannot_run,
+        "reruns": c.reruns.iter().map(check_run_json).collect::<Vec<_>>(),
     })
 }
 
