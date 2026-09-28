@@ -67,10 +67,12 @@ pub(crate) const OPENCODE_GOVERNED_AGENT: &str = "build";
 
 /// `OPENCODE_CONFIG_CONTENT` for an opencode seat: `existing` (the seat's governance content, the
 /// skills-composed document, or nothing) with every MCP tool denied and hidden. Composed, never
-/// replaced: every other key is kept. opencode loads this variable after the global, `~/.opencode`
-/// and project configs, and a key it adds lands after theirs, so under opencode's
-/// last-match-wins rule this deny outranks an ambient `"<server>_*": "allow"` at the top level or
-/// on the governed agent (measured, evidence `d-top` and `d-agent2`).
+/// replaced: every other key is kept, except a rule in the same permission object that would be
+/// read after the deny and could re-admit an MCP tool ([`deny_mcp_in`]). opencode loads this
+/// variable after the global, `~/.opencode` and project configs, and a key it adds lands after
+/// theirs, so under opencode's last-match-wins rule this deny outranks an ambient
+/// `"<server>_*": "allow"` in those files, at the top level or on the governed agent (measured,
+/// evidence `d-top`, `d-agent2`, `d-final-ovr`).
 ///
 /// Fails closed like the skills composition: a value that is not a JSON object, or whose
 /// `permission` / `agent` / `agent.build` / `agent.build.permission` is not an object, is an
@@ -107,14 +109,48 @@ pub(crate) fn opencode_config(existing: Option<&str>) -> Result<String, String> 
     Ok(doc.to_string())
 }
 
-/// Set `parent[key][OPENCODE_MCP_TOOL_PATTERN] = "deny"`, creating the object where absent.
+/// Set `parent[key][OPENCODE_MCP_TOOL_PATTERN] = "deny"`, creating the object where absent, so
+/// that the deny is the LAST rule in this object that can match a `<server>_<tool>` id.
+///
+/// opencode reads a permission object's rules in document order, and the last match wins. The
+/// order this document is emitted in is serde_json's `Map` order: sorted keys by default, and
+/// insertion order if a dependency ever turns on `preserve_order`. Under sorted keys `"*_*"` lands
+/// before every letter-led key, so an existing `"wt_*": "allow"` in the SAME document would be
+/// emitted after the deny and re-admit `wt_wt_note` (review of #659). So, whatever the map order:
+/// the old `*_*` entry is dropped and the deny re-inserted, then every rule emitted AFTER it that
+/// could match an underscore id (its key holds `*`, `?` or `_`) and is not itself a `deny` is
+/// dropped. A rule emitted before the deny (`"*": "ask"` under sorted keys) is kept: the deny
+/// outranks it. Literal non-underscore keys (`read`, `bash`) cannot match an MCP id and are kept.
 fn deny_mcp_in(parent: &mut serde_json::Map<String, Value>, key: &str) -> Result<(), String> {
     let rules = object_entry(parent, key, crate::skills_snapshot::OPENCODE_CONFIG_ENV)?;
-    rules.insert(
+    // Rebuilt rather than edited in place: `Map::remove` is a swap-remove under `preserve_order`,
+    // which would itself reorder the rules.
+    let mut staged = serde_json::Map::new();
+    for (k, v) in std::mem::take(rules) {
+        if k != OPENCODE_MCP_TOOL_PATTERN {
+            staged.insert(k, v);
+        }
+    }
+    staged.insert(
         OPENCODE_MCP_TOOL_PATTERN.to_string(),
         Value::String("deny".to_string()),
     );
+    let mut after_deny = false;
+    for (k, v) in staged {
+        if k == OPENCODE_MCP_TOOL_PATTERN {
+            after_deny = true;
+        } else if after_deny && could_match_mcp_id(&k) && v.as_str() != Some("deny") {
+            continue;
+        }
+        rules.insert(k, v);
+    }
     Ok(())
+}
+
+/// Could an opencode permission key match a `<server>_<tool>` tool id? A glob (`*`, `?`) or a key
+/// that itself holds an underscore can; a literal non-underscore name (`read`, `bash`) cannot.
+fn could_match_mcp_id(key: &str) -> bool {
+    key.contains(['*', '?', '_'])
 }
 
 /// `parent[key]` as an object, created where absent; a non-object is an error, never replaced.
@@ -317,6 +353,41 @@ mod tests {
         // No existing content: a bare document still carries the deny.
         let doc: Value = serde_json::from_str(&opencode_config(None).unwrap()).unwrap();
         assert_eq!(doc["permission"]["*_*"], "deny");
+    }
+
+    /// Review of #659: an allow for an MCP-shaped pattern INSIDE the composed document is not
+    /// left to be emitted after the deny (serde_json sorts keys, so `"wt_*"` follows `"*_*"`, and
+    /// opencode's last match wins). Rules the deny outranks, a `deny` of its own, and literal
+    /// non-underscore keys stay; the emitted text puts the deny after every kept matching rule.
+    #[test]
+    fn no_rule_in_the_composed_document_is_read_after_the_mcp_deny() {
+        let existing = r#"{"permission":{"wt_*":"allow","*":"ask","bash":{"git *":"allow"},"read":"ask","x_y":"deny","wt?note":{"*":"allow"},"*_*":"allow"},"agent":{"build":{"permission":{"wt_*":"allow","edit":"ask"}}}}"#;
+        let out = opencode_config(Some(existing)).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        for scope in [&doc["permission"], &doc["agent"]["build"]["permission"]] {
+            let rules = scope.as_object().unwrap();
+            assert_eq!(rules["*_*"], "deny", "{out}");
+            assert!(
+                !rules.contains_key("wt_*"),
+                "the outranking allow is dropped: {out}"
+            );
+            assert!(!rules.contains_key("wt?note"), "{out}");
+            // In emitted order, nothing after the deny can match an MCP id unless it denies.
+            let keys: Vec<&String> = rules.keys().collect();
+            let pos = keys.iter().position(|k| *k == "*_*").unwrap();
+            for k in &keys[pos + 1..] {
+                assert!(
+                    !could_match_mcp_id(k) || rules[k.as_str()] == "deny",
+                    "`{k}` is read after the deny: {out}"
+                );
+            }
+        }
+        let top = doc["permission"].as_object().unwrap();
+        assert_eq!(top["*"], "ask", "a rule the deny outranks is kept: {out}");
+        assert_eq!(top["bash"], serde_json::json!({"git *": "allow"}), "{out}");
+        assert_eq!(top["read"], "ask");
+        assert_eq!(top["x_y"], "deny", "a deny of its own is kept");
+        assert_eq!(doc["agent"]["build"]["permission"]["edit"], "ask");
     }
 
     /// Fail closed: a document the deny cannot be composed into refuses the launch.
