@@ -2411,7 +2411,13 @@ fn start_acp_process_with_write_roots(
             None => (Some(ws), None),
         }
     } else {
-        (None, None)
+        // core#548: the default repository boundary — the unit's own tree writable, the clone
+        // and its sibling worktrees read-only at the OS (`worker_sandbox`). `None` (a chat's
+        // scratch root, a self-sandboxing seat such as codex-acp, no launcher) spawns as before.
+        (
+            crate::worker_sandbox::default_worker_sandbox(cwd, &worker_write_roots, &config.binary),
+            None,
+        )
     };
     let worker_write_roots_env = std::env::join_paths(&worker_write_roots)
         .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
@@ -9352,6 +9358,103 @@ sleep 30
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    /// core#548: with NO strict profile on the seat record (`os_sandbox: false`, every built-in),
+    /// an ACP unit spawned in a run worktree still cannot write a SIBLING run worktree — the
+    /// default repository boundary is armed on the bridge's process tree. On main the write
+    /// succeeded silently (the bridge ran unwrapped). Skips where no launcher can arm.
+    #[cfg(unix)]
+    #[test]
+    fn acp_spawn_in_a_run_worktree_cannot_write_a_sibling_by_default_548() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("wicked-acp-repo-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&clone)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        std::fs::write(clone.join("a.txt"), "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wicked/r1",
+            "wicked-worktrees/r1",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wicked/r2",
+            "wicked-worktrees/r2",
+        ]);
+        let cwd = clone.join("wicked-worktrees").join("r1");
+        let sibling_file = clone.join("wicked-worktrees").join("r2").join("pwned");
+        if crate::worker_sandbox::default_worker_sandbox(&cwd, &[], "claude-agent-acp").is_none() {
+            eprintln!("acp_runner: no launcher can arm here — the #548 carrier proof skips");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let script = base.join("repo-boundary-probe-acp-bridge.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+printf x > "$WICKED_TEST_OUTSIDE"
+printf '%s' "$?" > acp-sibling-write-status
+read _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read _new
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"stub"}}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = AcpConfig {
+            binary: script.to_string_lossy().into_owned(),
+            start_args: vec![],
+            transport: AcpTransport::Stdio,
+            auth_method: None,
+            acp_input_governance: false,
+            os_sandbox: false,
+            acp_governance_env: Some((
+                "WICKED_TEST_OUTSIDE".to_string(),
+                sibling_file.to_string_lossy().into_owned(),
+            )),
+            verified_version: None,
+        };
+        let proc = start_acp_process(&config, &cwd, None, Some(&cwd.join("tmp")))
+            .expect("the boundary-wrapped ACP bridge completes its handshake");
+        let status = std::fs::read_to_string(cwd.join("acp-sibling-write-status")).unwrap();
+        assert!(
+            !status.trim().is_empty() && status.trim() != "0",
+            "the sibling write must fail at the OS, got exit {status:?}"
+        );
+        assert!(
+            !sibling_file.exists(),
+            "no file appears in the sibling worktree"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]
