@@ -673,7 +673,7 @@ fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
-/// skill's plan → record → review over the launch's one declared write root. `plan` and `review`
+/// skill's plan → record → review, meant for the launch's one declared write root. `plan` and `review`
 /// are the plan gate and the review gate (`human_confirm`); `plan` and `record` are creators and
 /// `review` is an evaluator, so evaluator ≠ creator puts the reviewer on another seat; every
 /// deliverable is relative, so it resolves inside the demo root; nothing executes code.
@@ -681,8 +681,6 @@ fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
 fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
     let dir = tmp_dir("demo");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
-    let root = dir.join("demo-root");
-    std::fs::create_dir_all(&root).unwrap();
     let rig = spawn(&db);
     let demo = rig
         .core
@@ -698,7 +696,8 @@ fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
 
     let mut launch = spec("rdemo", "demo", None);
     launch.problem = "Make a demo of http://127.0.0.1:5173 for new users".into();
-    launch.extra_write_roots = vec![root.to_str().unwrap().to_string()];
+    // No declared root here: the demo root is the launcher's (crew mints one per run), and a root
+    // needs $HOME to validate, which a Windows runner lacks. The steps are what this pins.
     rig.core.launch_run(launch).unwrap();
     let units = units_of(&rig.core, "rdemo");
     let hc = r#"{"human_confirm":{"unconditional":false}}"#;
