@@ -2375,10 +2375,11 @@ impl Core {
     /// broker calls this after the upstream answered and the result was scrubbed). `request_json`
     /// is `{ token, call: { server, tool, args?, annotations?, classOverride?, registered, kind?,
     /// carrier? }, raw }` — the same call `evaluateMcpCall` judged, plus `raw`, the scrubbed result
-    /// text. Resolves to `{ decision: "allow"|"deny", subject, ruleIds, reason?, remedy?, claimId? }`;
-    /// a deny withholds the result and is already recorded as an advisory `mcp-deny:` claim, an
-    /// allow records nothing. Rejects with `invalid_token: …`, `bad_request: …` or `guard_error: …`
-    /// — every rejection is a refusal (withhold the result).
+    /// text (the output decision reads `raw` in place of the args). Resolves to `{ decision:
+    /// "allow"|"deny", subject, ruleIds, reason?, remedy?, claimId? }`; a deny withholds the result
+    /// and is already recorded as an advisory `mcp-deny:` claim, an allow records nothing. Rejects
+    /// with `invalid_token: …`, `bad_request: …` or `guard_error: …` — every rejection is a refusal
+    /// (withhold the result).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn evaluate_mcp_output(request_json: String) -> AsyncTask<CoreTask> {
         task(move || wicked_core::evaluate_mcp_output_json(&request_json).map_err(err))

@@ -3,8 +3,9 @@
 //! After an upstream answers, crew's broker scrubs the result of every secret it injected (D-2) and
 //! then asks core, through the `evaluateMcpOutput` binding, whether the unit may SEE that result.
 //! This is the same `select_any` + `decide` the call itself went through ([`super::evaluate`]), over
-//! the same context plus `raw` (the scrubbed result text), so an operator's output policy is one
-//! more steering rule: `applies_to: [mcp:jira]`, `trigger.contains` over the result, `effect: deny`.
+//! the same context with `args` replaced by `raw` (the scrubbed result text; the call-time gate
+//! already judged the args), so an operator's output policy is one more steering rule:
+//! `applies_to: [mcp:jira]`, `trigger.contains` over the result, `effect: deny`.
 //!
 //! - A **deny** withholds the result. It is recorded like any MCP deny, as the ADVISORY claim class
 //!   `mcp-deny:` (blocked and disclosed, the unit continues), naming the rules that denied. A deny
@@ -52,7 +53,12 @@ pub(crate) fn evaluate_output(
     }
     let class = classify(call.annotations.as_ref(), call.class_override);
     let subject = super::subject_of(&call.server, &call.tool);
+    // The call-time gate already judged the args; the output decision judges the RESULT, so a
+    // trigger here can only fire on what came back, never again on what was sent.
     let mut ctx = context(unit, call, class);
+    if let Some(obj) = ctx.as_object_mut() {
+        obj.remove("args");
+    }
     ctx["raw"] = serde_json::Value::String(raw.to_string());
 
     let mcp_tokens = subject_tokens(&call.server, &call.tool, unit.mode);
@@ -260,7 +266,9 @@ mod tests {
     #[test]
     fn the_output_decision_reads_the_result_text() {
         let store = store_with_rule();
-        let (v, _) = evaluate_output(&store, &unit(), &call(), "nothing here", 1).unwrap();
+        let mut c = call();
+        c.args = serde_json::json!({"key": "AKIAABCDEFGHIJKLMNOP"});
+        let (v, _) = evaluate_output(&store, &unit(), &c, "nothing here", 1).unwrap();
         assert_eq!(v.decision, "allow");
     }
 
