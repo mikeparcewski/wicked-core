@@ -73,7 +73,8 @@
 //! nested-sandbox launcher signature on both trees are `env_cannot_run` (never deny; the count is
 //! on the gate's `floorNote` — external CI is the test gate for them), and a head-only failure
 //! with the signature still denies with an advisory naming the likely cause. A head-only set of
-//! at most [`MAX_FLAKE_RERUN`] libtest ids is re-run ONCE, each alone (core#553): if every one
+//! at most [`MAX_FLAKE_RERUN`] libtest ids, read on an oversubscribed host (1-min load above the
+//! CPU count — the evidence it was load), is re-run ONCE, each alone (core#553): if every one
 //! passes it is `flaky_under_load` (never denies; both attempts and the load at each are on the
 //! record), else a `regression`. A base that cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
@@ -216,9 +217,10 @@ pub const FLOOR_ENV_MISMATCH: &str = "floor_env_mismatch";
 /// evidence of the environment, never denies, and the count is on the card: external CI is the
 /// test gate for those ids.
 pub const ENV_CANNOT_RUN: &str = "env_cannot_run";
-/// (core#553) Every head-only failure (at most [`MAX_FLAKE_RERUN`]) PASSED when re-run once,
-/// alone, in the same worktree: a host-load flake, not a regression — never denies; both
-/// attempts (and the load at each) are on the record (`reruns`).
+/// (core#553) Every head-only failure (at most [`MAX_FLAKE_RERUN`]) of a floor that ran on an
+/// OVERSUBSCRIBED host (1-min load above the CPU count) PASSED when re-run once, alone, in the
+/// same worktree: a host-load flake, not a regression — never denies, named on the gate's
+/// `floorNote`; both attempts (and the load at each) are on the record (`reruns`).
 pub const FLAKY_UNDER_LOAD: &str = "flaky_under_load";
 /// The largest head-only failure set the floor re-runs in isolation before calling it a
 /// regression (core#553). Larger sets are regressions as before.
@@ -662,9 +664,9 @@ impl RepoChecksReport {
         for c in &self.checks {
             if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) {
                 notes.push(format!(
-                    "`{}`: {} failed in the full run and passed re-run alone — classed \
-                     flaky_under_load (host load), not denied; an order-dependent failure reads \
-                     the same way",
+                    "`{}`: {} failed in the full run on an oversubscribed host and passed \
+                     re-run alone — classed flaky_under_load (host load), not denied; an \
+                     order-dependent failure reads the same way",
                     c.name,
                     c.regressions.join(", ")
                 ));
@@ -1480,7 +1482,7 @@ pub const DERIVED_TARGETED_SOURCE: &str =
 /// * any deleted (or renamed-away) tracked file ⇒ full: what it left behind cannot be mapped;
 /// * vitest — a `test` script that is exactly `vitest` / `vitest run` ⇒ `vitest related --run
 ///   --passWithNoTests <files>` (the touched test files and the tests importing touched modules);
-///   a touched manifest, lockfile or vite/vitest/ts config ⇒ full.
+///   a touched manifest, lockfile, vite/vitest/ts config or test setup file ⇒ full.
 ///
 /// Only when exactly ONE auto-detected test set exists (a mixed Node + cargo repo keeps both
 /// full), and never with no touched file.
@@ -1545,6 +1547,9 @@ fn derive_targeted(
                 ) || n.starts_with("vitest.config")
                     || n.starts_with("vite.config")
                     || n.starts_with("tsconfig")
+                    // A setup file (`tests/setup.ts`) is loaded by the config, never imported, so
+                    // `related` cannot see what it reaches.
+                    || n.to_ascii_lowercase().contains("setup")
             };
             if files.iter().any(|f| wide(f)) {
                 return Ok(None);
@@ -2622,6 +2627,12 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
     Some((out, name.to_string()))
 }
 
+/// (core#553) Is the host oversubscribed — its 1-min load above its logical CPU count? The one
+/// condition under which a head-only failure that passes alone is read as a load flake.
+pub(crate) fn oversubscribed(load1: Option<f64>, cpus: usize) -> bool {
+    matches!(load1, Some(l) if l.is_finite() && cpus > 0 && l > cpus as f64)
+}
+
 /// (core#553) Re-run each head-only failure of a small `regression` set ONCE, alone, in the same
 /// worktree; when every one PASSES (exit 0 and libtest printed `test <name> ... ok` — a filter
 /// that matched nothing is not a pass) the check is `flaky_under_load`. Each re-run's own
@@ -2638,6 +2649,13 @@ fn rerun_flakes(
         || run.regressions.is_empty()
         || run.regressions.len() > MAX_FLAKE_RERUN
     {
+        return;
+    }
+    // The evidence that it was LOAD: the host is oversubscribed as the failure is read. On a host
+    // with headroom a failure that passes alone is as likely an order-dependent regression the
+    // change introduced — it stays a regression, and nothing is re-run.
+    let (load1, cpus) = host_load();
+    if !oversubscribed(load1, cpus) {
         return;
     }
     let plans: Option<Vec<(Vec<String>, String)>> = run
@@ -5752,6 +5770,12 @@ mod tests {
         assert!(isolated_rerun_argv(&s(&["npm", "run", "test"]), "test t::y").is_none());
         assert!(isolated_rerun_argv(&argv, "FAIL tests/x.test.ts > a").is_none());
         assert!(isolated_rerun_argv(&s(&["cargo", "nextest", "run"]), "test t::y").is_none());
+        // Only an oversubscribed host earns the re-run: load above the CPU count.
+        assert!(oversubscribed(Some(15.0), 14));
+        assert!(!oversubscribed(Some(14.0), 14));
+        assert!(!oversubscribed(Some(3.0), 14));
+        assert!(!oversubscribed(None, 14), "an unknown load is no evidence");
+        assert!(!oversubscribed(Some(f64::NAN), 14));
     }
 
     /// core#553, end to end on a real cargo crate: a test that fails once and passes alone is
@@ -5795,6 +5819,20 @@ mod tests {
             eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
             return;
         }
+        let (load1, cpus) = host_load();
+        if !oversubscribed(load1, cpus) {
+            // A host with headroom: no evidence of load, so no re-run — the failure stands.
+            let c = report
+                .checks
+                .iter()
+                .find(|c| c.name == "cargo-test")
+                .expect("cargo-test ran");
+            assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:#?}");
+            assert!(c.reruns.is_empty() && !report.passed);
+            eprintln!("repo_checks: host not oversubscribed — the flake re-run is not exercised");
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        }
         let c = report
             .checks
             .iter()
@@ -5832,8 +5870,8 @@ mod tests {
             .find(|c| c.name == "cargo-test")
             .expect("cargo-test ran");
         assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:#?}");
-        assert_eq!(c.reruns.len(), 1);
-        assert!(!c.reruns[0].passed());
+        assert!(c.reruns.len() <= 1, "at most one re-run: {c:#?}");
+        assert!(c.reruns.iter().all(|r| !r.passed()));
         assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&repo);
     }
@@ -5950,6 +5988,14 @@ mod tests {
                 "src/x.ts"
             ])
         );
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("tests/setup.ts"), "export {}\n").unwrap();
+        let d = detect_with(&repo, &ctx).unwrap();
+        assert!(
+            names(&d).contains(&"test") && !names(&d).contains(&"test_targeted"),
+            "a config-loaded setup file reaches every test"
+        );
+        std::fs::remove_file(repo.join("tests/setup.ts")).unwrap();
         std::fs::write(repo.join("package-lock.json"), "{ }").unwrap();
         let d = detect_with(&repo, &ctx).unwrap();
         assert!(names(&d).contains(&"test") && !names(&d).contains(&"test_targeted"));
