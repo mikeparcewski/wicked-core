@@ -1038,11 +1038,13 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
         c.regressions,
         vec!["test t::boom [-p wtguard_fixture --lib]".to_string()]
     );
-    assert_eq!(
-        c.reruns.len(),
-        1,
-        "a single head-only failure is re-run once, alone, before it is called a regression \
-         (core#553)"
+    // core#553: a single head-only failure is re-run once, alone, but only on an oversubscribed
+    // host (the evidence of load); on a host with headroom it is not re-run. Either way the
+    // always-red test stays a regression.
+    assert!(
+        c.reruns.len() <= 1 && c.reruns.iter().all(|r| !r.passed()),
+        "at most one re-run, and it failed: {:?}",
+        c.reruns
     );
     assert!(c.pre_existing.is_empty());
     assert!(
