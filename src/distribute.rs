@@ -219,15 +219,23 @@ pub fn distribute_units_on_benched(
 
 /// (crew#477) Whether a seat ENFORCES input governance on a governed unit's tool calls: an ACP
 /// seat when its adapter is admitted (`acp_input_governance`, the flag `acp_runner` reads before
-/// it answers a tool call), a seat with no ACP adapter only when it runs claude (the wrapped
-/// runner's PreToolUse gate-hook is claude-only — every other wrapped CLI runs with
-/// `governanceUnenforced`). Judged on the roster record the run was handed, so it is pure.
+/// it answers a tool call); a seat with no ACP adapter only when its wrapped template runs claude
+/// (the wrapped runner's PreToolUse gate-hook is claude-only and keys off the template's program —
+/// every other wrapped CLI runs with `governanceUnenforced`). Judged on the roster record the run
+/// was handed, so it is pure.
 pub(crate) fn seat_governs(seat: &AgenticCli) -> bool {
     match &seat.acp {
         Some(acp) => acp.acp_input_governance,
+        // The wrapped runner's own resolution, verbatim: the launch template (this record's, else
+        // the registry's) and its first token — never the record's `binary` field, which a
+        // template may contradict (codex review of #648).
         None => {
-            wicked_apps_core::spawn::SeatCli::from_binary(&seat.binary)
-                == wicked_apps_core::spawn::SeatCli::Claude
+            let invocation =
+                Some(seat.headless_invocation.clone()).filter(|s| !s.trim().is_empty());
+            let template = crate::execute_wrapped::launch_invocation(&seat.key, invocation);
+            crate::execute_wrapped::binary_is_claude(&crate::execute_wrapped::template_binary(
+                &template,
+            ))
         }
     }
 }
@@ -2535,6 +2543,16 @@ mod tests {
         assert!(
             !seat_governs(&wrapped("codex")),
             "wrapped codex has no gate-hook"
+        );
+        // The template decides, as it does for the wrapped runner — not the record's `binary`.
+        let mislabelled = AgenticCli {
+            binary: "claude".into(),
+            headless_invocation: "codex exec {PROMPT}".into(),
+            ..wrapped("claude")
+        };
+        assert!(
+            !seat_governs(&mislabelled),
+            "a codex template arms no gate-hook"
         );
     }
 
