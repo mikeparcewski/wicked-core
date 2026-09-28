@@ -20034,6 +20034,196 @@ transport = "stdio"
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// core#653 fixture: a governed claude unit whose worker home carries an org
+    /// `allowManagedHooksOnly: true` (`<worker home>/claude/remote-settings.json`), on a claude
+    /// seat whose `[cli.acp]` is `acp_binary`. The unit's wrapped invocation is a fake `claude`
+    /// that records it ran. Returns `(home, bridge ledger, ran marker, input)`.
+    #[cfg(unix)]
+    fn managed_hooks_only_claude(
+        tag: &str,
+        acp_binary: Option<&std::path::Path>,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        StepInput,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::skills_snapshot::test_support::scratch(tag);
+        let worker = home.join("worker");
+        std::fs::create_dir_all(worker.join("claude")).unwrap();
+        std::fs::write(
+            worker.join("claude").join("remote-settings.json"),
+            r#"{"allowManagedHooksOnly": true}"#,
+        )
+        .unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ran = home.join("wrapped-ran.txt");
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!("#!/bin/sh\necho ran > \"{}\"\nexit 0\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ledger = home.join("ledger.ndjson");
+        let bridge = match acp_binary {
+            Some(b) => b.to_path_buf(),
+            None => {
+                let b = bin.join("claude-agent-acp");
+                std::fs::rename(write_env_recording_bridge(&home), &b).unwrap();
+                b
+            }
+        };
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "claude"
+display_name = "claude"
+binary = "claude"
+headless_invocation = "claude -p {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+acp_input_governance = true
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let run_id = format!("run-653-{tag}-{}", std::process::id());
+        let mut u = crate::domain::WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "build");
+        u.assigned_cli = Some("claude".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
+        u.executes_code = true;
+        let input = StepInput {
+            run_id,
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-653".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(wt),
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: home.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        (home, ledger, ran, input)
+    }
+
+    /// core#653: under `allowManagedHooksOnly`, a governed claude unit whose seat HAS an admitted
+    /// ACP bridge runs on the ACP carrier (which uses no hook) — armed there, never refused, and
+    /// never handed to the wrapped carrier where the hook would be dropped.
+    #[test]
+    #[cfg(unix)]
+    fn managed_hooks_only_with_acp_available_runs_the_governed_claude_unit_on_acp() {
+        use crate::workflow::StepRunner;
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, ledger, ran, input) = managed_hooks_only_claude("mho-acp", None);
+        let _home = EnvPin::set("HOME", &home);
+        let _worker = EnvPin::set(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            &home.join("worker"),
+        );
+        let _nosnap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(
+            out.governed,
+            "the ACP carrier armed the unit: {}",
+            out.output
+        );
+        assert!(
+            !out.output
+                .contains(crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL),
+            "{}",
+            out.output
+        );
+        assert!(!ran.exists(), "the wrapped carrier must not run the unit");
+        assert!(
+            ledger_entries(&ledger)
+                .iter()
+                .any(|e| e.get("prompt").is_some()),
+            "the prompt reached the ACP bridge"
+        );
+        let log = std::fs::read_to_string(crate::gate_hook::decisions_path_for(&input.run_id, 0))
+            .unwrap_or_default();
+        assert!(
+            log.contains(&format!("\"{}\"", crate::gate_hook::CARRIER_ACP)),
+            "armed on the ACP carrier: {log}"
+        );
+        let fell_back = rx
+            .try_iter()
+            .any(|c| matches!(c, Command::EmitEvent(CoreEvent::AcpFallback { .. })));
+        assert!(!fell_back, "no fallback to the wrapped carrier");
+        runner.drop_session(&input.run_id);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// core#653: the same unit when ACP is UNAVAILABLE (the seat's bridge binary is missing) —
+    /// the fallback reaches the wrapped carrier, which refuses it with the escalation instead of
+    /// running claude with a gate-hook the org settings drop.
+    #[test]
+    #[cfg(unix)]
+    fn managed_hooks_only_with_acp_unavailable_refuses_the_governed_claude_unit() {
+        use crate::workflow::StepRunner;
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let missing = std::env::temp_dir().join("wicked-653-no-such-acp-bridge");
+        let (home, _ledger, ran, input) = managed_hooks_only_claude("mho-noacp", Some(&missing));
+        let _home = EnvPin::set("HOME", &home);
+        let _worker = EnvPin::set(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            &home.join("worker"),
+        );
+        let _nosnap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output
+                .contains(crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL)
+                && out.output.contains("ACP is unavailable"),
+            "refused with the escalation: {}",
+            out.output
+        );
+        assert!(!out.governed);
+        assert!(!ran.exists(), "claude must never run ungoverned");
+        runner.drop_session(&input.run_id);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// F-079 (core#441), the codex lever through the real `AcpStepRunner` and the merged
     /// registry: a codex seat whose `[cli.acp]` names a SEPARATE bridge (a recording bridge at
     /// `…/bin/codex-acp`) is `CodexSkillsDir`, not `Absent` — its skill-bearing unit is admitted

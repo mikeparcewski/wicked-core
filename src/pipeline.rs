@@ -93,6 +93,7 @@ pub fn run_session(
             session_id,
             0, // sync straight-through path is ungoverned (stub work) — the fold is inert (no log)
             false, // the stub sync path never arms governance
+            false, // …and a stub output reports no tool activity
             &cli_keys,
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             // The sync path is UNBOUND (no repo ⇒ no worktree): neither the worktree guard nor
@@ -870,6 +871,10 @@ pub(crate) fn apply_and_finish_unit(
     session_id: &str,
     attempt: u32,
     governed: bool,
+    // (#653) Whether the runner saw the agent invoke ≥1 tool this attempt (`StepOutput.tools`
+    // non-empty). A governed wrapped unit with tool activity but no proof its gate-hook ran is
+    // denied `governance_unproven` by the input fold.
+    tool_activity: bool,
     cli_keys: &[String],
     agent_verdict: Option<&crate::validator::AgentVerdict>,
     evidence: &crate::workflow::UnitEvidence,
@@ -1264,12 +1269,13 @@ pub(crate) fn apply_and_finish_unit(
     // unit properties — so a claude-assigned STUB/test unit (which never armed) is never false-denied for
     // a missing log. It gates evidence-integrity fail-closure: a governed unit whose armed marker is
     // missing (erased/never-fired) DENIES; an ungoverned unit's fold is inert.
-    let hook_denial = crate::gate_hook::fold_input_denial(
+    let hook_denial = crate::gate_hook::fold_input_denial_with_activity(
         store,
         session_id,
         attempt,
         &crate::scope::unit_phase(unit.ord),
         governed,
+        tool_activity,
     )?;
     // Capture whether the hook denied NOW, before `hook_denial` is moved into the deny-dominance
     // fold below and its source identity is lost in `validator_denial`. The actor uses this flag to

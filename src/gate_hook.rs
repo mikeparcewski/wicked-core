@@ -3640,12 +3640,37 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
 /// carries its claim id, its firing policy ids, and — when the log's tool-call annotation names it —
 /// the denied tool, so the UI can render "rule X denied tool Y in unit-N" from fields instead of
 /// parsing a sentence. The fail-closed arms carry prose only (there is no claim to cite).
+///
+/// This spelling knows nothing about the unit's tool activity; the unit-gate fold calls
+/// [`fold_input_denial_with_activity`] so a wrapped unit whose hook never fired is caught (#653).
 pub fn fold_input_denial(
     store: &mut dyn GraphStore,
     run_id: &str,
     attempt: u32,
     phase: &str,
     governed: bool,
+) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
+    fold_input_denial_with_activity(store, run_id, attempt, phase, governed, false)
+}
+
+/// Reason prefix of the #653 denial: a governed WRAPPED unit made tool calls, but the log holds no
+/// proof the gate-hook ran for it — its input governance is unproven, so it cannot pass as governed.
+pub const GOVERNANCE_UNPROVEN: &str = "governance_unproven";
+
+/// [`fold_input_denial`] plus the unit's TOOL ACTIVITY (#653): `tool_activity` is true when the
+/// runner saw the agent invoke at least one tool this attempt (`StepOutput.tools`, the list the
+/// actor emits as `ToolInvoked`). A governed unit armed on the WRAPPED carrier whose log holds the
+/// armed marker but NO hook-fired sentinel for its phase, and which DID make tool calls, is denied
+/// as [`GOVERNANCE_UNPROVEN`]: the hook was suppressed (an org `allowManagedHooksOnly` setting
+/// drops `--settings` hooks) and every call ran unchecked. Zero claims is not "no tool calls".
+/// A unit that genuinely made no tool calls has an empty list and still passes.
+pub fn fold_input_denial_with_activity(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    attempt: u32,
+    phase: &str,
+    governed: bool,
+    tool_activity: bool,
 ) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
     // Every denial this fold produces is an input-governance deny for `phase`.
     let fail_closed = |reason: String| {
@@ -3675,6 +3700,9 @@ pub fn fold_input_denial(
     };
     let mut denial: Option<crate::domain::UnitDenial> = None;
     let mut saw_marker = false;
+    // Whether THIS phase's armed marker names the ACP carrier (#653 scopes to wrapped only: the ACP
+    // carrier answers `session/request_permission` in-process and uses no hook).
+    let mut armed_on_acp = false;
     let mut saw_hook_fired = false;
     let mut has_claim_lines = false; // any ConformanceClaim present for `phase`
     let mut pending_tool: Option<String> = None; // tool name from the last annotation (this phase)
@@ -3702,6 +3730,7 @@ pub fn fold_input_denial(
         if let Some(mp) = marker_phase(&v) {
             if mp == phase {
                 saw_marker = true;
+                armed_on_acp = marker_carrier(&v) == Some(CARRIER_ACP);
             }
             continue;
         }
@@ -3813,6 +3842,23 @@ pub fn fold_input_denial(
         denial = Some(fail_closed(format!(
             "input governance denied {phase} (fail-closed): hook-fired sentinel missing with \
              claim lines present — hook process may have been suppressed (core#34)"
+        )));
+    }
+    // #653: armed on the WRAPPED carrier, the agent made tool calls, and nothing proves the hook
+    // ran — no claims and no hook-fired sentinel. `allowManagedHooksOnly` drops the `--settings`
+    // hook exactly this way, so "marker only" is not "a governed unit that made no tool calls".
+    if governed
+        && saw_marker
+        && !armed_on_acp
+        && tool_activity
+        && !saw_hook_fired
+        && denial.is_none()
+    {
+        denial = Some(fail_closed(format!(
+            "{GOVERNANCE_UNPROVEN}: input governance denied {phase} (fail-closed): the unit made \
+             tool calls on the wrapped carrier but its gate-hook never ran — the hook was not \
+             loaded (an org `allowManagedHooksOnly` setting blocks `--settings` hooks), so every \
+             call went unchecked (core#653)"
         )));
     }
     Ok(denial)
@@ -6568,6 +6614,82 @@ mod tests {
     /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.
     /// Append a hook-fired liveness sentinel — the production hook writes one per phase before any
     /// claim, so a governed fold that reaches its liveness check does not fail closed (core#34).
+    /// core#653 (red on main): a governed unit armed on the WRAPPED carrier under an org
+    /// `allowManagedHooksOnly` — the stubbed hook NEVER fires, so the log holds the armed marker
+    /// only — while the agent made tool calls (`ToolInvoked` non-empty). It must fail its gate
+    /// `governance_unproven`; before #653 the fold read "marker only" as "no tool calls" and passed.
+    #[test]
+    fn a_wrapped_unit_with_tool_calls_and_no_hook_proof_is_governance_unproven() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("unproven-653-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+
+        // (a) marker only (hook suppressed), tool calls made → DENY governance_unproven.
+        let p0 = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p0, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        let denial = fold_input_denial_with_activity(&mut store, &run_id, 0, "unit-1", true, true)
+            .unwrap()
+            .expect("tool calls with no hook proof must deny");
+        assert!(
+            denial.reason.starts_with(GOVERNANCE_UNPROVEN),
+            "{}",
+            denial.reason
+        );
+        assert_eq!(denial.source, "input_governance");
+        assert_eq!(denial.phase.as_deref(), Some("unit-1"));
+        // An older marker with no carrier key is the wrapped launcher's too.
+        let p4 = decisions_path_for(&run_id, 4);
+        write_armed_marker(&p4, "unit-1").unwrap();
+        assert!(
+            fold_input_denial_with_activity(&mut store, &run_id, 4, "unit-1", true, true)
+                .unwrap()
+                .is_some_and(|d| d.reason.starts_with(GOVERNANCE_UNPROVEN)),
+        );
+
+        // (b) the same log, but the unit genuinely made NO tool calls → still passes.
+        assert_eq!(
+            fold_input_denial_with_activity(&mut store, &run_id, 0, "unit-1", true, false).unwrap(),
+            None,
+            "a governed unit with no tool calls is not denied for an empty log"
+        );
+
+        // (c) a normal wrapped unit whose hook fires (sentinel + allow claim) → passes.
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker_for(&p1, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        write_hook_fired(&p1, "unit-1");
+        append_decision(&p1, &allow_claim("ok-653", "unit-1")).unwrap();
+        assert_eq!(
+            fold_input_denial_with_activity(&mut store, &run_id, 1, "unit-1", true, true).unwrap(),
+            None,
+            "a wrapped unit whose hook fired passes"
+        );
+
+        // (d) the hook-fired proof is per PHASE: another unit's sentinel proves nothing here.
+        let p2 = decisions_path_for(&run_id, 2);
+        write_armed_marker_for(&p2, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        write_hook_fired(&p2, "unit-9");
+        assert!(
+            fold_input_denial_with_activity(&mut store, &run_id, 2, "unit-1", true, true)
+                .unwrap()
+                .is_some_and(|d| d.reason.starts_with(GOVERNANCE_UNPROVEN)),
+        );
+
+        // (e) scoped to the wrapped carrier: the ACP carrier uses no hook.
+        let p3 = decisions_path_for(&run_id, 3);
+        write_armed_marker_for(&p3, "unit-1", Some(CARRIER_ACP)).unwrap();
+        assert_eq!(
+            fold_input_denial_with_activity(&mut store, &run_id, 3, "unit-1", true, true).unwrap(),
+            None
+        );
+
+        // (f) ungoverned units stay inert.
+        assert_eq!(
+            fold_input_denial_with_activity(&mut store, &run_id, 0, "unit-1", false, true).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
     fn write_hook_fired(path: &Path, phase: &str) {
         use std::io::Write;
         let line = serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
