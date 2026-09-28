@@ -74,6 +74,14 @@ pub(crate) const OPENCODE_GOVERNED_AGENT: &str = "build";
 /// `"<server>_*": "allow"` in those files, at the top level or on the governed agent (measured,
 /// evidence `d-top`, `d-agent2`, `d-final-ovr`).
 ///
+/// The load order this relies on, read from the installed opencode 1.18.31 config loader: global
+/// (`$XDG_CONFIG_HOME/opencode`), then `OPENCODE_CONFIG`, then the project files, then the
+/// `.opencode` directories and `OPENCODE_CONFIG_DIR` (agent/mode markdown included), then
+/// `OPENCODE_CONFIG_CONTENT`. So the operator's `OPENCODE_CONFIG` or `OPENCODE_CONFIG_DIR` under
+/// the inherit hatch is outranked like any other ambient file. Two sources load AFTER it and are
+/// not overridden here: a signed-in opencode console org's remote config, and the admin-managed
+/// config directory (the opencode analog of claude's managed settings).
+///
 /// Fails closed like the skills composition: a value that is not a JSON object, or whose
 /// `permission` / `agent` / `agent.build` / `agent.build.permission` is not an object, is an
 /// `Err`. The seat is then not launched rather than launched with the MCP tools visible.
@@ -172,19 +180,37 @@ fn object_entry<'a>(
 ///
 /// - **Any seat:** a name with the `mcp__` prefix (claude's `mcp__<server>__<tool>`, in the hook
 ///   payload's `tool_name` and in the ACP bridge's `toolCall.name` / `title`), case-insensitive.
-/// - **opencode:** its MCP titles are `<server>_<tool>` (`wt_wt_note`, evidence e7b) with
-///   `kind: "other"`. That shape is judged only on an opencode seat. Other seats name built-ins
-///   the same way (copilot's `write_bash`, codex's `update_plan`), and refusing those would break
-///   the seat. opencode's own built-ins either carry no underscore or arrive with a specific
-///   kind (`apply_patch` is `edit`, the `context7_*` tools are `search`).
+/// - **opencode:** its MCP titles are `<server>_<tool>` (`wt_wt_note`, evidence e7b), with kind
+///   `other`, or `search` for the context7 server's `context7_resolve_library_id` /
+///   `context7_get_library_docs` (opencode 1.18.31 `toToolKind`). That shape is judged only on an opencode seat. Other seats name
+///   built-ins the same way (copilot's `write_bash`, codex's `update_plan`), and refusing those
+///   would break the seat. opencode's own built-ins carry no underscore (1.18.31 offers
+///   `bash edit glob grep read skill todowrite webfetch write`) except `apply_patch`, which is
+///   excluded by name ([`OPENCODE_UNDERSCORE_BUILT_INS`]). The launch config's `*_*` deny matches
+///   `apply_patch` as `edit`, so the two layers agree.
 pub(crate) fn is_mcp_call(names: &[&str], kind: Option<&str>, seat: SeatCli) -> bool {
     if names.iter().any(|n| has_mcp_prefix(n)) {
         return true;
     }
+    // The kinds opencode can give an MCP tool: `other` (its default) and `search` (the context7
+    // pair). A built-in's own kind (`execute` for bash, whose title may be a one-word command,
+    // `edit`, `read`, `fetch`, `think`) is never an MCP call.
+    let mcp_kind = kind.is_none_or(|k| {
+        k.is_empty() || k.eq_ignore_ascii_case("other") || k.eq_ignore_ascii_case("search")
+    });
     seat == SeatCli::Opencode
-        && kind.is_none_or(|k| k.is_empty() || k.eq_ignore_ascii_case("other"))
-        && names.iter().any(|n| is_opencode_mcp_title(n))
+        && mcp_kind
+        && names.iter().any(|n| {
+            is_opencode_mcp_title(n)
+                && !OPENCODE_UNDERSCORE_BUILT_INS
+                    .iter()
+                    .any(|b| n.trim().eq_ignore_ascii_case(b))
+        })
 }
+
+/// opencode built-in tool ids that hold an underscore — the only titles of that shape on an
+/// opencode seat that are NOT MCP tools.
+pub(crate) const OPENCODE_UNDERSCORE_BUILT_INS: [&str; 1] = ["apply_patch"];
 
 /// `mcp__…`, case-insensitive, with something after the prefix.
 pub(crate) fn has_mcp_prefix(name: &str) -> bool {
@@ -295,6 +321,15 @@ mod tests {
             acp_mcp_tool(&f, SeatCli::Opencode).as_deref(),
             Some("wt_wt_note")
         );
+        // Review of #659: an MCP tool opencode gives a specific kind is still an MCP call — the
+        // context7 server's tools arrive as `search`.
+        for kind in ["search", "other", ""] {
+            let f = frame(None, "context7_resolve_library_id", kind);
+            assert!(
+                acp_mcp_tool(&f, SeatCli::Opencode).is_some(),
+                "kind {kind:?}"
+            );
+        }
         // Another seat's underscore built-in is not an MCP call: copilot's `write_bash`,
         // codex's `update_plan`.
         for (seat, title) in [
@@ -305,8 +340,8 @@ mod tests {
         }
     }
 
-    /// opencode's built-ins keep working: no underscore (`todowrite`, `skill`), or a specific
-    /// kind (`apply_patch` is `edit`, `context7_*` is `search`). Prose titles are not identifiers.
+    /// opencode's built-ins keep working: no underscore (`todowrite`, `skill`), or the one
+    /// underscore built-in, `apply_patch`, whatever its kind. Prose titles are not identifiers.
     #[test]
     fn opencode_built_in_tools_are_not_mcp_calls() {
         for (title, kind) in [
@@ -315,7 +350,9 @@ mod tests {
             ("bash", "execute"),
             ("read", "read"),
             ("apply_patch", "edit"),
-            ("context7_resolve_library_id", "search"),
+            ("apply_patch", "other"),
+            // A one-word bash command is `execute`, never an MCP title.
+            ("run_tests", "execute"),
             ("Run git status", "other"),
             ("_", "other"),
         ] {
