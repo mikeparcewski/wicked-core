@@ -1881,6 +1881,11 @@ pub(super) fn answer_dispute_gate(
         crate::workflow::HumanDecision::EditPlan { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: a plan edit answers only a plan_approval gate")
         }
+        // Refused before the row resolves (`confirm_gate`); unreachable here.
+        crate::workflow::HumanDecision::FloorRerun(_)
+        | crate::workflow::HumanDecision::AcceptSuggestion => {
+            anyhow::bail!("run {run_id} is paused team_dispute: approve, request changes or reject")
+        }
     };
     let ev = TeamEvent {
         env: Envelope {

@@ -1057,6 +1057,22 @@ pub(crate) fn apply_and_finish_unit(
     // (core#469) The denial carries its SOURCE beside the reason: a floor that did not FINISH (a
     // check hit its bound) is booked under `repo_checks_timeout`, never `repo_checks` — the gate
     // keys on it to offer extend / targeted / accept instead of retry-the-same-tree.
+    // (core#544) CARRIED FORWARD: a default-floor unit whose attempt left the tree exactly as it
+    // was dispatched, on a tree this unit's LAST floor already judged (`RepoChecksReport::tree`
+    // equals the dispatch baseline — the worker thread re-runs the checks on any other tree).
+    // That verdict stands for this attempt: a `request_changes` or approve-retry that changes
+    // nothing can no longer read as "no checks apply" and admit the tree the floor failed.
+    let carried: Option<crate::repo_checks::RepoChecksReport> = (evidence.repo_checks.is_none()
+        && evidence.tree_changed == Some(false)
+        && unit.default_floor
+        && !guard_denied)
+        .then(|| {
+            let baseline_tree = unit.worktree_baseline.as_ref().map(|b| b.tree.as_str());
+            unit.repo_checks
+                .clone()
+                .filter(|r| r.tree.is_some() && r.tree.as_deref() == baseline_tree)
+        })
+        .flatten();
     let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
@@ -1112,6 +1128,18 @@ pub(crate) fn apply_and_finish_unit(
                          the result reached the gate without the engine's own check evidence \
                          (fail-closed)",
                         crate::repo_checks::CRITERION
+                    ),
+                ))
+            }
+            None if carried.as_ref().is_some_and(|r| !r.passed) => {
+                let r = carried.as_ref().expect("checked");
+                Some((
+                    r.denial_source(),
+                    format!(
+                        "the rework left the tree unchanged; this unit's last floor result on \
+                         this tree stands ({}): {}",
+                        r.outcome(),
+                        r.denial_reason()
                     ),
                 ))
             }
@@ -1410,6 +1438,11 @@ pub(crate) fn apply_and_finish_unit(
     // (DES-L1 PR-1B) The attempt this fold judged — the next dispatch of this unit mints `+ 1`
     // (`actor::next_attempt`); an approved unit owes no rework any more.
     unit.last_attempt = Some(attempt);
+    // (core#469) An operator's floor re-run is consumed by the attempt that ran it — whatever
+    // this fold decided, the next dispatch is an ordinary one unless the gate arms another.
+    if let Some(r) = unit.repo_checks.as_mut() {
+        r.requested_rerun = None;
+    }
     if outcome.approved {
         unit.rework_of = None;
     }
@@ -1461,6 +1494,7 @@ pub(crate) fn apply_and_finish_unit(
     // denial read as "no floor, criterion None" (Copilot on #414).
     let checks_ran = !default_floor_refused_unsandboxed
         && (evidence.repo_checks.is_some()
+            || carried.is_some()
             || ((unit.repo_checks_floor || evidence.tree_changed == Some(true))
                 && unit.tool_cmd.is_none()
                 && workdir.is_some()
@@ -1479,7 +1513,23 @@ pub(crate) fn apply_and_finish_unit(
     // (review FL-1) WHY the deterministic layer is absent — on the wire whenever it is, judge or
     // no judge, so a `repoChecksEvaluated {passed:false, checks:[]}` beside an approved gate is
     // never left to daemon stderr to explain.
-    let floor_note: Option<String> =
+    // (core#544 / core#469) With a floor present, the note says what the floor's verdict rests
+    // on when it is not a fresh full run: a carried-forward result, or waived checks.
+    let rested_note: Option<String> = match (&carried, &evidence.repo_checks) {
+        (Some(r), _) => Some(format!(
+            "the rework made no change to the tree; this unit's last floor result on this tree \
+             stands ({})",
+            r.outcome()
+        )),
+        (None, Some(r)) if !r.waived.is_empty() => Some(format!(
+            "the operator's `{}` re-run waived {} for this unit — unverified by the floor, not \
+             refuted",
+            r.rerun.map(|m| m.as_wire()).unwrap_or("floor"),
+            r.waived.join(", ")
+        )),
+        _ => None,
+    };
+    let floor_note: Option<String> = rested_note.or_else(|| {
         (unit.tool_cmd.is_none() && !has_deterministic_floor).then(|| {
             match (workdir.is_some(), evidence.tree_changed) {
             (false, _) => "no pinned validator; repo checks do not apply to an unbound run (no \
@@ -1512,7 +1562,8 @@ pub(crate) fn apply_and_finish_unit(
             ),
             (true, _) => "no pinned validator and the repo checks did not run".to_string(),
         }
-        });
+        })
+    });
     let judge_skipped_reason: Option<String> = evidence.judge_skipped.clone();
     let ungated_reason = ungated.then(|| {
         let mut parts: Vec<String> = Vec::new();

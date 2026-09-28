@@ -211,6 +211,52 @@ pub const DENIAL_SOURCE: &str = "repo_checks";
 /// A floor that did not FINISH (a check hit its bound) — never "checks failed".
 pub const DENIAL_SOURCE_TIMEOUT: &str = "repo_checks_timeout";
 
+/// (core#469) What an operator chose at the escalation gate of a floor that did not FINISH
+/// (`repo_checks_timeout`). Each re-runs the floor on the tree as it stands — the seat does not
+/// run again — and the result goes through the ordinary gate fold:
+/// * `extend` — every check again under [`EXTEND_FACTOR`]× its bound;
+/// * `targeted` — the creator-stage selection: the repo's declared `test_targeted` stands in for
+///   the full test set (and `e2e` does not run); with no targeted command the test set is waived;
+/// * `accept_partial` — the checks that passed run again and the ones that did not finish (or
+///   never ran) are WAIVED for this unit.
+///
+/// A waived check is disclosed on `repoChecksEvaluated.waived` and in the gate's `floorNote`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloorRerunMode {
+    Extend,
+    Targeted,
+    AcceptPartial,
+}
+
+impl FloorRerunMode {
+    /// The wire token — also the gate decision's `action`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            FloorRerunMode::Extend => "extend",
+            FloorRerunMode::Targeted => "targeted",
+            FloorRerunMode::AcceptPartial => "accept_partial",
+        }
+    }
+}
+
+/// The bound multiplier of an `extend` re-run.
+pub const EXTEND_FACTOR: u64 = 2;
+
+/// (core#469) A floor-only re-dispatch the gate armed on a unit (`WorkUnit::floor_rerun`): the
+/// worker thread skips the seat, hands the fold `output` (the reviewed attempt's transcript) as
+/// the unit's output, and runs the floor under `mode`. Cleared by the fold that consumes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorRerun {
+    pub mode: FloorRerunMode,
+    /// `accept_partial`: the checks to waive (the ones that did not finish or never ran).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waive: Vec<String>,
+    /// The seat's output from the attempt the gate reviewed.
+    #[serde(default)]
+    pub output: String,
+}
+
 /// One check the floor detected: a name, the exact argv, and where it was read from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoCheck {
@@ -460,6 +506,23 @@ pub struct RepoChecksReport {
     /// (F-RC2-009) The environment the checks ran under, for CI-parity reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<FloorEnv>,
+    /// (core#544) The worktree tree id the checks ran ON (taken before they ran). The unit's last
+    /// report stands for THIS tree: a rework that leaves the tree identical carries it forward
+    /// instead of reading as "nothing to check". `None` when unknown (never carried).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// (core#469) An operator's floor re-run this report answers (`extend` | `targeted` |
+    /// `accept_partial`); `None` for the ordinary floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun: Option<FloorRerunMode>,
+    /// (core#469) Detected checks the operator WAIVED for this unit (never run, never counted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waived: Vec<String>,
+    /// (core#469) The operator's re-run of THIS floor, armed at the escalation gate and read by
+    /// the unit's next dispatch (`WorkUnit::repo_checks` is where the gate finds the floor it
+    /// answers). Consumed there: the re-run's own report replaces this one on the unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_rerun: Option<FloorRerun>,
 }
 
 impl RepoChecksReport {
@@ -1606,6 +1669,16 @@ pub(crate) fn run(worktree: &Path) -> RepoChecksReport {
 /// ([`CheckRun::denies`]): a failure the run base shares is recorded and the floor moves on
 /// (F-RC2-009). Fail-closed on a detection error and when no OS write boundary can be armed.
 pub fn run_floor(worktree: &Path, ctx: &FloorContext) -> RepoChecksReport {
+    run_floor_rerun(worktree, ctx, None)
+}
+
+/// [`run_floor`] for an operator's re-run (core#469, [`FloorRerun`]): the same floor with the
+/// check set and bounds the gate's choice asks for. `None` is the ordinary floor.
+pub fn run_floor_rerun(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: Option<&FloorRerun>,
+) -> RepoChecksReport {
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
@@ -1621,7 +1694,9 @@ pub fn run_floor(worktree: &Path, ctx: &FloorContext) -> RepoChecksReport {
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
     ]);
-    run_with_sandbox_ctx(worktree, sandbox, ctx, scratch)
+    let mut report = run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun);
+    report.rerun = rerun.map(|r| r.mode);
+    report
 }
 
 /// [`run_floor`] against an explicit sandbox probe — the injectable seam, so the fail-closed branch
@@ -1630,7 +1705,7 @@ pub fn run_floor(worktree: &Path, ctx: &FloorContext) -> RepoChecksReport {
 pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoChecksReport {
     let ctx = FloorContext::default();
     match CheckScratch::prepare(worktree) {
-        Ok(scratch) => run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch),
+        Ok(scratch) => run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None),
         Err(e) => scratch_refused(worktree, &ctx, &sandbox, &e),
     }
 }
@@ -1658,6 +1733,10 @@ fn scratch_refused(
         engine_writes_removed: Vec::new(),
         claim: None,
         env: None,
+        tree: None,
+        rerun: None,
+        waived: Vec::new(),
+        requested_rerun: None,
     }
 }
 
@@ -1666,6 +1745,7 @@ pub(crate) fn run_with_sandbox_ctx(
     sandbox: WorkerSandbox,
     ctx: &FloorContext,
     scratch: CheckScratch,
+    rerun: Option<&FloorRerun>,
 ) -> RepoChecksReport {
     let sandbox_level = sandbox.level.as_wire().to_string();
     let sandbox_note = sandbox.downgrade_reason.clone();
@@ -1693,6 +1773,10 @@ pub(crate) fn run_with_sandbox_ctx(
             engine_writes_removed: Vec::new(),
             claim: None,
             env: None,
+            tree: None,
+            rerun: None,
+            waived: Vec::new(),
+            requested_rerun: None,
         };
     }
     let detected = match detect_with(worktree, ctx) {
@@ -1710,8 +1794,37 @@ pub(crate) fn run_with_sandbox_ctx(
                 engine_writes_removed: Vec::new(),
                 claim: None,
                 env: None,
+                tree: None,
+                rerun: None,
+                waived: Vec::new(),
+                requested_rerun: None,
             }
         }
+    };
+    let (detected, waived) = match rerun {
+        Some(r) => match apply_rerun(worktree, ctx, r, detected) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return RepoChecksReport {
+                    detected: Vec::new(),
+                    checks: Vec::new(),
+                    skipped: Vec::new(),
+                    passed: false,
+                    detect_error: Some(e),
+                    sandbox_level,
+                    sandbox_note,
+                    sandbox_error: None,
+                    engine_writes_removed: Vec::new(),
+                    claim: None,
+                    env: None,
+                    tree: None,
+                    rerun: None,
+                    waived: Vec::new(),
+                    requested_rerun: None,
+                }
+            }
+        },
+        None => (detected, Vec::new()),
     };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
@@ -1817,7 +1930,90 @@ pub(crate) fn run_with_sandbox_ctx(
         engine_writes_removed,
         claim,
         env: Some(env),
+        tree: None,
+        rerun: None,
+        waived,
+        requested_rerun: None,
     }
+}
+
+/// Is `name` one of the floor's TEST-set checks (the ones a `targeted` re-run replaces)?
+fn is_test_set_check(name: &str) -> bool {
+    matches!(name, "test" | "cargo-test" | "e2e")
+}
+
+/// (core#469) The check set an operator's re-run runs, and the detected checks it waives.
+/// * `extend` — every check (the install excepted) under [`EXTEND_FACTOR`]× its base bound;
+/// * `targeted` — the CREATOR-stage selection (the declared `test_targeted` in place of the full
+///   test set, no `e2e`); a repo with no targeted command has its test set waived;
+/// * `accept_partial` — the named checks are waived, the rest run again.
+fn apply_rerun(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: &FloorRerun,
+    detected: Vec<RepoCheck>,
+) -> Result<(Vec<RepoCheck>, Vec<String>), String> {
+    match rerun.mode {
+        FloorRerunMode::Extend => Ok((
+            detected
+                .into_iter()
+                .map(|mut c| {
+                    if c.name != "install" {
+                        c.timeout_s = Some(c.base_timeout().as_secs() * EXTEND_FACTOR);
+                    }
+                    c
+                })
+                .collect(),
+            Vec::new(),
+        )),
+        FloorRerunMode::Targeted => {
+            let creator = detect_with(
+                worktree,
+                &FloorContext {
+                    stage: FloorStage::Creator,
+                    ..ctx.clone()
+                },
+            )?;
+            if creator.iter().any(|c| c.name == "test_targeted") {
+                // The full test set the targeted command stands in for is disclosed as waived.
+                let waived = detected
+                    .iter()
+                    .filter(|c| {
+                        is_test_set_check(&c.name) && !creator.iter().any(|k| k.name == c.name)
+                    })
+                    .map(|c| c.name.clone())
+                    .collect();
+                Ok((creator, waived))
+            } else {
+                let (run, waived): (Vec<RepoCheck>, Vec<RepoCheck>) = detected
+                    .into_iter()
+                    .partition(|c| !is_test_set_check(&c.name));
+                Ok((run, waived.into_iter().map(|c| c.name).collect()))
+            }
+        }
+        FloorRerunMode::AcceptPartial => {
+            let (waived, run): (Vec<RepoCheck>, Vec<RepoCheck>) = detected
+                .into_iter()
+                .partition(|c| rerun.waive.iter().any(|w| w == &c.name));
+            Ok((run, waived.into_iter().map(|c| c.name).collect()))
+        }
+    }
+}
+
+/// (core#469) The checks an `accept_partial` waives, read off the report of the floor that did
+/// not finish: every check that did not pass (the one that hit its bound) and every one that
+/// never ran after it. Empty when the report is not a timed-out floor — nothing to accept.
+pub fn partial_waiver(report: &RepoChecksReport) -> Vec<String> {
+    if !report.timed_out() {
+        return Vec::new();
+    }
+    report
+        .checks
+        .iter()
+        .filter(|c| c.denies())
+        .map(|c| c.name.clone())
+        .chain(report.skipped.iter().cloned())
+        .collect()
 }
 
 /// The run base, exported into the checks' scratch for the baseline diff — plain files, no git
@@ -2710,6 +2906,10 @@ mod tests {
             engine_writes_removed: Vec::new(),
             claim: None,
             env: None,
+            tree: None,
+            rerun: None,
+            waived: Vec::new(),
+            requested_rerun: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -3608,6 +3808,10 @@ mod tests {
             engine_writes_removed: Vec::new(),
             claim: None,
             env: None,
+            tree: None,
+            rerun: None,
+            waived: Vec::new(),
+            requested_rerun: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -3716,6 +3920,10 @@ mod tests {
             engine_writes_removed: Vec::new(),
             claim: None,
             env: None,
+            tree: None,
+            rerun: None,
+            waived: Vec::new(),
+            requested_rerun: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -4470,5 +4678,147 @@ mod tests {
     #[cfg(unix)]
     fn names_run(report: &RepoChecksReport) -> Vec<&str> {
         report.checks.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    fn run_named(name: &str, exit_code: Option<i32>, timed_out: bool) -> CheckRun {
+        CheckRun {
+            name: name.into(),
+            argv: vec!["sh".into()],
+            source: "t".into(),
+            exit_code,
+            timed_out,
+            spawn_error: None,
+            duration_ms: 1,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            bound_s: 1,
+            bound_note: None,
+            failure_ids: Vec::new(),
+            classification: None,
+            pre_existing: Vec::new(),
+            regressions: Vec::new(),
+            base: None,
+        }
+    }
+
+    fn report_of(checks: Vec<CheckRun>, skipped: &[&str]) -> RepoChecksReport {
+        let passed = !checks.iter().any(|c| c.denies());
+        RepoChecksReport {
+            detected: Vec::new(),
+            checks,
+            skipped: skipped.iter().map(|s| s.to_string()).collect(),
+            passed,
+            detect_error: None,
+            sandbox_level: "sandboxed".into(),
+            sandbox_note: None,
+            sandbox_error: None,
+            engine_writes_removed: Vec::new(),
+            claim: None,
+            env: None,
+            tree: None,
+            rerun: None,
+            waived: Vec::new(),
+            requested_rerun: None,
+        }
+    }
+
+    /// core#469: `accept_partial` waives exactly what the timed-out floor did not verify — the
+    /// check that hit its bound and every one that never ran after it — and nothing on a floor
+    /// that FAILED (a failure is not "unfinished").
+    #[test]
+    fn the_partial_waiver_is_what_the_timed_out_floor_did_not_verify() {
+        let timed_out = report_of(
+            vec![
+                run_named("lint", Some(0), false),
+                run_named("test", None, true),
+            ],
+            &["e2e"],
+        );
+        assert!(timed_out.timed_out());
+        assert_eq!(partial_waiver(&timed_out), vec!["test", "e2e"]);
+        let failed = report_of(
+            vec![
+                run_named("lint", Some(0), false),
+                run_named("test", Some(1), false),
+            ],
+            &[],
+        );
+        assert!(partial_waiver(&failed).is_empty());
+        let passed = report_of(vec![run_named("lint", Some(0), false)], &[]);
+        assert!(partial_waiver(&passed).is_empty());
+    }
+
+    /// core#469: what each operator re-run runs. `extend` doubles every non-install bound;
+    /// `targeted` swaps the full test set for the declared `test_targeted` (disclosing the
+    /// replaced full set) or, with none declared, waives the test set; `accept_partial` drops the
+    /// waived checks and runs the rest.
+    #[test]
+    fn an_operator_rerun_selects_its_checks_and_names_what_it_waives() {
+        let wt = scratch("rerun-select");
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            r#"{"lint":["sh","-c","exit 0"],"test":["sh","-c","exit 0"],"full":true,"timeout_s":10}"#,
+        )
+        .unwrap();
+        let ctx = FloorContext::default(); // verify stage
+        let detected = detect_with(&wt, &ctx).unwrap();
+        assert_eq!(names(&detected), vec!["lint", "test"]);
+        let rerun = |mode, waive: &[&str]| FloorRerun {
+            mode,
+            waive: waive.iter().map(|w| w.to_string()).collect(),
+            output: String::new(),
+        };
+
+        let (run, waived) = apply_rerun(
+            &wt,
+            &ctx,
+            &rerun(FloorRerunMode::Extend, &[]),
+            detected.clone(),
+        )
+        .unwrap();
+        assert!(waived.is_empty());
+        assert!(
+            run.iter().all(|c| c.timeout_s == Some(10 * EXTEND_FACTOR)),
+            "{run:?}"
+        );
+
+        let (run, waived) = apply_rerun(
+            &wt,
+            &ctx,
+            &rerun(FloorRerunMode::Targeted, &[]),
+            detected.clone(),
+        )
+        .unwrap();
+        assert_eq!(names(&run), vec!["lint"]);
+        assert_eq!(
+            waived,
+            vec!["test"],
+            "no targeted command: the test set is waived"
+        );
+
+        let (run, waived) = apply_rerun(
+            &wt,
+            &ctx,
+            &rerun(FloorRerunMode::AcceptPartial, &["test"]),
+            detected.clone(),
+        )
+        .unwrap();
+        assert_eq!(names(&run), vec!["lint"]);
+        assert_eq!(waived, vec!["test"]);
+
+        // A declared targeted command stands in for the full set, even under `full: true`.
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            r#"{"lint":["sh","-c","exit 0"],"test":["sh","-c","exit 0"],"test_targeted":["sh","-c","exit 0"],"full":true}"#,
+        )
+        .unwrap();
+        let detected = detect_with(&wt, &ctx).unwrap();
+        assert_eq!(names(&detected), vec!["lint", "test"], "verify, full: true");
+        let (run, waived) =
+            apply_rerun(&wt, &ctx, &rerun(FloorRerunMode::Targeted, &[]), detected).unwrap();
+        assert_eq!(names(&run), vec!["lint", "test_targeted"]);
+        assert_eq!(waived, vec!["test"], "the replaced full set is disclosed");
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }

@@ -364,6 +364,35 @@ pub enum HumanDecision {
     /// accepted directly as the next rev — the human who edited it approved it. A refused edit
     /// re-opens the gate with a new `gate_id`. Refused at any other gate.
     EditPlan { plan: crate::plan::PlanSteps },
+    /// (core#469) Answer the escalation gate of a repo-checks floor that did not FINISH (denial
+    /// source `repo_checks_timeout`): re-run the floor on the tree as it stands — `extend` (every
+    /// check under 2× its bound), `targeted` (the declared targeted test set in place of the full
+    /// one) or `accept_partial` (the checks that did not finish are waived for this unit, the rest
+    /// run again). The seat does not run again; the result goes through the ordinary gate fold, so
+    /// a failing re-run denies again. Refused at any other gate.
+    FloorRerun(crate::repo_checks::FloorRerunMode),
+    /// (core#467 item 4) Adopt the evaluator's DISCARDED edit — the worktree guard restored the
+    /// creator's tree and pinned the edit under `suggestion_ref` — as the creator's amendment: the
+    /// engine applies the pinned tree to the worktree and sends the run back to the creator (the
+    /// `request_changes` rewind), which then owns the change and whose floor judges it. Refused at
+    /// any gate that carries no restored, pinned suggestion.
+    AcceptSuggestion,
+}
+
+impl HumanDecision {
+    /// (core#469 / core#467) The escalation arm a gate decision's wire `action` names — `extend` |
+    /// `targeted` | `accept_partial` | `accept_suggestion` — or `None` for any other token. The
+    /// ONE parser every door (napi, bus) routes these tokens through.
+    pub fn escalation_action(token: &str) -> Option<Self> {
+        use crate::repo_checks::FloorRerunMode as Mode;
+        Some(match token {
+            "extend" => Self::FloorRerun(Mode::Extend),
+            "targeted" => Self::FloorRerun(Mode::Targeted),
+            "accept_partial" => Self::FloorRerun(Mode::AcceptPartial),
+            "accept_suggestion" => Self::AcceptSuggestion,
+            _ => return None,
+        })
+    }
 }
 
 /// Produces a unit's work output **off the actor thread**. The stub returns deterministic text;
@@ -2394,6 +2423,54 @@ mod workflow_def_tests {
                     .all(|u| !u.team_run),
                 "{id} under {sid}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod escalation_action_tests {
+    use super::HumanDecision;
+    use crate::repo_checks::FloorRerunMode;
+
+    /// (core#469 / core#467) The one parser for the escalation arms' wire tokens.
+    #[test]
+    fn the_escalation_tokens_parse_and_nothing_else_does() {
+        assert!(matches!(
+            HumanDecision::escalation_action("extend"),
+            Some(HumanDecision::FloorRerun(FloorRerunMode::Extend))
+        ));
+        assert!(matches!(
+            HumanDecision::escalation_action("targeted"),
+            Some(HumanDecision::FloorRerun(FloorRerunMode::Targeted))
+        ));
+        assert!(matches!(
+            HumanDecision::escalation_action("accept_partial"),
+            Some(HumanDecision::FloorRerun(FloorRerunMode::AcceptPartial))
+        ));
+        assert!(matches!(
+            HumanDecision::escalation_action("accept_suggestion"),
+            Some(HumanDecision::AcceptSuggestion)
+        ));
+        for other in [
+            "approve",
+            "reject",
+            "request_changes",
+            "edit_plan",
+            "Extend",
+            "",
+        ] {
+            assert!(HumanDecision::escalation_action(other).is_none(), "{other}");
+        }
+        // The wire token round-trips through the mode.
+        for m in [
+            FloorRerunMode::Extend,
+            FloorRerunMode::Targeted,
+            FloorRerunMode::AcceptPartial,
+        ] {
+            assert!(matches!(
+                HumanDecision::escalation_action(m.as_wire()),
+                Some(HumanDecision::FloorRerun(x)) if x == m
+            ));
         }
     }
 }

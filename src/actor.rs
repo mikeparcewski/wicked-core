@@ -5392,7 +5392,12 @@ fn apply_step_result(
             )?;
             return Ok(StepApplied::Paused);
         }
-        if output.attempt == 0 {
+        // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
+        // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
+        // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
+        // took the gate's own reassign-and-retry, the retried attempt refused identically, and
+        // the old `attempt == 0` guard sent it to `sessionFailed` with no route back.
+        {
             if let Some(refusal) = environment_refusal(&output.output) {
                 let cli = unit
                     .assigned_cli
@@ -5404,8 +5409,10 @@ fn apply_step_result(
                         .find(|c| c.key == cli)
                         .map(|c| c.headless_invocation)
                 });
+                // The self-heal is automatic, so it is bounded: attempt 0 only.
                 let fixed = refusal
                     .fix
+                    .filter(|_| output.attempt == 0)
                     .and_then(|f| effective_invocation.as_deref().and_then(|inv| f.apply(inv)));
                 emit(
                     subscribers,
@@ -5464,11 +5471,16 @@ fn apply_step_result(
                         "environment refused ({}): {raw_excerpt}",
                         refusal.reason
                     ));
+                    // (core#556) The unit RAN (and refused): Approve re-dispatches it at a fresh
+                    // attempt (`confirm_gate` bumps only an already-run cursor), so a late result
+                    // from the refused worker is dropped and the next refusal reads as attempt 2.
+                    unit.status = crate::domain::UnitStatus::Rejected;
                     put_node(store, unit.to_node())?;
                     let prompt = format!(
-                        "Unit {ord} ({cli}) refused its environment: {} — \"{raw_excerpt}\". \
-                     Approve to retry (optionally amend), reject to stop the run, or \
-                     reassign the unit to a different CLI first.",
+                        "Unit {ord} ({cli}) refused its environment on attempt {}: {} — \
+                         \"{raw_excerpt}\". Approve to retry (optionally amend), reject to stop \
+                         the run, or reassign the unit to a different CLI first.",
+                        output.attempt + 1,
                         refusal.reason
                     );
                     pause_for_human(
@@ -5483,7 +5495,54 @@ fn apply_step_result(
                     )?;
                     return Ok(StepApplied::Paused);
                 }
-            } else if human_present && seat_refusal.is_none() {
+            } else if human_present
+                && seat_refusal.is_none()
+                && output.attempt > 0
+                && !crate::acp_runner::is_worker_originated_failure(&output.output)
+            {
+                // (core#556) A RETRIED attempt that failed again without starting work (a launch
+                // refusal: fence, snapshot, environment, permission). The triage judge already
+                // ruled on attempt 0; the operator decides again here — never `sessionFailed`.
+                let raw_excerpt: String = failure_detail_excerpt(output.output.trim());
+                let why = format!(
+                    "Unit {ord} failed again on attempt {} before its work was judged: \
+                     {raw_excerpt}",
+                    output.attempt + 1
+                );
+                unit.status = crate::domain::UnitStatus::Rejected;
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(crate::domain::UnitDenial::new(
+                    "worker_failure",
+                    why.clone(),
+                ));
+                put_node(store, unit.to_node())?;
+                persist_rejected_transcript(store, &session, unit, &output.output);
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: format!("{why} — pausing for operator decision"),
+                        failure_kind: crate::event::StepFailureKind::WorkerError,
+                    },
+                );
+                let prompt = format!(
+                    "{why}. Approve to retry (optionally amend), reject to stop the run, or \
+                     reassign the unit to a different CLI first."
+                );
+                pause_for_human(
+                    store,
+                    subscribers,
+                    self_tx,
+                    &mut session,
+                    ord,
+                    Some(ord),
+                    "failure",
+                    prompt,
+                )?;
+                return Ok(StepApplied::Paused);
+            } else if human_present && seat_refusal.is_none() && output.attempt == 0 {
                 // UNRECOGNIZED failure → agent triage (the generalization of the signature
                 // table): a distinct judge seat reads the error and decides the remedy.
                 // (core#461) A CLASSIFIED seat refusal is not unrecognized: the seat is dead for
@@ -8902,6 +8961,10 @@ fn confirm_plan_gate(
             // are kept as they ran (`stage_edit`), so it is answered like any other edit.
         }
         HumanDecision::Reject => {}
+        HumanDecision::FloorRerun(_) | HumanDecision::AcceptSuggestion => anyhow::bail!(
+            "a plan_approval gate reviews a plan, not a floor or an evaluator's edit — approve, \
+             approve with an edited plan, or reject"
+        ),
     }
     let answer = match &decision {
         HumanDecision::Approve { .. } => {
@@ -9488,6 +9551,41 @@ pub(crate) fn confirm_gate(
                      approve without a scope to amend the cursor unit"
                 );
             }
+            // (core#469 / core#467) The escalation arms answer ONE kind of gate each; a team
+            // pause, or a cursor unit denied for anything else, refuses them here — the row stays
+            // open and the run stays re-answerable.
+            crate::workflow::HumanDecision::FloorRerun(_)
+            | crate::workflow::HumanDecision::AcceptSuggestion
+                if team_gate::transport_gate_open(&session)
+                    || team_gate::dispute_gate_open(&session) =>
+            {
+                anyhow::bail!(
+                    "a team pause takes approve, request changes or reject — not a floor re-run \
+                     or an evaluator's edit"
+                );
+            }
+            crate::workflow::HumanDecision::FloorRerun(mode) => {
+                let cursor = cursor.ok_or_else(|| {
+                    anyhow::anyhow!("run {run_id} has no unit at its cursor to re-run the floor of")
+                })?;
+                floor_rerun_request(&*store, cursor, *mode)?;
+            }
+            crate::workflow::HumanDecision::AcceptSuggestion => {
+                let cursor = cursor.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run {run_id} has no unit at its cursor to take a suggestion from"
+                    )
+                })?;
+                adoptable_suggestion(cursor)?;
+                let has_creator = cursor.role == crate::workflow::PhaseRole::Creator
+                    || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
+                if !has_creator {
+                    anyhow::bail!(
+                        "no creator phase precedes unit {cursor_ord} to adopt the suggestion — \
+                         approve (retry) or reject"
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -9513,6 +9611,14 @@ pub(crate) fn confirm_gate(
             }
             crate::workflow::HumanDecision::EditPlan { plan } => serde_json::json!({
                 "approve": true, "action": "edit_plan", "amend": null, "plan": plan,
+            })
+            .to_string(),
+            crate::workflow::HumanDecision::FloorRerun(mode) => serde_json::json!({
+                "approve": true, "action": mode.as_wire(), "amend": null,
+            })
+            .to_string(),
+            crate::workflow::HumanDecision::AcceptSuggestion => serde_json::json!({
+                "approve": true, "action": "accept_suggestion", "amend": null,
             })
             .to_string(),
         };
@@ -9572,6 +9678,8 @@ pub(crate) fn confirm_gate(
 
     // (DES-L1 PR-1B) Three arms. Reject = cancel, unchanged (D-2). `RequestChanges` and `Approve`
     // both pass the layer-3 boundary check below first; `rework` is `Some(note)` for the former.
+    let mut floor_rerun: Option<crate::repo_checks::FloorRerunMode> = None;
+    let mut adopt_suggestion = false;
     let (amend, amend_scope, rework): (
         Option<String>,
         crate::workflow::AmendScope,
@@ -9591,6 +9699,17 @@ pub(crate) fn confirm_gate(
         crate::workflow::HumanDecision::EditPlan { .. } => {
             anyhow::bail!("run {run_id} has no plan_approval gate open")
         }
+        // (core#469) A floor re-run is an approve of the cursor unit with the re-run armed on its
+        // last floor report (below, after the boundary check).
+        crate::workflow::HumanDecision::FloorRerun(mode) => {
+            floor_rerun = Some(mode);
+            (None, crate::workflow::AmendScope::Cursor, None)
+        }
+        // (core#467) Adopting the suggestion is a rewind to the creator, with the edit applied.
+        crate::workflow::HumanDecision::AcceptSuggestion => {
+            adopt_suggestion = true;
+            (None, crate::workflow::AmendScope::Cursor, Some(None))
+        }
     };
     {
         {
@@ -9607,8 +9726,25 @@ pub(crate) fn confirm_gate(
                 return result;
             }
             // (DES-L1 PR-1B) REQUEST CHANGES: rewind to the creator and re-dispatch it there.
+            // (core#467) ACCEPT SUGGESTION: the evaluator's pinned edit is applied to the worktree
+            // first; the creator's rework then owns it (and its floor judges the tree).
             if let Some(note) = rework {
-                return rewind_to_creator(
+                let (note, scope) = if adopt_suggestion {
+                    let units = crate::domain::session_units(store, run_id)?;
+                    let cursor = units
+                        .get(session.unit_ix)
+                        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+                    let workdir = session.workdir.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("run {run_id} has no worktree to apply the suggestion to")
+                    })?;
+                    (
+                        Some(apply_suggestion(cursor, std::path::Path::new(workdir))?),
+                        "accept_suggestion",
+                    )
+                } else {
+                    (note, "request_changes")
+                };
+                return rewind_to_creator_scoped(
                     store,
                     subscribers,
                     runner,
@@ -9617,11 +9753,25 @@ pub(crate) fn confirm_gate(
                     session,
                     run_id,
                     note,
+                    scope,
                     lifecycle_maps,
                     actor_maps,
                     process_gen,
                     is_acp,
                 );
+            }
+            // (core#469) Arm the floor re-run on the cursor unit's last floor report; the
+            // re-dispatch below skips the seat and re-runs only the checks.
+            if let Some(mode) = floor_rerun {
+                let mut units = crate::domain::session_units(store, run_id)?;
+                let cursor = units
+                    .get_mut(session.unit_ix)
+                    .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+                let request = floor_rerun_request(&*store, cursor, mode)?;
+                if let Some(r) = cursor.repo_checks.as_mut() {
+                    r.requested_rerun = Some(request);
+                }
+                put_node(store, cursor.to_node())?;
             }
             // Optionally inject an amendment (the gate is steering) — into the unit at the cursor,
             // or (DES-L1 PR-1B, core#465 `amendScope: creator`) into the first CREATOR phase at or
@@ -9756,6 +9906,114 @@ pub(crate) fn confirm_gate(
     }
 }
 
+/// (core#469) The floor re-run `mode` asks for on `unit` — refused unless the unit's denial is a
+/// floor that did not FINISH (`repo_checks_timeout`) with its report on the unit, and, for
+/// `accept_partial`, unless that report names a check to waive. The request carries the reviewed
+/// attempt's transcript: the seat does not run again, and the fold judges that output.
+fn floor_rerun_request(
+    store: &dyn GraphStore,
+    unit: &crate::domain::WorkUnit,
+    mode: crate::repo_checks::FloorRerunMode,
+) -> anyhow::Result<crate::repo_checks::FloorRerun> {
+    let source = unit.denial.as_ref().map(|d| d.source.as_str());
+    let report = unit
+        .repo_checks
+        .as_ref()
+        .filter(|_| source == Some(crate::repo_checks::DENIAL_SOURCE_TIMEOUT))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "`{}` answers the gate of a repo-checks floor that did not finish (denial source \
+                 `{}`); unit {} was denied by `{}` — approve (retry), request changes, or reject",
+                mode.as_wire(),
+                crate::repo_checks::DENIAL_SOURCE_TIMEOUT,
+                unit.ord,
+                source.unwrap_or("nothing")
+            )
+        })?;
+    let waive = match mode {
+        crate::repo_checks::FloorRerunMode::AcceptPartial => {
+            let waive = crate::repo_checks::partial_waiver(report);
+            if waive.is_empty() {
+                anyhow::bail!(
+                    "unit {}'s floor report names no check that did not finish — nothing to accept \
+                     partially",
+                    unit.ord
+                );
+            }
+            waive
+        }
+        _ => Vec::new(),
+    };
+    let output = crate::domain::get_unit_transcript(store, &unit.id)
+        .and_then(|t| t.output)
+        .unwrap_or_default();
+    Ok(crate::repo_checks::FloorRerun {
+        mode,
+        waive,
+        output,
+    })
+}
+
+/// (core#467) The evaluator's edit `unit`'s gate can adopt: the worktree guard denied the unit,
+/// RESTORED the creator's tree and pinned the discarded edit (`suggestion_ref`). Anything else
+/// is refused — there is no pinned tree to apply, or the tree under review is not the creator's.
+fn adoptable_suggestion(
+    unit: &crate::domain::WorkUnit,
+) -> anyhow::Result<&crate::worktree_guard::WorktreeMutation> {
+    unit.worktree_mutation
+        .as_ref()
+        .filter(|m| m.restored && m.suggestion_ref.is_some() && !m.after.tree.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unit {} carries no evaluator suggestion to adopt (the worktree guard must have \
+                 restored the creator's tree and pinned the discarded edit) — approve (retry), \
+                 request changes, or reject",
+                unit.ord
+            )
+        })
+}
+
+/// (core#467) Apply the evaluator's pinned edit to the worktree — the reverse of the guard's
+/// restore: `git read-tree --reset -u <edit tree>` through the PINNED git dir, then `git reset -q`
+/// (index → HEAD, working tree untouched) so the change reads as the creator's uncommitted work.
+/// Proven by a fresh snapshot whose tree equals the edit's. Returns the creator's rework note.
+fn apply_suggestion(
+    unit: &crate::domain::WorkUnit,
+    worktree: &std::path::Path,
+) -> anyhow::Result<String> {
+    let m = adoptable_suggestion(unit)?;
+    let git_dir = m.before.git_dir.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("the guard's baseline carries no pinned git dir — cannot apply the edit")
+    })?;
+    let git_dir = std::path::Path::new(git_dir);
+    let env: [(&str, &std::path::Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+    crate::worktree_guard::git(
+        worktree,
+        &["read-tree", "--reset", "-u", &m.after.tree],
+        &env,
+    )?;
+    crate::worktree_guard::git(worktree, &["reset", "-q"], &env)?;
+    let now = crate::worktree_guard::snapshot_through(worktree, git_dir)?;
+    if now.tree != m.after.tree {
+        anyhow::bail!(
+            "the evaluator's edit did not apply cleanly (tree {} after the apply, {} expected)",
+            now.tree,
+            m.after.tree
+        );
+    }
+    let paths: Vec<&str> = m.changed.iter().map(|c| c.path.as_str()).collect();
+    Ok(format!(
+        "The operator adopted the reviewer's suggested edit ({}; pinned at {}) into the tree — it \
+         is now part of your change. Review it, keep or refine it, and end your turn.",
+        if paths.is_empty() {
+            "no path changes".to_string()
+        } else {
+            paths.join(", ")
+        },
+        m.suggestion_ref.as_deref().unwrap_or("the suggestion ref")
+    ))
+}
+
 /// (DES-L1 PR-1B, core#459) REQUEST CHANGES: send a NOT-PASS review back to the creator. The
 /// target is the cursor when it IS a creator, else the most recent creator before the gated unit
 /// (`pipeline::most_recent_prior_creator`); none ⇒ error (approve = retry the review, or reject).
@@ -9778,6 +10036,41 @@ fn rewind_to_creator(
     session: crate::domain::AgentSession,
     run_id: &str,
     note: Option<String>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
+    rewind_to_creator_scoped(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        in_flight,
+        session,
+        run_id,
+        note,
+        "request_changes",
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    )
+}
+
+/// [`rewind_to_creator`] with the `unitReworkAmended.scope` token the rewind is booked under
+/// (`request_changes`, or core#467's `accept_suggestion`).
+#[allow(clippy::too_many_arguments)]
+fn rewind_to_creator_scoped(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    session: crate::domain::AgentSession,
+    run_id: &str,
+    note: Option<String>,
+    scope: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -9846,7 +10139,7 @@ fn rewind_to_creator(
             ord: target_ord,
             amendment,
             updated_description: units[target_ix].description.clone(),
-            scope: "request_changes".to_string(),
+            scope: scope.to_string(),
         },
     );
     emit(

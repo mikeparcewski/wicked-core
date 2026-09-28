@@ -963,7 +963,35 @@ fn run_unit_and_judge_on(
         }
         _ => None,
     };
-    let output = runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta);
+    // (core#469) A FLOOR RE-RUN the operator chose at a timed-out floor's gate: the seat does NOT
+    // run again — its reviewed output is handed to the fold as this attempt's output, and only the
+    // repository's checks re-run (below) under the chosen mode.
+    let floor_rerun: Option<&crate::repo_checks::FloorRerun> = input
+        .unit
+        .repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref());
+    let output = match floor_rerun {
+        Some(r) => {
+            emit_delta(&format!(
+                "repo checks floor re-run ({}): the seat does not run again; the repository's \
+                 checks re-run on the tree as it stands",
+                r.mode.as_wire()
+            ));
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: r.output.clone(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+        None => runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta),
+    };
     // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
     // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
     let mut team_snapshot: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
@@ -1109,10 +1137,30 @@ fn run_unit_and_judge_on(
     } else {
         None
     };
+    // (core#544) The tree id as it stands now: the floor's report records the tree it ran
+    // ON, so a rework that leaves the tree identical to the one the unit's last floor judged
+    // carries that verdict forward (the fold), while a tree no floor of this unit has judged —
+    // an operator's hand edit between attempts — runs the checks even though this attempt
+    // changed nothing.
+    let current_tree: Option<String> = bound_agent
+        .then(|| {
+            let wd = input.workdir.as_deref()?;
+            let git_dir = input.unit.worktree_baseline.as_ref()?.git_dir.as_deref()?;
+            crate::worktree_guard::snapshot_through(wd, std::path::Path::new(git_dir))
+                .map(|s| s.tree)
+                .ok()
+        })
+        .flatten();
+    let unfloored_tree =
+        input.unit.repo_checks.as_ref().is_some_and(|r| {
+            current_tree.is_none() || r.tree.as_deref() != current_tree.as_deref()
+        });
     // The DEFAULT floor applies to a bound agent unit that changed (or may have changed) its
     // tree: the repository's own checks run and, when an eligible non-creator seat exists, a
-    // judge distinct from the creator renders a verdict (F-7R2-005).
-    let default_floor_applies = bound_agent && tree_changed != Some(false);
+    // judge distinct from the creator renders a verdict (F-7R2-005) — and to one whose
+    // tree no floor of this unit has judged yet, or whose floor the operator asked to re-run.
+    let default_floor_applies =
+        bound_agent && (tree_changed != Some(false) || unfloored_tree || floor_rerun.is_some());
     // F-036 WORKTREE GUARD, first look — taken right after the seat's own work so the repo checks
     // below are never run over a tree the seat already rewrote (they would certify the wrong
     // code). This is NOT the outcome the gate sees: the FINAL comparison is taken at the very end
@@ -1437,8 +1485,12 @@ fn run_unit_and_judge_on(
                     stage.as_wire()
                 ),
                 FLOOR_HEARTBEAT_EVERY,
-                || crate::repo_checks::run_floor(wd, &ctx),
+                || crate::repo_checks::run_floor_rerun(wd, &ctx, floor_rerun),
             );
+            // (core#544) The tree these checks judged — the one this unit's next attempt compares
+            // against before it re-runs or carries this verdict.
+            let mut report = report;
+            report.tree = current_tree.clone();
             eprintln!(
                 "wicked-core: repo checks floor ({}) for unit {}: {} — {}",
                 stage.as_wire(),
