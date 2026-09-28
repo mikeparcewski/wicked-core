@@ -1,0 +1,71 @@
+{
+  "rules": [
+    {
+      "id": "MCP-FIRST-USE",
+      "rule_type": "policy",
+      "statement": "The first use of an MCP server asks for the operator's approval, in every run mode (engine gate engine:mcp-first-use). This rule is the approvals ledger: approving a server (mcp:<server>) or one tool (mcp:<server>/<tool>) adds that token to its excludes through the audited rule upsert, and a changed tool schema withdraws the approval so the next call asks again. The engine reads the ledger whether the rule is active or retired, so retiring it never lifts the ask.",
+      "severity": "error",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["mcp"],
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/mcp-defaults/rules/mcp-defaults.json#MCP-FIRST-USE",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
+      "id": "MCP-POSTURE-READ",
+      "rule_type": "policy",
+      "statement": "P-1: a read-only-annotated tool of an approved MCP server runs.",
+      "severity": "info",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["mcp"],
+      "effect": "allow",
+      "trigger": { "contains": "\"mcp\":\\{\"annotations\":\\{[^{}]*\\},\"class\":\"read\"" },
+      "criteria": "read tools of an approved server run",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/mcp-defaults/rules/mcp-defaults.json#MCP-POSTURE-READ",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
+      "id": "MCP-POSTURE-WRITE",
+      "rule_type": "policy",
+      "statement": "P-2, gate by risk (Balanced): a write or destructive MCP tool asks until the operator approves it. Approving the tool (mcp:<server>/<tool>) or the server (mcp:<server>) adds that token to this rule's excludes.",
+      "severity": "error",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["mcp-mode:balanced"],
+      "effect": "allow_with_conditions",
+      "obligations": ["mcp:approval"],
+      "trigger": { "contains": "\"mcp\":\\{\"annotations\":\\{[^{}]*\\},\"class\":\"(write|destructive)\"" },
+      "criteria": "balanced mode: write tools ask until approved",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/mcp-defaults/rules/mcp-defaults.json#MCP-POSTURE-WRITE",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
+      "id": "MCP-MODE-ASK-WRITE",
+      "rule_type": "policy",
+      "statement": "Gate every step (Ask): every write or destructive MCP call asks, approved tool or not.",
+      "severity": "error",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["mcp-mode:ask"],
+      "effect": "allow_with_conditions",
+      "obligations": ["mcp:approval"],
+      "trigger": { "contains": "\"mcp\":\\{\"annotations\":\\{[^{}]*\\},\"class\":\"(write|destructive)\"" },
+      "criteria": "ask mode: every write call asks",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/mcp-defaults/rules/mcp-defaults.json#MCP-MODE-ASK-WRITE",
+        "source_kinds": ["doc"]
+      }
+    }
+  ]
+}

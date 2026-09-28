@@ -162,6 +162,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
             }
         });
     Some(crate::workflow::GovernanceContext {
+        human_confirm: Default::default(),
         db_path: abs,
         // Deliberately not resolved here: this function only knows the process-wide store path, not
         // which repo a run targets nor which project it was filed into. `dispatch_unit` fills it in
@@ -833,6 +834,15 @@ pub(crate) fn run(
             "wicked-core: could not seed the built-in evidence floor ({e}); runs of the built-in \
              workflows will fail closed at plan time on an unresolvable validator pin"
         );
+    }
+
+    // Seed the MCP posture rules (DES-MCP-TOOLS-001 §4.3, the `mcp-defaults` pack) INSERT-ONLY, so
+    // a restart never undoes an approval or resurrects a retired rule. A store that cannot hold them
+    // fails CLOSED at the call, not here: `mcp_gate::evaluate` refuses every call it would judge by
+    // policy (`guard_error`) while the engine gates still deny, so the engine comes up either way
+    // and says why once, here.
+    if let Err(e) = crate::mcp_gate::seed_mcp_defaults(&mut store) {
+        eprintln!("wicked-core: could not seed the MCP posture rules ({e})");
     }
 
     let sidecar_base: String = sidecar_base(&path);
@@ -7815,6 +7825,8 @@ fn dispatch_unit(
             // resume/redrive re-arms the same scope. Threaded to the worker env as
             // `WICKED_RUN_PROJECT` by `estate_provenance_env`; `None` for a repo-only run.
             project_id: session.project_id.clone(),
+            // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
+            human_confirm: session.human_confirm,
             ..g
         }),
         prior_outputs,

@@ -2803,6 +2803,7 @@ mod tests {
             entity_mode: EntityMode::Shared,
             workdir: None,
             governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: "/abs/estate.db".into(),
                 // Through the resolver's spelling helper, not a hand-join (FINDING-069 discipline).
                 code_graph_db: Some(

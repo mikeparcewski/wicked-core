@@ -384,6 +384,7 @@ mod tests {
         let inbox = std::env::temp_dir().join("wicked-f02-inbox");
         let second = std::env::temp_dir().join("wicked-f02-second");
         let g = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
             db_path: "/state/core.db".into(),
             code_graph_db: Some("/state/repo-graphs/key/graph.db".into()),
             extra_write_roots: vec![

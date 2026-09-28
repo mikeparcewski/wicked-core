@@ -990,6 +990,12 @@ struct AcpProcess {
     /// that carries no governance gate (`acp_permission::chat_boundary_result`); `None` for unit
     /// sessions, whose boundary rides their `AcpGate`.
     chat_boundary: Option<crate::gate_hook::BoundaryCtx>,
+    /// The process's MCP capability token (DES-MCP-TOOLS-001 S1), handed to the bridge's env at
+    /// spawn as `WICKED_MCP_TOKEN` beside the broker's `WICKED_CREW_URL`. The process outlives a
+    /// unit (it is reused across the run's turns on this seat), so the token is BOUND to the unit
+    /// only for the duration of that unit's turn and resolves to nothing between turns and on a
+    /// chat session. Revoked when the process drops. `None` when the daemon has no broker URL.
+    mcp_token: Option<crate::mcp_gate::McpToken>,
 }
 
 impl Drop for AcpProcess {
@@ -2461,6 +2467,19 @@ fn start_acp_process_with_write_roots(
     };
     let worker_write_roots_env = std::env::join_paths(&worker_write_roots)
         .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
+    // The MCP channel (DES-MCP-TOOLS-001 S1): one token per UNIT session's process, bound per
+    // turn. A chat session (`session: None`) gets none: it has no unit to judge a call for.
+    // Known limit of a reused process: work an earlier unit backgrounded can still reach the
+    // broker while a LATER unit of the same run, on the same seat, is bound, and is judged as that
+    // unit. Never across a write-fence change: a fenced unit (read-only or deliverable-roots) never
+    // shares a process with a `Full` one (F-036), and a fenced unit's process is killed when its
+    // unit ends. It CAN cross a role change between two `Full` units (an `executes_code` evaluator
+    // and a creator): D-1 keys on the role too, so a call such an evaluator backgrounded is judged
+    // as the later creator. That evaluator already holds unfenced filesystem writes, so this
+    // widens nothing it could not do; the ACP env is fixed at spawn, so the token cannot rotate.
+    let mcp_token = session
+        .and(crate::mcp_gate::daemon_crew_url())
+        .map(|url| (crate::mcp_gate::McpToken::mint(), url));
     let build_cmd = |binary: &str| {
         let mut cmd = if let Some(sandbox) = &worker_sandbox {
             let mut cmd = std::process::Command::new(&sandbox.wrapper[0]);
@@ -2494,6 +2513,11 @@ fn start_acp_process_with_write_roots(
             cmd.env(crate::gate_hook::ESTATE_DB_ENV, db);
         }
         cmd.env(crate::gate_hook::ESTATE_READONLY_ENV, "1");
+        if let Some((token, url)) = &mcp_token {
+            for (k, v) in token.worker_env(Some(url)) {
+                cmd.env(k, v);
+            }
+        }
         // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
         // to a known slate, then set exactly what this path intends. The seat's OWN
         // configuration-home variable(s) point into its root under the worker home (this also
@@ -2819,6 +2843,7 @@ fn start_acp_process_with_write_roots(
     Ok(AcpProcess {
         kill_handle: Arc::new(KillHandle::new(child)),
         no_code: false,
+        mcp_token: mcp_token.map(|(token, _)| token),
         write_lock: Arc::new(Mutex::new(())),
         stdin,
         line_rx: rx,
@@ -7933,6 +7958,19 @@ impl AcpStepRunner {
         }
         // DES-TEAMING-002 §4.2: the turn's team context (a claimed attempt publishes its checkpoints).
         let team_turn = self.team_attach(input);
+        // The process's MCP token resolves to THIS unit for exactly this turn (DES-MCP-TOOLS-001
+        // S1); a governed unit only — the broker records into the unit's decisions log.
+        let mcp_binding =
+            proc.mcp_token
+                .as_ref()
+                .zip(input.governance.as_ref())
+                .map(|(token, g)| {
+                    token.bind(crate::mcp_gate::McpUnit::of(
+                        input,
+                        &g.db_path,
+                        crate::mcp_gate::McpMode::of(&g.human_confirm),
+                    ))
+                });
         let turn = exec_turn_acp_posture(
             &mut proc,
             &prompt,
@@ -7947,6 +7985,8 @@ impl AcpStepRunner {
             fence.as_ref(),
             team_turn.as_ref(),
         );
+        // The unit's turn is over: its token resolves to nothing until the next unit binds it.
+        drop(mcp_binding);
         let superseded = {
             let maps = self
                 .elicitation_maps
@@ -11591,6 +11631,102 @@ sleep 30
             "no repo graph ⇒ no WICKED_ESTATE_DB on the child (no store beats the wrong store): {env2}"
         );
         assert!(env2.contains("WICKED_ESTATE_READONLY=1"), "{env2}");
+        drop(proc2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DES-MCP-TOOLS-001 S1: the ACP child carries the process's MCP capability token and the
+    /// broker URL when the daemon has one, and neither when it has none. The token resolves to a
+    /// unit only while a turn binds it. Mutation: drop the `worker_env` loop in `build_cmd` → the
+    /// child has no `WICKED_MCP_TOKEN` → fail.
+    #[test]
+    #[cfg(unix)]
+    fn the_acp_child_carries_the_mcp_token_and_broker_url_only_with_a_broker() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("mcp-env");
+        let stub = |tag: &str| {
+            let envfile = dir.join(format!("child-env-{tag}.txt"));
+            let script = write_stub(
+                &dir.join(tag),
+                &format!(
+                    r#"#!/bin/sh
+env > "{envfile}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{tag}"}}}}'
+sleep 30
+"#,
+                    envfile = envfile.display(),
+                ),
+            );
+            (script, envfile)
+        };
+        for tag in ["with", "chat", "none"] {
+            std::fs::create_dir_all(dir.join(tag)).unwrap();
+        }
+        let unit_session = |script: &std::path::Path| {
+            start_acp_process_with_write_roots(
+                &stub_config(script, None),
+                &dir,
+                None,
+                None,
+                &[],
+                &[],
+                &crate::skills_snapshot::SkillsDelivery::None,
+                Some(("run-mcp-env", "claude")),
+            )
+        };
+
+        std::env::set_var(crate::mcp_gate::CREW_URL_ENV, "http://127.0.0.1:7701");
+        let (script, envfile) = stub("with");
+        let started = unit_session(&script);
+        // A CHAT session never carries one: there is no unit to judge its calls for.
+        let (chat_script, chat_envfile) = stub("chat");
+        let chat = start_acp_process(&stub_config(&chat_script, None), &dir, None, None);
+        std::env::remove_var(crate::mcp_gate::CREW_URL_ENV);
+        let chat = chat.expect("start chat");
+        let chat_env = std::fs::read_to_string(&chat_envfile).unwrap();
+        assert!(!chat_env.contains("WICKED_MCP_TOKEN="), "{chat_env}");
+        assert!(chat.mcp_token.is_none());
+        drop(chat);
+        let proc = started.expect("start");
+        let env = std::fs::read_to_string(&envfile).unwrap();
+        let token = env
+            .lines()
+            .find_map(|l| l.strip_prefix("WICKED_MCP_TOKEN="))
+            .unwrap_or_else(|| panic!("the child carries a token: {env}"))
+            .to_string();
+        assert!(token.starts_with("wmt_"), "{token}");
+        assert!(
+            env.contains("WICKED_CREW_URL=http://127.0.0.1:7701"),
+            "{env}"
+        );
+        assert_eq!(
+            proc.mcp_token.as_ref().map(|t| t.value()),
+            Some(token.as_str())
+        );
+        // Unbound between turns: the broker refuses it.
+        let call: crate::mcp_gate::McpCall = serde_json::from_value(
+            serde_json::json!({"server": "jira", "tool": "t", "registered": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::mcp_gate::evaluate_mcp_call(&token, &call),
+            Err(crate::mcp_gate::McpCallError::InvalidToken)
+        );
+        drop(proc);
+
+        let (script2, envfile2) = stub("none");
+        let proc2 = unit_session(&script2).expect("start");
+        let env2 = std::fs::read_to_string(&envfile2).unwrap();
+        assert!(
+            !env2.contains("WICKED_MCP_TOKEN="),
+            "no broker ⇒ no token: {env2}"
+        );
+        assert!(!env2.contains("WICKED_CREW_URL="), "{env2}");
+        assert!(proc2.mcp_token.is_none());
         drop(proc2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16039,6 +16175,7 @@ No further next steps — both questions fully answered.";
             entity_mode: crate::scope::EntityMode::Shared,
             workdir: Some(dir.to_path_buf()),
             governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
@@ -17300,6 +17437,7 @@ No further next steps — both questions fully answered.";
             std::fs::create_dir_all(d).unwrap();
         }
         let g = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
             db_path: base.join("core.db").to_string_lossy().into_owned(),
             code_graph_db: Some(graph.join("graph.db").to_string_lossy().into_owned()),
             extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
@@ -20772,6 +20910,7 @@ acp_input_governance = true
             entity_mode: crate::scope::EntityMode::Isolated,
             workdir: Some(wt),
             governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: home.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),

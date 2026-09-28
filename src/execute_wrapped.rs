@@ -2027,9 +2027,15 @@ impl WrappedCliStepRunner {
                     }
                 }
             }
+            // The unit's MCP channel (DES-MCP-TOOLS-001 S1): a capability token bound to THIS unit,
+            // and the broker's URL, on every seat — the broker, not the seat, is where an MCP call
+            // is governed. Bound until the worker exits (the guard drops after `run_bounded`); an
+            // ungoverned unit or a daemon with no broker gets neither variable.
+            let mcp_channel = crate::mcp_gate::arm_worker_mcp_channel(&mut cmd, input);
             let cancel_token = self.register_token(input);
             let bounded = run_bounded(cmd, self.timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
+            drop(mcp_channel);
             match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
                 // phase writes a resumable worker script into its worktree, starts N copies, and
@@ -4957,6 +4963,7 @@ mod tests {
             entity_mode: crate::scope::EntityMode::Shared,
             workdir: Some(dir.clone()),
             governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
@@ -5319,6 +5326,7 @@ mod tests {
         let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
         u.assigned_cli = Some("claude".to_string());
         let gov = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
             db_path: "/abs/estate.db".to_string(),
             code_graph_db: Some(
                 Path::new("/abs/repo")
@@ -5516,6 +5524,7 @@ mod tests {
     #[test]
     fn step_input_governance_project_reaches_the_worker_env() {
         let gov = |project: Option<&str>| crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
             db_path: "/tmp/op.db".to_string(),
             code_graph_db: None,
             extra_write_roots: Vec::new(),
@@ -5885,6 +5894,7 @@ mod tests {
             entity_mode: crate::scope::EntityMode::Shared,
             workdir: Some(dir.clone()),
             governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
@@ -7231,6 +7241,7 @@ mod tests {
         // probe test below), never a `--mcp-config` file a worker could read the `--db` path from.
         let (json, raw, mcp) = read_settings(
             &crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: op_db.to_string(),
                 code_graph_db: Some(graph_db.to_string()),
                 extra_write_roots: Vec::new(),
@@ -7264,6 +7275,7 @@ mod tests {
         // scratch db beside it (FINDING-067).
         let (json, raw, mcp) = read_settings(
             &crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
                 db_path: op_db.to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
@@ -9616,6 +9628,7 @@ mod tests {
         let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
         u.assigned_cli = Some("claude".to_string());
         let gov = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
             db_path: "/abs/estate.db".to_string(),
             code_graph_db: None,
             extra_write_roots: Vec::new(),

@@ -776,6 +776,25 @@ export declare class Core {
    */
   recallRulesPreview(queryJson: string): Promise<string>
   /**
+   * Judge and record ONE brokered MCP call (DES-MCP-TOOLS-001 §6 step 3; crew's broker calls
+   * this before it invokes anything). `request_json` is `{ token, call: { server, tool, args?,
+   * annotations?, classOverride?, registered, kind?, carrier? } }` — `token` is the worker's
+   * `WICKED_MCP_TOKEN`, the rest is the broker's registry resolution. Resolves to the verdict
+   * JSON `{ decision: "allow"|"ask"|"deny", subject, class, ruleIds, obligations, reason?,
+   * remedy?, claimId, unit: { runId, ord, attempt, phase, seat } }`; the decision is already
+   * recorded in the unit's decisions log. Rejects with `invalid_token: …`, `bad_request: …` or
+   * `guard_error: …` — every rejection is a refusal (a `guard_error` means the call could not be
+   * recorded, D-3: fail closed). Static: the token registry is process-global, so the broker
+   * needs no `Core` handle.
+   */
+  static evaluateMcpCall(requestJson: string): Promise<string>
+  /**
+   * The ONE MCP tool class derivation (D-4): `annotations_json` is the tool's `tools/list`
+   * annotations object (or `null`), `class_override` an operator override (`read` | `write` |
+   * `destructive`). Returns the class; a tool with no annotations is `write`.
+   */
+  static mcpToolClass(annotationsJson?: string | undefined | null, classOverride?: string | undefined | null): string
+  /**
    * Front-half coverage gate report — JSON-serialized `CoverageReport`, or the JSON literal
    * `null` when the store has no domain-model nodes yet. Opens a read-only connection so it
    * never blocks the single-writer actor.
