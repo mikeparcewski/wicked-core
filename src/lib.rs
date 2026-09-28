@@ -44,6 +44,8 @@ mod knowledge;
 #[cfg(test)]
 mod lockstep;
 mod mcp_gate;
+/// The broker's output decision (DES-MCP-TOOLS-001 §6 step 8), beside `evaluate_mcp_call_json`.
+pub use mcp_gate::evaluate_mcp_output_json;
 mod mcp_isolation;
 mod memory;
 mod output_throttle;

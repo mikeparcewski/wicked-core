@@ -806,6 +806,18 @@ export declare class Core {
    */
   static mcpToolClass(annotationsJson?: string | undefined | null, classOverride?: string | undefined | null): string
   /**
+   * The broker's OUTPUT decision for one brokered MCP call (DES-MCP-TOOLS-001 §6 step 8; crew's
+   * broker calls this after the upstream answered and the result was scrubbed). `request_json`
+   * is `{ token, call: { server, tool, args?, annotations?, classOverride?, registered, kind?,
+   * carrier? }, raw }` — the same call `evaluateMcpCall` judged, plus `raw`, the scrubbed result
+   * text (the output decision reads `raw` in place of the args). Resolves to `{ decision:
+   * "allow"|"deny", subject, ruleIds, reason?, remedy?, claimId? }`; a deny withholds the result
+   * and is already recorded as an advisory `mcp-deny:` claim, an allow records nothing. Rejects
+   * with `invalid_token: …`, `bad_request: …` or `guard_error: …` — every rejection is a refusal
+   * (withhold the result).
+   */
+  static evaluateMcpOutput(requestJson: string): Promise<string>
+  /**
    * Front-half coverage gate report — JSON-serialized `CoverageReport`, or the JSON literal
    * `null` when the store has no domain-model nodes yet. Opens a read-only connection so it
    * never blocks the single-writer actor.

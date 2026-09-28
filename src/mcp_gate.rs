@@ -61,6 +61,9 @@ use crate::domain::HumanConfirm;
 use crate::workflow::PhaseRole;
 use crate::write_posture::WritePosture;
 
+mod output;
+pub use output::evaluate_mcp_output_json;
+
 /// The evaluator identity every MCP claim carries. The fold keys the advisory class on it together
 /// with the claim-id prefix, so no other recorder's deny can pass as an MCP one.
 pub(crate) const MCP_EVALUATOR: &str = "wicked-governance-mcp";
