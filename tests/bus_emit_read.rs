@@ -124,6 +124,10 @@ fn bus_emit_never_waits_on_the_actor_and_the_actor_never_waits_on_it() {
     let core = core_on(&dir, Some(&bus));
     // Open the engine's connection first (schema in place), then lock the file from outside.
     core.bus_read(0, 0, None, false).unwrap();
+    // Let the actor finish booting first: its first command waits for the store open, migrations
+    // and seeds, which on a slow Windows runner took 2.5–6.9 s and read as "the actor waited on
+    // the bus" (main 83d8f36). The claim under test is about a WARM actor.
+    core.sessions().unwrap();
     let holder = rusqlite::Connection::open(&bus).unwrap();
     holder
         .execute_batch(
