@@ -1161,6 +1161,28 @@ fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
     Ok(files)
 }
 
+/// Did the change delete a tracked file relative to the base — renames counted as a deletion of
+/// the old path (`--no-renames`)? A derived targeted set cannot see what a missing file broke.
+fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
+    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
+        return Ok(false);
+    };
+    let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+    let deleted = crate::worktree_guard::git_string(
+        worktree,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=D",
+            base,
+        ],
+        &env,
+    )
+    .map_err(|e| format!("the change's deleted files could not be listed: {e}"))?;
+    Ok(deleted.lines().any(|l| !l.trim().is_empty()))
+}
+
 /// Substitute `{files}` / `{base}` into a targeted command: a standalone `{files}` element expands
 /// to one element per touched path; embedded, the placeholders are replaced in place.
 fn substitute_placeholders(
@@ -1439,6 +1461,7 @@ pub const DERIVED_TARGETED_SOURCE: &str =
 /// * cargo — `cargo test … -p <crate>` for each package owning a touched file (the nearest
 ///   `Cargo.toml` with a `[package]` name); a touched `Cargo.lock`, `.cargo/…`, `rust-toolchain*`
 ///   or workspace-only manifest can affect every crate ⇒ full;
+/// * any deleted (or renamed-away) tracked file ⇒ full: what it left behind cannot be mapped;
 /// * vitest — a `test` script that is exactly `vitest` / `vitest run` ⇒ `vitest related --run
 ///   --passWithNoTests <files>` (the touched test files and the tests importing touched modules);
 ///   a touched manifest, lockfile or vite/vitest/ts config ⇒ full.
@@ -1453,7 +1476,9 @@ fn derive_targeted(
     node_test_script: &Option<(&'static str, String)>,
 ) -> Result<Option<RepoCheck>, String> {
     let files = touched_files(worktree, ctx)?;
-    if files.is_empty() {
+    if files.is_empty() || deletes_a_file(worktree, ctx)? {
+        // A deleted (or renamed-away) path is not in `files`, and the crate or test it left can
+        // break without being named — never narrow past it.
         return Ok(None);
     }
     let base_name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
@@ -1664,10 +1689,9 @@ fn node_modules_gap(
 /// file that appears between detection and the end of the checks was written by the checks.
 fn engine_generated_candidates(worktree: &Path, detected: &[RepoCheck]) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if detected
-        .iter()
-        .any(|c| c.name == "cargo-test" && !c.argv.iter().any(|a| a == "--locked"))
-        && !worktree.join("Cargo.lock").exists()
+    if detected.iter().any(|c| {
+        c.argv.first().is_some_and(|b| b == "cargo") && !c.argv.iter().any(|a| a == "--locked")
+    }) && !worktree.join("Cargo.lock").exists()
     {
         out.push("Cargo.lock");
     }
@@ -5845,9 +5869,14 @@ mod tests {
         .unwrap();
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
         assert_eq!(t.name, "cargo-test");
+        git(&repo, &["checkout", "-q", "--", "Cargo.toml"]);
+        // A deleted file elsewhere (crate `a`) could break what it left ⇒ full.
+        std::fs::remove_file(repo.join("a/src/lib.rs")).unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "cargo-test", "a deletion never narrows the set");
         git(
             &repo,
-            &["checkout", "-q", "--", "Cargo.toml", "b/src/lib.rs"],
+            &["checkout", "-q", "--", "a/src/lib.rs", "b/src/lib.rs"],
         );
         // Docs beside a virtual workspace touch no crate ⇒ full (nothing to narrow to).
         std::fs::write(repo.join("README.md"), "y\n").unwrap();

@@ -824,7 +824,8 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
     assert_eq!(checks[0].name, "cargo-fmt-check");
     assert_eq!(checks[0].exit_code, Some(0), "{:?}", checks[0]);
     assert_eq!(checks[1].name, "cargo-test");
-    assert_eq!(checks[1].argv, vec!["cargo", "test"]);
+    // `--no-fail-fast` (core#481): a red crate never hides the crates after it.
+    assert_eq!(checks[1].argv, vec!["cargo", "test", "--no-fail-fast"]);
     assert_eq!(checks[1].exit_code, Some(0), "{:?}", checks[1]);
     assert!(
         checks[1].stdout_tail.contains("test result: ok"),
@@ -1013,7 +1014,7 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     );
     let reason = fix.denial_reason.expect("reason");
     assert!(
-        reason.contains("cargo-test: exit 101")
+        reason.contains("test_targeted: exit 101")
             && reason.contains("[regression]")
             && reason.contains("REGRESSION: the run base")
             && reason.contains("test result: FAILED"),
@@ -1024,14 +1025,25 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     assert_eq!(floor, "creator");
     assert_eq!(outcome, "failed");
     assert!(!passed);
-    // The formatter runs first and is clean here; the regression is in `cargo-test` (core#551).
+    // The formatter runs first and is clean here; the regression is in the test set (core#551) —
+    // at the creator floor of this unconfigured repo, the set derived from the touched crate
+    // (core#482), its ids qualified by their binary (core#481).
     assert_eq!(checks[0].name, "cargo-fmt-check");
     let c = &checks[1];
-    assert_eq!(c.name, "cargo-test");
+    assert_eq!(c.name, "test_targeted");
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
     assert_eq!(c.classification.as_deref(), Some("regression"));
-    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
+    assert_eq!(
+        c.regressions,
+        vec!["test t::boom [-p wtguard_fixture --lib]".to_string()]
+    );
+    assert_eq!(
+        c.reruns.len(),
+        1,
+        "a single head-only failure is re-run once, alone, before it is called a regression \
+         (core#553)"
+    );
     assert!(c.pre_existing.is_empty());
     assert!(
         format!("{}{}", c.stdout_tail, c.stderr_tail).contains("REPO CHECK BOOM"),
@@ -1467,9 +1479,10 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
 
 /// F-RC2-009 — BASELINE-DIFF: the fixture's base ALREADY fails `cargo test` and the fix changes
 /// nothing about that. The floor's sandbox reports the failure on the head, runs the same check
-/// on the base, finds the failure sets IDENTICAL ⇒ `floor_env_mismatch`: recorded on both the
-/// creator's and the evaluator's floor, denying neither — the run COMPLETES, the shared failure
-/// is listed, and the base run is paid for once (verify reads the creator's cached run).
+/// on the base, finds the failure sets IDENTICAL ⇒ `pre_existing_in_sandbox` (core#481 — the fact,
+/// not an inferred environment cause): recorded on both the creator's floor (the derived targeted
+/// set, core#482) and the evaluator's (the full suite), denying neither — the run COMPLETES and
+/// the shared failure is listed.
 #[test]
 fn a_check_the_base_fails_identically_is_recorded_not_denied() {
     let repo = make_git_repo("shared-failure", Some(false));
@@ -1513,9 +1526,15 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         assert_eq!(floor, want_floor);
         assert_eq!(outcome, "passed");
         assert!(passed);
-        // `cargo-fmt-check` is first and clean; the shared failure is in `cargo-test` (core#551).
+        // `cargo-fmt-check` is first and clean; the shared failure is in the test set (core#551):
+        // the derived targeted set at the creator (core#482), the full suite at verify.
         let c = &checks[1];
-        assert_eq!(c.name, "cargo-test");
+        let (want_name, want_id) = if ord == 3 {
+            ("test_targeted", "test t::boom [-p wtguard_fixture --lib]")
+        } else {
+            ("cargo-test", "test t::boom [--lib]")
+        };
+        assert_eq!(c.name, want_name);
         assert_eq!(
             c.exit_code,
             Some(101),
@@ -1524,19 +1543,13 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         assert_eq!(c.outcome(), "failed");
         assert_eq!(
             c.classification.as_deref(),
-            Some("floor_env_mismatch"),
+            Some("pre_existing_in_sandbox"),
             "ord {ord}: {c:?}"
         );
-        assert_eq!(c.pre_existing, vec!["test t::boom".to_string()]);
+        assert_eq!(c.pre_existing, vec![want_id.to_string()]);
         assert!(c.regressions.is_empty());
         let base = c.base.as_deref().expect("the base run rides the check");
         assert!(base.run.as_ref().is_some_and(|b| !b.passed()));
-        if ord == 4 {
-            assert!(
-                base.cached,
-                "verify reads the creator's base run from the run's cache"
-            );
-        }
     }
     let _ = std::fs::remove_dir_all(&repo);
 }
