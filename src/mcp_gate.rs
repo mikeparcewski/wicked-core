@@ -851,6 +851,89 @@ pub fn evaluate_mcp_call_json(request_json: &str) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The unit's tool list (S4): what the garden shim's `list` shows, judged and never recorded
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One tool a unit's worker may try: its subject, its class and what a call with no arguments would
+/// get right now (`allow` runs, `ask` waits for the operator's approval).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpVisibleTool {
+    pub subject: String,
+    pub class: McpClass,
+    /// `allow` | `ask`.
+    pub decision: &'static str,
+    pub rule_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The tools a token's unit may try, and the unit they were judged for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolList {
+    pub unit: McpUnitRef,
+    pub tools: Vec<McpVisibleTool>,
+}
+
+/// The unit's visible tool list (DES-MCP-TOOLS-001 §8 `GET /mcp/tools?token=`): each of the
+/// registry's `calls` is judged for the unit `token` is bound to with [`evaluate`], the same
+/// function [`evaluate_mcp_call`] runs, with no arguments; a certain deny (D-1, D-5, a policy deny
+/// that fires without arguments) is left out. PURE: no claim is appended, nothing is recorded, so a
+/// list is never mistaken for a call.
+pub fn list_mcp_tools(token: &str, calls: &[McpCall]) -> Result<McpToolList, McpCallError> {
+    let unit = resolve(token).ok_or(McpCallError::InvalidToken)?;
+    if calls.len() > PREVIEW_MAX_CALLS {
+        return Err(McpCallError::BadRequest(format!(
+            "a tool list judges at most {PREVIEW_MAX_CALLS} tools (got {})",
+            calls.len()
+        )));
+    }
+    let store = open_store_ro(Some(&unit.db_path))
+        .map_err(|e| McpCallError::GuardError(format!("policy store open failed: {e}")))?;
+    let now = crate::clock::eval_now();
+    let mut tools = Vec::new();
+    for call in calls {
+        // Judged with no arguments (`{}`, what the broker passes for a call without any), whatever
+        // the caller sent: an argument-triggered rule must not hide or reveal a tool here.
+        let bare = McpCall {
+            args: Value::Object(serde_json::Map::new()),
+            ..call.clone()
+        };
+        let (v, _claim) = evaluate(&store, &unit, &bare, now)?;
+        if v.decision == "deny" {
+            continue;
+        }
+        tools.push(McpVisibleTool {
+            subject: v.subject,
+            class: v.class,
+            decision: v.decision,
+            rule_ids: v.rule_ids,
+            reason: v.reason,
+        });
+    }
+    Ok(McpToolList {
+        unit: unit.unit_ref(),
+        tools,
+    })
+}
+
+/// The JSON face of [`list_mcp_tools`] for the core-ts binding: `{token, calls}` in, `{unit,
+/// tools}` out; an error string is `<code>: <message>`.
+pub fn list_mcp_tools_json(request_json: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        token: String,
+        calls: Vec<McpCall>,
+    }
+    let req: Request = serde_json::from_str(request_json)
+        .map_err(|e| McpCallError::BadRequest(format!("request: {e}")).to_string())?;
+    let list = list_mcp_tools(&req.token, &req.calls).map_err(|e| e.to_string())?;
+    serde_json::to_string(&list).map_err(|e| format!("guard_error: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The policy preview (S6): the same evaluation over synthetic units, never recorded
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2043,5 +2126,96 @@ mod tests {
         assert_eq!(McpMode::of(&HumanConfirm::All), McpMode::Ask);
         assert_eq!(McpMode::of(&HumanConfirm::Before(1)), McpMode::Balanced);
         assert_eq!(McpMode::of(&HumanConfirm::None), McpMode::Autonomous);
+    }
+
+    /// PROVING TEST (S4): the shim's `list` shows the token's unit what it may try, judged by the
+    /// same evaluation as a call: a creator sees reads that run and writes that ask; an evaluator
+    /// never sees a write (D-1); an unregistered tool (D-5) and a policy deny are left out; a
+    /// forged token lists nothing; and listing records nothing.
+    #[test]
+    fn the_tool_list_is_the_units_own_judgement_and_records_nothing() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-mcp-list-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("policy.db").to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&db_path)).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+            approve(&mut store, "MCP-FIRST-USE", "mcp:jira");
+            wicked_governance::register_rule(
+                &mut store,
+                &rule(serde_json::json!({
+                    "id": "SEC-MCP-NO-DELETE", "rule_type": "policy",
+                    "statement": "never delete a jira project", "severity": "critical",
+                    "confidence": 1.0, "steering_type": "security",
+                    "applies_to": ["mcp:jira/delete_project"], "effect": "deny",
+                    "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                })),
+            )
+            .unwrap();
+        }
+        {
+            // A deny that fires only on an argument: the list judges with none, so it never hides
+            // the tool (the call itself is judged with its real arguments).
+            let mut store = open_store(Some(&db_path)).unwrap();
+            wicked_governance::register_rule(
+                &mut store,
+                &rule(serde_json::json!({
+                    "id": "SEC-MCP-NO-SUMMARY", "rule_type": "policy",
+                    "statement": "no issue summaries", "severity": "error",
+                    "confidence": 1.0, "steering_type": "security",
+                    "applies_to": ["mcp:jira/get_issue"], "effect": "deny",
+                    "trigger": {"contains": "\"summary\":"},
+                    "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                })),
+            )
+            .unwrap();
+        }
+        let decisions = base.join("decisions.ndjson");
+        let mut unregistered = call("ghost", read_only());
+        unregistered.registered = false;
+        let calls = vec![
+            call("get_issue", read_only()),
+            call("create_issue", None),
+            call("delete_project", None),
+            unregistered,
+        ];
+        let listed = |posture, role| {
+            let mut u = unit(posture, role, "pi", McpMode::Balanced);
+            u.db_path = db_path.clone();
+            u.decisions_path = decisions.clone();
+            let token = McpToken::mint();
+            let _b = token.bind(u);
+            list_mcp_tools(&token.value, &calls)
+                .unwrap()
+                .tools
+                .into_iter()
+                .map(|t| (t.subject, t.decision))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(WritePosture::Full, PhaseRole::Creator),
+            vec![
+                ("mcp:jira/get_issue".to_string(), "allow"),
+                ("mcp:jira/create_issue".to_string(), "ask"),
+            ]
+        );
+        assert_eq!(
+            listed(WritePosture::ReadOnly, PhaseRole::Evaluator),
+            vec![("mcp:jira/get_issue".to_string(), "allow")],
+            "an evaluator never sees a write tool"
+        );
+        assert!(!decisions.exists(), "a list appends no claim");
+        assert_eq!(
+            list_mcp_tools("wmt_forged", &calls),
+            Err(McpCallError::InvalidToken)
+        );
+        let err = list_mcp_tools_json(r#"{"token":"wmt_forged","calls":[]}"#).unwrap_err();
+        assert!(err.starts_with("invalid_token:"), "{err}");
+        let err = list_mcp_tools_json("{}").unwrap_err();
+        assert!(err.starts_with("bad_request:"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
