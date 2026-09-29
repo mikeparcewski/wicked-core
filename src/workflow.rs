@@ -759,7 +759,9 @@ pub struct PhaseDef {
     /// a file validator forces `executes_code`, which would run the SURVEYED repo's
     /// typecheck/lint/test during an onboarding survey. Honest 0 is legal — `derived: 0,
     /// submitted: 0, failed: 0` passes; the contract is that the phase SAYS so.
-    #[serde(default)]
+    /// `skip_serializing_if`: a phase that declares no capture report serializes byte-identically
+    /// to before the field existed (the shipped workflow files do not gain the key).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_capture_report: bool,
     /// Whether the phase verdict requires re-verified evidence (re-run the pinned verifier).
     ///
