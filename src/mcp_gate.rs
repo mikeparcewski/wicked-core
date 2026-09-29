@@ -894,7 +894,13 @@ pub fn list_mcp_tools(token: &str, calls: &[McpCall]) -> Result<McpToolList, Mcp
     let now = crate::clock::eval_now();
     let mut tools = Vec::new();
     for call in calls {
-        let (v, _claim) = evaluate(&store, &unit, call, now)?;
+        // Judged with no arguments (`{}`, what the broker passes for a call without any), whatever
+        // the caller sent: an argument-triggered rule must not hide or reveal a tool here.
+        let bare = McpCall {
+            args: Value::Object(serde_json::Map::new()),
+            ..call.clone()
+        };
+        let (v, _claim) = evaluate(&store, &unit, &bare, now)?;
         if v.decision == "deny" {
             continue;
         }
@@ -2145,6 +2151,23 @@ mod tests {
                     "statement": "never delete a jira project", "severity": "critical",
                     "confidence": 1.0, "steering_type": "security",
                     "applies_to": ["mcp:jira/delete_project"], "effect": "deny",
+                    "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                })),
+            )
+            .unwrap();
+        }
+        {
+            // A deny that fires only on an argument: the list judges with none, so it never hides
+            // the tool (the call itself is judged with its real arguments).
+            let mut store = open_store(Some(&db_path)).unwrap();
+            wicked_governance::register_rule(
+                &mut store,
+                &rule(serde_json::json!({
+                    "id": "SEC-MCP-NO-SUMMARY", "rule_type": "policy",
+                    "statement": "no issue summaries", "severity": "error",
+                    "confidence": 1.0, "steering_type": "security",
+                    "applies_to": ["mcp:jira/get_issue"], "effect": "deny",
+                    "trigger": {"contains": "\"summary\":"},
                     "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
                 })),
             )
