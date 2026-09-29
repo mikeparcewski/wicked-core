@@ -25,6 +25,26 @@ hook never block (arch-R15); the only fail-closed enforcement is the crew/core g
 and only rules that carry an `effect` participate in it. Seeding steering makes agents
 *better informed* on day one, not suddenly gated.
 
+**One part of that ladder has a platform matrix** (core#416). The gate that re-derives "done"
+from a repository's OWN checks — the `repo_checks` verify floor — runs repo-controlled
+scripts only inside an OS write boundary, so the host decides whether it can run at all:
+
+| Host | Boundary | The verify floor |
+|---|---|---|
+| **macOS** (primary) | `sandbox-exec`, in the base system | runs the checks (`sandbox_level: sandboxed`) |
+| **Linux** (supported) | `bwrap` (`bubblewrap`) — install it | runs the checks; without `bwrap`, **denies** |
+| **Windows** (not supported) | none the engine can arm | **denies every floor phase, by construction** |
+
+On Windows this is a deny on every governed run that carries `bug/verify`, `feature/test`,
+`migration/verify` or one of crew's served mirrors, whatever the code says — so the matrix is
+stated here rather than learned from a gate denial after the councils have already spent. The
+only alternative is an opt-in an operator arms deliberately:
+`WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the checks with **no** write boundary and discloses it
+everywhere (`sandbox_level: "none"` on the report, the gate's note and the
+`repoChecksEvaluated` event) — the check results are real, the pass is not containment
+evidence. A native Windows boundary is deferred, not designed. Every other part of steering —
+recall, the CI comment, the per-turn hook, the rest of the gate ladder — is cross-platform.
+
 > **Status note.** Everything in the CLI sections below (`rules
 > ingest/fanout/relink/drift/recall/scoreboard/retire`, the crew `/api/v1/governance/*`
 > routes) is released and verified. The unified-model fields (`steering_type`, `excludes`,

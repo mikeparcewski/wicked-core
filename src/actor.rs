@@ -1316,7 +1316,9 @@ pub(crate) fn run(
                     // project/preflight checks above: an invalid root is a synchronous Err with
                     // NO session persisted — never a session whose boundary silently reopens
                     // the FINDING-098 pin-rewrite escape.
-                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    // core#640: HOME, or USERPROFILE on Windows — a HOME-only lookup refused
+                    // every Windows launch that declared extra roots.
+                    let home = crate::path_policy::launch_home();
                     crate::path_policy::validate_extra_write_roots(
                         &spec.extra_write_roots,
                         home.as_deref(),
@@ -4081,7 +4083,8 @@ pub(crate) fn launch_run_inner(
     // Same launch-time judgement as the interactive path (core#259): an invalid extra write root
     // is a synchronous Err before anything is planned or persisted.
     {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        // core#640: HOME, or USERPROFILE on Windows (see `launch_home`).
+        let home = crate::path_policy::launch_home();
         crate::path_policy::validate_extra_write_roots(&spec.extra_write_roots, home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
         // The read mirror (core#294): same judgement, same synchronous refusal.
@@ -5982,6 +5985,18 @@ fn apply_step_result(
             .clone()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(&run_id));
+        // core#640: the run's own launch clock, so a file a PRIOR run left in a shared write root
+        // is not read as this phase's output. Three states, never two (review of PR #674): a run
+        // that records NOTHING keeps the presence-only judgement, but a run that should have a
+        // durable trail and cannot be dated from it is refused rather than waved through on
+        // whatever was lying in the write root.
+        let launch = match subscribers.log_root() {
+            None => crate::path_policy::LaunchClock::Unrecorded,
+            Some(root) => match crate::event_log::run_started_ms(root, &run_id) {
+                Some(ms) => crate::path_policy::LaunchClock::At(ms),
+                None => crate::path_policy::LaunchClock::Undatable,
+            },
+        };
         if let Some(missing) = crate::path_policy::missing_deliverables(
             &unit.required_deliverables,
             &cwd,
@@ -5989,6 +6004,7 @@ fn apply_step_result(
             // validated. Without this an unbound run — every crew interactive seam — has no
             // spelling of the field that resolves, so it declares nothing at all.
             &session.extra_write_roots,
+            launch,
         ) {
             let why = format!(
                 "phase reported done but did not produce its declared deliverable(s): {missing}"
@@ -13873,6 +13889,116 @@ mod deliverable_floor_tests {
             "the floor must resolve deliverables against the run's DECLARED write roots too, \
              or an unbound run cannot spell its own deliverable (core#297 §3)"
         );
+    }
+
+    /// core#640, the WIRING. The freshness rule itself is pinned in
+    /// `path_policy::deliverables_tests`; this is the half that campaign after campaign finds
+    /// missing — that the fold actually hands the floor the run's launch clock. Delete the
+    /// `launch_floor` argument and the rule still passes its own unit tests while every run folds
+    /// Ok on a prior run's leftover, which is exactly the defect.
+    ///
+    /// The shape is the real one: an UNBOUND run (cwd = the per-run sandbox) whose deliverable
+    /// lives in a declared write root that an earlier run already wrote — crew keys those roots
+    /// by document, not by run, so chat, draft and demo hand the same directory to run after run.
+    #[test]
+    fn a_prior_runs_leftover_does_not_satisfy_this_runs_deliverable_floor() {
+        let inbox = tmp("stale-inbox");
+        // A PRIOR run's output, sitting in the write root this run is handed.
+        std::fs::write(inbox.join("draft.html"), "<p>a prior run's draft</p>").unwrap();
+        let logs = tmp("stale-logs");
+        let run_id = format!("deliv-stale-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec!["draft.html".into()],
+        );
+        // This run's durable log. Its FIRST record is the launch clock the floor dates the file
+        // against — written here, an hour after the file, rather than slept for.
+        let launched = crate::interaction::now_millis() + 3_600_000;
+        std::fs::write(
+            crate::event_log::run_log_path(&logs, &run_id),
+            format!("{{\"type\":\"unitDone\",\"session\":\"{run_id}\",\"ord\":0,\"ts\":{launched},\"seq\":0}}\n"),
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::persistent(logs.clone());
+
+        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(
+            unit.status,
+            UnitStatus::Rejected,
+            "a file written before this run launched is a PRIOR run's artifact, not this \
+             phase's output"
+        );
+        let why = unit.denial_reason.unwrap_or_default();
+        assert!(
+            why.contains("draft.html") && why.contains("stale"),
+            "the denial must name the artifact and say it predates the launch: {why}"
+        );
+
+        // The control: the SAME file and the SAME declaration, dated against a launch before it,
+        // folds Ok — so the rejection above is the freshness rule and not a resolution failure.
+        let fresh_logs = tmp("fresh-logs");
+        let fresh_id = format!("deliv-fresh-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &fresh_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec!["draft.html".into()],
+        );
+        std::fs::write(
+            crate::event_log::run_log_path(&fresh_logs, &fresh_id),
+            format!(
+                "{{\"type\":\"unitDone\",\"session\":\"{fresh_id}\",\"ord\":0,\"ts\":{},\"seq\":0}}\n",
+                crate::interaction::now_millis() - 3_600_000
+            ),
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::persistent(fresh_logs.clone());
+        let (_session, unit) = fold(&mut store, &mut subs, &fresh_id);
+        assert_eq!(
+            unit.status,
+            UnitStatus::Done,
+            "a deliverable written after the launch still folds Ok: {:?}",
+            unit.denial_reason
+        );
+
+        // And the third clock state (review of PR #674): a run that RECORDS — a persistent sink —
+        // whose log carries no launch stamp is refused, not waved through on presence alone. The
+        // event log is best-effort ("an unwritable log costs the record, never the run"), so an
+        // unwritable sidecar used to put the floor straight back to the defect. Reproduced
+        // portably by rooting the sink at a regular FILE: no platform can create a log directory
+        // under it, so nothing records and nothing can be dated.
+        let blank_logs = tmp("undatable-logs").join("not-a-directory");
+        std::fs::write(&blank_logs, "the .events sidecar could not be created").unwrap();
+        let blank_id = format!("deliv-undatable-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &blank_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec!["draft.html".into()],
+        );
+        let mut subs = crate::event_log::EventSink::persistent(blank_logs.clone());
+        let (_session, unit) = fold(&mut store, &mut subs, &blank_id);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert!(
+            unit.denial_reason
+                .unwrap_or_default()
+                .contains("cannot be dated"),
+            "an undatable run must say so, not read as a produced deliverable"
+        );
+
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_dir_all(&logs);
+        let _ = std::fs::remove_dir_all(&fresh_logs);
+        let _ = std::fs::remove_dir_all(blank_logs.parent().unwrap());
     }
 }
 
