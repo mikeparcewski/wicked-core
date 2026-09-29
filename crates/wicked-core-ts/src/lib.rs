@@ -1272,6 +1272,12 @@ impl Core {
     /// and `accept_suggestion` adopts the evaluator's discarded, pinned edit as the creator's
     /// amendment. The engine refuses each at any other gate.
     ///
+    /// (core#555, additive.) `amend_intent` (`approve=true`, the text in `amend`, no `amendScope`)
+    /// approves the gate AND AMENDS THE RUN'S INTENT: the text is appended to every unit at or
+    /// after the cursor, so the acceptance list each LATER EVALUATOR is handed changes with the
+    /// decision, and it is recorded on the run plus an `intentAmended` event. It is the only arm
+    /// that can descope a run mid-flight; refused at a plan or team gate, and with empty text.
+    ///
     /// (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
     /// edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
     /// as the next plan rev (floor phases added, never refused for being below the floor) or, if it
@@ -1325,6 +1331,25 @@ impl Core {
                 },
                 (None, false) | (Some("reject"), false) => HumanDecision::Reject,
                 (Some("request_changes"), false) => HumanDecision::RequestChanges { note: amend },
+                // (core#555) AMEND THE RUN'S INTENT: an approve that also changes the acceptance
+                // list every LATER evaluator is handed. The text rides `amend`; `amendScope` is
+                // refused because the scope IS "every unit from the cursor on".
+                (Some("amend_intent"), true) => {
+                    if amend_scope.is_some() {
+                        return Err(err(anyhow::anyhow!(
+                            "action `amend_intent` takes no amendScope — an intent amendment \
+                             reaches every unit at or after the cursor, which is what makes it \
+                             reach the evaluator"
+                        )));
+                    }
+                    let Some(text) = amend.filter(|t| !t.trim().is_empty()) else {
+                        return Err(err(anyhow::anyhow!(
+                            "action `amend_intent` needs the amendment text in `amend` — what the \
+                             run's acceptance list now says"
+                        )));
+                    };
+                    HumanDecision::AmendIntent { text }
+                }
                 // (core#469) The timed-out floor's escalation arms; (core#467) adopt the
                 // evaluator's pinned edit. All approve-shaped, none takes an amendment.
                 (
@@ -1343,20 +1368,20 @@ impl Core {
                 (
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
-                        | "accept_partial" | "accept_suggestion"),
+                        | "accept_partial" | "accept_suggestion" | "amend_intent"),
                     ),
                     _,
                 ) => {
                     return Err(err(anyhow::anyhow!(
                         "action `{a}` disagrees with approve={approve} (request_changes and \
-                         reject require approve=false; approve, extend, targeted, accept_partial \
-                         and accept_suggestion require approve=true)"
+                         reject require approve=false; approve, extend, targeted, accept_partial, \
+                         accept_suggestion and amend_intent require approve=true)"
                     )))
                 }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
-                         extend | targeted | accept_partial | accept_suggestion)"
+                         extend | targeted | accept_partial | accept_suggestion | amend_intent)"
                     )))
                 }
             };

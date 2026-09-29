@@ -1933,6 +1933,129 @@ fn parse_triage_decision(raw: &str) -> (TriageDecision, String) {
     (decision, analysis)
 }
 
+// ── The capture report (BC-80, core#535) ──────────────────────────────────────────────────────
+
+/// The marker head a capture phase's output must carry — the machine-readable counts contract
+/// garden's `repo-learn` skill (and any governed capture worker) emits, ALWAYS, including on a
+/// degrade and on a legitimate 0. Matched decoration-tolerantly and case-insensitively, exactly
+/// the way [`parse_evaluator_verdict`] matches `VERDICT:`.
+pub const CAPTURE_REPORT_MARKER: &str = "wicked-capture-report";
+
+/// The contract text the fold records when a `requires_capture_report` unit wrote NO marker line
+/// — the SILENT 0-proposal run (the skill loaded and never ran) that used to report `completed`.
+pub(crate) const CAPTURE_REPORT_MISSING: &str =
+    "no `wicked-capture-report` line in the capture phase's output (contract: end with \
+     `wicked-capture-report {\"derived\": N, \"submitted\": N, \"failed\": N}` — always, including \
+     a degrade and a legitimate 0). Nothing proves the capture ran, so 0 proposals cannot be told \
+     apart from a skill that never loaded";
+
+/// The counts a capture phase REPORTED (BC-80, core#535): what it derived from the repo, what it
+/// actually submitted as estate proposals, and what failed to submit. Persisted on the unit
+/// ([`crate::domain::WorkUnit::capture_report`]) so the run record carries the evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureReport {
+    /// Learnings the phase derived from the repo (candidates).
+    pub derived: u32,
+    /// Proposals it SUBMITTED (the inert queue a human reviews).
+    pub submitted: u32,
+    /// Submissions that FAILED (a denied tool call, an unreachable store).
+    pub failed: u32,
+}
+
+impl CaptureReport {
+    /// The fold's denial prose, or `None` when the report is honest. Three denials, all loud:
+    /// a failed submission, derived-but-not-submitted (the proposals were LOST), and — in
+    /// [`capture_report_denial`], where the marker itself can be absent — a missing marker.
+    /// A reported `0/0/0` PASSES: capturing nothing is legal, saying nothing is not.
+    pub(crate) fn denial_reason(&self) -> Option<String> {
+        let Self {
+            derived,
+            submitted,
+            failed,
+        } = *self;
+        if failed > 0 {
+            return Some(format!(
+                "the capture phase reported {failed} FAILED submission(s) (derived {derived}, \
+                 submitted {submitted}) — the learnings it derived did not reach the proposal \
+                 queue, so a human has nothing to review"
+            ));
+        }
+        if submitted < derived {
+            return Some(format!(
+                "the capture phase derived {derived} learning(s) and submitted {submitted} — \
+                 {} never reached the proposal queue and would be lost silently",
+                derived - submitted
+            ));
+        }
+        None
+    }
+}
+
+/// Parse the LAST `wicked-capture-report` line of a capture phase's output. Decoration-tolerant
+/// (`**`, `#`, `-`, `>`, backticks) and spelling-tolerant in the VALUES only: after the marker
+/// head, each of `derived`, `submitted` and `failed` is read as the first run of digits following
+/// its name, so `{"derived": 7, "submitted": 7, "failed": 0}`, `derived=7 submitted=7 failed=0`
+/// and `derived 7, submitted 7, failed 0` all read the same. A line missing any of the three keys
+/// is NOT a report (fail-closed: it denies with the contract text, never with invented zeroes).
+/// Pure; the fold calls it only for a unit whose phase declared `requires_capture_report`.
+pub fn parse_capture_report(raw: &str) -> Option<CaptureReport> {
+    let mut last: Option<CaptureReport> = None;
+    for line in raw.lines() {
+        let bare = line.trim_start_matches(|c: char| {
+            c.is_whitespace() || VERDICT_LINE_DECORATION.contains(&c)
+        });
+        let lower = bare.to_ascii_lowercase();
+        let Some(head) = lower.find(CAPTURE_REPORT_MARKER) else {
+            continue;
+        };
+        let rest = &lower[head + CAPTURE_REPORT_MARKER.len()..];
+        let field = |key: &str| -> Option<u32> {
+            let at = rest.find(key)? + key.len();
+            // The digits must follow the key CLOSELY (at most the punctuation a spelling puts
+            // between them — `": "`, `=`, `":"`). Without that bound `derived nothing, submitted
+            // 0` would read the 0 that belongs to `submitted` as `derived`.
+            let gap = rest[at..]
+                .chars()
+                .take(8)
+                .take_while(|c| !c.is_ascii_digit())
+                .count();
+            let digits: String = rest[at..]
+                .chars()
+                .skip(gap)
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        };
+        // `submitted` is read BEFORE `derived` only in the source order sense; each key is found
+        // independently, and `failed` cannot be confused with anything else on the line.
+        match (field("derived"), field("submitted"), field("failed")) {
+            (Some(derived), Some(submitted), Some(failed)) => {
+                last = Some(CaptureReport {
+                    derived,
+                    submitted,
+                    failed,
+                });
+            }
+            // A marker line that does not carry all three counts is malformed: the caller treats
+            // it exactly like an absent one (fail-closed).
+            _ => continue,
+        }
+    }
+    last
+}
+
+/// The capture-report gate arm (BC-80, core#535): the report a `requires_capture_report` unit's
+/// output carries, and the denial — if any. A missing or malformed marker denies with
+/// [`CAPTURE_REPORT_MISSING`]; a present report denies per
+/// [`CaptureReport::denial_reason`]. Returned as a pair so the fold can persist the counts it
+/// read even when they deny.
+pub(crate) fn capture_report_denial(raw: &str) -> (Option<CaptureReport>, Option<String>) {
+    match parse_capture_report(raw) {
+        None => (None, Some(CAPTURE_REPORT_MISSING.to_string())),
+        Some(report) => (Some(report), report.denial_reason()),
+    }
+}
+
 /// The contract text the fold records when an Evaluator-role agent unit wrote NO `VERDICT:` line
 /// (DES-L1 PR-1A, D-9 — fail-closed INTO THE HUMAN GATE, never `sessionFailed`).
 pub(crate) const EVALUATOR_VERDICT_MISSING: &str = "no `VERDICT:` line in the evaluator's output \
@@ -2670,6 +2793,90 @@ mod tests {
             prompt.contains(&final_line) && prompt.contains(&repeat_it),
             "the judge prompt never asks for a closing verdict, but the parser requires one — \
              every compliant-by-the-old-contract reviewer would be denied. Prompt was: {prompt}"
+        );
+    }
+
+    /// (BC-80, core#535) The capture-report grammar: decoration- and spelling-tolerant, the LAST
+    /// marker line wins, and a line missing any of the three counts is NOT a report (fail-closed).
+    #[test]
+    fn parse_capture_report_reads_the_last_marker_line_in_every_spelling() {
+        let json = parse_capture_report(
+            "surveyed the repo\nwicked-capture-report {\"derived\": 7, \"submitted\": 6, \"failed\": 1}",
+        )
+        .expect("the JSON spelling");
+        assert_eq!(
+            json,
+            CaptureReport {
+                derived: 7,
+                submitted: 6,
+                failed: 1
+            }
+        );
+        // key=value, decoration, mixed case, a trailing sentence.
+        let kv = parse_capture_report(
+            "**WICKED-Capture-Report derived=12 submitted=12 failed=0** — done",
+        )
+        .expect("the key=value spelling");
+        assert_eq!(
+            kv,
+            CaptureReport {
+                derived: 12,
+                submitted: 12,
+                failed: 0
+            }
+        );
+        // The LAST marker line decides (a worker that reports per-batch and then totals).
+        let last = parse_capture_report(
+            "wicked-capture-report derived 3 submitted 3 failed 0\n\
+             wicked-capture-report derived 5 submitted 5 failed 0",
+        )
+        .unwrap();
+        assert_eq!(last.derived, 5);
+        // Not reports: no marker, a marker with a missing count, prose between key and number.
+        assert!(parse_capture_report("I captured seven learnings.").is_none());
+        assert!(parse_capture_report("wicked-capture-report derived=4 submitted=4").is_none());
+        assert!(
+            parse_capture_report("wicked-capture-report derived nothing, submitted 0, failed 0")
+                .is_none(),
+            "a number that belongs to another key must never be read as `derived`"
+        );
+    }
+
+    /// (BC-80, core#535) The denial rules: a missing marker is the SILENT 0-proposal run the
+    /// invariant exists for; a failed submission and derived-but-not-submitted are both losses.
+    /// An honest reported 0 PASSES — capturing nothing is legal, saying nothing is not.
+    #[test]
+    fn a_silent_capture_run_denies_and_an_honest_zero_passes() {
+        let (report, denial) = capture_report_denial("the skill loaded.\ndone.");
+        assert!(report.is_none());
+        let denial = denial.expect("a missing marker must deny");
+        assert!(
+            denial.contains("no `wicked-capture-report` line")
+                && denial.contains("cannot be told apart from a skill that never loaded"),
+            "{denial}"
+        );
+
+        let (report, denial) = capture_report_denial(
+            "wicked-capture-report {\"derived\": 0, \"submitted\": 0, \"failed\": 0}",
+        );
+        assert_eq!(report.map(|r| r.derived), Some(0));
+        assert!(denial.is_none(), "an honest 0 is not a denial: {denial:?}");
+
+        let (_, denial) =
+            capture_report_denial("wicked-capture-report derived=9 submitted=4 failed=0");
+        assert!(
+            denial
+                .as_deref()
+                .is_some_and(|d| d.contains("derived 9 learning(s) and submitted 4")),
+            "{denial:?}"
+        );
+        let (_, denial) =
+            capture_report_denial("wicked-capture-report derived=9 submitted=7 failed=2");
+        assert!(
+            denial
+                .as_deref()
+                .is_some_and(|d| d.contains("2 FAILED submission(s)")),
+            "{denial:?}"
         );
     }
 

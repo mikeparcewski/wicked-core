@@ -420,6 +420,7 @@ fn entry(
     executes_code: bool,
 ) -> PhaseDef {
     PhaseDef {
+        requires_capture_report: false,
         id: id.to_string(),
         kind,
         instructions: None,

@@ -202,6 +202,10 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // worktree diff — the fold has no route back to the def, so like role/gate/deps the
             // declaration must ride the unit.
             unit.executes_code = phase.executes_code;
+            // (BC-80, core#535) Carry the phase's `requires_capture_report` declaration for the
+            // same reason `executes_code` rides the unit: the fold that reads the capture marker
+            // has no route back to the def.
+            unit.requires_capture_report = phase.requires_capture_report;
             // Carry the tool command for Tool-executor phases so the actor can run it directly.
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());

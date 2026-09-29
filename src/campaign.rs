@@ -389,6 +389,9 @@ impl Campaign {
                     | HumanDecision::EditPlan { .. }
                     | HumanDecision::FloorRerun(_)
                     | HumanDecision::AcceptSuggestion => None,
+                    // (core#555) A campaign step's amendment is the run's acceptance list, not
+                    // a unit instruction — the persisted mirror carries the text either way.
+                    HumanDecision::AmendIntent { text } => Some(text.clone()),
                 };
                 (k.clone(), amend)
             })
@@ -2275,6 +2278,7 @@ mod tests {
 
         // The run is parked at a human gate — the ONLY state the Reject arm accepts.
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.clone(),
             workflow_id: "wf-reject".into(),
             problem: "p".into(),
@@ -2439,6 +2443,7 @@ mod tests {
         let mut store = open_store(Some(":memory:")).unwrap();
         if let Some(status) = session {
             let session = AgentSession {
+                intent_amendments: Vec::new(),
                 id: run_id.clone(),
                 workflow_id: format!("wf-{cid}"),
                 problem: "p".into(),

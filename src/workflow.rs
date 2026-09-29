@@ -383,7 +383,28 @@ pub enum HumanDecision {
     /// `request_changes` rewind), which then owns the change and whose floor judges it. Refused at
     /// any gate that carries no restored, pinned suggestion.
     AcceptSuggestion,
+    /// (core#555) Approve this gate AND AMEND THE RUN'S INTENT: `text` is appended to the
+    /// description of EVERY unit at or after the cursor — so it reaches every LATER EVALUATOR, not
+    /// just the creator — prefixed with [`INTENT_AMENDMENT_PREFIX`], and recorded on the session
+    /// ([`crate::domain::IntentAmendment`]) plus an `IntentAmended` event, which is the audit
+    /// record. This is the only arm that can descope a run mid-flight: `request_changes` reaches
+    /// the creator and `approve { amend }` reaches one unit, so before it the evaluator kept
+    /// judging the un-amended launch intent and a withdrawn item could only be met or relaunched.
+    /// Refused with an empty text (there is nothing to amend) and at a plan/team gate (a plan's
+    /// own edit arm is [`Self::EditPlan`]).
+    AmendIntent { text: String },
 }
+
+/// (core#555) The sentence an approved intent amendment rides into every later unit's prompt. It
+/// names the amendment as APPROVED and states that it OVERRIDES the corresponding launch-intent
+/// item, which is what lets an evaluator stop judging a withdrawn one: an evaluator's contract is
+/// to judge the acceptance list it was handed, and this IS that list changing.
+///
+/// One line, like every other prompt fold (the PTY carrier submits a newline as a turn end), and
+/// short: the whole worker prompt rides a 1022-byte line.
+pub const INTENT_AMENDMENT_PREFIX: &str = " ||| APPROVED INTENT AMENDMENT (overrides the \
+                                           corresponding launch-intent item; judge the amended \
+                                           acceptance, never the withdrawn one): ";
 
 impl HumanDecision {
     /// (core#469 / core#467) The escalation arm a gate decision's wire `action` names — `extend` |
@@ -727,6 +748,19 @@ pub struct PhaseDef {
     /// Whether this phase runs code (drives worktree provisioning + code-tool mode).
     #[serde(default)]
     pub executes_code: bool,
+    /// (BC-80, core#535) Whether this phase must REPORT what it captured: its output carries a
+    /// machine-readable `wicked-capture-report {derived, submitted, failed}` marker
+    /// ([`crate::validator::parse_capture_report`]), and the gate fold DENIES the unit when the
+    /// marker is missing, when a submission failed, or when proposals were derived and not
+    /// submitted. A capture phase that loads its skill and never runs it reports `completed` with
+    /// 0 proposals and nothing says so — the hole in "nothing lost silently" this closes.
+    ///
+    /// A transcript MARKER layer, deliberately not a file [`validator_pin`](Self::validator_pin):
+    /// a file validator forces `executes_code`, which would run the SURVEYED repo's
+    /// typecheck/lint/test during an onboarding survey. Honest 0 is legal — `derived: 0,
+    /// submitted: 0, failed: 0` passes; the contract is that the phase SAYS so.
+    #[serde(default)]
+    pub requires_capture_report: bool,
     /// Whether the phase verdict requires re-verified evidence (re-run the pinned verifier).
     ///
     /// ENFORCED AT REGISTRATION (FINDING-055). The only mechanism that re-verifies anything is a
@@ -792,6 +826,7 @@ impl PhaseDef {
             gate_type: None,
             gate: GateSpec::Auto,
             executes_code: false,
+            requires_capture_report: false,
             verified_evidence: false,
             required_deliverables: Vec::new(),
             depends_on: Vec::new(),

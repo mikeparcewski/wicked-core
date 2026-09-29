@@ -72,6 +72,8 @@ mod tests {
 
     fn make_unit(ord: u32, description: &str, invocation: &str) -> WorkUnit {
         WorkUnit {
+            requires_capture_report: false,
+            capture_report: None,
             base_skill_ref: None,
             id: format!("u-test-{ord}"),
             session_id: "sess-p2wl".to_string(),

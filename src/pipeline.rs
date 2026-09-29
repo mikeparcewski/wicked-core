@@ -428,6 +428,7 @@ pub(crate) fn pre_distribute(
     };
 
     let mut session = AgentSession {
+        intent_amendments: Vec::new(),
         id: session_id.to_string(),
         workflow_id: workflow_id.clone(),
         problem: problem.to_string(),
@@ -1200,6 +1201,23 @@ pub(crate) fn apply_and_finish_unit(
         d.findings_trimmed = v.findings_trimmed;
         d
     });
+    // (BC-80, core#535) CAPTURE REPORT — the output-marker deny layer for a phase that declared
+    // `requires_capture_report`. A capture run whose skill loads and never runs produced 0
+    // proposals and reported `completed`: nothing in the fold could tell that apart from a repo
+    // with nothing worth capturing. The marker is the difference, so a missing one DENIES (into
+    // the human gate, like every other fold denial — `escalate_denied_unit` reaches
+    // `AwaitingHuman` even on `gate: auto`), as do a failed submission and proposals derived but
+    // never submitted. An honest `0/0/0` passes. Counts are persisted on the unit below, whichever
+    // way it went, so `GET /runs/:id` carries the evidence.
+    let (capture_report, capture_denial) = if unit.requires_capture_report {
+        let (report, reason) = crate::validator::capture_report_denial(output);
+        (
+            report,
+            reason.map(|r| crate::domain::UnitDenial::new("capture_report", r)),
+        )
+    } else {
+        (None, None)
+    };
     // The wire token (`gateEvaluated.evaluatorVerdict`): the decisive line's token for a unit the
     // layer read; `None` for every other unit AND for an Evaluator unit that wrote no verdict line
     // (that case denies with the contract text as its reason — the denial is the twin).
@@ -1448,6 +1466,7 @@ pub(crate) fn apply_and_finish_unit(
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
         .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
+        .or(capture_denial)
         .or(evaluator_verdict_denial)
         .or(agent_denial.map(|r| crate::domain::UnitDenial::new("agent_validator", r)))
         .or(evaluator_denial)
@@ -1481,6 +1500,12 @@ pub(crate) fn apply_and_finish_unit(
     }
     if outcome.approved {
         unit.rework_of = None;
+    }
+    // (BC-80, core#535) The counts the capture phase reported — evidence on the persisted unit,
+    // kept whether they passed or denied. `None` leaves the field untouched, so a unit that
+    // reported once and was re-dispatched never loses the earlier reading to a silent attempt.
+    if capture_report.is_some() {
+        unit.capture_report = capture_report;
     }
     unit.conformance_ref = outcome.claim_id.clone();
     unit.phase_status = Some(outcome.phase_status.clone());

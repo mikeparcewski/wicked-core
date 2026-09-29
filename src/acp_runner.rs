@@ -16173,6 +16173,8 @@ No further next steps — both questions fully answered.";
     #[allow(dead_code)]
     fn claude_unit_running_echo() -> crate::domain::WorkUnit {
         crate::domain::WorkUnit {
+            capture_report: None,
+            requires_capture_report: false,
             base_skill_ref: None,
             id: "u-gov".to_string(),
             session_id: "run-gov".to_string(),

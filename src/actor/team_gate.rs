@@ -1881,9 +1881,12 @@ pub(super) fn answer_dispute_gate(
         crate::workflow::HumanDecision::EditPlan { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: a plan edit answers only a plan_approval gate")
         }
-        // Refused before the row resolves (`confirm_gate`); unreachable here.
+        // Refused before the row resolves (`confirm_gate`); unreachable here. (core#555) An
+        // intent amendment is one of them: a dispute is answered over the unit's findings, and
+        // amending the run's acceptance list is a decision for its own gate.
         crate::workflow::HumanDecision::FloorRerun(_)
-        | crate::workflow::HumanDecision::AcceptSuggestion => {
+        | crate::workflow::HumanDecision::AcceptSuggestion
+        | crate::workflow::HumanDecision::AmendIntent { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: approve, request changes or reject")
         }
     };
