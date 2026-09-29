@@ -964,10 +964,7 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
         .filter(|(_, v)| v.is_some())
         .map(|(k, _)| k.to_os_string())
         .collect();
-    for name in std::env::vars_os()
-        .map(|(name, _)| name)
-        .chain(planted.into_iter())
-    {
+    for name in std::env::vars_os().map(|(name, _)| name).chain(planted) {
         let name = name.to_string_lossy().into_owned();
         if REMOTE_CREDENTIAL_ENV_PREFIXES
             .iter()
