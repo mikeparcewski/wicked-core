@@ -777,11 +777,10 @@ impl SeatFailureReason {
             return Some(SeatFailureReason::NotLoggedIn);
         }
         // (core#670) A HOST-forced approval policy next: it is more specific than the quota
-        // rule and cannot be confused with it.
-        if [stdout, stderr]
-            .iter()
-            .any(|s| matches_any(s, APPROVAL_UNAVAILABLE))
-        {
+        // rule and cannot be confused with it. A ballot's streams are judged WHOLE, like the
+        // authentication rule above — a ballot's output is the seat's own answer, not a file it
+        // was reading.
+        if [stdout, stderr].iter().any(|s| approval_refusal_frame(s)) {
             return Some(SeatFailureReason::ApprovalUnavailable);
         }
         if [stdout, stderr]
@@ -807,9 +806,10 @@ impl SeatFailureReason {
         if matches_any(output, NOT_LOGGED_IN) {
             return Some(SeatFailureReason::NotLoggedIn);
         }
-        // (core#670) Judged over the WHOLE transcript: the launcher's refusal lands where codex
-        // first wanted a command, which is wherever the unit's work reached — not at its tail.
-        if matches_any(output, APPROVAL_UNAVAILABLE) {
+        // (core#670) Judged over the TAIL only, by the same reasoning the quota rule uses: the
+        // launcher's refusal is terminal (codex exits on it), while the body of a long transcript
+        // is the unit's subject matter — and this repository's subject matter includes the phrase.
+        if approval_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES)) {
             return Some(SeatFailureReason::ApprovalUnavailable);
         }
         if quota_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES), nonzero_exit) {
@@ -874,17 +874,33 @@ const NOT_LOGGED_IN: &[&str] = &[
     "not signed in",
 ];
 
-/// (core#670) A HOST-forced approval policy, in the launcher's own words — ASCII-case-insensitive
-/// substrings, deliberately only the two sentences codex itself emits when exec mode is asked to
-/// approve a command. Prose ABOUT approvals (the subject matter of this repository, which a codex
-/// reviewer quotes back) matches neither: `approval request failed` is the tool router's
-/// `Rejected(...)` payload, and `approval is not supported in exec mode` is the app-server's
-/// JSON-RPC error. A broader phrase (`approval`, `approval_policy`) would misread a review of
-/// `plan_gate.rs` as a dead seat, so it is not here.
-const APPROVAL_UNAVAILABLE: &[&str] = &[
-    "approval request failed",
-    "approval is not supported in exec mode",
+/// (core#670) The launcher's own words when a HOST-forced approval policy stops it running a
+/// command, each paired with the FRAME it arrives in — ASCII-case-insensitive substrings, all of
+/// which must be in the judged text.
+///
+/// The phrase alone was not enough (review of PR #673, HIGH): this repository's own prose contains
+/// it — a changelog entry, an issue body, this very comment — so a codex unit that read such a file
+/// and then failed for an unrelated reason would have benched a healthy seat. `exec_command failed`
+/// is the tool router's own wrapper; `codex_app_server` is the process that emits the JSON-RPC
+/// error. Neither appears in prose that is merely ABOUT approvals.
+const APPROVAL_UNAVAILABLE: &[&[&str]] = &[
+    &["approval request failed", "exec_command failed"],
+    &["approval is not supported in exec mode", "codex_app_server"],
 ];
+
+/// (core#670) A HOST-forced approval refusal in the judged text: one of [`APPROVAL_UNAVAILABLE`]'s
+/// phrase+frame pairs, every part present.
+///
+/// The CALLER decides how much text to judge, and the two callers differ for the same reason they
+/// differ on quota: a ballot's two streams are judged whole, a transcript only over its tail
+/// ([`REFUSAL_TAIL_BYTES`]) — a launcher's refusal is terminal, while the body of a long transcript
+/// is the unit's subject matter. That is the second guard against a unit that quoted the launcher's
+/// line out of a file it was reviewing.
+fn approval_refusal_frame(text: &str) -> bool {
+    APPROVAL_UNAVAILABLE
+        .iter()
+        .any(|parts| parts.iter().all(|p| contains_ignore_ascii_case(text, p)))
+}
 
 /// (F-7R3-001, review F1 / r2-N1) Quota-class refusals that are complete in themselves — a
 /// provider's own sentence, an API error code, or a phrase no code identifier and no prose about
@@ -1802,13 +1818,46 @@ mod failure_reason_tests {
             "the plan_approval gate holds the plan until a human answers",
             "I reviewed src/plan_gate.rs: the approval matrix refuses a floor override in auto",
             "the deliver gate's approval was denied by the evaluator",
+            // The phrase WITHOUT the launcher's frame: an issue body, a changelog entry, a
+            // summary of this very change (review of PR #673, HIGH).
+            "core#670 says a codex unit dies with Rejected(\"approval request failed\") on such a host",
+            "the app-server answers \"command execution approval is not supported in exec mode\"",
         ] {
             assert_eq!(
                 SeatFailureReason::classify_refusal(innocent, true),
                 None,
                 "prose about approvals is not an approval refusal: {innocent:?}"
             );
+            assert_eq!(
+                SeatFailureReason::classify(innocent, "", true),
+                None,
+                "ballot path too: {innocent:?}"
+            );
         }
+        // …and a transcript that QUOTED the launcher's whole line out of a file it was reviewing,
+        // then failed for an unrelated reason, keeps the seat: the refusal is judged over the tail
+        // only, because a launcher's refusal is terminal (the quota rule's reasoning, review F4).
+        let quoted = format!(
+            "I read CHANGELOG.md. It says: ERROR codex_core::tools::router: error=exec_command \
+             failed: CreateProcess {{ message: \"Rejected(\\\"approval request failed\\\")\" }}\n{}\n\
+             error: the test suite failed (cli codex exited 1)",
+            "x".repeat(REFUSAL_TAIL_BYTES)
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&quoted, true),
+            None,
+            "a quote in the BODY is the unit's subject matter, not the seat's condition"
+        );
+        // The dogfood's real transcript — the same line, TERMINAL — still classifies.
+        let real = format!(
+            "{}\nERROR codex_core::tools::router: error=exec_command failed: CreateProcess \
+             {{ message: \"Rejected(\\\"approval request failed\\\")\" }}",
+            "x".repeat(REFUSAL_TAIL_BYTES)
+        );
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&real, true),
+            Some(SeatFailureReason::ApprovalUnavailable)
+        );
     }
 
     /// (F-7R3-001) The seats' REAL quota refusals classify `quota_exhausted` — the copilot string
