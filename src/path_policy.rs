@@ -108,6 +108,15 @@ fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     out
 }
 
+/// [`normalize`] for a fence that needs an ABSOLUTE base to join relative tokens onto, without
+/// asking whether the result is inside a root (`gate_hook::graph_store_cwd_bases`, issue #645):
+/// a `cd` destination the shell would have moved to becomes an absolute directory, `~`/`.`/`..`
+/// collapsed exactly as the boundary check collapses them, so the fence and the boundary cannot
+/// disagree about where the shell stands.
+pub(crate) fn normalize_for_fence(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+    normalize(raw, cwd, home)
+}
+
 /// Resolve symlinks as far as the filesystem allows.
 ///
 /// Walks up to the nearest existing ancestor, canonicalizes THAT, then re-appends the tail. A
