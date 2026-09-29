@@ -789,6 +789,17 @@ export declare class Core {
    */
   static evaluateMcpCall(requestJson: string): Promise<string>
   /**
+   * The unit's visible MCP tool list (DES-MCP-TOOLS-001 §8 `GET /mcp/tools?token=`; slice S4,
+   * the garden shim's `list`). `request_json` is `{ token, calls: [{ server, tool, annotations?,
+   * classOverride?, registered, kind? }] }` — the worker's `WICKED_MCP_TOKEN` and the registry's
+   * tools. Each is judged for the token's unit with the SAME evaluation `evaluateMcpCall` runs,
+   * with no arguments, and NOTHING is recorded; a certain deny is left out. Resolves to
+   * `{ unit: { runId, ord, attempt, phase, seat }, tools: [{ subject, class, decision:
+   * "allow"|"ask", ruleIds, reason? }] }`. Rejects with `invalid_token: …`, `bad_request: …` or
+   * `guard_error: …`. Static, like `evaluateMcpCall`.
+   */
+  static listMcpTools(requestJson: string): Promise<string>
+  /**
    * The MCP policy PREVIEW (DES-MCP-TOOLS-001 §4.7, §8 `POST /mcp/policies/preview`; slice
    * S6): judge each call for each synthetic unit cell with the SAME evaluation
    * `evaluateMcpCall` runs, over this Core's policy store, and record NOTHING. `request_json`
