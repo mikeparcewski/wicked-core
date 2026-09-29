@@ -8834,9 +8834,19 @@ mod phase_scope_tests {
             judge("gh pr create --fill").is_some(),
             "a PR opened from a seat is refused"
         );
+        // core#569: a `gh` READ is refused too — the seat carries no credentials to read
+        // GitHub with, so the alternative is exit 4 and the silent WebFetch substitution
+        // wicked-crew#648 observed.
+        let (read_reason, read_fatal) =
+            judge("gh pr view 258 --json state").expect("a gh read is refused");
+        assert!(!read_fatal, "advisory, like every other fence refusal");
         assert!(
-            judge("gh pr view 258 --json state").is_none(),
-            "a read passes"
+            read_reason.contains(crate::remote_write_fence::PROVIDER_REMEDY),
+            "{read_reason}"
+        );
+        assert!(
+            judge("az repos pr create --repository r").is_some(),
+            "wicked-crew#663: an Azure DevOps write is refused"
         );
         assert!(
             judge("git add -A && git commit -qm x").is_none(),
@@ -8883,7 +8893,10 @@ mod phase_scope_tests {
             write: vec![wt.clone()],
             read: vec![],
         };
-        for cmd in crate::remote_write_fence::REVIEW_BYPASS_STRINGS {
+        for cmd in crate::remote_write_fence::REVIEW_BYPASS_STRINGS
+            .iter()
+            .chain(crate::remote_write_fence::PROVIDER_FENCE_STRINGS.iter())
+        {
             let verdict = boundary_denial_with(
                 &roots,
                 &wt,
@@ -8896,7 +8909,8 @@ mod phase_scope_tests {
             assert!(!fatal, "advisory, the seat continues: {cmd}");
             assert!(
                 reason.starts_with(REMOTE_WRITE_REASON_PREFIX)
-                    && reason.contains(crate::remote_write_fence::REMEDY),
+                    && (reason.contains(crate::remote_write_fence::REMEDY)
+                        || reason.contains(crate::remote_write_fence::PROVIDER_REMEDY)),
                 "{cmd}: {reason}"
             );
         }

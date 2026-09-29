@@ -21580,7 +21580,30 @@ transport = "stdio"
             ))
         ));
 
-        // 3. A read passes to the ordinary answer (no gate, no chat boundary ⇒ permitted).
+        // 3. A local read passes to the ordinary answer (no gate, no chat boundary ⇒ permitted);
+        //    a `gh` READ does not — core#569: the seat has no credentials to read GitHub with,
+        //    so the refusal is the honest answer (the alternative is exit 4 and the silent
+        //    WebFetch substitution wicked-crew#648 observed).
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&full),
+            wicked_apps_core::spawn::SeatCli::Other,
+            &frame(
+                "Bash",
+                "execute",
+                json!({"command": "git log --oneline -5"}),
+                3,
+            ),
+            &mut output,
+            4096,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
+        assert!(rx.try_recv().is_err(), "no denial event for a read");
         let mut sink: Vec<u8> = Vec::new();
         let mut output = String::new();
         super::answer_permission_request(
@@ -21594,13 +21617,22 @@ transport = "stdio"
                 "Bash",
                 "execute",
                 json!({"command": "gh pr view 1 --json state"}),
-                3,
+                31,
             ),
             &mut output,
             4096,
         );
-        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
-        assert!(rx.try_recv().is_err(), "no denial event for a read");
+        assert_eq!(
+            answer_of(&sink)["result"]["outcome"]["optionId"],
+            "reject",
+            "a gh read is refused, not answered with an auth error"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::WorkerToolCallDenied { .. }
+            ))
+        ));
 
         // 4. A `Full` posture fences no write-class call: the fence rides every unit session
         //    now, and `judge` is a no-op for it — the edit reaches the ordinary answer.
@@ -21735,6 +21767,7 @@ transport = "stdio"
         };
         for (i, cmd) in crate::remote_write_fence::REVIEW_BYPASS_STRINGS
             .iter()
+            .chain(crate::remote_write_fence::PROVIDER_FENCE_STRINGS.iter())
             .enumerate()
         {
             for shape in ["string", "argv"] {
