@@ -9945,6 +9945,11 @@ pub(crate) fn confirm_gate(
                 .as_deref()
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
+                // IDEMPOTENT ON THE TEXT, the run record included (codex review on #675): the
+                // skin pre-fills every gate from the durable note, so the same amendment can be
+                // offered twice. The units are deduped above; without this the run would claim
+                // two approved amendments and emit two `intentAmended` events for one decision.
+                .filter(|t| !s.intent_amendments.iter().any(|a| a.text == *t))
             {
                 None => None,
                 Some(text) => Some(crate::domain::IntentAmendment {
@@ -13231,6 +13236,17 @@ mod request_changes_tests {
                 .count(),
             1,
             "an identical amendment is not re-landed on the unit"
+        );
+        // …nor re-recorded on the run, nor re-audited: one decision, one amendment.
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.intent_amendments.len(), 1);
+        assert!(
+            !drain(&erx)
+                .iter()
+                .any(|e| matches!(e, CoreEvent::IntentAmended { .. })),
+            "an identical amendment emits no second audit record"
         );
     }
 

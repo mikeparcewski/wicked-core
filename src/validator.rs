@@ -2036,9 +2036,11 @@ pub fn parse_capture_report(raw: &str) -> Option<CaptureReport> {
                     failed,
                 });
             }
-            // A marker line that does not carry all three counts is malformed: the caller treats
-            // it exactly like an absent one (fail-closed).
-            _ => continue,
+            // A marker line that does not carry all three counts is malformed, and the LAST
+            // marker line decides — so it CLEARS any earlier reading rather than leaving it
+            // standing (codex review on #675, fail-closed): a worker that reported `0/0/0` and
+            // then wrote a broken `derived=6 submitted=0` must deny, not pass on the stale 0.
+            _ => last = None,
         }
     }
     last
@@ -2835,6 +2837,15 @@ mod tests {
         // Not reports: no marker, a marker with a missing count, prose between key and number.
         assert!(parse_capture_report("I captured seven learnings.").is_none());
         assert!(parse_capture_report("wicked-capture-report derived=4 submitted=4").is_none());
+        // A malformed LAST marker clears an earlier good one — the last line decides, fail-closed.
+        assert!(
+            parse_capture_report(
+                "wicked-capture-report derived=0 submitted=0 failed=0\n\
+                 wicked-capture-report derived=6 submitted=0"
+            )
+            .is_none(),
+            "a broken final marker must not pass on a stale earlier reading"
+        );
         assert!(
             parse_capture_report("wicked-capture-report derived nothing, submitted 0, failed 0")
                 .is_none(),
