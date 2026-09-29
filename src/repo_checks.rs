@@ -126,6 +126,32 @@
 //! the gate turns into a denial an operator can read and act on (install the sandbox tool, or run
 //! the verify phase where one exists).
 //!
+//! ## Platform matrix (core#416)
+//!
+//! The boundary is the floor's precondition, so the host decides whether the verify gate can pass
+//! at all. Written down here because a Windows operator used to learn it only from a gate denial,
+//! after the councils and the creator phases had already run and spent:
+//!
+//! | Host | Boundary | The floor |
+//! |---|---|---|
+//! | **macOS** (primary) | `sandbox-exec`, in the base system | runs the checks; `sandbox_level: "sandboxed"` |
+//! | **Linux** (supported) | `bwrap` (`bubblewrap`), install it | runs the checks; without `bwrap`, denies |
+//! | **Windows** | none the engine can arm | **DENIES every `repo_checks_floor` phase**, unless opted in below |
+//!
+//! Windows is not supported for governed runs that carry a floor phase — `bug/verify`,
+//! `feature/test`, `migration/verify` and crew's served mirrors. There is no AppContainer /
+//! restricted-token boundary in the engine and none is designed (core#416 item 3, deferred); what
+//! exists instead is the disclosed opt-in, so an operator can choose:
+//!
+//! - `WICKED_REPO_CHECKS_UNSANDBOXED=1` ([`UNSANDBOXED_OPT_IN_ENV`]) runs the repository's own
+//!   check scripts with NO OS write boundary. The results are real; the pass is NOT containment
+//!   evidence, and every report, `floorNote`, `FloorEnv` and `repoChecksEvaluated` event says so
+//!   (`sandbox_level: "none"`). It is per host, never inferred, and never a default.
+//! - Otherwise the floor keeps denying, and the denial now names both remedies.
+//!
+//! A floor that ran here also says nothing about the platforms a repository's own CI gates: the
+//! checks ran on the daemon's OS alone.
+//!
 //! Two leaves are special. `TMPDIR` (with `TMP`/`TEMP`) is NOT under the worktree: it is a short
 //! random per-floor directory (`<system temp>/wc-<6 hex>`, mode 0700), armed as the boundary's
 //! second write root and reaped with the floor — a `TMPDIR` under a deep worktree overflowed the
@@ -623,6 +649,15 @@ impl RepoChecksReport {
     /// named. `None` when there is nothing of either kind to say.
     pub fn classification_note(&self) -> Option<String> {
         let mut notes: Vec<String> = Vec::new();
+        // (core#416 item 3b) The boundary posture rides the gate's own note, first: an operator
+        // approving an opted-in floor must see that repo-controlled code ran uncontained on this
+        // host whether the checks passed or failed — a disclosure the operator has to step over,
+        // not a line in a log.
+        if self.unsandboxed() {
+            notes.push(self.sandbox_note.clone().unwrap_or_else(|| {
+                format!("{UNSANDBOXED_OPT_IN_ENV}=1 — the checks ran with NO OS write boundary")
+            }));
+        }
         for c in &self.checks {
             if c.env_cannot_run.is_empty() {
                 continue;
@@ -847,11 +882,26 @@ impl RepoChecksReport {
                     test, no Cargo.toml)"
                 .to_string();
         }
-        self.checks
+        let mut s = self
+            .checks
             .iter()
             .map(CheckRun::summary)
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", ");
+        // (core#416 item 3b) An opted-in run says so on the SAME line as its results, so a `passed`
+        // floor is never read as a contained one.
+        if self.unsandboxed() {
+            s.push_str(&format!(
+                " [no OS write boundary — {UNSANDBOXED_OPT_IN_ENV}=1]"
+            ));
+        }
+        s
+    }
+
+    /// (core#416 item 3b) Did these checks run with NO OS write boundary, on the operator's
+    /// explicit opt-in? The report's results stand; its containment claim does not.
+    pub fn unsandboxed(&self) -> bool {
+        self.sandbox_level == UNSANDBOXED_LEVEL
     }
 }
 
@@ -2063,6 +2113,41 @@ fn scratch_refused(
     }
 }
 
+/// The operator's explicit, disclosed opt-in to running the repository's own check scripts with NO
+/// OS write boundary — core#416 item 3(b), for the hosts where the floor can arm no boundary at
+/// all and therefore denies the verify gate on every run by construction (Windows; a Linux host
+/// without `bwrap`).
+///
+/// It is opt-IN, per host, and it is never inferred: absent this variable the floor keeps failing
+/// closed, because "we could not contain repo-controlled code, so we ran it anyway" is not a
+/// default anyone chooses knowingly. `1` or `true` arms it; anything else does not.
+pub(crate) const UNSANDBOXED_OPT_IN_ENV: &str = "WICKED_REPO_CHECKS_UNSANDBOXED";
+
+/// The [`RepoChecksReport::sandbox_level`] wire spelling for the opted-in run: `none`, distinct
+/// from `best-effort` (which is the probe's own verdict, and on this path means the checks did NOT
+/// run). A consumer folding enforcement (crew's `enforcement.unenforced`) reads `none` as "this
+/// pass is test evidence, not containment evidence".
+pub(crate) const UNSANDBOXED_LEVEL: &str = "none";
+
+/// The disclosure text when [`UNSANDBOXED_OPT_IN_ENV`] is armed, or `None` when it is not (the
+/// fail-closed default). One function so the decision and the words for it cannot drift.
+fn unsandboxed_opt_in_note(probe_reason: Option<&str>) -> Option<String> {
+    let armed = matches!(
+        std::env::var(UNSANDBOXED_OPT_IN_ENV)
+            .unwrap_or_default()
+            .trim(),
+        "1" | "true"
+    );
+    armed.then(|| {
+        format!(
+            "{UNSANDBOXED_OPT_IN_ENV}=1 — the repository's own check scripts ran with NO OS write \
+             boundary ({}). The operator opted in: the checks' results are real, and this floor's \
+             pass is NOT evidence that repo-controlled code was contained.",
+            probe_reason.unwrap_or("no OS-sandbox tool on PATH")
+        )
+    })
+}
+
 pub(crate) fn run_with_sandbox_ctx(
     worktree: &Path,
     sandbox: WorkerSandbox,
@@ -2070,37 +2155,61 @@ pub(crate) fn run_with_sandbox_ctx(
     scratch: CheckScratch,
     rerun: Option<&FloorRerun>,
 ) -> RepoChecksReport {
-    let sandbox_level = sandbox.level.as_wire().to_string();
-    let sandbox_note = sandbox.downgrade_reason.clone();
+    let mut sandbox = sandbox;
+    let mut sandbox_level = sandbox.level.as_wire().to_string();
+    let mut sandbox_note = sandbox.downgrade_reason.clone();
     if sandbox.level != crate::validator::SandboxLevel::Sandboxed || sandbox.wrapper.is_empty() {
-        // NEVER run repo-controlled scripts unsandboxed (codex review on #414): the floor fails
-        // with the probe's own reason, and the gate turns that into a denial the operator can act
-        // on. Detection is still reported so the record says what WOULD have run — and a
-        // detection FAILURE is reported as such, never as "no checks" (Copilot on #414).
-        let (detected, detect_error) = match detect_with(worktree, ctx) {
-            Ok(d) => (d, None),
-            Err(e) => (Vec::new(), Some(e)),
-        };
-        return RepoChecksReport {
-            detected,
-            checks: Vec::new(),
-            skipped: Vec::new(),
-            passed: false,
-            detect_error,
-            sandbox_level,
-            sandbox_note: sandbox_note.clone(),
-            sandbox_error: Some(format!(
-                "no OS write boundary could be armed for the checks ({})",
-                sandbox_note.unwrap_or_else(|| "no OS-sandbox tool on PATH".to_string())
-            )),
-            engine_writes_removed: Vec::new(),
-            claim: None,
-            env: None,
-            tree: None,
-            rerun: None,
-            waived: Vec::new(),
-            requested_rerun: None,
-        };
+        match unsandboxed_opt_in_note(sandbox_note.as_deref()) {
+            // (core#416 item 3b) The operator asked for the checks WITHOUT a boundary, knowing
+            // what that means. Run them with no wrapper at all — not the probe's partial jail,
+            // which would let the report imply a containment it does not have — and record
+            // `sandbox_level: "none"` plus the disclosure on the report, the event and the
+            // `FloorEnv`, so nothing downstream can read this pass as contained.
+            Some(note) => {
+                eprintln!("wicked-core: repo checks floor — {note}");
+                sandbox_level = UNSANDBOXED_LEVEL.to_string();
+                sandbox_note = Some(note.clone());
+                sandbox = crate::validator::WorkerSandbox {
+                    wrapper: Vec::new(),
+                    level: sandbox.level,
+                    downgrade_reason: Some(note),
+                };
+            }
+            // NEVER run repo-controlled scripts unsandboxed (codex review on #414): the floor
+            // fails with the probe's own reason, and the gate turns that into a denial the
+            // operator can act on. Detection is still reported so the record says what WOULD have
+            // run — and a detection FAILURE is reported as such, never as "no checks" (Copilot on
+            // #414).
+            None => {
+                let (detected, detect_error) = match detect_with(worktree, ctx) {
+                    Ok(d) => (d, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                return RepoChecksReport {
+                    detected,
+                    checks: Vec::new(),
+                    skipped: Vec::new(),
+                    passed: false,
+                    detect_error,
+                    sandbox_level,
+                    sandbox_note: sandbox_note.clone(),
+                    sandbox_error: Some(format!(
+                        "no OS write boundary could be armed for the checks ({}). On this host the \
+                         verify floor cannot run: install `bwrap` (Linux), or set \
+                         {UNSANDBOXED_OPT_IN_ENV}=1 to run the repository's own scripts with NO \
+                         write boundary, disclosed on every report",
+                        sandbox_note.unwrap_or_else(|| "no OS-sandbox tool on PATH".to_string())
+                    )),
+                    engine_writes_removed: Vec::new(),
+                    claim: None,
+                    env: None,
+                    tree: None,
+                    rerun: None,
+                    waived: Vec::new(),
+                    requested_rerun: None,
+                };
+            }
+        }
     }
     let detected = match detect_with(worktree, ctx) {
         Ok(d) => d,
@@ -3940,6 +4049,11 @@ mod tests {
     /// even a check that would have passed.
     #[test]
     fn without_a_write_boundary_the_floor_fails_closed_and_runs_nothing() {
+        // Reads an environment variable another test MUTATES (the core#416 opt-in below), so it
+        // holds the crate-wide lock shared: fail-closed is only the default while nobody opted in.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let wt = scratch("no-boundary");
         std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let probe_marker = wt.join("ran.txt");
@@ -3978,6 +4092,84 @@ mod tests {
             "{denial}"
         );
         assert!(!probe_marker.exists());
+        assert!(
+            report.denial_reason().contains(UNSANDBOXED_OPT_IN_ENV),
+            "the denial names the opt-in, so an operator on a boundary-less host is not stuck: {}",
+            report.denial_reason()
+        );
+    }
+
+    /// core#416 item 3(b) — the disclosed opt-in, and the only thing an operator on Windows can
+    /// do about the floor. The default above denies every `repo_checks_floor` phase on a host
+    /// where no boundary can arm; with `WICKED_REPO_CHECKS_UNSANDBOXED=1` the checks RUN, and the
+    /// report, the gate's own note and the recorded `FloorEnv` all say that nothing contained
+    /// them (`sandbox_level: "none"`) — so a pass is never read as containment evidence.
+    ///
+    /// Deterministic by injection, like the fail-closed test: a best-effort probe is what a host
+    /// with no `sandbox-exec`/`bwrap` yields, whatever this host has.
+    #[test]
+    fn the_disclosed_opt_in_runs_the_checks_with_no_boundary() {
+        if crate::validator::find_on_path("npm").is_none() {
+            eprintln!("repo_checks: npm not on PATH — the opt-in floor test cannot run here");
+            return;
+        }
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var_os(UNSANDBOXED_OPT_IN_ENV);
+        let wt = scratch("unsandboxed-opt-in");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"name":"floor-fixture","version":"0.0.0","scripts":{"test":"node -e \"process.stdout.write('RAN UNSANDBOXED\\n')\""}}"#,
+        )
+        .unwrap();
+        // node_modules present ⇒ no install step (nothing to install, no network).
+        std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+        let no_boundary = || WorkerSandbox {
+            wrapper: Vec::new(),
+            level: SandboxLevel::BestEffort,
+            downgrade_reason: Some("no OS-sandbox tool on PATH".to_string()),
+        };
+
+        std::env::set_var(UNSANDBOXED_OPT_IN_ENV, "1");
+        let report = run_with_sandbox(&wt, no_boundary());
+        match &prior {
+            Some(v) => std::env::set_var(UNSANDBOXED_OPT_IN_ENV, v),
+            None => std::env::remove_var(UNSANDBOXED_OPT_IN_ENV),
+        }
+
+        assert!(
+            report.sandbox_error.is_none(),
+            "the opt-in is not a refusal: {report:?}"
+        );
+        assert_eq!(report.sandbox_level, UNSANDBOXED_LEVEL);
+        assert!(report.unsandboxed());
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test")
+            .expect("the repository's own check RAN");
+        assert!(
+            c.stdout_tail.contains("RAN UNSANDBOXED"),
+            "{}",
+            c.stdout_tail
+        );
+        assert!(report.passed, "{report:?}");
+        // Disclosed on every surface a reader can reach.
+        let summary = report.summary();
+        assert!(summary.contains("no OS write boundary"), "{summary}");
+        let note = report
+            .classification_note()
+            .expect("the gate's floorNote discloses the posture");
+        assert!(
+            note.contains(UNSANDBOXED_OPT_IN_ENV) && note.contains("NOT evidence"),
+            "{note}"
+        );
+        assert_eq!(
+            report.env.as_ref().map(|e| e.sandbox_level.as_str()),
+            Some(UNSANDBOXED_LEVEL),
+            "the recorded environment carries the level CI parity is read against"
+        );
     }
 
     /// The boundary itself, where the host has one: a check script that writes outside the
@@ -3987,6 +4179,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_check_that_writes_outside_the_worktree_fails_the_floor() {
+        // Its no-tool branch asserts the fail-closed refusal, which the core#416 opt-in can turn
+        // off process-wide — shared lock, so that mutation cannot land mid-assert.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let base = scratch("contain");
         let wt = base.join("wt");
         let outside = base.join("outside");

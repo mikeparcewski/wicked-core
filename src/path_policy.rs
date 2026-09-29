@@ -270,6 +270,23 @@ pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Resul
     )
 }
 
+/// The home directory the launch-time root validation judges against: `$HOME`, or `$USERPROFILE`
+/// on Windows — the same two-step every other home lookup in the engine already does
+/// (`code_graph`, `execute_wrapped`, `acp_runner`, `mcp_isolation`).
+///
+/// core#640: the two launch call sites read `$HOME` ALONE, so on native Windows — where `HOME` is
+/// normally unset and `USERPROFILE` is the home — the `None` arm of [`validate_extra_roots`] fired
+/// on every launch that declared `extra_write_roots` or `extra_read_roots`. The fail-closed refusal
+/// was correct for a home that genuinely cannot be located and wrong for a host that simply spells
+/// it differently: every Windows document, draft and demo run, which is exactly the set of runs
+/// that declares extra roots, was refused at launch.
+pub fn launch_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The shared body of [`validate_extra_write_roots`] / [`validate_extra_read_roots`]: one judgement,
 /// two spellings, so the read mirror cannot drift from the write original (core#294). `kind` names
 /// the root set in every message; `exposure` states what admitting a pin-tree root would hand over.
@@ -284,12 +301,16 @@ fn validate_extra_roots(
     }
     let config_tree = match home {
         Some(h) => resolve_symlinks(&h.join(".config").join("wicked-core")),
-        // No HOME ⇒ the pin tree cannot be located, so containment cannot be proven either way.
-        // Fail CLOSED: refuse the widening rather than arm roots we cannot judge.
+        // No home directory ⇒ the pin tree cannot be located, so containment cannot be proven
+        // either way. Fail CLOSED: refuse the widening rather than arm roots we cannot judge.
+        //
+        // The message names BOTH variables on purpose (core#640): callers resolve the home with
+        // [`launch_home`], so on Windows — where `HOME` is normally unset and `USERPROFILE` is the
+        // home — an operator told only to "set $HOME" would be chasing the wrong knob.
         None => {
             return Err(format!(
-                "extra {kind} roots need $HOME to validate against the engine config tree; \
-                 refusing to widen the boundary without it"
+                "extra {kind} roots need a home directory ($HOME, or $USERPROFILE on Windows) to \
+                 validate against the engine config tree; refusing to widen the boundary without it"
             ))
         }
     };
@@ -364,34 +385,71 @@ fn validate_extra_roots(
 /// Symlink-resolved with the same [`resolve_symlinks`] the boundary check uses, so a root reached
 /// through `/tmp`→`/private/tmp` cannot dodge the containment test (macOS temp dirs are exactly
 /// that symlink, so this is the common case, not the exotic one).
+///
+/// # Freshness: a prior run's leftover is not this run's evidence (core#640)
+///
+/// `launch_floor_ms` is the run's own launch clock in epoch millis — see
+/// [`crate::event_log::run_started_ms`], the `ts` of the first record in the run's durable event
+/// log. A deliverable that carries bytes but was last written BEFORE the run launched is reported
+/// as not produced, with how far ahead of the launch it was written.
+///
+/// Presence alone was not enough. Every crew interactive seam (chat, draft, demo) declares a write
+/// root keyed by DOCUMENT, not by run, so the same directory is handed to run after run: once one
+/// run wrote `draft.html` there, every later run on that document passed this floor without
+/// producing anything at all. crew's floor caught it
+/// (`packages/crew/src/core/deliverable-floor.ts`, crew#320) and migration M9 deletes crew's, so
+/// the engine's has to catch it first.
+///
+/// The floor is the run's FIRST-EVER event, so it is conservative by construction: output an
+/// earlier unit of the SAME run produced is newer than it and stays produced, across a resume or a
+/// redrive (which continue the same log). `None` — an embedder or a test whose event sink records
+/// nowhere — keeps the presence-only judgement; the daemon always records.
 pub(crate) fn missing_deliverables(
     declared: &[String],
     cwd: &Path,
     write_roots: &[String],
+    launch_floor_ms: Option<i64>,
 ) -> Option<String> {
     let missing: Vec<String> = declared
         .iter()
         .filter(|d| !d.trim().is_empty())
-        .filter_map(|d| match deliverable_state(d, cwd, write_roots) {
-            Found::Produced => None,
-            Found::Absent => Some(d.clone()),
-            Found::Empty => Some(format!("{d} (empty)")),
-        })
+        .filter_map(
+            |d| match deliverable_state(d, cwd, write_roots, launch_floor_ms) {
+                Found::Produced => None,
+                Found::Absent => Some(d.clone()),
+                Found::Empty => Some(format!("{d} (empty)")),
+                Found::Stale(why) => Some(format!("{d} ({why})")),
+            },
+        )
         .collect();
     (!missing.is_empty()).then(|| missing.join(", "))
 }
 
+/// Slack on the freshness comparison, in millis — the same 1 s crew's floor allows
+/// (`DELIVERABLE_FLOOR_MTIME_SLACK_MS`). The launch stamp and a file's mtime come from two
+/// different clocks, and a coarse filesystem truncates mtimes to the second, so a file written in
+/// the same second as the launch must not read as older than it.
+const FRESHNESS_SLACK_MS: i64 = 1_000;
+
 /// What one declared deliverable resolved to.
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone)]
 enum Found {
     Produced,
     /// Present but hollow: a zero-byte file or an empty directory.
     Empty,
+    /// Present and non-empty, but last written before this run launched (core#640): a PRIOR run's
+    /// artifact. Carries the parenthetical the miss is reported with.
+    Stale(String),
     Absent,
 }
 
 /// One deliverable's presence test — see [`missing_deliverables`] for the rules and why.
-fn deliverable_state(declared: &str, cwd: &Path, write_roots: &[String]) -> Found {
+fn deliverable_state(
+    declared: &str,
+    cwd: &Path,
+    write_roots: &[String],
+    launch_floor_ms: Option<i64>,
+) -> Found {
     let p = Path::new(declared);
     let candidates: Vec<PathBuf> = if p.is_absolute() {
         let resolved = resolve_symlinks(p);
@@ -416,9 +474,16 @@ fn deliverable_state(declared: &str, cwd: &Path, write_roots: &[String]) -> Foun
             })
             .collect()
     };
-    let states: Vec<Found> = candidates.iter().map(|c| content_state(c)).collect();
+    let states: Vec<Found> = candidates
+        .iter()
+        .map(|c| content_state(c, launch_floor_ms))
+        .collect();
+    // Best evidence wins across the candidate bases, and a STALE candidate outranks an empty or
+    // absent one: "it is there but it predates this run" is the more actionable miss.
     if states.contains(&Found::Produced) {
         Found::Produced
+    } else if let Some(stale) = states.iter().find(|s| matches!(s, Found::Stale(_))) {
+        stale.clone()
     } else if states.contains(&Found::Empty) {
         Found::Empty
     } else {
@@ -426,20 +491,70 @@ fn deliverable_state(declared: &str, cwd: &Path, write_roots: &[String]) -> Foun
     }
 }
 
-/// A file counts when it carries bytes; a directory when it holds an entry.
-fn content_state(path: &Path) -> Found {
+/// A file counts when it carries bytes AND was written after the run launched; a directory when it
+/// holds at least one such entry. `launch_floor_ms` is the launch clock — see
+/// [`missing_deliverables`] for why a `None` there keeps the presence-only judgement.
+fn content_state(path: &Path, launch_floor_ms: Option<i64>) -> Found {
     match std::fs::metadata(path) {
         Err(_) => Found::Absent,
         Ok(m) if m.is_dir() => {
-            let occupied = std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some());
-            if occupied {
-                Found::Produced
-            } else {
-                Found::Empty
+            let entries: Vec<std::path::PathBuf> = match std::fs::read_dir(path) {
+                Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                Err(_) => return Found::Absent,
+            };
+            if entries.is_empty() {
+                return Found::Empty;
+            }
+            let Some(floor) = launch_floor_ms else {
+                return Found::Produced;
+            };
+            // The freshest entry decides: one file this run wrote makes the directory this run's
+            // output, however much of a prior run's output sits beside it.
+            let newest = entries.iter().filter_map(|e| written_at_ms(e)).max();
+            match newest {
+                Some(ts) if ts >= floor - FRESHNESS_SLACK_MS => Found::Produced,
+                // Unreadable mtimes on every entry: the engine cannot date the directory, so it
+                // cannot call it stale either.
+                None => Found::Produced,
+                Some(ts) => Found::Stale(format!(
+                    "stale: {} entries, none written by this run — the newest predates the launch \
+                     by {}",
+                    entries.len(),
+                    ago(floor - ts)
+                )),
             }
         }
-        Ok(m) if m.len() > 0 => Found::Produced,
+        Ok(m) if m.len() > 0 => match (launch_floor_ms, written_at_ms(path)) {
+            (Some(floor), Some(ts)) if ts < floor - FRESHNESS_SLACK_MS => Found::Stale(format!(
+                "stale: last written {} before this run launched — a PRIOR run's artifact",
+                ago(floor - ts)
+            )),
+            _ => Found::Produced,
+        },
         Ok(_) => Found::Empty,
+    }
+}
+
+/// A path's mtime in epoch millis, or `None` when the filesystem will not report one (a clock
+/// before the epoch included). Unreadable is never "stale": the engine says what it can prove.
+fn written_at_ms(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+}
+
+/// A millisecond gap in the coarsest unit that still reads as a number — the floor's message has
+/// to be legible to an operator, and the engine carries no date formatter.
+fn ago(ms: i64) -> String {
+    let s = ms / 1_000;
+    match s {
+        _ if s >= 86_400 => format!("{}d", s / 86_400),
+        _ if s >= 3_600 => format!("{}h", s / 3_600),
+        _ if s >= 60 => format!("{}m", s / 60),
+        _ => format!("{s}s"),
     }
 }
 
@@ -755,6 +870,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&repo);
     }
+
+    /// core#640, second half. The launch path resolved the home from `$HOME` alone, so on native
+    /// Windows — where `HOME` is normally unset and `USERPROFILE` IS the home — the fail-closed
+    /// `None` arm fired on every launch that declared extra roots: every document, draft and demo
+    /// run on that host, refused for a home that was sitting right there under another name.
+    ///
+    /// The refusal itself still stands when NEITHER resolves, and its message now names both
+    /// variables so the operator is not sent after the wrong knob.
+    #[test]
+    fn the_launch_home_is_userprofile_when_home_is_unset() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior_home = std::env::var_os("HOME");
+        let prior_profile = std::env::var_os("USERPROFILE");
+        let restore = || {
+            match &prior_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &prior_profile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        };
+
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "/windows/home");
+        assert_eq!(
+            launch_home(),
+            Some(PathBuf::from("/windows/home")),
+            "USERPROFILE is the home on Windows"
+        );
+
+        // HOME wins where both are set — the POSIX spelling stays authoritative.
+        std::env::set_var("HOME", "/posix/home");
+        assert_eq!(launch_home(), Some(PathBuf::from("/posix/home")));
+
+        // An EMPTY value is not a home: joining `.config/wicked-core` onto it would judge every
+        // root against a relative path.
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "");
+        assert_eq!(launch_home(), None);
+
+        // Neither resolves ⇒ still refused, and the message names both variables.
+        std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
+        assert_eq!(launch_home(), None);
+        let e = validate_extra_write_roots(&["/tmp/inbox".into()], launch_home().as_deref())
+            .expect_err("a home that cannot be located is still a fail-closed refusal");
+        assert!(e.contains("$HOME") && e.contains("$USERPROFILE"), "{e}");
+        restore();
+    }
 }
 
 /// The DELIVERABLE FLOOR's resolution rules (FINDING-101, core#297 §3). The floor's WIRING — that
@@ -782,7 +950,7 @@ mod deliverables_tests {
     #[test]
     fn no_declared_deliverables_is_always_satisfied() {
         let d = tmp("empty");
-        assert!(missing_deliverables(&[], &d, &[]).is_none());
+        assert!(missing_deliverables(&[], &d, &[], None).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -790,11 +958,12 @@ mod deliverables_tests {
     fn a_declared_file_that_exists_passes_and_one_that_does_not_is_named() {
         let d = tmp("named");
         std::fs::write(d.join("coverage-report.json"), "{}").unwrap();
-        assert!(missing_deliverables(&["coverage-report.json".into()], &d, &[]).is_none());
+        assert!(missing_deliverables(&["coverage-report.json".into()], &d, &[], None).is_none());
         let miss = missing_deliverables(
             &["coverage-report.json".into(), "domain-model.json".into()],
             &d,
             &[],
+            None,
         )
         .expect("the absent deliverable must be reported");
         assert!(miss.contains("domain-model.json"), "{miss}");
@@ -810,7 +979,7 @@ mod deliverables_tests {
         let d = tmp("dir");
         std::fs::create_dir_all(d.join(".wicked/domain")).unwrap();
         std::fs::write(d.join(".wicked/domain/model.json"), "{}").unwrap();
-        assert!(missing_deliverables(&[".wicked/domain".into()], &d, &[]).is_none());
+        assert!(missing_deliverables(&[".wicked/domain".into()], &d, &[], None).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -823,18 +992,22 @@ mod deliverables_tests {
         let d = tmp("hollow");
         std::fs::write(d.join("draft.html"), "").unwrap();
         std::fs::create_dir_all(d.join("out")).unwrap();
-        let miss = missing_deliverables(&["draft.html".into(), "out".into()], &d, &[])
+        let miss = missing_deliverables(&["draft.html".into(), "out".into()], &d, &[], None)
             .expect("an empty file and an empty directory are missing");
         assert!(miss.contains("draft.html (empty)"), "{miss}");
         assert!(miss.contains("out (empty)"), "{miss}");
         // Inside a declared write root, absolute, the same.
         let sandbox = tmp("hollow-sandbox");
         let abs = s(&d.join("draft.html"));
-        assert!(missing_deliverables(std::slice::from_ref(&abs), &sandbox, &[s(&d)]).is_some());
+        assert!(
+            missing_deliverables(std::slice::from_ref(&abs), &sandbox, &[s(&d)], None).is_some()
+        );
         std::fs::write(d.join("draft.html"), "<p>x</p>").unwrap();
         std::fs::write(d.join("out/fragment-1.html"), "<p>y</p>").unwrap();
-        assert!(missing_deliverables(&["draft.html".into(), "out".into()], &d, &[]).is_none());
-        assert!(missing_deliverables(&[abs], &sandbox, &[s(&d)]).is_none());
+        assert!(
+            missing_deliverables(&["draft.html".into(), "out".into()], &d, &[], None).is_none()
+        );
+        assert!(missing_deliverables(&[abs], &sandbox, &[s(&d)], None).is_none());
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&sandbox);
     }
@@ -846,8 +1019,8 @@ mod deliverables_tests {
     fn an_unverifiable_deliverable_is_reported_missing_not_skipped() {
         let d = tmp("unverifiable");
         std::fs::write(d.join("real.json"), "{}").unwrap();
-        assert!(missing_deliverables(&["/etc/passwd".into()], &d, &[]).is_some());
-        assert!(missing_deliverables(&["../escape.json".into()], &d, &[]).is_some());
+        assert!(missing_deliverables(&["/etc/passwd".into()], &d, &[], None).is_some());
+        assert!(missing_deliverables(&["../escape.json".into()], &d, &[], None).is_some());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -861,12 +1034,12 @@ mod deliverables_tests {
         let file = inbox.join("hand-off.md");
 
         assert!(
-            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)]).is_some(),
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)], None).is_some(),
             "declared but never written is still missing"
         );
         std::fs::write(&file, "the answer").unwrap();
         assert!(
-            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)]).is_none(),
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)], None).is_none(),
             "an absolute deliverable inside a DECLARED root is verifiable"
         );
         let _ = std::fs::remove_dir_all(&sandbox);
@@ -885,12 +1058,12 @@ mod deliverables_tests {
         std::fs::write(&file, "not this run's work").unwrap();
 
         assert!(
-            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)]).is_some(),
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)], None).is_some(),
             "an existing file outside every declared root is not this run's evidence"
         );
         // …and it is admitted the moment the launcher actually declares that root.
         assert!(
-            missing_deliverables(&[s(&file)], &sandbox, &[s(&elsewhere)]).is_none(),
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&elsewhere)], None).is_none(),
             "declaring the root is exactly what makes it verifiable"
         );
         let _ = std::fs::remove_dir_all(&sandbox);
@@ -905,12 +1078,12 @@ mod deliverables_tests {
         let sandbox = tmp("sandbox-rel");
         let inbox = tmp("inbox-rel");
         assert!(
-            missing_deliverables(&["hand-off.md".into()], &sandbox, &[s(&inbox)]).is_some(),
+            missing_deliverables(&["hand-off.md".into()], &sandbox, &[s(&inbox)], None).is_some(),
             "absent from both the cwd and the declared root"
         );
         std::fs::write(inbox.join("hand-off.md"), "x").unwrap();
         assert!(
-            missing_deliverables(&["hand-off.md".into()], &sandbox, &[s(&inbox)]).is_none(),
+            missing_deliverables(&["hand-off.md".into()], &sandbox, &[s(&inbox)], None).is_none(),
             "a relative deliverable resolves against the declared root too"
         );
         let _ = std::fs::remove_dir_all(&sandbox);
@@ -927,7 +1100,8 @@ mod deliverables_tests {
         let sibling = inbox.parent().unwrap().join("escape.json");
         std::fs::write(&sibling, "{}").unwrap();
         assert!(
-            missing_deliverables(&["../escape.json".into()], &sandbox, &[s(&inbox)]).is_some(),
+            missing_deliverables(&["../escape.json".into()], &sandbox, &[s(&inbox)], None)
+                .is_some(),
             "a `..` escape is ambiguous by construction and must stay unverifiable"
         );
         let _ = std::fs::remove_file(&sibling);
@@ -948,13 +1122,13 @@ mod deliverables_tests {
         std::fs::write(outside.join("hosts"), "127.0.0.1 localhost").unwrap();
         std::os::unix::fs::symlink(outside.join("hosts"), inbox.join("draft.html")).unwrap();
         assert!(
-            missing_deliverables(&["draft.html".into()], &sandbox, &[s(&inbox)]).is_some(),
+            missing_deliverables(&["draft.html".into()], &sandbox, &[s(&inbox)], None).is_some(),
             "a symlink to bytes outside the declared root is not a produced deliverable"
         );
         std::fs::write(inbox.join("real.html"), "<p>x</p>").unwrap();
         std::os::unix::fs::symlink(inbox.join("real.html"), inbox.join("alias.html")).unwrap();
         assert!(
-            missing_deliverables(&["alias.html".into()], &sandbox, &[s(&inbox)]).is_none(),
+            missing_deliverables(&["alias.html".into()], &sandbox, &[s(&inbox)], None).is_none(),
             "a symlink that stays inside the root still counts"
         );
         let _ = std::fs::remove_dir_all(&inbox);
@@ -967,7 +1141,123 @@ mod deliverables_tests {
     #[test]
     fn a_blank_declaration_is_ignored() {
         let d = tmp("blank");
-        assert!(missing_deliverables(&["   ".into(), "".into()], &d, &[]).is_none());
+        assert!(missing_deliverables(&["   ".into(), "".into()], &d, &[], None).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A file's mtime in epoch millis — the value the floor dates a deliverable by.
+    fn mtime_ms(p: &Path) -> i64 {
+        written_at_ms(p).expect("the test filesystem reports an mtime")
+    }
+
+    /// core#640, the defect this batch exists for. The engine floor judged PRESENCE only, so a
+    /// file a PRIOR run left in a write root passed for every later run handed the same root —
+    /// which is every chat, draft and demo run, because crew keys that root by DOCUMENT and not
+    /// by run. The miss now says the file predates the launch, and by how much, so the operator
+    /// reads "a prior run's artifact" instead of "produced".
+    ///
+    /// Deterministic without sleeping or rewriting mtimes: the file is written, then judged
+    /// against a launch floor an hour AFTER it — the same ordering as a stale leftover, with no
+    /// clock manipulation.
+    #[test]
+    fn a_deliverable_older_than_the_launch_is_not_produced() {
+        let sandbox = tmp("stale-sandbox");
+        let inbox = tmp("stale-inbox");
+        let prior = inbox.join("draft.html");
+        std::fs::write(&prior, "<p>a PRIOR run's draft</p>").unwrap();
+        let written = mtime_ms(&prior);
+
+        // Launched an hour after that file was written: a leftover, not this run's output.
+        let miss = missing_deliverables(
+            &["draft.html".into()],
+            &sandbox,
+            &[s(&inbox)],
+            Some(written + 3_600_000),
+        )
+        .expect("a file written before the launch is not this run's deliverable");
+        assert!(miss.contains("draft.html"), "{miss}");
+        assert!(miss.contains("stale"), "the miss must say WHY: {miss}");
+        assert!(
+            miss.contains("1h"),
+            "the miss must say how far ahead of the launch it was written: {miss}"
+        );
+
+        // Written after the launch: produced, the ordinary case.
+        assert!(
+            missing_deliverables(
+                &["draft.html".into()],
+                &sandbox,
+                &[s(&inbox)],
+                Some(written - 60_000),
+            )
+            .is_none(),
+            "a file written after the launch is this run's deliverable"
+        );
+
+        // Inside the slack window (the launch stamp and the filesystem are two clocks, and a
+        // coarse filesystem truncates to the second) it still counts.
+        assert!(
+            missing_deliverables(
+                &["draft.html".into()],
+                &sandbox,
+                &[s(&inbox)],
+                Some(written + FRESHNESS_SLACK_MS),
+            )
+            .is_none(),
+            "a file written in the same second as the launch is not stale"
+        );
+
+        // No launch clock (a sink that records nowhere) ⇒ the presence-only judgement, unchanged.
+        assert!(
+            missing_deliverables(&["draft.html".into()], &sandbox, &[s(&inbox)], None).is_none()
+        );
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// The directory arm of the same rule. A declared directory of outputs is produced when ONE
+    /// entry is this run's — a run that appends a fragment beside a prior run's is still producing
+    /// — and stale when every entry predates the launch.
+    #[test]
+    fn a_directory_whose_every_entry_predates_the_launch_is_stale() {
+        let d = tmp("stale-dir");
+        std::fs::create_dir_all(d.join("out")).unwrap();
+        let old = d.join("out/fragment-1.html");
+        std::fs::write(&old, "<p>prior</p>").unwrap();
+        let written = mtime_ms(&old);
+        let floor = written + 3_600_000;
+
+        let miss = missing_deliverables(&["out".into()], &d, &[], Some(floor))
+            .expect("a directory holding only a prior run's output produced nothing");
+        assert!(miss.contains("out (stale"), "{miss}");
+        assert!(
+            miss.contains("1 entries"),
+            "the miss must say what IS there: {miss}"
+        );
+
+        // One entry from this run makes the directory this run's output.
+        let fresh = d.join("out/fragment-2.html");
+        std::fs::write(&fresh, "<p>this run</p>").unwrap();
+        let floor = mtime_ms(&fresh) - 60_000;
+        assert!(missing_deliverables(&["out".into()], &d, &[], Some(floor)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An EMPTY file stays "(empty)" rather than becoming "(stale)": zero bytes is the sharper
+    /// statement about what the phase produced, and the empty test runs before the date test.
+    #[test]
+    fn an_empty_file_is_reported_empty_not_stale() {
+        let d = tmp("empty-not-stale");
+        let f = d.join("draft.html");
+        std::fs::write(&f, "").unwrap();
+        let miss = missing_deliverables(
+            &["draft.html".into()],
+            &d,
+            &[],
+            Some(mtime_ms(&f) + 3_600_000),
+        )
+        .expect("a zero-byte file is not produced");
+        assert!(miss.contains("draft.html (empty)"), "{miss}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

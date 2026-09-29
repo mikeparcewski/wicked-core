@@ -1316,7 +1316,9 @@ pub(crate) fn run(
                     // project/preflight checks above: an invalid root is a synchronous Err with
                     // NO session persisted — never a session whose boundary silently reopens
                     // the FINDING-098 pin-rewrite escape.
-                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    // core#640: HOME, or USERPROFILE on Windows — a HOME-only lookup refused
+                    // every Windows launch that declared extra roots.
+                    let home = crate::path_policy::launch_home();
                     crate::path_policy::validate_extra_write_roots(
                         &spec.extra_write_roots,
                         home.as_deref(),
@@ -4081,7 +4083,8 @@ pub(crate) fn launch_run_inner(
     // Same launch-time judgement as the interactive path (core#259): an invalid extra write root
     // is a synchronous Err before anything is planned or persisted.
     {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        // core#640: HOME, or USERPROFILE on Windows (see `launch_home`).
+        let home = crate::path_policy::launch_home();
         crate::path_policy::validate_extra_write_roots(&spec.extra_write_roots, home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
         // The read mirror (core#294): same judgement, same synchronous refusal.
@@ -5982,6 +5985,12 @@ fn apply_step_result(
             .clone()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(&run_id));
+        // core#640: the run's own launch clock, so a file a PRIOR run left in a shared write root
+        // is not read as this phase's output. `None` (a sink that records nowhere) keeps the
+        // presence-only judgement.
+        let launch_floor = subscribers
+            .log_root()
+            .and_then(|root| crate::event_log::run_started_ms(root, &run_id));
         if let Some(missing) = crate::path_policy::missing_deliverables(
             &unit.required_deliverables,
             &cwd,
@@ -5989,6 +5998,7 @@ fn apply_step_result(
             // validated. Without this an unbound run — every crew interactive seam — has no
             // spelling of the field that resolves, so it declares nothing at all.
             &session.extra_write_roots,
+            launch_floor,
         ) {
             let why = format!(
                 "phase reported done but did not produce its declared deliverable(s): {missing}"

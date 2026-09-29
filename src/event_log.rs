@@ -455,6 +455,33 @@ pub fn read_run(root: &Path, run_id: &str) -> Vec<serde_json::Value> {
     parse_log(&raw)
 }
 
+/// When a run LAUNCHED, in epoch millis: the `ts` of the first record in its own log.
+///
+/// The run's launch clock, for the callers that need to date a run against the filesystem — the
+/// deliverable floor's freshness half (`path_policy::missing_deliverables`, core#640), which has to
+/// tell this run's output from a prior run's leftover in a write root both runs were handed.
+///
+/// It reads the FIRST record, not the last, and only that one: the log is append-only in emission
+/// order (see [`read_run`]), so line 1 is the earliest event the run ever produced — the plan or
+/// launch event, before any unit could write anything. A resume or a redrive continues the same
+/// run's log, so the launch stamp of a resumed run stays its ORIGINAL launch, which is what a
+/// freshness floor wants: never newer than the run's own earlier output.
+///
+/// `None` when the run has no log yet, the file cannot be read, or its first line carries no
+/// numeric `ts` (a hand-truncated log). Callers decide what an undatable run means; this function
+/// never guesses a stamp.
+pub(crate) fn run_started_ms(root: &Path, run_id: &str) -> Option<i64> {
+    // Same reason [`read_run`] drains first: a caller must not read a log that is missing records
+    // already handed to the writer.
+    flush();
+    let raw = read_log(&run_log_path(root, run_id))?;
+    let first = raw.lines().find(|l| !l.trim().is_empty())?;
+    serde_json::from_str::<serde_json::Value>(first)
+        .ok()?
+        .get("ts")?
+        .as_i64()
+}
+
 /// The live subscriber list PLUS the durable log, bundled so the actor's single emit point reaches
 /// both through one `&mut` argument.
 ///
@@ -477,6 +504,13 @@ impl EventSink {
             subscribers: Vec::new(),
             root: Some(root),
         }
+    }
+
+    /// Where this sink records, if anywhere — the root [`run_started_ms`] and [`read_run`] read
+    /// back through. `None` for a fanout-only sink (an embedder, or a test that wants no
+    /// filesystem writes), and a caller that needs the durable trail has to handle that.
+    pub(crate) fn log_root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// Register a live subscriber.
@@ -508,6 +542,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// (core#640) The run's launch clock, for the deliverable floor's freshness half: the `ts` of
+    /// the FIRST record, so a resumed run keeps its ORIGINAL launch and its own earlier output
+    /// never reads as a prior run's leftover. A run with no log has no clock — never a guess.
+    #[test]
+    fn a_runs_launch_clock_is_its_first_records_stamp() {
+        let root = tmp("launch-clock");
+        assert_eq!(
+            run_started_ms(&root, "run-never-launched"),
+            None,
+            "a run with no log has no launch clock, and the caller must handle that"
+        );
+        let mut sink = EventSink::persistent(root.clone());
+        assert_eq!(sink.log_root(), Some(root.as_path()));
+        sink.emit(CoreEvent::UnitDone {
+            session: "run-clock".to_string(),
+            ord: 0,
+        });
+        let first = run_started_ms(&root, "run-clock").expect("the launched run has a clock");
+        // Later events never move it: the floor must not drift forward past output the run's own
+        // earlier units produced.
+        for ord in 1..4u32 {
+            sink.emit(CoreEvent::UnitDone {
+                session: "run-clock".to_string(),
+                ord,
+            });
+        }
+        assert_eq!(run_started_ms(&root, "run-clock"), Some(first));
+        let records = read_run(&root, "run-clock");
+        assert_eq!(
+            records
+                .first()
+                .and_then(|r| r.get("ts"))
+                .and_then(|t| t.as_i64()),
+            Some(first),
+            "the clock IS the first record's own stamp, not a re-read of `now`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The whole point of the finding: a run with NO live subscriber must still leave a complete,

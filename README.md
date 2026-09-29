@@ -52,6 +52,34 @@ wicked-studio's Steering section, CI comments with it on PRs. Start here:
 **[crates/wicked-governance/STEERING.md](./crates/wicked-governance/STEERING.md)** — the
 operator guide from "never heard of it" to seeded and recalling.
 
+## Platform support
+
+macOS is the primary platform. Linux is supported. **Windows is not supported for governed runs**
+— it runs, and then it denies the verify gate on every one of them. The engine runs a repository's
+own check scripts (the `repo_checks` floor behind `bug/verify`, `feature/test`,
+`migration/verify` and crew's served mirrors) only inside an OS write boundary, because those
+scripts are code the repository chose; there is no boundary the engine can arm on Windows, so the
+floor fails closed and the gate denies (core#416).
+
+| Host | OS write boundary | The verify floor | Governed runs |
+|---|---|---|---|
+| **macOS** | `sandbox-exec` (base system) | runs the checks (`sandbox_level: sandboxed`) | primary |
+| **Linux** | `bwrap` — `apt install bubblewrap` / `dnf install bubblewrap` | runs the checks with `bwrap`; **without it, denies** | supported |
+| **Windows** (incl. Git Bash / WSL host side) | none | **denies every floor phase, by construction** | not supported |
+
+The escape hatch is an opt-in, not a default: `WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the
+repository's own checks with **no OS write boundary**. The results are real; the pass is not
+containment evidence, and every report, gate note and `repoChecksEvaluated` event says so
+(`sandbox_level: "none"`). A real Windows boundary (AppContainer / a restricted-token job object,
+or the checks under WSL2 `bwrap`) is not designed and not shipped.
+
+Two smaller consequences of the same rule, worth knowing before you debug them:
+
+- A floor that passed says nothing about the platforms a repository's own CI gates — the checks ran
+  on the daemon's OS alone.
+- Everything else (planning, councils, chat, documents, the gate ladder) is cross-platform; it is
+  the *floor* that has a platform matrix.
+
 ## Audience
 
 Internal. The consumers are the other wicked-* products — the [wicked-crew](https://github.com/mikeparcewski/wicked-crew)
