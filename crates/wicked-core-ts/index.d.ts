@@ -1006,6 +1006,13 @@ export declare class Subscription {
  * DES-TEAMING-002 T6 (removal): the DES-001 team events unitCheckpoint, monitorAttached,
  * monitorFinding, adviceDelivered and workerAdviceResponse are no longer emitted. Team
  * communication is the `wicked.team.*` bus stream (crew relays it as `teamEvent` frames).
+ * core#416 (no shape change, a new VALUE): repoChecksEvaluated.sandboxLevel — and the same field
+ * on `env` — can now read `'none'`, beside 'sandboxed' | 'network-only' | 'best-effort'. It means
+ * the repository's own check scripts RAN with no OS write boundary, on the operator's explicit
+ * `WICKED_REPO_CHECKS_UNSANDBOXED=1` opt-in (the hosts where none can be armed: Windows, a Linux
+ * box without `bwrap`). The check results are real; a consumer folding enforcement must read
+ * 'none' as UNENFORCED containment, never as a contained pass. 'best-effort' still means the
+ * checks did NOT run.
  */
 export interface CoreEventJson {
   type: string
