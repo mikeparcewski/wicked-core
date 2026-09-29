@@ -5986,11 +5986,17 @@ fn apply_step_result(
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(&run_id));
         // core#640: the run's own launch clock, so a file a PRIOR run left in a shared write root
-        // is not read as this phase's output. `None` (a sink that records nowhere) keeps the
-        // presence-only judgement.
-        let launch_floor = subscribers
-            .log_root()
-            .and_then(|root| crate::event_log::run_started_ms(root, &run_id));
+        // is not read as this phase's output. Three states, never two (review of PR #674): a run
+        // that records NOTHING keeps the presence-only judgement, but a run that should have a
+        // durable trail and cannot be dated from it is refused rather than waved through on
+        // whatever was lying in the write root.
+        let launch = match subscribers.log_root() {
+            None => crate::path_policy::LaunchClock::Unrecorded,
+            Some(root) => match crate::event_log::run_started_ms(root, &run_id) {
+                Some(ms) => crate::path_policy::LaunchClock::At(ms),
+                None => crate::path_policy::LaunchClock::Undatable,
+            },
+        };
         if let Some(missing) = crate::path_policy::missing_deliverables(
             &unit.required_deliverables,
             &cwd,
@@ -5998,7 +6004,7 @@ fn apply_step_result(
             // validated. Without this an unbound run — every crew interactive seam — has no
             // spelling of the field that resolves, so it declares nothing at all.
             &session.extra_write_roots,
-            launch_floor,
+            launch,
         ) {
             let why = format!(
                 "phase reported done but did not produce its declared deliverable(s): {missing}"
@@ -13962,9 +13968,37 @@ mod deliverable_floor_tests {
             unit.denial_reason
         );
 
+        // And the third clock state (review of PR #674): a run that RECORDS — a persistent sink —
+        // whose log carries no launch stamp is refused, not waved through on presence alone. The
+        // event log is best-effort ("an unwritable log costs the record, never the run"), so an
+        // unwritable sidecar used to put the floor straight back to the defect. Reproduced
+        // portably by rooting the sink at a regular FILE: no platform can create a log directory
+        // under it, so nothing records and nothing can be dated.
+        let blank_logs = tmp("undatable-logs").join("not-a-directory");
+        std::fs::write(&blank_logs, "the .events sidecar could not be created").unwrap();
+        let blank_id = format!("deliv-undatable-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &blank_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec!["draft.html".into()],
+        );
+        let mut subs = crate::event_log::EventSink::persistent(blank_logs.clone());
+        let (_session, unit) = fold(&mut store, &mut subs, &blank_id);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert!(
+            unit.denial_reason
+                .unwrap_or_default()
+                .contains("cannot be dated"),
+            "an undatable run must say so, not read as a produced deliverable"
+        );
+
         let _ = std::fs::remove_dir_all(&inbox);
         let _ = std::fs::remove_dir_all(&logs);
         let _ = std::fs::remove_dir_all(&fresh_logs);
+        let _ = std::fs::remove_dir_all(blank_logs.parent().unwrap());
     }
 }
 
