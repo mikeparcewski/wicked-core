@@ -879,7 +879,16 @@ pub(crate) fn boundary_denial_tracked(
             // code-executing) to decide advisory vs fatal; the `false` placeholder here is never
             // read for estate denies. Same defense-in-depth limit as bash_write_targets (a renamed
             // binary / raw SQLite still evades a literal scan; the OS sandbox is the hermetic layer).
-            if let Some(hit) = classify_estate_command(command, estate_store_pinned, graph_store) {
+            // Where the shell could be standing when a segment opens a database (issue #645
+            // second half): the effective cwd `here` — the install fence's per-attempt sidecar,
+            // so a `cd` in an EARLIER allowed call counts — plus every `cd` destination in THIS
+            // command, resolved through the boundary's own normalize chain. Without these, `cd
+            // <graph-dir> && sqlite3 graph.db 'UPDATE nodes SET risk = 0'` named the store in no
+            // way the literal scan could see.
+            let cwd_bases = graph_store_cwd_bases(command, &here, cwd, home);
+            if let Some(hit) =
+                classify_estate_command(command, estate_store_pinned, graph_store, &cwd_bases, home)
+            {
                 return Some((
                     format!(
                         "{ESTATE_DENY_REASON_PREFIX} `{}` — {}; {ESTATE_DENY_REMEDY}",
@@ -2089,14 +2098,73 @@ fn is_sqlite_capable_program(base: &str) -> bool {
 /// an inline `-c` program text — but every occurrence must sit on a NAME BOUNDARY, or the
 /// sibling graph key `…/graphs/abc1234` would be refused because it starts with `…/graphs/abc123`
 /// (codex review). Refusing a unit's own fixture db is a false refusal, not a safe default.
-fn token_names_graph_store(tok: &str, graph_store: &[std::path::PathBuf]) -> bool {
+fn token_names_graph_store(
+    tok: &str,
+    graph_store: &[std::path::PathBuf],
+    cwd_bases: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> bool {
     if ESTATE_STORE_PIN_ENV.iter().any(|k| tok.contains(k)) {
         return true;
     }
     let normalised = script_path(tok);
-    graph_store
+    if graph_store
         .iter()
         .any(|g| names_path(&normalised, &g.to_string_lossy()))
+    {
+        return true;
+    }
+    relative_token_names_graph_store(&normalised, graph_store, cwd_bases, home)
+}
+
+/// Does a RELATIVE token name the graph store from where the shell STANDS (issue #645, second
+/// half)?
+///
+/// The absolute arm above needs the store spelled out, so `cd <graph-dir> && sqlite3 graph.db
+/// 'UPDATE nodes SET risk = 0'` named neither a pin variable nor a path inside the store and was
+/// allowed — the cd is into an ADMITTED write root, so no boundary arm objects either. The
+/// engine already knows where the shell stands (the install fence's per-attempt cwd sidecar, plus
+/// the `cd` destinations in this very command), so a relative token is resolved against those
+/// bases through the SAME normalize → symlink-resolve → containment chain the boundary uses
+/// ([`crate::path_policy::raw_resolves_within`]) — `..`, a symlinked store and Windows spellings
+/// included, rather than a second path notion that could disagree with the first.
+///
+/// Only PATH-SHAPED fragments are resolved: one that carries a `/` or a `.`. Resolving every bare
+/// word would refuse a whole segment the moment the shell stood in the store dir (`select` would
+/// "resolve into" it), which is a false refusal — and a control that fires on legitimate work is
+/// how a control gets switched off ([`crate::path_policy`]'s module doc).
+fn relative_token_names_graph_store(
+    normalised: &str,
+    graph_store: &[std::path::PathBuf],
+    cwd_bases: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> bool {
+    if cwd_bases.is_empty() || graph_store.is_empty() {
+        return false;
+    }
+    // A token may be a bare argument, a `--db=<path>` flag or an interpreter's whole `-c` program
+    // text, so split on the characters no path continues through and judge each fragment.
+    normalised
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | ',' | ';' | '=' | '`')
+        })
+        .filter_map(|frag| {
+            let f = frag.trim_start_matches("./");
+            // Absolute fragments were already judged by the literal arm; a flag is not a path; a
+            // bare word (`select`, `nodes`) is not one either.
+            (!f.is_empty()
+                && !f.starts_with('/')
+                && !f.starts_with('-')
+                && (f.contains('/') || f.contains('.')))
+            .then_some(f)
+        })
+        .any(|f| {
+            cwd_bases.iter().any(|base| {
+                graph_store
+                    .iter()
+                    .any(|g| crate::path_policy::raw_resolves_within(f, base, home, g))
+            })
+        })
 }
 
 /// Is `path` named somewhere in `text`, on a name boundary at both ends?
@@ -2144,11 +2212,45 @@ fn names_path(text: &str, path: &str) -> bool {
 /// Same DEFENSE-IN-DEPTH limit as the rest of this scan (see [`classify_estate_command`]'s doc): a
 /// renamed interpreter, a path assembled from a variable, or a second wrapper level still evades a
 /// literal scan. OS-level containment is the hermetic layer.
-fn opens_graph_store(words: &[&str], base: &str, graph_store: &[std::path::PathBuf]) -> bool {
+fn opens_graph_store(
+    words: &[&str],
+    base: &str,
+    graph_store: &[std::path::PathBuf],
+    cwd_bases: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> bool {
     is_sqlite_capable_program(base)
         && words
             .iter()
-            .any(|t| token_names_graph_store(t, graph_store))
+            .any(|t| token_names_graph_store(t, graph_store, cwd_bases, home))
+}
+
+/// The directories a relative token in a sqlite-capable segment could resolve against (issue #645
+/// second half): where the shell STANDS (`here` — the install fence's per-attempt cwd sidecar, so a
+/// `cd` in an earlier allowed call still counts) plus every `cd` destination in THIS command.
+///
+/// The `cd` destinations are themselves resolved with [`crate::path_policy`]'s normalize chain
+/// against `cwd`, the same way [`bash_cd_escape_targets`]' results are judged, so `cd
+/// ../graphs/abc123` becomes an absolute base rather than a string nothing can join.
+fn graph_store_cwd_bases(
+    command: &str,
+    here: &std::path::Path,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut bases = vec![here.to_path_buf()];
+    for dest in bash_cd_targets_inner(command, true) {
+        // Resolve the destination the way the shell would: relative to where it stands.
+        let base = if std::path::Path::new(&script_path(&dest)).is_absolute() {
+            here
+        } else {
+            cwd
+        };
+        bases.push(crate::path_policy::normalize_for_fence(&dest, base, home));
+    }
+    bases.sort();
+    bases.dedup();
+    bases
 }
 
 /// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
@@ -2355,17 +2457,31 @@ fn classify_estate_command(
     command: &str,
     store_pinned_by_env: bool,
     graph_store: &[std::path::PathBuf],
+    cwd_bases: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
 ) -> Option<EstateDeny> {
-    classify_estate_command_in(command, store_pinned_by_env, graph_store, true)
+    classify_estate_command_in(
+        command,
+        store_pinned_by_env,
+        graph_store,
+        cwd_bases,
+        home,
+        true,
+    )
 }
 
 /// The scan behind [`classify_estate_command`]. `unwrap_inline` is true for the command line the
 /// worker issued and false for the ONE inner rescan of a shell `-c` string (a nested `-c` is the
 /// documented pass — see the limit list above).
+#[allow(clippy::too_many_arguments)]
 fn classify_estate_command_in(
     command: &str,
     store_pinned_by_env: bool,
     graph_store: &[std::path::PathBuf],
+    // Where the shell could be standing, for the raw-SQLite fence's relative arm (issue #645
+    // second half): the effective cwd plus this command's own `cd` destinations.
+    cwd_bases: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
     unwrap_inline: bool,
 ) -> Option<EstateDeny> {
     let owned = shell_tokens(command);
@@ -2417,8 +2533,14 @@ fn classify_estate_command_in(
             Unwrapped::Program { idx, assignments } => (idx, assignments),
             Unwrapped::Inline(inner) => {
                 if unwrap_inline {
-                    let hit =
-                        classify_estate_command_in(inner, store_pinned_by_env, graph_store, false);
+                    let hit = classify_estate_command_in(
+                        inner,
+                        store_pinned_by_env,
+                        graph_store,
+                        cwd_bases,
+                        home,
+                        false,
+                    );
                     if hit.is_some() {
                         return hit;
                     }
@@ -2472,7 +2594,7 @@ fn classify_estate_command_in(
         }
 
         // RAW SQLITE FENCE (issue #645).
-        if opens_graph_store(words, base, graph_store) {
+        if opens_graph_store(words, base, graph_store, cwd_bases, home) {
             return deny(ESTATE_WHY_RAW_SQLITE);
         }
     }
@@ -7352,7 +7474,7 @@ mod boundary_tests {
     /// written against (shadows `super::classify_estate_command`, whose third argument the
     /// raw-SQLite arm of issue #645 needs and which has its own tests).
     fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<EstateDeny> {
-        super::classify_estate_command(command, store_pinned_by_env, &[])
+        super::classify_estate_command(command, store_pinned_by_env, &[], &[], None)
     }
 
     // Env is process-global and Rust runs tests in threads, so these serialize on the CRATE-WIDE
@@ -8333,7 +8455,7 @@ mod boundary_tests {
             "python3 -c 'import os,sqlite3; sqlite3.connect(os.environ[\"WICKED_ESTATE_DB\"]).execute(\"CREATE TABLE t (x)\")'",
             "node -e 'require(\"node:sqlite\").open(process.env.WICKED_MEMORY_DB)'",
         ] {
-            let hit = super::classify_estate_command(command, true, &store)
+            let hit = super::classify_estate_command(command, true, &store, &[], None)
                 .unwrap_or_else(|| panic!("not refused: {command}"));
             assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
         }
@@ -8345,7 +8467,7 @@ mod boundary_tests {
             "python3 -c 'import sqlite3; sqlite3.connect(\"/srv/estate/graphs/abc123/graph.db\").execute(\"CREATE TABLE t (x)\")'",
             "sqlite3 \"/srv/estate/graphs/abc123\"/graph.db 'DELETE FROM nodes'",
         ] {
-            let hit = super::classify_estate_command(command, false, &store)
+            let hit = super::classify_estate_command(command, false, &store, &[], None)
                 .unwrap_or_else(|| panic!("the resolved graph path is refused too: {command}"));
             assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
         }
@@ -8386,7 +8508,7 @@ mod boundary_tests {
             "wicked-estate query --db /srv/estate/graphs/abc123/graph.db 'fn:main'",
         ] {
             assert!(
-                super::classify_estate_command(allowed, true, &store).is_none(),
+                super::classify_estate_command(allowed, true, &store, &[], None).is_none(),
                 "the read-only estate transport stays allowed: {allowed}"
             );
         }
@@ -8402,11 +8524,86 @@ mod boundary_tests {
             "sqlite3 /mnt/backup/srv/estate/graphs/abc123/graph.db 'select 1'",
         ] {
             assert!(
-                super::classify_estate_command(benign, true, &store).is_none(),
+                super::classify_estate_command(benign, true, &store, &[], None).is_none(),
                 "{benign}"
             );
         }
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// Issue #645, the RELATIVE spelling the first pass left open (found re-verifying W3-K6).
+    ///
+    /// The fence's literal arm needs the store spelled out — a pin variable, or a path inside the
+    /// engine-resolved graph dir. So `cd <graph-dir> && sqlite3 graph.db 'UPDATE nodes SET
+    /// risk = 0'` was ALLOWED end to end: the `cd` goes into an admitted write root (SQLite needs
+    /// its WAL siblings there), so no boundary arm objects, and the sqlite segment names neither a
+    /// variable nor a path. Reproduced against the merged binary before this fix: the hook exited
+    /// 0 and the statement zeroed the `risk` column the issue names.
+    ///
+    /// A relative token is now resolved against where the shell stands — the effective cwd and
+    /// this command's own `cd` destinations — through the boundary's own normalize chain.
+    #[test]
+    fn a_relative_spelling_of_the_project_graph_is_refused_too() {
+        let graph = std::path::PathBuf::from("/srv/estate/graphs/abc123");
+        let store = [graph.clone()];
+        let wt = std::path::PathBuf::from("/srv/work/wt");
+        // `here` is the process cwd until a cd moves it; the destinations come from the command.
+        let bases = |command: &str, here: &std::path::Path| {
+            super::graph_store_cwd_bases(command, here, &wt, None)
+        };
+
+        // The reproduced escape: a cd in the SAME command, absolute or relative, and after a `sh -c`.
+        for command in [
+            "cd /srv/estate/graphs/abc123 && sqlite3 graph.db \'UPDATE nodes SET risk = 0\'",
+            "cd ../../estate/graphs/abc123 && sqlite3 graph.db \'CREATE TABLE evil (x)\'",
+            "cd /srv/estate/graphs && sqlite3 abc123/graph.db \'DELETE FROM edges\'",
+            "cd /srv/estate/graphs/abc123 && python3 -c \'import sqlite3; sqlite3.connect(\"graph.db\").execute(\"CREATE TABLE t (x)\")\'",
+        ] {
+            let b = bases(command, &wt);
+            let hit = super::classify_estate_command(command, false, &store, &b, None)
+                .unwrap_or_else(|| panic!("a relative spelling is refused: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
+
+        // The TWO-CALL spelling: the cd landed in an earlier allowed call, so this command carries
+        // none — the install fence's cwd sidecar is what says where the shell stands.
+        let command = "sqlite3 graph.db \'UPDATE nodes SET risk = 0\'";
+        let b = bases(command, &graph);
+        assert_eq!(
+            super::classify_estate_command(command, false, &store, &b, None)
+                .expect("a shell already standing in the store is refused")
+                .why,
+            ESTATE_WHY_RAW_SQLITE,
+        );
+        // … and with the shell in the worktree the very same command is nobody\'s business.
+        assert!(
+            super::classify_estate_command(command, false, &store, &bases(command, &wt), None)
+                .is_none(),
+            "the same relative name from the worktree is a local db, not the graph",
+        );
+
+        // NOT refused, standing IN the store dir: a non-path argument must not read as one — a
+        // fence that refuses `select` the moment the shell stands there is a false refusal, and a
+        // control that fires on legitimate work is how a control gets switched off.
+        for benign in [
+            "sqlite3 /srv/work/wt/fixture.db \'select count(*) from nodes\'",
+            "cd /srv/estate/graphs/abc123 && ls",
+            "cd /srv/estate/graphs/abc123 && wc -l notes",
+            "cd /srv/estate/graphs/abc1234 && sqlite3 graph.db \'select 1\'",
+        ] {
+            let b = bases(benign, &wt);
+            assert!(
+                super::classify_estate_command(benign, true, &store, &b, None).is_none(),
+                "{benign}"
+            );
+        }
+        // The grounding transport stays allowed from inside the store dir too.
+        let allowed = "wicked-estate-mcp --readonly --db graph.db";
+        assert!(
+            super::classify_estate_command(allowed, true, &store, &bases(allowed, &graph), None)
+                .is_none(),
+            "the read-only transport is not the raw-SQLite arm\'s business",
+        );
     }
 
     /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),
