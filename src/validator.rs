@@ -1945,7 +1945,7 @@ pub const CAPTURE_REPORT_MARKER: &str = "wicked-capture-report";
 /// — the SILENT 0-proposal run (the skill loaded and never ran) that used to report `completed`.
 pub(crate) const CAPTURE_REPORT_MISSING: &str =
     "no `wicked-capture-report` line in the capture phase's output (contract: end with \
-     `wicked-capture-report {\"derived\": N, \"submitted\": N, \"failed\": N}` — always, including \
+     `wicked-capture-report {\"derived\": N, \"submitted\": M, \"failed\": K}` — always, including \
      a degrade and a legitimate 0). Nothing proves the capture ran, so 0 proposals cannot be told \
      apart from a skill that never loaded";
 
