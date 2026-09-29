@@ -723,6 +723,15 @@ pub enum SeatFailureReason {
     /// a transcript: `No such file or directory` in a worker's output is more often the worker's
     /// own `cat` than the seat's absence.
     NotInstalled,
+    /// (core#670) The HOST forces an approval policy the headless launch cannot satisfy, so the
+    /// seat could not run a command at all. Seen on an enterprise-managed codex account whose
+    /// requirements forbid `approval_policy = Never`: `codex exec` falls back to `OnRequest`,
+    /// there is no approver in exec mode, and the first command that wants one dies with
+    /// `Rejected("approval request failed")` — the run's unit failed with that opaque line and no
+    /// cause. Nothing the run can do grants the approval: the policy is signed, account-wide and
+    /// outside wicked's reach, so the seat is benched for the run and the work fails over to a
+    /// seat that CAN run.
+    ApprovalUnavailable,
 }
 
 impl SeatFailureReason {
@@ -732,6 +741,7 @@ impl SeatFailureReason {
             SeatFailureReason::NotLoggedIn => "not_logged_in",
             SeatFailureReason::QuotaExhausted => "quota_exhausted",
             SeatFailureReason::NotInstalled => "not_installed",
+            SeatFailureReason::ApprovalUnavailable => "approval_unavailable",
         }
     }
 
@@ -742,6 +752,9 @@ impl SeatFailureReason {
             SeatFailureReason::NotLoggedIn => "failed authentication",
             SeatFailureReason::QuotaExhausted => "exhausted its quota",
             SeatFailureReason::NotInstalled => "is not installed",
+            SeatFailureReason::ApprovalUnavailable => {
+                "cannot run a command on this host (its approval policy is forced)"
+            }
         }
     }
 
@@ -762,6 +775,14 @@ impl SeatFailureReason {
             .any(|s| matches_any(s, NOT_LOGGED_IN))
         {
             return Some(SeatFailureReason::NotLoggedIn);
+        }
+        // (core#670) A HOST-forced approval policy next: it is more specific than the quota
+        // rule and cannot be confused with it.
+        if [stdout, stderr]
+            .iter()
+            .any(|s| matches_any(s, APPROVAL_UNAVAILABLE))
+        {
+            return Some(SeatFailureReason::ApprovalUnavailable);
         }
         if [stdout, stderr]
             .iter()
@@ -786,6 +807,11 @@ impl SeatFailureReason {
         if matches_any(output, NOT_LOGGED_IN) {
             return Some(SeatFailureReason::NotLoggedIn);
         }
+        // (core#670) Judged over the WHOLE transcript: the launcher's refusal lands where codex
+        // first wanted a command, which is wherever the unit's work reached — not at its tail.
+        if matches_any(output, APPROVAL_UNAVAILABLE) {
+            return Some(SeatFailureReason::ApprovalUnavailable);
+        }
         if quota_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES), nonzero_exit) {
             return Some(SeatFailureReason::QuotaExhausted);
         }
@@ -799,6 +825,7 @@ impl SeatFailureReason {
             SeatFailureReason::NotLoggedIn,
             SeatFailureReason::QuotaExhausted,
             SeatFailureReason::NotInstalled,
+            SeatFailureReason::ApprovalUnavailable,
         ]
         .into_iter()
         .find(|r| r.as_str() == token)
@@ -845,6 +872,18 @@ const NOT_LOGGED_IN: &[&str] = &[
     "please sign in",
     "login required",
     "not signed in",
+];
+
+/// (core#670) A HOST-forced approval policy, in the launcher's own words — ASCII-case-insensitive
+/// substrings, deliberately only the two sentences codex itself emits when exec mode is asked to
+/// approve a command. Prose ABOUT approvals (the subject matter of this repository, which a codex
+/// reviewer quotes back) matches neither: `approval request failed` is the tool router's
+/// `Rejected(...)` payload, and `approval is not supported in exec mode` is the app-server's
+/// JSON-RPC error. A broader phrase (`approval`, `approval_policy`) would misread a review of
+/// `plan_gate.rs` as a dead seat, so it is not here.
+const APPROVAL_UNAVAILABLE: &[&str] = &[
+    "approval request failed",
+    "approval is not supported in exec mode",
 ];
 
 /// (F-7R3-001, review F1 / r2-N1) Quota-class refusals that are complete in themselves — a
@@ -1720,6 +1759,56 @@ mod failure_reason_tests {
         assert_eq!(f.reason, None);
         assert!(!f.summary().contains('['), "{}", f.summary());
         assert_eq!(SeatFailureReason::classify("", "", true), None);
+    }
+
+    /// (core#670) The MCP S8 dogfood's F-1, verbatim: on a host whose enterprise-managed codex
+    /// requirements forbid `approval_policy = Never`, headless `codex exec` cannot approve the
+    /// first command it wants to run, so the unit died with an OPAQUE
+    /// `Rejected("approval request failed")`. It must classify as `approval_unavailable` — the
+    /// engine's own words for "this seat cannot run a command on this host" — on either stream
+    /// and through the transcript path, and an ordinary sentence about approvals must not.
+    #[test]
+    fn a_forced_approval_policy_classifies_as_approval_unavailable() {
+        for words in [
+            // The line the run actually recorded (codex's tool router, debug-escaped).
+            "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"approval request failed\\\")\" }",
+            // The cause, as codex's app-server states it.
+            "ERROR codex_app_server: request failed with client error: JSONRPCErrorError { code: -32000, message: \"command execution approval is not supported in exec mode for thread 019\" }",
+        ] {
+            let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "exit 1").with_output(words, "");
+            assert_eq!(
+                f.reason,
+                Some(SeatFailureReason::ApprovalUnavailable),
+                "{words:?} must classify as approval_unavailable"
+            );
+            assert_eq!(f.reason.unwrap().as_str(), "approval_unavailable");
+            assert_eq!(
+                SeatFailureReason::classify("", words, true),
+                Some(SeatFailureReason::ApprovalUnavailable),
+                "either stream: {words:?}"
+            );
+            assert_eq!(
+                SeatFailureReason::classify_refusal(words, true),
+                Some(SeatFailureReason::ApprovalUnavailable),
+                "transcript: {words:?}"
+            );
+        }
+        assert_eq!(
+            SeatFailureReason::from_token("approval_unavailable"),
+            Some(SeatFailureReason::ApprovalUnavailable)
+        );
+        // Prose ABOUT approvals — the subject matter of this very repository — is not a refusal.
+        for innocent in [
+            "the plan_approval gate holds the plan until a human answers",
+            "I reviewed src/plan_gate.rs: the approval matrix refuses a floor override in auto",
+            "the deliver gate's approval was denied by the evaluator",
+        ] {
+            assert_eq!(
+                SeatFailureReason::classify_refusal(innocent, true),
+                None,
+                "prose about approvals is not an approval refusal: {innocent:?}"
+            );
+        }
     }
 
     /// (F-7R3-001) The seats' REAL quota refusals classify `quota_exhausted` — the copilot string
