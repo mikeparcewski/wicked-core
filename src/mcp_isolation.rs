@@ -41,6 +41,166 @@ use wicked_apps_core::spawn::SeatCli;
 /// an empty `mcpServers`, and a JSON argv value would have to survive Windows `.cmd` quoting.
 pub(crate) const CLAUDE_STRICT_MCP_ARGS: [&str; 1] = ["--strict-mcp-config"];
 
+/// (core#660) The MCP off-switches a NON-claude seat's launch carries, so nothing ambient loads
+/// on the carriers claude's `--strict-mcp-config` does not cover. Empty for a seat with no MCP
+/// (pi) and for claude (whose flags are [`CLAUDE_STRICT_MCP_ARGS`], injected with the rest of its
+/// isolation). `seat_root` is the seat's ENGINE-MINTED configuration home
+/// (`SeatConfig::Isolated::root`; `None` under the operator-inherit hatch, which then resolves the
+/// CLI's own default home — the hatch inherits the operator's scopes, never an ungoverned tool
+/// channel); `cwd` is the unit's working directory, which for copilot is a config SOURCE.
+///
+/// **copilot** (measured on GitHub Copilot CLI 1.0.88): `--disable-builtin-mcps` — copilot ships
+/// a built-in `github-mcp-server`, ENABLED by default, which is a GitHub write path the
+/// remote-write fence never sees — plus `--disable-mcp-server <name>` for every server named by
+/// its config sources (`<COPILOT_HOME>/mcp-config.json`, and the workspace's `.mcp.json` /
+/// `.github/mcp.json`, which load once the working directory is trusted). Verified: with
+/// `COPILOT_HOME` pointed at a throwaway home holding one server, `copilot mcp list` reads
+/// `probe (local)` + `github-mcp-server (http)`, and with these flags it reads
+/// `probe (local, disabled)` + `github-mcp-server (http, disabled)`. A name that is not
+/// configured is accepted and does nothing.
+///
+/// **codex** (measured on codex-cli 0.154.0): `-c mcp_servers.<name>.enabled=false` for every
+/// server in `<CODEX_HOME>/config.toml`. NOT `-c mcp_servers={}`, which core#660 proposed and
+/// which does NOT work: the table MERGES, and `codex mcp list` still reads the ambient server as
+/// `enabled`. The per-server form reads `disabled`, and `codex exec … -c mcp_servers.x.enabled=…`
+/// is parsed in that position (a bad value is rejected before the model runs). A server whose
+/// name is not a bare TOML key REFUSES the launch: the quoted-key override
+/// (`mcp_servers."weird name".enabled=false`) replaces the table instead of merging into it and
+/// codex then fails to load its own config ("invalid transport"), so there is no override this
+/// can emit — and a governed seat that loads an MCP server the engine did not hand it is what
+/// this closes. Not covered, disclosed: the codex-acp bridge is a different binary, so it takes
+/// no `-c` (core#660 item 2's ACP half stays open), and an enterprise-managed codex config
+/// source this cannot read.
+pub(crate) fn seat_mcp_pin_flags(
+    cli: SeatCli,
+    seat_root: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+) -> Result<Vec<String>, String> {
+    match cli {
+        SeatCli::Copilot => {
+            let mut flags = vec![COPILOT_DISABLE_BUILTIN_MCPS.to_string()];
+            let mut sources: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(root) = seat_root {
+                sources.push(root.join(COPILOT_MCP_CONFIG_FILE));
+            }
+            if let Some(cwd) = cwd {
+                sources.push(cwd.join(".mcp.json"));
+                sources.push(cwd.join(".github").join("mcp.json"));
+            }
+            for source in sources {
+                for name in copilot_mcp_server_names(&source)? {
+                    flags.push("--disable-mcp-server".to_string());
+                    flags.push(name);
+                }
+            }
+            Ok(flags)
+        }
+        SeatCli::Codex => {
+            let Some(root) = seat_root else {
+                return Ok(Vec::new());
+            };
+            let mut flags = Vec::new();
+            for name in codex_mcp_server_names(&root.join("config.toml"))? {
+                flags.push("-c".to_string());
+                flags.push(format!("mcp_servers.{name}.enabled=false"));
+            }
+            Ok(flags)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// copilot's built-in MCP off-switch (its own flag; currently `github-mcp-server`).
+pub(crate) const COPILOT_DISABLE_BUILTIN_MCPS: &str = "--disable-builtin-mcps";
+
+/// The user-scope MCP config copilot reads from its configuration home.
+pub(crate) const COPILOT_MCP_CONFIG_FILE: &str = "mcp-config.json";
+
+/// The server names in one copilot MCP config file (`{"mcpServers": {"<name>": …}}`). A missing
+/// file is no servers; a file that EXISTS and cannot be read, is not JSON, or whose `mcpServers`
+/// is not an object is an `Err` — the launch is refused rather than run with servers the pin
+/// could not name (fail closed, like the rest of this module).
+fn copilot_mcp_server_names(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(Vec::new());
+    };
+    let doc: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not valid JSON ({e}); {REFUSAL_TAIL}", path.display()))?;
+    if !doc.is_object() {
+        // Fail closed on a document this cannot read as a config at all: `.get("mcpServers")` on
+        // a JSON array answers `None`, which would read as "no servers configured".
+        return Err(format!(
+            "{} is not a JSON object, so the MCP servers it configures cannot be named; \
+             {REFUSAL_TAIL}",
+            path.display()
+        ));
+    }
+    match doc.get("mcpServers") {
+        None => Ok(Vec::new()),
+        Some(Value::Object(map)) => Ok(map.keys().cloned().collect()),
+        Some(_) => Err(format!(
+            "{} has an `mcpServers` that is not an object; {REFUSAL_TAIL}",
+            path.display()
+        )),
+    }
+}
+
+/// The server names in a codex `config.toml` (`[mcp_servers.<name>]`). A missing file is no
+/// servers; an unreadable or unparseable file, or a name codex's own `-c` override cannot address
+/// (anything but `[A-Za-z0-9_-]+`), is an `Err`.
+fn codex_mcp_server_names(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(Vec::new());
+    };
+    let doc: toml::Value = text
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML ({e}); {REFUSAL_TAIL}", path.display()))?;
+    let names = match doc.get("mcp_servers") {
+        None => Vec::new(),
+        Some(toml::Value::Table(table)) => table.keys().cloned().collect(),
+        Some(_) => {
+            return Err(format!(
+                "{} has an `mcp_servers` that is not a table; {REFUSAL_TAIL}",
+                path.display()
+            ))
+        }
+    };
+    for name in &names {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "{} names the MCP server `{name}`, which codex's own `-c \
+                 mcp_servers.<name>.enabled=false` override cannot address (a quoted key replaces \
+                 the table and codex then fails to load its config), so the engine cannot pin it \
+                 off; {REFUSAL_TAIL} — rename or remove that server",
+                path.display()
+            ));
+        }
+    }
+    Ok(names)
+}
+
+/// The tail every pin refusal carries: what the engine was doing and why it stopped.
+const REFUSAL_TAIL: &str = "governed workers load no MCP server the engine did not hand them \
+    (core#657/#660), and this launch cannot be pinned to none — refusing it rather than running \
+    a worker with an ungoverned tool channel";
+
+/// A file's text, or `None` when it does not exist. Any other read error is an `Err` (a config
+/// the pin cannot READ is not a config the pin can be sure is empty).
+fn read_optional(path: &std::path::Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "{} could not be read ({e}); {REFUSAL_TAIL}",
+            path.display()
+        )),
+    }
+}
+
 /// The claude flags a template may not state: the engine owns which MCP servers a worker loads.
 /// A template `--mcp-config` would be loaded even under `--strict-mcp-config`, so it is refused,
 /// like `--setting-sources` (see `execute_wrapped::inject_isolation_flags`).
@@ -425,6 +585,134 @@ mod tests {
         assert_eq!(top["read"], "ask");
         assert_eq!(top["x_y"], "deny", "a deny of its own is kept");
         assert_eq!(doc["agent"]["build"]["permission"]["edit"], "ask");
+    }
+
+    /// core#660 items 1 and 2. A copilot seat's launch disables copilot's BUILT-IN
+    /// `github-mcp-server` (a GitHub write path the remote-write fence never sees) and every
+    /// server its config sources name — the seat's own `mcp-config.json` and the workspace's
+    /// `.mcp.json` / `.github/mcp.json`. A codex seat's launch disables every server in its seat
+    /// home's `config.toml`, in the ONE spelling that works (measured on codex-cli 0.154.0:
+    /// `-c mcp_servers={}` leaves the ambient server `enabled`; the per-server form reads
+    /// `disabled`). claude and pi get nothing here — claude's pin is its own flag, pi has no MCP.
+    #[test]
+    fn a_copilot_or_codex_seat_launch_pins_every_ambient_mcp_server_off() {
+        let base = std::env::temp_dir().join(format!("wicked-660-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seat = base.join("copilot");
+        let ws = base.join("wt");
+        std::fs::create_dir_all(seat.join("x")).unwrap();
+        std::fs::create_dir_all(ws.join(".github")).unwrap();
+        std::fs::write(
+            seat.join(COPILOT_MCP_CONFIG_FILE),
+            r#"{"mcpServers":{"user-one":{"command":"/bin/echo"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(".mcp.json"),
+            r#"{"mcpServers":{"ws-one":{"command":"/bin/echo"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(".github").join("mcp.json"),
+            r#"{"mcpServers":{"gh-one":{"command":"/bin/echo"}}}"#,
+        )
+        .unwrap();
+        let flags =
+            seat_mcp_pin_flags(SeatCli::Copilot, Some(&seat), Some(&ws)).expect("copilot pins");
+        assert_eq!(flags[0], COPILOT_DISABLE_BUILTIN_MCPS, "{flags:?}");
+        for name in ["user-one", "ws-one", "gh-one"] {
+            let ix = flags
+                .iter()
+                .position(|f| f == name)
+                .unwrap_or_else(|| panic!("{name} is disabled: {flags:?}"));
+            assert_eq!(flags[ix - 1], "--disable-mcp-server", "{flags:?}");
+        }
+        // A seat with no config file at all still disables the built-in server.
+        let empty = base.join("copilot-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            seat_mcp_pin_flags(SeatCli::Copilot, Some(&empty), Some(&empty)).unwrap(),
+            vec![COPILOT_DISABLE_BUILTIN_MCPS.to_string()]
+        );
+
+        let codex = base.join("codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            codex.join("config.toml"),
+            "model = \"x\"\n\n[mcp_servers.probe]\ncommand = \"/bin/echo\"\nargs = [\"hi\"]\n\n[mcp_servers.other-1]\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let flags =
+            seat_mcp_pin_flags(SeatCli::Codex, Some(&codex), Some(&ws)).expect("codex pins");
+        for name in ["probe", "other-1"] {
+            assert!(
+                flags
+                    .windows(2)
+                    .any(|w| w[0] == "-c" && w[1] == format!("mcp_servers.{name}.enabled=false")),
+                "{name}: {flags:?}"
+            );
+        }
+        // A codex home with no config, and the seats with nothing to pin.
+        let bare = base.join("codex-bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(seat_mcp_pin_flags(SeatCli::Codex, Some(&bare), None)
+            .unwrap()
+            .is_empty());
+        for cli in [
+            SeatCli::Claude,
+            SeatCli::Pi,
+            SeatCli::Opencode,
+            SeatCli::Other,
+        ] {
+            assert!(
+                seat_mcp_pin_flags(cli, Some(&seat), Some(&ws))
+                    .unwrap()
+                    .is_empty(),
+                "{cli:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Fail closed: a config the pin cannot READ, cannot PARSE, or names a server codex's own
+    /// `-c` override cannot address refuses the launch. A worker that loads an MCP server the
+    /// engine did not hand it is the thing core#657/#660 close; an unreadable file is not a
+    /// reason to run one.
+    #[test]
+    fn a_config_the_mcp_pin_cannot_read_or_address_refuses_the_launch() {
+        let base = std::env::temp_dir().join(format!("wicked-660-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seat = base.join("copilot");
+        std::fs::create_dir_all(&seat).unwrap();
+        for bad in ["not json", "[]", r#"{"mcpServers":[]}"#] {
+            std::fs::write(seat.join(COPILOT_MCP_CONFIG_FILE), bad).unwrap();
+            let err = seat_mcp_pin_flags(SeatCli::Copilot, Some(&seat), None).expect_err(bad);
+            assert!(err.contains(COPILOT_MCP_CONFIG_FILE), "{bad}: {err}");
+            assert!(err.contains("refusing it"), "{bad}: {err}");
+        }
+        // A config that is a DIRECTORY is a read error, not "no servers".
+        let dir_seat = base.join("copilot-dir");
+        std::fs::create_dir_all(dir_seat.join(COPILOT_MCP_CONFIG_FILE)).unwrap();
+        assert!(seat_mcp_pin_flags(SeatCli::Copilot, Some(&dir_seat), None).is_err());
+
+        let codex = base.join("codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("config.toml"), "this is not = = toml").unwrap();
+        let err = seat_mcp_pin_flags(SeatCli::Codex, Some(&codex), None).expect_err("bad toml");
+        assert!(err.contains("not valid TOML"), "{err}");
+        // A name the `-c` override cannot address: the quoted-key form replaces the table instead
+        // of merging into it, and codex then fails to load its own config.
+        std::fs::write(
+            codex.join("config.toml"),
+            "[mcp_servers.\"weird name\"]\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let err = seat_mcp_pin_flags(SeatCli::Codex, Some(&codex), None).expect_err("weird name");
+        assert!(
+            err.contains("weird name") && err.contains("cannot address"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Fail closed: a document the deny cannot be composed into refuses the launch.

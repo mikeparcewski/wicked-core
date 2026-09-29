@@ -63,6 +63,10 @@ serde_json = "1"
 # final, feature-complete release of the crate (marked deprecated upstream, no maintained
 # successor with the same API); pinned here as the widely used reference implementation.
 serde_yaml = "0.9"
+# A codex seat's own `config.toml`, read at spawn so every MCP server it names can be pinned OFF
+# (`mcp_isolation::seat_mcp_pin_flags`, core#660). Same version the council's `clis.toml` reader
+# uses, so cargo unifies one compilation.
+toml = "0.8"
 sha2 = "0.10"
 # Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): a direct SQLite handle to the wicked-bus event log
 # (a SEPARATE db from the estate store) so core can emit/poll `wicked.*` events the JS bus reads.

@@ -1577,11 +1577,32 @@ impl WrappedCliStepRunner {
                     ..
                 })
             );
+        // (core#503) A read-only unit on a seat whose lever is its OWN sandbox: the lever holds
+        // the tree, and it also denies every write and all network, so the repository's own test,
+        // build and audit commands CANNOT run in this phase. The observed damage is not the
+        // denial — it is the worker reporting the checks it could not run as FAILING checks
+        // ("derived 7 / submitted 7 / failed 5", "Verdict: CONDITIONAL" on a correct tree), so
+        // the prompt says what cannot run and where the checks' exit codes actually are.
+        let sandbox_cannot_run_checks = !is_claude
+            && write_posture == crate::write_posture::WritePosture::ReadOnly
+            && matches!(
+                no_code_posture(&binary, resolve_seat_posture(&cli_key)),
+                Ok(NoCodePosture {
+                    lever: ReadOnlyLever::CodexSandbox,
+                    ..
+                })
+            );
         let task = if guard_only {
             format!(
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
                 read_only_instruction(input.unit.notes_root.as_deref())
+            )
+        } else if sandbox_cannot_run_checks {
+            format!(
+                "{}\n\n{}",
+                unit_prompt(input, form, handed),
+                sandboxed_checks_instruction(input.unit.notes_root.as_deref())
             )
         } else if !is_claude
             && write_posture == crate::write_posture::WritePosture::DeliverableRoots
@@ -1711,6 +1732,30 @@ impl WrappedCliStepRunner {
             let flags = delivery.argv_flags();
             if !flags.is_empty() {
                 apply_seat_posture(&mut argv, &flags);
+            }
+            // core#660: the seat's own MCP off-switches, so nothing ambient loads on the carriers
+            // claude's `--strict-mcp-config` does not cover — copilot's `--disable-builtin-mcps`
+            // (its built-in `github-mcp-server` is a GitHub write path the remote-write fence
+            // never sees) plus `--disable-mcp-server <name>` per configured server, and codex's
+            // `-c mcp_servers.<name>.enabled=false` per server in its seat home. A config the pin
+            // cannot read or cannot address REFUSES the launch (fail closed, like the skills
+            // composition): a governed worker never gets an ungoverned tool channel because a
+            // file was unreadable.
+            match crate::mcp_isolation::seat_mcp_pin_flags(
+                wicked_apps_core::spawn::SeatCli::from_binary(&binary),
+                seat_config.root(),
+                Some(&input.workdir.clone().unwrap_or_else(|| sandbox_for(input))),
+            ) {
+                Ok(pins) if !pins.is_empty() => {
+                    eprintln!(
+                        "wicked-core: unit {} on '{cli_key}' launches with the seat's MCP pin \
+                         {pins:?} (core#660)",
+                        input.unit.ord
+                    );
+                    apply_seat_posture(&mut argv, &pins);
+                }
+                Ok(_) => {}
+                Err(why) => return posture_refusal(input, &why),
             }
             if let (Some(s), true) = (handed, delivery.delivers_skills()) {
                 s.report(&format!(
@@ -3272,6 +3317,29 @@ pub(crate) fn notes_root_sentence(notes_root: &str) -> String {
         "If you must write notes, write them ONLY under {notes_root} (outside the worktree; the \
          guard ignores that directory)."
     )
+}
+
+/// (core#503) The instruction a READ-ONLY unit carries on a seat whose read-only lever is the
+/// seat's OWN sandbox — codex's `--sandbox read-only`, which denies every filesystem write and
+/// all network, not only writes to the tree. The repository's own runners need both: vitest
+/// bundles its config into a temp file beside it, cargo takes `target/debug/.cargo-build-lock`,
+/// `npm audit` resolves the registry. So the checks the evaluator's standing instruction asks for
+/// cannot run here, and the engine's own deterministic floor is what ran them.
+///
+/// This is a DISCLOSURE, not a fix for core#503: the lever still cannot both deny the tree and
+/// admit a check's scratch (codex's `workspace-write` admits the WORKSPACE, which is the tree
+/// under review, and the wrapped carrier has no per-call judge to hold it). What it prevents is
+/// the damage the issue measured — a worker reporting checks it could not run as FAILING checks
+/// and settling on a "CONDITIONAL" verdict for a tree the floor had passed.
+pub(crate) fn sandboxed_checks_instruction(notes_root: Option<&str>) -> String {
+    let mut out = String::from(
+        "READ-ONLY PHASE, SANDBOXED: this phase declares executes_code: false, so your seat runs          in its own read-only sandbox — EVERY filesystem write is denied (including the temp file          a test runner writes beside its config and cargo's build lock) and so is the network.          The repository's own test, build and audit commands therefore CANNOT RUN in this phase.          Do NOT report a check you could not run as a failing check, and do not let it decide          your verdict: the engine's own deterministic floor runs the repository's checks on this          tree and its exit codes are on the run record — cite those. If a check is the only way          to settle a question, say so in your output and name the command you would run. Do not          edit, write, create, delete, move or format any file in the worktree, and do not commit.",
+    );
+    if let Some(root) = notes_root {
+        out.push(' ');
+        out.push_str(&notes_root_sentence(root));
+    }
+    out
 }
 
 /// (F-4R2-004) The instruction a DELIVERABLE-ROOTS creator carries on a non-claude seat — a bound
@@ -7056,6 +7124,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// END-TO-END through `run_unit` (core#660): a copilot unit's argv carries copilot's own MCP
+    /// off-switches — `--disable-builtin-mcps` (its built-in `github-mcp-server` is enabled by
+    /// default and is a GitHub write path the remote-write fence never sees) and
+    /// `--disable-mcp-server <name>` for the server its seat home configures. The fixture is an
+    /// executable named `copilot` because recognition reads the resolved binary, never the key.
+    #[cfg(unix)]
+    #[test]
+    fn a_copilot_units_argv_pins_its_ambient_mcp_servers_off_660() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let home = std::env::temp_dir().join(format!(
+            "wicked-660-copilot-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        // The seat's ENGINE-MINTED configuration home, with one MCP server configured in it (the
+        // shape an operator's `copilot mcp add` in that home leaves, and the shape the hatch
+        // inherits from the operator's own `~/.copilot`).
+        let worker_home = home.join("worker");
+        let seat_root = worker_home.join("copilot");
+        std::fs::create_dir_all(&seat_root).unwrap();
+        std::fs::write(
+            seat_root.join(crate::mcp_isolation::COPILOT_MCP_CONFIG_FILE),
+            r#"{"mcpServers":{"user-one":{"command":"/bin/echo"}}}"#,
+        )
+        .unwrap();
+        let _worker = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A workspace config too: copilot reads `.mcp.json` from the directory it works in.
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers":{"ws-one":{"command":"/bin/echo"}}}"#,
+        )
+        .unwrap();
+        let copilot = fake_cli(&dir, "copilot");
+
+        let mut u = WorkUnit::pending("s:build", "s", 4, "do the work");
+        u.assigned_cli = Some("copilot".to_string());
+        u.assigned_invocation = Some(format!("{copilot} -p {{PROMPT}}"));
+        let input = StepInput {
+            run_id: "run-660-copilot".to_string(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(
+            out.output.contains("--disable-builtin-mcps"),
+            "copilot's built-in github MCP server must be disabled; got: {}",
+            out.output
+        );
+        for name in ["user-one", "ws-one"] {
+            assert!(
+                out.output.contains(&format!("--disable-mcp-server {name}")),
+                "the configured server `{name}` must be disabled; got: {}",
+                out.output
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// END-TO-END through `run_unit`: a unit whose phase declared `executes_code: false` on a
     /// binary whose stem is `codex` — the argv must carry `--sandbox read-only` and NOT the
     /// workspace-write posture the code phases get. The fixture is an executable named `codex`
@@ -7107,6 +7250,14 @@ mod tests {
         assert!(
             !out.output.contains("workspace-write") && !out.output.contains("dangerously-bypass"),
             "no write-capable sandbox may survive on a no-code phase; got: {}",
+            out.output
+        );
+        // core#503: the prompt says the repository's own checks cannot run under that sandbox,
+        // so the worker does not report them as FAILING checks.
+        assert!(
+            out.output.contains("CANNOT RUN in this phase")
+                && out.output.contains("deterministic floor"),
+            "the sandbox limit must ride the prompt; got: {}",
             out.output
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -8218,6 +8369,25 @@ mod tests {
             "a workdir that is not there degrades to the plain prompt — it never fails the unit"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#503: the sandboxed-checks instruction says what cannot run, where the checks' exit
+    /// codes are, and that a check it could not run must not decide the verdict — and it still
+    /// carries the notes root when the unit has one.
+    #[test]
+    fn the_sandboxed_checks_instruction_names_the_limit_the_floor_and_the_notes_root() {
+        let bare = sandboxed_checks_instruction(None);
+        for must in [
+            "CANNOT RUN in this phase",
+            "Do NOT report a check you could not run as a failing check",
+            "deterministic floor",
+            "do not commit",
+        ] {
+            assert!(bare.contains(must), "{must}: {bare}");
+        }
+        assert!(!bare.contains("write them ONLY under"), "{bare}");
+        let with_notes = sandboxed_checks_instruction(Some("/notes/u4"));
+        assert!(with_notes.contains("/notes/u4"), "{with_notes}");
     }
 
     /// core#464: the guard-only seat's read-only instruction names the unit's notes root when it
