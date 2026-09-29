@@ -3097,19 +3097,33 @@ const OUTPUT_GATE_TOOL: &str = "(output)";
 const DESCRIBED_TOOL_PREFIX: &str = "(described) ";
 
 /// Is `name` shaped like a canonical tool name — `Bash`, `NotebookEdit`, `mcp__estate__recall`,
-/// `str_replace_based_edit_tool`? An identifier-ish token: no whitespace, no path separator, and
-/// only the punctuation real tool names use.
+/// `str_replace_based_edit_tool`, or the broker's qualified `mcp:<server>/<tool>`? An
+/// identifier-ish token: no whitespace, and only the punctuation real tool names use.
 ///
-/// A parenthesised word (`(unnamed)`, `(output)`, `(tool-call)`) is a SENTINEL this codebase
-/// writes on purpose and passes through unchanged; nothing else with a `(` can reach here, because
-/// a carrier-supplied name is checked against this predicate first.
+/// A parenthesised word (`(unnamed)`, `(output)`) is a SENTINEL this codebase writes on purpose
+/// and passes through unchanged; nothing else with a `(` can reach here, because a
+/// carrier-supplied name is checked against this predicate first.
 fn is_tool_shaped(name: &str) -> bool {
     if name.starts_with('(') && name.ends_with(')') && name.len() > 2 {
         return true; // one of our own sentinels
     }
-    !name.is_empty()
-        && name.len() <= 96
-        && name
+    if name.is_empty() || name.len() > 96 {
+        return false;
+    }
+    // The broker's own subject spelling ([`crate::mcp_gate::subject_of`]) is the ONE canonical
+    // name that carries a `/`, and it carries exactly one, between two plain tokens. Admitting it
+    // by that shape keeps the general rule below free of path separators — which is the whole
+    // point: `/tmp` must not read as a tool name.
+    if let Some((server, tool)) = name.strip_prefix("mcp:").and_then(|r| r.split_once('/')) {
+        return is_plain_tool_token(server) && is_plain_tool_token(tool);
+    }
+    is_plain_tool_token(name)
+}
+
+/// One unqualified tool-name token: alphanumerics plus the punctuation tool names actually use.
+fn is_plain_tool_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
 }
@@ -8147,6 +8161,7 @@ mod boundary_tests {
             "Edit",
             "NotebookEdit",
             "mcp__estate__knowledge.recall",
+            "mcp:jira/create_issue",
             "str_replace_based_edit_tool",
             "tool-call",
         ] {
@@ -8167,6 +8182,14 @@ mod boundary_tests {
             "(described) C:\\Users\\x\\notes.md"
         );
         assert_eq!(audit_tool_name("   "), "tool-call", "empty ⇒ the sentinel");
+        // The qualified MCP subject is admitted by SHAPE, not by its `mcp:` prefix alone: a
+        // second slash, or a path masquerading behind the prefix, is still a description.
+        assert_eq!(
+            audit_tool_name("mcp:jira/a/b"),
+            "(described) mcp:jira/a/b",
+            "`mcp:<server>/<tool>` carries exactly one slash"
+        );
+        assert_eq!(audit_tool_name("mcp:/tmp/x"), "(described) mcp:/tmp/x");
 
         // End to end: a claim recorded for a title-only call, replayed off the log.
         let run_id = format!("tool-name-{}", std::process::id());
