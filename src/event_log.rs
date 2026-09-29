@@ -455,31 +455,66 @@ pub fn read_run(root: &Path, run_id: &str) -> Vec<serde_json::Value> {
     parse_log(&raw)
 }
 
-/// When a run LAUNCHED, in epoch millis: the `ts` of the first record in its own log.
+/// The `type` of the one event the engine emits per LAUNCH — `pipeline::plan_and_distribute` and
+/// the actor's launch handler each emit exactly one, and a resume, a redrive or a re-plan emits
+/// none. `the_launch_marker_matches_the_emitted_event_type` pins the spelling against the event's
+/// own JSON so this cannot drift into a silent no-match.
+const LAUNCH_TYPE: &str = "sessionStarted";
+
+/// When a run's CURRENT life LAUNCHED, in epoch millis: the `ts` of its last `sessionStarted`
+/// record, else of its first record.
 ///
 /// The run's launch clock, for the callers that need to date a run against the filesystem — the
 /// deliverable floor's freshness half (`path_policy::missing_deliverables`, core#640), which has to
 /// tell this run's output from a prior run's leftover in a write root both runs were handed.
 ///
-/// It reads the FIRST record, not the last, and only that one: the log is append-only in emission
-/// order (see [`read_run`]), so line 1 is the earliest event the run ever produced — the plan or
-/// launch event, before any unit could write anything. A resume or a redrive continues the same
-/// run's log, so the launch stamp of a resumed run stays its ORIGINAL launch, which is what a
-/// freshness floor wants: never newer than the run's own earlier output.
+/// **The LAST launch marker, not the first record** (review of PR #674, HIGH). A run id may be
+/// re-launched once its prior life is terminal — `LaunchRun` allows it and deliberately clears that
+/// life's governance dir so a stale Deny cannot fail the new run. This log is NOT cleared with it
+/// (an audit trail has to outlive the run — see the module docs), so the first record belongs to
+/// the FIRST life, and dating a relaunch against it would admit the previous life's leftovers: the
+/// core#640 defect, surviving on exactly the path the engine invites. Every launch appends its own
+/// marker, so the last one is the current life's start.
 ///
-/// `None` when the run has no log yet, the file cannot be read, or its first line carries no
-/// numeric `ts` (a hand-truncated log). Callers decide what an undatable run means; this function
-/// never guesses a stamp.
+/// Within one life it is still the earliest thing that life emitted, before any unit could write
+/// anything, and a resume or a redrive appends no marker — so a resumed run keeps its ORIGINAL
+/// launch stamp, which is what a freshness floor wants: never newer than the run's own earlier
+/// output.
+///
+/// The first-record fallback covers a log with no marker at all (a pre-#674 log, a hand-truncated
+/// one): same value this function used to return.
+///
+/// `None` when the run has no log yet, the file cannot be read, or nothing in it carries a numeric
+/// `ts`. Callers decide what an undatable run means; this function never guesses a stamp.
 pub(crate) fn run_started_ms(root: &Path, run_id: &str) -> Option<i64> {
     // Same reason [`read_run`] drains first: a caller must not read a log that is missing records
     // already handed to the writer.
     flush();
     let raw = read_log(&run_log_path(root, run_id))?;
-    let first = raw.lines().find(|l| !l.trim().is_empty())?;
-    serde_json::from_str::<serde_json::Value>(first)
-        .ok()?
-        .get("ts")?
-        .as_i64()
+    let ts_of = |line: &str| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("ts")?.as_i64())
+    };
+    let mut first = None;
+    let mut launched = None;
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        if first.is_none() {
+            first = ts_of(line);
+        }
+        // Substring pre-filter, then the real field check: JSON-parsing every line of a multi-MB
+        // log per floor evaluation is work on the actor thread, and keying on the serialized field
+        // ORDER instead would be a textual assumption one `json!` edit could break.
+        if line.contains(LAUNCH_TYPE) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) == Some(LAUNCH_TYPE) {
+                launched = v.get("ts").and_then(|t| t.as_i64()).or(launched);
+            }
+        }
+    }
+    launched.or(first)
 }
 
 /// The live subscriber list PLUS the durable log, bundled so the actor's single emit point reaches
@@ -544,9 +579,10 @@ mod tests {
         d
     }
 
-    /// (core#640) The run's launch clock, for the deliverable floor's freshness half: the `ts` of
-    /// the FIRST record, so a resumed run keeps its ORIGINAL launch and its own earlier output
-    /// never reads as a prior run's leftover. A run with no log has no clock — never a guess.
+    /// (core#640) The run's launch clock, for the deliverable floor's freshness half: within one
+    /// life it is the `ts` of the earliest record, so a resumed run keeps its ORIGINAL launch and
+    /// its own earlier output never reads as a prior run's leftover. A run with no log has no
+    /// clock — never a guess.
     #[test]
     fn a_runs_launch_clock_is_its_first_records_stamp() {
         let root = tmp("launch-clock");
@@ -581,6 +617,71 @@ mod tests {
             "the clock IS the first record's own stamp, not a re-read of `now`"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review of PR #674, HIGH. A run id may be RE-LAUNCHED once its prior life is terminal, and
+    /// this log is deliberately not cleared with that life's governance dir — an audit trail
+    /// outlives the run. So the first record belongs to the FIRST life, and a deliverable floor
+    /// dating a relaunch against it would admit the previous life's leftovers: the core#640 defect
+    /// surviving on exactly the path the engine invites. Every launch appends its own marker, so
+    /// the clock is the LAST one.
+    #[test]
+    fn a_relaunched_run_id_is_dated_from_its_latest_launch_not_its_first() {
+        let root = tmp("relaunch-clock");
+        let run = "run-relaunched";
+        let launch = |ts: i64| {
+            format!("{{\"type\":\"{LAUNCH_TYPE}\",\"session\":\"{run}\",\"problem\":\"p\",\"ts\":{ts},\"seq\":0}}\n")
+        };
+        let unit = |ts: i64| {
+            format!(
+                "{{\"type\":\"unitDone\",\"session\":\"{run}\",\"ord\":0,\"ts\":{ts},\"seq\":1}}\n"
+            )
+        };
+        // Life one launched at 1000 and produced something at 2000; life two launched at 9000.
+        std::fs::write(
+            run_log_path(&root, run),
+            format!("{}{}{}", launch(1_000), unit(2_000), launch(9_000)),
+        )
+        .unwrap();
+        assert_eq!(
+            run_started_ms(&root, run),
+            Some(9_000),
+            "the current life's launch, so life one's 2000-stamped output reads as stale"
+        );
+
+        // No marker at all (a pre-#674 log, or a hand-truncated one): the first record, exactly
+        // what this function used to return.
+        let legacy = "run-legacy";
+        std::fs::write(
+            run_log_path(&root, legacy),
+            format!(
+                "{{\"type\":\"unitDone\",\"session\":\"{legacy}\",\"ord\":0,\"ts\":4242,\"seq\":0}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(run_started_ms(&root, legacy), Some(4_242));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The marker is matched on the event's own wire `type`, so the spelling cannot drift into a
+    /// silent no-match — which would put the clock back on the first record and quietly restore
+    /// the relaunch hole above.
+    #[test]
+    fn the_launch_marker_matches_the_emitted_event_type() {
+        let emitted = CoreEvent::SessionStarted {
+            session: "run-x".to_string(),
+            problem: "p".to_string(),
+            workflow_id: None,
+            cli_count: 1,
+            governed: false,
+            entity_mode: "shared".to_string(),
+        }
+        .to_json();
+        assert_eq!(
+            emitted.get("type").and_then(|t| t.as_str()),
+            Some(LAUNCH_TYPE),
+            "the one event the engine emits per launch is what the clock keys on"
+        );
     }
 
     /// The whole point of the finding: a run with NO live subscriber must still leave a complete,
