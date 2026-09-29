@@ -963,7 +963,10 @@ mod tests {
             // Privilege escalation and remote-write Bash verbs — static, never HOME-dependent.
             "Bash(sudo:*)".to_string(),
             "Bash(git push:*)".to_string(),
-            "Bash(gh pr create:*)".to_string(),
+            // wicked-crew#663: the provider CLIs are denied by PROGRAM, not by verb.
+            "Bash(gh:*)".to_string(),
+            "Bash(glab:*)".to_string(),
+            "Bash(az:*)".to_string(),
         ] {
             assert!(
                 deny.contains(&must_contain),

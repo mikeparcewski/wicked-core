@@ -460,7 +460,7 @@ fn secret_read_block_dirs() -> Vec<std::path::PathBuf> {
 
 /// [`secret_read_block_dirs`] for an explicit home — the seam the Linux regression test uses so it
 /// never mutates the process-global `HOME` (tests elsewhere read it without a lock).
-fn secret_read_block_dirs_under(home: Option<&Path>) -> Vec<std::path::PathBuf> {
+pub(crate) fn secret_read_block_dirs_under(home: Option<&Path>) -> Vec<std::path::PathBuf> {
     // Relative-to-HOME components (nested paths handled per component join). Kept as forward-slash
     // segments and joined so the platform separator is applied correctly on each OS.
     const REL: &[&[&str]] = &[
@@ -469,7 +469,17 @@ fn secret_read_block_dirs_under(home: Option<&Path>) -> Vec<std::path::PathBuf> 
         &[".gnupg"],
         &[".config", "wicked-council"],
         &[".claude"],
+        &[".config", "claude"],
         &[".config", "gh"],
+        &[".config", "git"],
+        // (wicked-crew#663) The other forge logins the remote-write fence now names
+        // (`remote_write_fence::FENCED_PROVIDER_CLIS`), kept in step with the worker fence's own
+        // list (`execute_wrapped::DENIED_HOME_SUBDIRS`): a credential store one layer masks and
+        // the other leaves readable is the seam that issue is about.
+        &[".azure"],
+        &[".config", "glab-cli"],
+        &[".config", "tea"],
+        &[".subversion"],
     ];
     let Some(home) = home else {
         return Vec::new();
@@ -3124,6 +3134,15 @@ mod tests {
 
     #[test]
     fn run_validator_reports_level_and_jails_when_a_real_sandbox_is_present() {
+        // The write probe below resolves `$HOME` and so does the profile this asserts on, and
+        // tests elsewhere PIN `HOME` at a temp dir for the length of their own body
+        // (`execute_wrapped`'s `HomeGuard`, which takes this lock for writing). Without the read
+        // side of that lock the probe could resolve a pinned home under the system temp dir —
+        // which the validator profile deliberately admits for writes — and read as "the sandbox
+        // did not block the write". Observed while running this module beside `execute_wrapped`.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         // A read-only check must still PASS under the hardening (whatever the platform), and the reported
         // level must agree with the platform's sandbox availability.
         let dir = std::env::temp_dir().join(format!("wicked-val-sbx-{}", std::process::id()));
@@ -3576,7 +3595,7 @@ mod tests {
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::create_dir_all(&wt).unwrap();
         let secrets = secret_read_block_dirs_under(Some(&home));
-        assert_eq!(secrets.len(), 6, "{secrets:?}");
+        assert_eq!(secrets.len(), 12, "{secrets:?}");
         let sandbox = launcher_for_roots_masking(&[wt.as_path()], NetworkPolicy::Allow, secrets);
         assert_eq!(sandbox.level, SandboxLevel::Sandboxed, "{sandbox:?}");
         let masked = |rel: &str| {

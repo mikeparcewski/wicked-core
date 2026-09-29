@@ -496,13 +496,29 @@ pub const REMOTE_CREDENTIAL_ENV: &[&str] = &[
     // entry: an inherited allow-list must not undo the ssh/git/ext refusal below.
     "GIT_ALLOW_PROTOCOL",
     "GIT_PROTOCOL_FROM_USER",
+    // (wicked-crew#663) The Azure DevOps pipeline token, which is not prefixed like the rest.
+    "SYSTEM_ACCESSTOKEN",
 ];
 
 /// Name PREFIXES of remote-write credential variables stripped by enumeration (their suffix is
-/// a counter): `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git's environment-injected config —
-/// the `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p …` bypass) and any `GIT_CREDENTIAL*`.
-pub const REMOTE_CREDENTIAL_ENV_PREFIXES: &[&str] =
-    &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_CREDENTIAL"];
+/// a counter, a provider noun or a family): `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` (git's
+/// environment-injected config — the `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p …` bypass),
+/// any `GIT_CREDENTIAL*`, and (wicked-crew#663) every OTHER forge's tokens and config homes:
+/// `AZURE_DEVOPS_EXT_PAT` / `AZURE_CONFIG_DIR`, `GITLAB_TOKEN` / `GLAB_TOKEN` /
+/// `GLAB_CONFIG_DIR`, Gitea/Forgejo and Bitbucket. A worker seat never delivers, so it needs no
+/// provider credential at all — and the command fence refuses those CLIs whole, so a token left
+/// in the environment could only serve an escape the literal scan missed.
+pub const REMOTE_CREDENTIAL_ENV_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "GIT_CREDENTIAL",
+    "AZURE_",
+    "GITLAB_",
+    "GLAB_",
+    "GITEA_",
+    "FORGEJO_",
+    "BITBUCKET_",
+];
 
 /// The scheme every seat push is rewritten to — one git has no remote helper for, so the push
 /// fails before any transport is contacted ("unable to find remote helper for 'wicked-nopush'").
@@ -938,13 +954,23 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
     for key in REMOTE_CREDENTIAL_ENV {
         cmd.env_remove(key);
     }
-    for (name, _) in std::env::vars_os() {
-        let name = name.to_string_lossy();
+    // Both sources, because both can carry one: the DAEMON's own environment (which the child
+    // inherits unless removed) and any entry an earlier layer already set ON this command
+    // (wicked-crew#663 — a prefix strip that reads only `std::env` leaves a planted
+    // `AZURE_DEVOPS_EXT_PAT` on the spawn, and a fence with a source it does not look at is the
+    // shape of defect this closes).
+    let planted: Vec<std::ffi::OsString> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_some())
+        .map(|(k, _)| k.to_os_string())
+        .collect();
+    for name in std::env::vars_os().map(|(name, _)| name).chain(planted) {
+        let name = name.to_string_lossy().into_owned();
         if REMOTE_CREDENTIAL_ENV_PREFIXES
             .iter()
             .any(|p| name.starts_with(p))
         {
-            cmd.env_remove(name.as_ref());
+            cmd.env_remove(name.as_str());
         }
     }
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -2564,6 +2590,13 @@ mod tests {
             "GIT_ASKPASS",
             "GIT_CONFIG_PARAMETERS",
             "GIT_EXEC_PATH",
+            // wicked-crew#663: the other providers' tokens and config homes.
+            "AZURE_DEVOPS_EXT_PAT",
+            "AZURE_CONFIG_DIR",
+            "GITLAB_TOKEN",
+            "GLAB_TOKEN",
+            "GLAB_CONFIG_DIR",
+            "SYSTEM_ACCESSTOKEN",
         ] {
             cmd.env(var, "planted");
         }
@@ -2581,6 +2614,12 @@ mod tests {
             "GIT_EXEC_PATH",
             "GIT_CONFIG_KEY_97",
             "GIT_CONFIG_VALUE_97",
+            "AZURE_DEVOPS_EXT_PAT",
+            "AZURE_CONFIG_DIR",
+            "GITLAB_TOKEN",
+            "GLAB_TOKEN",
+            "GLAB_CONFIG_DIR",
+            "SYSTEM_ACCESSTOKEN",
         ] {
             assert_eq!(value(&cmd, var), Some(None), "{var} is REMOVED");
         }

@@ -305,12 +305,35 @@ const DENIED_HOME_SUBDIRS: &[&str] = &[
     // an escape the command filter misses.
     ".config/gh",
     ".config/git",
+    // (wicked-crew#663) The credential store of every OTHER provider the remote-write fence
+    // names (`remote_write_fence::FENCED_PROVIDER_CLIS`). The fence refuses the COMMANDS; these
+    // deny the file tools the same logins, so the two layers cover the same providers — a
+    // desktop logged into Azure DevOps or GitLab was fenced for neither.
+    ".azure", // az / Azure DevOps: azureProfile.json, accessTokens.json, the PAT cache
+    ".config/glab-cli", // glab: config.yml carries the GitLab token
+    ".config/tea", // tea (Gitea/Forgejo): config.yml carries the token
+    ".subversion", // svn: the auth/ credential cache
+    // (core#403) The OTHER well-known Claude config dir. `$CLAUDE_CONFIG_DIR` is honoured when
+    // the daemon has it, but a boundary that depends on the daemon's environment is not a
+    // boundary: a service-managed daemon with a minimal environment has neither, so both
+    // well-known homes are denied unconditionally, and a NON-default config dir is recorded in
+    // the file [`extra_denied_dirs`] reads.
+    ".config/claude",
 ];
 
 /// Credential FILES under `$HOME` a worker may not read or edit (review of #449, FN-5): git's
-/// plaintext credential store. Fenced as `Read(<file>)`/`Edit(<file>)` — the file form, since
-/// `<file>/**` would match nothing.
-const DENIED_HOME_FILES: &[&str] = &[".git-credentials"];
+/// plaintext credential store, the machine-wide `.netrc` every git/curl transport reads, and the
+/// single-file credential stores of the fenced providers (wicked-crew#663). Fenced as
+/// `Read(<file>)`/`Edit(<file>)` — the file form, since `<file>/**` would match nothing.
+const DENIED_HOME_FILES: &[&str] = &[
+    ".git-credentials",
+    ".netrc",
+    "_netrc", // the Windows spelling
+    ".hgrc",  // hg: [auth] passwords
+    ".p4tickets",
+    ".p4passwd",
+    ".config/hub", // hub's oauth token (a FILE, not a directory)
+];
 
 /// Bash verbs that leave the worktree by construction, so no path rule can catch them.
 ///
@@ -833,7 +856,7 @@ pub(crate) fn deny_rules(
     // The engine's OWN operational home (codex round 8) is fenced on every launch — the registry
     // when the handed snapshot derives it, the blanket otherwise.
     let state_home = skills_root.and_then(crate::state_home::of_snapshot);
-    let mut dirs = denied_dirs(operational_home);
+    let mut dirs = denied_dirs(operational_home)?;
     if let Some(sh) = &state_home {
         if !dirs.iter().any(|d| crate::state_home::same_dir(d, sh)) {
             dirs.push(sh.clone());
@@ -932,7 +955,7 @@ fn denied_home_file_rules() -> Result<Vec<String>, String> {
 pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<String>, String> {
     let candidates = state_home_candidates(operational_home);
     let mut rules: Vec<String> = Vec::new();
-    for dir in denied_dirs(operational_home) {
+    for dir in denied_dirs(operational_home)? {
         if candidates
             .iter()
             .any(|c| crate::state_home::same_dir(c, &dir))
@@ -1026,7 +1049,7 @@ pub(crate) fn ensure_secondary_instance_fence(seat_key: &str) -> anyhow::Result<
 /// the root sits in the read slot of a fully classified state home — its own, wherever that is.
 pub(crate) fn fence_check(root: &Path, operational_home: Option<&Path>) -> Result<(), String> {
     let state_home = crate::state_home::of_snapshot(root);
-    for dir in denied_dirs(operational_home) {
+    for dir in denied_dirs(operational_home)? {
         if state_home
             .as_deref()
             .is_some_and(|sh| crate::state_home::same_dir(&dir, sh))
@@ -1087,7 +1110,7 @@ fn state_home_candidates(operational_home: Option<&Path>) -> Vec<PathBuf> {
 /// home resolves (the Bash verb rules do not need one). The handed snapshot's DERIVED state home
 /// is added by [`deny_rules`] when it is not among these (v3.4 §2: no variable states a state
 /// home; the snapshot path is the one input).
-fn denied_dirs(operational_home: Option<&Path>) -> Vec<PathBuf> {
+fn denied_dirs(operational_home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
@@ -1098,21 +1121,106 @@ fn denied_dirs(operational_home: Option<&Path>) -> Vec<PathBuf> {
              from workers (the Bash verb rules still apply)"
         );
     }
+    let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    denied_dirs_from(
+        home.as_deref(),
+        claude_config_dir.as_deref(),
+        operational_home,
+    )
+}
+
+/// The pure half of [`denied_dirs`] (core#403): the same list for an EXPLICIT home, Claude config
+/// dir and operational home, so the fence can be judged with the daemon's environment EMPTY —
+/// `claude_config_dir: None` is that daemon, and the list must still fence both well-known Claude
+/// homes and every directory the operator recorded ([`extra_denied_dirs`]).
+fn denied_dirs_from(
+    home: Option<&Path>,
+    claude_config_dir: Option<&Path>,
+    operational_home: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
     let mut unique: Vec<PathBuf> = Vec::new();
-    for dir in std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
+    for dir in claude_config_dir
+        .map(Path::to_path_buf)
         .into_iter()
         .chain(operational_home.map(Path::to_path_buf))
         .chain(
             home.iter()
                 .flat_map(|h| DENIED_HOME_SUBDIRS.iter().map(|d| h.join(d))),
         )
+        .chain(extra_denied_dirs(home)?)
     {
         if !unique.iter().any(|u| crate::state_home::same_dir(u, &dir)) {
             unique.push(dir);
         }
     }
-    unique
+    Ok(unique)
+}
+
+/// The path of the file an operator records extra denied directories in, relative to the home
+/// directory (core#403).
+const EXTRA_DENIED_DIRS_FILE: [&str; 3] = [".config", "wicked-core", "worker-denied-dirs"];
+
+/// (core#403) The directories the OPERATOR recorded as fenced, read from
+/// `~/.config/wicked-core/worker-denied-dirs` — one path per line, `#` comments and blank lines
+/// ignored, a leading `~/` resolved against the home directory.
+///
+/// The defect this closes: the fence for the operator's own Claude config dir was derived from
+/// the DAEMON's `CLAUDE_CONFIG_DIR`. A daemon started by a service manager or an `env -i` rig has
+/// no such variable, so the `Read`/`Edit` rules over a NON-default config dir — the seed source
+/// for the skills baseline, and the operator's own hooks, plugins and transcripts — were simply
+/// dropped, silently, for that daemon's workers. A boundary that depends on the daemon's
+/// environment is not a boundary. This file is the environment-independent source: it sits under
+/// `~/.config/wicked-core`, which is itself a fenced directory, and it is read on every launch
+/// whatever the daemon inherited.
+///
+/// FAILS CLOSED, like every other rule in this module: an unreadable file or a line that is
+/// neither absolute nor `~/`-rooted REFUSES the launch, naming the file, the line number and the
+/// entry. A fence the operator asked for and did not get is the failure to prevent — half a
+/// fence that reads like a whole one is how core#403 happened. A missing file is not an error
+/// (the default homes are fenced by [`DENIED_HOME_SUBDIRS`]).
+fn extra_denied_dirs(home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+    let Some(home) = home else {
+        return Ok(Vec::new());
+    };
+    let path = EXTRA_DENIED_DIRS_FILE
+        .iter()
+        .fold(home.to_path_buf(), |p, seg| p.join(seg));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "the operator's extra worker-denied directories could not be read from {} ({e}); \
+                 refusing the launch rather than running a worker without the fence that file \
+                 states (core#403) — fix or remove the file",
+                path.display()
+            ))
+        }
+    };
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let dir = match line.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(line),
+        };
+        if !dir.is_absolute() {
+            return Err(format!(
+                "{}:{}: `{line}` is not an absolute path (or a `~/`-rooted one), so the worker \
+                 fence cannot spell a rule for it; refusing the launch rather than dropping the \
+                 directory the operator asked to fence (core#403)",
+                path.display(),
+                i + 1
+            ));
+        }
+        out.push(dir);
+    }
+    Ok(out)
 }
 
 /// The refusal for a fenced directory [`rule_path`] cannot spell (codex round 9): names the
@@ -4256,6 +4364,98 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 
 #[cfg(test)]
 mod tests {
+    /// wicked-crew#663: the two path layers cover the SAME providers as the command fence. A
+    /// credential store the file-tool fence denies while the OS sandbox leaves it readable (or
+    /// the other way round) is exactly the seam that issue is about — a desktop logged into
+    /// Azure DevOps or GitLab was covered by neither.
+    #[test]
+    fn every_fenced_provider_credential_store_is_denied_by_path_and_masked_by_the_sandbox() {
+        // The stores of the providers `remote_write_fence::FENCED_PROVIDER_CLIS` names; the
+        // credential-less ones (`bzr`, `jj`) and the single-FILE stores (`hub`, `hg`, `p4` — in
+        // `DENIED_HOME_FILES`) are listed below rather than here.
+        const PROVIDER_STORES: &[&str] = &[
+            ".config/gh",
+            ".azure",
+            ".config/glab-cli",
+            ".config/tea",
+            ".subversion",
+        ];
+        let home = std::path::Path::new("/h");
+        let masked = crate::validator::secret_read_block_dirs_under(Some(home));
+        for rel in PROVIDER_STORES {
+            assert!(
+                super::DENIED_HOME_SUBDIRS.contains(rel),
+                "{rel} is denied for the file tools"
+            );
+            let want = rel
+                .split('/')
+                .fold(home.to_path_buf(), |p, seg| p.join(seg));
+            assert!(
+                masked.contains(&want),
+                "{rel} is masked by the OS sandbox: {masked:?}"
+            );
+        }
+        for file in [".config/hub", ".hgrc", ".p4tickets", ".netrc"] {
+            assert!(super::DENIED_HOME_FILES.contains(&file), "{file}");
+        }
+        // Every provider the command fence names is denied by PROGRAM in the Bash fence — one
+        // rule per program, so a provider cannot be added to the fence and forgotten here.
+        let rules: Vec<&str> = super::denied_bash_rules().collect();
+        for (stem, _) in crate::remote_write_fence::FENCED_PROVIDER_CLIS {
+            for rule in [format!("Bash({stem})"), format!("Bash({stem}:*)")] {
+                assert!(rules.iter().any(|r| *r == rule), "{rule} is denied");
+            }
+        }
+    }
+
+    /// core#403: the fence over the operator's own Claude config dir was derived from the
+    /// DAEMON's `CLAUDE_CONFIG_DIR`, so a daemon a service manager or an `env -i` rig started
+    /// with a minimal environment dropped the `Read`/`Edit` rules over a NON-default config dir
+    /// — the seed source for the skills baseline — silently. `claude_config_dir: None` IS that
+    /// daemon: both well-known homes and every directory the operator recorded are still fenced.
+    #[test]
+    fn the_config_dir_fence_holds_with_an_empty_daemon_environment() {
+        let base = std::env::temp_dir().join(format!("wicked-403-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let record = home.join(".config").join("wicked-core");
+        std::fs::create_dir_all(&record).unwrap();
+        let record = record.join("worker-denied-dirs");
+        let alt = base.join("alt-configs").join(".claude");
+        std::fs::write(
+            &record,
+            format!(
+                "# the operator's real config dir (the skills seed source)\n{}\n\n~/other-secrets\n",
+                alt.display()
+            ),
+        )
+        .unwrap();
+        let dirs = super::denied_dirs_from(Some(&home), None, None).expect("the fence builds");
+        for want in [
+            home.join(".claude"),
+            home.join(".config").join("claude"),
+            alt.clone(),
+            home.join("other-secrets"),
+        ] {
+            assert!(
+                dirs.iter().any(|d| d == &want),
+                "{} is fenced: {dirs:?}",
+                want.display()
+            );
+        }
+        // Fails closed on an entry the fence cannot spell a rule for, naming file, line and entry.
+        std::fs::write(&record, "relative/dir\n").unwrap();
+        let err = super::denied_dirs_from(Some(&home), None, None)
+            .expect_err("a relative entry refuses the launch");
+        assert!(err.contains("worker-denied-dirs:1"), "{err}");
+        assert!(err.contains("relative/dir"), "{err}");
+        // No file at all is not an error, and the well-known homes stay fenced.
+        std::fs::remove_file(&record).unwrap();
+        let dirs = super::denied_dirs_from(Some(&home), None, None).expect("no file, no error");
+        assert!(dirs.iter().any(|d| d == &home.join(".claude")), "{dirs:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// core#595 review (codex HIGH): a secondary home gets the SAME re-sanitize as the primary.
     /// A stale or planted `claude-2/settings.local.json` merges over the fence's `settings.json`,
     /// and `hooks/` runs code, so both must be gone after the fence is ensured. Fixed facts: the
@@ -9134,7 +9334,7 @@ mod tests {
             }
         }
         // Every fenced directory has exactly ONE write-side rule in the blanket fence, the Edit one.
-        for dir in denied_dirs(None) {
+        for dir in denied_dirs(None).expect("the denied directories") {
             let p = rule_path(&dir).expect("expressible");
             assert!(
                 blanket.contains(&format!("Edit({p}/**)")),

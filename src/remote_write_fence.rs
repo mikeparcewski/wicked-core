@@ -46,6 +46,22 @@
 //!    working; fetch over ssh does not. The deliver tool phase applies no seat config and keeps
 //!    the daemon's login.
 //!
+//! ## Which programs (wicked-crew#663, core#569)
+//!
+//! `git` is judged by verb — a worker commits, fetches and rebases, so only the remote-writing
+//! verbs and the alias/config/transport escapes around them are refused. Every CLI that talks to
+//! a hosted forge or another VCS's server ([`FENCED_PROVIDER_CLIS`]: `gh`, `glab`, `az`, `hub`,
+//! `tea`, `bb`, `hg`, `svn`, `bzr`, `p4`, `jj`) is refused WHOLE, reads included. The fence used
+//! to enumerate `gh`'s write verbs and judge nothing else, so a worker on a desktop logged into
+//! Azure DevOps or GitLab could open a pull request or mutate a work item and the engine would
+//! never see it — the same defect as F-7R2-012, one provider over. A verb catalogue is the wrong
+//! shape for this: it cannot name a provider it was not taught, and it cannot prove an
+//! unrecognised verb (`az devops invoke --http-method POST`) is a read. The reads are refused for
+//! the reason core#569 names: layer 3 strips the provider tokens and the credential directories
+//! are masked, so the read cannot succeed — and its bare auth error is what a worker routes
+//! around with an unauthenticated WebFetch that answers with silently partial data
+//! (wicked-crew#648). A refused provider command carries [`PROVIDER_REMEDY`], which says so.
+//!
 //! Stated limit, as everywhere in this codebase: the shell is Turing-complete, so a determined
 //! escape (`base64 | sh`, a script file, a variable holding the verb, a renamed binary) can evade
 //! a scan of the literal command. Layer 3 is what holds then, and what it holds is exactly this:
@@ -59,11 +75,12 @@
 //! refuses every one of those as a literal; hidden in a script file they are the stated limit —
 //! disclosed here rather than promised away.
 
-/// The claude CLI's Bash deny rules for remote-writing `git`/`gh` invocations — PREFIX rules
-/// (`Bash(<prefix>:*)`), the one Bash rule form the CLI matches (wicked-crew#524 / F-3R2-004:
-/// path-tool rules are `Read(...)`/`Edit(...)`; Bash rules are exact or `:*`-prefixed). Every
-/// `gh api` is denied whole: the CLI cannot see the method, and a mutation is one flag away from
-/// a read (the command filter below lets a plain `GET` through on the carriers that can judge it).
+/// The claude CLI's Bash deny rules for remote-writing `git` invocations and for every fenced
+/// provider CLI ([`FENCED_PROVIDER_CLIS`]) — PREFIX rules (`Bash(<prefix>:*)`), the one Bash rule
+/// form the CLI matches (wicked-crew#524 / F-3R2-004: path-tool rules are `Read(...)`/`Edit(...)`;
+/// Bash rules are exact or `:*`-prefixed). Since wicked-crew#663 each provider CLI is denied by
+/// PROGRAM rather than by verb: the verb catalogue could not name a provider it had not been
+/// taught, and a provider read cannot work on a credential-less seat anyway (core#569).
 pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(git push:*)",
     "Bash(git push)",
@@ -85,114 +102,199 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(git config --global:*)",
     "Bash(git config --system:*)",
     "Bash(git --config-env:*)",
-    "Bash(gh pr create:*)",
-    "Bash(gh pr merge:*)",
-    "Bash(gh pr edit:*)",
-    "Bash(gh pr comment:*)",
-    "Bash(gh pr review:*)",
-    "Bash(gh pr close:*)",
-    "Bash(gh pr reopen:*)",
-    "Bash(gh pr ready:*)",
-    "Bash(gh pr lock:*)",
-    "Bash(gh pr unlock:*)",
-    "Bash(gh pr update-branch:*)",
-    "Bash(gh api:*)",
-    "Bash(gh alias:*)",
-    "Bash(gh release:*)",
-    "Bash(gh issue create:*)",
-    "Bash(gh issue comment:*)",
-    "Bash(gh issue edit:*)",
-    "Bash(gh issue close:*)",
-    "Bash(gh issue reopen:*)",
-    "Bash(gh issue delete:*)",
-    "Bash(gh issue transfer:*)",
-    "Bash(gh issue pin:*)",
-    "Bash(gh issue unpin:*)",
-    "Bash(gh issue lock:*)",
-    "Bash(gh issue unlock:*)",
-    "Bash(gh issue develop:*)",
-    "Bash(gh repo create:*)",
-    "Bash(gh repo delete:*)",
-    "Bash(gh repo edit:*)",
-    "Bash(gh repo fork:*)",
-    "Bash(gh repo sync:*)",
-    "Bash(gh repo archive:*)",
-    "Bash(gh repo rename:*)",
-    "Bash(gh repo unarchive:*)",
-    "Bash(gh repo deploy-key:*)",
-    "Bash(gh repo autolink:*)",
-    "Bash(gh auth:*)",
-    "Bash(gh workflow run:*)",
-    "Bash(gh workflow enable:*)",
-    "Bash(gh workflow disable:*)",
-    "Bash(gh run cancel:*)",
-    "Bash(gh run rerun:*)",
-    "Bash(gh run delete:*)",
-    "Bash(gh secret:*)",
-    "Bash(gh variable:*)",
-    "Bash(gh label:*)",
-    "Bash(gh gist create:*)",
-    "Bash(gh gist edit:*)",
-    "Bash(gh gist delete:*)",
-    "Bash(gh cache delete:*)",
-    "Bash(gh project create:*)",
-    "Bash(gh project edit:*)",
-    "Bash(gh project delete:*)",
-    "Bash(gh project close:*)",
-    "Bash(gh project item-add:*)",
-    "Bash(gh project item-edit:*)",
-    "Bash(gh project item-delete:*)",
-    // (review of #449, r2 R2-4) account keys, codespaces and extensions.
-    "Bash(gh ssh-key add:*)",
-    "Bash(gh ssh-key delete:*)",
-    "Bash(gh gpg-key add:*)",
-    "Bash(gh gpg-key delete:*)",
-    "Bash(gh codespace create:*)",
-    "Bash(gh codespace delete:*)",
-    "Bash(gh codespace edit:*)",
-    "Bash(gh codespace rebuild:*)",
-    "Bash(gh codespace stop:*)",
-    "Bash(gh extension install:*)",
-    "Bash(gh extension upgrade:*)",
-    "Bash(gh extension remove:*)",
-    "Bash(gh ext install:*)",
-    "Bash(gh ext upgrade:*)",
-    "Bash(gh ext remove:*)",
+    // (wicked-crew#663, core#569) Every forge and foreign-VCS CLI the fence can name, denied
+    // WHOLE — one rule per program instead of a verb catalogue. A worker seat carries no forge
+    // login by construction (layer 3 strips the tokens; the credential directories are masked),
+    // so a read cannot succeed there either: refusing it is the honest answer, and the silent
+    // WebFetch substitution wicked-crew#648 observed is what a bare auth error bought instead.
+    "Bash(gh)",
+    "Bash(gh:*)",
+    "Bash(glab)",
+    "Bash(glab:*)",
+    "Bash(az)",
+    "Bash(az:*)",
+    "Bash(hub)",
+    "Bash(hub:*)",
+    "Bash(tea)",
+    "Bash(tea:*)",
+    "Bash(bb)",
+    "Bash(bb:*)",
+    "Bash(hg)",
+    "Bash(hg:*)",
+    "Bash(svn)",
+    "Bash(svn:*)",
+    "Bash(bzr)",
+    "Bash(bzr:*)",
+    "Bash(p4)",
+    "Bash(p4:*)",
+    "Bash(jj)",
+    "Bash(jj:*)",
 ];
 
-/// The remedy every refusal carries to the seat and onto the wire (`workerToolCallDenied.remedy`).
+/// The remedy a REMOTE-WRITE refusal carries to the seat and onto the wire
+/// (`workerToolCallDenied.remedy`); a provider refusal carries [`PROVIDER_REMEDY`].
 pub(crate) const REMEDY: &str = "delivery is performed by the run's deliver phase: the engine \
     lifts the run branch onto the current base, re-verifies the repository's own checks, pushes \
     and opens the pull request, so the ledger records it. Commit your work on the run branch and \
     finish the unit; never push or open/edit a PR from a worker seat";
 
+/// The remedy a FENCED-PROVIDER refusal carries (wicked-crew#663, core#569, wicked-crew#648):
+/// the provider CLIs are refused whole, so this covers a write, a read and a verb the fence does
+/// not recognise. It says WHY the command cannot work at all on a worker seat — the credentials
+/// are not there — and names the one thing a worker must not do instead, because that is the
+/// failure wicked-crew#648 observed: `gh` exit 4, then an unauthenticated WebFetch that returned
+/// a silently partial inventory the phase reported as success.
+pub(crate) const PROVIDER_REMEDY: &str = "a worker seat has no forge login and never writes to a \
+    forge: its credential directories are masked and the provider tokens stripped from the \
+    spawn, so this command cannot succeed — it is refused here rather than failing as an auth \
+    error you would route around. Delivery (a pull request, merge request or work item) is the \
+    run's deliver phase's job: commit your work on the run branch and finish the unit. For a \
+    READ, do NOT substitute WebFetch or an unauthenticated public-API call — that answer is \
+    silently partial (wicked-crew#648); the issues and pull requests a run needs are handed to \
+    the phase by the launch, and anything else you could not read must be reported as \
+    unavailable in this phase's output, naming what is missing";
+
+/// Which fence refused, and therefore which remedy the reason carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HitClass {
+    /// A remote WRITE the deliver phase owns (`git push`, `gh pr create`, an alias that could
+    /// be one) — [`REMEDY`].
+    RemoteWrite,
+    /// A fenced provider CLI the worker may not run at all — [`PROVIDER_REMEDY`].
+    ProviderFenced,
+}
+
 /// One remote-writing invocation the filter found in a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteWriteHit {
-    /// The program judged (`git`, `gh`, `env` for a fenced environment variable set in the
-    /// seat's shell, or `pwsh` for an encoded PowerShell payload the filter cannot decode).
+    /// The program judged (`git`, `gh`, a fenced provider CLI (`az`, `glab`, …), `env` for a
+    /// fenced environment variable set in the seat's shell, or `pwsh` for an encoded PowerShell
+    /// payload the filter cannot decode).
     pub program: &'static str,
     /// The verb path that writes remotely (`push`, `pr create`, `api (mutation)`, `alias`,
-    /// `-c alias.p (config override)`, `unknown subcommand p (possible alias)`, …).
+    /// `-c alias.p (config override)`, `unknown subcommand p (possible alias)`, …), or the verb
+    /// path of a fenced provider CLI's invocation (`repos pr`, `mr create`, `(no verb)`).
     pub verb: String,
     /// The command segment the hit was found in (trimmed).
     pub segment: String,
+    /// Which fence refused it.
+    pub class: HitClass,
 }
 
 impl RemoteWriteHit {
+    /// The remedy this refusal's class carries — the `remedy` field of `workerToolCallDenied`,
+    /// which must be the SAME remedy the reason embeds (review of #671: the ACP carrier sent the
+    /// deliver-phase remedy with a provider-read reason, so the structured event told a worker to
+    /// commit and let the deliver phase open the PR when what it had asked for was a read).
+    pub(crate) fn remedy(&self) -> &'static str {
+        match self.class {
+            HitClass::RemoteWrite => REMEDY,
+            HitClass::ProviderFenced => PROVIDER_REMEDY,
+        }
+    }
+
     /// The operator- and seat-facing reason for the refusal (the `reason` on the wire).
     pub(crate) fn reason(&self) -> String {
-        format!(
-            "remote-write fence: `{} {}` is not available to a worker seat (segment: `{}`) — {}",
-            self.program, self.verb, self.segment, REMEDY
-        )
+        match self.class {
+            HitClass::RemoteWrite => format!(
+                "remote-write fence: `{} {}` is not available to a worker seat (segment: `{}`) — {}",
+                self.program, self.verb, self.segment, REMEDY
+            ),
+            HitClass::ProviderFenced => format!(
+                "remote-write fence: `{}` is the {} CLI, which a worker seat may not run \
+                 (`{} {}`, segment: `{}`) — {}",
+                self.program,
+                provider_label(self.program),
+                self.program,
+                self.verb,
+                self.segment,
+                PROVIDER_REMEDY
+            ),
+        }
     }
 }
 
-/// `gh` subcommand → verbs that WRITE remotely. `api` is judged separately (by method/flags);
-/// `auth` and `alias` are denied whole (credentials; a verb alias defeats every other rule).
-/// Absent subcommands (`pr view`, `pr list`, `pr checkout`, `pr diff`, `pr checks`, `issue view`,
-/// `run view`, `repo view`, `repo clone`) are reads or local and pass.
+/// The remedy a recorded refusal's REASON belongs to — for the one carrier that has no hit, only
+/// the durable text the gate-hook subprocess wrote (`pipeline::disclose_hook_decisions`). The
+/// reason embeds its own remedy, so the field beside it must not contradict it.
+pub(crate) fn remedy_for_reason(reason: &str) -> &'static str {
+    if reason.contains(PROVIDER_REMEDY) {
+        PROVIDER_REMEDY
+    } else {
+        REMEDY
+    }
+}
+
+/// Every CLI that can write to a hosted forge or another VCS's server, denied WHOLE
+/// (wicked-crew#663). The fence used to enumerate `gh`'s write verbs and judge nothing else, so
+/// on a desktop logged into Azure DevOps or GitLab a worker could open a pull request or mutate
+/// a work item and the engine would never see it — the F-7R2-012 defect, one provider over.
+///
+/// Whole, and not a verb catalogue per provider, for three reasons. The fence cannot PROVE an
+/// unrecognised verb is a read (`az devops invoke --http-method POST`, `glab api --method POST`,
+/// a provider alias), and an unproven verb must fail closed. A read cannot work on a worker seat
+/// anyway: layer 3 strips the provider tokens and the credential directories are masked
+/// (`execute_wrapped::DENIED_HOME_SUBDIRS`, `validator::secret_read_block_dirs_under`), so the
+/// command's own auth error is the alternative — and that error is what a worker routes around
+/// (core#569, wicked-crew#648). And a per-provider catalogue is a standing invitation to ship a
+/// provider before teaching the fence its verbs, which is the failure mode wicked-crew#663 is
+/// about. Teaching the engine a provider means adding it HERE first.
+///
+/// The stated limit is the module's own: a renamed binary, a script file or a REST call from a
+/// language runtime is not a literal this scan can read. Layer 3 is what holds then.
+pub(crate) const FENCED_PROVIDER_CLIS: &[(&str, &str)] = &[
+    ("gh", "GitHub"),
+    ("glab", "GitLab"),
+    (
+        "az",
+        "Azure (`az repos`, `az boards`, `az pipelines`, `az devops invoke`)",
+    ),
+    ("hub", "GitHub (legacy `hub`)"),
+    ("tea", "Gitea/Forgejo"),
+    ("bb", "Bitbucket"),
+    ("hg", "Mercurial"),
+    ("svn", "Subversion"),
+    ("bzr", "Bazaar"),
+    ("p4", "Perforce"),
+    ("jj", "Jujutsu"),
+];
+
+/// The fenced provider a program stem names, with its static stem (so a hit can carry it).
+fn fenced_provider_cli(stem: &str) -> Option<(&'static str, &'static str)> {
+    FENCED_PROVIDER_CLIS
+        .iter()
+        .find(|(p, _)| *p == stem)
+        .map(|(p, label)| (*p, *label))
+}
+
+/// The provider label for a refusal's wording; the stem itself when it is not a provider (a
+/// `ProviderFenced` hit always names one).
+fn provider_label(stem: &str) -> &str {
+    fenced_provider_cli(stem).map(|(_, l)| l).unwrap_or(stem)
+}
+
+/// The verb path a fenced provider CLI's invocation names, for the refusal's wording: the first
+/// two positional tokens (`repos pr`, `mr create`, `work-item`), `(no verb)` when there are
+/// none. Wording only — every invocation is refused whatever this says.
+fn provider_verb(args: &[String]) -> String {
+    let words: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .take(2)
+        .map(String::as_str)
+        .collect();
+    if words.is_empty() {
+        "(no verb)".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+/// `gh` subcommand → verbs that WRITE remotely — kept so a refusal can NAME the write the
+/// deliver phase owns (`gh pr create`, `gh issue comment`). It is no longer the boundary: since
+/// core#569 every other `gh` invocation is refused too, as a fenced provider CLI
+/// ([`FENCED_PROVIDER_CLIS`]), because a read has no credentials to read with. `api` is judged
+/// by method/flags for the same naming reason; `auth` and `alias` are denied whole.
 const GH_REMOTE_WRITE_VERBS: &[(&str, &[&str])] = &[
     (
         "pr",
@@ -481,6 +583,16 @@ const FENCED_GIT_ENV_PREFIXES: &[&str] = &[
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
     "GH_CONFIG_DIR",
+    // (wicked-crew#663) The other providers' tokens and config homes, by prefix: Azure DevOps
+    // (`AZURE_DEVOPS_EXT_PAT`, `AZURE_CONFIG_DIR`, the pipeline `SYSTEM_ACCESSTOKEN`), GitLab
+    // (`GITLAB_TOKEN`, `GLAB_TOKEN`, `GLAB_CONFIG_DIR`), Gitea/Forgejo and Bitbucket.
+    "AZURE_",
+    "SYSTEM_ACCESSTOKEN",
+    "GITLAB_",
+    "GLAB_",
+    "GITEA_",
+    "FORGEJO_",
+    "BITBUCKET_",
 ];
 
 /// Shell builtins that SET environment for later commands in the same shell.
@@ -527,6 +639,7 @@ pub(crate) fn remote_write_command(command: &str) -> Option<RemoteWriteHit> {
                 program: hit.0,
                 verb: hit.1,
                 segment: segment.trim().to_string(),
+                class: hit.2,
             });
         }
     }
@@ -829,18 +942,24 @@ fn rest_script(args: &[String], flags: &[&str]) -> Option<String> {
 /// with a remote-writing verb, a fenced config override, or an unknown (alias) verb; a shell
 /// interpreter / `eval` whose script is judged as a command in its own right; an environment
 /// setter naming a fenced variable; or a fenced variable assigned in front of `git`/`gh`.
-fn judge_tokens(tokens: &[String]) -> Option<(&'static str, String)> {
+fn judge_tokens(tokens: &[String]) -> Option<(&'static str, String, HitClass)> {
     let (start, assigned) = program_index(tokens)?;
     let program = program_stem(&tokens[start]);
     let args = &tokens[start + 1..];
     let program_is_git = program == "git" || program.starts_with("git-");
-    if (program_is_git || program == "gh") && assigned.iter().any(|n| fenced_env_name(n)) {
+    if (program_is_git || fenced_provider_cli(&program).is_some())
+        && assigned.iter().any(|n| fenced_env_name(n))
+    {
         let names: Vec<&str> = assigned
             .iter()
             .filter(|n| fenced_env_name(n))
             .map(String::as_str)
             .collect();
-        return Some(("env", format!("{} (fenced variable)", names.join(", "))));
+        return Some((
+            "env",
+            format!("{} (fenced variable)", names.join(", ")),
+            HitClass::RemoteWrite,
+        ));
     }
     if ENV_SETTERS.contains(&program.as_str()) {
         if let Some(name) = args
@@ -848,23 +967,33 @@ fn judge_tokens(tokens: &[String]) -> Option<(&'static str, String)> {
             .filter_map(|a| env_assignment(a).or(Some(a.as_str())))
             .find(|n| fenced_env_name(n))
         {
-            return Some(("env", format!("{program} {name} (fenced variable)")));
+            return Some((
+                "env",
+                format!("{program} {name} (fenced variable)"),
+                HitClass::RemoteWrite,
+            ));
         }
         return None;
     }
     match program.as_str() {
-        "git" => judge_git(args).map(|v| ("git", v)),
+        "git" => judge_git(args).map(|v| ("git", v, HitClass::RemoteWrite)),
         p if p.starts_with("git-") => {
             // `git-push …` — the dashed spelling of a git verb.
             let verb = p["git-".len()..].to_string();
             let mut full: Vec<String> = vec![verb];
             full.extend(args.iter().cloned());
-            judge_git(&full).map(|v| ("git", v))
+            judge_git(&full).map(|v| ("git", v, HitClass::RemoteWrite))
         }
-        "gh" => judge_gh(args).map(|v| ("gh", v)),
+        // `gh`'s write verbs keep their names (the refusal says WHICH write the deliver phase
+        // owns); every other `gh` invocation, and every other fenced provider CLI, is refused
+        // whole (wicked-crew#663, core#569).
+        "gh" => Some(match judge_gh(args) {
+            Some(v) => ("gh", v, HitClass::RemoteWrite),
+            None => ("gh", provider_verb(args), HitClass::ProviderFenced),
+        }),
         "eval" => {
             let script = args.join(" ");
-            remote_write_command(&script).map(|h| (h.program, h.verb))
+            remote_write_command(&script).map(|h| (h.program, h.verb, h.class))
         }
         p if SH_INTERPRETERS.contains(&p) => {
             // `busybox sh -c …`: the applet name comes first (review r2, R2-4).
@@ -876,26 +1005,32 @@ fn judge_tokens(tokens: &[String]) -> Option<(&'static str, String)> {
             };
             sh_script(args)
                 .and_then(remote_write_command)
-                .map(|h| (h.program, h.verb))
+                .map(|h| (h.program, h.verb, h.class))
         }
         p if PWSH_INTERPRETERS.contains(&p) => match pwsh_script(args) {
             Ok(script) => script
                 .and_then(|s| remote_write_command(&s))
-                .map(|h| (h.program, h.verb)),
-            Err(()) => Some(("pwsh", "-EncodedCommand (undecodable payload)".to_string())),
+                .map(|h| (h.program, h.verb, h.class)),
+            Err(()) => Some((
+                "pwsh",
+                "-EncodedCommand (undecodable payload)".to_string(),
+                HitClass::RemoteWrite,
+            )),
         },
         p if CMD_INTERPRETERS.contains(&p) => rest_script(args, &["/c", "/k"])
             .and_then(|s| remote_write_command(&s))
-            .map(|h| (h.program, h.verb)),
+            .map(|h| (h.program, h.verb, h.class)),
         "script" => {
             // util-linux/BSD `script [-q] -c <command> [file]` runs a command under a pty.
             args.iter()
                 .position(|a| a == "-c" || a == "--command")
                 .and_then(|i| args.get(i + 1))
                 .and_then(|s| remote_write_command(s))
-                .map(|h| (h.program, h.verb))
+                .map(|h| (h.program, h.verb, h.class))
         }
-        _ => None,
+        // Every other fenced provider CLI: refused whole, whatever the verb.
+        _ => fenced_provider_cli(&program)
+            .map(|(stem, _)| (stem, provider_verb(args), HitClass::ProviderFenced)),
     }
 }
 
@@ -1023,7 +1158,8 @@ fn skip_gh_options(args: &[String], mut i: usize) -> usize {
 /// `gh api` mutates when it names a non-GET method or carries a body: `-X/--method <M>` (or
 /// attached: `-XPOST`, `--method=PATCH`) with `M != GET`, or any of `-f/-F/--field/--raw-field/
 /// --input` (attached forms `-ftitle=x`, `--field=…` included — they imply `POST`). A plain
-/// `gh api repos/o/r/pulls` is a read and passes.
+/// `gh api repos/o/r/pulls` is a read: it is still refused (core#569), as the provider-fenced
+/// class, and this judgement only decides which remedy the refusal names.
 fn judge_gh_api(args: &[String]) -> bool {
     let mut i = 0;
     while i < args.len() {
@@ -1060,6 +1196,57 @@ fn judge_gh_api(args: &[String]) -> bool {
     }
     false
 }
+
+/// (wicked-crew#663, core#569) The provider spellings that must be refused on EVERY carrier —
+/// the Azure DevOps and GitLab writes the fence used to permit, the other forge CLIs and other
+/// VCSes, the credential variables in front of them, and the `gh` READS the filesystem layer
+/// makes impossible. The three carriers' tests iterate this list beside
+/// [`REVIEW_BYPASS_STRINGS`]; a hit here carries [`PROVIDER_REMEDY`] rather than [`REMEDY`].
+#[cfg(test)]
+pub(crate) const PROVIDER_FENCE_STRINGS: &[&str] = &[
+    // Azure DevOps (the ungoverned PR and work-item writes wicked-crew#663 reproduced).
+    "az repos pr create --repository r --source-branch b --target-branch main",
+    "az boards work-item create --title x --type Bug",
+    "az repos pr update --id 4 --status completed",
+    "az devops invoke --area git --resource pullrequests --http-method POST",
+    "az pipelines run --name build",
+    "az repos pr list",
+    "az --version",
+    "cd /wt && az repos pr create",
+    "env -i az repos pr create",
+    "AZURE_DEVOPS_EXT_PAT=x az repos pr create",
+    // GitLab.
+    "glab mr create --fill",
+    "glab mr merge 12",
+    "glab issue create --title x",
+    "glab api --method POST projects/1/merge_requests",
+    "glab issue list",
+    "sh -c 'glab mr create --fill'",
+    "GITLAB_TOKEN=x glab mr create",
+    "GLAB_TOKEN=x glab mr create",
+    // The other forge CLIs and VCSes the fence can name.
+    "hub pull-request -m x",
+    "tea pr create",
+    "hg push",
+    "svn commit -m x",
+    "bzr push",
+    "p4 submit",
+    "jj git push",
+    // core#569 / wicked-crew#648: the `gh` reads the command layer used to permit while the
+    // filesystem layer masked the credential store, so the worker got exit 4 and substituted a
+    // silently partial WebFetch.
+    "gh issue list --repo o/r --json number",
+    "gh pr view 258 --json state",
+    "gh pr list --state open",
+    "gh pr diff 12",
+    "gh pr checks 12",
+    "gh issue view 4",
+    "gh run view 123 --log",
+    "gh repo view o/r",
+    "gh api repos/o/r/pulls",
+    "gh api -XGET repos/o/r",
+    "gh --version",
+];
 
 /// (review of #449, FN-1/FN-2) The bypass spellings the independent review reproduced against
 /// the first cut, plus the observed F-7R2-012 spelling — EVERY one must be refused by the filter,
@@ -1123,6 +1310,12 @@ mod tests {
 
     fn hit(cmd: &str) -> Option<(&'static str, String)> {
         remote_write_command(cmd).map(|h| (h.program, h.verb))
+    }
+
+    /// The command is refused as a FENCED PROVIDER invocation (wicked-crew#663, core#569) — the
+    /// class that carries [`PROVIDER_REMEDY`] rather than the deliver-phase remedy.
+    fn provider_fenced(cmd: &str) -> bool {
+        remote_write_command(cmd).is_some_and(|h| h.class == HitClass::ProviderFenced)
     }
 
     #[test]
@@ -1332,19 +1525,41 @@ mod tests {
             hit("powershell -c \"git push\""),
             Some(("git", "push".into()))
         );
-        // …and the read-shaped neighbours still pass.
+        // …the read-shaped `git` neighbours still pass…
         assert_eq!(hit("bash -e script.sh"), None);
-        assert_eq!(hit("gh pr -R o/r view 1"), None);
-        assert_eq!(hit("gh --hostname github.com pr list"), None);
-        assert_eq!(hit("gh api -XGET repos/o/r"), None);
         assert_eq!(hit("timeout -k 5 30 git fetch"), None);
+        // …and the `gh` ones are refused as provider reads (core#569): the same parse, a
+        // different remedy.
+        for cmd in [
+            "gh pr -R o/r view 1",
+            "gh --hostname github.com pr list",
+            "gh api -XGET repos/o/r",
+        ] {
+            assert!(provider_fenced(cmd), "{cmd}");
+        }
     }
 
     #[test]
     fn gh_api_is_judged_by_method_and_body() {
-        assert_eq!(hit("gh api repos/o/r/pulls"), None);
-        assert_eq!(hit("gh api -X GET repos/o/r"), None);
-        assert_eq!(hit("gh api --method=get repos/o/r"), None);
+        // A GET is a read: refused too (core#569), and the judgement decides only which remedy
+        // the refusal names — the mutations keep the deliver-phase one.
+        for read in [
+            "gh api repos/o/r/pulls",
+            "gh api -X GET repos/o/r",
+            "gh api --method=get repos/o/r",
+        ] {
+            assert!(provider_fenced(read), "{read}");
+        }
+        for write in [
+            "gh api -X POST repos/o/r/pulls",
+            "gh api --method=DELETE repos/o/r",
+        ] {
+            assert_eq!(
+                remote_write_command(write).map(|h| h.class),
+                Some(HitClass::RemoteWrite),
+                "{write}"
+            );
+        }
         assert!(hit("gh api -X POST repos/o/r/pulls").is_some());
         assert!(hit("gh api --method PATCH repos/o/r/pulls/1").is_some());
         assert!(hit("gh api repos/o/r/issues -f title=x").is_some());
@@ -1369,16 +1584,6 @@ mod tests {
             "git stash push -m wip",
             "git lfs pull",
             "git submodule update --init",
-            "gh pr view 258 --json state",
-            "gh pr list --state open",
-            "gh pr checkout 12",
-            "gh pr diff 12",
-            "gh pr checks 12",
-            "gh issue view 4",
-            "gh run view 123 --log",
-            "gh repo view o/r",
-            "gh repo clone o/r",
-            "gh --version",
             "npm test && cargo test",
             "echo 'do not git push from here'", // a quoted sentence is data, not a verb
             "grep -rn 'git push' docs/",
@@ -1399,6 +1604,70 @@ mod tests {
     fn every_review_bypass_string_is_a_hit() {
         for cmd in REVIEW_BYPASS_STRINGS {
             assert!(hit(cmd).is_some(), "not refused: {cmd}");
+        }
+    }
+
+    /// wicked-crew#663: the fence judged `git` and `gh` only, so on a desktop logged into Azure
+    /// DevOps or GitLab a worker could open a pull request or mutate a work item ungoverned.
+    /// Every provider CLI the fence can name is refused WHOLE — its writes, its reads and any
+    /// verb the fence does not recognise (it cannot prove an unknown verb is a read, so it fails
+    /// closed) — through every wrapper, quoting and credential-variable spelling.
+    #[test]
+    fn every_provider_fence_string_is_a_hit() {
+        for cmd in PROVIDER_FENCE_STRINGS {
+            let h = remote_write_command(cmd).unwrap_or_else(|| panic!("not refused: {cmd}"));
+            assert!(
+                FENCED_PROVIDER_CLIS.iter().any(|(p, _)| *p == h.program)
+                    || h.program == "env"
+                    || h.program == "gh",
+                "{cmd}: judged as `{}`",
+                h.program
+            );
+        }
+    }
+
+    /// core#569 + wicked-crew#648. The command layer permitted `gh` READS that the filesystem
+    /// layer (`.config/gh` masked, the tokens stripped) makes impossible, so a worker got
+    /// `exit 4` and substituted an unauthenticated WebFetch that silently returned a partial
+    /// inventory. The decision is REFUSAL with the reason named, so the failure is loud.
+    #[test]
+    fn a_provider_read_is_refused_with_the_no_credentials_remedy() {
+        for cmd in [
+            "gh issue list --repo o/r --json number",
+            "gh pr view 258 --json state",
+            "gh api repos/o/r/pulls",
+            "az repos pr list",
+            "glab issue list",
+        ] {
+            let h = remote_write_command(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            let reason = h.reason();
+            assert!(reason.contains(PROVIDER_REMEDY), "{cmd}: {reason}");
+            assert!(
+                reason.contains("no forge login"),
+                "the refusal names WHY the read cannot work: {reason}"
+            );
+        }
+        // A WRITE keeps its verb and the deliver-phase remedy — that refusal is about who
+        // delivers, not about credentials.
+        let h = remote_write_command("gh pr create --fill").unwrap();
+        assert_eq!(h.verb, "pr create");
+        assert!(h.reason().contains(REMEDY), "{}", h.reason());
+        let h = remote_write_command("az repos pr create").unwrap();
+        assert_eq!(h.program, "az");
+        assert!(h.reason().contains(PROVIDER_REMEDY), "{}", h.reason());
+    }
+
+    /// A provider CLI's credential variables are fenced the way git's are: a seat re-adding one
+    /// in its shell is refused before the program even runs.
+    #[test]
+    fn a_provider_credential_variable_in_front_of_a_command_is_fenced() {
+        for cmd in [
+            "AZURE_DEVOPS_EXT_PAT=x az repos pr list",
+            "GLAB_TOKEN=x glab mr view 1",
+            "export AZURE_DEVOPS_EXT_PAT=x",
+            "export GITLAB_TOKEN=x",
+        ] {
+            assert!(hit(cmd).is_some(), "{cmd}");
         }
     }
 
@@ -1426,23 +1695,26 @@ mod tests {
                 "a Bash rule: {rule}"
             );
             let inner = &rule["Bash(".len()..rule.len() - 1];
+            let program = inner.trim_end_matches(":*");
+            let is_program_rule = FENCED_PROVIDER_CLIS.iter().any(|(p, _)| *p == program);
             assert!(
-                inner.ends_with(":*") || inner == "git push",
-                "prefix form (`:*`) or the bare exact command: {rule}"
+                inner.ends_with(":*") || inner == "git push" || is_program_rule,
+                "prefix form (`:*`), a bare fenced program, or the bare exact command: {rule}"
             );
             assert!(
-                inner.starts_with("git ") || inner.starts_with("gh "),
-                "only git/gh verbs are fenced here: {rule}"
+                inner.starts_with("git ") || is_program_rule,
+                "only git verbs and whole fenced programs are fenced here: {rule}"
             );
         }
         for must in [
             "Bash(git push:*)",
-            "Bash(gh pr create:*)",
-            "Bash(gh api:*)",
-            "Bash(gh release:*)",
-            "Bash(gh alias:*)",
             "Bash(git config alias.:*)",
             "Bash(git --config-env:*)",
+            // wicked-crew#663: one rule per provider program, not a verb catalogue.
+            "Bash(gh)",
+            "Bash(gh:*)",
+            "Bash(glab:*)",
+            "Bash(az:*)",
         ] {
             assert!(REMOTE_WRITE_BASH_RULES.contains(&must), "{must}");
         }
@@ -1548,9 +1820,9 @@ mod tests {
         ] {
             assert_eq!(hit(cmd), Some(("gh", verb.into())), "{cmd}");
         }
-        assert_eq!(hit("gh ssh-key list"), None);
-        assert_eq!(hit("gh extension list"), None);
-        assert_eq!(hit("gh codespace list"), None);
+        for read in ["gh ssh-key list", "gh extension list", "gh codespace list"] {
+            assert!(provider_fenced(read), "{read}");
+        }
         // Wrapper options: only the wrapper's own value-taking options consume a token.
         assert_eq!(hit("env -i git push"), push);
         assert_eq!(hit("env -u FOO git push"), push);
@@ -1563,25 +1835,17 @@ mod tests {
         assert!(hit("export GIT_ALLOW_PROTOCOL=ssh; git fetch").is_some());
     }
 
-    /// Every `gh <command> <verb>` the filter refuses has a claude Bash rule for the same
-    /// spelling (or for the whole command), and so does every command denied whole — one
-    /// generator, three carriers, no drift.
+    /// Every program the filter refuses whole has its two claude Bash rules, and every git verb
+    /// pair the filter refuses has one — one generator, three carriers, no drift.
     #[test]
-    fn every_gh_remote_write_verb_has_a_bash_rule() {
-        for (command, verbs) in GH_REMOTE_WRITE_VERBS {
-            for verb in verbs.iter() {
-                let exact = format!("Bash(gh {command} {verb}:*)");
-                let whole = format!("Bash(gh {command}:*)");
+    fn every_fenced_program_and_git_pair_has_a_bash_rule() {
+        for (program, _) in FENCED_PROVIDER_CLIS {
+            for rule in [format!("Bash({program})"), format!("Bash({program}:*)")] {
                 assert!(
-                    REMOTE_WRITE_BASH_RULES.contains(&exact.as_str())
-                        || REMOTE_WRITE_BASH_RULES.contains(&whole.as_str()),
-                    "{exact} (or {whole}) is missing"
+                    REMOTE_WRITE_BASH_RULES.contains(&rule.as_str()),
+                    "{rule} is missing"
                 );
             }
-        }
-        for whole in GH_DENIED_WHOLE {
-            let rule = format!("Bash(gh {whole}:*)");
-            assert!(REMOTE_WRITE_BASH_RULES.contains(&rule.as_str()), "{rule}");
         }
         for (a, b) in GIT_REMOTE_WRITE_PAIRS {
             let rule = format!("Bash(git {a} {b}:*)");

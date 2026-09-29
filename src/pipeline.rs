@@ -1325,7 +1325,11 @@ pub(crate) fn apply_and_finish_unit(
                 let remedy = if reason.starts_with(crate::install_fence::REASON_PREFIX) {
                     crate::install_fence::REMEDY
                 } else {
-                    crate::remote_write_fence::REMEDY
+                    // Which remote-write remedy the recorded reason embeds: the deliver-phase one
+                    // for a write, the no-credentials one for a fenced provider command (core#569
+                    // — a read refusal answered with "commit and let the deliver phase push" is
+                    // the wrong instruction, and the event is what a reviewer reads).
+                    crate::remote_write_fence::remedy_for_reason(&reason)
                 };
                 eprintln!(
                     "wicked-core: unit {} ({}) on '{}' asked to run a fenced command and was \
