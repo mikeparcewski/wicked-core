@@ -13884,6 +13884,88 @@ mod deliverable_floor_tests {
              or an unbound run cannot spell its own deliverable (core#297 §3)"
         );
     }
+
+    /// core#640, the WIRING. The freshness rule itself is pinned in
+    /// `path_policy::deliverables_tests`; this is the half that campaign after campaign finds
+    /// missing — that the fold actually hands the floor the run's launch clock. Delete the
+    /// `launch_floor` argument and the rule still passes its own unit tests while every run folds
+    /// Ok on a prior run's leftover, which is exactly the defect.
+    ///
+    /// The shape is the real one: an UNBOUND run (cwd = the per-run sandbox) whose deliverable
+    /// lives in a declared write root that an earlier run already wrote — crew keys those roots
+    /// by document, not by run, so chat, draft and demo hand the same directory to run after run.
+    #[test]
+    fn a_prior_runs_leftover_does_not_satisfy_this_runs_deliverable_floor() {
+        let inbox = tmp("stale-inbox");
+        // A PRIOR run's output, sitting in the write root this run is handed.
+        std::fs::write(inbox.join("draft.html"), "<p>a prior run's draft</p>").unwrap();
+        let logs = tmp("stale-logs");
+        let run_id = format!("deliv-stale-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec!["draft.html".into()],
+        );
+        // This run's durable log. Its FIRST record is the launch clock the floor dates the file
+        // against — written here, an hour after the file, rather than slept for.
+        let launched = crate::interaction::now_millis() + 3_600_000;
+        std::fs::write(
+            crate::event_log::run_log_path(&logs, &run_id),
+            format!("{{\"type\":\"unitDone\",\"session\":\"{run_id}\",\"ord\":0,\"ts\":{launched},\"seq\":0}}\n"),
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::persistent(logs.clone());
+
+        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(
+            unit.status,
+            UnitStatus::Rejected,
+            "a file written before this run launched is a PRIOR run's artifact, not this \
+             phase's output"
+        );
+        let why = unit.denial_reason.unwrap_or_default();
+        assert!(
+            why.contains("draft.html") && why.contains("stale"),
+            "the denial must name the artifact and say it predates the launch: {why}"
+        );
+
+        // The control: the SAME file and the SAME declaration, dated against a launch before it,
+        // folds Ok — so the rejection above is the freshness rule and not a resolution failure.
+        let fresh_logs = tmp("fresh-logs");
+        let fresh_id = format!("deliv-fresh-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &fresh_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec!["draft.html".into()],
+        );
+        std::fs::write(
+            crate::event_log::run_log_path(&fresh_logs, &fresh_id),
+            format!(
+                "{{\"type\":\"unitDone\",\"session\":\"{fresh_id}\",\"ord\":0,\"ts\":{},\"seq\":0}}\n",
+                crate::interaction::now_millis() - 3_600_000
+            ),
+        )
+        .unwrap();
+        let mut subs = crate::event_log::EventSink::persistent(fresh_logs.clone());
+        let (_session, unit) = fold(&mut store, &mut subs, &fresh_id);
+        assert_eq!(
+            unit.status,
+            UnitStatus::Done,
+            "a deliverable written after the launch still folds Ok: {:?}",
+            unit.denial_reason
+        );
+
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_dir_all(&logs);
+        let _ = std::fs::remove_dir_all(&fresh_logs);
+    }
 }
 
 /// core#282 — AUTONOMOUS SEAT FAILOVER over the whole roster. A WORKER-originated failure (CLI
