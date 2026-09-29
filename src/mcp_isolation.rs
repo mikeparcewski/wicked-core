@@ -45,9 +45,10 @@ pub(crate) const CLAUDE_STRICT_MCP_ARGS: [&str; 1] = ["--strict-mcp-config"];
 /// on the carriers claude's `--strict-mcp-config` does not cover. Empty for a seat with no MCP
 /// (pi) and for claude (whose flags are [`CLAUDE_STRICT_MCP_ARGS`], injected with the rest of its
 /// isolation). `seat_root` is the seat's ENGINE-MINTED configuration home
-/// (`SeatConfig::Isolated::root`; `None` under the operator-inherit hatch, which then resolves the
-/// CLI's own default home — the hatch inherits the operator's scopes, never an ungoverned tool
-/// channel); `cwd` is the unit's working directory, which for copilot is a config SOURCE.
+/// (`SeatConfig::Isolated::root`); `None` is the operator-inherit hatch, and the pin then reads the
+/// CLI's OWN home instead ([`config_home`]) — the hatch inherits the operator's scopes, never an
+/// ungoverned tool channel, so the pin rides every launch. `cwd` is the unit's working directory,
+/// which for copilot is a config SOURCE of its own.
 ///
 /// **copilot** (measured on GitHub Copilot CLI 1.0.88): `--disable-builtin-mcps` — copilot ships
 /// a built-in `github-mcp-server`, ENABLED by default, which is a GitHub write path the
@@ -79,10 +80,7 @@ pub(crate) fn seat_mcp_pin_flags(
     match cli {
         SeatCli::Copilot => {
             let mut flags = vec![COPILOT_DISABLE_BUILTIN_MCPS.to_string()];
-            let mut sources: Vec<std::path::PathBuf> = Vec::new();
-            if let Some(root) = seat_root {
-                sources.push(root.join(COPILOT_MCP_CONFIG_FILE));
-            }
+            let mut sources = vec![config_home(cli, seat_root)?.join(COPILOT_MCP_CONFIG_FILE)];
             if let Some(cwd) = cwd {
                 sources.push(cwd.join(".mcp.json"));
                 sources.push(cwd.join(".github").join("mcp.json"));
@@ -96,11 +94,8 @@ pub(crate) fn seat_mcp_pin_flags(
             Ok(flags)
         }
         SeatCli::Codex => {
-            let Some(root) = seat_root else {
-                return Ok(Vec::new());
-            };
             let mut flags = Vec::new();
-            for name in codex_mcp_server_names(&root.join("config.toml"))? {
+            for name in codex_mcp_server_names(&config_home(cli, seat_root)?.join("config.toml"))? {
                 flags.push("-c".to_string());
                 flags.push(format!("mcp_servers.{name}.enabled=false"));
             }
@@ -108,6 +103,45 @@ pub(crate) fn seat_mcp_pin_flags(
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// The configuration home whose MCP config a seat will actually read: its ENGINE-MINTED root when
+/// it has one, and otherwise — under the operator-inherit hatch, where `SeatConfig::Inherit`
+/// touches no CLI configuration variable — the CLI's OWN home, `$CODEX_HOME` / `$COPILOT_HOME`
+/// or its default under the home directory.
+///
+/// Review of #672 (codex, HIGH): with `seat_root: None` treated as "nothing to pin", the hatch
+/// disabled the pin silently while the operator's real `~/.codex/config.toml` MCP servers loaded
+/// — the one case where an ambient server is most likely to exist. The hatch inherits the
+/// operator's scopes, never an ungoverned tool channel: the pin rides EVERY launch, hatch or not,
+/// exactly like claude's `--strict-mcp-config` and the deny fence. A home that cannot be resolved
+/// at all is an `Err`: a config whose location is unknown cannot be shown to be empty.
+fn config_home(
+    cli: SeatCli,
+    seat_root: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(root) = seat_root {
+        return Ok(root.to_path_buf());
+    }
+    let (var, default_dir) = match cli {
+        SeatCli::Codex => (wicked_apps_core::spawn::CODEX_HOME_ENV, ".codex"),
+        SeatCli::Copilot => (wicked_apps_core::spawn::COPILOT_HOME_ENV, ".copilot"),
+        other => return Err(format!("{other:?} has no MCP configuration home to pin")),
+    };
+    if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+        return Ok(std::path::PathBuf::from(v));
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(|h| std::path::PathBuf::from(h).join(default_dir))
+        .ok_or_else(|| {
+            format!(
+                "this launch inherits the operator's {var} but neither {var} nor a home directory \
+                 resolves, so the MCP servers `{default_dir}` configures cannot be named; \
+                 {REFUSAL_TAIL}"
+            )
+        })
 }
 
 /// copilot's built-in MCP off-switch (its own flag; currently `github-mcp-server`).
@@ -650,6 +684,46 @@ mod tests {
                     .windows(2)
                     .any(|w| w[0] == "-c" && w[1] == format!("mcp_servers.{name}.enabled=false")),
                 "{name}: {flags:?}"
+            );
+        }
+        // Review of #672 (HIGH): under the operator-inherit hatch there is no engine-minted seat
+        // root (`SeatConfig::Inherit` sets no configuration variable), and the operator's OWN
+        // home is exactly where an ambient MCP server is most likely to be. The pin reads that
+        // home instead of quietly doing nothing.
+        {
+            let _env = crate::test_env::ENV_LOCK
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            struct Pin(&'static str, Option<std::ffi::OsString>);
+            impl Pin {
+                fn set(k: &'static str, v: &std::path::Path) -> Self {
+                    let prev = std::env::var_os(k);
+                    std::env::set_var(k, v);
+                    Self(k, prev)
+                }
+            }
+            impl Drop for Pin {
+                fn drop(&mut self) {
+                    match &self.1 {
+                        Some(v) => std::env::set_var(self.0, v),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+            let _codex_home = Pin::set(wicked_apps_core::spawn::CODEX_HOME_ENV, &codex);
+            let _copilot_home = Pin::set(wicked_apps_core::spawn::COPILOT_HOME_ENV, &seat);
+            let hatched = seat_mcp_pin_flags(SeatCli::Codex, None, Some(&ws)).expect("hatch pins");
+            assert!(
+                hatched
+                    .windows(2)
+                    .any(|w| w[0] == "-c" && w[1] == "mcp_servers.probe.enabled=false"),
+                "the hatch reads the operator's own codex home: {hatched:?}"
+            );
+            let hatched =
+                seat_mcp_pin_flags(SeatCli::Copilot, None, Some(&ws)).expect("hatch pins");
+            assert!(
+                hatched.iter().any(|f| f == "user-one"),
+                "the hatch reads the operator's own copilot home: {hatched:?}"
             );
         }
         // A codex home with no config, and the seats with nothing to pin.
