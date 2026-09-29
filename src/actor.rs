@@ -1507,6 +1507,7 @@ pub(crate) fn run(
                         EntityMode::Isolated => None,
                     };
                     let stub = AgentSession {
+                        intent_amendments: Vec::new(),
                         id: run_id.clone(),
                         workflow_id: format!("wf-{run_id}"),
                         problem: spec.problem.clone(),
@@ -8996,9 +8997,14 @@ fn confirm_plan_gate(
             // are kept as they ran (`stage_edit`), so it is answered like any other edit.
         }
         HumanDecision::Reject => {}
-        HumanDecision::FloorRerun(_) | HumanDecision::AcceptSuggestion => anyhow::bail!(
-            "a plan_approval gate reviews a plan, not a floor or an evaluator's edit — approve, \
-             approve with an edited plan, or reject"
+        // (core#555) An intent amendment is refused here too: a plan gate's own edit arm is the
+        // edited plan, and an amendment at intake would change an acceptance list no unit has
+        // been judged against yet.
+        HumanDecision::FloorRerun(_)
+        | HumanDecision::AcceptSuggestion
+        | HumanDecision::AmendIntent { .. } => anyhow::bail!(
+            "a plan_approval gate reviews a plan, not a floor, an evaluator's edit or an intent \
+             amendment — approve, approve with an edited plan, or reject"
         ),
     }
     let answer = match &decision {
@@ -9591,12 +9597,22 @@ pub(crate) fn confirm_gate(
             // open and the run stays re-answerable.
             crate::workflow::HumanDecision::FloorRerun(_)
             | crate::workflow::HumanDecision::AcceptSuggestion
+            | crate::workflow::HumanDecision::AmendIntent { .. }
                 if team_gate::transport_gate_open(&session)
                     || team_gate::dispute_gate_open(&session) =>
             {
                 anyhow::bail!(
-                    "a team pause takes approve, request changes or reject — not a floor re-run \
-                     or an evaluator's edit"
+                    "a team pause takes approve, request changes or reject — not a floor re-run, \
+                     an evaluator's edit or an intent amendment"
+                );
+            }
+            // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
+            // resolves, so the gate stays open and re-answerable rather than resolving as an
+            // approve that silently changed no acceptance list.
+            crate::workflow::HumanDecision::AmendIntent { text } if text.trim().is_empty() => {
+                anyhow::bail!(
+                    "action `amend_intent` needs the amendment text — what the run's acceptance \
+                     list now says (approve without it to proceed unamended)"
                 );
             }
             crate::workflow::HumanDecision::FloorRerun(mode) => {
@@ -9654,6 +9670,12 @@ pub(crate) fn confirm_gate(
             .to_string(),
             crate::workflow::HumanDecision::AcceptSuggestion => serde_json::json!({
                 "approve": true, "action": "accept_suggestion", "amend": null,
+            })
+            .to_string(),
+            // (core#555) The amendment text rides `amend` so the durable prompt's answer carries
+            // WHAT was amended, not just that the gate was approved.
+            crate::workflow::HumanDecision::AmendIntent { text } => serde_json::json!({
+                "approve": true, "action": "amend_intent", "amend": text,
             })
             .to_string(),
         };
@@ -9715,6 +9737,9 @@ pub(crate) fn confirm_gate(
     // both pass the layer-3 boundary check below first; `rework` is `Some(note)` for the former.
     let mut floor_rerun: Option<crate::repo_checks::FloorRerunMode> = None;
     let mut adopt_suggestion = false;
+    // (core#555) The approved INTENT AMENDMENT this decision carries, applied below to every unit
+    // at or after the cursor (not one unit's instruction) so it reaches every later evaluator.
+    let mut intent_amendment: Option<String> = None;
     let (amend, amend_scope, rework): (
         Option<String>,
         crate::workflow::AmendScope,
@@ -9744,6 +9769,12 @@ pub(crate) fn confirm_gate(
         crate::workflow::HumanDecision::AcceptSuggestion => {
             adopt_suggestion = true;
             (None, crate::workflow::AmendScope::Cursor, Some(None))
+        }
+        // (core#555) An intent amendment is an APPROVE that also changes the acceptance list
+        // every later unit is judged against (applied after the boundary check, below).
+        crate::workflow::HumanDecision::AmendIntent { text } => {
+            intent_amendment = Some(text);
+            (None, crate::workflow::AmendScope::Cursor, None)
         }
     };
     {
@@ -9855,6 +9886,26 @@ pub(crate) fn confirm_gate(
                     }
                 }
             }
+            // (core#555) THE INTENT AMENDMENT. Unlike an approve's `amend` — which lands on ONE
+            // unit's instruction — this is appended to EVERY unit at or after the cursor, so the
+            // acceptance list each LATER EVALUATOR is handed changes with the human's decision.
+            // Before it, a mid-run descope was structurally impossible: the evaluator kept judging
+            // the un-amended launch intent (and flipped between attempts on the same tree), so the
+            // only honest exit was a relaunch. IDEMPOTENT on the text, like the approve amendment.
+            if let Some(text) = intent_amendment
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                let segment = format!("{}{text}", crate::workflow::INTENT_AMENDMENT_PREFIX);
+                let mut units = crate::domain::session_units(store, run_id)?;
+                for u in units.iter_mut().skip(session.unit_ix) {
+                    if !u.description.contains(&segment) {
+                        u.description.push_str(&segment);
+                        put_node(store, u.to_node())?;
+                    }
+                }
+            }
             // Clear the pause → Executing, then dispatch the cursor unit directly (bypass should_pause
             // so it doesn't immediately re-pause on the same unit).
             let mut s = session;
@@ -9888,9 +9939,48 @@ pub(crate) fn confirm_gate(
             if cursor_ran {
                 s.attempt = s.attempt.saturating_add(1);
             }
+            // (core#555) Record the amendment on the RUN so the run record — and the run page —
+            // can show what was withdrawn beside the original intent, with when.
+            let amended = match intent_amendment
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                // IDEMPOTENT ON THE TEXT, the run record included (codex review on #675): the
+                // skin pre-fills every gate from the durable note, so the same amendment can be
+                // offered twice. The units are deduped above; without this the run would claim
+                // two approved amendments and emit two `intentAmended` events for one decision.
+                .filter(|t| !s.intent_amendments.iter().any(|a| a.text == *t))
+            {
+                None => None,
+                Some(text) => Some(crate::domain::IntentAmendment {
+                    text: text.to_string(),
+                    ord: crate::domain::session_units(store, run_id)?
+                        .get(s.unit_ix)
+                        .map(|u| u.ord)
+                        .unwrap_or(0),
+                    at: crate::interaction::now_millis(),
+                }),
+            };
+            if let Some(a) = amended.clone() {
+                s.intent_amendments.push(a);
+            }
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
+            // (core#555, EVT) IntentAmended — the amendment's audit record, emitted after the
+            // units and the session are durable and BEFORE `Resumed`, so no subscriber sees the
+            // run move before the text that changed its acceptance list.
+            if let Some(a) = amended {
+                emit(
+                    subscribers,
+                    CoreEvent::IntentAmended {
+                        session: run_id.to_string(),
+                        ord: a.ord,
+                        amendment: a.text,
+                        at: a.at,
+                    },
+                );
+            }
             // F-036: a human APPROVING a gate on an ALREADY-RUN guarded unit (a `HumanConfirmIf`
             // escalation — e.g. the guard denied the evaluator for rewriting the fix) has seen the
             // denial name every path and chosen to continue: the re-dispatch re-baselines on the
@@ -10789,6 +10879,7 @@ mod gate_pause_tests {
 
     fn sess(hc: HumanConfirm) -> AgentSession {
         AgentSession {
+            intent_amendments: Vec::new(),
             id: "s".into(),
             workflow_id: "wf-s".into(),
             problem: "p".into(),
@@ -11041,6 +11132,7 @@ mod terminal_gate_tests {
 
     fn seed_session(store: &mut dyn GraphStore, terminal_gate: GateSpec) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "r".into(),
             workflow_id: "wf-r".into(),
             problem: "p".into(),
@@ -11187,6 +11279,7 @@ retry the deliver phase";
     /// is `phase` — `deliver` is what crew composes; anything else is a plain tool phase.
     fn seed(store: &mut dyn GraphStore, run_id: &str, phase: &str, auto_deliver: bool) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -11513,6 +11606,7 @@ mod substance_gate_tests {
         tweak: impl FnOnce(&mut WorkUnit),
     ) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -12259,6 +12353,86 @@ mod substance_gate_tests {
         assert!(paused.3.contains("no `VERDICT:` line"), "{}", paused.3);
     }
 
+    /// (BC-80, core#535) A capture phase that reports NOTHING is denied INTO THE HUMAN GATE — the
+    /// silent 0-proposal run that used to read `completed`. An honest report passes and its counts
+    /// are persisted on the unit; a unit that declares no capture report is not parsed at all.
+    #[test]
+    fn a_capture_phase_with_no_report_marker_is_denied_and_an_honest_report_passes() {
+        let capture = |run_id: &str, output: &str, declared: bool| {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, run_id, PhaseRole::Creator, |u| {
+                u.requires_capture_report = declared;
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (applied, session, unit) = fold(&mut store, &mut subs, run_id, output, false);
+            (applied, session.status, unit)
+        };
+        let pid = std::process::id();
+        let prose = format!(
+            "Surveyed the repository and read its hotspots. {}",
+            "Everything looked familiar. ".repeat(10)
+        );
+
+        // 1. DECLARED and SILENT → denied into the gate, naming the contract.
+        let (applied, status, unit) = capture(&format!("capture-silent-{pid}"), &prose, true);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("capture_report")
+        );
+        assert!(
+            unit.denial_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(crate::validator::CAPTURE_REPORT_MISSING)),
+            "{:?}",
+            unit.denial_reason
+        );
+        assert!(unit.capture_report.is_none());
+
+        // 2. DECLARED and HONEST (a legitimate 0) → completes, counts on the unit.
+        let (applied, _, unit) = capture(
+            &format!("capture-zero-{pid}"),
+            &format!(
+                "{prose}\nwicked-capture-report {{\"derived\": 0, \"submitted\": 0, \"failed\": 0}}"
+            ),
+            true,
+        );
+        assert!(matches!(applied, StepApplied::Finished));
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(
+            unit.capture_report,
+            Some(crate::validator::CaptureReport {
+                derived: 0,
+                submitted: 0,
+                failed: 0
+            })
+        );
+
+        // 3. DECLARED and LOSSY (derived, never submitted) → denied, naming the loss.
+        let (_, status, unit) = capture(
+            &format!("capture-lossy-{pid}"),
+            &format!("{prose}\nwicked-capture-report derived=6 submitted=0 failed=0"),
+            true,
+        );
+        assert_eq!(status, SessionStatus::AwaitingHuman);
+        assert!(
+            unit.denial_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("derived 6 learning(s) and submitted 0")),
+            "{:?}",
+            unit.denial_reason
+        );
+        assert_eq!(unit.capture_report.map(|r| r.derived), Some(6));
+
+        // 4. NOT DECLARED → not parsed; every other phase behaves exactly as before.
+        let (applied, _, unit) = capture(&format!("capture-undeclared-{pid}"), &prose, false);
+        assert!(matches!(applied, StepApplied::Finished));
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert!(unit.capture_report.is_none());
+    }
+
     /// Review-L1-513 LOW 4 (DES §7 (5)): a NEUTRAL unit is not read either — its prose may quote
     /// a `VERDICT: FAIL` line (a triage phase summarising a failed review) and it completes with
     /// `evaluatorVerdict: null`.
@@ -12488,6 +12662,7 @@ mod request_changes_tests {
     /// session. Otherwise: the intake gate — nothing has run, cursor 0, `AwaitingHuman`.
     fn seed_bug(store: &mut dyn GraphStore, run_id: &str, at_verify: bool) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "fix the bug".into(),
@@ -12563,6 +12738,7 @@ mod request_changes_tests {
     /// inject the operator note even though the deliver unit carries no evaluator denial.
     fn seed_bug_with_deliver(store: &mut dyn GraphStore, run_id: &str) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "fix the bug".into(),
@@ -12972,6 +13148,164 @@ mod request_changes_tests {
         );
     }
 
+    /// (core#555) `amend_intent` at a human gate reaches EVERY unit at or after the cursor — the
+    /// LATER EVALUATOR above all, which is the whole point: `approve { amend }` lands on one
+    /// unit's instruction, so before this arm a mid-run descope never reached the evaluator and it
+    /// kept judging the un-amended launch intent. The amendment is recorded on the run and
+    /// audited by `intentAmended`, and offering the same text twice does not double it.
+    #[test]
+    fn amend_intent_reaches_every_later_evaluator_and_is_recorded() {
+        let run_id = format!("rc-amend-intent-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let amend = || HumanDecision::AmendIntent {
+            text: "issue #621 is withdrawn from this run's scope".into(),
+        };
+        gate(&mut store, &mut subs, &run_id, amend()).unwrap();
+
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let expected = format!(
+            "{}issue #621 is withdrawn from this run's scope",
+            crate::workflow::INTENT_AMENDMENT_PREFIX
+        );
+        for (ix, u) in units.iter().enumerate() {
+            assert!(
+                u.description.ends_with(&expected),
+                "unit {ix} must carry the amendment: {}",
+                u.description
+            );
+        }
+        // The evaluator specifically — the seat that judges the acceptance list.
+        assert_eq!(units[3].role, PhaseRole::Evaluator);
+        assert!(units[3].description.contains("APPROVED INTENT AMENDMENT"));
+        assert!(units[3]
+            .description
+            .contains("judge the amended acceptance"));
+
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.intent_amendments.len(), 1);
+        assert_eq!(
+            session.intent_amendments[0].text,
+            "issue #621 is withdrawn from this run's scope"
+        );
+        assert_eq!(session.intent_amendments[0].ord, 1, "the gate's cursor ord");
+        assert!(session.intent_amendments[0].at > 0, "decided-at is stamped");
+        assert_eq!(
+            session.status,
+            SessionStatus::Executing,
+            "the gate approved"
+        );
+
+        let evs = drain(&erx);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::IntentAmended { ord: 1, amendment, .. }
+                    if amendment == "issue #621 is withdrawn from this run's scope"
+            )),
+            "intentAmended is the audit record"
+        );
+        // …before `Resumed`: no subscriber sees the run move before the amendment.
+        let amended_at = evs
+            .iter()
+            .position(|e| matches!(e, CoreEvent::IntentAmended { .. }))
+            .expect("intentAmended");
+        let resumed_at = evs
+            .iter()
+            .position(|e| matches!(e, CoreEvent::Resumed { .. }))
+            .expect("resumed");
+        assert!(amended_at < resumed_at);
+
+        // The SAME text at a later gate is not appended twice (the studio pre-fills gates).
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.status = SessionStatus::AwaitingHuman;
+        put_node(&mut store, session.to_node()).unwrap();
+        gate(&mut store, &mut subs, &run_id, amend()).unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[3]
+                .description
+                .matches("APPROVED INTENT AMENDMENT")
+                .count(),
+            1,
+            "an identical amendment is not re-landed on the unit"
+        );
+        // …nor re-recorded on the run, nor re-audited: one decision, one amendment.
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.intent_amendments.len(), 1);
+        assert!(
+            !drain(&erx)
+                .iter()
+                .any(|e| matches!(e, CoreEvent::IntentAmended { .. })),
+            "an identical amendment emits no second audit record"
+        );
+    }
+
+    /// (core#555) An amendment with no text amends nothing: refused BEFORE the row resolves, so
+    /// the gate stays open and re-answerable — never an approve that silently changed no
+    /// acceptance list. And a run with no amendment is byte-identical to before the arm existed.
+    #[test]
+    fn an_empty_amend_intent_is_refused_and_an_unamended_run_is_unchanged() {
+        let run_id = format!("rc-amend-empty-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, false);
+        let mut subs = crate::event_log::EventSink::default();
+        let err = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::AmendIntent { text: "   ".into() },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("needs the amendment text") && err.contains("approve without it"),
+            "{err}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (session.unit_ix, session.status),
+            (0, SessionStatus::AwaitingHuman),
+            "the gate stays open"
+        );
+        assert!(session.intent_amendments.is_empty());
+
+        // A plain approve leaves every description and the wire untouched (behaviour unchanged
+        // when no amendment is offered — the third acceptance item on core#555).
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert!(units
+            .iter()
+            .all(|u| !u.description.contains("INTENT AMENDMENT")));
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert!(serde_json::to_value(&session)
+            .unwrap()
+            .get("intent_amendments")
+            .is_none());
+    }
+
     /// DES §7 (10), review H2: the marker REPLACES its predecessor — a second round leaves the
     /// description no longer than the first — is single-line, whitespace-collapsed and bounded.
     #[test]
@@ -13155,6 +13489,7 @@ mod code_evidence_floor_tests {
         workdir: Option<String>,
     ) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -13524,6 +13859,7 @@ mod deliverable_floor_tests {
         deliverables: Vec<String>,
     ) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -14046,6 +14382,7 @@ mod seat_failover_tests {
         unit_ix: usize,
     ) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -14690,6 +15027,7 @@ mod def_gate_disclosure_tests {
     /// the exact state FINDING-023 observed (`feature`'s clarify gate under `human_confirm: none`).
     fn seed(store: &mut dyn GraphStore, hc: HumanConfirm) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "d".into(),
             workflow_id: "wf-d".into(),
             problem: "p".into(),
@@ -14797,6 +15135,7 @@ mod def_gate_disclosure_tests {
     fn a_terminal_def_gate_under_none_discloses_too() {
         let mut store = open_store(Some(":memory:")).unwrap();
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "d".into(),
             workflow_id: "wf-d".into(),
             problem: "p".into(),
@@ -14893,6 +15232,7 @@ mod def_gate_disclosure_tests {
         bench: Vec<crate::domain::BenchedSeat>,
     ) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "rl".into(),
             workflow_id: "wf-rl".into(),
             problem: "p".into(),
@@ -15212,6 +15552,7 @@ mod terminal_worktree_reap_tests {
         .unwrap();
         let wt = crate::repo::create_worktree(&entry.root_path, run_id).unwrap();
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -15686,6 +16027,7 @@ mod terminal_worktree_reap_tests {
     #[test]
     fn partition_returns_live_first_then_terminal() {
         let live_session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "s-live".into(),
             workflow_id: "wf".into(),
             problem: "p".into(),
@@ -15858,6 +16200,7 @@ mod worker_code_graph_tests {
     /// fixed instantly — the recovery worked; nothing announced it was needed.
     fn session_at(id: &str, status: SessionStatus) -> AgentSession {
         crate::domain::AgentSession {
+            intent_amendments: Vec::new(),
             id: id.into(),
             workflow_id: "wf".into(),
             problem: "p".into(),
@@ -16182,6 +16525,7 @@ mod project_graph_binding_tests {
     /// A minimal executing session; each test overrides only the two fields this seam reads.
     fn session_fixture() -> AgentSession {
         AgentSession {
+            intent_amendments: Vec::new(),
             id: "run-fixture".into(),
             workflow_id: "wf-run-fixture".into(),
             problem: "p".into(),
@@ -16930,6 +17274,7 @@ mod phase_boundary_governance_tests {
 
     fn awaiting_session(store: &mut dyn GraphStore) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "r".into(),
             workflow_id: "wf-r".into(),
             problem: "p".into(),
@@ -17388,6 +17733,7 @@ mod turn_timeout_vs_cancel_tests {
 
     fn seed_run(store: &mut dyn GraphStore, run_id: &str, attempt: u32) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -17584,6 +17930,7 @@ mod turn_timeout_vs_cancel_tests {
 
         // Seed a session at attempt 1 with a unit that has NO tool_cmd.
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.clone(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -17644,6 +17991,7 @@ mod turn_timeout_vs_cancel_tests {
         std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
         let now = crate::interaction::now_millis();
         let fresh = AgentSession {
+            intent_amendments: Vec::new(),
             id: "s-fresh".into(),
             workflow_id: "wf".into(),
             problem: "p".into(),
@@ -17722,6 +18070,7 @@ mod turn_timeout_vs_cancel_tests {
     #[test]
     fn eligible_roster_keys_drop_benched_seats() {
         let mut session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "s".into(),
             workflow_id: "wf".into(),
             problem: "p".into(),
@@ -18271,6 +18620,7 @@ mod dead_seat_park_tests {
 
     fn seed_cancelled(store: &mut dyn GraphStore, run_id: &str) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: run_id.into(),
             workflow_id: format!("wf-{run_id}"),
             problem: "p".into(),
@@ -18397,6 +18747,7 @@ mod plan_gate_confirm_tests {
     /// `r` paused at `plan_approval` before unit 2, unit 1 `Done`; `cursor_status` is unit 2's.
     fn fixture(store: &mut dyn GraphStore, cursor_status: UnitStatus) {
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "r".into(),
             workflow_id: "wf-r".into(),
             problem: "p".into(),
@@ -18576,6 +18927,7 @@ mod catalog_alias_governance_tests {
     fn approve_under_review_policy(phase_id: &str, catalog: Option<&str>) -> SessionStatus {
         let mut store = open_store(Some(":memory:")).unwrap();
         let session = AgentSession {
+            intent_amendments: Vec::new(),
             id: "r".into(),
             workflow_id: "wf-r".into(),
             problem: "p".into(),

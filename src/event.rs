@@ -1023,6 +1023,20 @@ pub enum CoreEvent {
         /// Additive.
         scope: String,
     },
+    /// (core#555) A human APPROVED A GATE AND AMENDED THE RUN'S INTENT: the amendment was
+    /// appended to every unit at or after `ord`, so the acceptance list each LATER EVALUATOR is
+    /// handed changed with the decision. Fires after the units and the session are durable and
+    /// before `Resumed`. This is the amendment's AUDIT RECORD: `unitReworkAmended` says one
+    /// unit's instruction changed; this says the run's acceptance list did.
+    IntentAmended {
+        session: String,
+        /// The gate's cursor unit — the first unit the amendment reaches.
+        ord: u32,
+        /// The human's own words: what the run's acceptance list now says.
+        amendment: String,
+        /// When it was decided (unix millis).
+        at: i64,
+    },
     /// (EVT-013) A worker's `ApplyStepResult` arrived and the output is ready to be gated. Fires
     /// after all terminal/idempotency/attempt guards pass, before the gate runs. `output_bytes` is
     /// the byte length of the worker's output — lets an operator immediately distinguish "0 bytes"
@@ -2224,6 +2238,18 @@ impl CoreEvent {
                 "amendment": amendment,
                 "updatedDescription": updated_description,
                 "scope": scope,
+            }),
+            CoreEvent::IntentAmended {
+                session,
+                ord,
+                amendment,
+                at,
+            } => json!({
+                "type": "intentAmended",
+                "session": session,
+                "ord": ord,
+                "amendment": amendment,
+                "at": at,
             }),
             CoreEvent::UnitOutputCaptured {
                 session,

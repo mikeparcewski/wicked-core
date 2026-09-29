@@ -317,6 +317,12 @@ export declare class Core {
    * and `accept_suggestion` adopts the evaluator's discarded, pinned edit as the creator's
    * amendment. The engine refuses each at any other gate.
    *
+   * (core#555, additive.) `amend_intent` (`approve=true`, the text in `amend`, no `amendScope`)
+   * approves the gate AND AMENDS THE RUN'S INTENT: the text is appended to every unit at or after
+   * the cursor, so the acceptance list each LATER EVALUATOR is handed changes with the decision,
+   * and it is recorded on the run (`intent_amendments`) plus an `intentAmended` event. It is the
+   * only arm that can descope a run mid-flight; refused at a plan or team gate, and with no text.
+   *
    * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
    * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
    * as the next plan rev (floor phases added, never refused for being below the floor) or, if it

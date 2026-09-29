@@ -196,6 +196,21 @@ pub struct AgentSession {
     /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<BenchedSeat>,
+    /// (core#555) The run's APPROVED INTENT AMENDMENTS, in the order a human decided them: the
+    /// `amend_intent` arm of a human gate ([`crate::workflow::HumanDecision::AmendIntent`]).
+    ///
+    /// An amendment is the ONE in-run channel that changes the acceptance list a LATER EVALUATOR
+    /// is handed. `Approve { amend }` reaches one unit's instruction (the creator's, or the
+    /// cursor's); nothing reached the evaluator, so a mid-run descope was structurally impossible
+    /// — the evaluator kept judging the un-amended launch intent and the only exit was a relaunch.
+    /// The amendment is appended to the description of every unit at or after the amending gate's
+    /// cursor, and it is recorded HERE so the run record (and the run page) can show what was
+    /// withdrawn, by whom and when, beside the original intent.
+    ///
+    /// `#[serde(default)]` + skip-if-empty: older sessions deserialize and an unamended run
+    /// serializes byte-identical to before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_amendments: Vec<IntentAmendment>,
     /// (DES-TEAMING-002 §4.1/§4.7, seam P1) A TEAM run's durable team state: its transport, the
     /// acknowledged `path.started` (`stream_floor`), the accepted plan rev, the gate sequence and
     /// the one engine fact the run is waiting on. `None` on every non-team run (and on a team run
@@ -438,6 +453,24 @@ impl UnitTeamSnapshot {
             transcript: None,
         }
     }
+}
+
+/// One APPROVED INTENT AMENDMENT (core#555) — [`AgentSession::intent_amendments`].
+///
+/// A human at a gate withdrew or changed a launch-intent item, so the acceptance list every LATER
+/// evaluator is handed must change with it. The engine appends [`Self::text`] to the description
+/// of every unit at or after [`Self::ord`], prefixed with
+/// [`crate::workflow::INTENT_AMENDMENT_PREFIX`] — the prompt sentence that tells an evaluator an
+/// approved amendment OVERRIDES the corresponding launch item, so it cannot honestly judge against
+/// a withdrawn one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentAmendment {
+    /// The human's own words — what the run's acceptance list now says.
+    pub text: String,
+    /// The gate's cursor `ord` when it was decided: the first unit the amendment reaches.
+    pub ord: u32,
+    /// When it was decided (unix millis, [`crate::clock`]).
+    pub at: i64,
 }
 
 /// One seat benched for a run ([`AgentSession::benched_seats`], F-7R2-006).
@@ -738,6 +771,21 @@ pub struct WorkUnit {
     /// non-code units serialize byte-identical to before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub executes_code: bool,
+    /// (BC-80, core#535) Whether this unit's backing phase declared
+    /// [`requires_capture_report`](crate::workflow::PhaseDef::requires_capture_report) — carried
+    /// verbatim at plan time, exactly the way `executes_code` is. One consumer: the gate fold's
+    /// CAPTURE-REPORT arm ([`crate::validator::parse_capture_report`]), which denies a capture
+    /// phase whose output carries no `wicked-capture-report` marker, or whose marker says
+    /// proposals were derived and not submitted. Skip-if-false: every other unit serializes
+    /// byte-identical to before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_capture_report: bool,
+    /// (BC-80, core#535) The counts the capture phase REPORTED, read from its output marker by the
+    /// gate fold. `None` on every unit that declares no capture report, and on one whose marker
+    /// was missing (that case denies — the denial is the record). Evidence on the persisted unit,
+    /// so `GET /runs/:id` can show "N derived · M submitted · K failed" without re-reading output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_report: Option<crate::validator::CaptureReport>,
     /// The exact command this unit runs when `PhaseExecutor::Tool` (carried from the phase def).
     /// `None` for Agent-executor units. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1105,8 @@ impl WorkUnit {
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,
+            requires_capture_report: false,
+            capture_report: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
@@ -1383,6 +1433,7 @@ mod tests {
 
     fn sample_session() -> AgentSession {
         AgentSession {
+            intent_amendments: Vec::new(),
             id: "s-demo".to_string(),
             workflow_id: "wf-s-demo".to_string(),
             problem: "Build a thing".to_string(),

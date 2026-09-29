@@ -613,6 +613,7 @@ fn craft_campaign_at(def: CampaignDef, node: &str, status: NodeStatus) -> Campai
 /// written by the caller, so `session_units` is empty — the R1 window).
 fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
     AgentSession {
+        intent_amendments: Vec::new(),
         id: run_id.to_string(),
         workflow_id: format!("wf-{run_id}"),
         problem: "crashed mid-campaign".into(),

@@ -33,6 +33,7 @@ fn fixture(
         proposal_id: "p-fixture".into(),
     };
     let session = AgentSession {
+        intent_amendments: Vec::new(),
         id: "r".into(),
         workflow_id: "wf-r".into(),
         problem: "p".into(),
