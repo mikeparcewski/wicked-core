@@ -5945,7 +5945,11 @@ fn chat_boundary(
         // chat (formerly hard-coded `false`: the strict argv-only spelling).
         estate_store_pinned: crate::gate_hook::estate_store_pinned_for_child()
             || scope.code_graph_db.is_some(),
+        // A chat grounds on its graph READ-ONLY, so the key dir is never a write root here
+        // (Copilot, #426) — but the store it is BOUND to is still the one no seat may open with
+        // raw SQL, so the raw-SQLite fence reads it off `graph_store_db` (issue #645).
         graph_write_dir: None,
+        graph_store_db: scope.code_graph_db.as_deref().map(std::path::PathBuf::from),
     }
 }
 
@@ -7392,6 +7396,8 @@ impl AcpStepRunner {
                         || g.code_graph_db.is_some(),
                     // The exact graph dir in `write` above — the witness skips it and only it.
                     graph_write_dir: graph_write,
+                    // The store this unit is bound to, for the raw-SQLite fence (issue #645).
+                    graph_store_db: g.code_graph_db.as_deref().map(std::path::PathBuf::from),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -7893,6 +7899,7 @@ impl AcpStepRunner {
                         deliverable_roots: boundary.deliverable_roots.clone(),
                         estate_store_pinned: boundary.estate_store_pinned,
                         graph_write_dir: boundary.graph_write_dir.clone(),
+                        graph_store_db: boundary.graph_store_db.clone(),
                     }),
                 }
             },
@@ -14800,6 +14807,7 @@ os_sandbox = true
                 "Write",
                 None,
                 boundary.estate_store_pinned,
+                &[],
             )
             .map(|(_, fatal)| fatal)
         };
@@ -15633,6 +15641,47 @@ acp_input_governance = true
         assert!(
             !allowed_unbound,
             "…and stays refused where nothing pins the store (the silently-ungrounded class)"
+        );
+
+        // Issue #645, the chat arm: the store a chat is BOUND to may not be opened with raw SQL,
+        // named by its literal path — not only through `$WICKED_ESTATE_DB`. A chat's graph is
+        // read-only, so `graph_write_dir` is `None` here by design; reading the fence off that
+        // field alone left this exact call allowed (codex review), which is why the boundary
+        // carries `graph_store_db`.
+        assert_eq!(
+            chat_boundary(&bound, seat, "").graph_store_db.as_deref(),
+            Some(graph.as_path()),
+            "the bound chat names the store the raw-SQLite fence judges"
+        );
+        let raw_sql = |db: &str| {
+            json!({
+                "sessionId": "s1",
+                "toolName": "Bash",
+                "toolCall": {"toolCallId": "t2", "rawInput": {
+                    "command": format!("sqlite3 {db} 'CREATE TABLE evil (x)'")}},
+                "options": [
+                    {"optionId": "allow", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"},
+                ],
+            })
+        };
+        let (refusal, allowed_raw) = crate::acp_permission::chat_boundary_result(
+            &chat_boundary(&bound, seat, ""),
+            &raw_sql(&graph.to_string_lossy()),
+        );
+        assert!(
+            !allowed_raw,
+            "raw SQLite on the chat's own graph is refused: {refusal}"
+        );
+        assert_eq!(refusal["outcome"]["optionId"], "reject");
+        let other = dir.join("fixture.db");
+        let (_, allowed_other) = crate::acp_permission::chat_boundary_result(
+            &chat_boundary(&bound, seat, ""),
+            &raw_sql(&other.to_string_lossy()),
+        );
+        assert!(
+            allowed_other,
+            "a sqlite call on another database is not the graph fence's business"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -21289,6 +21338,7 @@ transport = "stdio"
             write_posture: crate::write_posture::WritePosture::Full,
             estate_store_pinned: false,
             graph_write_dir: None,
+            graph_store_db: None,
         };
         let lock = std::sync::Mutex::new(());
         let ask = |cmd: &str, id: u64| -> serde_json::Value {

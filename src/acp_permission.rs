@@ -346,7 +346,10 @@ pub(crate) fn pretool_payload(params: &Value) -> Option<(String, Value)> {
     // MCP tools surfaced through the estate server) omit the top-level `toolName` field and carry
     // the canonical tool name only in `toolCall.name`. `toolCall.title` is a human-readable
     // per-call description (e.g. "Reading /tmp/foo") — NOT the canonical name — so it is the last
-    // resort and must not substitute for `toolCall.name` when the latter is present.
+    // resort and must not substitute for `toolCall.name` when the latter is present. A title that
+    // reaches here is judged (a self-describing request is not waved through) but is NEVER filed
+    // as an identity in the audit record — `gate_hook::audit_tool_name` labels it, so no row reads
+    // a path as the tool name (issue #570 defect 2).
     // Without the `toolCall.name` step this function returned `None`, causing `permission_result`
     // to answer `cancelled` (deny) with no governance record, silently blocking legitimate calls.
     // Empty strings at any step must not short-circuit the fallback — an explicit `"toolName": ""`
@@ -461,6 +464,8 @@ pub(crate) fn chat_boundary_result(
         &tool_name,
         None,
         boundary.estate_store_pinned,
+        // A chat seat bound to a graph gets the same raw-SQLite fence a unit does (issue #645).
+        &crate::gate_hook::graph_store_paths(Some(boundary)),
     )
     .is_none();
     match choose_option(params.get("options").unwrap_or(&Value::Null), allowed) {
@@ -562,6 +567,14 @@ mod tests {
             decisions_path: decisions.to_str().unwrap(),
             boundary: None, // pure policy-evaluation test — no unit filesystem
         };
+        // `boundary: None` means the gate resolves the boundary from PROCESS ENV, so a concurrent
+        // test holding `WICKED_WRITE_ROOTS` (every `gate_hook` boundary row does) makes the fence
+        // refuse `rm -rf /` before any policy is consulted — and the recorded claim is then a
+        // boundary deny, not `pol-deny-bash`. Hold the crate-wide env lock for READING, as the
+        // lock's own doc prescribes.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let params = json!({
             "sessionId": "s1",
             "toolName": "Bash",
@@ -665,6 +678,7 @@ mod tests {
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
                 graph_write_dir: None,
+                graph_store_db: None,
             })
         };
 
@@ -774,6 +788,7 @@ mod tests {
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
                 graph_write_dir: None,
+                graph_store_db: None,
             })
         };
         // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.
@@ -1123,6 +1138,38 @@ mod tests {
         );
     }
 
+    /// Issue #570 defect 2: the bridge that sends NO canonical name, only `toolCall.title`.
+    ///
+    /// Three records of run 35565185 named `/tmp` as the tool — all on the evaluator unit, all in
+    /// the same millisecond: the title fallback, filed as if it were an identity. The title is
+    /// still what governance evaluates (a request that only describes itself is judged on its
+    /// description, not waved through), but the AUDIT record must not claim a path is a tool
+    /// name — `gate_hook::audit_tool_name` labels it instead, so the row reads
+    /// `(described) /tmp` and no reader mistakes it for a tool a policy could match.
+    #[test]
+    fn a_title_only_request_is_never_audited_as_a_tool_name() {
+        for title in ["/tmp", "Reading /tmp/foo"] {
+            let params = json!({
+                "sessionId": "s-title",
+                "toolCall": {"toolCallId": "tc-t", "title": title, "rawInput": {}},
+            });
+            let (tool, payload) =
+                pretool_payload(&params).expect("a title-only request is still evaluated");
+            assert_eq!(tool, title, "the title is what there is to judge");
+            let (_, name) =
+                crate::gate_hook::claude_pretool_context(&payload.to_string(), "unit", "build");
+            assert_eq!(
+                crate::gate_hook::audit_tool_name(&name),
+                format!("(described) {title}"),
+                "the record labels a description instead of filing it as the tool name"
+            );
+        }
+        // A tool-shaped `toolCall.name` is untouched by the same seam.
+        let params = json!({"toolCall": {"name": "Read", "title": "Reading /tmp/foo"}});
+        let (tool, _) = pretool_payload(&params).unwrap();
+        assert_eq!(crate::gate_hook::audit_tool_name(&tool), "Read");
+    }
+
     /// F-7R2-012 (wave 6): the command of an EXECUTE-class request — by ACP kind or by the
     /// seats' shell tool names, from the tool's own arguments (several spellings) or the title
     /// as a last resort; a non-execute call yields nothing.
@@ -1257,6 +1304,9 @@ mod tests {
                 {"optionId": "reject", "kind": "reject_once"},
             ],
         });
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let allowed = |n: usize, phase_alias: Option<&str>, catalog_alias: Option<&str>| {
             let log = dir.join(format!("decisions-{n}.jsonl"));
             let gate = AcpGate {
@@ -1266,7 +1316,7 @@ mod tests {
                 catalog_alias,
                 db: Some(db.to_str().unwrap()),
                 decisions_path: log.to_str().unwrap(),
-                boundary: None,
+                boundary: None, // env-resolved: the read guard below keeps a mutator out
             };
             permission_result(&gate, &params).1
         };

@@ -303,6 +303,7 @@ fn boundary_denial(
         tool,
         Some(install_state),
         estate_store_pinned_from_env(),
+        &graph_store_paths(None),
     )
 }
 
@@ -365,6 +366,16 @@ pub(crate) struct BoundaryCtx {
     /// `None`. It is the engine's store, in the write set only for SQLite's WAL files, so the
     /// write-root witness skips it; the subprocess carrier reads [`GRAPH_WRITE_DIR_ENV`].
     pub graph_write_dir: Option<std::path::PathBuf>,
+    /// The graph STORE this boundary is bound to — the db path the carrier handed the seat as
+    /// `WICKED_ESTATE_DB`, for the raw-SQLite fence (issue #645).
+    ///
+    /// Deliberately NOT `graph_write_dir`: that field is the engine-computed WRITE root, and it is
+    /// `None` for a chat by design (a chat grounds on its graph READ-ONLY, so its key dir never
+    /// becomes a kernel-floor write root — `acp_runner`, Copilot on #426). Whether the store is
+    /// writable is a different question from WHICH store must never be opened with raw SQL, and
+    /// the second is true on both carriers. Reading the fence off the write dir left a chat able
+    /// to name the graph by literal path (codex review of this change).
+    pub graph_store_db: Option<std::path::PathBuf>,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -419,6 +430,7 @@ pub(crate) fn boundary_denial_with(
         tool,
         None,
         false,
+        &[],
     )
 }
 
@@ -709,6 +721,34 @@ fn compute_witness_roots(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathB
         .collect()
 }
 
+/// The locations that identify the SHARED graph store, for the raw-SQLite fence (issue #645):
+/// the engine's EXACT repo-graph key dir ([`BoundaryCtx::graph_write_dir`] /
+/// [`GRAPH_WRITE_DIR_ENV`]), the store the boundary is BOUND to
+/// ([`BoundaryCtx::graph_store_db`] — the chat carrier has one without a write dir) and the store
+/// paths the environment PINS ([`ESTATE_STORE_PIN_ENV`]).
+///
+/// Read per carrier exactly as [`compute_witness_roots`] reads its inputs: the in-process carrier
+/// takes the dir off the boundary it was handed, the hook subprocess off its own environment
+/// (which is the worker's). The env values are kept only when they are absolute and not a
+/// filesystem root — the same fail-closed screen [`valid_config_home`] applies, so a stray
+/// `WICKED_HOME=/` cannot make every path look like the graph store.
+pub(crate) fn graph_store_paths(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathBuf> {
+    let dir = match boundary {
+        Some(b) => b.graph_write_dir.clone(),
+        None => graph_write_dir_from_env(),
+    };
+    let mut out: Vec<std::path::PathBuf> = dir.into_iter().collect();
+    if let Some(db) = boundary.and_then(|b| b.graph_store_db.clone()) {
+        out.push(db);
+    }
+    for key in ESTATE_STORE_PIN_ENV {
+        if let Some(p) = std::env::var_os(key).and_then(|v| valid_config_home(&v)) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Diff two sorted entry lists and return the paths that changed (created, deleted, or modified).
 fn diff_witness_entries(old: &[(String, u64, u64)], new: &[(String, u64, u64)]) -> Vec<String> {
     use std::collections::HashMap;
@@ -745,6 +785,7 @@ pub(crate) fn boundary_denial_tracked(
     tool: &str,
     install_state: Option<&std::path::Path>,
     estate_store_pinned: bool,
+    graph_store: &[std::path::PathBuf],
 ) -> Option<(String, bool)> {
     // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
     if let Some(path) = context
@@ -838,7 +879,7 @@ pub(crate) fn boundary_denial_tracked(
             // code-executing) to decide advisory vs fatal; the `false` placeholder here is never
             // read for estate denies. Same defense-in-depth limit as bash_write_targets (a renamed
             // binary / raw SQLite still evades a literal scan; the OS sandbox is the hermetic layer).
-            if let Some(hit) = classify_estate_command(command, estate_store_pinned) {
+            if let Some(hit) = classify_estate_command(command, estate_store_pinned, graph_store) {
                 return Some((
                     format!(
                         "{ESTATE_DENY_REASON_PREFIX} `{}` — {}; {ESTATE_DENY_REMEDY}",
@@ -2017,6 +2058,99 @@ pub(crate) const ESTATE_WHY_NO_READONLY: &str =
 pub(crate) const ESTATE_WHY_NO_PIN: &str = "the estate shim / `wicked-estate-mcp` names no store \
      (`--db <path>` on argv, or WICKED_ESTATE_DB / WICKED_HOME / WICKED_MEMORY_DB in the worker env)";
 
+/// Why an estate invocation was refused — the segment opens the graph store as a raw SQLite file
+/// (issue #645).
+pub(crate) const ESTATE_WHY_RAW_SQLITE: &str =
+    "it opens the shared project graph as a raw SQLite database — the graph dir is an admitted \
+     write root only so SQLite can create its WAL files, and a hand-written statement mutates the \
+     graph that feeds risk scoring";
+
+/// Program basenames that open a SQLite database file directly (issue #645).
+const SQLITE_CLIENTS: [&str; 4] = ["sqlite3", "sqlite", "sqlite-utils", "litecli"];
+/// Interpreters whose standard library or everyday packages open a SQLite file — python's
+/// `sqlite3`, node's `node:sqlite` / `better-sqlite3`, and the rest of the family.
+const SQLITE_DRIVER_HOSTS: [&str; 7] = ["py", "node", "deno", "bun", "ruby", "perl", "tclsh"];
+
+/// Can this program word open a SQLite database — a sqlite client, or an interpreter that hosts a
+/// sqlite driver? Matched on the basename with the `.exe` suffix off, and `python*` by prefix so
+/// `python3`, `python3.12` and `python` all count.
+fn is_sqlite_capable_program(base: &str) -> bool {
+    let b = base.trim_end_matches(".exe").to_ascii_lowercase();
+    SQLITE_CLIENTS.contains(&b.as_str())
+        || SQLITE_DRIVER_HOSTS.contains(&b.as_str())
+        || b.starts_with("python")
+}
+
+/// Does this token NAME the shared graph store — one of the store-pin environment variables
+/// (`$WICKED_ESTATE_DB`, `${WICKED_HOME}`, `os.environ["WICKED_MEMORY_DB"]`) or one of the
+/// engine-resolved `graph_store` locations (the dir itself, or a file inside it)?
+///
+/// The path arm searches INSIDE the token — it may be a quoted argument, a `--db=<path>` flag or
+/// an inline `-c` program text — but every occurrence must sit on a NAME BOUNDARY, or the
+/// sibling graph key `…/graphs/abc1234` would be refused because it starts with `…/graphs/abc123`
+/// (codex review). Refusing a unit's own fixture db is a false refusal, not a safe default.
+fn token_names_graph_store(tok: &str, graph_store: &[std::path::PathBuf]) -> bool {
+    if ESTATE_STORE_PIN_ENV.iter().any(|k| tok.contains(k)) {
+        return true;
+    }
+    let normalised = script_path(tok);
+    graph_store
+        .iter()
+        .any(|g| names_path(&normalised, &g.to_string_lossy()))
+}
+
+/// Is `path` named somewhere in `text`, on a name boundary at both ends?
+///
+/// * before the match: the start of the token, or a character no path continues through (a quote,
+///   a space, `=`, `(`, `,`) — a leading `/` or a letter means a DIFFERENT path
+///   (`/mnt/backup/srv/g` is a copy, not the store);
+/// * after it: the end, a `/` (a file inside the dir) or any non-name character — a letter, digit,
+///   `-`, `_` or `.` means a longer sibling name.
+fn names_path(text: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let mut from = 0;
+    while let Some(i) = text[from..].find(path) {
+        let start = from + i;
+        let end = start + path.len();
+        let before_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !(name_char(c) || c == '/'));
+        let after_ok = match text[end..].chars().next() {
+            Some(c) => !name_char(c),
+            None => true, // the path ends the token
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Does this segment OPEN the shared graph store as a raw SQLite database (issue #645)?
+///
+/// The graph store sits in the unit's write set (SQLite must create its `-wal`/`-shm` siblings) and
+/// the write-root witness deliberately skips it (the read-only shim checkpoints it), so
+/// `sqlite3 "$WICKED_ESTATE_DB" 'CREATE TABLE …'` passes every path check, and the estate allowlist
+/// above never sees it because the program word is no estate binary. A read-only unit could
+/// therefore mutate the graph on purpose. So: a sqlite-capable program that names the store is
+/// refused, and the read-only estate shim stays the one way in.
+///
+/// Same DEFENSE-IN-DEPTH limit as the rest of this scan (see [`classify_estate_command`]'s doc): a
+/// renamed interpreter, a path assembled from a variable, or a second wrapper level still evades a
+/// literal scan. OS-level containment is the hermetic layer.
+fn opens_graph_store(words: &[&str], base: &str, graph_store: &[std::path::PathBuf]) -> bool {
+    is_sqlite_capable_program(base)
+        && words
+            .iter()
+            .any(|t| token_names_graph_store(t, graph_store))
+}
+
 /// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
 /// `clusters` joins them only WITHOUT `--annotate` (judged at the call site).
 const ESTATE_READ_VERBS: [&str; 8] = [
@@ -2217,8 +2351,12 @@ fn estate_subcommand<'a>(rest: &[&'a str]) -> Option<&'a str> {
     None
 }
 
-fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<EstateDeny> {
-    classify_estate_command_in(command, store_pinned_by_env, true)
+fn classify_estate_command(
+    command: &str,
+    store_pinned_by_env: bool,
+    graph_store: &[std::path::PathBuf],
+) -> Option<EstateDeny> {
+    classify_estate_command_in(command, store_pinned_by_env, graph_store, true)
 }
 
 /// The scan behind [`classify_estate_command`]. `unwrap_inline` is true for the command line the
@@ -2227,6 +2365,7 @@ fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<E
 fn classify_estate_command_in(
     command: &str,
     store_pinned_by_env: bool,
+    graph_store: &[std::path::PathBuf],
     unwrap_inline: bool,
 ) -> Option<EstateDeny> {
     let owned = shell_tokens(command);
@@ -2278,7 +2417,8 @@ fn classify_estate_command_in(
             Unwrapped::Program { idx, assignments } => (idx, assignments),
             Unwrapped::Inline(inner) => {
                 if unwrap_inline {
-                    let hit = classify_estate_command_in(inner, store_pinned_by_env, false);
+                    let hit =
+                        classify_estate_command_in(inner, store_pinned_by_env, graph_store, false);
                     if hit.is_some() {
                         return hit;
                     }
@@ -2326,6 +2466,14 @@ fn classify_estate_command_in(
             if !(store_pinned_by_env || argv_pins_store(words, &prefix_assignments)) {
                 return deny(ESTATE_WHY_NO_PIN);
             }
+            // An ALLOWED grounding call names the store on purpose (`--db "$WICKED_ESTATE_DB"`),
+            // so it must not fall through to the raw-SQLite arm below.
+            continue;
+        }
+
+        // RAW SQLITE FENCE (issue #645).
+        if opens_graph_store(words, base, graph_store) {
+            return deny(ESTATE_WHY_RAW_SQLITE);
         }
     }
     None
@@ -2516,6 +2664,7 @@ pub(crate) fn evaluate_tool_call(
             tool,
             None,
             b.estate_store_pinned,
+            &graph_store_paths(Some(b)),
         ),
         None => boundary_denial(context, tool, &install_state),
     };
@@ -2564,7 +2713,7 @@ pub(crate) fn evaluate_tool_call(
                 !advisory,
             );
         } else {
-            append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
+            append_boundary_deny(decisions_path, scope, phase, tool, &reason, fatal);
         }
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
@@ -2637,7 +2786,7 @@ pub(crate) fn evaluate_tool_call(
                          allowed Bash call — changed paths: {} (issue #541)",
                         changed.join(", ")
                     );
-                    append_witness_deny(decisions_path, scope, phase, &changed);
+                    append_witness_deny(decisions_path, scope, phase, tool, &changed);
                     eprintln!("wicked-governance: DENY ({reason})");
                     return 2;
                 }
@@ -2714,7 +2863,7 @@ pub(crate) fn evaluate_tool_call(
     // subprocess can interleave between the annotation and the claim (Copilot).
     {
         let annotation_json = serde_json::json!({
-            TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
+            TOOL_CALL_KEY: audit_tool_name(tool),
             TOOL_CALL_PHASE_KEY: phase,
         })
         .to_string()
@@ -2745,7 +2894,7 @@ pub(crate) fn evaluate_tool_call(
 
     match claim.decision {
         Decision::Deny => {
-            let t = if tool.is_empty() { "tool-call" } else { tool };
+            let t = audit_tool_name(tool);
             eprintln!("wicked-governance: DENY `{t}` (claim {})", claim.claim_id);
             2
         }
@@ -2887,6 +3036,12 @@ pub fn decisions_path_for(run_id: &str, attempt: u32) -> std::path::PathBuf {
 /// is atomic on both POSIX (`O_APPEND`) and Windows (`FILE_APPEND_DATA`), so parallel per-tool-call hook
 /// subprocesses cannot interleave a claim (finding #10 — the prior two-syscall `writeln!` split the JSON
 /// body from its newline, which could interleave and corrupt a line the drain then dropped).
+///
+/// TEST-ONLY since issue #570: every production recorder writes the tool-call annotation IN THE
+/// SAME buffer ([`append_annotated_claim_checked`]), because a claim appended bare reads
+/// `toolName: "(unknown)"` in [`collect_hook_decisions`] — the audit gap the issue reports. The
+/// tests keep it to forge claim lines and to prove an UNANNOTATED line still degrades gracefully.
+#[cfg(test)]
 fn append_decision(path: &Path, claim: &ConformanceClaim) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all_private(parent)?;
@@ -2980,6 +3135,82 @@ const HOOK_FIRED_KEY: &str = "_wicked_hook_fired";
 const TOOL_CALL_KEY: &str = "_wicked_tool_call";
 /// Companion phase key on the tool-call annotation (pairs with `TOOL_CALL_KEY`).
 const TOOL_CALL_PHASE_KEY: &str = "_wicked_tool_phase";
+
+/// The annotation value for a call whose carrier named no tool at all (the pinned wire literal —
+/// unchanged since the annotation was added; see [`audit_tool_name`]).
+const TOOL_CALL_PLACEHOLDER: &str = "tool-call";
+/// The annotation value for an OUTPUT-gate decision: it judges generated text, not a tool call, so
+/// the record says so instead of degrading to `(unknown)` (issue #570).
+const OUTPUT_GATE_TOOL: &str = "(output)";
+/// Prefix [`audit_tool_name`] puts on a carrier-supplied string that is NOT a tool name — the
+/// per-call DESCRIPTION some ACP bridges send in place of one (issue #570 defect 2: three records
+/// in run 35565185 named `/tmp`, a path, as the tool).
+const DESCRIBED_TOOL_PREFIX: &str = "(described) ";
+/// The parenthesised SENTINELS this codebase writes on purpose, matched EXACTLY — never by shape.
+/// A shape rule (`starts_with('(') && ends_with(')')`) would let a carrier's parenthesised
+/// description impersonate a sentinel, so `toolCall.title = "(Reading /tmp/foo)"` would be filed
+/// as a tool name (codex review of #570). `(unnamed)` is `acp_permission`'s name for a write-class
+/// request that carries no name; `(unknown)` is what a reader shows for a log line with no
+/// annotation at all.
+const TOOL_NAME_SENTINELS: [&str; 3] = [OUTPUT_GATE_TOOL, "(unnamed)", "(unknown)"];
+
+/// Is `name` shaped like a canonical tool name — `Bash`, `NotebookEdit`, `mcp__estate__recall`,
+/// `str_replace_based_edit_tool`, or the broker's qualified `mcp:<server>/<tool>`? An
+/// identifier-ish token: no whitespace, and only the punctuation real tool names use.
+///
+/// One of this codebase's own [`TOOL_NAME_SENTINELS`] passes through unchanged — by exact match,
+/// so a carrier's parenthesised description cannot impersonate one.
+fn is_tool_shaped(name: &str) -> bool {
+    if TOOL_NAME_SENTINELS.contains(&name) {
+        return true;
+    }
+    if name.is_empty() || name.len() > 96 {
+        return false;
+    }
+    // The broker's own subject spelling ([`crate::mcp_gate::subject_of`]) is the ONE canonical
+    // name that carries a `/`, and it carries exactly one, between two plain tokens. Admitting it
+    // by that shape keeps the general rule below free of path separators — which is the whole
+    // point: `/tmp` must not read as a tool name.
+    if let Some((server, tool)) = name.strip_prefix("mcp:").and_then(|r| r.split_once('/')) {
+        return is_plain_tool_token(server) && is_plain_tool_token(tool);
+    }
+    is_plain_tool_token(name)
+}
+
+/// One unqualified tool-name token: alphanumerics plus the punctuation tool names actually use.
+fn is_plain_tool_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// The tool name a decision record may carry (issue #570).
+///
+/// Every audit reader — `GovernanceHookFired`, `workerToolCallDenied`, an operator grepping the
+/// decisions log — treats this field as "the tool the hook intercepted". A carrier that names no
+/// tool and only DESCRIBES the call (`toolCall.title`, which ACP bridges fill with prose like
+/// `Reading /tmp/foo` or with the bare path `/tmp`) must therefore not have its description filed
+/// AS the name: a path recorded in that field reads like a tool that does not exist, and a policy
+/// written against `Bash` never fires for it, so the mislabelling is an unenforced rule and not
+/// just an ugly row.
+///
+/// So: a tool-shaped name rides verbatim; anything else is recorded LABELLED
+/// ([`DESCRIBED_TOOL_PREFIX`]), which keeps the raw string (the record stays reconstructible) while
+/// making it unmistakable that the carrier named no tool. Empty ⇒ [`TOOL_CALL_PLACEHOLDER`].
+///
+/// This lives at the ONE recording seam — the annotation the three appenders write — so it holds
+/// for every carrier (wrapped hook, ACP bridge, MCP broker) rather than per parse site.
+pub(crate) fn audit_tool_name(tool: &str) -> String {
+    let t = tool.trim();
+    if t.is_empty() {
+        return TOOL_CALL_PLACEHOLDER.to_string();
+    }
+    if is_tool_shaped(t) {
+        return t.to_string();
+    }
+    format!("{DESCRIBED_TOOL_PREFIX}{t}")
+}
 
 /// `create_dir_all` + restrict the leaf dir to owner-only (0700) on Unix, so another local user on a
 /// shared host cannot traverse in to read a run's policy scope/phase, tool-call context, or denial
@@ -3076,7 +3307,7 @@ pub(crate) fn append_annotated_claim_checked(
     claim: &ConformanceClaim,
 ) -> std::io::Result<()> {
     let annotation = serde_json::json!({
-        TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
+        TOOL_CALL_KEY: audit_tool_name(tool),
         TOOL_CALL_PHASE_KEY: phase,
     })
     .to_string()
@@ -3105,7 +3336,7 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str,
         claim_id: format!("infra-deny:{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
-        policy_ids: vec![],
+        policy_ids: vec![INFRA_RULE_ID.to_string()],
         decision: Decision::Deny,
         obligations: vec![reason.to_string()],
         evaluated_context_ref: "sha256:infra".to_string(),
@@ -3152,6 +3383,22 @@ const PHASE_SCOPE_EVALUATOR: &str = "wicked-governance-phase-scope";
 /// `wicked-governance` policy row: it is a structural property of the workflow def, not something an
 /// operator authors or edits per run.
 pub(crate) const PHASE_SCOPE_RULE_ID: &str = "engine:pre-build-scope";
+
+/// The engine-owned rule ids the OTHER deny recorders carry (issue #570).
+///
+/// `collect_hook_decisions` reports a Deny's FIRST policy id as `denyingPolicy`, and every
+/// engine-side recorder used to file `policy_ids: vec![]` — so in run 35565185 the run's ONE denial
+/// arrived with `denyingPolicy: null`, and the single moment the fence acted was the single record
+/// that could not say which rule acted. A deny that cannot name its rule is not a reconstructible
+/// deny-dominates guarantee, so each fence names itself here, in the `engine:` namespace the
+/// phase-scope rule already uses (a structural property of the engine, not an operator-authored
+/// policy row): one id per fence, so an operator can grep and alert on the specific boundary.
+pub(crate) const BOUNDARY_WRITE_RULE_ID: &str = "engine:filesystem-boundary-write";
+pub(crate) const BOUNDARY_READ_RULE_ID: &str = "engine:filesystem-boundary-read";
+pub(crate) const INFRA_RULE_ID: &str = "engine:governance-infra";
+pub(crate) const MCP_FENCE_RULE_ID: &str = "engine:mcp-isolation";
+pub(crate) const REMOTE_WRITE_RULE_ID: &str = "engine:remote-write-fence";
+pub(crate) const ESTATE_FENCE_RULE_ID: &str = "engine:estate-command-fence";
 /// Claim-id prefix for a phase-scope deny. ADVISORY, for the same reason a blocked out-of-boundary
 /// READ is (core#219): the harmful thing — production code appearing before the build phase — was
 /// PREVENTED, the worker is told exactly how to proceed, and it adapts. Failing the unit on the
@@ -3168,7 +3415,13 @@ const PHASE_SCOPE_DENY_PREFIX: &str = "phase-scope-deny:";
 /// The changed paths are listed in `obligations` so the fold can name them without parsing prose.
 const WITNESS_DENY_PREFIX: &str = "witness-deny:";
 
-fn append_witness_deny(decisions_path: &str, scope: &str, phase: &str, changed_paths: &[String]) {
+fn append_witness_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    changed_paths: &[String],
+) {
     let paths_str = changed_paths.join(", ");
     let reason = format!(
         "write-root-mutated: the admitted write roots changed since the \
@@ -3186,7 +3439,9 @@ fn append_witness_deny(decisions_path: &str, scope: &str, phase: &str, changed_p
         evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    let _ = append_decision(Path::new(decisions_path), &claim);
+    // Annotated like every other fence recorder (issue #570): the witness fires ON a tool call, so
+    // its record names the call it refused instead of degrading to `(unknown)`.
+    append_annotated_claim(decisions_path, phase, tool, &claim);
 }
 
 /// Record a PHASE-SCOPE block: a pre-build phase's `Write`/`Edit` to a non-documentation path
@@ -3197,11 +3452,9 @@ fn append_witness_deny(decisions_path: &str, scope: &str, phase: &str, changed_p
 /// `policy_ids` is what closes the reported gap most directly: [`collect_hook_decisions`] reports
 /// the first id of a Deny as `denying_policy`, so `GovernanceHookFired` for this refusal reads
 /// `decision=deny, denyingPolicy=engine:pre-build-scope` where run d1bc72c2's read
-/// `decision=allow, denyingPolicy=None`. The event's `tool_name` still shows `(unknown)` here, as
-/// it does for every pre-policy block: the tool-call annotation is written further down
-/// [`evaluate_tool_call`], after the boundary and scope checks have already returned. The tool and
-/// the path are in the `reason` either way, so the record names them — this is a shape shared with
-/// [`append_boundary_deny`], not a new hole.
+/// `decision=allow, denyingPolicy=None`. Since issue #570 EVERY engine recorder does both halves:
+/// each names a rule in the `engine:` namespace and writes its own tool-call annotation, so no
+/// pre-policy block reads `(unknown)` / `null` any more.
 /// Record a phase-scope refusal as a REAL decision record naming the tool (annotation, F3) and —
 /// for the `Bash` arm — the offending command at `obligations[1]`, so the fold can disclose
 /// `workerToolCallDenied{tool, command}` through [`HookDecisionRecord::phase_scope_refusal`]
@@ -3332,7 +3585,7 @@ fn append_mcp_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str, r
         claim_id: format!("{MCP_DENY_PREFIX}{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
-        policy_ids: vec![],
+        policy_ids: vec![MCP_FENCE_RULE_ID.to_string()],
         decision: Decision::Deny,
         obligations: vec![reason.to_string(), tool.to_string()],
         evaluated_context_ref: "sha256:mcp-fence".to_string(),
@@ -3356,7 +3609,7 @@ fn append_remote_write_deny(
         claim_id: format!("{REMOTE_WRITE_DENY_PREFIX}{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
-        policy_ids: vec![],
+        policy_ids: vec![REMOTE_WRITE_RULE_ID.to_string()],
         decision: Decision::Deny,
         obligations: vec![reason.to_string(), command.to_string()],
         evaluated_context_ref: "sha256:remote-write-fence".to_string(),
@@ -3411,7 +3664,7 @@ fn append_estate_deny(
         claim_id: format!("{prefix}{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
-        policy_ids: vec![],
+        policy_ids: vec![ESTATE_FENCE_RULE_ID.to_string()],
         decision: Decision::Deny,
         obligations: vec![reason.to_string(), command.to_string()],
         evaluated_context_ref: "sha256:estate-deny".to_string(),
@@ -3423,7 +3676,7 @@ fn append_estate_deny(
     // policy path makes in `evaluate_tool_call`: a single `write_all` of a small buffer cannot be
     // interleaved by a concurrent hook subprocess even if the lock degrades.
     let annotation = serde_json::json!({
-        TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
+        TOOL_CALL_KEY: audit_tool_name(tool),
         TOOL_CALL_PHASE_KEY: phase,
     })
     .to_string()
@@ -3446,15 +3699,24 @@ fn append_estate_deny(
     });
 }
 
-fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str, fatal: bool) {
-    let (prefix, criteria) = if fatal {
+fn append_boundary_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+    fatal: bool,
+) {
+    let (prefix, rule, criteria) = if fatal {
         (
             BOUNDARY_WRITE_DENY_PREFIX,
+            BOUNDARY_WRITE_RULE_ID,
             format!("filesystem boundary: {reason}"),
         )
     } else {
         (
             BOUNDARY_READ_DENY_PREFIX,
+            BOUNDARY_READ_RULE_ID,
             format!("filesystem boundary (advisory: blocked, worker continues): {reason}"),
         )
     };
@@ -3464,7 +3726,7 @@ fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: 
         claim_id: format!("{prefix}{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
-        policy_ids: vec![],
+        policy_ids: vec![rule.to_string()],
         decision: Decision::Deny,
         obligations: vec![reason.to_string()],
         evaluated_context_ref: "sha256:boundary".to_string(),
@@ -3472,7 +3734,11 @@ fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: 
         evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    let _ = append_decision(Path::new(decisions_path), &claim);
+    // Annotated (issue #570): this is the DEFAULT recorder for a blocked call — the one that fired
+    // in run 35565185 — and a bare `append_decision` left its record reading
+    // `toolName: "(unknown)", denyingPolicy: null`, i.e. a denial that named neither what was
+    // blocked nor what blocked it.
+    append_annotated_claim(decisions_path, phase, tool, &claim);
 }
 
 /// Whether a Deny claim is ADVISORY — recorded for audit but NOT unit-fatal. Two members, both
@@ -3544,13 +3810,17 @@ fn tool_call_entry(v: &serde_json::Value) -> Option<(&str, &str)> {
 /// intercepted by the governance hook subprocess and recorded in the decisions NDJSON.
 #[derive(Debug, Clone)]
 pub struct HookDecisionRecord {
-    /// The tool the hook intercepted (e.g. `"Bash"`, `"Edit"`). `"(unknown)"` when the
-    /// tool-call annotation was not present in the log (older hook versions, or write failure).
+    /// The tool the hook intercepted (e.g. `"Bash"`, `"Edit"`), as [`audit_tool_name`] files it —
+    /// so a carrier that sent only a per-call DESCRIPTION reads `(described) …` and never puts a
+    /// path where a tool name belongs (issue #570). `"(unknown)"` when the tool-call annotation
+    /// was not present in the log at all: a log an older hook version wrote, since every recorder
+    /// in this build annotates.
     pub tool_name: String,
     /// The hook's decision for this tool call: `"allow"`, `"allow_with_conditions"`, or `"deny"`.
     pub decision: String,
-    /// The first policy id that denied, when `decision == "deny"`. `None` when allowed (or when
-    /// the deny came from an infra/corruption path with no policy ids).
+    /// The first policy id that denied, when `decision == "deny"`. `None` when allowed — or, on a
+    /// log an older build wrote, for the engine fences that filed no rule id before issue #570; a
+    /// deny recorded by THIS build always names one (an operator policy id, or an `engine:` rule).
     pub denying_policy: Option<String>,
     /// The recording claim's id — its PREFIX names the recorder (`boundary-deny:`,
     /// `remote-write-deny:`, `phase-scope-deny:`, a policy claim's own id).
@@ -3632,8 +3902,8 @@ impl HookDecisionRecord {
 ///
 /// Correlates each tool-call annotation (`TOOL_CALL_KEY`) with the immediately-following claim
 /// for the same phase, so the tool name rides the event even though `ConformanceClaim` does not
-/// store it. Logs written before the annotation was added gracefully degrade to `"(unknown)"` for
-/// the tool name.
+/// store it. Only a log an older hook version wrote degrades to `"(unknown)"`: every recorder in
+/// this build writes the annotation in the same buffer as its claim (issue #570).
 pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<HookDecisionRecord> {
     let path = decisions_path_for(run_id, attempt);
     let raw = match std::fs::read_to_string(&path) {
@@ -4205,7 +4475,11 @@ pub fn run_output_gate_hook(
         return 2;
     }
 
-    if let Err(e) = append_decision(Path::new(&decisions_path), &claim) {
+    // Annotated (issue #570): an output-gate decision judges generated TEXT, not a tool call, so
+    // the record says `(output)` rather than degrading to `(unknown)` — the same audit field, an
+    // honest value.
+    if let Err(e) = append_annotated_claim_checked(&decisions_path, phase, OUTPUT_GATE_TOOL, &claim)
+    {
         eprintln!("wicked-governance: DENY (could not append output decision: {e})");
         return 2;
     }
@@ -5527,6 +5801,7 @@ mod tests {
             deliverable_roots: vec![notes.clone()], // notes root
             estate_store_pinned: false,
             graph_write_dir: None,
+            graph_store_db: None,
         };
         let wr = compute_witness_roots(Some(&boundary));
         assert_eq!(wr, vec![wt.clone()], "witness roots = write minus notes");
@@ -5623,6 +5898,7 @@ mod tests {
             deliverable_roots: vec![],
             estate_store_pinned: false,
             graph_write_dir,
+            graph_store_db: None,
         };
         let no_graph = ctx(vec![app.clone(), outbox.clone()], None);
         assert_eq!(
@@ -5680,6 +5956,7 @@ mod tests {
             deliverable_roots: vec![],
             estate_store_pinned: false,
             graph_write_dir: Some(graph_dir.clone()),
+            graph_store_db: None,
         };
         let bash = || {
             evaluate_tool_call(
@@ -5766,6 +6043,7 @@ mod tests {
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
                 graph_write_dir: None,
+                graph_store_db: None,
             };
             let call = |tool: &str, input: serde_json::Value| {
                 evaluate_tool_call(
@@ -6461,6 +6739,7 @@ mod tests {
             p0.to_str().unwrap(),
             "wf/unit-5",
             "unit-5",
+            "Read",
             "path outside this unit's boundary: /other/repo/domain-modeler.md (read)",
             false,
         );
@@ -6483,6 +6762,7 @@ mod tests {
             p1.to_str().unwrap(),
             "wf/unit-5",
             "unit-5",
+            "Write",
             "path outside this unit's boundary: /etc/evil (write)",
             true,
         );
@@ -6509,6 +6789,7 @@ mod tests {
             p2.to_str().unwrap(),
             "wf/unit-5",
             "unit-5",
+            "Read",
             "path outside this unit's boundary: /other/probe (read)",
             false,
         );
@@ -6531,6 +6812,7 @@ mod tests {
             p3.to_str().unwrap(),
             "wf/exec",
             "exec",
+            "Read",
             "path outside this unit's boundary: /other/read (read)",
             false,
         );
@@ -7033,6 +7315,45 @@ mod protocol_tests {
 mod boundary_tests {
     use super::*;
     use serde_json::json;
+
+    /// Pins `HOME` for the rest of the enclosing scope, restoring it on drop.
+    ///
+    /// Several tests in this binary pin `HOME` to a scratch under the SYSTEM TEMP, and a row whose
+    /// expectation is "a `~/.config/**` write stays unit-fatal" silently flips when such a pin
+    /// leaks in — a home under temp is the core#264 advisory carve-out, so the answer becomes
+    /// "advisory" and the assert fails. It cost this file two red CI legs. Declared INSIDE
+    /// `with_roots`, so it is held under the same env write lock and restored before the lock
+    /// releases (drop order is reverse of declaration).
+    #[cfg(unix)]
+    struct PinnedHome(Option<std::ffi::OsString>);
+    #[cfg(unix)]
+    impl PinnedHome {
+        fn at(dir: &str) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self(prev)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for PinnedHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+    /// The home those rows pin: absolute, outside the system temp, and it need not exist — the
+    /// boundary check is lexical.
+    #[cfg(unix)]
+    const PINNED_HOME: &str = "/wicked-gate-test-home";
+
+    /// The estate allowlist with NO graph-store paths handed in — the spelling every row below was
+    /// written against (shadows `super::classify_estate_command`, whose third argument the
+    /// raw-SQLite arm of issue #645 needs and which has its own tests).
+    fn classify_estate_command(command: &str, store_pinned_by_env: bool) -> Option<EstateDeny> {
+        super::classify_estate_command(command, store_pinned_by_env, &[])
+    }
 
     // Env is process-global and Rust runs tests in threads, so these serialize on the CRATE-WIDE
     // lock (`crate::test_env`). Without it, two tests setting WICKED_WRITE_ROOTS race and the
@@ -7645,6 +7966,7 @@ mod boundary_tests {
             "Bash",
             None,
             false,
+            &[],
         )
         .expect("an estate write is denied");
         assert!(reason.starts_with(ESTATE_DENY_REASON_PREFIX), "{reason}");
@@ -7768,6 +8090,325 @@ mod boundary_tests {
         let _ = std::fs::remove_dir_all(&wt);
     }
 
+    /// Issue #570 defect 1 — the denial that could not be audited.
+    ///
+    /// Run 35565185 produced 59 hook records; its ONE deny read
+    /// `{"decision":"deny","denyingPolicy":null,"toolName":"(unknown)"}`, so the single moment the
+    /// fence acted was the single record that could say neither WHAT was blocked nor WHICH rule
+    /// blocked it. Both halves came from the DEFAULT recorder: `append_boundary_deny` appended a
+    /// bare claim (no tool-call annotation ⇒ `(unknown)`) with `policy_ids: vec![]` (⇒ `null`). The
+    /// post-hoc write-root witness had the same annotation gap.
+    ///
+    /// Mutation: give either recorder back `policy_ids: vec![]`, or route it back through bare
+    /// `append_decision`, and this test fails.
+    #[test]
+    fn a_boundary_and_witness_deny_name_their_tool_and_their_rule() {
+        let run_id = format!("boundary-audit-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p, "unit-2", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        let path = p.to_str().unwrap();
+
+        // The advisory arm: a blocked out-of-boundary READ — the exact shape of the live run's deny.
+        append_boundary_deny(
+            path,
+            "wf/unit-2",
+            "unit-2",
+            "Read",
+            "path outside this unit's boundary: /other/repo/notes.md (read)",
+            false,
+        );
+        // The fatal arm: a WRITE escape.
+        append_boundary_deny(
+            path,
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            "Bash write leaves the unit boundary: /etc/hosts (write)",
+            true,
+        );
+        // The post-hoc witness (issue #541) fires ON a tool call, so its record names that call.
+        append_witness_deny(
+            path,
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            &["src/lib.rs".to_string()],
+        );
+
+        let recs = collect_hook_decisions(&run_id, 0, "unit-2");
+        assert_eq!(recs.len(), 3, "{recs:?}");
+        assert!(
+            recs.iter().all(|r| r.decision == "deny"),
+            "every row is a deny: {recs:?}"
+        );
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read", "Bash", "Bash"],
+            "each deny names the tool it blocked: {recs:?}"
+        );
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.denying_policy.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(BOUNDARY_READ_RULE_ID),
+                Some(BOUNDARY_WRITE_RULE_ID),
+                Some("engine:write-root-witness"),
+            ],
+            "each deny names the rule that blocked it: {recs:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// Issue #570, the acceptance in one assertion: EVERY engine-side deny recorder names its tool
+    /// and its policy. `infra` and `mcp` are the two that still filed `policy_ids: vec![]` after
+    /// the annotation work landed; phase-scope and remote-write are pinned here so the invariant
+    /// covers the whole family rather than the rows someone remembered.
+    #[test]
+    fn every_engine_deny_recorder_names_a_policy() {
+        let run_id = format!("deny-policy-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        let path = p.to_str().unwrap();
+        append_infra_deny(path, "wf/unit-1", "unit-1", "Edit", "store open failed");
+        append_mcp_deny(
+            path,
+            "wf/unit-1",
+            "unit-1",
+            "mcp__ambient__write",
+            "mcp fence: an ambient server is not governed",
+        );
+        append_remote_write_deny(
+            path,
+            "wf/unit-1",
+            "unit-1",
+            "remote-write fence: `git push` is the deliver phase's job",
+            "git push origin main",
+        );
+        append_phase_scope_deny(
+            path,
+            "wf/unit-1",
+            "unit-1",
+            "Write",
+            "phase scope: `Write` to `src/x.ts` before the build phase",
+            None,
+        );
+        append_estate_deny(
+            path,
+            "wf/unit-1",
+            "unit-1",
+            "Bash",
+            "estate-deny fence: `wicked-estate index .`",
+            "wicked-estate index .",
+            false,
+        );
+        let recs = collect_hook_decisions(&run_id, 0, "unit-1");
+        assert_eq!(recs.len(), 5, "{recs:?}");
+        for r in &recs {
+            assert_eq!(r.decision, "deny", "{r:?}");
+            assert!(
+                r.denying_policy
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("engine:")),
+                "a deny with no attributable rule is a bug in the hook, not a valid record: {r:?}"
+            );
+            assert!(
+                r.tool_name != "(unknown)" && !r.tool_name.starts_with('/'),
+                "{r:?}"
+            );
+        }
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.denying_policy.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                INFRA_RULE_ID,
+                MCP_FENCE_RULE_ID,
+                REMOTE_WRITE_RULE_ID,
+                PHASE_SCOPE_RULE_ID,
+                ESTATE_FENCE_RULE_ID,
+            ]
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// Issue #570 defect 2 — `/tmp` is an argument, not a tool.
+    ///
+    /// Three records in the live run named `/tmp` as the tool, all on the evaluator unit, all in
+    /// the same millisecond: an ACP bridge that sends no canonical name, only `toolCall.title` (a
+    /// per-call DESCRIPTION — "Reading /tmp/foo", or just the path). The record then reads like a
+    /// tool that does not exist, and a policy written against `Bash` never fires for it.
+    ///
+    /// The fix is at the ONE recording seam, so it holds for every carrier: a tool-shaped name
+    /// rides verbatim; a description is recorded LABELLED, keeping the raw string without claiming
+    /// it is a name.
+    #[test]
+    fn no_record_names_a_path_or_a_sentence_as_the_tool() {
+        // Real names — including MCP and the snake_case edit tools — ride verbatim.
+        for name in [
+            "Bash",
+            "Edit",
+            "NotebookEdit",
+            "mcp__estate__knowledge.recall",
+            "mcp:jira/create_issue",
+            "str_replace_based_edit_tool",
+            "tool-call",
+        ] {
+            assert_eq!(audit_tool_name(name), name, "{name} is a tool name");
+        }
+        // Our own sentinels pass through — by exact match, so a parenthesised DESCRIPTION cannot
+        // impersonate one and ride in unlabelled (codex review).
+        for sentinel in TOOL_NAME_SENTINELS {
+            assert_eq!(audit_tool_name(sentinel), sentinel);
+        }
+        assert_eq!(
+            audit_tool_name("(Reading /tmp/foo)"),
+            "(described) (Reading /tmp/foo)",
+            "parentheses are not a free pass"
+        );
+        // A path or a sentence is a DESCRIPTION, not a name.
+        assert_eq!(audit_tool_name("/tmp"), "(described) /tmp");
+        assert_eq!(
+            audit_tool_name("Reading /tmp/foo"),
+            "(described) Reading /tmp/foo"
+        );
+        assert_eq!(
+            audit_tool_name("C:\\Users\\x\\notes.md"),
+            "(described) C:\\Users\\x\\notes.md"
+        );
+        assert_eq!(audit_tool_name("   "), "tool-call", "empty ⇒ the sentinel");
+        // The qualified MCP subject is admitted by SHAPE, not by its `mcp:` prefix alone: a
+        // second slash, or a path masquerading behind the prefix, is still a description.
+        assert_eq!(
+            audit_tool_name("mcp:jira/a/b"),
+            "(described) mcp:jira/a/b",
+            "`mcp:<server>/<tool>` carries exactly one slash"
+        );
+        assert_eq!(audit_tool_name("mcp:/tmp/x"), "(described) mcp:/tmp/x");
+
+        // End to end: a claim recorded for a title-only call, replayed off the log.
+        let run_id = format!("tool-name-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p, "unit-4", Some(CARRIER_ACP)).unwrap();
+        append_infra_deny(
+            p.to_str().unwrap(),
+            "wf/unit-4",
+            "unit-4",
+            "/tmp",
+            "store open failed",
+        );
+        let recs = collect_hook_decisions(&run_id, 0, "unit-4");
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].tool_name, "(described) /tmp");
+        assert!(
+            !recs[0].tool_name.starts_with('/'),
+            "no event records a path AS the tool name: {recs:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// Issue #645 — a read-only unit must not reach the project graph with raw SQL.
+    ///
+    /// The graph dir is an admitted write root (SQLite needs its WAL siblings) and the write-root
+    /// witness skips it (the read-only shim checkpoints it legitimately, core#642), so
+    /// `sqlite3 "$WICKED_ESTATE_DB" 'CREATE TABLE …'` passed every check: the path gate sees an
+    /// admitted root, and the estate allowlist never looked at it because the program word is no
+    /// estate binary. The graph feeds risk scoring, so the fence now fails closed on a
+    /// sqlite-capable program that names the store — and the read-only shim stays the one way in.
+    #[test]
+    fn raw_sqlite_on_the_project_graph_is_refused() {
+        let graph = std::path::PathBuf::from("/srv/estate/graphs/abc123");
+        let store = [graph.clone()];
+
+        // The issue's own command, spelled through the pinned env var …
+        for command in [
+            "sqlite3 \"$WICKED_ESTATE_DB\" 'CREATE TABLE evil (x)'",
+            "sqlite3 ${WICKED_ESTATE_DB} 'UPDATE nodes SET risk = 0'",
+            "sh -c 'sqlite3 \"$WICKED_ESTATE_DB\" \"DELETE FROM edges\"'",
+            "python3 -c 'import os,sqlite3; sqlite3.connect(os.environ[\"WICKED_ESTATE_DB\"]).execute(\"CREATE TABLE t (x)\")'",
+            "node -e 'require(\"node:sqlite\").open(process.env.WICKED_MEMORY_DB)'",
+        ] {
+            let hit = super::classify_estate_command(command, true, &store)
+                .unwrap_or_else(|| panic!("not refused: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
+        // … and spelled as the resolved graph path, with no variable in sight — bare, quoted,
+        // glued to a flag, or inside an interpreter's program text.
+        for command in [
+            "sqlite3 /srv/estate/graphs/abc123/graph.db 'CREATE TABLE evil (x)'",
+            "sqlite3 --db=/srv/estate/graphs/abc123/graph.db 'CREATE TABLE evil (x)'",
+            "python3 -c 'import sqlite3; sqlite3.connect(\"/srv/estate/graphs/abc123/graph.db\").execute(\"CREATE TABLE t (x)\")'",
+            "sqlite3 \"/srv/estate/graphs/abc123\"/graph.db 'DELETE FROM nodes'",
+        ] {
+            let hit = super::classify_estate_command(command, false, &store)
+                .unwrap_or_else(|| panic!("the resolved graph path is refused too: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
+
+        // The reason reaches the seat under the estate-deny prefix `evaluate_tool_call` routes on,
+        // so the refusal is recorded by `append_estate_deny` (tool + command + remedy).
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-sqlite-645");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone(), graph.clone()],
+            read: vec![],
+        };
+        let command = "sqlite3 \"$WICKED_ESTATE_DB\" 'CREATE TABLE evil (x)'";
+        let (reason, _) = boundary_denial_tracked(
+            &roots,
+            &wt,
+            None,
+            None,
+            &json!({ "command": command }),
+            "Bash",
+            None,
+            true,
+            &store,
+        )
+        .expect("a read-only unit's raw sqlite write is denied");
+        assert!(reason.starts_with(ESTATE_DENY_REASON_PREFIX), "{reason}");
+        assert!(
+            reason.contains(command)
+                && reason.contains(ESTATE_WHY_RAW_SQLITE)
+                && reason.contains(ESTATE_DENY_REMEDY),
+            "{reason}"
+        );
+
+        // NOT refused: the grounding transport, which names the store on purpose …
+        for allowed in [
+            "wicked-estate-mcp --readonly --db \"$WICKED_ESTATE_DB\"",
+            "sh -c 'python3 scripts/mem/estate_memory.py --readonly --db \"$WICKED_ESTATE_DB\" recall {}'",
+            "wicked-estate query --db /srv/estate/graphs/abc123/graph.db 'fn:main'",
+        ] {
+            assert!(
+                super::classify_estate_command(allowed, true, &store).is_none(),
+                "the read-only estate transport stays allowed: {allowed}"
+            );
+        }
+        // … and a sqlite call on a database that is NOT the project graph (a unit's own fixture).
+        // The last two rows are the name-boundary cases: a SIBLING graph key whose name merely
+        // starts with the protected one, and a copy of the store under another root. Refusing
+        // either is a false refusal, which is how a fence gets switched off.
+        for benign in [
+            "sqlite3 tests/fixtures/sample.db 'select count(*) from t'",
+            "python3 -c 'import sqlite3; sqlite3.connect(\"build/cache.db\")'",
+            "grep -r WICKED_ESTATE_DB scripts/",
+            "sqlite3 /srv/estate/graphs/abc1234/fixture.db 'select 1'",
+            "sqlite3 /mnt/backup/srv/estate/graphs/abc123/graph.db 'select 1'",
+        ] {
+            assert!(
+                super::classify_estate_command(benign, true, &store).is_none(),
+                "{benign}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
     /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),
     /// judged exactly as the evidence-derived read roots are. Reads inside it pass; a WRITE into it
     /// stays a fatal escape — a read root never widens write scope; reads outside every root stay
@@ -7863,6 +8504,7 @@ mod boundary_tests {
                 "Bash",
                 Some(&state),
                 false,
+                &[],
             )
         };
         // Fresh attempt: judged from the worktree.
@@ -8104,9 +8746,12 @@ mod boundary_tests {
         let wt = std::env::temp_dir().join("wicked-boundary-wt");
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
-            // Resolved INSIDE the env lock: the pin path derives from HOME, and a concurrent
-            // HOME-pinning test (the skills fixtures pin HOME to a temp scratch) would otherwise
-            // hand this test a pin under the system temp, where the core#264 carve-out applies.
+            // HOME is PINNED, not merely read inside the lock: the pin path derives from it, and a
+            // concurrent HOME-pinning test (several point it at a temp scratch) would otherwise
+            // hand this test a pin under the system temp, where the core#264 carve-out applies and
+            // the write is legitimately advisory.
+            #[cfg(unix)]
+            let _home = PinnedHome::at(PINNED_HOME);
             let pin = dirs_config_workflow();
             let (denial, is_write) = boundary_denial_untracked(&ctx(&pin), "Write")
                 .expect("writing the gate's own pin must be refused");
@@ -8133,11 +8778,13 @@ mod boundary_tests {
     fn a_write_to_the_workers_own_claude_memory_is_advisory_not_fatal() {
         let wt = std::env::temp_dir().join("wicked-boundary-wt-mem");
         std::fs::create_dir_all(&wt).unwrap();
-        let home = std::env::var("HOME").expect("HOME set in the unix test env");
         let mem = format!(
-            "{home}/.claude/projects/-tmp-wicked-boundary-wt-mem/memory/project_x_domain.md"
+            "{PINNED_HOME}/.claude/projects/-tmp-wicked-boundary-wt-mem/memory/project_x_domain.md"
         );
         with_roots(Some(wt.to_str().unwrap()), || {
+            // Pinned, for the reason `PinnedHome` documents: with an ambient home under the system
+            // temp the pin control below is legitimately advisory and this row goes red.
+            let _home = PinnedHome::at(PINNED_HOME);
             let (_, fatal) = boundary_denial_untracked(&ctx(&mem), "Write")
                 .expect("a write outside the worktree is STILL blocked");
             assert!(
