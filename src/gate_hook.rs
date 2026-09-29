@@ -2082,18 +2082,54 @@ fn is_sqlite_capable_program(base: &str) -> bool {
 }
 
 /// Does this token NAME the shared graph store — one of the store-pin environment variables
-/// (`$WICKED_ESTATE_DB`, `${WICKED_HOME}`, `os.environ["WICKED_MEMORY_DB"]`) or a path inside one
-/// of the engine-resolved `graph_store` locations? Substring matching on purpose: the token may be
-/// a quoted argument, an inline `-c` program text, or a `--db=<path>` flag.
+/// (`$WICKED_ESTATE_DB`, `${WICKED_HOME}`, `os.environ["WICKED_MEMORY_DB"]`) or one of the
+/// engine-resolved `graph_store` locations (the dir itself, or a file inside it)?
+///
+/// The path arm searches INSIDE the token — it may be a quoted argument, a `--db=<path>` flag or
+/// an inline `-c` program text — but every occurrence must sit on a NAME BOUNDARY, or the
+/// sibling graph key `…/graphs/abc1234` would be refused because it starts with `…/graphs/abc123`
+/// (codex review). Refusing a unit's own fixture db is a false refusal, not a safe default.
 fn token_names_graph_store(tok: &str, graph_store: &[std::path::PathBuf]) -> bool {
     if ESTATE_STORE_PIN_ENV.iter().any(|k| tok.contains(k)) {
         return true;
     }
     let normalised = script_path(tok);
-    graph_store.iter().any(|g| {
-        let g = g.to_string_lossy();
-        !g.is_empty() && normalised.contains(g.as_ref())
-    })
+    graph_store
+        .iter()
+        .any(|g| names_path(&normalised, &g.to_string_lossy()))
+}
+
+/// Is `path` named somewhere in `text`, on a name boundary at both ends?
+///
+/// * before the match: the start of the token, or a character no path continues through (a quote,
+///   a space, `=`, `(`, `,`) — a leading `/` or a letter means a DIFFERENT path
+///   (`/mnt/backup/srv/g` is a copy, not the store);
+/// * after it: the end, a `/` (a file inside the dir) or any non-name character — a letter, digit,
+///   `-`, `_` or `.` means a longer sibling name.
+fn names_path(text: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let mut from = 0;
+    while let Some(i) = text[from..].find(path) {
+        let start = from + i;
+        let end = start + path.len();
+        let before_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !(name_char(c) || c == '/'));
+        let after_ok = match text[end..].chars().next() {
+            Some(c) => !name_char(c),
+            None => true, // the path ends the token
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// Does this segment OPEN the shared graph store as a raw SQLite database (issue #645)?
@@ -8269,14 +8305,18 @@ mod boundary_tests {
                 .unwrap_or_else(|| panic!("not refused: {command}"));
             assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
         }
-        // … and spelled as the resolved graph path, with no variable in sight.
-        let hit = super::classify_estate_command(
+        // … and spelled as the resolved graph path, with no variable in sight — bare, quoted,
+        // glued to a flag, or inside an interpreter's program text.
+        for command in [
             "sqlite3 /srv/estate/graphs/abc123/graph.db 'CREATE TABLE evil (x)'",
-            false,
-            &store,
-        )
-        .expect("the resolved graph path is refused too");
-        assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE);
+            "sqlite3 --db=/srv/estate/graphs/abc123/graph.db 'CREATE TABLE evil (x)'",
+            "python3 -c 'import sqlite3; sqlite3.connect(\"/srv/estate/graphs/abc123/graph.db\").execute(\"CREATE TABLE t (x)\")'",
+            "sqlite3 \"/srv/estate/graphs/abc123\"/graph.db 'DELETE FROM nodes'",
+        ] {
+            let hit = super::classify_estate_command(command, false, &store)
+                .unwrap_or_else(|| panic!("the resolved graph path is refused too: {command}"));
+            assert_eq!(hit.why, ESTATE_WHY_RAW_SQLITE, "{command}");
+        }
 
         // The reason reaches the seat under the estate-deny prefix `evaluate_tool_call` routes on,
         // so the refusal is recorded by `append_estate_deny` (tool + command + remedy).
@@ -8319,10 +8359,15 @@ mod boundary_tests {
             );
         }
         // … and a sqlite call on a database that is NOT the project graph (a unit's own fixture).
+        // The last two rows are the name-boundary cases: a SIBLING graph key whose name merely
+        // starts with the protected one, and a copy of the store under another root. Refusing
+        // either is a false refusal, which is how a fence gets switched off.
         for benign in [
             "sqlite3 tests/fixtures/sample.db 'select count(*) from t'",
             "python3 -c 'import sqlite3; sqlite3.connect(\"build/cache.db\")'",
             "grep -r WICKED_ESTATE_DB scripts/",
+            "sqlite3 /srv/estate/graphs/abc1234/fixture.db 'select 1'",
+            "sqlite3 /mnt/backup/srv/estate/graphs/abc123/graph.db 'select 1'",
         ] {
             assert!(
                 super::classify_estate_command(benign, true, &store).is_none(),
