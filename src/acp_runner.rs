@@ -4800,13 +4800,7 @@ fn answer_permission_request<W: Write>(
                 fence.home.as_deref(),
             );
             let denial = crate::remote_write_fence::remote_write_command(&command)
-                .map(|hit| {
-                    (
-                        "remote-write fence",
-                        hit.reason(),
-                        crate::remote_write_fence::REMEDY,
-                    )
-                })
+                .map(|hit| ("remote-write fence", hit.reason(), hit.remedy()))
                 .or_else(|| {
                     install_judgement
                         .hit
@@ -21809,15 +21803,20 @@ transport = "stdio"
                     v["result"]["outcome"]["optionId"], "reject",
                     "not refused on the ACP bridge ({shape}): {cmd} → {v}"
                 );
-                assert!(
-                    matches!(
-                        rx.try_recv(),
-                        Ok(crate::command::Command::EmitEvent(
-                            crate::event::CoreEvent::WorkerToolCallDenied { .. }
-                        ))
-                    ),
-                    "no workerToolCallDenied for ({shape}): {cmd}"
-                );
+                // The event's `remedy` must be the one the reason embeds — review of #671: a
+                // provider READ refusal carrying the deliver-phase remedy tells the worker to
+                // commit and let the deliver phase push, which is not what it asked for.
+                match rx.try_recv() {
+                    Ok(crate::command::Command::EmitEvent(
+                        crate::event::CoreEvent::WorkerToolCallDenied { remedy, reason, .. },
+                    )) => {
+                        let expected = crate::remote_write_fence::remote_write_command(cmd)
+                            .map(|h| h.remedy())
+                            .unwrap_or_else(|| panic!("the filter itself refuses: {cmd}"));
+                        assert_eq!(remedy, expected, "({shape}) {cmd}: {reason}");
+                    }
+                    _ => panic!("no workerToolCallDenied for ({shape}): {cmd}"),
+                }
             }
         }
     }

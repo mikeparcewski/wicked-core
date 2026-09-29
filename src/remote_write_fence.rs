@@ -131,7 +131,8 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(jj:*)",
 ];
 
-/// The remedy every refusal carries to the seat and onto the wire (`workerToolCallDenied.remedy`).
+/// The remedy a REMOTE-WRITE refusal carries to the seat and onto the wire
+/// (`workerToolCallDenied.remedy`); a provider refusal carries [`PROVIDER_REMEDY`].
 pub(crate) const REMEDY: &str = "delivery is performed by the run's deliver phase: the engine \
     lifts the run branch onto the current base, re-verifies the repository's own checks, pushes \
     and opens the pull request, so the ledger records it. Commit your work on the run branch and \
@@ -181,6 +182,17 @@ pub(crate) struct RemoteWriteHit {
 }
 
 impl RemoteWriteHit {
+    /// The remedy this refusal's class carries — the `remedy` field of `workerToolCallDenied`,
+    /// which must be the SAME remedy the reason embeds (review of #671: the ACP carrier sent the
+    /// deliver-phase remedy with a provider-read reason, so the structured event told a worker to
+    /// commit and let the deliver phase open the PR when what it had asked for was a read).
+    pub(crate) fn remedy(&self) -> &'static str {
+        match self.class {
+            HitClass::RemoteWrite => REMEDY,
+            HitClass::ProviderFenced => PROVIDER_REMEDY,
+        }
+    }
+
     /// The operator- and seat-facing reason for the refusal (the `reason` on the wire).
     pub(crate) fn reason(&self) -> String {
         match self.class {
@@ -199,6 +211,17 @@ impl RemoteWriteHit {
                 PROVIDER_REMEDY
             ),
         }
+    }
+}
+
+/// The remedy a recorded refusal's REASON belongs to — for the one carrier that has no hit, only
+/// the durable text the gate-hook subprocess wrote (`pipeline::disclose_hook_decisions`). The
+/// reason embeds its own remedy, so the field beside it must not contradict it.
+pub(crate) fn remedy_for_reason(reason: &str) -> &'static str {
+    if reason.contains(PROVIDER_REMEDY) {
+        PROVIDER_REMEDY
+    } else {
+        REMEDY
     }
 }
 
