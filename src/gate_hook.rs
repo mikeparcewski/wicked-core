@@ -1635,7 +1635,7 @@ fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
                 // `pushd` moves the shell exactly as `cd` does — the install fence already
                 // tracks both — so a `pushd <outside> && <write>` escape is the same escape as
                 // issue #540's, and the raw-SQLite fence's cwd walk needs it too (#645).
-                if matches!(&*program_basename(prog), "cd" | "pushd") {
+                if matches!(program_basename(prog), "cd" | "pushd") {
                     if let Some(dest) = words[idx + 1..].iter().find(|w| !w.starts_with('-')) {
                         targets.push((*dest).to_string());
                     }
