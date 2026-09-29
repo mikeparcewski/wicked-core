@@ -7316,6 +7316,38 @@ mod boundary_tests {
     use super::*;
     use serde_json::json;
 
+    /// Pins `HOME` for the rest of the enclosing scope, restoring it on drop.
+    ///
+    /// Several tests in this binary pin `HOME` to a scratch under the SYSTEM TEMP, and a row whose
+    /// expectation is "a `~/.config/**` write stays unit-fatal" silently flips when such a pin
+    /// leaks in — a home under temp is the core#264 advisory carve-out, so the answer becomes
+    /// "advisory" and the assert fails. It cost this file two red CI legs. Declared INSIDE
+    /// `with_roots`, so it is held under the same env write lock and restored before the lock
+    /// releases (drop order is reverse of declaration).
+    #[cfg(unix)]
+    struct PinnedHome(Option<std::ffi::OsString>);
+    #[cfg(unix)]
+    impl PinnedHome {
+        fn at(dir: &str) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self(prev)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for PinnedHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+    /// The home those rows pin: absolute, outside the system temp, and it need not exist — the
+    /// boundary check is lexical.
+    #[cfg(unix)]
+    const PINNED_HOME: &str = "/wicked-gate-test-home";
+
     /// The estate allowlist with NO graph-store paths handed in — the spelling every row below was
     /// written against (shadows `super::classify_estate_command`, whose third argument the
     /// raw-SQLite arm of issue #645 needs and which has its own tests).
@@ -8714,9 +8746,12 @@ mod boundary_tests {
         let wt = std::env::temp_dir().join("wicked-boundary-wt");
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
-            // Resolved INSIDE the env lock: the pin path derives from HOME, and a concurrent
-            // HOME-pinning test (the skills fixtures pin HOME to a temp scratch) would otherwise
-            // hand this test a pin under the system temp, where the core#264 carve-out applies.
+            // HOME is PINNED, not merely read inside the lock: the pin path derives from it, and a
+            // concurrent HOME-pinning test (several point it at a temp scratch) would otherwise
+            // hand this test a pin under the system temp, where the core#264 carve-out applies and
+            // the write is legitimately advisory.
+            #[cfg(unix)]
+            let _home = PinnedHome::at(PINNED_HOME);
             let pin = dirs_config_workflow();
             let (denial, is_write) = boundary_denial_untracked(&ctx(&pin), "Write")
                 .expect("writing the gate's own pin must be refused");
@@ -8743,11 +8778,13 @@ mod boundary_tests {
     fn a_write_to_the_workers_own_claude_memory_is_advisory_not_fatal() {
         let wt = std::env::temp_dir().join("wicked-boundary-wt-mem");
         std::fs::create_dir_all(&wt).unwrap();
-        let home = std::env::var("HOME").expect("HOME set in the unix test env");
         let mem = format!(
-            "{home}/.claude/projects/-tmp-wicked-boundary-wt-mem/memory/project_x_domain.md"
+            "{PINNED_HOME}/.claude/projects/-tmp-wicked-boundary-wt-mem/memory/project_x_domain.md"
         );
         with_roots(Some(wt.to_str().unwrap()), || {
+            // Pinned, for the reason `PinnedHome` documents: with an ambient home under the system
+            // temp the pin control below is legitimately advisory and this row goes red.
+            let _home = PinnedHome::at(PINNED_HOME);
             let (_, fatal) = boundary_denial_untracked(&ctx(&mem), "Write")
                 .expect("a write outside the worktree is STILL blocked");
             assert!(
