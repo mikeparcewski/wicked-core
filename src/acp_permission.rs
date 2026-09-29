@@ -346,7 +346,10 @@ pub(crate) fn pretool_payload(params: &Value) -> Option<(String, Value)> {
     // MCP tools surfaced through the estate server) omit the top-level `toolName` field and carry
     // the canonical tool name only in `toolCall.name`. `toolCall.title` is a human-readable
     // per-call description (e.g. "Reading /tmp/foo") — NOT the canonical name — so it is the last
-    // resort and must not substitute for `toolCall.name` when the latter is present.
+    // resort and must not substitute for `toolCall.name` when the latter is present. A title that
+    // reaches here is judged (a self-describing request is not waved through) but is NEVER filed
+    // as an identity in the audit record — `gate_hook::audit_tool_name` labels it, so no row reads
+    // a path as the tool name (issue #570 defect 2).
     // Without the `toolCall.name` step this function returned `None`, causing `permission_result`
     // to answer `cancelled` (deny) with no governance record, silently blocking legitimate calls.
     // Empty strings at any step must not short-circuit the fallback — an explicit `"toolName": ""`
@@ -461,6 +464,8 @@ pub(crate) fn chat_boundary_result(
         &tool_name,
         None,
         boundary.estate_store_pinned,
+        // A chat seat bound to a graph gets the same raw-SQLite fence a unit does (issue #645).
+        &crate::gate_hook::graph_store_paths(Some(boundary)),
     )
     .is_none();
     match choose_option(params.get("options").unwrap_or(&Value::Null), allowed) {
@@ -1121,6 +1126,38 @@ mod tests {
             tool5, "Write",
             "toolCall.name must be reached when toolName is an empty string"
         );
+    }
+
+    /// Issue #570 defect 2: the bridge that sends NO canonical name, only `toolCall.title`.
+    ///
+    /// Three records of run 35565185 named `/tmp` as the tool — all on the evaluator unit, all in
+    /// the same millisecond: the title fallback, filed as if it were an identity. The title is
+    /// still what governance evaluates (a request that only describes itself is judged on its
+    /// description, not waved through), but the AUDIT record must not claim a path is a tool
+    /// name — `gate_hook::audit_tool_name` labels it instead, so the row reads
+    /// `(described) /tmp` and no reader mistakes it for a tool a policy could match.
+    #[test]
+    fn a_title_only_request_is_never_audited_as_a_tool_name() {
+        for title in ["/tmp", "Reading /tmp/foo"] {
+            let params = json!({
+                "sessionId": "s-title",
+                "toolCall": {"toolCallId": "tc-t", "title": title, "rawInput": {}},
+            });
+            let (tool, payload) =
+                pretool_payload(&params).expect("a title-only request is still evaluated");
+            assert_eq!(tool, title, "the title is what there is to judge");
+            let (_, name) =
+                crate::gate_hook::claude_pretool_context(&payload.to_string(), "unit", "build");
+            assert_eq!(
+                crate::gate_hook::audit_tool_name(&name),
+                format!("(described) {title}"),
+                "the record labels a description instead of filing it as the tool name"
+            );
+        }
+        // A tool-shaped `toolCall.name` is untouched by the same seam.
+        let params = json!({"toolCall": {"name": "Read", "title": "Reading /tmp/foo"}});
+        let (tool, _) = pretool_payload(&params).unwrap();
+        assert_eq!(crate::gate_hook::audit_tool_name(&tool), "Read");
     }
 
     /// F-7R2-012 (wave 6): the command of an EXECUTE-class request — by ACP kind or by the

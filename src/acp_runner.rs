@@ -14800,6 +14800,7 @@ os_sandbox = true
                 "Write",
                 None,
                 boundary.estate_store_pinned,
+                &[],
             )
             .map(|(_, fatal)| fatal)
         };
