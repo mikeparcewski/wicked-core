@@ -497,8 +497,9 @@ pub fn seat_succeeded_in_run(units: &[WorkUnit], seat: &str) -> bool {
 }
 
 /// (F-7R3-001, review F3) The bench reason a worker's / judge's classified refusal earns, or
-/// `None` when it does not bench: `not_logged_in` and `not_installed` bench on first occurrence
-/// (a sign-in or a binary does not appear mid-run); `quota_exhausted` only while the seat has NO
+/// `None` when it does not bench: `not_logged_in`, `not_installed` and `approval_unavailable`
+/// bench on first occurrence (a sign-in, a binary or a host-forced approval policy does not
+/// appear mid-run); `quota_exhausted` only while the seat has NO
 /// success in the run — the ballot ledger's deny-dominates rule applied to a transcript — and the
 /// reason says so, because a single refusal sufficed.
 pub fn transcript_bench_reason(
@@ -507,7 +508,13 @@ pub fn transcript_bench_reason(
 ) -> Option<String> {
     use wicked_council::types::SeatFailureReason as R;
     match reason {
-        R::NotLoggedIn | R::NotInstalled => Some(reason.as_str().to_string()),
+        // (core#670) `approval_unavailable` joins them: the host's approval policy is signed,
+        // account-wide and unanswerable from a headless launch, so it does not appear or
+        // disappear mid-run either — and a seat that already finished a unit is no counter-example
+        // (that unit simply never needed to run a command).
+        R::NotLoggedIn | R::NotInstalled | R::ApprovalUnavailable => {
+            Some(reason.as_str().to_string())
+        }
         R::QuotaExhausted if seat_succeeded => None,
         R::QuotaExhausted => Some(format!("{} (no success in the run)", reason.as_str())),
     }
@@ -1323,6 +1330,18 @@ mod tests {
         assert_eq!(
             transcript_bench_reason(R::NotInstalled, true).as_deref(),
             Some("not_installed")
+        );
+        // (core#670) A host-forced approval policy is a property of the HOST, not of the work:
+        // it benches on first occurrence — even for a seat that already finished a unit in this
+        // run (its earlier unit simply never needed to run a command) — so the run's failover
+        // routes to a seat that CAN run instead of re-trying the same refusal.
+        assert_eq!(
+            transcript_bench_reason(R::ApprovalUnavailable, true).as_deref(),
+            Some("approval_unavailable")
+        );
+        assert_eq!(
+            transcript_bench_reason(R::ApprovalUnavailable, false).as_deref(),
+            Some("approval_unavailable")
         );
     }
 
