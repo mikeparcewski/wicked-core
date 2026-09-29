@@ -366,6 +366,16 @@ pub(crate) struct BoundaryCtx {
     /// `None`. It is the engine's store, in the write set only for SQLite's WAL files, so the
     /// write-root witness skips it; the subprocess carrier reads [`GRAPH_WRITE_DIR_ENV`].
     pub graph_write_dir: Option<std::path::PathBuf>,
+    /// The graph STORE this boundary is bound to — the db path the carrier handed the seat as
+    /// `WICKED_ESTATE_DB`, for the raw-SQLite fence (issue #645).
+    ///
+    /// Deliberately NOT `graph_write_dir`: that field is the engine-computed WRITE root, and it is
+    /// `None` for a chat by design (a chat grounds on its graph READ-ONLY, so its key dir never
+    /// becomes a kernel-floor write root — `acp_runner`, Copilot on #426). Whether the store is
+    /// writable is a different question from WHICH store must never be opened with raw SQL, and
+    /// the second is true on both carriers. Reading the fence off the write dir left a chat able
+    /// to name the graph by literal path (codex review of this change).
+    pub graph_store_db: Option<std::path::PathBuf>,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -713,7 +723,9 @@ fn compute_witness_roots(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathB
 
 /// The locations that identify the SHARED graph store, for the raw-SQLite fence (issue #645):
 /// the engine's EXACT repo-graph key dir ([`BoundaryCtx::graph_write_dir`] /
-/// [`GRAPH_WRITE_DIR_ENV`]) plus the store paths the environment PINS ([`ESTATE_STORE_PIN_ENV`]).
+/// [`GRAPH_WRITE_DIR_ENV`]), the store the boundary is BOUND to
+/// ([`BoundaryCtx::graph_store_db`] — the chat carrier has one without a write dir) and the store
+/// paths the environment PINS ([`ESTATE_STORE_PIN_ENV`]).
 ///
 /// Read per carrier exactly as [`compute_witness_roots`] reads its inputs: the in-process carrier
 /// takes the dir off the boundary it was handed, the hook subprocess off its own environment
@@ -726,6 +738,9 @@ pub(crate) fn graph_store_paths(boundary: Option<&BoundaryCtx>) -> Vec<std::path
         None => graph_write_dir_from_env(),
     };
     let mut out: Vec<std::path::PathBuf> = dir.into_iter().collect();
+    if let Some(db) = boundary.and_then(|b| b.graph_store_db.clone()) {
+        out.push(db);
+    }
     for key in ESTATE_STORE_PIN_ENV {
         if let Some(p) = std::env::var_os(key).and_then(|v| valid_config_home(&v)) {
             out.push(p);
@@ -5744,6 +5759,7 @@ mod tests {
             deliverable_roots: vec![notes.clone()], // notes root
             estate_store_pinned: false,
             graph_write_dir: None,
+            graph_store_db: None,
         };
         let wr = compute_witness_roots(Some(&boundary));
         assert_eq!(wr, vec![wt.clone()], "witness roots = write minus notes");
@@ -5840,6 +5856,7 @@ mod tests {
             deliverable_roots: vec![],
             estate_store_pinned: false,
             graph_write_dir,
+            graph_store_db: None,
         };
         let no_graph = ctx(vec![app.clone(), outbox.clone()], None);
         assert_eq!(
@@ -5897,6 +5914,7 @@ mod tests {
             deliverable_roots: vec![],
             estate_store_pinned: false,
             graph_write_dir: Some(graph_dir.clone()),
+            graph_store_db: None,
         };
         let bash = || {
             evaluate_tool_call(
@@ -5983,6 +6001,7 @@ mod tests {
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
                 graph_write_dir: None,
+                graph_store_db: None,
             };
             let call = |tool: &str, input: serde_json::Value| {
                 evaluate_tool_call(

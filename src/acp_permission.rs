@@ -567,6 +567,14 @@ mod tests {
             decisions_path: decisions.to_str().unwrap(),
             boundary: None, // pure policy-evaluation test — no unit filesystem
         };
+        // `boundary: None` means the gate resolves the boundary from PROCESS ENV, so a concurrent
+        // test holding `WICKED_WRITE_ROOTS` (every `gate_hook` boundary row does) makes the fence
+        // refuse `rm -rf /` before any policy is consulted — and the recorded claim is then a
+        // boundary deny, not `pol-deny-bash`. Hold the crate-wide env lock for READING, as the
+        // lock's own doc prescribes.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let params = json!({
             "sessionId": "s1",
             "toolName": "Bash",
@@ -670,6 +678,7 @@ mod tests {
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
                 graph_write_dir: None,
+                graph_store_db: None,
             })
         };
 
@@ -779,6 +788,7 @@ mod tests {
                 deliverable_roots: vec![],
                 estate_store_pinned: false,
                 graph_write_dir: None,
+                graph_store_db: None,
             })
         };
         // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.
@@ -1294,6 +1304,9 @@ mod tests {
                 {"optionId": "reject", "kind": "reject_once"},
             ],
         });
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let allowed = |n: usize, phase_alias: Option<&str>, catalog_alias: Option<&str>| {
             let log = dir.join(format!("decisions-{n}.jsonl"));
             let gate = AcpGate {
@@ -1303,7 +1316,7 @@ mod tests {
                 catalog_alias,
                 db: Some(db.to_str().unwrap()),
                 decisions_path: log.to_str().unwrap(),
-                boundary: None,
+                boundary: None, // env-resolved: the read guard below keeps a mutator out
             };
             permission_result(&gate, &params).1
         };
