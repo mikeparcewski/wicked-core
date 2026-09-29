@@ -3110,17 +3110,23 @@ const OUTPUT_GATE_TOOL: &str = "(output)";
 /// per-call DESCRIPTION some ACP bridges send in place of one (issue #570 defect 2: three records
 /// in run 35565185 named `/tmp`, a path, as the tool).
 const DESCRIBED_TOOL_PREFIX: &str = "(described) ";
+/// The parenthesised SENTINELS this codebase writes on purpose, matched EXACTLY — never by shape.
+/// A shape rule (`starts_with('(') && ends_with(')')`) would let a carrier's parenthesised
+/// description impersonate a sentinel, so `toolCall.title = "(Reading /tmp/foo)"` would be filed
+/// as a tool name (codex review of #570). `(unnamed)` is `acp_permission`'s name for a write-class
+/// request that carries no name; `(unknown)` is what a reader shows for a log line with no
+/// annotation at all.
+const TOOL_NAME_SENTINELS: [&str; 3] = [OUTPUT_GATE_TOOL, "(unnamed)", "(unknown)"];
 
 /// Is `name` shaped like a canonical tool name — `Bash`, `NotebookEdit`, `mcp__estate__recall`,
 /// `str_replace_based_edit_tool`, or the broker's qualified `mcp:<server>/<tool>`? An
 /// identifier-ish token: no whitespace, and only the punctuation real tool names use.
 ///
-/// A parenthesised word (`(unnamed)`, `(output)`) is a SENTINEL this codebase writes on purpose
-/// and passes through unchanged; nothing else with a `(` can reach here, because a
-/// carrier-supplied name is checked against this predicate first.
+/// One of this codebase's own [`TOOL_NAME_SENTINELS`] passes through unchanged — by exact match,
+/// so a carrier's parenthesised description cannot impersonate one.
 fn is_tool_shaped(name: &str) -> bool {
-    if name.starts_with('(') && name.ends_with(')') && name.len() > 2 {
-        return true; // one of our own sentinels
+    if TOOL_NAME_SENTINELS.contains(&name) {
+        return true;
     }
     if name.is_empty() || name.len() > 96 {
         return false;
@@ -8186,10 +8192,16 @@ mod boundary_tests {
         ] {
             assert_eq!(audit_tool_name(name), name, "{name} is a tool name");
         }
-        // Our own sentinels are parenthesised words and pass through.
-        for sentinel in ["(output)", "(unnamed)"] {
+        // Our own sentinels pass through — by exact match, so a parenthesised DESCRIPTION cannot
+        // impersonate one and ride in unlabelled (codex review).
+        for sentinel in TOOL_NAME_SENTINELS {
             assert_eq!(audit_tool_name(sentinel), sentinel);
         }
+        assert_eq!(
+            audit_tool_name("(Reading /tmp/foo)"),
+            "(described) (Reading /tmp/foo)",
+            "parentheses are not a free pass"
+        );
         // A path or a sentence is a DESCRIPTION, not a name.
         assert_eq!(audit_tool_name("/tmp"), "(described) /tmp");
         assert_eq!(
