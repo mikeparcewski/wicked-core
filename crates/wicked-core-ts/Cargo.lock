@@ -2778,6 +2778,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "toml",
  "tracing",
  "uuid",
  "wicked-apps-core",
