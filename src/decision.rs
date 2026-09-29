@@ -149,7 +149,16 @@ fn is_claude_ballot(cli: &AgenticCli) -> bool {
 
 /// The roster the council convenes with: every claude ballot's `trust_flags` gain
 /// `--disallowedTools <state-home rules>` (`execute_wrapped::ballot_deny_rules`) — the half of the
-/// fence the shared worker file omits by design; every other seat is handed back untouched.
+/// fence the shared worker file omits by design — AND `--strict-mcp-config` (core#660 item 3), so
+/// a ballot loads no MCP server the engine did not hand it. Every other seat is handed back
+/// untouched.
+///
+/// The MCP pin is UNCONDITIONAL, unlike the deny rules: a ballot ran with the deny fence
+/// (`ballot_deny_rules`) and `ENABLE_CLAUDEAI_MCP_SERVERS=false` (`SeatConfig::apply`) but never
+/// with the flag, so a repository `.mcp.json`, a local-scope entry in the worker home or a
+/// claude.ai connector recorded on the ballot seat's account still loaded for the vote — the one
+/// carrier core#657 left open, and the sharpest of its residuals because a council convenes on
+/// the operator's own signed-in claude home.
 fn fenced_roster(
     clis: &[AgenticCli],
     operational_home: Option<&std::path::Path>,
@@ -160,9 +169,16 @@ fn fenced_roster(
         .iter()
         .cloned()
         .map(|mut c| {
-            if is_claude_ballot(&c) && !rules.is_empty() {
-                c.trust_flags.push("--disallowedTools".into());
-                c.trust_flags.push(rules.join(","));
+            if is_claude_ballot(&c) {
+                for arg in crate::mcp_isolation::CLAUDE_STRICT_MCP_ARGS {
+                    if !c.trust_flags.iter().any(|f| f == arg) {
+                        c.trust_flags.push(arg.to_string());
+                    }
+                }
+                if !rules.is_empty() {
+                    c.trust_flags.push("--disallowedTools".into());
+                    c.trust_flags.push(rules.join(","));
+                }
             }
             c
         })
@@ -866,10 +882,16 @@ mod tests {
             claude.trust_flags,
             vec![
                 "--dangerously-skip-permissions".to_string(),
+                // core#660 item 3: the ballot loads no ambient MCP server — a repository
+                // `.mcp.json`, a worker-home local-scope entry or a claude.ai connector on the
+                // seat's own signed-in account. It ran with the deny fence and
+                // `ENABLE_CLAUDEAI_MCP_SERVERS=false` but never with this flag.
+                "--strict-mcp-config".to_string(),
                 "--disallowedTools".to_string(),
                 expected.join(","),
             ],
-            "the claude ballot carries the state-home rules on its argv, after its own trust flag"
+            "the claude ballot carries the MCP pin and the state-home rules on its argv, after \
+             its own trust flag"
         );
         let opr = crate::execute_wrapped::rule_path(&op_home).unwrap();
         assert!(

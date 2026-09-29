@@ -2480,6 +2480,19 @@ fn start_acp_process_with_write_roots(
     let mcp_token = session
         .and(crate::mcp_gate::daemon_crew_url())
         .map(|url| (crate::mcp_gate::McpToken::mint(), url));
+    // core#660: the seat's own MCP off-switches, on the carriers claude's `strictMcpConfig`
+    // session option does not cover. Only when the BRIDGE IS that CLI (copilot's ACP mode is
+    // `copilot --acp` — the same binary, so its flags are valid here): the codex bridge is
+    // `codex-acp`, a different program that takes no `-c`, so the codex ACP half of core#660
+    // stays open and disclosed rather than being handed flags it would reject. A pin the engine
+    // cannot build refuses the spawn — fail closed, never a spawn with an ungoverned tool channel.
+    let mcp_pins: Vec<String> =
+        if wicked_apps_core::spawn::SeatCli::from_binary(&config.binary) == seat_cli {
+            crate::mcp_isolation::seat_mcp_pin_flags(seat_cli, seat_config.root(), Some(cwd))
+                .map_err(|why| anyhow::anyhow!("ACP seat '{}': {why}", config.binary))?
+        } else {
+            Vec::new()
+        };
     let build_cmd = |binary: &str| {
         let mut cmd = if let Some(sandbox) = &worker_sandbox {
             let mut cmd = std::process::Command::new(&sandbox.wrapper[0]);
@@ -2567,6 +2580,7 @@ fn start_acp_process_with_write_roots(
             }
         }
         cmd.args(&config.start_args);
+        cmd.args(&mcp_pins);
         // v3.2: pi's `--no-skills --skill <dir>…` / copilot's `--add-dir <view>` — only when the
         // bridge IS that CLI (`SkillsDelivery::acp_transport` judged the carrier); empty
         // otherwise (a separate pi bridge is handed `WICKED_PI_SKILL_DIRS` above instead).
