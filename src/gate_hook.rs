@@ -885,7 +885,7 @@ pub(crate) fn boundary_denial_tracked(
             // command, resolved through the boundary's own normalize chain. Without these, `cd
             // <graph-dir> && sqlite3 graph.db 'UPDATE nodes SET risk = 0'` named the store in no
             // way the literal scan could see.
-            let cwd_bases = graph_store_cwd_bases(command, &here, cwd, home);
+            let cwd_bases = graph_store_cwd_bases(command, &here, home);
             if let Some(hit) =
                 classify_estate_command(command, estate_store_pinned, graph_store, &cwd_bases, home)
             {
@@ -1632,7 +1632,10 @@ fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
                 let Some(prog) = words.get(idx) else {
                     continue;
                 };
-                if program_basename(prog) == "cd" {
+                // `pushd` moves the shell exactly as `cd` does — the install fence already
+                // tracks both — so a `pushd <outside> && <write>` escape is the same escape as
+                // issue #540's, and the raw-SQLite fence's cwd walk needs it too (#645).
+                if matches!(&*program_basename(prog), "cd" | "pushd") {
                     if let Some(dest) = words[idx + 1..].iter().find(|w| !w.starts_with('-')) {
                         targets.push((*dest).to_string());
                     }
@@ -2229,24 +2232,24 @@ fn opens_graph_store(
 /// second half): where the shell STANDS (`here` — the install fence's per-attempt cwd sidecar, so a
 /// `cd` in an earlier allowed call still counts) plus every `cd` destination in THIS command.
 ///
-/// The `cd` destinations are themselves resolved with [`crate::path_policy`]'s normalize chain
-/// against `cwd`, the same way [`bash_cd_escape_targets`]' results are judged, so `cd
-/// ../graphs/abc123` becomes an absolute base rather than a string nothing can join.
+/// The destinations (`cd` and `pushd`) are resolved with [`crate::path_policy`]'s normalize chain,
+/// each against the one before it, so `cd ../graphs/abc123` becomes an absolute base rather than a
+/// string nothing can join — and a CHAIN of moves lands where the shell would.
 fn graph_store_cwd_bases(
     command: &str,
     here: &std::path::Path,
-    cwd: &std::path::Path,
     home: Option<&std::path::Path>,
 ) -> Vec<std::path::PathBuf> {
-    let mut bases = vec![here.to_path_buf()];
+    let mut at = here.to_path_buf();
+    let mut bases = vec![at.clone()];
+    // A shell's cwd evolves LEFT TO RIGHT: `cd ../graphs && cd abc123` lands in
+    // `../graphs/abc123`, so each destination is resolved against the one BEFORE it — not against
+    // the launch cwd, which would resolve the second `cd` to `<worktree>/abc123` and miss the
+    // store. `script_path` takes the quotes off first, so `cd "../graphs/abc123"` is the same
+    // move as the bare spelling. An ABSOLUTE destination ignores the base, as the shell does.
     for dest in bash_cd_targets_inner(command, true) {
-        // Resolve the destination the way the shell would: relative to where it stands.
-        let base = if std::path::Path::new(&script_path(&dest)).is_absolute() {
-            here
-        } else {
-            cwd
-        };
-        bases.push(crate::path_policy::normalize_for_fence(&dest, base, home));
+        at = crate::path_policy::normalize_for_fence(&script_path(&dest), &at, home);
+        bases.push(at.clone());
     }
     bases.sort();
     bases.dedup();
@@ -8547,9 +8550,9 @@ mod boundary_tests {
         let graph = std::path::PathBuf::from("/srv/estate/graphs/abc123");
         let store = [graph.clone()];
         let wt = std::path::PathBuf::from("/srv/work/wt");
-        // `here` is the process cwd until a cd moves it; the destinations come from the command.
+        // `here` is where the shell stands; the command's own moves walk on from there.
         let bases = |command: &str, here: &std::path::Path| {
-            super::graph_store_cwd_bases(command, here, &wt, None)
+            super::graph_store_cwd_bases(command, here, None)
         };
 
         // The reproduced escape: a cd in the SAME command, absolute or relative, and after a `sh -c`.
@@ -8558,6 +8561,18 @@ mod boundary_tests {
             "cd ../../estate/graphs/abc123 && sqlite3 graph.db \'CREATE TABLE evil (x)\'",
             "cd /srv/estate/graphs && sqlite3 abc123/graph.db \'DELETE FROM edges\'",
             "cd /srv/estate/graphs/abc123 && python3 -c \'import sqlite3; sqlite3.connect(\"graph.db\").execute(\"CREATE TABLE t (x)\")\'",
+            // The three spellings my own probe matrix found still open after the first cut of
+            // this fix — each a different reason the cwd model has to be a left-to-right WALK.
+            "pushd /srv/estate/graphs/abc123 && sqlite3 graph.db \'CREATE TABLE evil (x)\'",
+            "cd \"/srv/estate/graphs/abc123\" && sqlite3 graph.db \'CREATE TABLE evil (x)\'",
+            "cd /srv/estate/graphs && cd abc123 && sqlite3 graph.db \'CREATE TABLE evil (x)\'",
+            // … and the spellings that were already closed, kept as rows so a refactor of the
+            // splitter cannot quietly drop one.
+            "cd /srv/estate/graphs/abc123; sqlite3 graph.db \'CREATE TABLE evil (x)\'",
+            "cd /srv/estate/graphs/abc123 && sqlite3 ./graph.db \'CREATE TABLE evil (x)\'",
+            "cd /srv/estate/graphs/abc123/ && sqlite3 graph.db \'CREATE TABLE evil (x)\'",
+            "cd /srv/estate/graphs/abc123 && sqlite3 -- graph.db \'CREATE TABLE evil (x)\'",
+            "cd /srv/estate/graphs/abc123 && litecli graph.db",
         ] {
             let b = bases(command, &wt);
             let hit = super::classify_estate_command(command, false, &store, &b, None)
@@ -8590,6 +8605,11 @@ mod boundary_tests {
             "cd /srv/estate/graphs/abc123 && ls",
             "cd /srv/estate/graphs/abc123 && wc -l notes",
             "cd /srv/estate/graphs/abc1234 && sqlite3 graph.db \'select 1\'",
+            "pushd /srv/estate/graphs/abc1234 && sqlite3 graph.db \'select 1\'",
+            // A chain that never reaches the store: each move resolves against the one before it,
+            // so this lands in the worktree's own fixtures, not in the graph dir.
+            "cd tests && cd fixtures && sqlite3 sample.db \'select 1\'",
+            "cd /srv/estate/graphs/abc123 && cat graph.db",
         ] {
             let b = bases(benign, &wt);
             assert!(
