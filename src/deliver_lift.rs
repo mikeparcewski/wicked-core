@@ -105,6 +105,22 @@ impl LiftOutcome {
 }
 
 /// The lift's record — every field the `deliverLiftEvaluated` event carries.
+///
+/// # `base_before` / `base_after` both name THE BASE (core#684, F1)
+///
+/// They are the base commit the run's verified tree was judged against **before** the lift and
+/// the base tip it is judged against **after** it — never the run branch. Consumers render them
+/// as the base: wicked-studio's `DeliverLift.tsx` says *"{base_ref} is still at {base_before}"*
+/// for `unchanged` and *"re-based onto {base_ref} @ {base_after} (was {base_before})"* for
+/// `lifted`, on the consent surface for the only irreversible action the platform takes.
+///
+/// So: **`outcome == Unchanged` ⇒ `base_before == base_after`** (the base did not move). It holds
+/// by construction — [`LiftReport::unchanged`] takes the tip ONCE — and is re-checked in
+/// [`LiftReport::to_event`]. In the `Lifted` / `Conflict` / `Failed` arms `base_before` is the
+/// worktree `HEAD`, which in that path IS the old base (the work is uncommitted on a `HEAD` that
+/// is a strict ancestor of the tip). In the divergent `Skipped` arm the branch carries its own
+/// commits, so `HEAD` is not a base and their common ancestor (`merge-base`) is reported
+/// instead.
 #[derive(Debug, Clone)]
 pub(crate) struct LiftReport {
     pub outcome: LiftOutcome,
@@ -118,6 +134,23 @@ pub(crate) struct LiftReport {
 }
 
 impl LiftReport {
+    /// The base did not move: the remote tip is already an ancestor of the worktree `HEAD`.
+    /// `tip` is the ONE value both base fields take — the invariant cannot be spelt wrong here
+    /// (F1: the `Unchanged` arm used to report `HEAD`, the run branch, as `base_before`, so a
+    /// retry after any phase committed stated a false SHA in the studio's "base unchanged" line).
+    fn unchanged(base_ref: String, tip: String) -> Self {
+        LiftReport {
+            outcome: LiftOutcome::Unchanged,
+            base_ref: Some(base_ref),
+            base_before: Some(tip.clone()),
+            base_after: Some(tip),
+            tree_before: None,
+            tree_after: None,
+            conflicts: Vec::new(),
+            note: None,
+        }
+    }
+
     fn skipped(note: impl Into<String>) -> Self {
         LiftReport {
             outcome: LiftOutcome::Skipped,
@@ -132,6 +165,22 @@ impl LiftReport {
     }
 
     pub(crate) fn to_event(&self, session: &str, ord: u32, attempt: u32) -> CoreEvent {
+        // The one invariant a consumer reads as a claim about the base (core#684, F1): an
+        // `unchanged` lift whose base moved is self-contradictory, and one with no base at all
+        // renders as "still at ?". The guarantee in a release build is STRUCTURAL — the only
+        // `Unchanged` construction is `LiftReport::unchanged`, which takes the tip once and
+        // cannot spell either field `None` — so this is a development fence against a future
+        // hand-built arm, not a runtime gate (making `to_event` fallible would buy a fallback
+        // path for a state the type system already excludes; a release `assert!` on the deliver
+        // path would be worse than the contradiction). codex review of #682, LOW.
+        debug_assert!(
+            self.outcome != LiftOutcome::Unchanged
+                || (self.base_before.is_some() && self.base_before == self.base_after),
+            "an `unchanged` lift must report one base, present on both sides: base_before {:?}, \
+             base_after {:?}",
+            self.base_before,
+            self.base_after
+        );
         CoreEvent::DeliverLiftEvaluated {
             session: session.to_string(),
             ord,
@@ -278,6 +327,16 @@ fn is_ancestor(cwd: &Path, env: &[(&str, &Path)], ancestor: &str, descendant: &s
     .is_ok()
 }
 
+/// A best common ancestor of `a` and `b` (`git merge-base`) — the base a divergent run branch
+/// forked from. `None` when git cannot name one (unrelated histories, or the call failed).
+/// A criss-cross history can have several best common ancestors and git picks one of them, so
+/// this names A valid common base, not necessarily a unique fork point (codex review of #682).
+fn merge_base(cwd: &Path, env: &[(&str, &Path)], a: &str, b: &str) -> Option<String> {
+    git_string(cwd, &["merge-base", a, b], env)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// The in-memory merge: the run's content (`probe`, a dangling commit whose parent is the old
 /// base) onto `tip`. `Ok(Ok(tree))` clean; `Ok(Err(conflicted_paths))` conflict; `Err(why)` when
 /// `git merge-tree --write-tree` is unavailable or failed outright.
@@ -374,22 +433,19 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
         Ok(_) => return LiftReport::skipped(format!("{base_ref} does not resolve")),
     };
     if is_ancestor(worktree, &env, &tip, &head) {
-        return LiftReport {
-            outcome: LiftOutcome::Unchanged,
-            base_ref: Some(base_ref),
-            base_before: Some(head.clone()),
-            base_after: Some(tip),
-            tree_before: None,
-            tree_after: None,
-            conflicts: Vec::new(),
-            note: None,
-        };
+        // The base did NOT move. `HEAD` may be well past it (a phase committed, and every
+        // deliver retry lands here), so the base is the TIP on both sides — reporting `HEAD`
+        // here is what made the studio's "base unchanged" line state the run branch's SHA (F1).
+        return LiftReport::unchanged(base_ref, tip);
     }
     if !is_ancestor(worktree, &env, &head, &tip) {
+        // Divergent: the branch carries commits the tip lacks, so `HEAD` is not a base. The base
+        // the run's work was judged against is their common ancestor; `None` if git cannot name
+        // one. Nothing is lifted either way — this only makes the disclosure true.
         return LiftReport {
             outcome: LiftOutcome::Skipped,
             base_ref: Some(base_ref.clone()),
-            base_before: Some(head),
+            base_before: merge_base(worktree, &env, &head, &tip),
             base_after: Some(tip),
             tree_before: None,
             tree_after: None,
@@ -704,9 +760,8 @@ pub(crate) fn lift_and_reverify(
             ))
         }
         LiftOutcome::Unchanged => eprintln!(
-            "wicked-core: deliver lift for unit {ord}: unchanged — the run's base {} is already \
-             at {base_ref} ({tip})",
-            report.base_before.as_deref().map(short).unwrap_or("?")
+            "wicked-core: deliver lift for unit {ord}: unchanged — {base_ref} is still at {tip}, \
+             the run's base; the verified tree is the tree that would ship"
         ),
         LiftOutcome::Skipped => eprintln!(
             "wicked-core: deliver lift for unit {ord}: skipped — {}",
@@ -1018,6 +1073,64 @@ mod tests {
         );
     }
 
+    /// F1 (C7 run `964e0c3f`): on a deliver **retry** a phase has already committed, so the
+    /// worktree `HEAD` is the RUN BRANCH head and no longer the base. `unchanged` means THE BASE
+    /// DID NOT MOVE, so both `base_before` and `base_after` must name the base tip — never the
+    /// run branch. wicked-studio renders this verbatim (`{base} is still at {baseBefore}`) on the
+    /// consent surface for the only irreversible action, and `unchanged` with
+    /// `base_before != base_after` is self-contradictory on its face.
+    #[test]
+    fn an_unchanged_lift_on_a_retry_names_the_base_not_the_run_branch() {
+        let (clone, wt) = stale_base_layout("unchanged-retry");
+        // The retry shape: a phase committed the run's work, so HEAD is past the base.
+        identity(&wt);
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-qm", "a phase committed the run's work"]);
+        let branch_head = run_git(&wt, &["rev-parse", "HEAD"]);
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_ne!(branch_head, tip, "the retry shape needs HEAD past the base");
+
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Unchanged, "{r:?}");
+        assert_eq!(r.base_ref.as_deref(), Some("origin/main"));
+        assert_eq!(r.base_after.as_deref(), Some(tip.as_str()), "{r:?}");
+        assert_ne!(
+            r.base_before.as_deref(),
+            Some(branch_head.as_str()),
+            "base_before must not name the RUN BRANCH head: {r:?}"
+        );
+        assert_eq!(
+            r.base_before.as_deref(),
+            Some(tip.as_str()),
+            "base_before must name the base tip: {r:?}"
+        );
+        assert_eq!(
+            r.base_before, r.base_after,
+            "`unchanged` means the base did not move: {r:?}"
+        );
+    }
+
+    /// The fence under F1: any FUTURE arm that spells the two base fields by hand and lets them
+    /// disagree on an `unchanged` lift trips before the event — and the studio's assurance line —
+    /// is ever written. (`debug_assert`: the invariant is structural in release via
+    /// [`LiftReport::unchanged`]; this is the guard against a new hand-built arm.)
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "an `unchanged` lift must report one base")]
+    fn an_unchanged_lift_whose_base_moved_trips_the_invariant() {
+        let contradictory = LiftReport {
+            outcome: LiftOutcome::Unchanged,
+            base_ref: Some("origin/main".into()),
+            base_before: Some("c9caa85".into()),
+            base_after: Some("4a18d8d".into()),
+            tree_before: None,
+            tree_after: None,
+            conflicts: Vec::new(),
+            note: None,
+        };
+        let _ = contradictory.to_event("run", 0, 1);
+    }
+
     /// The F-3R2-013 shape with a NON-conflicting landing: the remote moved (a new file), the run's
     /// uncommitted work sits on the stale base. The lift puts the branch on the remote tip with the
     /// run's changes as its diff — and the landed file is present — without a rebase ever running.
@@ -1119,6 +1232,7 @@ mod tests {
             std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
         });
         let head = run_git(&wt, &["rev-parse", "HEAD"]);
+        let fork_point = run_git(&wt, &["merge-base", "HEAD", "origin/main"]);
         let r = lift_onto_remote_default(&wt, &clone);
         assert_eq!(r.outcome, LiftOutcome::Skipped, "{r:?}");
         assert!(
@@ -1127,6 +1241,23 @@ mod tests {
                 .is_some_and(|n| n.contains("commits origin/main lacks")),
             "{:?}",
             r.note
+        );
+        // F1, same class: `HEAD` is the RUN BRANCH here, so the base fields must name the fork
+        // point and the tip — never the branch.
+        assert_ne!(
+            r.base_before.as_deref(),
+            Some(head.as_str()),
+            "base_before must not name the run branch head: {r:?}"
+        );
+        assert_eq!(
+            r.base_before.as_deref(),
+            Some(fork_point.as_str()),
+            "base_before is the common ancestor the branch forked from: {r:?}"
+        );
+        assert_eq!(
+            r.base_after.as_deref(),
+            Some(run_git(&wt, &["rev-parse", "origin/main"]).as_str()),
+            "{r:?}"
         );
         assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), head, "nothing moved");
     }
