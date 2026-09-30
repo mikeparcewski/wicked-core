@@ -119,7 +119,8 @@ impl LiftOutcome {
 /// [`LiftReport::to_event`]. In the `Lifted` / `Conflict` / `Failed` arms `base_before` is the
 /// worktree `HEAD`, which in that path IS the old base (the work is uncommitted on a `HEAD` that
 /// is a strict ancestor of the tip). In the divergent `Skipped` arm the branch carries its own
-/// commits, so `HEAD` is not a base and the fork point (`merge-base`) is reported instead.
+/// commits, so `HEAD` is not a base and their common ancestor (`merge-base`) is reported
+/// instead.
 #[derive(Debug, Clone)]
 pub(crate) struct LiftReport {
     pub outcome: LiftOutcome,
@@ -165,11 +166,18 @@ impl LiftReport {
 
     pub(crate) fn to_event(&self, session: &str, ord: u32, attempt: u32) -> CoreEvent {
         // The one invariant a consumer reads as a claim about the base (core#684, F1): an
-        // `unchanged` lift whose base moved is self-contradictory. Structural via
-        // `LiftReport::unchanged`; asserted here so no future arm can spell it by hand and drift.
+        // `unchanged` lift whose base moved is self-contradictory, and one with no base at all
+        // renders as "still at ?". The guarantee in a release build is STRUCTURAL — the only
+        // `Unchanged` construction is `LiftReport::unchanged`, which takes the tip once and
+        // cannot spell either field `None` — so this is a development fence against a future
+        // hand-built arm, not a runtime gate (making `to_event` fallible would buy a fallback
+        // path for a state the type system already excludes; a release `assert!` on the deliver
+        // path would be worse than the contradiction). codex review of #682, LOW.
         debug_assert!(
-            self.outcome != LiftOutcome::Unchanged || self.base_before == self.base_after,
-            "an `unchanged` lift must report one base: base_before {:?} != base_after {:?}",
+            self.outcome != LiftOutcome::Unchanged
+                || (self.base_before.is_some() && self.base_before == self.base_after),
+            "an `unchanged` lift must report one base, present on both sides: base_before {:?}, \
+             base_after {:?}",
             self.base_before,
             self.base_after
         );
@@ -319,8 +327,10 @@ fn is_ancestor(cwd: &Path, env: &[(&str, &Path)], ancestor: &str, descendant: &s
     .is_ok()
 }
 
-/// The best common ancestor of `a` and `b` (`git merge-base`) — the base a divergent run branch
+/// A best common ancestor of `a` and `b` (`git merge-base`) — the base a divergent run branch
 /// forked from. `None` when git cannot name one (unrelated histories, or the call failed).
+/// A criss-cross history can have several best common ancestors and git picks one of them, so
+/// this names A valid common base, not necessarily a unique fork point (codex review of #682).
 fn merge_base(cwd: &Path, env: &[(&str, &Path)], a: &str, b: &str) -> Option<String> {
     git_string(cwd, &["merge-base", a, b], env)
         .ok()
@@ -430,7 +440,8 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
     }
     if !is_ancestor(worktree, &env, &head, &tip) {
         // Divergent: the branch carries commits the tip lacks, so `HEAD` is not a base. The base
-        // the run's work was judged against is the fork point; `None` if git cannot name it.
+        // the run's work was judged against is their common ancestor; `None` if git cannot name
+        // one. Nothing is lifted either way — this only makes the disclosure true.
         return LiftReport {
             outcome: LiftOutcome::Skipped,
             base_ref: Some(base_ref.clone()),
@@ -1241,7 +1252,7 @@ mod tests {
         assert_eq!(
             r.base_before.as_deref(),
             Some(fork_point.as_str()),
-            "base_before is the base the branch forked from: {r:?}"
+            "base_before is the common ancestor the branch forked from: {r:?}"
         );
         assert_eq!(
             r.base_after.as_deref(),
