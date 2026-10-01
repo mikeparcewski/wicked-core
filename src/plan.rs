@@ -23,7 +23,7 @@ use crate::workflow::WorkflowDef;
 /// already use for exactly this reason (both documented single-line-by-contract). Two guards keep
 /// it honest: `folded_instructions_never_introduce_a_newline_into_the_prompt` here, and the
 /// call-site `pty_unit_prompt` refusal in `execute_wrapped`.
-const INSTRUCTION_SEP: &str = " ||| ";
+pub(crate) const INSTRUCTION_SEP: &str = " ||| ";
 
 /// The recognizable head of the engine-side scope preamble (core#283) — a const so the tests that
 /// assert its presence/absence and any operator grepping a prompt share one spelling.

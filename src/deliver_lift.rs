@@ -67,6 +67,23 @@ pub(crate) fn is_deliver_unit(unit: &crate::domain::WorkUnit) -> bool {
 /// keeps its terminal path; every other deliver refusal parks at an `escalation` gate.
 pub(crate) const LIFT_CONFLICT_MARKER: &str = "deliver: LIFT-CONFLICT";
 
+/// crew's `DELIVER_PUSH_REJECTED_MARKER` (N4): the deliver script's LAST line when the REMOTE refused
+/// the push after the commit. Not a strand — the deterministic refusal arm parks the run at a gate.
+pub(crate) const PUSH_REJECTED_MARKER: &str = "deliver: PUSH-REJECTED";
+
+/// Is this deliver output a `LIFT-CONFLICT` strand? The marker must be present AND be the LAST of
+/// the two post-commit markers: the script prints its own verdict last, and text before it can be
+/// the remote's (a pre-receive hook may echo anything, the lift marker included) — so a refused
+/// push whose remote said "LIFT-CONFLICT" still takes the refusal gate (N4, codex review).
+pub(crate) fn is_lift_conflict_strand(output: &str) -> bool {
+    match output.rfind(LIFT_CONFLICT_MARKER) {
+        None => false,
+        Some(lift) => output
+            .rfind(PUSH_REJECTED_MARKER)
+            .is_none_or(|push| push < lift),
+    }
+}
+
 /// `UnitDenial.source` of a deliver unit the actor parked on a refusal (DES-L9 F1 arm). Rides
 /// the existing `unit.denial` shape — `UnitDenialSource` is open-ended on the wire.
 pub(crate) const DENIAL_SOURCE_DELIVER_REFUSAL: &str = "deliver_refusal";
