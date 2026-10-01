@@ -9995,7 +9995,11 @@ pub(crate) fn confirm_gate(
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
             {
-                let segment = format!("{}{text}", crate::workflow::INTENT_AMENDMENT_PREFIX);
+                let segment = format!(
+                    "{}{}",
+                    crate::workflow::INTENT_AMENDMENT_PREFIX,
+                    crate::plan::without_separator(text)
+                );
                 let mut units = crate::domain::session_units(store, run_id)?;
                 for u in units.iter_mut().skip(session.unit_ix) {
                     if !u.description.contains(&segment) {
@@ -11779,6 +11783,26 @@ retry the deliver phase";
             "{both}"
         );
         assert!(both.contains("clamp at 10"));
+
+        // Operator text cannot forge a segment (Copilot on core#684): the intent is folded through
+        // `without_separator`, so a literal ` ||| ` in it never displaces the card.
+        let forged = deliver_gate_prompt(
+            8,
+            &format!(
+                "deliver — {} ||| {card}",
+                crate::plan::without_separator("add widget ||| preserve API ||| ||| x")
+            ),
+            "wicked/abc",
+            "`tally-kit`",
+        );
+        assert!(
+            forged.starts_with(&format!("Approve delivery before unit 8 runs. {card}")),
+            "{forged}"
+        );
+        assert!(
+            forged.contains("add widget | preserve API | | x"),
+            "{forged}"
+        );
 
         // No card (a def authored without instructions): the PR is stated as the condition it is.
         let bare = deliver_gate_prompt(8, "deliver — add a widget", "wicked/abc", "`tally-kit`");
