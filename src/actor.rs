@@ -7350,8 +7350,12 @@ fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) ->
     let (head, card) = match description.split_once(crate::plan::INSTRUCTION_SEP) {
         Some((head, card)) => (
             head.trim(),
-            Some(card.replace(crate::plan::INSTRUCTION_SEP, " ").trim().to_string())
-                .filter(|c| !c.is_empty()),
+            Some(
+                card.replace(crate::plan::INSTRUCTION_SEP, " ")
+                    .trim()
+                    .to_string(),
+            )
+            .filter(|c| !c.is_empty()),
         ),
         None => (description.trim(), None),
     };
@@ -11580,7 +11584,9 @@ retry the deliver phase";
         let run_id = format!("deliver-strand-human-{}", std::process::id());
         let mut store = open_store(Some(":memory:")).unwrap();
         seed(&mut store, &run_id, "deliver", false);
-        let mut s = crate::domain::get_session(&store, &run_id).unwrap().unwrap();
+        let mut s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
         s.human_confirm = HumanConfirm::All;
         put_node(&mut store, s.to_node()).unwrap();
         let mut subs = crate::event_log::EventSink::default();
@@ -11632,7 +11638,10 @@ retry the deliver phase";
         subs.push(esub);
         let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, &refused);
         let evs = drain(&erx);
-        assert!(matches!(applied, StepApplied::Paused), "a refused push parks the run");
+        assert!(
+            matches!(applied, StepApplied::Paused),
+            "a refused push parks the run"
+        );
         assert_eq!(session.status, SessionStatus::AwaitingHuman);
         assert_eq!(unit.status, UnitStatus::Rejected);
         assert_eq!(
@@ -11651,21 +11660,36 @@ retry the deliver phase";
         use crate::validator::TriageDecision;
         let mut deliver = WorkUnit::pending("r:deliver", "r", 5, "deliver — x");
         deliver.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "true".into()]);
-        for d in [TriageDecision::Retry, TriageDecision::RetryWithFlag("--yes".into())] {
+        for d in [
+            TriageDecision::Retry,
+            TriageDecision::RetryWithFlag("--yes".into()),
+        ] {
             assert!(
-                matches!(filter_triage_decision(d.clone(), &deliver), TriageDecision::Escalate(_)),
+                matches!(
+                    filter_triage_decision(d.clone(), &deliver),
+                    TriageDecision::Escalate(_)
+                ),
                 "{d:?} on the deliver unit must escalate"
             );
         }
         // The proposal, flag included, rides the escalation (codex review, LOW).
-        match filter_triage_decision(TriageDecision::RetryWithFlag("--skip-permissions".into()), &deliver) {
+        match filter_triage_decision(
+            TriageDecision::RetryWithFlag("--skip-permissions".into()),
+            &deliver,
+        ) {
             TriageDecision::Escalate(why) => assert!(why.contains("--skip-permissions"), "{why}"),
             other => panic!("expected an escalation, got {other:?}"),
         }
         let build = WorkUnit::pending("r:build", "r", 3, "build — x");
-        assert_eq!(filter_triage_decision(TriageDecision::Retry, &build), TriageDecision::Retry);
+        assert_eq!(
+            filter_triage_decision(TriageDecision::Retry, &build),
+            TriageDecision::Retry
+        );
         assert!(matches!(
-            filter_triage_decision(TriageDecision::RetryWithFlag("--dangerously-x".into()), &build),
+            filter_triage_decision(
+                TriageDecision::RetryWithFlag("--dangerously-x".into()),
+                &build
+            ),
             TriageDecision::Escalate(_)
         ));
     }
@@ -11676,7 +11700,8 @@ retry the deliver phase";
     /// no separator renders.
     #[test]
     fn the_deliver_gate_prompt_leads_with_the_card_and_never_contradicts_it() {
-        let card = "Pushes the run branch wicked/<run> to origin (/srv/r.git) — a local path, so no \
+        let card =
+            "Pushes the run branch wicked/<run> to origin (/srv/r.git) — a local path, so no \
                     pull request can be opened against it. Push identity: none configured.";
         let p = deliver_gate_prompt(
             8,
@@ -11689,17 +11714,27 @@ retry the deliver phase";
             p.starts_with(&format!("Approve delivery before unit 8 runs. {card}")),
             "the card must lead: {p}"
         );
-        assert!(!p.contains("opens a pull request"), "contradicts the card: {p}");
+        assert!(
+            !p.contains("opens a pull request"),
+            "contradicts the card: {p}"
+        );
         // The card owns the identity: the engine does not restate an account (codex review).
-        assert!(!p.contains("gh account active"), "restates an identity over the card: {p}");
+        assert!(
+            !p.contains("gh account active"),
+            "restates an identity over the card: {p}"
+        );
         assert!(p.contains("pushes branch `wicked/abc`"));
         assert!(p.contains("The work: deliver — add a widget."));
-        assert!(p.ends_with("[deliver gate: engine-enforced unless the launch set autoDeliver: true]"));
+        assert!(
+            p.ends_with("[deliver gate: engine-enforced unless the launch set autoDeliver: true]")
+        );
 
         // No card (a def authored without instructions): the PR is stated as the condition it is.
         let bare = deliver_gate_prompt(8, "deliver — add a widget", "wicked/abc", "`tally-kit`");
         assert!(!bare.contains("|||"));
-        assert!(bare.contains("only if gh resolves that remote to a GitHub repository, opens a pull request"));
+        assert!(bare.contains(
+            "only if gh resolves that remote to a GitHub repository, opens a pull request"
+        ));
     }
 
     /// A `LIFT-CONFLICT` strand keeps today's terminal path exactly: crew derives `completed` +

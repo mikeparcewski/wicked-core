@@ -78,7 +78,9 @@ pub(crate) const PUSH_REJECTED_MARKER: &str = "deliver: PUSH-REJECTED";
 pub(crate) fn is_lift_conflict_strand(output: &str) -> bool {
     match output.rfind(LIFT_CONFLICT_MARKER) {
         None => false,
-        Some(lift) => output.rfind(PUSH_REJECTED_MARKER).is_none_or(|push| push < lift),
+        Some(lift) => output
+            .rfind(PUSH_REJECTED_MARKER)
+            .is_none_or(|push| push < lift),
     }
 }
 
