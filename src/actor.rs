@@ -3332,20 +3332,7 @@ pub(crate) fn run(
                     continue;
                 };
                 let ord = unit.ord;
-                // DENY-DOMINATES policy filter: a judge may PROPOSE any flag, but flags
-                // smelling of privilege bypass are never auto-applied — they escalate
-                // with the proposal attached so the operator makes that call.
-                const DANGER: &[&str] = &["dangerous", "bypass", "allow-all", "skip-permissions"];
-                let decision = match decision {
-                    TriageDecision::RetryWithFlag(flag)
-                        if DANGER.iter().any(|d| flag.to_lowercase().contains(d)) =>
-                    {
-                        TriageDecision::Escalate(format!(
-                            "triage proposed privileged flag {flag} — operator approval required"
-                        ))
-                    }
-                    other => other,
-                };
+                let decision = filter_triage_decision(decision, unit);
                 // The event's `analysis` is the JUDGE'S reasoning for every variant; the
                 // flag (when any) is appended so the record shows what will be applied.
                 let decision_str = match &decision {
@@ -5349,9 +5336,7 @@ fn apply_step_result(
         // `is_deliver_unit` (tool_cmd + phase id `deliver`) leaves every other Tool unit — and
         // `should_pause`'s deliver GATE — exactly as they are.
         if crate::deliver_lift::is_deliver_unit(unit)
-            && !output
-                .output
-                .contains(crate::deliver_lift::LIFT_CONFLICT_MARKER)
+            && !crate::deliver_lift::is_lift_conflict_strand(&output.output)
         {
             let unit = units.get_mut(output.unit_ix).ok_or_else(|| {
                 anyhow::anyhow!("unit ix {} vanished on a deliver refusal", output.unit_ix)
@@ -5409,12 +5394,22 @@ fn apply_step_result(
             )?;
             return Ok(StepApplied::Paused);
         }
+        // (N4, ship re-proof) A deliver unit that reaches this point carries the LIFT-CONFLICT
+        // strand marker (the arm above took every other deliver failure). It gets NO automatic
+        // remedy below — no trust-grant self-heal, no LLM triage judge, no retried-attempt gate —
+        // because every one of them can RE-DISPATCH the deliver unit, and a re-dispatched deliver
+        // unit pushes: run `efe69c4b`'s triage judge read a stamped push rejection, answered
+        // `retry`, and the push went out a second time with no gate. The platform invariant is that
+        // nothing leaves the machine without the deliver gate, so a strand keeps the terminal path
+        // below on EVERY `human_confirm` (it was only ever pinned for `None`): crew derives
+        // `completed` + `delivery: stranded` and the post-hoc lift is the operator's explicit act.
+        let deliver_strand = crate::deliver_lift::is_deliver_unit(unit);
         // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
         // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
         // took the gate's own reassign-and-retry, the retried attempt refused identically, and
         // the old `attempt == 0` guard sent it to `sessionFailed` with no route back.
-        {
+        if !deliver_strand {
             if let Some(refusal) = environment_refusal(&output.output) {
                 let cli = unit
                     .assigned_cli
@@ -7179,16 +7174,7 @@ fn advance_or_pause(
                     .map_or_else(|| "the run's repository".to_string(), |r| format!("`{r}`"));
                 (
                     reviewing_ord,
-                    format!(
-                        "Approve delivery before unit {} runs: {}. This step leaves the machine \
-                         — it commits the run's verified work, pushes branch `{branch}` to the \
-                         remote and opens a pull request on {repo} under the gh account active \
-                         in the daemon's environment (pin it now if it must differ). Merge stays \
-                         yours. Reject cancels the run and keeps the worktree and its \
-                         uncommitted work on disk. [deliver gate: engine-enforced unless the \
-                         launch set autoDeliver: true]",
-                        unit.ord, unit.description
-                    ),
+                    deliver_gate_prompt(unit.ord, &unit.description, &branch, &repo),
                 )
             }
         };
@@ -7304,6 +7290,97 @@ fn prior_context_label(
         None if cli != current_cli => Some(format!("[{cli} — unit {}]", prior.ord)),
         None => None,
     }
+}
+
+/// The DENY-DOMINATES policy filter over a triage judge's decision, applied before anything acts
+/// on it. A judge may PROPOSE any remedy; two classes are never auto-applied and escalate to the
+/// operator with the proposal named instead:
+///  - a flag smelling of privilege bypass (`dangerous`, `bypass`, `allow-all`, `skip-permissions`);
+///  - (N4) ANY re-run of the DELIVER unit: a re-dispatched deliver unit pushes, and nothing leaves
+///    the machine without a human gate. This is the apply-side twin of the `deliver_strand` guard
+///    in `apply_step_result`, which keeps a deliver failure from reaching the judge at all — so no
+///    future path into triage can re-open the ungated re-push that run `efe69c4b` took.
+fn filter_triage_decision(
+    decision: crate::validator::TriageDecision,
+    unit: &crate::domain::WorkUnit,
+) -> crate::validator::TriageDecision {
+    use crate::validator::TriageDecision;
+    const DANGER: &[&str] = &["dangerous", "bypass", "allow-all", "skip-permissions"];
+    match decision {
+        TriageDecision::Retry | TriageDecision::RetryWithFlag(_)
+            if crate::deliver_lift::is_deliver_unit(unit) =>
+        {
+            // The proposal rides the escalation verbatim (a flag included), so the operator sees
+            // exactly what the judge wanted to do.
+            let proposal = match &decision {
+                TriageDecision::RetryWithFlag(flag) => format!("re-running it with {flag}"),
+                _ => "re-running it".to_string(),
+            };
+            TriageDecision::Escalate(format!(
+                "triage proposed {proposal} — a re-run of the deliver step pushes again, so it \
+                 needs a human gate"
+            ))
+        }
+        TriageDecision::RetryWithFlag(flag)
+            if DANGER.iter().any(|d| flag.to_lowercase().contains(d)) =>
+        {
+            TriageDecision::Escalate(format!(
+                "triage proposed privileged flag {flag} — operator approval required"
+            ))
+        }
+        other => other,
+    }
+}
+
+/// The deliver gate's consent prompt (N3, ship re-proof). The deliver unit's description is
+/// `deliver — <intent>` plus, after [`crate::plan::INSTRUCTION_SEP`], the gate-card text the
+/// workflow's author wrote for the phase (crew's `deliverGateInstructions`: what the push will do
+/// on THIS origin, and under which identity).
+///
+/// It used to print the description verbatim — the raw ` ||| ` separator included — and then
+/// promise "pushes branch … and opens a pull request on <repo>" unconditionally, so on a non-GitHub
+/// origin the one prompt said both "no pull request can be opened" and "opens a pull request", with
+/// the true sentence buried behind the intent. Now:
+///  - the author's card LEADS, right after the ask, so the first visible line states what will
+///    actually happen;
+///  - the engine's own sentence states only what the engine knows — it commits and pushes the
+///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
+///  - no separator is ever rendered: the intent follows as plain prose.
+fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) -> String {
+    let (head, card) = match description.split_once(crate::plan::INSTRUCTION_SEP) {
+        Some((head, card)) => (
+            head.trim(),
+            Some(card.replace(crate::plan::INSTRUCTION_SEP, " ").trim().to_string())
+                .filter(|c| !c.is_empty()),
+        ),
+        None => (description.trim(), None),
+    };
+    let what = match &card {
+        // The card owns the push target AND the identity (crew states the configured login and
+        // its pin, or that none is configured); restating "the gh account active" here would
+        // contradict it for a remote no gh account is involved in, such as a local path.
+        Some(card) => format!(
+            "{card} This step leaves the machine — it commits the run's verified work and pushes \
+             branch `{branch}` to the remote of {repo}; whether a pull request is opened, and \
+             under which identity, is as stated above."
+        ),
+        None => format!(
+            "This step leaves the machine — it commits the run's verified work, pushes branch \
+             `{branch}` to the remote of {repo} and, only if gh resolves that remote to a GitHub \
+             repository, opens a pull request there, under the gh account active in the daemon's \
+             environment (pin it now if it must differ)."
+        ),
+    };
+    let work = if head.is_empty() {
+        String::new()
+    } else {
+        format!(" The work: {head}.")
+    };
+    format!(
+        "Approve delivery before unit {ord} runs. {what} Merge stays yours. Reject cancels the \
+         run and keeps the worktree and its uncommitted work on disk.{work} [deliver gate: \
+         engine-enforced unless the launch set autoDeliver: true]"
+    )
 }
 
 /// Why a run paused before dispatching a unit — not merely *that* it did.
@@ -11491,6 +11568,138 @@ retry the deliver phase";
         let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, IDENTITY_REFUSAL);
         let evs = drain(&erx);
         assert_parked_on_the_refusal(&store, &run_id, applied, &session, &unit, &evs);
+    }
+
+    /// N4 (ship re-proof, run `efe69c4b` seq 364-376): with an OPERATOR present (`human_confirm`
+    /// not `None` — every studio launch), a strand-marked deliver failure fell past the
+    /// deterministic arm into the attempt-0 LLM triage, whose `retry` re-dispatched the deliver
+    /// unit — a second push with no gate. A strand must take the terminal path on every
+    /// `human_confirm`: no judge, no auto re-dispatch.
+    #[test]
+    fn a_strand_with_an_operator_present_never_reaches_the_triage_judge() {
+        let run_id = format!("deliver-strand-human-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "deliver", false);
+        let mut s = crate::domain::get_session(&store, &run_id).unwrap().unwrap();
+        s.human_confirm = HumanConfirm::All;
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let strand = format!(
+            "remote: HTTP 403 authentication failed\ndeliver: git push of wicked/x failed after \
+             commit: remote: HTTP 403; retry POST /runs/:id/deliver; nothing was pushed; {}",
+            crate::deliver_lift::LIFT_CONFLICT_MARKER
+        );
+
+        let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, &strand);
+        let evs = drain(&erx);
+        assert!(
+            !matches!(applied, StepApplied::Continuing),
+            "the triage judge was convened on a deliver strand — its `retry` re-pushes ungated"
+        );
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert!(evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::SessionFailed { .. })));
+        assert!(!evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::FailureTriaged { .. })));
+    }
+
+    /// N4 (codex review): the remote's own words ride the transcript before the script's verdict, and
+    /// a pre-receive hook may echo the lift marker. The LAST marker decides — a refused push is
+    /// never a strand.
+    #[test]
+    fn a_refused_push_whose_remote_echoes_the_lift_marker_still_parks_at_the_gate() {
+        let refused = format!(
+            "remote: {} (hook text)\ndeliver: the remote refused the push of wicked/x after \
+             commit: …; {}",
+            crate::deliver_lift::LIFT_CONFLICT_MARKER,
+            crate::deliver_lift::PUSH_REJECTED_MARKER
+        );
+        assert!(!crate::deliver_lift::is_lift_conflict_strand(&refused));
+        assert!(crate::deliver_lift::is_lift_conflict_strand(&format!(
+            "{} — rebase of wicked/x onto origin/main hit conflicts",
+            crate::deliver_lift::LIFT_CONFLICT_MARKER
+        )));
+        let run_id = format!("deliver-hostile-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "deliver", false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, &refused);
+        let evs = drain(&erx);
+        assert!(matches!(applied, StepApplied::Paused), "a refused push parks the run");
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("deliver_refusal")
+        );
+        assert!(!evs
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::SessionFailed { .. })));
+    }
+
+    /// N4, the apply-side twin: whatever path reaches the judge, a `retry` of the DELIVER unit is
+    /// never auto-applied — it escalates to a human gate. Any other unit's retry is untouched.
+    #[test]
+    fn a_triage_retry_of_the_deliver_unit_always_escalates() {
+        use crate::validator::TriageDecision;
+        let mut deliver = WorkUnit::pending("r:deliver", "r", 5, "deliver — x");
+        deliver.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "true".into()]);
+        for d in [TriageDecision::Retry, TriageDecision::RetryWithFlag("--yes".into())] {
+            assert!(
+                matches!(filter_triage_decision(d.clone(), &deliver), TriageDecision::Escalate(_)),
+                "{d:?} on the deliver unit must escalate"
+            );
+        }
+        // The proposal, flag included, rides the escalation (codex review, LOW).
+        match filter_triage_decision(TriageDecision::RetryWithFlag("--skip-permissions".into()), &deliver) {
+            TriageDecision::Escalate(why) => assert!(why.contains("--skip-permissions"), "{why}"),
+            other => panic!("expected an escalation, got {other:?}"),
+        }
+        let build = WorkUnit::pending("r:build", "r", 3, "build — x");
+        assert_eq!(filter_triage_decision(TriageDecision::Retry, &build), TriageDecision::Retry);
+        assert!(matches!(
+            filter_triage_decision(TriageDecision::RetryWithFlag("--dangerously-x".into()), &build),
+            TriageDecision::Escalate(_)
+        ));
+    }
+
+    /// N3 (ship re-proof): on a non-GitHub origin the deliver gate said both "no pull request can
+    /// be opened" (crew's card, behind a raw ` ||| `) and "…opens a pull request on <repo>" (the
+    /// engine's boilerplate). The card now leads, the engine claims no pull request of its own, and
+    /// no separator renders.
+    #[test]
+    fn the_deliver_gate_prompt_leads_with_the_card_and_never_contradicts_it() {
+        let card = "Pushes the run branch wicked/<run> to origin (/srv/r.git) — a local path, so no \
+                    pull request can be opened against it. Push identity: none configured.";
+        let p = deliver_gate_prompt(
+            8,
+            &format!("deliver — add a widget ||| {card}"),
+            "wicked/abc",
+            "`tally-kit`",
+        );
+        assert!(!p.contains("|||"), "raw separator rendered: {p}");
+        assert!(
+            p.starts_with(&format!("Approve delivery before unit 8 runs. {card}")),
+            "the card must lead: {p}"
+        );
+        assert!(!p.contains("opens a pull request"), "contradicts the card: {p}");
+        // The card owns the identity: the engine does not restate an account (codex review).
+        assert!(!p.contains("gh account active"), "restates an identity over the card: {p}");
+        assert!(p.contains("pushes branch `wicked/abc`"));
+        assert!(p.contains("The work: deliver — add a widget."));
+        assert!(p.ends_with("[deliver gate: engine-enforced unless the launch set autoDeliver: true]"));
+
+        // No card (a def authored without instructions): the PR is stated as the condition it is.
+        let bare = deliver_gate_prompt(8, "deliver — add a widget", "wicked/abc", "`tally-kit`");
+        assert!(!bare.contains("|||"));
+        assert!(bare.contains("only if gh resolves that remote to a GitHub repository, opens a pull request"));
     }
 
     /// A `LIFT-CONFLICT` strand keeps today's terminal path exactly: crew derives `completed` +
