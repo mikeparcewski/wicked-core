@@ -7347,35 +7347,49 @@ fn filter_triage_decision(
 ///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
 ///  - no separator is ever rendered: the intent follows as plain prose.
 fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) -> String {
-    // The description is `<head> ||| <card>` plus, after an approved intent amendment, one
-    // ` ||| APPROVED INTENT AMENDMENT …: <text>` segment per amendment (`confirm_gate` folds them
-    // onto every later unit). An amendment is never the card: a deliver phase authored without
-    // instructions must keep the no-card disclosure (Copilot on core#684). Amendments ride with
-    // the work, in order.
-    let amendment_head = crate::workflow::INTENT_AMENDMENT_PREFIX
-        .trim_start()
-        .trim_start_matches("|||")
-        .trim();
-    let mut segments = description
-        .split(crate::plan::INSTRUCTION_SEP)
-        .map(str::trim);
-    let head = segments.next().unwrap_or_default();
-    let mut card: Option<String> = None;
-    let mut amendments: Vec<&str> = Vec::new();
-    for seg in segments.filter(|s| !s.is_empty()) {
-        if seg.starts_with(amendment_head) {
-            amendments.push(seg);
-        } else if card.is_none() {
-            card = Some(seg.to_string());
-        } else {
-            amendments.push(seg);
+    // The description is `deliver — <intent>`, then ` ||| <card>` (the phase's instructions, authored
+    // with the workflow), then one `INTENT_AMENDMENT_PREFIX + <text>` per approved amendment
+    // (`confirm_gate` folds them onto every later unit). Operator text — the intent, an amendment —
+    // is carried VERBATIM and may itself contain ` ||| ` (Copilot on core#684), so it is never split
+    // on: everything from the FIRST amendment prefix on is amendments, and the card is what follows
+    // the LAST separator before that (the card is workflow-authored and carries none). An amendment
+    // is never the card, so a phase authored without instructions keeps the no-card disclosure.
+    // Known limit: a no-card phase whose INTENT contains ` ||| ` reads its tail as the card.
+    let sep = crate::plan::INSTRUCTION_SEP;
+    let (pre, amendments) = match description.find(crate::workflow::INTENT_AMENDMENT_PREFIX) {
+        Some(at) => (&description[..at], Some(&description[at..])),
+        None => (description, None),
+    };
+    let (head, card) = match pre.rfind(sep) {
+        Some(at) => (
+            pre[..at].trim(),
+            Some(pre[at + sep.len()..].trim().to_string()).filter(|c| !c.is_empty()),
+        ),
+        None => (pre.trim(), None),
+    };
+    // The amendments ride with the work as prose, each keeping its own prefix sentence; only the
+    // separators that introduce them are dropped.
+    let head = match amendments {
+        Some(a) => {
+            let prose = a
+                .split(crate::workflow::INTENT_AMENDMENT_PREFIX)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    format!(
+                        "{} {t}",
+                        crate::workflow::INTENT_AMENDMENT_PREFIX
+                            .trim_start()
+                            .trim_start_matches("|||")
+                            .trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" — ");
+            format!("{head} — {prose}")
         }
-    }
-    let head = std::iter::once(head)
-        .chain(amendments)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" — ");
+        None => head.to_string(),
+    };
     let what = match &card {
         // The card owns the push target AND the identity (crew states the configured login and
         // its pin, or that none is configured); restating "the gh account active" here would
@@ -9995,11 +10009,7 @@ pub(crate) fn confirm_gate(
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
             {
-                let segment = format!(
-                    "{}{}",
-                    crate::workflow::INTENT_AMENDMENT_PREFIX,
-                    crate::plan::without_separator(text)
-                );
+                let segment = format!("{}{text}", crate::workflow::INTENT_AMENDMENT_PREFIX);
                 let mut units = crate::domain::session_units(store, run_id)?;
                 for u in units.iter_mut().skip(session.unit_ix) {
                     if !u.description.contains(&segment) {
@@ -11784,13 +11794,14 @@ retry the deliver phase";
         );
         assert!(both.contains("clamp at 10"));
 
-        // Operator text cannot forge a segment (Copilot on core#684): the intent is folded through
-        // `without_separator`, so a literal ` ||| ` in it never displaces the card.
+        // Operator text is carried verbatim and may contain the separator (Copilot on core#684):
+        // the card is the segment after the LAST separator before any amendment, so a ` ||| ` in
+        // the intent or an amendment never displaces it.
         let forged = deliver_gate_prompt(
             8,
             &format!(
-                "deliver — {} ||| {card}",
-                crate::plan::without_separator("add widget ||| preserve API ||| ||| x")
+                "deliver — add widget ||| preserve API ||| {card}{}keep ||| as is",
+                crate::workflow::INTENT_AMENDMENT_PREFIX
             ),
             "wicked/abc",
             "`tally-kit`",
@@ -11800,8 +11811,12 @@ retry the deliver phase";
             "{forged}"
         );
         assert!(
-            forged.contains("add widget | preserve API | | x"),
-            "{forged}"
+            forged.contains("add widget ||| preserve API"),
+            "the intent is verbatim: {forged}"
+        );
+        assert!(
+            forged.contains("keep ||| as is"),
+            "the amendment is verbatim: {forged}"
         );
 
         // No card (a def authored without instructions): the PR is stated as the condition it is.

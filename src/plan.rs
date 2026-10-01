@@ -25,19 +25,6 @@ use crate::workflow::WorkflowDef;
 /// call-site `pty_unit_prompt` refusal in `execute_wrapped`.
 pub(crate) const INSTRUCTION_SEP: &str = " ||| ";
 
-/// Free text folded onto a unit description (the launch intent, an approved intent amendment) with
-/// every [`INSTRUCTION_SEP`] neutralised to ` | `, so operator text can never forge a segment
-/// boundary: the deliver gate reads the phase's card as a segment, and `add widget ||| preserve API`
-/// must not turn "preserve API" into it (Copilot on core#684). Loops because a replacement can
-/// expose a new separator (` ||| ||| `).
-pub(crate) fn without_separator(text: &str) -> String {
-    let mut out = text.to_string();
-    while out.contains(INSTRUCTION_SEP) {
-        out = out.replace(INSTRUCTION_SEP, " | ");
-    }
-    out
-}
-
 /// The recognizable head of the engine-side scope preamble (core#283) — a const so the tests that
 /// assert its presence/absence and any operator grepping a prompt share one spelling.
 ///
@@ -134,7 +121,7 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             let mut description = if intent.is_empty() {
                 phase.id.clone()
             } else {
-                format!("{} — {}", phase.id, without_separator(intent))
+                format!("{} — {intent}", phase.id)
             };
             // FINDING-011: fold the phase's own INSTRUCTIONS into the description. The description
             // IS the worker's prompt (`execute_wrapped::skill_prompt` sends it bare on the authored
