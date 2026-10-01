@@ -7347,18 +7347,35 @@ fn filter_triage_decision(
 ///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
 ///  - no separator is ever rendered: the intent follows as plain prose.
 fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) -> String {
-    let (head, card) = match description.split_once(crate::plan::INSTRUCTION_SEP) {
-        Some((head, card)) => (
-            head.trim(),
-            Some(
-                card.replace(crate::plan::INSTRUCTION_SEP, " ")
-                    .trim()
-                    .to_string(),
-            )
-            .filter(|c| !c.is_empty()),
-        ),
-        None => (description.trim(), None),
-    };
+    // The description is `<head> ||| <card>` plus, after an approved intent amendment, one
+    // ` ||| APPROVED INTENT AMENDMENT …: <text>` segment per amendment (`confirm_gate` folds them
+    // onto every later unit). An amendment is never the card: a deliver phase authored without
+    // instructions must keep the no-card disclosure (Copilot on core#684). Amendments ride with
+    // the work, in order.
+    let amendment_head = crate::workflow::INTENT_AMENDMENT_PREFIX
+        .trim_start()
+        .trim_start_matches("|||")
+        .trim();
+    let mut segments = description
+        .split(crate::plan::INSTRUCTION_SEP)
+        .map(str::trim);
+    let head = segments.next().unwrap_or_default();
+    let mut card: Option<String> = None;
+    let mut amendments: Vec<&str> = Vec::new();
+    for seg in segments.filter(|s| !s.is_empty()) {
+        if seg.starts_with(amendment_head) {
+            amendments.push(seg);
+        } else if card.is_none() {
+            card = Some(seg.to_string());
+        } else {
+            amendments.push(seg);
+        }
+    }
+    let head = std::iter::once(head)
+        .chain(amendments)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ");
     let what = match &card {
         // The card owns the push target AND the identity (crew states the configured login and
         // its pin, or that none is configured); restating "the gh account active" here would
@@ -11728,6 +11745,40 @@ retry the deliver phase";
         assert!(
             p.ends_with("[deliver gate: engine-enforced unless the launch set autoDeliver: true]")
         );
+
+        // An approved intent amendment is never mistaken for the card (Copilot on core#684): with
+        // no card the PR stays conditional, and the amendment rides with the work.
+        let amended = deliver_gate_prompt(
+            8,
+            &format!(
+                "deliver — add a widget{}clamp at 10",
+                crate::workflow::INTENT_AMENDMENT_PREFIX
+            ),
+            "wicked/abc",
+            "`tally-kit`",
+        );
+        assert!(!amended.contains("|||"), "{amended}");
+        assert!(
+            amended.contains("only if gh resolves that remote to a GitHub repository"),
+            "an amendment suppressed the no-card disclosure: {amended}"
+        );
+        assert!(amended.contains("clamp at 10"));
+        assert!(!amended.contains("as stated above"), "{amended}");
+        // With a card AND an amendment, the card still leads and the amendment rides with the work.
+        let both = deliver_gate_prompt(
+            8,
+            &format!(
+                "deliver — add a widget ||| {card}{}clamp at 10",
+                crate::workflow::INTENT_AMENDMENT_PREFIX
+            ),
+            "wicked/abc",
+            "`tally-kit`",
+        );
+        assert!(
+            both.starts_with(&format!("Approve delivery before unit 8 runs. {card}")),
+            "{both}"
+        );
+        assert!(both.contains("clamp at 10"));
 
         // No card (a def authored without instructions): the PR is stated as the condition it is.
         let bare = deliver_gate_prompt(8, "deliver — add a widget", "wicked/abc", "`tally-kit`");
