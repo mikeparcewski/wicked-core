@@ -14,8 +14,9 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **core-ts 0.7.33** — 2026-10-01 — npm release carrying the **sixty-six** engine changes since
-  0.7.30, on main tip `6dfdf4d`. Supersedes the never-tagged 0.7.31 (#681) and 0.7.32 (#683) cuts,
+- **core-ts 0.7.33** — 2026-10-01 — npm release carrying the **sixty-seven** engine changes since
+  0.7.30, on main tip `00545af`; the last of them, #687, is lint-only (clean under clippy 1.99, no
+  behaviour change). Supersedes the never-tagged 0.7.31 (#681) and 0.7.32 (#683) cuts,
   both closed: each time the ship gate re-read the composed stack it sent engine defects back, so
   the train is re-cut on top of the fixes rather than published around them. The largest core-ts
   cut to date, and the engine half of the 2026-09 ship point. Headline, in the order a user meets
