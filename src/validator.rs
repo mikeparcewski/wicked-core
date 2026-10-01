@@ -2299,7 +2299,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             .rfind(|l| !l.is_empty())
             .map(|l| {
                 let mut tok = l.split_whitespace();
-                match (tok.next().map(&norm), tok.next()) {
+                match (tok.next().map(norm), tok.next()) {
                     // A bare verdict word and NOTHING else on the line. Trailing prose means the
                     // model never closed — the whole point is a position it cannot revise.
                     (Some(t), None) if t == "PASS" || t == "REJECT" => t,
@@ -2343,7 +2343,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             .any(|l| {
                 // Just the first token — normalizing the whole line allocates per line scanned for
                 // a decision that never looks past position 0 (review).
-                let lead = l.split_whitespace().next().map(&norm).unwrap_or_default();
+                let lead = l.split_whitespace().next().map(norm).unwrap_or_default();
                 (lead == "PASS" && first == "REJECT") || (lead == "REJECT" && first == "PASS")
             });
         if contradicted_later {

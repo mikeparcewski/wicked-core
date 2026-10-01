@@ -279,7 +279,7 @@ pub(crate) fn execute_command(params: &Value) -> Option<String> {
             "args",
         ]
         .into_iter()
-        .find_map(|k| i.get(k).and_then(&text_of))
+        .find_map(|k| i.get(k).and_then(text_of))
     });
     from_input
         .or_else(|| {

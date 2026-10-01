@@ -20,15 +20,10 @@ fn point_repo_graph_root_at_scratch() {
 }
 
 fn indexer() -> Option<String> {
-    for cand in [
-        "/tmp/wicked-tools/bin/wicked-estate",
-        // also honor an installed one
-    ] {
-        if std::path::Path::new(cand).exists() {
-            return Some(cand.to_string());
-        }
-    }
-    None
+    let cand = "/tmp/wicked-tools/bin/wicked-estate";
+    std::path::Path::new(cand)
+        .exists()
+        .then(|| cand.to_string())
 }
 
 #[test]
