@@ -14,6 +14,58 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.33** — 2026-10-01 — npm release carrying the **sixty-seven** engine changes since
+  0.7.30, on main tip `00545af`; the last of them, #687, is lint-only (clean under clippy 1.99, no
+  behaviour change). Supersedes the never-tagged 0.7.31 (#681) and 0.7.32 (#683) cuts,
+  both closed: each time the ship gate re-read the composed stack it sent engine defects back, so
+  the train is re-cut on top of the fixes rather than published around them. The largest core-ts
+  cut to date, and the engine half of the 2026-09 ship point. Headline, in the order a user meets
+  them:
+  **A deliver strand never reaches the triage judge, and no judge can re-run the deliver unit
+  (#684, ship re-proof N4)** — with an operator present, a refused push fell past the deterministic
+  deliver-refusal arm into the LLM triage, whose `retry` pushed a second time with no gate. A
+  strand now takes the terminal path on every `human_confirm`, and any triage `retry` of the
+  deliver unit is forced into a human escalation.
+  **The deliver gate states what will actually happen (#684, ship re-proof N3)** — the prompt
+  leads with the workflow's own gate card, claims only the commit and push, and renders no raw
+  ` ||| ` separator, so on a non-GitHub origin it no longer says both "no pull request can be
+  opened" and "opens a pull request".
+  **The deliver gate's "base unchanged" line names the base, not the run branch (#682)** — the
+  lift's `Unchanged` arm reported the worktree `HEAD` as `base_before`, so on a deliver RETRY (any
+  attempt after a phase committed) the one sentence whose job is to assure the operator the base has
+  not moved stated the run branch's SHA, on the consent surface for the only irreversible action —
+  and `outcome: unchanged` arrived with `base_before != base_after`. Both base fields now name the
+  base on every arm, by construction.
+  **Governed workers load no ambient MCP server and every MCP call is denied (#657)** — the
+  isolation lives in `src/mcp_isolation.rs`, and #660 closed the three remaining carriers (a
+  council ballot, a copilot seat, a codex seat).
+  **A governed claude unit runs on ACP or wrapped with a gate-hook that provably ran, with no
+  silent third option (#653)** — an org `allowManagedMcpServers` policy can no longer strip the
+  hook and leave the unit ungoverned.
+  **The worker fence covers every remote-write CLI it can name, and a provider read is refused
+  rather than failing open (wicked-crew#663, #569, #671)** — eleven forge CLIs are denied whole in
+  `src/remote_write_fence.rs`.
+  **Workers get an OS write boundary by default: the repository boundary (#548)** — a real kernel
+  mount in `src/worker_sandbox.rs` (Linux `bwrap`, macOS `sandbox-exec`); a host that cannot arm one
+  fails closed unless the operator opts out.
+  **A read-only unit cannot reach the project graph with raw SQL (#645, #642)**, in the absolute
+  and the relative spelling both.
+  **A human gate can amend the run's intent and the amendment reaches the evaluator (#555).**
+  **A capture-learnings run that captures nothing says so, or the gate stops it (#535, BC-80)** —
+  this is the change that forces the publish order: `PhaseDef` gained `requires_capture_report`
+  and `PhaseDef` carries `#[serde(deny_unknown_fields)]`, so an engine older than this release
+  refuses the whole workflow def the moment the key appears (#680). **core-ts must be on npm before
+  wicked-crew is published.**
+  Also in the cut: the DES-TEAMING-002 engine seams (the phase catalog and `plan::compose`, the
+  plan approval gate, presets, the team supervisor on the bus, the worker-thread seam, reliable
+  team publishing), the DES-MCP-TOOLS-001 engine seams (S1 one-evaluation judging, S3 the broker's
+  output decision, S6 the non-recording policy preview), seat-instance identity (#591), the
+  verify-floor platform matrix and its boundary-less opt-in (#416), deliverable-freshness (#640),
+  approval-policy bench-and-fail-over (#670), and `Core.busEmit`/`Core.busRead` (#631).
+  Platform note: the Windows leg of CI is the only flaky one (#589) and Windows is **not** a
+  supported platform for governed runs.
+
+
 - **A deliver strand never reaches the triage judge, and a judge can never re-run the deliver unit (ship re-proof N4).** With an operator present (`human_confirm` not `None`, i.e. every studio launch), a deliver failure carrying the `LIFT-CONFLICT` marker fell past the deterministic deliver-refusal arm into the attempt-0 LLM triage, whose `retry` re-dispatched the deliver unit: a second push with no gate (re-proof run, `stepFailed`/`failureTriaged` seq 364-376). A strand now skips every automatic remedy (trust-grant self-heal, triage, the retried-attempt gate) and takes the terminal path on every `human_confirm`, as it already did for `None`. Independently, `filter_triage_decision` turns any `retry`/`retry_with_flag` of a deliver unit into an escalation, so no future path into triage can re-open an ungated re-push.
 - **The deliver gate states what will actually happen, and renders no raw separator (ship re-proof N3).** The prompt printed the deliver unit's description verbatim — the ` ||| ` segment marker included — and then promised "pushes branch … and opens a pull request on <repo>" unconditionally, so on a non-GitHub origin it said both "no pull request can be opened" and "opens a pull request". `deliver_gate_prompt` now leads with the phase's gate card (what the push does on this origin), states only what the engine knows (it commits and pushes the branch), makes the pull request conditional when there is no card, and folds the intent in as plain prose. Needs a core-ts release to reach crew.
 - **A seat that cannot run a command because the HOST forces an approval policy is named and benched, not an opaque failure (core#670).** On a desktop whose enterprise-managed codex requirements forbid `approval_policy = Never`, headless `codex exec` falls back to `OnRequest`; there is no approver in exec mode, so the first command codex wants to run dies with `Rejected("approval request failed")`. The MCP S8 dogfood lost two runs that way: a codex evaluator unit failed before the garden shim ran, with that line and nothing else — no cause, no remedy, and the failover ladder re-tried the same seat. `SeatFailureReason::approval_unavailable` now classifies codex's own two refusals — each matched as a phrase PLUS the frame it arrives in (the tool router's wrapper, the app-server's process name), and on the transcript path over its TAIL only — so the existing bench-and-fail-over mechanism does the rest: the seat is benched for the run on FIRST occurrence (a signed, account-wide policy neither appears nor disappears mid-run, and a seat that already finished a unit is no counter-example — that unit simply never needed to run a command), the record says `codex (approval_unavailable — worker)` in `degradedReason`, and the unit fails over to a seat that CAN run. Two guards keep the repository's own prose out of it (review of PR #673, HIGH): the phrase alone is not a match without the launcher's frame, and a transcript is judged over its tail, because a launcher's refusal is terminal while the body of a long transcript is the unit's subject matter — the same reasoning the quota rule uses. A broader phrase (`approval`, `approval_policy`) would have misread a codex review of `plan_gate.rs` as a dead seat. The policy itself is outside wicked's reach; this is the disclosure and the route away from it, not a workaround. Tests: `a_forced_approval_policy_classifies_as_approval_unavailable` (which also pins five innocent sentences about approvals to `None` on both paths, and a transcript that QUOTED the launcher's whole line out of a file it was reviewing before failing for an unrelated reason — the seat is kept — against the same line TERMINAL, which classifies) and the `ApprovalUnavailable` arm in `a_transcript_refusal_benches_quota_only_while_the_seat_has_no_success` (both fail on the previous main).
