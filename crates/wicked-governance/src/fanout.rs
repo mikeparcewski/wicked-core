@@ -370,7 +370,23 @@ fn smoke_graph_lane(
     expect_rulesets: &[String],
     expect_policies: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let recalled = recall_rules(store, &RuleQuery::default())?;
+    // (DC-S1) Recall is ASYMMETRIC on project: a project-scoped rule is served only to a query
+    // naming its project. Ask with every project the store's rules name, so the enforcement read
+    // path still proves each written rule is served (Copilot review on #696).
+    let projects: Vec<String> =
+        crate::conformance::list_rules(store, &RuleQuery::default(), false)?
+            .into_iter()
+            .filter_map(|r| r.targets.project)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    let recalled = recall_rules(
+        store,
+        &RuleQuery {
+            projects,
+            ..Default::default()
+        },
+    )?;
     let present: HashSet<&str> = recalled.iter().map(|r| r.id.as_str()).collect();
     let mut missing: Vec<String> = expect_rules
         .iter()
@@ -728,6 +744,43 @@ mod tests {
     /// version-cached BEFORE the import must go stale, or a worker keeps recalling the old
     /// ruleset. Twin of the retire-side test (`retire::tests`) — both directions of the
     /// manifest-keyed contract bump the store's graph version.
+    /// DC-S1 (Copilot review on #696): a project-scoped rule fans out and passes the lane's own
+    /// smoke check — recall is asked WITH the ruleset's projects, so the enforcement read path
+    /// still proves every written rule is served.
+    #[test]
+    fn a_project_scoped_rule_fans_out_and_passes_the_smoke_check() {
+        crate::events::hermetic_test_spool();
+        let dir = std::env::temp_dir().join(format!("wg-fanout-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rules")).unwrap();
+        std::fs::write(
+            dir.join("rules/bundle.json"),
+            serde_json::json!({ "rules": [
+                { "id": "PAT-001", "rule_type": "pattern", "statement": "global rule",
+                  "severity": "warn", "confidence": 0.9,
+                  "provenance": { "ref": "wiki://g#PAT-001", "source_kinds": ["doc"] } },
+                { "id": "PAT-002", "rule_type": "pattern", "statement": "alpha only",
+                  "severity": "warn", "confidence": 0.9, "targets": { "project": "proj_alpha" },
+                  "provenance": { "ref": "wiki://a#PAT-002", "source_kinds": ["doc"] } }
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let load = load_ruleset(&dir).unwrap();
+        let targets = FanoutTargets {
+            scope: FanoutScope::Repo,
+            enforcement: EnforcementTarget::Cli {
+                db: dir.join("gov.db").to_string_lossy().into_owned(),
+            },
+            discovery_dbs: vec![dir.join("graph.db").to_string_lossy().into_owned()],
+            knowledge_dbs: vec![dir.join("k.db").to_string_lossy().into_owned()],
+            knowledge_scope: "wiki:governance".to_string(),
+        };
+        fanout(&load, &targets, "ruleset", 1_750_000_000)
+            .expect("a project-scoped rule must pass the lane's smoke check");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fanout_invalidates_the_stores_versioned_response_cache() {
         crate::events::hermetic_test_spool();
