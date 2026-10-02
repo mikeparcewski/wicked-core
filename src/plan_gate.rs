@@ -189,7 +189,7 @@ impl AcceptedPlan {
         let mut truncated = prior.is_some_and(|p| p.touch_truncated);
         let own: &[String] = self.steps.touch.as_deref().unwrap_or_default();
         // A row persisted before TR-W1a (`touch_source` absent) never stamped its union: its
-        // declared touch is still on its steps, so union from there (codex review on #692).
+        // declared touch is still on its steps, so union from there (codex review on #693).
         let earlier: &[String] = match prior {
             Some(p) if p.touch_source.is_none() => p.steps.touch.as_deref().unwrap_or_default(),
             Some(p) => p.touch.as_slice(),
@@ -1387,7 +1387,7 @@ mod tests {
         assert_eq!(p["touch_truncated"], true);
     }
 
-    /// TR-W1a (codex review on #692): an accepted rev persisted before the touch fields existed
+    /// TR-W1a (codex review on #693): an accepted rev persisted before the touch fields existed
     /// still contributes its declared touch to the next rev's union (read off its steps).
     #[test]
     fn a_pre_w1a_accepted_row_still_unions_its_declared_touch() {

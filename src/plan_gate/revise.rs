@@ -240,7 +240,9 @@ pub(crate) fn revise(
     // its touch source is the base's.
     let base_touch_source = match (&prior.pending, &prior.accepted) {
         (Some(p), _) => p.touch_source.unwrap_or(TouchSource::User),
-        (None, Some(a)) => a.touch_source.unwrap_or(TouchSource::None),
+        // A pre-W1a accepted row recorded no source: its declared touch reads as `user`, the
+        // same fallback `with_touch` and gate approval use (Copilot review on #693).
+        (None, Some(a)) => a.touch_source.unwrap_or(TouchSource::User),
         (None, None) => TouchSource::None,
     };
     let mut events = Vec::new();
