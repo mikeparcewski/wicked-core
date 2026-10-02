@@ -677,6 +677,25 @@ fn seat_candidates(
         .collect()
 }
 
+/// Whether the roster seat `key` may take `unit` as far as its skills say (core#401), judged the
+/// way routing judged it: a unit whose skills are Claude-only goes only to a claude seat; every
+/// other unit, and a tool unit, goes anywhere. For a MID-RUN re-seat (`actor::reseat_off_benched_seat`),
+/// where the distribution's own candidate list is gone: `clis` is the registry roster the run
+/// resolves invocations from. With no skills snapshot to judge against, the unit is unconstrained,
+/// exactly as routing treats it.
+pub(crate) fn seat_admits_unit(unit: &WorkUnit, key: &str, clis: &[AgenticCli]) -> bool {
+    if unit.tool_cmd.is_some() || unit.skill_ref.as_deref().is_none_or(str::is_empty) {
+        return true;
+    }
+    let Some(snapshot) = crate::skills_snapshot::routing_snapshot() else {
+        return true;
+    };
+    match crate::skills_snapshot::seat_requirement(&snapshot, unit.skill_ref.as_deref()) {
+        SeatRequirement::Any => true,
+        SeatRequirement::ClaudeOnly { .. } => seat_is_claude(clis, key),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only: how many seat judgements [`seat_is_claude`] has made on THIS thread.

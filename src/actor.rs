@@ -6954,6 +6954,16 @@ fn pause_for_human_keyed(
     Ok(())
 }
 
+/// What [`reseat_off_benched_seat`] did with the cursor unit.
+enum Reseat {
+    /// Its seat is not benched (or it is a tool unit, or done): dispatch as planned.
+    Unchanged,
+    /// Moved onto an eligible seat (persisted, `unitReassigned` emitted).
+    Moved,
+    /// Its seat is benched and no eligible seat may take it. Carries why, in the operator's words.
+    NoSeat(String),
+}
+
 /// Re-seat the cursor unit when the seat it was planned on has been BENCHED for this run since.
 ///
 /// Distribution seats every unit at plan time (core#590 S5: no ballot finds a dead seat first). A
@@ -6962,41 +6972,66 @@ fn pause_for_human_keyed(
 /// planned on the same seat used to be dispatched to it anyway, one dead turn and one failover
 /// each (crew 0.7.45's release smoke: copilot was dispatched for units 2 and 4). This moves such a
 /// unit with the failover ladder's own rule ([`next_failover_seat`] over the eligible roster, so
-/// it never lands on a seat that built the work it reviews) and says so with `unitReassigned`.
+/// it never lands on a seat that built the work it reviews), restricted to the seats its skills
+/// admit ([`crate::distribute::seat_admits_unit`]), and says so with `unitReassigned`. The new
+/// seat keeps the launch roster's template when another unit of the run already carries it.
 ///
-/// Called only where the cursor ADVANCES onto a unit. An operator's explicit reassign and a gate's
-/// approve-and-retry dispatch directly, so an operator can still send a unit to a benched seat on
-/// purpose (a seat signed back in). With no eligible seat left the unit keeps its seat: its
-/// refusal then takes the dead-seat route, which pauses an attended run at the escalation gate.
+/// With no seat left it returns [`Reseat::NoSeat`] and the caller PAUSES the run on the unit
+/// instead of dispatching it to the benched seat. Called only where the cursor ADVANCES onto a
+/// unit: an operator's explicit reassign and a gate's approve-and-retry dispatch directly, so an
+/// operator can still send a unit to a benched seat on purpose (a seat signed back in).
 fn reseat_off_benched_seat(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
     session: &crate::domain::AgentSession,
     units: &[crate::domain::WorkUnit],
     unit_ix: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Reseat> {
     let Some(unit) = units.get(unit_ix) else {
-        return Ok(());
+        return Ok(Reseat::Unchanged);
     };
     if unit.tool_cmd.is_some() || matches!(unit.status, crate::domain::UnitStatus::Done) {
-        return Ok(());
+        return Ok(Reseat::Unchanged);
     }
     let seat = unit
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
-    if !session.benched_seats.iter().any(|b| b.cli == seat) {
-        return Ok(());
-    }
-    let Some(next) = next_failover_seat(units, unit_ix, &eligible_roster_keys(session)) else {
-        return Ok(());
+    let Some(bench) = session.benched_seats.iter().find(|b| b.cli == seat) else {
+        return Ok(Reseat::Unchanged);
+    };
+    let registry = crate::registry_roster();
+    let admitted: Vec<String> = eligible_roster_keys(session)
+        .into_iter()
+        .filter(|k| crate::distribute::seat_admits_unit(unit, k, &registry))
+        .collect();
+    let Some(next) = next_failover_seat(units, unit_ix, &admitted) else {
+        let bench_summary =
+            crate::domain::benched_summary(&session.benched_seats, session.clis.len())
+                .unwrap_or_default();
+        return Ok(Reseat::NoSeat(format!(
+            "it was planned on '{seat}', which this run benched ({} — {}), and no other eligible \
+             seat may take it (a seat that built the work it checks, or one its skills refuse, is \
+             excluded) — {bench_summary}",
+            bench.reason, bench.source
+        )));
     };
     let mut moved = unit.clone();
     moved.assigned_cli = Some(next.clone());
-    moved.assigned_invocation = crate::registry_roster()
-        .into_iter()
-        .find(|c| c.key == next)
-        .map(|c| c.headless_invocation);
+    // The launch roster's own template for the seat, when another unit of this run carries it (an
+    // ad-hoc seat is not in the registry), else the registry's — the failover ladder's source.
+    moved.assigned_invocation = units
+        .iter()
+        .find(|u| {
+            u.assigned_cli.as_deref() == Some(next.as_str()) && u.assigned_invocation.is_some()
+        })
+        .and_then(|u| u.assigned_invocation.clone())
+        .or_else(|| {
+            registry
+                .iter()
+                .find(|c| c.key == next)
+                .map(|c| c.headless_invocation.clone())
+        });
     put_node(store, moved.to_node())?;
     eprintln!(
         "wicked-core: unit {} of {} was planned on '{seat}', which this run benched; re-seated on \
@@ -7014,7 +7049,7 @@ fn reseat_off_benched_seat(
             previous_attempt_reaped: false,
         },
     );
-    Ok(())
+    Ok(Reseat::Moved)
 }
 
 /// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
@@ -7121,8 +7156,36 @@ fn advance_or_pause(
     }
 
     // A unit planned on a seat this run has since BENCHED is re-seated before it is gated or
-    // dispatched, so the seat that refused is never handed another unit of the run.
-    reseat_off_benched_seat(store, subscribers, &session, &units, unit_ix)?;
+    // dispatched, so the seat that refused is never handed another unit of the run. With no seat
+    // left the run PAUSES on the unit at the dead-seat gate (core#464's one denial route; the unit
+    // was never seated, so the prompt offers sign-in, reassign or reject) instead of dispatching it
+    // to the benched seat.
+    if let Reseat::NoSeat(why) =
+        reseat_off_benched_seat(store, subscribers, &session, &units, unit_ix)?
+    {
+        let mut parked = unit.clone();
+        parked.denial_reason = Some(why.clone());
+        parked.denial = Some(crate::domain::UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_DEAD_SEAT,
+            why,
+        ));
+        put_node(store, parked.to_node())?;
+        let attempt = session.attempt;
+        let note = denial_gate_note(session.human_confirm);
+        escalate_denied_unit(
+            store,
+            subscribers,
+            self_tx,
+            &mut session,
+            &parked,
+            attempt,
+            false,
+            false,
+            false,
+            note,
+        )?;
+        return Ok(Progress::Paused);
+    }
 
     // (DES-TEAMING-002 T3) A unit a `plan_approval` gate just released skips the human gates that
     // approval answered — once (the confirm path's bypass of `should_pause`, which P1's

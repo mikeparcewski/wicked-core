@@ -1008,6 +1008,7 @@ pub(crate) fn apply_and_finish_unit(
             // newer serializer) benches as written — deny wins.
             let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
             let mut changed = false;
+            let mut newly_benched: Vec<CoreEvent> = Vec::new();
             for (seat, token) in judge_benches {
                 let why = match wicked_council::types::SeatFailureReason::from_token(&token) {
                     Some(reason) => crate::domain::transcript_bench_reason(
@@ -1033,8 +1034,9 @@ pub(crate) fn apply_and_finish_unit(
                     },
                 ) {
                     changed = true;
-                    // The bench on the wire, once (see `CoreEvent::SeatBenched`).
-                    emit(CoreEvent::SeatBenched {
+                    // The bench on the wire, once (see `CoreEvent::SeatBenched`) — emitted only
+                    // after the session write below, so no frame claims a bench the store lacks.
+                    newly_benched.push(CoreEvent::SeatBenched {
                         session: session_id.to_string(),
                         ord: unit.ord,
                         cli: seat,
@@ -1045,6 +1047,9 @@ pub(crate) fn apply_and_finish_unit(
             }
             if changed {
                 put_node(store, session.to_node())?;
+            }
+            for ev in newly_benched {
+                emit(ev);
             }
         }
     }

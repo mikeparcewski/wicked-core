@@ -314,3 +314,76 @@ fn with_no_live_seat_left_the_run_pauses_plainly_at_the_dead_seat_gate() {
         "the dead seat ran once, the turn that found it dead"
     );
 }
+
+/// build → review → verify, where `verify` checks BOTH earlier units. Distribution puts the build
+/// on the first seat and both reviews on the dead seat. The dead seat's refusal on `review` fails
+/// that unit over to the third seat — which makes the third seat a creator of what `verify`
+/// checks. When the cursor reaches `verify`, every eligible seat built part of its input.
+const VERIFY_CHECKS_BOTH: &str = r#"{"id":"benched-seat-verify-both","phases":[
+  {"id":"build","kind":"build","gate":"auto"},
+  {"id":"review","kind":"review","gate":"auto","depends_on":["build"]},
+  {"id":"verify","kind":"review","gate":"auto","depends_on":["build","review"]}]}"#;
+
+/// A later unit planned on a benched seat with NO eligible seat left to take it is not dispatched
+/// to the benched seat: the run pauses on it at the dead-seat gate, with a prompt that says it was
+/// never seated and names the levers (sign in, reassign, reject). The dead seat ran exactly once.
+#[test]
+fn a_later_unit_with_no_eligible_seat_left_pauses_instead_of_reaching_the_benched_seat() {
+    let sid = "benched-seat-no-reseat";
+    let runner = Arc::new(Scripted::new());
+    let core = Core::spawn_with_engine(":memory:".to_string(), Arc::new(NoBallots), runner.clone());
+    core.register_workflow(VERIFY_CHECKS_BOTH)
+        .expect("register the build → review → verify def");
+    let ev = core.subscribe();
+    let mut spec = launch(sid, vec![cli("claude"), cli(DEAD), cli("opencode")]);
+    spec.workflow = Some("benched-seat-verify-both".into());
+    core.launch_run(spec).expect("launch");
+    let evs = drain(&ev, sid);
+
+    let plan = planned(&evs, sid);
+    assert_eq!(
+        plan.iter()
+            .filter(|(_, c)| c == DEAD)
+            .map(|(o, _)| *o)
+            .collect::<Vec<_>>(),
+        vec![2, 3],
+        "both reviews planned on the dead seat: {plan:?}"
+    );
+    let (gate_kind, prompt) = evs
+        .iter()
+        .find_map(|e| match e {
+            CoreEvent::AwaitingHuman {
+                session,
+                ord: 3,
+                gate_kind,
+                prompt,
+                ..
+            } if session == sid => Some((gate_kind.clone(), prompt.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the run must PAUSE on unit 3: {evs:?}"));
+    assert_eq!(gate_kind, "escalation");
+    assert!(
+        prompt.contains("Unit 3 was never seated")
+            && prompt.contains(&format!("planned on '{DEAD}'"))
+            && prompt.contains("reassign"),
+        "the prompt says the unit was never seated, why, and the levers: {prompt}"
+    );
+    assert!(
+        evs.iter().any(|e| matches!(e,
+            CoreEvent::GateEscalated { session, ord: 3, condition, .. }
+                if session == sid && condition == "dead_seat")),
+        "the pause is the dead-seat escalation: {evs:?}"
+    );
+    assert_eq!(
+        runner.dead_calls.load(Ordering::SeqCst),
+        1,
+        "the benched seat is never handed unit 3; dispatches: {:?}",
+        runner.seats.lock().unwrap()
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == sid)),
+        "no silent failure: {evs:?}"
+    );
+}
