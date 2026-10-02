@@ -3013,10 +3013,10 @@ mod judge_bench_tests {
     }
 
     /// A JUDGE seat that refused on quota is benched for the run (`source: "judge"`) and the bench
-    /// is on the wire once, as `seatBenched`, with the persisted reason. The same refusal on a
-    /// later unit adds nothing and emits nothing (the bench is already there). The frame is
-    /// emitted after the session write (the code orders it so), and the bench is read back from
-    /// the store here.
+    /// is on the wire once, as `seatBenched`, with the persisted reason. A second refusal by the
+    /// same seat adds nothing and emits nothing (the bench is already there; the first reason
+    /// wins). The frame is emitted after the session write (the code orders it so), and the bench
+    /// is read back from the store here.
     #[test]
     fn a_judge_refusal_benches_the_seat_once_and_emits_seat_benched() {
         let sid = "judge-bench-once";
@@ -3049,21 +3049,26 @@ mod judge_bench_tests {
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {
-            judge_refusals: vec![crate::workflow::JudgeRefusal {
-                seat: "j".into(),
-                reason: "quota_exhausted".into(),
-            }],
+            judge_refusals: vec![
+                crate::workflow::JudgeRefusal {
+                    seat: "j".into(),
+                    reason: "quota_exhausted".into(),
+                },
+                // The same seat again (a second judge rotation): already benched, so no frame.
+                crate::workflow::JudgeRefusal {
+                    seat: "j".into(),
+                    reason: "not_logged_in".into(),
+                },
+            ],
             ..Default::default()
         };
-        let apply = |store: &mut wicked_apps_core::SqliteStore,
-                     unit: &mut crate::domain::WorkUnit|
-         -> Vec<CoreEvent> {
+        let first = {
             let mut seen: Vec<CoreEvent> = Vec::new();
-            let output = crate::workflow::stub_output(unit);
+            let output = crate::workflow::stub_output(&units[0]);
             let mut emit = |e: CoreEvent| seen.push(e);
             apply_and_finish_unit(
-                store,
-                unit,
+                &mut store,
+                &mut units[0],
                 &output,
                 &workflow_id,
                 EntityMode::Shared,
@@ -3080,7 +3085,6 @@ mod judge_bench_tests {
             .expect("apply");
             seen
         };
-        let first = apply(&mut store, &mut units[0]);
         let benched: Vec<(String, String, String)> = first
             .iter()
             .filter_map(|e| match e {
@@ -3101,7 +3105,7 @@ mod judge_bench_tests {
                 "quota_exhausted (no success in the run)".to_string(),
                 "judge".to_string()
             )],
-            "one seatBenched frame for the judge's refusal: {first:?}"
+            "exactly one seatBenched frame for the judge seat, with the first reason: {first:?}"
         );
         let session = crate::domain::get_session(&store, sid)
             .expect("read")
@@ -3113,13 +3117,6 @@ mod judge_bench_tests {
                 .any(|b| b.cli == "j" && b.source == "judge"),
             "the bench is persisted: {:?}",
             session.benched_seats
-        );
-        let again = apply(&mut store, &mut units[0]);
-        assert!(
-            !again
-                .iter()
-                .any(|e| matches!(e, CoreEvent::SeatBenched { .. })),
-            "an already-benched seat emits no second frame: {again:?}"
         );
     }
 }
