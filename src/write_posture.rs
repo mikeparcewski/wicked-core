@@ -83,17 +83,26 @@ impl WritePosture {
         if unit.is_member_step_review() && unit.tool_cmd.is_none() {
             return WritePosture::ReadOnly;
         }
-        if !crate::worktree_guard::applies_to(unit) {
-            return WritePosture::Full;
-        }
         // WT-C1 (DES-walkthrough-proof §4.3, B3): the walkthrough author is an evaluator that
         // writes exactly one file, its storyline, into the run's declared author dir. Keyed off
         // the catalog entry, never the prompt; on a bound run only (unbound it stays read-only,
         // and a repo-less walkthrough fails closed at its pinned validator anyway). Spelled
         // `deliverable-roots` on the hook env — an EVALUATOR carrying it is why gate protocol 2
         // exists (an older hook would parse it as no fence; a mismatched hook refuses instead).
-        if bound && unit.catalog.as_deref() == Some(crate::catalog::WALKTHROUGH_PLAN) {
-            return WritePosture::DeliverableRoots;
+        // Decided BEFORE the guard marker (Copilot review on #691): a plan step may raise
+        // `executes_code` (TightenOnly), which clears the marker — that must never turn the
+        // author's fence into `Full`.
+        if unit.tool_cmd.is_none()
+            && unit.catalog.as_deref() == Some(crate::catalog::WALKTHROUGH_PLAN)
+        {
+            return if bound {
+                WritePosture::DeliverableRoots
+            } else {
+                WritePosture::ReadOnly
+            };
+        }
+        if !crate::worktree_guard::applies_to(unit) {
+            return WritePosture::Full;
         }
         match unit.role {
             PhaseRole::Creator if bound => WritePosture::DeliverableRoots,
@@ -550,5 +559,15 @@ mod tests {
             WritePosture::ReadOnly,
             "the prompt never keys the posture"
         );
+        // A step that raised `executes_code` (TightenOnly) clears the guard marker; the author
+        // keeps its fence anyway (Copilot review on #691).
+        let mut raised = unit(PhaseRole::Evaluator, true);
+        raised.catalog = Some("walkthrough_plan".to_string());
+        assert!(!raised.worktree_guarded);
+        assert_eq!(
+            WritePosture::of(&raised, true),
+            WritePosture::DeliverableRoots
+        );
+        assert_eq!(WritePosture::of(&raised, false), WritePosture::ReadOnly);
     }
 }

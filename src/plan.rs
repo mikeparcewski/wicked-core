@@ -664,8 +664,8 @@ impl std::fmt::Display for PlanRefusal {
             ),
             PlanRefusal::ExecutorNotAllowed { step, catalog } => write!(
                 f,
-                "{r}: step {step} sets an executor on {catalog}, an agent entry — only run and \
-                 deliver take one"
+                "{r}: step {step} sets an executor on {catalog}, an agent entry — only the Tool \
+                 entries (run, deliver, walkthrough_review) take one"
             ),
             PlanRefusal::ToolCommandMissing { step, catalog } => write!(
                 f,

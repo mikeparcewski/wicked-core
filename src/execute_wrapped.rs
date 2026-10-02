@@ -1709,13 +1709,14 @@ impl WrappedCliStepRunner {
             } else {
                 if write_posture == crate::write_posture::WritePosture::DeliverableRoots {
                     let note = format!(
-                        "phase `{}` plays creator and declares executes_code:false — its \
+                        "phase `{}` plays {} and declares executes_code:false — its \
                          deliverables belong in the run's declared write roots, not the tree; seat \
                          '{cli_key}' exposes no per-root write lever, so the tree is GUARD-ONLY: \
                          the deliverable-roots instruction rides the prompt and the worktree guard \
                          denies (and restores) any change to the tree after the fact (F-036 / \
                          F-4R2-004)",
-                        input.unit.phase_id().unwrap_or("?")
+                        input.unit.phase_id().unwrap_or("?"),
+                        crate::write_posture::role_noun(input.unit.role)
                     );
                     eprintln!("wicked-core: {note}");
                     no_lever_note = Some(note);
@@ -3347,7 +3348,8 @@ pub(crate) fn sandboxed_checks_instruction(notes_root: Option<&str>) -> String {
 /// not the tree", so the posture the boundary cannot apply per path is at least stated; the
 /// worktree guard holds the tree after the fact.
 pub(crate) const DELIVERABLE_ROOTS_INSTRUCTION: &str = "DELIVERABLE-ROOTS PHASE (the tree is \
-    enforced after the fact): this phase plays creator and declares executes_code: false. Write \
+    enforced after the fact): this phase declares executes_code: false and writes only its \
+    deliverable. Write \
     your deliverable ONLY inside the run's declared write roots (the output paths named in the \
     task). Do NOT edit, write, create, delete, move or format any file in the worktree, and do \
     not commit — any change to the worktree is detected by the engine's worktree guard, \

@@ -243,7 +243,12 @@ pub(crate) fn seat_governs(seat: &AgenticCli) -> bool {
 /// (crew#477) Is `unit` one whose seat must enforce governance — a seated BUILD unit, the stage
 /// that writes? Review/test units run read-only (the write posture), and a tool unit has no seat.
 fn needs_governed_seat(unit: &WorkUnit) -> bool {
-    unit.tool_cmd.is_none() && matches!(unit.stage, crate::domain::StageKind::Build)
+    unit.tool_cmd.is_none()
+        && (matches!(unit.stage, crate::domain::StageKind::Build)
+            // WT-C1 (Copilot review on #691): the walkthrough author is a WRITING evaluator (its
+            // storyline, into the declared author dir) — it wants a seat whose boundary enforces
+            // the deliverable-roots fence per call, first.
+            || unit.catalog.as_deref() == Some(crate::catalog::WALKTHROUGH_PLAN))
 }
 
 /// `pool` with the seats that enforce governance first (stable, so roster order holds within
@@ -2642,5 +2647,28 @@ mod tests {
         assert_eq!(dists[1].assigned_cli, "pi");
         assert_eq!(dists[0].degraded_reason, None);
         assert_eq!(dists[1].degraded_reason, None);
+    }
+}
+
+#[cfg(test)]
+mod walkthrough_routing_tests {
+    use super::*;
+
+    /// WT-C1 (Copilot review on #691): the walkthrough author is a writing evaluator, so it asks
+    /// for a governing seat first exactly as a build unit does; another evaluator does not, and a
+    /// tool unit never does.
+    #[test]
+    fn the_walkthrough_author_wants_a_governing_seat_first() {
+        let mut author = WorkUnit::pending("r:wt", "r", 3, "write the storyline");
+        author.stage = crate::domain::StageKind::Test;
+        author.role = crate::workflow::PhaseRole::Evaluator;
+        author.catalog = Some(crate::catalog::WALKTHROUGH_PLAN.into());
+        assert!(needs_governed_seat(&author));
+        let mut test = author.clone();
+        test.catalog = Some("test".into());
+        assert!(!needs_governed_seat(&test));
+        let mut tool = author.clone();
+        tool.tool_cmd = Some(vec!["true".into()]);
+        assert!(!needs_governed_seat(&tool));
     }
 }

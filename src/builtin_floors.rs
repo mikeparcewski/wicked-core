@@ -67,8 +67,9 @@
 //! The actor still seeds at boot, but only as an early warning and to make the floor visible in the
 //! vault before a first run — not as the thing that makes a plan resolve.
 //!
-//! Seeding per plan is affordable because it is idempotent (content-addressed) and cheap (two
-//! `put_node`s that collapse onto themselves).
+//! Seeding per plan is affordable because it is idempotent (content-addressed) and cheap (six
+//! `put_node`s that collapse onto themselves: an unapproved + approved copy of the evidence floor
+//! and of each of the two walkthrough pins, WT-C1).
 
 use crate::validator::DeterministicValidator;
 
@@ -175,7 +176,7 @@ pub fn walkthrough_validators() -> [DeterministicValidator; 2] {
 /// load-bearing, not incidental: `attach_pinned_validators` BAILS a run whose phase pins a validator
 /// the vault does not hold, so shipping a pin in a built-in def is only safe if the seed provably
 /// runs before any plan. Idempotent — the vault is content-addressed, so re-seeding an already
-/// seeded store rewrites the same two nodes.
+/// seeded store rewrites the same six nodes.
 ///
 /// Goes through the same author → vault-unapproved → APPROVE path an operator's
 /// `provision-validator` / `approve-validator` pair does, rather than writing an approved node
