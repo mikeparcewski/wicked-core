@@ -5365,6 +5365,18 @@ mod tests {
         assert!(err.contains(&exe), "must name the resolved path: {err}");
     }
 
+    /// WT-C1 (DES-walkthrough-proof §4.3): protocol 2 is the first in which an EVALUATOR (the
+    /// walkthrough author) can carry `deliverable-roots`. A protocol-1 hook parses that spelling as
+    /// "no fence" (`Full`), so it must refuse to arm rather than run the evaluator unfenced.
+    #[test]
+    fn a_protocol_1_hook_refuses_now_that_an_evaluator_can_carry_deliverable_roots() {
+        assert_eq!(crate::gate_hook::GATE_PROTOCOL_VERSION, 2);
+        let exe = fixture_exe("protocol-1");
+        seed_probe_for_test(&exe, Ok((1, Some(env!("CARGO_PKG_VERSION").to_string()))));
+        let err = check_gate_protocol(&exe).expect_err("a protocol-1 hook must refuse to arm");
+        assert!(err.contains("gate protocol mismatch"), "{err}");
+    }
+
     /// A matching CLI arms. Without this the test above passes for a `check` that refuses everything.
     #[test]
     fn a_matching_cli_is_allowed_to_arm() {

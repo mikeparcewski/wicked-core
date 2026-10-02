@@ -120,6 +120,49 @@ pub fn evidence_floor_validator() -> DeterministicValidator {
     }
 }
 
+/// WT-C1 (DES-walkthrough-proof §4.3, B1): the criterion of the `walkthrough_plan` entry's pin.
+pub const WALKTHROUGH_LINT_CRITERION: &str =
+    "the walkthrough storyline passes garden's deterministic lint (a weak proof is never recorded)";
+
+/// The `walkthrough_plan` pin's script: garden's walkthrough lint over the run's evidence root.
+/// Only `${VAR}` expansion (no `>`, no `$(`, no backtick), so it passes `looks_dangerous`. Both
+/// variables are injected for this entry's units only (WT-C2); unset, `test -n` denies.
+pub const WALKTHROUGH_LINT_SCRIPT: &str = "test -n \"${WICKED_GARDEN_ROOT}\" && test -n \"${WICKED_EVIDENCE_ROOT}\" && \"${WICKED_GARDEN_ROOT}/scripts/wicked-garden\" run scripts/demo/walkthrough.mjs lint --root \"${WICKED_EVIDENCE_ROOT}\"";
+
+/// The APPROVED pin the `walkthrough_plan` catalog entry carries (content hash over
+/// `(WALKTHROUGH_LINT_CRITERION, WALKTHROUGH_LINT_SCRIPT, approved=true)`), re-derived by
+/// [`tests::seeded_walkthrough_pins_match_the_constants_the_catalog_carries`].
+pub const WALKTHROUGH_LINT_PIN: &str = "1aa3f15487018f68";
+
+/// WT-C1: the criterion of the `walkthrough_review` entry's pin.
+pub const WALKTHROUGH_RESULT_CRITERION: &str =
+    "the walkthrough's sealed result is PASS, with no FAIL or INCONCLUSIVE chapter";
+
+/// The `walkthrough_review` pin's script: reads one small result file, so the validator bound holds
+/// whatever the chapter count. A missing file, a non-PASS overall or any FAIL/INCONCLUSIVE verdict
+/// denies.
+pub const WALKTHROUGH_RESULT_SCRIPT: &str = "test -n \"${WICKED_EVIDENCE_ROOT}\" && test -f \"${WICKED_EVIDENCE_ROOT}/result.json\" && grep -Eq '\"overall\":\"PASS\"' \"${WICKED_EVIDENCE_ROOT}/result.json\" && ! grep -Eq '\"verdict\":\"(FAIL|INCONCLUSIVE)\"' \"${WICKED_EVIDENCE_ROOT}/result.json\"";
+
+/// The APPROVED pin the `walkthrough_review` catalog entry carries.
+pub const WALKTHROUGH_RESULT_PIN: &str = "f1b20e8ee671a619";
+
+/// The two authored (UNAPPROVED) walkthrough validators, lint then result.
+#[must_use]
+pub fn walkthrough_validators() -> [DeterministicValidator; 2] {
+    [
+        DeterministicValidator {
+            criterion: WALKTHROUGH_LINT_CRITERION.to_string(),
+            script: WALKTHROUGH_LINT_SCRIPT.to_string(),
+            approved: false,
+        },
+        DeterministicValidator {
+            criterion: WALKTHROUGH_RESULT_CRITERION.to_string(),
+            script: WALKTHROUGH_RESULT_SCRIPT.to_string(),
+            approved: false,
+        },
+    ]
+}
+
 /// Vault + approve every floor the built-in defs pin, returning the approved evidence-floor pin
 /// (== [`EVIDENCE_FLOOR_PIN`]).
 ///
@@ -133,7 +176,17 @@ pub fn evidence_floor_validator() -> DeterministicValidator {
 /// `provision-validator` / `approve-validator` pair does, rather than writing an approved node
 /// directly: the approval is a distinct, audited step, and the floor should not get to skip it just
 /// because we ship it.
+///
+/// Also seeds the two walkthrough pins (WT-C1): the catalog carries them as data, and
+/// `attach_pinned_validators` bails a plan whose entry pins an unvaulted validator — so seeding
+/// them here, on the same choke point, keeps a PA-added walkthrough step from bailing its run.
 pub fn seed_builtin_floors(store: &mut dyn wicked_apps_core::GraphStore) -> anyhow::Result<String> {
+    for v in walkthrough_validators() {
+        let unapproved = crate::validator_vault::store_validator(store, &v)?;
+        crate::validator_vault::approve_and_store(store, &unapproved)?.ok_or_else(|| {
+            anyhow::anyhow!("a walkthrough pin vanished from the vault between store and approve")
+        })?;
+    }
     let unapproved = crate::validator_vault::store_validator(store, &evidence_floor_validator())?;
     crate::validator_vault::approve_and_store(store, &unapproved)?.ok_or_else(|| {
         anyhow::anyhow!("evidence floor vanished from the vault between store and approve")
@@ -516,5 +569,38 @@ mod tests {
             "an Evaluator with no floor has nothing it can deny on (#176): a shipped workflow \
              carries an unfalsifiable review step — give it a floor: {ungated:?}"
         );
+    }
+
+    /// WT-C1: each walkthrough pin the catalog carries is the content address of its seeded,
+    /// APPROVED validator, and both scripts pass the denylist that gates every pinned script.
+    #[test]
+    fn seeded_walkthrough_pins_match_the_constants_the_catalog_carries() {
+        let dir = scratch("walkthrough-pins");
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+        seed_builtin_floors(&mut store).unwrap();
+        for (v, want) in walkthrough_validators()
+            .iter()
+            .zip([WALKTHROUGH_LINT_PIN, WALKTHROUGH_RESULT_PIN])
+        {
+            let approved = DeterministicValidator {
+                approved: true,
+                ..v.clone()
+            };
+            assert_eq!(
+                crate::validator_vault::pin(&approved),
+                want,
+                "{}",
+                v.criterion
+            );
+            let loaded = load_validator(&store, want).unwrap().expect("seeded");
+            assert!(loaded.approved);
+            assert_eq!(
+                crate::validator::looks_dangerous(&v.script),
+                None,
+                "denylist-dirty: {}",
+                v.script
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

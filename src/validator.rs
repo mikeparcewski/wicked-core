@@ -291,7 +291,7 @@ fn strip_shell_lang_prefix(s: &str) -> String {
 /// script is clean. This is NOT a sandbox and NOT a security boundary — a determined author can evade a
 /// token denylist; real isolation still requires OS-level sandboxing around [`run_validator`]. It is a
 /// cheap, cross-platform (pure string) tripwire that fails closed on the obvious cases.
-fn looks_dangerous(script: &str) -> Option<&'static str> {
+pub(crate) fn looks_dangerous(script: &str) -> Option<&'static str> {
     // Symbolic patterns matched anywhere. NOTE: deliberately NOT `&`/`|` alone — that would also flag
     // the legitimate `&&`/`||` used by real checks. The network-pipe attack (`curl … | sh`) is caught
     // by the `curl`/`wget` word tokens below instead.

@@ -7340,7 +7340,11 @@ mod tests {
 ///
 /// Whenever a carrier NAME changes, an argument is added or removed, or an exit code changes meaning.
 /// Not for behaviour changes behind a stable interface.
-pub const GATE_PROTOCOL_VERSION: u32 = 1;
+///
+/// History: 2 (WT-C1) — an EVALUATOR (the walkthrough author) may now carry the
+/// `deliverable-roots` posture spelling, which a protocol-1 hook parses as "no fence"; the bump
+/// makes such a hook refuse to arm rather than run that evaluator unfenced.
+pub const GATE_PROTOCOL_VERSION: u32 = 2;
 
 /// The line `gate-hook --protocol-version` prints. Parsed by the launcher; keep it one stable line.
 ///

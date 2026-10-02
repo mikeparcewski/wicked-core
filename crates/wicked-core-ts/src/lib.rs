@@ -2664,7 +2664,7 @@ impl Drop for Subscription {
 mod tests {
     use super::*;
 
-    /// (DES-TEAMING-002 T8) `Core.catalog()`: the thirteen entries, in catalog order, each with
+    /// (DES-TEAMING-002 T8) `Core.catalog()`: the fifteen entries, in catalog order, each with
     /// the picker's keys.
     #[test]
     fn catalog_json_is_the_catalog_in_order() {
@@ -2684,7 +2684,7 @@ mod tests {
             .filter(|e| e["verified_evidence"] == true)
             .map(|e| e["id"].as_str().unwrap())
             .collect();
-        assert_eq!(verified, ["test", "domain_coverage"]);
+        assert_eq!(verified, ["test", "walkthrough_review", "domain_coverage"]);
     }
 
     /// (wicked-core#631) `Core.busEmit()` / `Core.busRead()`: an emit resolves to the row's id (a
