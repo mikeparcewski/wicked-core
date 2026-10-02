@@ -1057,6 +1057,10 @@ export declare class Subscription {
  * decision fired (the claim's `policy_ids`), whatever the decision, so a fired `effect: warn` rule
  * rides an `allow` / `allow_with_conditions` frame. Always present (`[]` when none): its absence
  * means an engine that predates the field.
+ * C3 (additive): elicitationCreated carries `recommended?: number` — the index into `options` of
+ * the option the producer of the options recommends (the field's own JSON Schema `default`, when
+ * it names a delivered option). ABSENT ⇒ nothing is preselected; `options`/`propType` stay
+ * explicit nulls.
  */
 export interface CoreEventJson {
   type: string

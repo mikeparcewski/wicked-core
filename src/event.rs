@@ -1206,6 +1206,10 @@ pub enum CoreEvent {
         /// `"string"`, or `"array"` for a multi-select (the chosen option is delivered as a
         /// one-element array). `None` when no type constraint was specified.
         prop_type: Option<String>,
+        /// (C3, additive) The index into `options` of the option the PRODUCER of the options
+        /// recommends — the field's own JSON Schema `default`, when it names one of the delivered
+        /// options. `None` (ABSENT on the wire) ⇒ nothing is preselected.
+        recommended: Option<u32>,
     },
     /// The elicitation identified by `elicitation_id` reached a terminal state. `session` is the
     /// `run_id`. `action` mirrors the resolved `action` field from the `elicitation/create`
@@ -2381,15 +2385,23 @@ impl CoreEvent {
                 message,
                 options,
                 prop_type,
-            } => json!({
-                "type": "elicitationCreated",
-                "session": session,
-                "epoch": epoch,
-                "elicitationId": elicitation_id,
-                "message": message,
-                "options": options,   // serde_json renders Some(v) → v, None → null
-                "propType": prop_type,
-            }),
+                recommended,
+            } => {
+                let mut v = json!({
+                    "type": "elicitationCreated",
+                    "session": session,
+                    "epoch": epoch,
+                    "elicitationId": elicitation_id,
+                    "message": message,
+                    "options": options,   // serde_json renders Some(v) → v, None → null
+                    "propType": prop_type,
+                });
+                // (C3) Optional, unlike `options`: absent means "nothing preselected".
+                if let Some(i) = recommended {
+                    v["recommended"] = json!(i);
+                }
+                v
+            }
             CoreEvent::ElicitationResolved {
                 session,
                 elicitation_id,
@@ -2472,6 +2484,27 @@ mod tests {
             frame(vec!["OPS-WATCH-002".into()])["firedPolicies"],
             serde_json::json!(["OPS-WATCH-002"])
         );
+    }
+
+    /// C3: `recommended` rides the elicitation frame only when the producer named one;
+    /// `options`/`propType` stay explicit nulls.
+    #[test]
+    fn elicitation_recommended_is_on_the_wire_only_when_set() {
+        let frame = |recommended: Option<u32>| {
+            CoreEvent::ElicitationCreated {
+                session: "s".into(),
+                epoch: 1,
+                elicitation_id: "e".into(),
+                message: "pick".into(),
+                options: Some(vec!["a".into(), "b".into()]),
+                prop_type: Some("string".into()),
+                recommended,
+            }
+            .to_json()
+        };
+        assert!(frame(None).get("recommended").is_none());
+        assert_eq!(frame(Some(1))["recommended"], 1);
+        assert_eq!(frame(Some(1))["options"], serde_json::json!(["a", "b"]));
     }
 
     /// The throttled live-output frame: camelCase tag `unitOutputDelta`, and `attempt` MUST ride

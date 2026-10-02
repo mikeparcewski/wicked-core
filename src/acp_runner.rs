@@ -3478,12 +3478,36 @@ fn validate_elicitation_schema(schema: &Value) -> Result<ElicitationField, Strin
             ))
         }
     };
+    let recommended = recommended_option(prop, options.as_deref(), multi_select);
     Ok(ElicitationField {
         key: key.clone(),
         prop_type: prop_type.map(str::to_string),
         options,
         multi_select,
+        recommended,
     })
+}
+
+/// (C3, DES-studio-rebuild §5.6 rule 3) The option the PRODUCER of the options recommends: the
+/// field's own JSON Schema `default` — a string for a single select, a one-element array for a
+/// multi-select — when it names one of the field's options. Nothing else is read and nothing is
+/// guessed: no default, a default that is not an option, or a multi-element default ⇒ `None`, and
+/// the surface preselects nothing.
+fn recommended_option(prop: &Value, options: Option<&[String]>, multi: bool) -> Option<String> {
+    let options = options?;
+    let default = prop.get("default")?;
+    let value = if multi {
+        match default.as_array().map(Vec::as_slice) {
+            Some([one]) => one.as_str()?,
+            _ => return None,
+        }
+    } else {
+        default.as_str()?
+    };
+    options
+        .iter()
+        .any(|o| o == value)
+        .then(|| value.to_string())
 }
 
 /// The one answerable field of a validated `elicitation/create` form (core#594).
@@ -3497,6 +3521,8 @@ struct ElicitationField {
     options: Option<Vec<String>>,
     /// Multi-select (`type: "array"`): the chosen option is delivered as a one-element array.
     multi_select: bool,
+    /// (C3) The option the schema's own `default` names, if it is one of `options`.
+    recommended: Option<String>,
 }
 
 /// The option values of a select schema node: `oneOf[].const` / `anyOf[].const` (titled enum,
@@ -4168,6 +4194,7 @@ fn exec_turn_acp_posture(
                         prop_type,
                         options,
                         multi_select,
+                        recommended,
                     } = field;
 
                     // Mint a unique elicitation id and register in the maps.
@@ -4201,6 +4228,15 @@ fn exec_turn_acp_posture(
                             epoch,
                             elicitation_id: elicitation_id.clone(),
                             message: capped_msg,
+                            // (C3) The index into the options AS DELIVERED (after the cap filter),
+                            // so a recommendation the filter dropped preselects nothing.
+                            recommended: recommended.as_deref().and_then(|want| {
+                                filtered_opts
+                                    .as_deref()?
+                                    .iter()
+                                    .position(|o| o == want)
+                                    .and_then(|i| u32::try_from(i).ok())
+                            }),
                             options: filtered_opts,
                             prop_type,
                         },
@@ -18185,6 +18221,8 @@ No further next steps — both questions fully answered.";
                 prop_type: Some("string".to_string()),
                 options: Some(vec!["Postgres".to_string(), "SQLite".to_string()]),
                 multi_select: false,
+                // The adapter sends no `default`: nothing is recommended (C3).
+                recommended: None,
             }
         );
     }
@@ -18202,7 +18240,50 @@ No further next steps — both questions fully answered.";
                 prop_type: Some("array".to_string()),
                 options: Some(vec!["Rust".to_string(), "TypeScript".to_string()]),
                 multi_select: true,
+                // The adapter sends no `default`: nothing is recommended (C3).
+                recommended: None,
             }
+        );
+    }
+
+    /// C3: the schema's own `default` is the recommendation — only when it names a delivered
+    /// option; a default outside the options, a multi-element default or no default recommend
+    /// nothing.
+    #[test]
+    fn the_recommendation_is_the_schemas_own_default_when_it_is_an_option() {
+        let single = |default: Value| {
+            let mut prop =
+                json!({"type": "string", "oneOf": [{"const": "Postgres"}, {"const": "SQLite"}]});
+            if !default.is_null() {
+                prop["default"] = default;
+            }
+            validate_elicitation_schema(&json!({"properties": {"q": prop}}))
+                .unwrap()
+                .recommended
+        };
+        assert_eq!(single(json!("SQLite")), Some("SQLite".to_string()));
+        assert_eq!(
+            single(json!("MySQL")),
+            None,
+            "a default that is not an option"
+        );
+        assert_eq!(single(json!(1)), None, "a default that is not a string");
+        assert_eq!(single(Value::Null), None, "no default, nothing recommended");
+        let multi = |default: Value| {
+            validate_elicitation_schema(&json!({"properties": {"q": {
+                "type": "array",
+                "items": {"anyOf": [{"const": "Rust"}, {"const": "TypeScript"}]},
+                "default": default,
+            }}}))
+            .unwrap()
+            .recommended
+        };
+        assert_eq!(multi(json!(["Rust"])), Some("Rust".to_string()));
+        assert_eq!(multi(json!(["Rust", "TypeScript"])), None, "more than one");
+        assert_eq!(
+            multi(json!("Rust")),
+            None,
+            "a multi-select default is an array"
         );
     }
 
@@ -19191,11 +19272,23 @@ transport = "stdio"
         behavior: &str,
         answer: Option<&'static str>,
     ) -> (TurnResult, Vec<Command>) {
-        let run_id = format!("run-594-{behavior}");
+        run_ask_turn_replaying(behavior, answer, ASK_USER_QUESTION_FIXTURE, "")
+    }
+
+    /// [`run_ask_user_question_turn`] replaying `fixture` (the real one, or a variant of it); `tag`
+    /// keeps the run and scratch dir of a variant apart from the real fixture's.
+    #[cfg(unix)]
+    fn run_ask_turn_replaying(
+        behavior: &str,
+        answer: Option<&'static str>,
+        fixture: &str,
+        tag: &str,
+    ) -> (TurnResult, Vec<Command>) {
+        let run_id = format!("run-594-{behavior}{tag}");
         let dir =
-            std::env::temp_dir().join(format!("wicked-594-{behavior}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("wicked-594-{behavior}{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ask_fixture.json"), ASK_USER_QUESTION_FIXTURE).unwrap();
+        std::fs::write(dir.join("ask_fixture.json"), fixture).unwrap();
 
         let mut proc = start_mock_proc(&dir, behavior);
         let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
@@ -19285,6 +19378,43 @@ transport = "stdio"
             )],
             "the question must surface with the adapter's oneOf options"
         );
+    }
+
+    /// C3: the real adapter request carries no `default`, so its frame recommends nothing; the
+    /// same request with `default: "SQLite"` on the question surfaces `recommended: 1` — the
+    /// index into the options AS DELIVERED, through the real turn loop.
+    #[test]
+    #[cfg(unix)]
+    fn an_elicitations_recommendation_is_the_index_of_its_schema_default() {
+        let recommended = |commands: &[Command]| -> Vec<Option<u32>> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::EmitEvent(crate::event::CoreEvent::ElicitationCreated {
+                        recommended,
+                        ..
+                    }) => Some(*recommended),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (_, real) = run_ask_user_question_turn("ask_single", Some("Postgres"));
+        assert_eq!(
+            recommended(&real),
+            vec![None],
+            "no default, nothing recommended"
+        );
+        let mut fixture: Value = serde_json::from_str(ASK_USER_QUESTION_FIXTURE).unwrap();
+        fixture["single_select"]["requestedSchema"]["properties"]["question_0"]["default"] =
+            json!("SQLite");
+        let (result, with_default) = run_ask_turn_replaying(
+            "ask_single",
+            Some("Postgres"),
+            &fixture.to_string(),
+            "-default",
+        );
+        assert_eq!(result.status, StepStatus::Ok, "{}", result.output);
+        assert_eq!(recommended(&with_default), vec![Some(1)]);
     }
 
     /// core#594: a multi-select AskUserQuestion (`type: "array"`, options under
