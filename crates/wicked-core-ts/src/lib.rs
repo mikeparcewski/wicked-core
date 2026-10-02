@@ -2437,6 +2437,20 @@ impl Core {
         task(move || wicked_core::preview_mcp_calls_json(&db_path, &request_json).map_err(err))
     }
 
+    /// (EP-K1, DES-artifact-editor-plugins §6.2) Decide an artifact editor's permissions over this
+    /// Core's policy store, recording nothing. `request_json` is `{ editorId, version, sha256 (the
+    /// full 64-hex sha256 of the entry file), permissions: [...], project?, firstParty? }` —
+    /// `firstParty: true` only when the hash is the one studio's bundle ships for a `wicked-*` id.
+    /// Resolves to `{ editorId, version, sha256, project, firstParty, grants: [{ permission,
+    /// decision: "allow"|"ask"|"deny", ruleIds, token }] }` — `token` is the ledger entry an
+    /// operator's "allow" adds to `EDITOR-GRANTS.excludes`. Deny dominates. Rejects with
+    /// `bad_request: …` or `guard_error: …` (an unseeded store fails closed).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn evaluate_editor_grants(&self, request_json: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || wicked_core::evaluate_editor_grants_json(&db_path, &request_json).map_err(err))
+    }
+
     /// The ONE MCP tool class derivation (D-4): `annotations_json` is the tool's `tools/list`
     /// annotations object (or `null`), `class_override` an operator override (`read` | `write` |
     /// `destructive`). Returns the class; a tool with no annotations is `write`.
@@ -4468,10 +4482,15 @@ mod tests {
             .collect();
         ids.sort_unstable();
         // The engine seeds the `mcp-defaults` posture rules (steering_type security) at boot
-        // (DES-MCP-TOOLS-001 §4.3); they list beside the imported ones.
+        // (DES-MCP-TOOLS-001 §4.3), and the `editor-defaults` rules (EP-K1); they list beside
+        // the imported ones.
         assert_eq!(
             ids,
             [
+                "EDITOR-BUILTIN",
+                "EDITOR-BUILTIN-PAGE-MEDIA",
+                "EDITOR-GRANTS",
+                "EDITOR-OPEN-DEFAULTS",
                 "MCP-FIRST-USE",
                 "MCP-MODE-ASK-WRITE",
                 "MCP-POSTURE-READ",

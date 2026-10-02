@@ -32,6 +32,7 @@ mod distribute;
 mod docs;
 mod domain;
 mod domain_extraction;
+mod editor_gate;
 mod event;
 pub mod event_log;
 mod execute;
@@ -45,6 +46,10 @@ mod knowledge;
 mod lockstep;
 mod mcp_gate;
 /// The broker's output decision (DES-MCP-TOOLS-001 §6 step 8), beside `evaluate_mcp_call_json`.
+pub use editor_gate::{
+    evaluate_editor_grants, evaluate_editor_grants_json, grant_token as editor_grant_token,
+    EditorGrant, EditorGrantError, EditorGrantRequest, EditorGrants, EDITOR_PERMISSIONS,
+};
 pub use mcp_gate::evaluate_mcp_output_json;
 mod mcp_isolation;
 mod memory;
