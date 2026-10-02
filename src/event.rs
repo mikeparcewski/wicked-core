@@ -597,6 +597,11 @@ pub enum CoreEvent {
         tool_name: String,
         decision: String,
         denying_policy: Option<String>,
+        /// (TR-W2, additive) Every rule the decision fired (the claim's `policy_ids`), for EVERY
+        /// decision — a fired `effect: warn` rule rides an `allow_with_conditions` decision here.
+        /// Always on the wire (`[]` when none), so a consumer can tell an engine that reports
+        /// fired rules from one that predates the field.
+        fired_policies: Vec<String>,
     },
     /// (EVT-009) A pinned, approved deterministic validator was successfully loaded from the vault
     /// and attached to a unit during `attach_pinned_validators`. Fires at plan time (before the
@@ -1912,6 +1917,7 @@ impl CoreEvent {
                 tool_name,
                 decision,
                 denying_policy,
+                fired_policies,
             } => json!({
                 "type": "governanceHookFired",
                 "session": session,
@@ -1920,6 +1926,7 @@ impl CoreEvent {
                 "toolName": tool_name,
                 "decision": decision,
                 "denyingPolicy": denying_policy,
+                "firedPolicies": fired_policies,
             }),
             CoreEvent::ValidationPinAttached {
                 session,
@@ -2441,6 +2448,29 @@ mod tests {
             serde_json::json!([{"status": "M", "path": "src/a.rs"}])
         );
         assert_eq!(some["changedTruncated"], true);
+    }
+
+    /// TR-W2: `governanceHookFired.firedPolicies` is always on the wire — `[]` when nothing fired —
+    /// so a consumer can tell an engine that reports fired rules from one that predates the field.
+    #[test]
+    fn governance_hook_fired_always_carries_its_fired_policies() {
+        let frame = |fired: Vec<String>| {
+            CoreEvent::GovernanceHookFired {
+                session: "s".into(),
+                ord: 1,
+                attempt: 0,
+                tool_name: "Bash".into(),
+                decision: "allow".into(),
+                denying_policy: None,
+                fired_policies: fired,
+            }
+            .to_json()
+        };
+        assert_eq!(frame(Vec::new())["firedPolicies"], serde_json::json!([]));
+        assert_eq!(
+            frame(vec!["OPS-WATCH-002".into()])["firedPolicies"],
+            serde_json::json!(["OPS-WATCH-002"])
+        );
     }
 
     /// The throttled live-output frame: camelCase tag `unitOutputDelta`, and `attempt` MUST ride

@@ -1515,6 +1515,7 @@ pub(crate) fn apply_and_finish_unit(
                 tool_name: rec.tool_name,
                 decision: rec.decision,
                 denying_policy: rec.denying_policy,
+                fired_policies: rec.fired_policies,
             });
         }
     }

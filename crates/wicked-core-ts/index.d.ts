@@ -1053,6 +1053,10 @@ export declare class Subscription {
  * every path the unit changed (its dispatch baseline tree against the tree the checks ran on,
  * repo-relative, `git diff-tree --name-status` statuses, any way of editing) — capped at 200, and
  * `changedTruncated: boolean`. Both are ABSENT when the tree did not change and on a verify floor.
+ * TR-W2 (additive): governanceHookFired carries `firedPolicies: string[]` — EVERY rule the hook
+ * decision fired (the claim's `policy_ids`), whatever the decision, so a fired `effect: warn` rule
+ * rides an `allow` / `allow_with_conditions` frame. Always present (`[]` when none): its absence
+ * means an engine that predates the field.
  */
 export interface CoreEventJson {
   type: string

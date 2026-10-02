@@ -3963,6 +3963,11 @@ pub struct HookDecisionRecord {
     /// The recording claim's evaluator identity — with the claim-id prefix, what names the recorder
     /// (DES-MCP-TOOLS-001: only the broker gate's own evaluator is a brokered MCP refusal).
     pub evaluator: String,
+    /// (TR-W2, DES-trigger-registry §4.4 row 7) EVERY rule the decision fired — the claim's
+    /// `policy_ids`, whatever the decision. `denying_policy` keeps only the first, and only for a
+    /// deny; a fired `effect: warn` rule (`allow_with_conditions`) is recorded here and nowhere
+    /// else, which is what the Watchtower's `risky-call` entry reads.
+    pub fired_policies: Vec<String>,
 }
 
 impl HookDecisionRecord {
@@ -4093,6 +4098,7 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
             wicked_apps_core::Decision::AllowWithConditions => "allow_with_conditions",
             _ => "allow",
         };
+        let fired_policies = claim.policy_ids.clone();
         let denying_policy = if claim.decision == wicked_apps_core::Decision::Deny {
             claim.policy_ids.into_iter().next()
         } else {
@@ -4108,6 +4114,7 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
             obligations: claim.obligations,
             carrier: carrier.clone(),
             evaluator: claim.evaluator_identity,
+            fired_policies,
         });
     }
     records
@@ -7216,6 +7223,54 @@ mod tests {
             "annotation for a different phase must not attach to a unit-1 claim"
         );
 
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// TR-W2: every decision records EVERY rule it fired — a fired `effect: warn` rule on an allow
+    /// is no longer dropped — while `denying_policy` keeps its deny-only meaning.
+    #[test]
+    fn hook_decisions_carry_every_fired_rule_whatever_the_decision() {
+        let run_id = format!("chd-fired-{}", std::process::id());
+        let path = decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        write_armed_marker(&path, "unit-1").unwrap();
+        let mut warned = allow_claim("w1", "unit-1");
+        warned.policy_ids = vec!["OPS-WATCH-002".into()];
+        append_decision(&path, &warned).unwrap();
+        let mut conditional = allow_claim("w2", "unit-1");
+        conditional.decision = Decision::AllowWithConditions;
+        conditional.policy_ids = vec!["OPS-WATCH-004".into(), "OPS-WATCH-005".into()];
+        append_decision(&path, &conditional).unwrap();
+        let mut denied = allow_claim("d1", "unit-1");
+        denied.decision = Decision::Deny;
+        denied.policy_ids = vec!["POL-1".into(), "OPS-WATCH-001".into()];
+        append_decision(&path, &denied).unwrap();
+        append_decision(&path, &allow_claim("a1", "unit-1")).unwrap();
+
+        let recs = collect_hook_decisions(&run_id, 0, "unit-1");
+        let got: Vec<(&str, Option<&str>, Vec<&str>)> = recs
+            .iter()
+            .map(|r| {
+                (
+                    r.decision.as_str(),
+                    r.denying_policy.as_deref(),
+                    r.fired_policies.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("allow", None, vec!["OPS-WATCH-002"]),
+                (
+                    "allow_with_conditions",
+                    None,
+                    vec!["OPS-WATCH-004", "OPS-WATCH-005"]
+                ),
+                ("deny", Some("POL-1"), vec!["POL-1", "OPS-WATCH-001"]),
+                ("allow", None, vec![]),
+            ]
+        );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
