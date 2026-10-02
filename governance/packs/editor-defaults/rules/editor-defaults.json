@@ -1,0 +1,69 @@
+{
+  "rules": [
+    {
+      "id": "EDITOR-GRANTS",
+      "rule_type": "policy",
+      "statement": "The editor permission approvals ledger. Allowing a permission for an editor adds the token editor:<editor-id>@<version>#<sha256>/<permission> (the full 64-hex sha256 of the editor's entry file, and its version) to this rule's excludes through the audited rule upsert; revoking removes it. A new version or a changed entry hash is a different token, so the permission asks again. The engine reads the ledger whether the rule is active or retired, and an explicit deny still dominates an approval.",
+      "severity": "error",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["editor"],
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/editor-defaults/rules/editor-defaults.json#EDITOR-GRANTS",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
+      "id": "EDITOR-BUILTIN",
+      "rule_type": "policy",
+      "statement": "A first-party editor (a wicked-* id whose entry hash is the one shipped in studio's bundle) is allowed its default permission set: read, write as new versions, point, draft, see checks, contribute notes, see sources, play media, export and go full screen.",
+      "severity": "info",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["editor-origin:first-party"],
+      "effect": "allow",
+      "trigger": { "contains": "\"permission\":\"(artifact\\.read|artifact\\.write|selection\\.chip|composer\\.draft|checks\\.read|checks\\.contribute|sources\\.read|media\\.read|artifact\\.export|ui\\.fullscreen)\"" },
+      "criteria": "first-party editors get their default set",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/editor-defaults/rules/editor-defaults.json#EDITOR-BUILTIN",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
+      "id": "EDITOR-BUILTIN-PAGE-MEDIA",
+      "rule_type": "policy",
+      "statement": "The first-party page editor (wicked-page) may load images and fonts from the internet, because agent-authored pages use web images today. No other editor gets network.media by default.",
+      "severity": "info",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["editor-origin:first-party"],
+      "effect": "allow",
+      "trigger": { "contains": "\"id\":\"wicked-page\",\"permission\":\"network\\.media\"" },
+      "criteria": "the first-party page editor loads web images and fonts",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/editor-defaults/rules/editor-defaults.json#EDITOR-BUILTIN-PAGE-MEDIA",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
+      "id": "EDITOR-OPEN-DEFAULTS",
+      "rule_type": "policy",
+      "statement": "Every editor, third-party included, may read the artifact it opens, point at parts of it, contribute notes marked as its own, and go full screen without being asked. Everything else asks until the operator allows it.",
+      "severity": "info",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["editor"],
+      "effect": "allow",
+      "trigger": { "contains": "\"permission\":\"(artifact\\.read|selection\\.chip|checks\\.contribute|ui\\.fullscreen)\"" },
+      "criteria": "the permissions every editor holds by default",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/editor-defaults/rules/editor-defaults.json#EDITOR-OPEN-DEFAULTS",
+        "source_kinds": ["doc"]
+      }
+    }
+  ]
+}

@@ -844,6 +844,11 @@ pub(crate) fn run(
     if let Err(e) = crate::mcp_gate::seed_mcp_defaults(&mut store) {
         eprintln!("wicked-core: could not seed the MCP posture rules ({e})");
     }
+    // (EP-K1) The editor-defaults pack (DES-artifact-editor-plugins §6.2), seeded the same way:
+    // INSERT-ONLY, and an unseeded store fails closed at the grants read, not here.
+    if let Err(e) = crate::editor_gate::seed_editor_defaults(&mut store) {
+        eprintln!("wicked-core: could not seed the editor grant rules ({e})");
+    }
 
     let sidecar_base: String = sidecar_base(&path);
 
