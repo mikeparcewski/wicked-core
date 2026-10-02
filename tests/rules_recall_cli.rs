@@ -96,6 +96,52 @@ fn recall_reports_the_shipped_pack_with_ids_and_wiki_uris() {
 }
 
 /// Facet filters narrow the report; a filtered-out severity is absent, not demoted.
+/// DC-S1 (Copilot review on #696): `--project` with a missing value or an empty element is
+/// REFUSED — never read as "no projects" (which `rules list` would widen to every project). A
+/// well-formed `--project` is accepted by both `recall` and `list`.
+#[test]
+fn a_malformed_project_flag_is_refused_on_recall_and_list() {
+    let dir = scratch("project-flag");
+    let db = dir.join("gov.db");
+    let db = db.to_str().unwrap();
+    ingest_pack(db);
+    for cmd in ["recall", "list"] {
+        for bad in [
+            vec!["--project"],
+            vec!["--project", ","],
+            vec!["--project", "p,"],
+        ] {
+            let mut args = vec!["rules", cmd, "--db", db];
+            args.extend_from_slice(&bad);
+            let out = Command::new(BIN).args(&args).output().unwrap();
+            assert!(!out.status.success(), "{cmd} {bad:?} must be refused");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("--project"),
+                "{cmd} {bad:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let out = Command::new(BIN)
+            .args([
+                "rules",
+                cmd,
+                "--db",
+                db,
+                "--project",
+                "proj_a,proj_b",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn recall_severity_facet_filters_exactly() {
     let dir = scratch("facet");
