@@ -94,6 +94,7 @@ fn spec(session_id: &str, hc: HumanConfirm, project_id: Option<String>) -> Launc
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     }
 }
 

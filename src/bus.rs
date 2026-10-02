@@ -1517,6 +1517,7 @@ fn launch_from_event(
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     };
 
     let (reply, rx) = channel();

@@ -299,6 +299,13 @@ pub struct LaunchSpec {
     /// no `deliver` step of its own, and its command is what puts `deliver` in the floor. A launch
     /// carrying it without a plan or preset is refused (never a silently dropped delivery).
     pub deliver_step: Option<crate::plan::PlanStep>,
+    /// (EP-K3, DES-artifact-editor-plugins §7.6) Seats never to convene as a JUDGE on this run —
+    /// cli keys (`codex`) or seat instances (`claude#2`; excluding an instance excludes its cli
+    /// key too). UNIONED into the engine's computed exclusion (the work author, the team monitors),
+    /// so a caller can only narrow the judge choice, never widen it: evaluator ≠ creator holds
+    /// whatever this says. Empty = today's behaviour. Crew fills it from the run that authored
+    /// the version under review, which a new review run cannot see in its own ledger.
+    pub exclude_seats: Vec<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -1996,6 +2003,7 @@ mod tests {
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch");
         let runs = vec!["held".to_string(), "ghost".to_string()];

@@ -69,6 +69,7 @@ fn fixture(
             edit_requests: edit_requests.iter().map(|r| r.to_string()).collect(),
             ..TeamPlanState::default()
         }),
+        exclude_seats: Vec::new(),
     };
     put_node(store, session.to_node()).unwrap();
     for (i, (phase, st, last)) in units.iter().enumerate() {

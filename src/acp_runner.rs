@@ -16232,6 +16232,7 @@ No further next steps — both questions fully answered.";
             rework_amendment: None,
             status: crate::domain::UnitStatus::Pending,
             catalog: None,
+            exclude_seats: Vec::new(),
         }
     }
 

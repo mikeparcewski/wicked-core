@@ -765,6 +765,7 @@ mod tests {
             rework_amendment: None,
             status: UnitStatus::Pending,
             catalog: None,
+            exclude_seats: Vec::new(),
         }
     }
 

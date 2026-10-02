@@ -165,6 +165,7 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     })
     .expect("launch");
 
@@ -246,6 +247,7 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     })
     .expect("launch");
 

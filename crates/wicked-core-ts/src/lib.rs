@@ -739,6 +739,10 @@ pub struct LaunchOptions {
     /// Only with `planJson` or a preset `workflow`: appended to the plan (unless it has its own
     /// `deliver` step) and put in the floor. Without a plan or preset the launch is REJECTED.
     pub deliver_step_json: Option<String>,
+    /// (EP-K3) Seats never to convene as a JUDGE on this run — cli keys or seat instances
+    /// (`claude#2`). UNIONED into the engine's computed exclusion (the work author, the team
+    /// monitors), so it can only narrow the judge choice. Omit for today's behaviour.
+    pub exclude_seats: Option<Vec<String>>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
@@ -776,6 +780,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         }),
         plan,
         deliver_step,
+        exclude_seats: o.exclude_seats.unwrap_or_default(),
     })
 }
 

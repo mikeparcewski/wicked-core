@@ -122,6 +122,7 @@ fn spec(sid: &str, workflow: &str) -> LaunchSpec {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     }
 }
 

@@ -1236,6 +1236,7 @@ pub(crate) fn run(
                     project_graph: _,
                     plan,
                     deliver_step,
+                    exclude_seats,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1246,6 +1247,16 @@ pub(crate) fn run(
                     workflow.as_deref(),
                     None,
                 ) {
+                    // (EP-K3) A judge exclusion is honoured only on the governed dispatch: refused
+                    // here rather than silently dropped.
+                    Ok(None)
+                        if !crate::domain::normalize_exclude_seats(&exclude_seats).is_empty() =>
+                    {
+                        Err(anyhow::anyhow!(
+                            "a launch with exclude_seats must use launch_run: the straight-through \
+                             path does not carry a judge exclusion"
+                        ))
+                    }
                     Ok(None) if deliver_step.is_none() => Ok(()),
                     Ok(_) => Err(anyhow::anyhow!(
                         "a plan or preset launch must use launch_run: its plan_approval gate \
@@ -1534,6 +1545,7 @@ pub(crate) fn run(
                         benched_seats: Vec::new(),
                         team: None,
                         team_plan: None,
+                        exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1658,6 +1670,7 @@ pub(crate) fn run(
                     Some(&registry),
                     true, // session stub already created + SessionStarted already emitted
                     in_process_governance().is_some(), // keep governed accurate even when unused today
+                    Vec::new(),
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -1849,6 +1862,7 @@ pub(crate) fn run(
                         Some(team_registry.as_ref().unwrap_or(&registry)),
                         true, // session stub already created + SessionStarted already emitted
                         in_process_governance().is_some(), // keep governed accurate even when unused today
+                        Vec::new(),
                     )
                 }) {
                     Err(e) => {
@@ -4112,6 +4126,7 @@ pub(crate) fn launch_run_inner(
         Some(team.as_ref().map_or(registry, |(_, _, reg)| reg)),
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
+        crate::domain::normalize_exclude_seats(&spec.exclude_seats),
     )?;
     if let Some((state, _, _)) = team {
         let mut s = crate::domain::get_session(store, &run_id)?
@@ -7793,6 +7808,12 @@ fn dispatch_unit(
     }
     // DES-TEAMING-002 §8.8 (T6): a member's step records the member seat it belongs to.
     team_changed |= team_gate::stamp_member_step(&session, &mut unit);
+    // (EP-K3) The run's launch-time judge exclusion rides on the unit to whichever worker runs
+    // it (in-process or over the bus), stamped from the persisted session, never the worker.
+    if unit.exclude_seats != session.exclude_seats {
+        unit.exclude_seats = session.exclude_seats.clone();
+        team_changed = true;
+    }
     if (notes_root.is_some() && unit.notes_root != notes_root) || attempt_changed || team_changed {
         if notes_root.is_some() {
             unit.notes_root = notes_root;
@@ -9733,6 +9754,7 @@ fn replan_for_accepted_edit(
         Some(&scoped),
         true,
         in_process_governance().is_some(),
+        Vec::new(),
     )?;
     let distributions = crate::distribute::distribute_units_on_benched(
         &pre.units,
@@ -11200,6 +11222,7 @@ mod gate_pause_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -11453,6 +11476,7 @@ mod terminal_gate_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -11600,6 +11624,7 @@ retry the deliver phase";
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -12149,6 +12174,7 @@ mod substance_gate_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -13205,6 +13231,7 @@ mod request_changes_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -13281,6 +13308,7 @@ mod request_changes_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -14032,6 +14060,7 @@ mod code_evidence_floor_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -14402,6 +14431,7 @@ mod deliverable_floor_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -14925,6 +14955,7 @@ mod seat_failover_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -15570,6 +15601,7 @@ mod def_gate_disclosure_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -15678,6 +15710,7 @@ mod def_gate_disclosure_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -15775,6 +15808,7 @@ mod def_gate_disclosure_tests {
             benched_seats: bench,
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -16095,6 +16129,7 @@ mod terminal_worktree_reap_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -16570,6 +16605,7 @@ mod terminal_worktree_reap_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -16743,6 +16779,7 @@ mod worker_code_graph_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         }
     }
 
@@ -17068,6 +17105,7 @@ mod project_graph_binding_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         }
     }
 
@@ -17817,6 +17855,7 @@ mod phase_boundary_governance_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -18276,6 +18315,7 @@ mod turn_timeout_vs_cancel_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -18473,6 +18513,7 @@ mod turn_timeout_vs_cancel_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -18534,6 +18575,7 @@ mod turn_timeout_vs_cancel_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -18613,6 +18655,7 @@ mod turn_timeout_vs_cancel_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -19163,6 +19206,7 @@ mod dead_seat_park_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -19300,6 +19344,7 @@ mod plan_gate_confirm_tests {
                 pending: Some(pending()),
                 ..TeamPlanState::default()
             }),
+            exclude_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("r:understand", "r", 1, "understand the problem");
@@ -19471,6 +19516,7 @@ mod catalog_alias_governance_tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("r:{phase_id}"), "r", 1, "a unit");

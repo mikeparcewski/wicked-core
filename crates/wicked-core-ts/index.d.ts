@@ -114,6 +114,12 @@ export interface LaunchOptions {
    * `deliver` step) and put in the floor. Without a plan or preset the launch is REJECTED.
    */
   deliverStepJson?: string
+  /**
+   * (EP-K3) Seats never to convene as a JUDGE on this run — cli keys or seat instances
+   * (`claude#2`). UNIONED into the engine's computed exclusion (the work author, the team
+   * monitors), so it can only narrow the judge choice. Omit for today's behaviour.
+   */
+  excludeSeats?: Array<string>
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real

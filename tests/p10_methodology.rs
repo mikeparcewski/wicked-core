@@ -138,6 +138,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     })
     .unwrap();
     assert!(wait_done(&core, "r"), "the run completes");
@@ -226,6 +227,7 @@ fn a_run_convenes_no_council_and_still_separates_evaluator_from_creator() {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     })
     .unwrap();
     assert!(wait_done(&core, "teamed"), "the run completes");

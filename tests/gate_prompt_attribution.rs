@@ -172,6 +172,7 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     })
     .expect("launch");
 
@@ -240,6 +241,7 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     })
     .expect("launch");
 

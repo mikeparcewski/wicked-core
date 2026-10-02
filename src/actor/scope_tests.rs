@@ -41,6 +41,7 @@ fn launch_preset(e: &Engine, run: &str, workflow: &str, repo_ref: Option<&str>, 
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch");
 }
@@ -267,6 +268,7 @@ fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
         project_graph: None,
         plan,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     };
     let authored = json!([{"catalog": "produce", "id": "pa-scope"}]);
     let err = e
@@ -316,6 +318,7 @@ fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
             {"catalog": "produce", "id": "draft"}
         ]}))),
         deliver_step: None,
+        exclude_seats: Vec::new(),
     };
     let Err(err) =
         crate::actor::team_plan_at_launch(&mut store, &registry, &spec, None, None, false)
@@ -813,6 +816,7 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch");
 }

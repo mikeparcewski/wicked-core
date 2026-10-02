@@ -640,6 +640,7 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         benched_seats: Vec::new(),
         team: None,
         team_plan: None,
+        exclude_seats: Vec::new(),
     }
 }
 
