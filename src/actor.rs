@@ -5304,6 +5304,18 @@ fn apply_step_result(
                              / F-7R3-001)",
                             reason.verb()
                         );
+                        // The bench on the wire, once, so a launcher can keep the seat out of
+                        // its next launches (no ballot tells it any more, core#590 S5).
+                        emit(
+                            subscribers,
+                            CoreEvent::SeatBenched {
+                                session: run_id.clone(),
+                                ord,
+                                cli: cli.clone(),
+                                reason: why.clone(),
+                                source: "worker".to_string(),
+                            },
+                        );
                     }
                 }
                 None => eprintln!(
@@ -6946,6 +6958,69 @@ fn pause_for_human_keyed(
 /// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
 #[allow(clippy::too_many_arguments)]
+/// Re-seat the cursor unit when the seat it was planned on has been BENCHED for this run since.
+///
+/// Distribution seats every unit at plan time (core#590 S5: no ballot finds a dead seat first). A
+/// seat that looks signed in but cannot work (out of quota, say) is found by its first unit: the
+/// worker refuses, the seat is benched for the run and that unit fails over. The later units
+/// planned on the same seat used to be dispatched to it anyway, one dead turn and one failover
+/// each (crew 0.7.45's release smoke: copilot was dispatched for units 2 and 4). This moves such a
+/// unit with the failover ladder's own rule ([`next_failover_seat`] over the eligible roster, so
+/// it never lands on a seat that built the work it reviews) and says so with `unitReassigned`.
+///
+/// Called only where the cursor ADVANCES onto a unit. An operator's explicit reassign and a gate's
+/// approve-and-retry dispatch directly, so an operator can still send a unit to a benched seat on
+/// purpose (a seat signed back in). With no eligible seat left the unit keeps its seat: its
+/// refusal then takes the dead-seat route, which pauses an attended run at the escalation gate.
+fn reseat_off_benched_seat(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+) -> anyhow::Result<()> {
+    let Some(unit) = units.get(unit_ix) else {
+        return Ok(());
+    };
+    if unit.tool_cmd.is_some() || matches!(unit.status, crate::domain::UnitStatus::Done) {
+        return Ok(());
+    }
+    let seat = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    if !session.benched_seats.iter().any(|b| b.cli == seat) {
+        return Ok(());
+    }
+    let Some(next) = next_failover_seat(units, unit_ix, &eligible_roster_keys(session)) else {
+        return Ok(());
+    };
+    let mut moved = unit.clone();
+    moved.assigned_cli = Some(next.clone());
+    moved.assigned_invocation = crate::registry_roster()
+        .into_iter()
+        .find(|c| c.key == next)
+        .map(|c| c.headless_invocation);
+    put_node(store, moved.to_node())?;
+    eprintln!(
+        "wicked-core: unit {} of {} was planned on '{seat}', which this run benched; re-seated on \
+         '{next}' before it runs",
+        unit.ord, session.id
+    );
+    emit(
+        subscribers,
+        CoreEvent::UnitReassigned {
+            session: session.id.clone(),
+            ord: unit.ord,
+            attempt: session.attempt,
+            previous_cli: seat,
+            new_cli: Some(next),
+            previous_attempt_reaped: false,
+        },
+    );
+    Ok(())
+}
+
 fn advance_or_pause(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -7044,6 +7119,10 @@ fn advance_or_pause(
             return Ok(Progress::Paused);
         }
     }
+
+    // A unit planned on a seat this run has since BENCHED is re-seated before it is gated or
+    // dispatched, so the seat that refused is never handed another unit of the run.
+    reseat_off_benched_seat(store, subscribers, &session, &units, unit_ix)?;
 
     // (DES-TEAMING-002 T3) A unit a `plan_approval` gate just released skips the human gates that
     // approval answered — once (the confirm path's bypass of `should_pause`, which P1's

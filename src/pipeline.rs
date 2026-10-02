@@ -1024,14 +1024,24 @@ pub(crate) fn apply_and_finish_unit(
                     );
                     continue;
                 };
-                changed |= crate::domain::bench_seat(
+                if crate::domain::bench_seat(
                     &mut session.benched_seats,
                     crate::domain::BenchedSeat {
+                        cli: seat.clone(),
+                        reason: why.clone(),
+                        source: "judge".to_string(),
+                    },
+                ) {
+                    changed = true;
+                    // The bench on the wire, once (see `CoreEvent::SeatBenched`).
+                    emit(CoreEvent::SeatBenched {
+                        session: session_id.to_string(),
+                        ord: unit.ord,
                         cli: seat,
                         reason: why,
                         source: "judge".to_string(),
-                    },
-                );
+                    });
+                }
             }
             if changed {
                 put_node(store, session.to_node())?;
