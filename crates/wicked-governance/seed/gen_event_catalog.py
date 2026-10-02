@@ -102,10 +102,10 @@ SEAMS = [
     ("wicked-garden", "scripts/qe/lib/gate.mjs", "emit", "literals"),
     ("wicked-ledger", "lib/bus-emit.mjs", "emit", "literals"),
     ("wicked-crew", "packages/crew/src/projects/events.ts", "const", "ts_consts"),
+    ("wicked-crew", "packages/crew/src/watch/events.ts", "const", "ts_consts"),
     ("wicked-crew", "packages/crew/src/interactive/chat-events.ts", "mirror", "ts_consts"),
     ("wicked-crew", "packages/crew/src/interactive/edit-events.ts", "mirror", "ts_consts"),
     ("wicked-crew", "packages/crew/src/interactive/draft-events.ts", "mirror", "ts_consts"),
-    ("wicked-crew", "packages/crew/src/interactive/demo-events.ts", "mirror", "ts_consts"),
     ("wicked-interactive", "src/service/events.js", "registry", "js_registry"),
     ("wicked-interactive", "src/artifact/create.js", "emit", "literals"),
     ("wicked-interactive", "src/artifact/publish.js", "emit", "literals"),
@@ -125,11 +125,13 @@ DOMAIN_NOTES = {
     "test": "legacy-stable QE-lifecycle spelling kept at the wicked-testing retirement — the `domain` stamp is `qe`",
 }
 
+# A const whose value ends in `.` is a type PREFIX (crew's `WATCH_FINDING_PREFIX`), never an
+# event type: the value must end in a segment character.
 RUST_CONST = re.compile(
-    r'^pub const ([A-Z_][A-Z0-9_]*): &str = "(wicked\.[a-z0-9_.-]+)";', re.M
+    r'^pub const ([A-Z_][A-Z0-9_]*): &str = "(wicked\.[a-z0-9_.-]*[a-z0-9_-])";', re.M
 )
 TS_CONST = re.compile(
-    r"^export const ([A-Z_][A-Z0-9_]*) = '(wicked\.[a-z0-9_.-]+)';", re.M
+    r"^export const ([A-Z_][A-Z0-9_]*) = '(wicked\.[a-z0-9_.-]*[a-z0-9_-])';", re.M
 )
 EMIT_OPENER = re.compile(r"EmitEvent::new\(|BusEmit::new\(|\.emit\(")
 
@@ -296,6 +298,8 @@ def scan_core_emit_wiring(ws: Path, consts: dict[str, dict]) -> dict[str, list[s
     rs_files = sorted(
         p for p in list((core / "src").rglob("*.rs")) + list((core / "crates").rglob("*.rs"))
         if "/tests/" not in p.as_posix() and "/target/" not in p.as_posix()
+        # a `*_tests.rs` file is a `#[cfg(test)] #[path = …] mod` body: test code, not a seam
+        and not p.name.endswith("_tests.rs")
     )
     for p in rs_files:
         lines = strip_test_items(p.read_text(encoding="utf-8")).splitlines()
