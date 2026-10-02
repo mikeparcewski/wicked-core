@@ -1008,7 +1008,30 @@ fn break_outbox(rig: &Rig) -> std::path::PathBuf {
         "could not move the outbox aside: {}",
         rig.outbox.display()
     );
-    std::fs::create_dir_all(&rig.outbox).unwrap();
+    // core#706: a publisher appending in the window recreates the FILE before the directory can
+    // take its place (Windows: AlreadyExists). Fold what it wrote into the aside copy, remove it,
+    // and try again, until the directory stands.
+    for _ in 0..50 {
+        match std::fs::create_dir(&rig.outbox) {
+            Ok(()) => break,
+            Err(_) if rig.outbox.is_dir() => break,
+            Err(_) => {
+                if let Ok(late) = std::fs::read(&rig.outbox) {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&aside) {
+                        let _ = f.write_all(&late);
+                    }
+                }
+                let _ = std::fs::remove_file(&rig.outbox);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    assert!(
+        rig.outbox.is_dir(),
+        "could not put a directory in place of the outbox: {}",
+        rig.outbox.display()
+    );
     aside
 }
 
