@@ -6954,10 +6954,6 @@ fn pause_for_human_keyed(
     Ok(())
 }
 
-/// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
-/// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
-/// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
-#[allow(clippy::too_many_arguments)]
 /// Re-seat the cursor unit when the seat it was planned on has been BENCHED for this run since.
 ///
 /// Distribution seats every unit at plan time (core#590 S5: no ballot finds a dead seat first). A
@@ -7021,6 +7017,10 @@ fn reseat_off_benched_seat(
     Ok(())
 }
 
+/// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
+/// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
+/// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
+#[allow(clippy::too_many_arguments)]
 fn advance_or_pause(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
