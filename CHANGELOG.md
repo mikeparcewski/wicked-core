@@ -14,6 +14,30 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.35** — 2026-10-02 — npm release carrying the **nine** engine changes since 0.7.34, on
+  main tip `c98f283`: the held W2 slices and the W3 core slices of the 2026-09 build plan. All new wire
+  fields are additive and `serde(default)`, so an old row and an old consumer read as before.
+  **Walkthrough proof (#691 WT-C1, #697 WT-C2)** — the catalog gains the dormant `walkthrough_plan`
+  and `walkthrough_review` entries (no built-in preset uses them) and gate protocol 2; a launch can
+  name an `evidenceRoot`, and the review's record Tool runs jailed, loopback-only, with its declared
+  env, writing under `<evidence_root>/<step>`.
+  **Trigger sources for crew's Watchtower (#693 TR-W1a, #700 TR-W1b, #701 TR-W2)** — `plan.accepted`
+  carries the accepted `touch` set (capped at 64, with `touch_truncated` and `touch_source`); a
+  creator floor's `repoChecksEvaluated` carries the `changed` paths (capped at 200); every hook
+  decision carries `firedPolicies` (always present, `[]` when nothing fired), and the
+  `ops-watch` pack ships eleven `OPS-WATCH-*` warn rules.
+  **Launch-time `excludeSeats` (#695 EP-K3)** — seats named at launch never judge the run, unioned
+  into the judge exclusion.
+  **Project-scoped rules (#696 DC-S1)** — a rule may name a project and is recalled only for a run in
+  that project; rules may `supersede` others; the new `considerRules` binding, and unit claims carry
+  the run's project rules.
+  **Recommended option on an elicitation (#702 C3-core)** — `elicitationCreated` carries
+  `recommended`, the index of the option the producer's own JSON Schema `default` names, and nothing
+  else.
+  **Editor grants (#704 EP-K1)** — the `editor-defaults` pack (approvals ledger, first-party
+  defaults, open defaults; insert-only boot seed) and the `evaluateEditorGrants` binding. Known gap:
+  a manual `rules ingest` of a seeded pack resets its approvals ledger (#709, shared with
+  `mcp-defaults`). The lockfile re-stamp #694 is packaging only.
 - **core-ts 0.7.34** — 2026-10-01 — patch release carrying **one** engine change since 0.7.33, on main
   tip `7e0abf4`. **A seat benched mid-run is never handed another unit of that run, and the bench is on
   the wire (#689).** crew 0.7.45's post-publish smoke (wicked-ci S04, run 36946090323) found it: since
