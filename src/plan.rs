@@ -547,6 +547,9 @@ pub enum PlanRefusal {
     ExecutorNotAllowed { step: String, catalog: String },
     /// A Tool-entry step (`run`, `deliver`) supplies no non-empty Tool command.
     ToolCommandMissing { step: String, catalog: String },
+    /// A step of a Tool entry whose command is FIXED (`walkthrough_review`, WT-C1) supplies a
+    /// different executor than that command: a step may only omit or restate it.
+    ToolCommandChanged { step: String, catalog: String },
     /// The step replaces `instructions` its entry already carries.
     InstructionsChanged { step: String, catalog: String },
     /// The step replaces the `skill_ref` its entry already carries (a `security_review` step
@@ -604,6 +607,7 @@ impl PlanRefusal {
             PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
             PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
             PlanRefusal::ToolCommandMissing { .. } => "tool_command_missing",
+            PlanRefusal::ToolCommandChanged { .. } => "tool_command_changed",
             PlanRefusal::InstructionsChanged { .. } => "instructions_changed",
             PlanRefusal::SkillRefChanged { .. } => "skill_ref_changed",
             PlanRefusal::AllowedSkillsChanged { .. } => "allowed_skills_changed",
@@ -660,12 +664,17 @@ impl std::fmt::Display for PlanRefusal {
             ),
             PlanRefusal::ExecutorNotAllowed { step, catalog } => write!(
                 f,
-                "{r}: step {step} sets an executor on {catalog}, an agent entry — only run and \
-                 deliver take one"
+                "{r}: step {step} sets an executor on {catalog}, an agent entry — only the Tool \
+                 entries (run, deliver, walkthrough_review) take one"
             ),
             PlanRefusal::ToolCommandMissing { step, catalog } => write!(
                 f,
                 "{r}: step {step} instantiates the tool entry {catalog} without a tool command"
+            ),
+            PlanRefusal::ToolCommandChanged { step, catalog } => write!(
+                f,
+                "{r}: step {step} changes {catalog}'s fixed Tool command — a step may only omit \
+                 or restate it"
             ),
             PlanRefusal::InstructionsChanged { step, catalog } => write!(
                 f,
@@ -750,8 +759,9 @@ pub enum FieldRule {
     /// final. Restating the entry's own value is a no-op. For `validator_pin` this bans swaps: a
     /// different pin is `pin_changed` and a `null` is `pin_removed`.
     SetIfUnset,
-    /// Only on the Tool entries (`run`, `deliver`), where the entry carries no command and the step
-    /// MUST supply one; refused on every agent entry.
+    /// Only on the Tool entries. Where the entry carries no command (`run`, `deliver`) the step
+    /// MUST supply one; where it carries one (`walkthrough_review`, WT-C1) the step may only omit
+    /// or restate it. Refused on every agent entry.
     ToolEntriesOnly,
     /// Only on `run`; anywhere else it is fixed (the entry's own value is a no-op).
     RunOnly,
@@ -952,19 +962,35 @@ fn apply_step(
         }
         phase.required_deliverables = deliverables.clone();
     }
-    // executor — ToolEntriesOnly: required (non-empty) on run/deliver, refused on agent entries.
+    // executor — ToolEntriesOnly: required (non-empty) on run/deliver, omit-or-restate on a Tool
+    // entry with a fixed command (WT-C1), refused on agent entries.
     let tool_entry = crate::catalog::is_tool_entry(entry);
-    match (&step.executor, tool_entry) {
-        (Some(_), false) => {
-            return refuse(|step, catalog| PlanRefusal::ExecutorNotAllowed { step, catalog });
+    let fixed_cmd = match &entry.executor {
+        PhaseExecutor::Tool { cmd } if !cmd.is_empty() => Some(cmd),
+        _ => None,
+    };
+    if let Some(fixed) = fixed_cmd {
+        match &step.executor {
+            None => {}
+            Some(PhaseExecutor::Tool { cmd }) if cmd == fixed => {}
+            Some(_) => {
+                return refuse(|step, catalog| PlanRefusal::ToolCommandChanged { step, catalog });
+            }
         }
-        (Some(PhaseExecutor::Tool { cmd }), true) if !cmd.is_empty() => {
-            phase.executor = PhaseExecutor::Tool { cmd: cmd.clone() };
+        phase.executor = entry.executor.clone();
+    } else {
+        match (&step.executor, tool_entry) {
+            (Some(_), false) => {
+                return refuse(|step, catalog| PlanRefusal::ExecutorNotAllowed { step, catalog });
+            }
+            (Some(PhaseExecutor::Tool { cmd }), true) if !cmd.is_empty() => {
+                phase.executor = PhaseExecutor::Tool { cmd: cmd.clone() };
+            }
+            (_, true) => {
+                return refuse(|step, catalog| PlanRefusal::ToolCommandMissing { step, catalog });
+            }
+            (None, false) => {}
         }
-        (_, true) => {
-            return refuse(|step, catalog| PlanRefusal::ToolCommandMissing { step, catalog });
-        }
-        (None, false) => {}
     }
     // instructions, skill_ref — SetIfUnset.
     if let Some(text) = &step.instructions {

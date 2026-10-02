@@ -83,6 +83,24 @@ impl WritePosture {
         if unit.is_member_step_review() && unit.tool_cmd.is_none() {
             return WritePosture::ReadOnly;
         }
+        // WT-C1 (DES-walkthrough-proof §4.3, B3): the walkthrough author is an evaluator that
+        // writes exactly one file, its storyline, into the run's declared author dir. Keyed off
+        // the catalog entry, never the prompt; on a bound run only (unbound it stays read-only,
+        // and a repo-less walkthrough fails closed at its pinned validator anyway). Spelled
+        // `deliverable-roots` on the hook env — an EVALUATOR carrying it is why gate protocol 2
+        // exists (an older hook would parse it as no fence; a mismatched hook refuses instead).
+        // Decided BEFORE the guard marker (Copilot review on #691): a plan step may raise
+        // `executes_code` (TightenOnly), which clears the marker — that must never turn the
+        // author's fence into `Full`.
+        if unit.tool_cmd.is_none()
+            && unit.catalog.as_deref() == Some(crate::catalog::WALKTHROUGH_PLAN)
+        {
+            return if bound {
+                WritePosture::DeliverableRoots
+            } else {
+                WritePosture::ReadOnly
+            };
+        }
         if !crate::worktree_guard::applies_to(unit) {
             return WritePosture::Full;
         }
@@ -116,12 +134,12 @@ impl WritePosture {
     ///
     /// The read-only posture is written as `1` — the spelling the hook parsed BEFORE postures
     /// existed (strict `1`/`true`), on purpose (independent review of #444, F-01): the hook is the
-    /// STANDALONE `wicked-core` binary the daemon finds on PATH, the gate protocol handshake
-    /// (`check_gate_protocol`) compares crate versions, and this change ships no bump — so a
-    /// same-version pre-posture hook must still read an evaluator's fence as ON. Only
-    /// `deliverable-roots` is a new spelling; an old hook reads it as "no fence", i.e. a bound
-    /// creator becomes guard-only there — strictly better than the pre-fix "refuse the
-    /// deliverable", and never a lost evaluator fence.
+    /// STANDALONE `wicked-core` binary the daemon finds on PATH, so a pre-posture hook must still
+    /// read an evaluator's fence as ON. `deliverable-roots` is the newer spelling; a protocol-1
+    /// hook reads it as "no fence". That was acceptable while only a creator carried it (a bound
+    /// creator became guard-only there). WT-C1 gives it to an EVALUATOR (the walkthrough author),
+    /// so gate protocol 2 ([`crate::gate_hook::GATE_PROTOCOL_VERSION`]) makes a protocol-1 hook
+    /// refuse to arm instead of running that evaluator unfenced.
     pub(crate) fn env_value(self) -> Option<&'static str> {
         match self {
             WritePosture::Full => None,
@@ -514,5 +532,42 @@ mod tests {
         assert_eq!(WritePosture::of(&u, true), WritePosture::ReadOnly);
         assert_eq!(WritePosture::of(&u, false), WritePosture::ReadOnly);
         assert!(WritePosture::of(&u, true).fences_writes());
+    }
+
+    /// WT-C1 (DES-walkthrough-proof §4.3, B3): the walkthrough author is an EVALUATOR that writes
+    /// exactly one file, its storyline, into the run's declared author dir. Keyed off the catalog
+    /// entry, never the prompt: on a BOUND run it gets `DeliverableRoots` (fenced to the declared
+    /// roots, the tree excluded, never `Full`); on an unbound run, and for any other evaluator,
+    /// the posture stays read-only.
+    #[test]
+    fn the_walkthrough_author_gets_deliverable_roots_on_a_bound_run_only() {
+        let mut author = unit(PhaseRole::Evaluator, false);
+        author.catalog = Some("walkthrough_plan".to_string());
+        assert_eq!(
+            WritePosture::of(&author, true),
+            WritePosture::DeliverableRoots
+        );
+        assert_ne!(WritePosture::of(&author, true), WritePosture::Full);
+        assert_eq!(WritePosture::of(&author, false), WritePosture::ReadOnly);
+        let mut other = unit(PhaseRole::Evaluator, false);
+        other.catalog = Some("test".to_string());
+        assert_eq!(WritePosture::of(&other, true), WritePosture::ReadOnly);
+        let mut named = unit(PhaseRole::Evaluator, false);
+        named.description = "walkthrough_plan: write the storyline".to_string();
+        assert_eq!(
+            WritePosture::of(&named, true),
+            WritePosture::ReadOnly,
+            "the prompt never keys the posture"
+        );
+        // A step that raised `executes_code` (TightenOnly) clears the guard marker; the author
+        // keeps its fence anyway (Copilot review on #691).
+        let mut raised = unit(PhaseRole::Evaluator, true);
+        raised.catalog = Some("walkthrough_plan".to_string());
+        assert!(!raised.worktree_guarded);
+        assert_eq!(
+            WritePosture::of(&raised, true),
+            WritePosture::DeliverableRoots
+        );
+        assert_eq!(WritePosture::of(&raised, false), WritePosture::ReadOnly);
     }
 }

@@ -67,8 +67,9 @@
 //! The actor still seeds at boot, but only as an early warning and to make the floor visible in the
 //! vault before a first run — not as the thing that makes a plan resolve.
 //!
-//! Seeding per plan is affordable because it is idempotent (content-addressed) and cheap (two
-//! `put_node`s that collapse onto themselves).
+//! Seeding per plan is affordable because it is idempotent (content-addressed) and cheap (six
+//! `put_node`s that collapse onto themselves: an unapproved + approved copy of the evidence floor
+//! and of each of the two walkthrough pins, WT-C1).
 
 use crate::validator::DeterministicValidator;
 
@@ -120,6 +121,54 @@ pub fn evidence_floor_validator() -> DeterministicValidator {
     }
 }
 
+/// WT-C1 (DES-walkthrough-proof §4.3, B1): the criterion of the `walkthrough_plan` entry's pin.
+pub const WALKTHROUGH_LINT_CRITERION: &str =
+    "the walkthrough storyline passes garden's deterministic lint (a weak proof is never recorded)";
+
+/// The `walkthrough_plan` pin's script: garden's walkthrough lint over the run's evidence root.
+/// Only `${VAR}` expansion (no `>`, no `$(`, no backtick), so it passes `looks_dangerous`. Both
+/// variables are injected for this entry's units only (WT-C2); unset, `test -n` denies.
+pub const WALKTHROUGH_LINT_SCRIPT: &str = "test -n \"${WICKED_GARDEN_ROOT}\" && test -n \"${WICKED_EVIDENCE_ROOT}\" && \"${WICKED_GARDEN_ROOT}/scripts/wicked-garden\" run scripts/demo/walkthrough.mjs lint --root \"${WICKED_EVIDENCE_ROOT}\"";
+
+/// The APPROVED pin the `walkthrough_plan` catalog entry carries (content hash over
+/// `(WALKTHROUGH_LINT_CRITERION, WALKTHROUGH_LINT_SCRIPT, approved=true)`), re-derived by
+/// [`tests::seeded_walkthrough_pins_match_the_constants_the_catalog_carries`].
+pub const WALKTHROUGH_LINT_PIN: &str = "1aa3f15487018f68";
+
+/// WT-C1: the criterion of the `walkthrough_review` entry's pin.
+pub const WALKTHROUGH_RESULT_CRITERION: &str =
+    "the walkthrough's sealed result is PASS, with no FAIL or INCONCLUSIVE chapter";
+
+/// The `walkthrough_review` pin's script: reads one small result file, so the validator bound holds
+/// whatever the chapter count. A missing file, a non-PASS overall or any FAIL/INCONCLUSIVE verdict
+/// denies.
+///
+/// Hardened from the DES's verbatim script (codex review on WT-C1): whitespace around `:` is
+/// tolerated in both directions, and a FAIL/INCONCLUSIVE `overall` anywhere denies too, so a
+/// pretty-printed result cannot hide a failing verdict and a stray `"overall":"PASS"` beside a
+/// failing one cannot pass. Deny dominates.
+pub const WALKTHROUGH_RESULT_SCRIPT: &str = "test -n \"${WICKED_EVIDENCE_ROOT}\" && test -f \"${WICKED_EVIDENCE_ROOT}/result.json\" && grep -Eq '\"overall\"[[:space:]]*:[[:space:]]*\"PASS\"' \"${WICKED_EVIDENCE_ROOT}/result.json\" && ! grep -Eq '\"(overall|verdict)\"[[:space:]]*:[[:space:]]*\"(FAIL|INCONCLUSIVE)\"' \"${WICKED_EVIDENCE_ROOT}/result.json\"";
+
+/// The APPROVED pin the `walkthrough_review` catalog entry carries.
+pub const WALKTHROUGH_RESULT_PIN: &str = "cd95e6e0acdb4d8b";
+
+/// The two authored (UNAPPROVED) walkthrough validators, lint then result.
+#[must_use]
+pub fn walkthrough_validators() -> [DeterministicValidator; 2] {
+    [
+        DeterministicValidator {
+            criterion: WALKTHROUGH_LINT_CRITERION.to_string(),
+            script: WALKTHROUGH_LINT_SCRIPT.to_string(),
+            approved: false,
+        },
+        DeterministicValidator {
+            criterion: WALKTHROUGH_RESULT_CRITERION.to_string(),
+            script: WALKTHROUGH_RESULT_SCRIPT.to_string(),
+            approved: false,
+        },
+    ]
+}
+
 /// Vault + approve every floor the built-in defs pin, returning the approved evidence-floor pin
 /// (== [`EVIDENCE_FLOOR_PIN`]).
 ///
@@ -127,13 +176,23 @@ pub fn evidence_floor_validator() -> DeterministicValidator {
 /// load-bearing, not incidental: `attach_pinned_validators` BAILS a run whose phase pins a validator
 /// the vault does not hold, so shipping a pin in a built-in def is only safe if the seed provably
 /// runs before any plan. Idempotent — the vault is content-addressed, so re-seeding an already
-/// seeded store rewrites the same two nodes.
+/// seeded store rewrites the same six nodes.
 ///
 /// Goes through the same author → vault-unapproved → APPROVE path an operator's
 /// `provision-validator` / `approve-validator` pair does, rather than writing an approved node
 /// directly: the approval is a distinct, audited step, and the floor should not get to skip it just
 /// because we ship it.
+///
+/// Also seeds the two walkthrough pins (WT-C1): the catalog carries them as data, and
+/// `attach_pinned_validators` bails a plan whose entry pins an unvaulted validator — so seeding
+/// them here, on the same choke point, keeps a PA-added walkthrough step from bailing its run.
 pub fn seed_builtin_floors(store: &mut dyn wicked_apps_core::GraphStore) -> anyhow::Result<String> {
+    for v in walkthrough_validators() {
+        let unapproved = crate::validator_vault::store_validator(store, &v)?;
+        crate::validator_vault::approve_and_store(store, &unapproved)?.ok_or_else(|| {
+            anyhow::anyhow!("a walkthrough pin vanished from the vault between store and approve")
+        })?;
+    }
     let unapproved = crate::validator_vault::store_validator(store, &evidence_floor_validator())?;
     crate::validator_vault::approve_and_store(store, &unapproved)?.ok_or_else(|| {
         anyhow::anyhow!("evidence floor vanished from the vault between store and approve")
@@ -516,5 +575,101 @@ mod tests {
             "an Evaluator with no floor has nothing it can deny on (#176): a shipped workflow \
              carries an unfalsifiable review step — give it a floor: {ungated:?}"
         );
+    }
+
+    /// WT-C1: each walkthrough pin the catalog carries is the content address of its seeded,
+    /// APPROVED validator, and both scripts pass the denylist that gates every pinned script.
+    #[test]
+    fn seeded_walkthrough_pins_match_the_constants_the_catalog_carries() {
+        let dir = scratch("walkthrough-pins");
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+        seed_builtin_floors(&mut store).unwrap();
+        for (v, want) in walkthrough_validators()
+            .iter()
+            .zip([WALKTHROUGH_LINT_PIN, WALKTHROUGH_RESULT_PIN])
+        {
+            let approved = DeterministicValidator {
+                approved: true,
+                ..v.clone()
+            };
+            assert_eq!(
+                crate::validator_vault::pin(&approved),
+                want,
+                "{}",
+                v.criterion
+            );
+            let loaded = load_validator(&store, want).unwrap().expect("seeded");
+            assert!(loaded.approved);
+            assert_eq!(
+                crate::validator::looks_dangerous(&v.script),
+                None,
+                "denylist-dirty: {}",
+                v.script
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WT-C1: the result script's verdict table, run through `sh -c` against fixture roots (the
+    /// engine-side `WICKED_EVIDENCE_ROOT` injection and the run under `run_validator_reporting`
+    /// are WT-C2). PASS passes; FAIL, INCONCLUSIVE, a missing file, an unset root, a
+    /// pretty-printed failing verdict and a contradictory `overall` all deny.
+    #[cfg(unix)]
+    #[test]
+    fn the_walkthrough_result_script_passes_only_a_clean_pass() {
+        let dir = scratch("walkthrough-result");
+        let cases: [(&str, Option<&str>, bool); 8] = [
+            (
+                "pass",
+                Some(r#"{"overall":"PASS","chapters":[{"verdict":"PASS"}]}"#),
+                true,
+            ),
+            (
+                "pass-pretty",
+                Some("{\n  \"overall\": \"PASS\",\n  \"chapters\": [{ \"verdict\": \"PASS\" }]\n}"),
+                true,
+            ),
+            (
+                "fail",
+                Some(r#"{"overall":"FAIL","chapters":[{"verdict":"FAIL"}]}"#),
+                false,
+            ),
+            (
+                "inconclusive",
+                Some(r#"{"overall":"PASS","chapters":[{"verdict":"INCONCLUSIVE"}]}"#),
+                false,
+            ),
+            (
+                "pretty-fail",
+                Some("{\"overall\":\"PASS\",\"chapters\":[{\"verdict\": \"FAIL\"}]}"),
+                false,
+            ),
+            (
+                "contradictory",
+                Some(r#"{"overall":"FAIL","meta":{"overall":"PASS"}}"#),
+                false,
+            ),
+            ("missing", None, false),
+            ("unset", None, false),
+        ];
+        for (name, body, want) in cases {
+            let root = dir.join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            if let Some(b) = body {
+                std::fs::write(root.join("result.json"), b).unwrap();
+            }
+            use wicked_apps_core::spawn::HardenedCommand;
+            let mut cmd = Command::new("sh");
+            cmd.hardened()
+                .arg("-c")
+                .arg(WALKTHROUGH_RESULT_SCRIPT)
+                .env_clear();
+            if name != "unset" {
+                cmd.env("WICKED_EVIDENCE_ROOT", &root);
+            }
+            let ok = cmd.status().unwrap().success();
+            assert_eq!(ok, want, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

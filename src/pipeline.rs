@@ -652,7 +652,8 @@ pub(crate) fn planned_units(
         //
         // This is the one choke point both paths cross (actor launch and `run_session`), the writes
         // are content-addressed upserts, and the pin is a compile-time constant — so it is idempotent
-        // and costs two `put_node`s per plan. The boot-time seed stays as the loud early warning and
+        // and costs six `put_node`s per plan (an unapproved + approved copy of each of the three
+        // built-in validators: the evidence floor and the two walkthrough pins, WT-C1). The boot-time seed stays as the loud early warning and
         // to make the floor visible in the vault before a first run; this is the invariant.
         crate::builtin_floors::seed_builtin_floors(store)?;
         // The shipped `domain-extraction` drop-in's coverage validator is seeded HERE for the same
@@ -2608,10 +2609,19 @@ mod resolve_tests {
             .zip(def.phases.iter())
             .filter(|(u, _)| u.validator.is_some())
             .map(|(u, p)| {
-                let want = if p.id == "domain_coverage" {
-                    &coverage
-                } else {
-                    &floor
+                let walkthrough;
+                let want = match p.id.as_str() {
+                    "domain_coverage" => &coverage,
+                    "walkthrough_plan" | "walkthrough_review" => {
+                        walkthrough = crate::validator_vault::load_validator(
+                            &store,
+                            p.validator_pin.as_deref().unwrap(),
+                        )
+                        .unwrap()
+                        .expect("the walkthrough pins are seeded with the floors (WT-C1)");
+                        &walkthrough
+                    }
+                    _ => &floor,
                 };
                 assert_eq!(u.validator.as_ref(), Some(want), "{} carries its pin", p.id);
                 p.id.as_str()
@@ -2622,6 +2632,8 @@ mod resolve_tests {
             [
                 "build",
                 "test",
+                "walkthrough_plan",
+                "walkthrough_review",
                 "review",
                 "security_review",
                 "domain_coverage"

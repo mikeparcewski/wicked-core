@@ -28,7 +28,7 @@
 
 use std::sync::OnceLock;
 
-use crate::builtin_floors::EVIDENCE_FLOOR_PIN;
+use crate::builtin_floors::{EVIDENCE_FLOOR_PIN, WALKTHROUGH_LINT_PIN, WALKTHROUGH_RESULT_PIN};
 use crate::domain::StageKind;
 use crate::domain_extraction::COVERAGE_VALIDATOR_PIN;
 use crate::plan::PlanStep;
@@ -40,8 +40,9 @@ use crate::workflow::{
 /// frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
 pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer";
 
-/// The thirteen catalog ids, in the §8.3 table's order.
-pub const CATALOG_IDS: [&str; 13] = [
+/// The fifteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
+/// after `test`).
+pub const CATALOG_IDS: [&str; 15] = [
     "understand",
     "test_plan",
     "design",
@@ -49,6 +50,8 @@ pub const CATALOG_IDS: [&str; 13] = [
     "build",
     "produce",
     "test",
+    WALKTHROUGH_PLAN,
+    WALKTHROUGH_REVIEW,
     "review",
     "critique",
     "security_review",
@@ -57,7 +60,23 @@ pub const CATALOG_IDS: [&str; 13] = [
     "deliver",
 ];
 
-/// The phase catalog: thirteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
+/// The walkthrough author (DES-walkthrough-proof §4.3, WT-C1): an EVALUATOR agent step that writes
+/// one file, the storyline, into the run's declared author dir. Its posture is
+/// [`crate::write_posture`]'s `DeliverableRoots` on a bound run, keyed off this id.
+pub const WALKTHROUGH_PLAN: &str = "walkthrough_plan";
+/// The walkthrough recorder + judge (DES-walkthrough-proof §4.3, WT-C1): a Tool step whose
+/// command is FIXED here ([`WALKTHROUGH_RECORD_CMD`]) — the engine's own command, no seat. A step
+/// may omit or restate the command, never change it (`plan::compose`: `tool_command_changed`).
+pub const WALKTHROUGH_REVIEW: &str = "walkthrough_review";
+/// The `walkthrough_review` entry's fixed command: garden's walkthrough tool, action `record`.
+pub const WALKTHROUGH_RECORD_CMD: [&str; 4] = [
+    "wicked-garden",
+    "run",
+    "scripts/demo/walkthrough.mjs",
+    "record",
+];
+
+/// The phase catalog: fifteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
     CATALOG.get_or_init(build_catalog)
@@ -116,8 +135,8 @@ pub fn catalog_entries() -> Vec<CatalogEntry> {
         .collect()
 }
 
-/// `true` for an entry whose executor is a Tool (`run`, `deliver`): the only entries a step may
-/// hand an `executor`.
+/// `true` for an entry whose executor is a Tool (`run`, `deliver`, `walkthrough_review`): the only
+/// entries a step may hand an `executor`.
 pub fn is_tool_entry(entry: &PhaseDef) -> bool {
     matches!(entry.executor, PhaseExecutor::Tool { .. })
 }
@@ -297,7 +316,7 @@ on `storyline.mjs` in the demo root the task names: `wicked-garden run scripts/d
 <root>/storyline.mjs --out <root>/demo-video` (inside a crew run the launcher is \
 \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\"). It records every missing segment, then stitches \
 `demo-video/demo.mp4` with chapters. The recorder is read-only against the app: it blocks every \
-non-GET request and fails the segment `side_effect_blocked`; never set DEMO_ALLOW_WRITES. When a \
+non-GET request and fails the segment `side_effect_blocked`. When a \
 note asks to re-record one chapter, delete only `demo-video/segments/<key>/`, fix that segment \
 in the storyline if the note says why, and run record.mjs with that key alone. Then write the \
 review's contact sheets with the skill's contact_sheet.py: `--chapters --out \
@@ -368,6 +387,39 @@ fn build_catalog() -> Vec<PhaseDef> {
                 GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
                 Execution,
                 floor(),
+                false,
+            )
+        },
+        PhaseDef {
+            // WT-C1: the walkthrough author. Dormant — no preset uses it (N5).
+            skill_ref: Some(DEMO_SKILL.to_string()),
+            ..entry(
+                WALKTHROUGH_PLAN,
+                Test,
+                Evaluator,
+                auto,
+                Execution,
+                Some(WALKTHROUGH_LINT_PIN.to_string()),
+                false,
+            )
+        },
+        PhaseDef {
+            // WT-C1: the engine-run recorder + judge. Its pin reads the sealed result, so it is
+            // what re-verifies the evidence; the command is fixed (a step may only restate it).
+            verified_evidence: true,
+            executor: PhaseExecutor::Tool {
+                cmd: WALKTHROUGH_RECORD_CMD
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            },
+            ..entry(
+                WALKTHROUGH_REVIEW,
+                Test,
+                Neutral,
+                auto,
+                Execution,
+                Some(WALKTHROUGH_RESULT_PIN.to_string()),
                 false,
             )
         },
@@ -446,7 +498,7 @@ mod tests {
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
-    fn the_catalog_is_the_thirteen_entries_of_the_table() {
+    fn the_catalog_is_the_fifteen_entries_of_the_table() {
         let got: Vec<_> = catalog()
             .iter()
             .map(|e| {
@@ -475,6 +527,8 @@ mod tests {
             ("build", j("build"), j("creator"), j("auto"), j("execution"), f, true, j("agent"), None),
             ("produce", j("build"), j("creator"), j("auto"), j("value"), None, false, j("agent"), None),
             ("test", j("test"), j("evaluator"), hci.clone(), j("execution"), f, false, j("agent"), None),
+            ("walkthrough_plan", j("test"), j("evaluator"), j("auto"), j("execution"), Some("1aa3f15487018f68"), false, j("agent"), Some("wicked-garden-demo")),
+            ("walkthrough_review", j("test"), j("neutral"), j("auto"), j("execution"), Some("cd95e6e0acdb4d8b"), false, j("tool"), None),
             ("review", j("review"), j("evaluator"), j("auto"), j("execution"), f, false, j("agent"), None),
             ("critique", j("review"), j("evaluator"), j("auto"), j("execution"), None, false, j("agent"), None),
             (
@@ -564,7 +618,7 @@ mod tests {
             .filter(|e| e["verified_evidence"] == true)
             .map(|e| e["id"].as_str().unwrap())
             .collect();
-        assert_eq!(verified, ["test", "domain_coverage"]);
+        assert_eq!(verified, ["test", WALKTHROUGH_REVIEW, "domain_coverage"]);
     }
 
     fn composed(name: &str) -> crate::workflow::WorkflowDef {
@@ -663,6 +717,59 @@ mod tests {
                 Some(pin) => Some((e.id.as_str(), pin)),
             })
             .collect();
-        assert_eq!(other, [("domain_coverage", COVERAGE_VALIDATOR_PIN)]);
+        // The other pins: the two walkthrough pins (WT-C1) and domain_coverage's coverage pin.
+        assert_eq!(
+            other,
+            [
+                (WALKTHROUGH_PLAN, WALKTHROUGH_LINT_PIN),
+                (WALKTHROUGH_REVIEW, WALKTHROUGH_RESULT_PIN),
+                ("domain_coverage", COVERAGE_VALIDATOR_PIN)
+            ]
+        );
+    }
+
+    /// WT-C1 (DES-walkthrough-proof §4.3): `walkthrough_review` is a Tool entry whose command is
+    /// FIXED in the catalog (the engine runs garden's recorder + judge; no seat), and only it
+    /// re-verifies evidence among the two walkthrough entries.
+    #[test]
+    fn the_walkthrough_entries_carry_a_fixed_record_command_and_verified_evidence() {
+        let review = catalog_entry("walkthrough_review").expect("walkthrough_review entry");
+        assert_eq!(
+            serde_json::to_value(&review.executor).unwrap(),
+            serde_json::json!({"type": "tool", "cmd": ["wicked-garden", "run", "scripts/demo/walkthrough.mjs", "record"]})
+        );
+        assert!(review.verified_evidence);
+        let plan = catalog_entry("walkthrough_plan").expect("walkthrough_plan entry");
+        assert!(!plan.verified_evidence);
+        assert!(
+            !plan.executes_code,
+            "the author writes a storyline, never the tree"
+        );
+    }
+
+    /// WT-C1 (N5, dormant): no built-in preset references the walkthrough entries — a walkthrough
+    /// reaches a run only when a PA or a user adds one.
+    #[test]
+    fn no_builtin_preset_references_the_walkthrough_entries() {
+        for (name, steps) in builtin_presets() {
+            for step in steps {
+                assert!(
+                    !step.catalog.starts_with("walkthrough_"),
+                    "preset {name} step {} uses {}",
+                    step.id,
+                    step.catalog
+                );
+            }
+        }
+    }
+
+    /// WT-C1: the recorder's write escape hatch is gone (garden WT-G1 deletes the variable), so the
+    /// demo `record` instruction no longer names it.
+    #[test]
+    fn the_demo_record_instruction_does_not_name_the_deleted_env_var() {
+        assert!(
+            !DEMO_RECORD_INSTRUCTIONS.contains("DEMO_ALLOW_WRITES"),
+            "{DEMO_RECORD_INSTRUCTIONS}"
+        );
     }
 }

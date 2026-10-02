@@ -1709,13 +1709,14 @@ impl WrappedCliStepRunner {
             } else {
                 if write_posture == crate::write_posture::WritePosture::DeliverableRoots {
                     let note = format!(
-                        "phase `{}` plays creator and declares executes_code:false — its \
+                        "phase `{}` plays {} and declares executes_code:false — its \
                          deliverables belong in the run's declared write roots, not the tree; seat \
                          '{cli_key}' exposes no per-root write lever, so the tree is GUARD-ONLY: \
                          the deliverable-roots instruction rides the prompt and the worktree guard \
                          denies (and restores) any change to the tree after the fact (F-036 / \
                          F-4R2-004)",
-                        input.unit.phase_id().unwrap_or("?")
+                        input.unit.phase_id().unwrap_or("?"),
+                        crate::write_posture::role_noun(input.unit.role)
                     );
                     eprintln!("wicked-core: {note}");
                     no_lever_note = Some(note);
@@ -3347,7 +3348,8 @@ pub(crate) fn sandboxed_checks_instruction(notes_root: Option<&str>) -> String {
 /// not the tree", so the posture the boundary cannot apply per path is at least stated; the
 /// worktree guard holds the tree after the fact.
 pub(crate) const DELIVERABLE_ROOTS_INSTRUCTION: &str = "DELIVERABLE-ROOTS PHASE (the tree is \
-    enforced after the fact): this phase plays creator and declares executes_code: false. Write \
+    enforced after the fact): this phase declares executes_code: false and writes only its \
+    deliverable. Write \
     your deliverable ONLY inside the run's declared write roots (the output paths named in the \
     task). Do NOT edit, write, create, delete, move or format any file in the worktree, and do \
     not commit — any change to the worktree is detected by the engine's worktree guard, \
@@ -5363,6 +5365,18 @@ mod tests {
             "must name the CLI's version: {err}"
         );
         assert!(err.contains(&exe), "must name the resolved path: {err}");
+    }
+
+    /// WT-C1 (DES-walkthrough-proof §4.3): protocol 2 is the first in which an EVALUATOR (the
+    /// walkthrough author) can carry `deliverable-roots`. A protocol-1 hook parses that spelling as
+    /// "no fence" (`Full`), so it must refuse to arm rather than run the evaluator unfenced.
+    #[test]
+    fn a_protocol_1_hook_refuses_now_that_an_evaluator_can_carry_deliverable_roots() {
+        assert_eq!(crate::gate_hook::GATE_PROTOCOL_VERSION, 2);
+        let exe = fixture_exe("protocol-1");
+        seed_probe_for_test(&exe, Ok((1, Some(env!("CARGO_PKG_VERSION").to_string()))));
+        let err = check_gate_protocol(&exe).expect_err("a protocol-1 hook must refuse to arm");
+        assert!(err.contains("gate protocol mismatch"), "{err}");
     }
 
     /// A matching CLI arms. Without this the test above passes for a `check` that refuses everything.

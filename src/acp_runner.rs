@@ -3943,12 +3943,13 @@ impl AcpWritePosture {
                 let roots =
                     crate::write_posture::describe_deliverable_roots(&self.deliverable_roots);
                 Err(format!(
-                    "phase `{}` plays creator and declares executes_code:false — its deliverables \
+                    "phase `{}` plays {} and declares executes_code:false — its deliverables \
                      belong in the run's declared write roots ({roots}), not in the tree under \
                      review; {} is refused at the ACP permission boundary (F-4R2-004 \
                      deliverable-roots posture){}. Write the deliverable inside a declared root; a \
                      phase that must change the tree itself declares executes_code:true.",
                     self.phase,
+                    crate::write_posture::role_noun(self.role),
                     target(call),
                     if call.path.is_none() {
                         " because it names no path the boundary could place"
@@ -7940,13 +7941,14 @@ impl AcpStepRunner {
         if let Some(f) = fence.as_ref() {
             match f.posture {
                 crate::write_posture::WritePosture::DeliverableRoots => eprintln!(
-                    "wicked-core: unit {} (phase `{}`, creator, executes_code:false) runs on ACP \
+                    "wicked-core: unit {} (phase `{}`, {}, executes_code:false) runs on ACP \
                      seat '{cli_key}' with the deliverable-roots posture: write-class tool calls \
                      are allowed inside the run's declared write roots ({}) and refused elsewhere, \
                      the worktree included; bash stays — the worktree guard holds the rest (F-036 \
                      / F-4R2-004)",
                     input.unit.ord,
                     input.unit.phase_id().unwrap_or("?"),
+                    crate::write_posture::role_noun(f.role),
                     if f.deliverable_roots.is_empty() {
                         "none declared".to_string()
                     } else {
@@ -8696,14 +8698,26 @@ fn acp_unadmitted_but_configured(acp_cfg: Option<&AcpConfig>) -> bool {
 /// never rerouted (F-4R2-004: it must write its deliverable, and the wrapped carrier's read-only
 /// lever would refuse exactly that — a bound creator stays under the worktree guard instead).
 /// Pure — testable with a fabricated config.
+/// The units that must leave an ACP seat whose permission behaviour is unadmitted or unproven:
+/// every READ-ONLY unit, and a non-creator on the DELIVERABLE-ROOTS posture — the walkthrough
+/// author, WT-C1 (Copilot review on #691): an unadmitted seat answers either fence with silence.
+/// A creator on the deliverable-roots posture stays (F-4R2-004, pinned by the routing test).
+fn fenced_non_creator(unit: &crate::domain::WorkUnit, bound: bool) -> bool {
+    match crate::write_posture::WritePosture::of(unit, bound) {
+        crate::write_posture::WritePosture::ReadOnly => true,
+        crate::write_posture::WritePosture::DeliverableRoots => {
+            unit.role != crate::workflow::PhaseRole::Creator
+        }
+        crate::write_posture::WritePosture::Full => false,
+    }
+}
+
 fn acp_read_only_requires_wrapped(
     acp_cfg: Option<&AcpConfig>,
     unit: &crate::domain::WorkUnit,
     bound: bool,
 ) -> bool {
-    crate::write_posture::WritePosture::of(unit, bound)
-        == crate::write_posture::WritePosture::ReadOnly
-        && acp_unadmitted_but_configured(acp_cfg)
+    fenced_non_creator(unit, bound) && acp_unadmitted_but_configured(acp_cfg)
 }
 
 /// (Copilot on #433, sixth pass) The per-PROCESS half of [`acp_read_only_requires_wrapped`]: a
@@ -8716,9 +8730,7 @@ fn acp_read_only_unproven_at_spawn(
     unit: &crate::domain::WorkUnit,
     bound: bool,
 ) -> bool {
-    !governance_verified
-        && crate::write_posture::WritePosture::of(unit, bound)
-            == crate::write_posture::WritePosture::ReadOnly
+    !governance_verified && fenced_non_creator(unit, bound)
 }
 
 #[cfg(test)]
@@ -16950,6 +16962,28 @@ No further next steps — both questions fully answered.";
                 !super::acp_read_only_unproven_at_spawn(false, &doc_creator, bound),
                 "bound={bound}"
             );
+        }
+        // WT-C1 (Copilot review on #691): the walkthrough author is a WRITING evaluator on the
+        // deliverable-roots posture — an unadmitted or unproven seat leaves for the wrapped
+        // carrier exactly like a read-only unit; unbound it is read-only and does too.
+        let mut author = crate::domain::WorkUnit::pending("r:wt", "r", 5, "storyline");
+        author.worktree_guarded = true;
+        author.role = crate::workflow::PhaseRole::Evaluator;
+        author.catalog = Some("walkthrough_plan".into());
+        for bound in [true, false] {
+            assert!(
+                super::acp_read_only_requires_wrapped(Some(&cfg(false)), &author, bound),
+                "bound={bound}"
+            );
+            assert!(
+                super::acp_read_only_unproven_at_spawn(false, &author, bound),
+                "bound={bound}"
+            );
+            assert!(!super::acp_read_only_requires_wrapped(
+                Some(&cfg(true)),
+                &author,
+                bound
+            ));
         }
         // A NEUTRAL recon rung is read-only and reroutes exactly like an evaluator.
         let mut recon = crate::domain::WorkUnit::pending("r:understand", "r", 1, "understand");

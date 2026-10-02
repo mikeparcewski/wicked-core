@@ -1029,7 +1029,8 @@ pub(crate) fn phase_scope_denial(
         }
         let roots = crate::write_posture::describe_deliverable_roots(deliverable_roots);
         return Some(format!(
-            "phase scope: this phase plays creator and declares `executes_code: false` — its \
+            "phase scope: this phase writes only to the run's declared write roots and declares \
+             `executes_code: false` — its \
              deliverables belong in the run's declared write roots ({roots}), not in the tree \
              under review or anywhere else; `{tool}` to `{path}` is outside them, so it is \
              refused. Write the deliverable inside a declared root; a phase that must change the \
@@ -1137,7 +1138,8 @@ pub(crate) fn bash_write_phase_scope(
         }
         let allowed_where = match posture {
             WritePosture::DeliverableRoots if !pre_build_scope => format!(
-                "this phase plays creator and declares `executes_code: false`; its deliverables \
+                "this phase writes only to the run's declared write roots and declares \
+                 `executes_code: false`; its deliverables \
                  belong in the run's declared write roots ({})",
                 crate::write_posture::describe_deliverable_roots(admitted_roots)
             ),
@@ -6475,7 +6477,8 @@ mod tests {
             let denied = deny(&wt.join("src").join("app.ts"), tool)
                 .expect("a creator that declared no code may not write the worktree");
             assert!(
-                denied.contains("plays creator") && denied.contains("executes_code: false"),
+                denied.contains("writes only to the run's declared write roots")
+                    && denied.contains("executes_code: false"),
                 "the refusal names the CREATOR role and its rule: {denied}"
             );
             assert!(
@@ -6493,7 +6496,10 @@ mod tests {
         // deliverable root — refused here exactly as the ACP fence refuses it.
         let graph_write = deny(&graph.join("graph.db-wal"), "Write")
             .expect("engine scratch the boundary admits is still not a deliverable root");
-        assert!(graph_write.contains("plays creator"), "{graph_write}");
+        assert!(
+            graph_write.contains("writes only to the run's declared write roots"),
+            "{graph_write}"
+        );
         // …and so is anything outside every root.
         assert!(deny(&base.join("elsewhere.html"), "Write").is_some());
         // A RELATIVE spelling resolves against the tree — refused too.
@@ -7340,7 +7346,11 @@ mod tests {
 ///
 /// Whenever a carrier NAME changes, an argument is added or removed, or an exit code changes meaning.
 /// Not for behaviour changes behind a stable interface.
-pub const GATE_PROTOCOL_VERSION: u32 = 1;
+///
+/// History: 2 (WT-C1) — an EVALUATOR (the walkthrough author) may now carry the
+/// `deliverable-roots` posture spelling, which a protocol-1 hook parses as "no fence"; the bump
+/// makes such a hook refuse to arm rather than run that evaluator unfenced.
+pub const GATE_PROTOCOL_VERSION: u32 = 2;
 
 /// The line `gate-hook --protocol-version` prints. Parsed by the launcher; keep it one stable line.
 ///

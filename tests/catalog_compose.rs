@@ -750,3 +750,69 @@ fn an_owner_omitted_def_serializes_byte_identically() {
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
 }
+
+/// WT-C1 (DES-walkthrough-proof §4.3): `walkthrough_review` is a Tool entry whose command is FIXED
+/// in the catalog. A step may omit it (the entry's command runs) or restate it; any other command
+/// is refused, so a plan author cannot point the engine-run recorder at another script.
+#[test]
+fn a_step_cannot_change_a_fixed_tool_command() {
+    let fixed = json!([
+        "wicked-garden",
+        "run",
+        "scripts/demo/walkthrough.mjs",
+        "record"
+    ]);
+    let after_plan = |step: Value| {
+        json!([
+            {"catalog": "walkthrough_plan", "id": "walkthrough_plan"},
+            step,
+        ])
+    };
+    for cmd in [
+        json!(["sh", "-c", "true"]),
+        json!([
+            "wicked-garden",
+            "run",
+            "scripts/demo/walkthrough.mjs",
+            "record",
+            "--skip"
+        ]),
+        json!([]),
+    ] {
+        let r = refusal(after_plan(json!({
+            "catalog": "walkthrough_review", "id": "walkthrough_review",
+            "depends_on": ["walkthrough_plan"],
+            "executor": {"type": "tool", "cmd": cmd},
+        })));
+        assert_eq!(r.reason(), "tool_command_changed", "{cmd}: {r}");
+    }
+    let r = refusal(after_plan(json!({
+        "catalog": "walkthrough_review", "id": "walkthrough_review",
+        "depends_on": ["walkthrough_plan"],
+        "executor": {"type": "agent"},
+    })));
+    assert_eq!(r.reason(), "tool_command_changed", "{r}");
+    for executor in [None, Some(json!({"type": "tool", "cmd": fixed.clone()}))] {
+        let mut step = json!({
+            "catalog": "walkthrough_review", "id": "walkthrough_review",
+            "depends_on": ["walkthrough_plan"],
+        });
+        if let Some(e) = &executor {
+            step["executor"] = e.clone();
+        }
+        let steps: PlanSteps =
+            serde_json::from_value(json!({ "steps": after_plan(step) })).unwrap();
+        let def =
+            compose(catalog(), &steps).expect("omitting or restating the fixed command composes");
+        let review = def
+            .phases
+            .iter()
+            .find(|p| p.id == "walkthrough_review")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&review.executor).unwrap(),
+            json!({"type": "tool", "cmd": fixed}),
+            "{executor:?}"
+        );
+    }
+}
