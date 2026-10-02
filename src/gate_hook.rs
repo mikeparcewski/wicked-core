@@ -3965,8 +3965,8 @@ pub struct HookDecisionRecord {
     pub evaluator: String,
     /// (TR-W2, DES-trigger-registry §4.4 row 7) EVERY rule the decision fired — the claim's
     /// `policy_ids`, whatever the decision. `denying_policy` keeps only the first, and only for a
-    /// deny; a fired `effect: warn` rule (`allow_with_conditions`) is recorded here and nowhere
-    /// else, which is what the Watchtower's `risky-call` entry reads.
+    /// deny; a fired `effect: warn` rule (an `allow`: the doc lane gives it no obligations) is
+    /// recorded here and nowhere else, which is what the Watchtower's `risky-call` entry reads.
     pub fired_policies: Vec<String>,
 }
 

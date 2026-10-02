@@ -59,6 +59,8 @@ fn the_ops_watch_pack_ingests_and_its_warn_rules_fire_on_risky_calls_only() {
         ),
         ("rm-root", "rm -rf /usr/local/lib/x", Some("OPS-WATCH-001")),
         ("rm-trash", "rm -rf trash", Some("OPS-WATCH-001")),
+        ("rm-tar", "rm -rf tar", Some("OPS-WATCH-001")),
+        ("rm-tarball", "rm -rf tarball.tgz", Some("OPS-WATCH-001")),
         (
             "push-force",
             "git push --force origin main",
@@ -132,6 +134,24 @@ fn the_ops_watch_pack_ingests_and_its_warn_rules_fire_on_risky_calls_only() {
             None,
         ),
     ];
+    // A non-shell tool whose CONTENT reads like a risky command fires nothing (Copilot on #701):
+    // every trigger is anchored on the tool call's `command`.
+    let write = SampleSignals {
+        phase: Some("build".into()),
+        tool: Some("Write".into()),
+        files: vec!["docs/setup.md".into()],
+        content: Some("Run sudo apt-get install jq, then git push --force".into()),
+    };
+    let raw = pretool_event_from_signals(&write);
+    let (context, _) = pretool_context(&raw, "wicked-agent/s/shared", "build");
+    let selected =
+        select_any(&store, "wicked-agent/s/shared", &["build"], &context).expect("select");
+    let claim = decide(&selected, "wicked-agent/s/shared", "build", &context, 1_000);
+    assert!(
+        claim.policy_ids.is_empty(),
+        "a Write's content is not a shell call: {:?}",
+        claim.policy_ids
+    );
     for &(id, cmd, want) in cases {
         let signals = SampleSignals {
             phase: Some("build".into()),
@@ -157,5 +177,47 @@ fn the_ops_watch_pack_ingests_and_its_warn_rules_fire_on_risky_calls_only() {
             ),
             None => assert!(fired.is_empty(), "{cmd:?} must fire nothing: {fired:?}"),
         }
+    }
+}
+
+/// Copilot on #701: a governed phase the pack does not name would fire nothing. Every phase id of
+/// every shipped workflow, and every catalog id, must be in the pack's `applies_to`.
+#[test]
+fn the_pack_covers_every_shipped_phase_and_catalog_id() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let doc = std::fs::read_to_string(pack_dir().join("ops-watch.md")).unwrap();
+    let line = doc
+        .lines()
+        .find(|l| l.starts_with("applies_to: ["))
+        .expect("the pack names its phases");
+    let named: Vec<&str> = line["applies_to: [".len()..line.len() - 1]
+        .split(',')
+        .map(str::trim)
+        .collect();
+    let mut want: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root.join("workflows")).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let def: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for phase in def["phases"].as_array().into_iter().flatten() {
+            want.push(phase["id"].as_str().unwrap().to_string());
+        }
+    }
+    let catalog = serde_json::to_value(wicked_core::catalog_entries()).unwrap();
+    for entry in catalog.as_array().unwrap() {
+        // Tool entries (`run`, `deliver`, `walkthrough_review`) run no governed shell.
+        if entry["executor"].as_str() == Some("tool") {
+            continue;
+        }
+        want.push(entry["id"].as_str().unwrap().to_string());
+    }
+    for id in want {
+        assert!(
+            named.contains(&id.as_str()),
+            "phase {id} is not covered: {named:?}"
+        );
     }
 }

@@ -598,7 +598,8 @@ pub enum CoreEvent {
         decision: String,
         denying_policy: Option<String>,
         /// (TR-W2, additive) Every rule the decision fired (the claim's `policy_ids`), for EVERY
-        /// decision — a fired `effect: warn` rule rides an `allow_with_conditions` decision here.
+        /// decision — a fired `effect: warn` rule rides an `allow` decision here (it carries no
+        /// obligations, so the fold does not make it `allow_with_conditions`).
         /// Always on the wire (`[]` when none), so a consumer can tell an engine that reports
         /// fired rules from one that predates the field.
         fired_policies: Vec<String>,
