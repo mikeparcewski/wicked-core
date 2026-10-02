@@ -188,7 +188,13 @@ impl AcceptedPlan {
         let mut union: Vec<String> = Vec::new();
         let mut truncated = prior.is_some_and(|p| p.touch_truncated);
         let own: &[String] = self.steps.touch.as_deref().unwrap_or_default();
-        let earlier: &[String] = prior.map(|p| p.touch.as_slice()).unwrap_or_default();
+        // A row persisted before TR-W1a (`touch_source` absent) never stamped its union: its
+        // declared touch is still on its steps, so union from there (codex review on #692).
+        let earlier: &[String] = match prior {
+            Some(p) if p.touch_source.is_none() => p.steps.touch.as_deref().unwrap_or_default(),
+            Some(p) => p.touch.as_slice(),
+            None => &[],
+        };
         for path in earlier.iter().chain(own) {
             if union.contains(path) {
                 continue;
@@ -202,9 +208,11 @@ impl AcceptedPlan {
         self.touch_source = Some(if union.is_empty() {
             TouchSource::None
         } else if own.is_empty() {
+            // An old row that declared a touch could not record who did: `user`, the source of
+            // every declared touch before X1's PA scope.
             prior
                 .and_then(|p| p.touch_source)
-                .unwrap_or(TouchSource::None)
+                .unwrap_or(TouchSource::User)
         } else {
             source
         });
@@ -1377,6 +1385,37 @@ mod tests {
         assert_eq!(p["touch"].as_array().unwrap().len(), 64);
         assert_eq!(p["touch"][63], "src/f63.rs");
         assert_eq!(p["touch_truncated"], true);
+    }
+
+    /// TR-W1a (codex review on #692): an accepted rev persisted before the touch fields existed
+    /// still contributes its declared touch to the next rev's union (read off its steps).
+    #[test]
+    fn a_pre_w1a_accepted_row_still_unions_its_declared_touch() {
+        let legacy: AcceptedPlan = serde_json::from_value(json!({
+            "rev": 1, "by": "engine", "band": "0-19", "high_risk": false, "auto": true,
+            "steps": {"steps": [{"catalog": "understand", "id": "u"}], "touch": ["src/a.rs"]},
+            "floor_override": null, "proposal_id": "p-old"
+        }))
+        .unwrap();
+        assert!(legacy.touch.is_empty() && legacy.touch_source.is_none());
+        let next = AcceptedPlan {
+            rev: 2,
+            steps: plan(
+                json!({"steps": [{"catalog": "understand", "id": "u"}], "touch": ["src/b.rs"]}),
+            ),
+            ..legacy.clone()
+        }
+        .with_touch(Some(&legacy), TouchSource::User);
+        assert_eq!(next.touch, ["src/a.rs", "src/b.rs"]);
+        assert_eq!(next.touch_source, Some(TouchSource::User));
+        let same = AcceptedPlan {
+            rev: 2,
+            steps: plan(json!({"steps": [{"catalog": "understand", "id": "u"}]})),
+            ..legacy.clone()
+        }
+        .with_touch(Some(&legacy), TouchSource::User);
+        assert_eq!(same.touch, ["src/a.rs"]);
+        assert_eq!(same.touch_source, Some(TouchSource::User));
     }
 
     /// The matrix binds a PA-composed plan exactly as it binds a user plan (T3: "on a PA plan and
