@@ -60,6 +60,13 @@ fn arm() {
     std::fs::write(&stub, script).expect("write the stub");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // Hermetic skills ladder: no published snapshot and an EMPTY claude config dir, so the ladder
+    // finds no garden (`Absent`) rather than whatever plugin cache the host carries — a ladder
+    // that FAILS refuses the record (Copilot on #697), which is not what these tests exercise.
+    let config = root.join("claude-config");
+    std::fs::create_dir_all(&config).expect("fixture claude config dir");
+    std::env::remove_var("WICKED_SKILLS_SNAPSHOT");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),

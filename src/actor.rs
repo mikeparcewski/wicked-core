@@ -8329,17 +8329,28 @@ fn dispatch_unit(
                     // runs — the deliver gate never pushes a tree that was not verified.
                     if let Some(rec) = &record {
                         // The skills generation the run was admitted against, else the ladder's.
-                        let garden = admitted.as_ref().map(|g| g.root.clone()).or_else(|| {
-                            match crate::skills_snapshot::resolve_ladder() {
-                                Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
-                                _ => None,
-                            }
-                        });
+                        // A ladder that FAILED (or could not be read) is a refusal, never "no
+                        // garden": the recorder must not fall through to an unadmitted
+                        // `wicked-garden` on the daemon's PATH (Copilot on #697). Only a ladder
+                        // that found NO garden at all runs the fixed command from PATH.
+                        let garden: Result<Option<std::path::PathBuf>, String> =
+                            match admitted.as_ref() {
+                                Some(g) => Ok(Some(g.root.clone())),
+                                None => match crate::skills_snapshot::resolve_ladder() {
+                                    Ok(crate::skills_snapshot::Ladder::Root(g)) => Ok(Some(g.root)),
+                                    Ok(crate::skills_snapshot::Ladder::Absent) => Ok(None),
+                                    Ok(crate::skills_snapshot::Ladder::Failed(why)) => Err(why),
+                                    Err(e) => Err(e.to_string()),
+                                },
+                            };
                         let (o, st, k) = run_walkthrough_record(
                             &cmd,
                             workdir.as_deref(),
                             rec,
-                            garden.as_deref(),
+                            garden
+                                .as_ref()
+                                .map(Option::as_deref)
+                                .map_err(String::as_str),
                             attempt,
                             &crate::validator::loopback_jail,
                             &stop,
@@ -8592,7 +8603,7 @@ fn run_walkthrough_record(
     cmd: &[String],
     workdir: Option<&str>,
     rec: &crate::walkthrough::RecordLaunch,
-    garden_root: Option<&std::path::Path>,
+    garden: Result<Option<&std::path::Path>, &str>,
     attempt: u32,
     jail: &dyn Fn(&[&std::path::Path]) -> crate::validator::SandboxLauncher,
     stop: &dyn Fn() -> Option<&'static str>,
@@ -8632,6 +8643,18 @@ fn run_walkthrough_record(
     let proof_root = match &rec.proof_root {
         Ok(p) => p.clone(),
         Err(why) => return refused(wt::ENGINE_REFUSED, why.clone()),
+    };
+    let garden_root = match garden {
+        Ok(root) => root,
+        Err(why) => {
+            return refused(
+                wt::ENGINE_REFUSED,
+                format!(
+                    "the skills generation could not be resolved ({why}); the recorder is never \
+                     run from an unadmitted garden"
+                ),
+            )
+        }
     };
     if let Err(e) = std::fs::create_dir_all(&proof_root) {
         return refused(
@@ -19076,7 +19099,7 @@ except OSError as e:
             &cmd,
             Some(worktree.to_str().unwrap()),
             &launch(&proof),
-            None,
+            Ok(None),
             0,
             &crate::validator::loopback_jail,
             &never,
@@ -19162,7 +19185,7 @@ except OSError as e:
             &cmd,
             None,
             &launch(&proof),
-            None,
+            Ok(None),
             0,
             &no_jail,
             &never,
@@ -19196,7 +19219,7 @@ except OSError as e:
             &["true".to_string()],
             None,
             &launch(&proof),
-            None,
+            Ok(None),
             2,
             &no_jail,
             &never,
@@ -19229,7 +19252,7 @@ except OSError as e:
             &["true".to_string()],
             None,
             &rec,
-            None,
+            Ok(None),
             3,
             &crate::validator::loopback_jail,
             &never,
@@ -19246,6 +19269,40 @@ except OSError as e:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Copilot on #697: a skills ladder that FAILED is a refusal — the fixed `wicked-garden`
+    /// command is never resolved from the daemon's PATH instead of the admitted generation.
+    #[test]
+    fn a_failed_skills_ladder_refuses_the_record() {
+        let dir = scratch("failed-ladder");
+        let proof = dir.join("wr");
+        std::fs::create_dir_all(&proof).unwrap();
+        let marker = dir.join("ran.txt");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo ran > '{}'", marker.display()),
+        ];
+        let (out, st, _) = run_walkthrough_record(
+            &cmd,
+            None,
+            &launch(&proof),
+            Err("the installed plugin is not a contained tree"),
+            0,
+            &crate::validator::loopback_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        assert!(out.contains("never run from an unadmitted garden"), "{out}");
+        assert!(!marker.exists(), "the recorder must not run");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(proof.join(RESULT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(v["cause"], crate::walkthrough::ENGINE_REFUSED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// No proof root (repo-less run, no evidence root, no tree): nothing runs, the unit is `Ok`
     /// with the reason, so the verdict stays the validator's (never the failover ladder's retry).
     #[test]
@@ -19259,7 +19316,7 @@ except OSError as e:
             &["true".to_string()],
             None,
             &rec,
-            None,
+            Ok(None),
             0,
             &crate::validator::loopback_jail,
             &never,
