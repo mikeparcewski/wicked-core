@@ -128,6 +128,13 @@ pub struct Targets {
     pub layer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework: Option<String>,
+    /// (DES-decision-capture §4.2.2, DC-S1) The project the rule belongs to. ASYMMETRIC, unlike
+    /// the wildcard facets above: a rule with no project applies everywhere (as today); a rule
+    /// with `project = P` is recalled only for a query whose [`RuleQuery::projects`] contains P;
+    /// a query with no projects recalls no project-scoped rule. Skipped when absent, so every
+    /// pre-existing rule serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// Optional mapping to an external compliance control (SOC2/PCI/…). The resolver behind a named
@@ -224,6 +231,11 @@ pub struct ConformanceRule {
     /// before the field existed (read back honestly as "unknown", never a fabricated now).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
+    /// (DES-decision-capture §4.2.2, DC-S1) The rule ids this rule REPLACES — a vector because
+    /// widening one decision to everywhere replaces N project rules. Every id named here reads as
+    /// `replaced` in [`consider_rules`] (the landing retires them). Skipped when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supersedes: Vec<String>,
 }
 
 /// The all-defaults rule — INVALID as-is (empty id), useful as `..Default::default()` filler so
@@ -250,6 +262,7 @@ impl Default for ConformanceRule {
             obligations: Vec::new(),
             criteria: String::new(),
             created_at: None,
+            supersedes: Vec::new(),
         }
     }
 }
@@ -654,6 +667,34 @@ pub struct RuleQuery {
     /// parses as `None` (serde's built-in Option handling), so old query payloads stay valid.
     #[serde(default)]
     pub steering_type: Option<String>,
+    /// (DES-decision-capture §4.2.2, DC-S1) The projects the asking run or chat belongs to (a run
+    /// can be filed in several). Recall matches a project-scoped rule only when its project is in
+    /// this set; empty recalls none of them (globals only). `#[serde(default)]` and skipped when
+    /// empty, so an old-wire query parses and an un-projected query serializes as before. An OLD
+    /// engine rejects a query that carries it (`deny_unknown_fields`), so callers probe first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
+}
+
+/// How [`scan_rules`] treats a project-scoped rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectMatch {
+    /// The enforcement funnel: a project rule matches only a query naming its project.
+    Strict,
+    /// The management listing: an empty `projects` lists every project's rules; a non-empty one
+    /// narrows exactly as [`ProjectMatch::Strict`].
+    ListAll,
+    /// [`consider_rules`]: the project facet is not applied here (it is the caller's split).
+    Ignore,
+}
+
+/// Whether `rule`'s project facet admits `query` under `mode` (DC-S1's asymmetric rule).
+fn project_admits(rule: &ConformanceRule, query: &RuleQuery, mode: ProjectMatch) -> bool {
+    match (&rule.targets.project, mode) {
+        (_, ProjectMatch::Ignore) | (None, _) => true,
+        (Some(_), ProjectMatch::ListAll) if query.projects.is_empty() => true,
+        (Some(p), _) => query.projects.iter().any(|q| q == p),
+    }
 }
 
 /// The shared scan behind [`recall_rules`] (the enforcement funnel) and [`list_rules`] (the
@@ -666,6 +707,7 @@ fn scan_rules(
     query: &RuleQuery,
     include_retired: bool,
     include_enforcing: bool,
+    projects: ProjectMatch,
 ) -> anyhow::Result<Vec<ConformanceRule>> {
     // Index-only: restrict to native Rule nodes (the cheap deterministic lane — no FTS, no traversal).
     let sym_query = SymbolQuery {
@@ -712,6 +754,7 @@ fn scan_rules(
                 .steering_type
                 .as_deref()
                 .is_none_or(|t| t == rule.steering_type)
+            && project_admits(&rule, query, projects)
         {
             matched.push(rule);
         }
@@ -737,7 +780,7 @@ pub fn recall_rules(
     store: &dyn GraphRead,
     query: &RuleQuery,
 ) -> anyhow::Result<Vec<ConformanceRule>> {
-    scan_rules(store, query, false, false)
+    scan_rules(store, query, false, false, ProjectMatch::Strict)
 }
 
 /// List steering rules for MANAGEMENT (the studio Steering surface / `wicked-core rules list`):
@@ -750,7 +793,83 @@ pub fn list_rules(
     query: &RuleQuery,
     include_retired: bool,
 ) -> anyhow::Result<Vec<ConformanceRule>> {
-    scan_rules(store, query, include_retired, true)
+    scan_rules(store, query, include_retired, true, ProjectMatch::ListAll)
+}
+
+/// Why [`consider_rules`] set a rule aside (DES-decision-capture §4.2.2 / §4.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetAsideReason {
+    /// Another project's rule: not in force for the asking run or chat.
+    OutOfScope,
+    /// A live rule's `supersedes` names it.
+    Replaced,
+    /// Withdrawn (retire-not-delete).
+    Retired,
+}
+
+/// One rule [`consider_rules`] set aside, with why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetAside {
+    pub id: String,
+    pub statement: String,
+    pub reason: SetAsideReason,
+}
+
+/// What [`consider_rules`] found: the rules in force for the query, and the ones it set aside.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Consideration {
+    pub in_force: Vec<ConformanceRule>,
+    pub set_aside: Vec<SetAside>,
+}
+
+/// "Considered · set aside" (DES-decision-capture §4.2.2 / §4.7) — the ONE implementation of
+/// project matching crew reads through core-ts `considerRules`. Scans every rule matching the
+/// query on every facet EXCEPT project and retirement (recall-only and decide-lane rules alike:
+/// both are in force), then splits: a rule a live rule's `supersedes` names is `replaced`; else a
+/// retired rule is `retired`; else a rule of a project outside `query.projects` is
+/// `out_of_scope`; everything else is in force. Both lists keep recall order.
+pub fn consider_rules(store: &dyn GraphRead, query: &RuleQuery) -> anyhow::Result<Consideration> {
+    let all = scan_rules(store, query, true, true, ProjectMatch::Ignore)?;
+    // `replaced` is read off EVERY live rule in the store, not only the ones this query's facets
+    // match: a successor may differ in severity, language or type from what it replaces, and the
+    // predecessor is replaced all the same (codex review on DC-S1).
+    let live = scan_rules(
+        store,
+        &RuleQuery::default(),
+        false,
+        true,
+        ProjectMatch::Ignore,
+    )?;
+    let replaced: std::collections::BTreeSet<&str> = live
+        .iter()
+        .flat_map(|r| r.supersedes.iter().map(String::as_str))
+        .collect();
+    let mut in_force = Vec::new();
+    let mut set_aside = Vec::new();
+    for rule in &all {
+        let reason = if replaced.contains(rule.id.as_str()) {
+            Some(SetAsideReason::Replaced)
+        } else if rule.retired {
+            Some(SetAsideReason::Retired)
+        } else if !project_admits(rule, query, ProjectMatch::Strict) {
+            Some(SetAsideReason::OutOfScope)
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => set_aside.push(SetAside {
+                id: rule.id.clone(),
+                statement: rule.statement.clone(),
+                reason,
+            }),
+            None => in_force.push(rule.clone()),
+        }
+    }
+    Ok(Consideration {
+        in_force,
+        set_aside,
+    })
 }
 
 #[cfg(test)]
@@ -774,6 +893,220 @@ mod tests {
         Targets {
             language: Some(l.into()),
             ..Default::default()
+        }
+    }
+
+    // ── project-scoped rules (DES-decision-capture §4.2.2, DC-S1) ───────────────────────────────
+
+    fn in_project(id: &str, sev: ConfSeverity, project: &str) -> ConformanceRule {
+        rule(
+            id,
+            RuleType::Pattern,
+            sev,
+            Targets {
+                project: Some(project.into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn ids(rules: &[ConformanceRule]) -> Vec<&str> {
+        rules.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    /// The asymmetric match: a rule with no project applies everywhere; a rule in project P
+    /// matches only a query whose `projects` contains P; an empty `projects` matches no
+    /// project-scoped rule. A run filed in two projects gets both projects' rules.
+    #[test]
+    fn project_matching_is_asymmetric_and_a_query_carries_a_set() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        for r in [
+            rule(
+                "PAT-001",
+                RuleType::Pattern,
+                ConfSeverity::Warn,
+                Targets::default(),
+            ),
+            in_project("PAT-002", ConfSeverity::Warn, "proj_p"),
+            in_project("PAT-003", ConfSeverity::Warn, "proj_q"),
+        ] {
+            register_rule(&mut store, &r).unwrap();
+        }
+        let q = |projects: &[&str]| RuleQuery {
+            projects: projects.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(ids(&recall_rules(&store, &q(&[])).unwrap()), ["PAT-001"]);
+        assert_eq!(
+            ids(&recall_rules(&store, &q(&["proj_p"])).unwrap()),
+            ["PAT-001", "PAT-002"]
+        );
+        assert_eq!(
+            ids(&recall_rules(&store, &q(&["proj_p", "proj_q"])).unwrap()),
+            ["PAT-001", "PAT-002", "PAT-003"]
+        );
+        // The management listing is not the enforcement funnel: an empty `projects` lists every
+        // project's rules (an operator auditing the store sees them all), a non-empty one narrows.
+        assert_eq!(
+            ids(&list_rules(&store, &q(&[]), false).unwrap()),
+            ["PAT-001", "PAT-002", "PAT-003"]
+        );
+        assert_eq!(
+            ids(&list_rules(&store, &q(&["proj_q"]), false).unwrap()),
+            ["PAT-001", "PAT-003"]
+        );
+    }
+
+    /// `consider_rules`: every rule matching the other facets, split into in force and set aside —
+    /// `replaced` (a live rule's `supersedes` names it), `retired`, `out_of_scope` (another
+    /// project's rule) — and `supersedes` is a vector (widening replaces N project rules).
+    #[test]
+    fn consider_rules_splits_in_force_from_set_aside_with_a_reason() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut wide = rule(
+            "PAT-010",
+            RuleType::Pattern,
+            ConfSeverity::Warn,
+            Targets::default(),
+        );
+        wide.supersedes = vec!["PAT-011".into(), "PAT-012".into()];
+        let mut retired = in_project("PAT-013", ConfSeverity::Warn, "proj_p");
+        retired.retired = true;
+        for r in [
+            wide,
+            in_project("PAT-011", ConfSeverity::Warn, "proj_p"),
+            in_project("PAT-012", ConfSeverity::Warn, "proj_q"),
+            retired,
+            in_project("PAT-014", ConfSeverity::Error, "proj_q"),
+            in_project("PAT-015", ConfSeverity::Info, "proj_p"),
+        ] {
+            register_rule(&mut store, &r).unwrap();
+        }
+        let c = consider_rules(
+            &store,
+            &RuleQuery {
+                projects: vec!["proj_p".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&c.in_force), ["PAT-010", "PAT-015"]);
+        let aside: Vec<(&str, SetAsideReason)> = c
+            .set_aside
+            .iter()
+            .map(|s| (s.id.as_str(), s.reason))
+            .collect();
+        assert_eq!(
+            aside,
+            [
+                ("PAT-014", SetAsideReason::OutOfScope),
+                ("PAT-011", SetAsideReason::Replaced),
+                ("PAT-012", SetAsideReason::Replaced),
+                ("PAT-013", SetAsideReason::Retired),
+            ]
+        );
+        assert_eq!(c.set_aside[0].statement, "statement for PAT-014");
+        let wire = serde_json::to_value(&c).unwrap();
+        assert_eq!(wire["set_aside"][0]["reason"], "out_of_scope");
+        assert_eq!(wire["set_aside"][1]["reason"], "replaced");
+    }
+
+    /// A successor that the query's other facets do NOT match still replaces its predecessor
+    /// (codex review on DC-S1): `replaced` reads every live rule, not the filtered set.
+    #[test]
+    fn a_successor_outside_the_query_facets_still_replaces() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut new = rule(
+            "PAT-021",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            Targets::default(),
+        );
+        new.supersedes = vec!["PAT-020".into()];
+        register_rule(&mut store, &new).unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-020",
+                RuleType::Pattern,
+                ConfSeverity::Warn,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        let c = consider_rules(
+            &store,
+            &RuleQuery {
+                severity: Some(ConfSeverity::Warn),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(c.in_force.is_empty(), "{:?}", ids(&c.in_force));
+        assert_eq!(c.set_aside.len(), 1);
+        assert_eq!(
+            (c.set_aside[0].id.as_str(), c.set_aside[0].reason),
+            ("PAT-020", SetAsideReason::Replaced)
+        );
+    }
+
+    /// Byte-identical serialisation: a rule that uses none of the new fields serializes exactly as
+    /// before (no `targets.project`, no `supersedes`), and an old-wire query still parses.
+    #[test]
+    fn a_rule_without_the_new_fields_serializes_byte_identical_and_old_queries_parse() {
+        let r = rule(
+            "PAT-100",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            lang("rust"),
+        );
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"id":"PAT-100","rule_type":"pattern","statement":"statement for PAT-100","severity":"error","confidence":0.72,"targets":{"language":"rust"},"provenance":{"source":"","source_kinds":[]},"retired":false}"#
+        );
+        let old: RuleQuery =
+            serde_json::from_str(r#"{"language":"rust","steering_type":"testing"}"#).unwrap();
+        assert!(old.projects.is_empty());
+        let new: RuleQuery = serde_json::from_str(r#"{"projects":["proj_p"]}"#).unwrap();
+        assert_eq!(new.projects, ["proj_p"]);
+        assert!(
+            serde_json::to_value(RuleQuery::default())
+                .unwrap()
+                .get("projects")
+                .is_none(),
+            "an empty projects list stays off the wire"
+        );
+    }
+
+    /// The golden parity fixture (copied byte-identical into wicked-estate's `rules.recall`).
+    #[test]
+    fn the_project_parity_fixture_holds() {
+        crate::events::hermetic_test_spool();
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/rules-project-parity.json"))
+                .unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        for r in fx["rules"].as_array().unwrap() {
+            let rule: ConformanceRule = serde_json::from_value(r.clone()).unwrap();
+            register_rule(&mut store, &rule).unwrap();
+        }
+        for case in fx["cases"].as_array().unwrap() {
+            let q: RuleQuery = serde_json::from_value(case["query"].clone()).unwrap();
+            let want: Vec<&str> = case["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids(&recall_rules(&store, &q).unwrap()),
+                want,
+                "{}",
+                case["name"]
+            );
         }
     }
 

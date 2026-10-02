@@ -51,18 +51,22 @@
 //!       # when residue is found (0 clean, 1 operational error) — run with the same --dir as ingest
 //!   wicked-core rules recall [--language L] [--layer L] [--framework F] \
 //!       [--severity info|warn|error|critical] [--rule-type pattern|policy] \
-//!       [--type <steering-type>] [--json]
+//!       [--type <steering-type>] [--project P[,Q]] [--json]
 //!       # the AW-17 recall-REPORT: the conformance rules that APPLY to the query facets,
 //!       # severity-ordered (critical→info, then weight desc, then id), each citing rule id +
 //!       # provenance ref (the wiki URI a CI comment links to). --type is the STEERING facet
 //!       # (architecture|development|security|testing|operations|compliance|design-ux).
+//!       # --project (DC-S1): the projects to recall for; a project-scoped rule is recalled
+//!       # only for its own project, and without --project recall serves global rules only.
 //!       # Read-only, and strictly a report: exit 0 even when rules match
 //!       # (v1 never blocks — arch-R15); 1 = operational error only
 //!   wicked-core rules list [--type <t>] [--include-retired] [--language L] [--layer L] \
-//!       [--framework F] [--severity S] [--rule-type T] [--json]
+//!       [--framework F] [--severity S] [--rule-type T] [--project P[,Q]] [--json]
 //!       # the STEERING management LISTING over the unified store: recall-only AND effect-bearing
 //!       # (decide-lane / migrated-policy) rules, with retired rows included under
-//!       # --include-retired (recall never returns them — this is the audit view). Read-only.
+//!       # --include-retired (recall never returns them — this is the audit view). Without
+//!       # --project it lists every project's rules; with it, the global rules plus those
+//!       # projects' (DC-S1). Read-only.
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -199,19 +203,23 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          WRITES to every cli lane store.\n\
          wicked-core rules recall [--db <F>] [--language <L>] [--layer <L>] [--framework <F>] \
          [--severity info|warn|error|critical] [--rule-type pattern|policy] \
-         [--type <steering-type>] [--json]\n  \
+         [--type <steering-type>] [--project <P[,Q]>] [--json]\n  \
          The AW-17 recall-REPORT: the conformance rules that APPLY to the query facets, \
          severity-ordered (critical→info, then weight desc, then id), each citing rule id + \
          provenance ref (the wiki URI a CI comment links to). --type filters on the STEERING type \
-         (architecture|development|security|testing|operations|compliance|design-ux). READ-ONLY, \
+         (architecture|development|security|testing|operations|compliance|design-ux); --project \
+         names the projects to recall for (a project-scoped rule is recalled only for its own \
+         project; without --project, global rules only). READ-ONLY, \
          and strictly a report: exit 0 even when rules match (v1 of \
          the CI conformance seam never blocks — arch-R15); 1 = operational error only.\n\
          wicked-core rules list [--db <F>] [--type <steering-type>] [--include-retired] \
          [--language <L>] [--layer <L>] [--framework <F>] [--severity <S>] [--rule-type <T>] \
-         [--json]\n  \
+         [--project <P[,Q]>] [--json]\n  \
          The STEERING management LISTING over the unified steering-rule store: recall-only AND \
          effect-bearing (decide-lane / migrated-policy) rules alike, with retired rows included \
-         under --include-retired — the audit view recall deliberately never serves. READ-ONLY.\n\
+         under --include-retired — the audit view recall deliberately never serves. Without \
+         --project it lists every project's rules; with it, the global rules plus those \
+         projects'. READ-ONLY.\n\
          wicked-core rules scoreboard [--db <F>] [--dir <docs>] [--ambiguity-cap <N>] [--json]\n  \
          The AW-23 population/connection scoreboard: % statements typed into enforcement classes \
          (needs --dir — the class lives in doc frontmatter), % symbol_refs resolving at the current \
@@ -2039,7 +2047,30 @@ fn parse_rule_query(args: &[String], cmd: &str) -> wicked_governance::RuleQuery 
         severity,
         rule_type,
         steering_type,
+        // (DC-S1) `--project P[,Q]`: the projects to recall for (a project-scoped rule is
+        // recalled only for its own project; omitted = global rules only on `recall`).
+        projects: parse_project_flag(args, cmd),
     }
+}
+
+/// (DC-S1) `--project P[,Q]` as a project set. A PRESENT flag with a missing value, or with an
+/// empty comma-separated element, is refused — never read as "no projects", which `rules list`
+/// would turn into "every project's rules" (Copilot review on #696).
+fn parse_project_flag(args: &[String], cmd: &str) -> Vec<String> {
+    let Some(at) = args.iter().position(|a| a == "--project") else {
+        return Vec::new();
+    };
+    let Some(raw) = args.get(at + 1).filter(|v| !v.starts_with("--")) else {
+        fail(&format!("{cmd}: --project needs a value (P or P,Q)"));
+        unreachable!("fail exits");
+    };
+    let projects: Vec<String> = raw.split(',').map(|p| p.trim().to_string()).collect();
+    if projects.iter().any(String::is_empty) {
+        fail(&format!(
+            "{cmd}: --project {raw:?} has an empty project id — give P or P,Q"
+        ));
+    }
+    projects
 }
 
 /// One rule row of the `rules recall`/`rules list` text reports.

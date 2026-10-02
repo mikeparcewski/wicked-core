@@ -64,6 +64,11 @@
           "type": "string",
           "minLength": 1,
           "description": "Framework the rule scopes to (e.g. 'express', 'django', 'axum'). Absent = all frameworks."
+        },
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "v1.2.0 (DES-decision-capture DC-S1): the project the rule belongs to. ASYMMETRIC, unlike the wildcard facets: absent = applies everywhere; present = recalled only for a query whose projects set contains it; a query with no projects recalls no project-scoped rule."
         }
       }
     },
@@ -215,6 +220,14 @@
         "retired": {
           "type": "boolean",
           "description": "Withdrawn from recall/enforcement (retire-not-delete: the row stays resolvable so past decisions citing it remain explicable). OPTIONAL — absent reads back as active."
+        },
+        "supersedes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "v1.2.0 (DES-decision-capture DC-S1): rule ids this rule replaces (a vector: widening one decision replaces N project rules). Each named rule reads as 'replaced' when rules are considered; the landing retires them. OPTIONAL — absent reads back as empty."
         }
       }
     }

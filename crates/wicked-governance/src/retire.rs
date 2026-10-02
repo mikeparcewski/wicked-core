@@ -359,7 +359,24 @@ fn retire_rule_graph_lane(lane: &str, db: &str, id: &str) -> LaneOutcome {
         Ok(s) => s,
         Err(e) => return failed_lane(lane, db, format!("verify re-open {db:?}: {e}")),
     };
-    let recalled = match recall_rules(&store, &RuleQuery::default()) {
+    // (DC-S1) Recall is asymmetric on project: ask with the retired rule's OWN project (read off
+    // its surviving node), or a project-scoped rule could never show as "still served" and the
+    // verification would pass vacuously.
+    let projects: Vec<String> = store
+        .get_node(&synthetic_symbol(CONFORMANCE_RULE, id))
+        .ok()
+        .flatten()
+        .and_then(|n| crate::conformance::ConformanceRule::from_node(&n).ok())
+        .and_then(|r| r.targets.project)
+        .into_iter()
+        .collect();
+    let recalled = match recall_rules(
+        &store,
+        &RuleQuery {
+            projects,
+            ..Default::default()
+        },
+    ) {
         Ok(rs) => rs,
         Err(e) => return failed_lane(lane, db, format!("verify recall on {db:?}: {e}")),
     };

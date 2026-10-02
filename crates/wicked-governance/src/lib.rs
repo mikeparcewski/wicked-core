@@ -56,9 +56,9 @@ pub use engine::{
 // the management view (retired rows listable, decide-lane rows included); `recall_rules` stays
 // the enforcement funnel.
 pub use conformance::{
-    list_rules, recall_rules, register_rule, retire_rule, Compliance, ConfSeverity,
-    ConformanceRule, RuleProvenance, RuleQuery, RuleType, Targets, DEFAULT_RULE_WEIGHT,
-    DEFAULT_STEERING_TYPE, STEERING_TYPES,
+    consider_rules, list_rules, recall_rules, register_rule, retire_rule, Compliance, ConfSeverity,
+    ConformanceRule, Consideration, RuleProvenance, RuleQuery, RuleType, SetAside, SetAsideReason,
+    Targets, DEFAULT_RULE_WEIGHT, DEFAULT_STEERING_TYPE, STEERING_TYPES,
 };
 
 // STEERING unification (the wiki/rules model + the standalone Policy model, merged): the

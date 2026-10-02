@@ -153,11 +153,21 @@ pub(crate) fn apply_unit(
     // over-broad wildcard is the fail-CLOSED direction (surface more, never fewer); facet narrowing
     // stays in the subprocess hook where the launcher scopes it per-run. Fail-CLOSED: a recall error
     // is a governance failure, never a silent skip.
-    crate::gate_hook::attach_recalled_rules(
-        store,
-        &wicked_governance::RuleQuery::default(),
-        &mut claim,
-    )?;
+    //
+    // (DC-S1, DES-decision-capture §4.2.3) Still a wildcard on every facet but ONE: the projects
+    // this run is filed in, read from the STORE's `crew.run` membership (the session id IS the
+    // run id) — never from process env, so the leak above cannot happen. A project-scoped rule is
+    // recalled only for a run in its project; an unfiled run gets the global rules alone. A store
+    // error propagates (fail closed, never a silent narrowing).
+    let rule_query = wicked_governance::RuleQuery {
+        projects: crate::project::member_projects(
+            &*store,
+            crate::project::MEMBER_KIND_RUN,
+            session_id,
+        )?,
+        ..Default::default()
+    };
+    crate::gate_hook::attach_recalled_rules(store, &rule_query, &mut claim)?;
     let governance_denied = matches!(claim.decision, Decision::Deny);
     let decision_tok = decision_token(&claim.decision);
 
@@ -442,6 +452,96 @@ mod tests {
     /// the storage HALF of that rule: the denied unit's PARTIAL output is still persisted, flagged
     /// `rejected`, readable through `get_unit_transcript` — while `get_work_output` (what evaluator
     /// artifact-passing and context injection read) stays `None`.
+    /// DC-S1 (DES-decision-capture §4.2.3, review B3): a governed unit's claim carries the rules of
+    /// the projects ITS RUN is filed in — read from the store's `crew.run` membership, never env.
+    /// A run filed in P carries P's rule as a `conform:` obligation; a run filed in Q does not;
+    /// both carry the global rule.
+    #[test]
+    fn a_unit_claim_carries_its_runs_project_rules_and_no_other_projects() {
+        let _ = wicked_apps_core::emit::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let p = crate::project::create_project(&mut store, "Alpha", None, 1).unwrap();
+        let q = crate::project::create_project(&mut store, "Beta", None, 2).unwrap();
+        for (project, run) in [(&p.id, "run-p"), (&q.id, "run-q")] {
+            crate::project::attach_member(
+                &mut store,
+                crate::project::MemberSpec {
+                    project_id: project.clone(),
+                    member_kind: crate::project::MEMBER_KIND_RUN.to_string(),
+                    member_ref: run.to_string(),
+                    meta: None,
+                    attached_by: "test".into(),
+                },
+                3,
+            )
+            .unwrap();
+        }
+        let rule = |id: &str, project: Option<&str>| wicked_governance::ConformanceRule {
+            id: id.to_string(),
+            rule_type: wicked_governance::RuleType::Pattern,
+            statement: format!("statement {id}"),
+            severity: wicked_governance::ConfSeverity::Warn,
+            targets: wicked_governance::Targets {
+                project: project.map(str::to_string),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        wicked_governance::register_rule(&mut store, &rule("PAT-777", None)).unwrap();
+        wicked_governance::register_rule(&mut store, &rule("proposal:p-1", Some(&p.id))).unwrap();
+        let obligations = |store: &mut dyn GraphStore, run: &str| -> Vec<String> {
+            let mut unit = WorkUnit::pending(format!("{run}:u1"), run, 1, "build it");
+            unit.assigned_cli = Some("claude".into());
+            let out = apply_unit(
+                store,
+                &unit,
+                "out",
+                &format!("wf-{run}"),
+                EntityMode::Shared,
+                run,
+                None,
+                0,
+            )
+            .unwrap();
+            let id = out.claim_id.expect("a claim is recorded");
+            let node = store
+                .find_symbols(&wicked_estate_core::SymbolQuery {
+                    kinds: vec![wicked_estate_core::NodeKind::Other(
+                        wicked_apps_core::CONFORMANCE_CLAIM.to_string(),
+                    )],
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .find(|n| n.metadata.get("claim_id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                .expect("the claim node");
+            wicked_governance::claim_from_node(&node)
+                .unwrap()
+                .obligations
+        };
+        let in_p = obligations(&mut store, "run-p");
+        assert!(
+            in_p.iter()
+                .any(|o| o.starts_with("conform:Warn:proposal:p-1:")),
+            "{in_p:?}"
+        );
+        assert!(
+            in_p.iter().any(|o| o.starts_with("conform:Warn:PAT-777:")),
+            "{in_p:?}"
+        );
+        let in_q = obligations(&mut store, "run-q");
+        assert!(!in_q.iter().any(|o| o.contains("proposal:p-1")), "{in_q:?}");
+        assert!(
+            in_q.iter().any(|o| o.starts_with("conform:Warn:PAT-777:")),
+            "{in_q:?}"
+        );
+        let unfiled = obligations(&mut store, "run-none");
+        assert!(
+            !unfiled.iter().any(|o| o.contains("proposal:p-1")),
+            "{unfiled:?}"
+        );
+    }
+
     #[test]
     fn a_validator_deny_drives_the_phase_rejected_and_writes_no_work_output() {
         let mut store = open_store(Some(":memory:")).unwrap();

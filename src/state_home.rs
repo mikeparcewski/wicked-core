@@ -1297,6 +1297,9 @@ mod tests {
             // crew-placed by a `join(<state home>, …)`: the chat transcripts (`chats`) and the
             // interactive bridge's docs root + recorder browser (`interactive`).
             "chats",
+            // DC-S1 (DES-decision-capture §4.2.1): crew's decision ledger — the operator's own
+            // words, fenced from every worker.
+            "decisions",
             "interactive",
             // crew's MCP tools registry (`join(<state home>, 'mcp')`): fenced, never read by a
             // worker — a worker reaches MCP tools only through the broker.

@@ -788,6 +788,17 @@ export declare class Core {
    */
   recallRulesPreview(queryJson: string): Promise<string>
   /**
+   * (DC-S1, DES-decision-capture §4.2.2 / §4.7) "Considered · set aside": the ONE
+   * implementation of project matching crew reads (no second read transport). `query_json` is a
+   * JSON `RuleQuery` (language, layer, framework, severity, rule_type, steering_type, and
+   * `projects`: the asking run's or chat's projects); empty = no facet filters and no projects.
+   * Resolves to `{ in_force: ConformanceRule[], set_aside: [{ id, statement, reason:
+   * "out_of_scope"|"replaced"|"retired" }] }`. Read-only connection — never blocks the actor.
+   * Crew probes for this method before sending a query with `projects` (an older engine's
+   * `RuleQuery` rejects the field).
+   */
+  considerRules(queryJson: string): Promise<string>
+  /**
    * Judge and record ONE brokered MCP call (DES-MCP-TOOLS-001 §6 step 3; crew's broker calls
    * this before it invokes anything). `request_json` is `{ token, call: { server, tool, args?,
    * annotations?, classOverride?, registered, kind?, carrier? } }` — `token` is the worker's
