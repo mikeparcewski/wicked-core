@@ -7000,10 +7000,25 @@ fn reseat_off_benched_seat(
     let Some(bench) = session.benched_seats.iter().find(|b| b.cli == seat) else {
         return Ok(Reseat::Unchanged);
     };
+    // The template the unit would carry on each seat: the launch roster's own, when another unit
+    // of this run carries it (an ad-hoc seat is not in the registry), else the registry's — the
+    // failover ladder's source. Admission is judged on that same template.
     let registry = crate::registry_roster();
+    let invocation_on = |key: &str| -> Option<String> {
+        units
+            .iter()
+            .find(|u| u.assigned_cli.as_deref() == Some(key) && u.assigned_invocation.is_some())
+            .and_then(|u| u.assigned_invocation.clone())
+            .or_else(|| {
+                registry
+                    .iter()
+                    .find(|c| c.key == key)
+                    .map(|c| c.headless_invocation.clone())
+            })
+    };
     let admitted: Vec<String> = eligible_roster_keys(session)
         .into_iter()
-        .filter(|k| crate::distribute::seat_admits_unit(unit, k, &registry))
+        .filter(|k| crate::distribute::seat_admits_unit(unit, k, invocation_on(k.as_str())))
         .collect();
     let Some(next) = next_failover_seat(units, unit_ix, &admitted) else {
         let bench_summary =
@@ -7018,20 +7033,7 @@ fn reseat_off_benched_seat(
     };
     let mut moved = unit.clone();
     moved.assigned_cli = Some(next.clone());
-    // The launch roster's own template for the seat, when another unit of this run carries it (an
-    // ad-hoc seat is not in the registry), else the registry's — the failover ladder's source.
-    moved.assigned_invocation = units
-        .iter()
-        .find(|u| {
-            u.assigned_cli.as_deref() == Some(next.as_str()) && u.assigned_invocation.is_some()
-        })
-        .and_then(|u| u.assigned_invocation.clone())
-        .or_else(|| {
-            registry
-                .iter()
-                .find(|c| c.key == next)
-                .map(|c| c.headless_invocation.clone())
-        });
+    moved.assigned_invocation = invocation_on(next.as_str());
     put_node(store, moved.to_node())?;
     eprintln!(
         "wicked-core: unit {} of {} was planned on '{seat}', which this run benched; re-seated on \
