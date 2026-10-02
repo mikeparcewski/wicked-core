@@ -2447,8 +2447,15 @@ impl Core {
     /// `bad_request: …` or `guard_error: …` (an unseeded store fails closed).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn evaluate_editor_grants(&self, request_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
         let db_path = self.db_path.clone();
-        task(move || wicked_core::evaluate_editor_grants_json(&db_path, &request_json).map_err(err))
+        task(move || {
+            // The store actor opens the db and seeds the editor-defaults pack at boot; a ping the
+            // actor acks proves both happened, so a call made right after construction never
+            // reads a store that is not there yet (Copilot on #704).
+            core.ping();
+            wicked_core::evaluate_editor_grants_json(&db_path, &request_json).map_err(err)
+        })
     }
 
     /// The ONE MCP tool class derivation (D-4): `annotations_json` is the tool's `tools/list`

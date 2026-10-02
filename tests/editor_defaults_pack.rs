@@ -88,3 +88,26 @@ fn the_editor_defaults_pack_ingests_and_recalls_its_rules() {
     assert_eq!(ask("acme-notes", "artifact.write", false).0, "ask");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The daemon path (Copilot on #704): a fresh `Core` seeds the pack at boot, and once the actor has
+/// acked a ping (what core-ts `evaluateEditorGrants` does first) the grants read finds it.
+#[test]
+fn a_fresh_core_answers_grants_after_its_actor_acks() {
+    let dir = std::env::temp_dir().join(format!("wc-editor-boot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("estate.db").to_string_lossy().into_owned();
+    let core = wicked_core::Core::spawn(db.clone());
+    core.ping();
+    let body = serde_json::json!({
+        "editorId": "wicked-page", "version": "1.0.0", "sha256": "b".repeat(64),
+        "permissions": ["artifact.write"], "firstParty": true,
+    });
+    let v: serde_json::Value = serde_json::from_str(
+        &wicked_core::evaluate_editor_grants_json(&db, &body.to_string()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v["grants"][0]["decision"], "allow");
+    drop(core);
+    let _ = std::fs::remove_dir_all(&dir);
+}
