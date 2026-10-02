@@ -16,7 +16,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **core-ts 0.7.35** — 2026-10-02 — npm release carrying the **nine** engine changes since 0.7.34, on
   main tip `c98f283`: the held W2 slices and the W3 core slices of the 2026-09 build plan. All new wire
-  fields are additive and `serde(default)`, so an old row and an old consumer read as before.
+  fields are additive. The new session and plan fields are `serde(default)`, so an old stored row
+  reads as before. The event fields (`touch`, `changed`,
+  `firedPolicies`, `recommended`) are new keys written by the event serializer, so a consumer that
+  ignores unknown keys reads as before.
   **Walkthrough proof (#691 WT-C1, #697 WT-C2)** — the catalog gains the dormant `walkthrough_plan`
   and `walkthrough_review` entries (no built-in preset uses them) and gate protocol 2; a launch can
   name an `evidenceRoot`, and the review's record Tool runs jailed, loopback-only, with its declared
