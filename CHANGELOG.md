@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.34** — 2026-10-01 — patch release carrying **one** engine change since 0.7.33, on main
+  tip `7e0abf4`. **A seat benched mid-run is never handed another unit of that run, and the bench is on
+  the wire (#689).** crew 0.7.45's post-publish smoke (wicked-ci S04, run 36946090323) found it: since
+  #590 S5 removed the routing ballots, a seat that reads signed in but cannot work (the smoke's copilot,
+  out of quota) was planned onto both review units and dispatched for both. A later unit planned on a
+  seat the run has benched is now re-seated before it runs (`unitReassigned`). With no eligible seat
+  left, the run pauses on that unit at the dead-seat gate. A crash redrive does the same. The new
+  additive event `seatBenched {session, ord, cli, reason, source}` names each in-run bench once, so
+  wicked-crew 0.7.46 can keep the seat out of its next launches for a bounded window. No other change
+  since 0.7.33 (`d706986`); the lockfile re-stamp #688 is packaging only.
 - **core-ts 0.7.33** — 2026-10-01 — npm release carrying the **sixty-seven** engine changes since
   0.7.30, on main tip `00545af`; the last of them, #687, is lint-only (clean under clippy 1.99, no
   behaviour change). Supersedes the never-tagged 0.7.31 (#681) and 0.7.32 (#683) cuts,
