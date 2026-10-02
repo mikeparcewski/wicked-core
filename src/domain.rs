@@ -233,6 +233,17 @@ pub struct AgentSession {
     /// a run without it serializes byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_seats: Vec<String>,
+    /// (WT-C2, DES-walkthrough-proof §4.2) The run's EVIDENCE ROOT, minted by the launcher
+    /// (`LaunchSpec::evidence_root`): `<root>/author/<plan step>/` is the walkthrough author's
+    /// write dir (the launcher lists `<root>/author` in `extra_write_roots`), and
+    /// `<root>/<review step>/` is the proof root only the jailed `walkthrough_review` Tool
+    /// writes. Persisted beside `extra_write_roots` for the same reason (core#259): a
+    /// resume/redrive re-arms the roots the launch declared. `None` for a repo-less run and for
+    /// a launcher that mints none — a walkthrough step on such a run fails closed at its pinned
+    /// validator. `#[serde(default)]` + skip-if-none: older sessions deserialize and a run
+    /// without it serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_root: Option<String>,
 }
 
 /// (EP-K3) A launch's `exclude_seats` as the session keeps it: trimmed, empties dropped, first-seen
@@ -1488,6 +1499,7 @@ mod tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         }
     }
 

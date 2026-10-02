@@ -239,6 +239,7 @@ fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> Laun
         plan,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     }
 }
 

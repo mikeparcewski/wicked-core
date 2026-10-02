@@ -351,6 +351,7 @@ fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
         plan: None,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     }
 }
 

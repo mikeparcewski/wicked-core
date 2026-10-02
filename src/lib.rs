@@ -73,6 +73,7 @@ mod team;
 mod terminal;
 mod validator;
 mod validator_vault;
+pub mod walkthrough;
 mod worker_sandbox;
 mod workflow;
 mod worktree_guard;
@@ -205,8 +206,9 @@ pub use state_home::{
 };
 pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
-    run_validator_reporting, sandbox_availability, AgentVerdict, DeterministicValidator,
-    GateVerdict, SandboxLevel, ValidatorOutcome, DETERMINISTIC_VALIDATOR_SEAT,
+    run_validator_reporting, run_validator_reporting_with_env, sandbox_availability, AgentVerdict,
+    DeterministicValidator, GateVerdict, SandboxLevel, ValidatorOutcome,
+    DETERMINISTIC_VALIDATOR_SEAT,
 };
 pub use validator_vault::{
     approve_and_store, load_validator, pin, provision_validator, store_validator, VALIDATOR_VAULT,
@@ -306,6 +308,14 @@ pub struct LaunchSpec {
     /// whatever this says. Empty = today's behaviour. Crew fills it from the run that authored
     /// the version under review, which a new review run cannot see in its own ledger.
     pub exclude_seats: Vec<String>,
+    /// (WT-C2, DES-walkthrough-proof §4.2) The run's EVIDENCE ROOT — an absolute directory the
+    /// launcher minted for this run (crew: `<home>/.wicked/walkthroughs/<runId>`). The walkthrough
+    /// author writes under `<root>/author/<step>/` (the launcher lists `<root>/author` in
+    /// [`Self::extra_write_roots`]); the jailed `walkthrough_review` Tool writes its proof root
+    /// `<root>/<step>/`, which is in NO unit's write roots. Validated at launch like a write root
+    /// (absolute, outside the engine's config/pin tree) and persisted on the session. `None` ⇒ no
+    /// walkthrough can pass on this run (its pinned validators fail closed).
+    pub evidence_root: Option<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -2004,6 +2014,7 @@ mod tests {
             plan: None,
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .expect("launch");
         let runs = vec!["held".to_string(), "ghost".to_string()];

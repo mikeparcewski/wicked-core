@@ -72,6 +72,7 @@ pub fn run_session(
         false, // stub not yet created
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
         Vec::new(),
+        None,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -412,6 +413,9 @@ pub(crate) fn pre_distribute(
     // in the same write as the session, never a later one. A launch stub's own value is carried
     // forward instead (`session_already_started`).
     exclude_seats: Vec<String>,
+    // (WT-C2) The launch's evidence root, recorded the same way: in the write that creates the
+    // session, or carried forward from a launch stub.
+    evidence_root: Option<String>,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -461,6 +465,7 @@ pub(crate) fn pre_distribute(
         team: None,
         team_plan: None,
         exclude_seats,
+        evidence_root,
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -473,6 +478,8 @@ pub(crate) fn pre_distribute(
             session.benched_seats = existing.benched_seats;
             // (EP-K3) The launch's judge exclusion is the run's, recorded on the stub.
             session.exclude_seats = existing.exclude_seats;
+            // (WT-C2) …and so is its evidence root.
+            session.evidence_root = existing.evidence_root;
             // (DES-TEAMING-002 T3) The team state (P1's transport, path floor and gate counter)
             // and the plan state are the run's, not the plan's: a plan written onto a launch stub
             // (or re-planned at an edit) keeps them.
@@ -840,6 +847,8 @@ pub(crate) fn plan_and_distribute(
     // in the same write as the session, never a later one. A launch stub's own value is carried
     // forward instead (`session_already_started`).
     exclude_seats: Vec<String>,
+    // (WT-C2) The launch's evidence root, forwarded to `pre_distribute` the same way.
+    evidence_root: Option<String>,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -861,6 +870,7 @@ pub(crate) fn plan_and_distribute(
         session_already_started,
         governed,
         exclude_seats,
+        evidence_root,
     )?;
     let distributions = distribute::distribute_units_on(&pre.units, clis, session_id)?;
     apply_distributions(store, &mut pre, distributions, emit)?;
@@ -905,7 +915,20 @@ pub(crate) fn apply_and_finish_unit(
     // (layer-1) PINNED VALIDATOR — the rev0.4 deterministic re-verify against the run's worktree. A
     // FAIL — OR the ABSENCE of a worktree (fail-closed, so the agent LLM can never lone-approve a pinned
     // phase) — denies. Pure, no LLM.
-    let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
+    let run_session = crate::domain::get_session(store, session_id)?;
+    let workdir = run_session.as_ref().and_then(|s| s.workdir.clone());
+    // (WT-C2) A walkthrough step's validator is handed its root (and the author's lint the skills
+    // generation); empty for every other unit.
+    let validator_env = run_session
+        .as_ref()
+        .map(|s| {
+            crate::walkthrough::validator_env(
+                s,
+                unit,
+                crate::walkthrough::garden_root_for(unit).as_deref(),
+            )
+        })
+        .unwrap_or_default();
 
     // ── PHASE-SCOPE OBSERVABILITY (core#283, the completion-path backstop) ── A pre-build,
     // non-creator phase whose worktree contribution touches NON-documentation files jumped the
@@ -990,8 +1013,12 @@ pub(crate) fn apply_and_finish_unit(
             None
         };
 
-    let det_denial =
-        pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new), db_path);
+    let det_denial = pinned_validator_denial_with_env(
+        unit,
+        workdir.as_deref().map(std::path::Path::new),
+        db_path,
+        &validator_env,
+    );
 
     // (F-7R2-006 / review RT-1 / F-7R3-001) A judge seat that REFUSED while this unit's judge
     // rotated — an authentication failure, a quota refusal, a binary that could not start — is
@@ -1786,10 +1813,22 @@ pub(crate) fn apply_and_finish_unit(
 /// rev0.4 violation ("Approve requires a deterministic PASS"). "Can't re-verify" is treated as
 /// NOT-passed, never assumed-pass. (Consequence: a repo-less run cannot satisfy a pinned phase — that
 /// is intended; register a repo so the run has a worktree.)
+#[cfg(test)]
 fn pinned_validator_denial(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&std::path::Path>,
     db_path: Option<&str>,
+) -> Option<String> {
+    pinned_validator_denial_with_env(unit, workdir, db_path, &[])
+}
+
+/// [`pinned_validator_denial`] with the variables the unit's validator is handed (WT-C2:
+/// [`crate::walkthrough::validator_env`]; empty for every non-walkthrough unit).
+fn pinned_validator_denial_with_env(
+    unit: &crate::domain::WorkUnit,
+    workdir: Option<&std::path::Path>,
+    db_path: Option<&str>,
+    extra_env: &[(String, String)],
 ) -> Option<String> {
     // No pinned validator ⇒ ungated phase ⇒ no denial (unchanged pre-gate behavior).
     let v = unit.validator.as_ref()?;
@@ -1804,7 +1843,7 @@ fn pinned_validator_denial(
             v.criterion
         ));
     };
-    match crate::validator::run_validator_reporting(v, cwd, db_path) {
+    match crate::validator::run_validator_reporting_with_env(v, cwd, db_path, extra_env) {
         Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion, cwd),
         Err(e) => Some(format!("pinned validator error: {e}")),
     }
@@ -2142,6 +2181,133 @@ mod resolve_tests {
         );
     }
 
+    /// WT-C2 (DES-walkthrough-proof §4.3 B1): both walkthrough pins, run by the REAL re-verify
+    /// (`run_validator_reporting` under the OS jail) with the variables the engine derives from the
+    /// session and the unit — never handed in by the test. Result pin: PASS passes; FAIL,
+    /// INCONCLUSIVE (including the engine's own `unjailed_host` file) and a missing file deny, and
+    /// so does a run with no evidence root. Lint pin: the garden's verdict decides; no garden root
+    /// denies.
+    #[cfg(unix)]
+    #[test]
+    fn the_walkthrough_pins_run_under_the_real_re_verify_with_the_engine_derived_roots() {
+        use crate::builtin_floors as bf;
+        use crate::domain::{AgentSession, WorkUnit};
+        use crate::validator::DeterministicValidator;
+        let dir = std::env::temp_dir().join(format!("wicked-wt-c2-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let worktree = dir.join("wt");
+        let evidence = dir.join("evidence");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&evidence).unwrap();
+        let session = |root: Option<&std::path::Path>| -> AgentSession {
+            let mut s: AgentSession = serde_json::from_value(serde_json::json!({
+                "id": "s", "workflow_id": "wf-s", "problem": "p",
+                "entity_mode": "shared", "clis": [], "status": "executing"
+            }))
+            .unwrap();
+            s.workdir = Some(worktree.to_string_lossy().into_owned());
+            s.evidence_root = root.map(|r| r.to_string_lossy().into_owned());
+            s
+        };
+        let approved = |criterion: &str, script: &str| DeterministicValidator {
+            criterion: criterion.into(),
+            script: script.into(),
+            approved: true,
+        };
+        let deny = |s: &AgentSession, u: &WorkUnit, garden: Option<&std::path::Path>| {
+            pinned_validator_denial_with_env(
+                u,
+                Some(&worktree),
+                None,
+                &crate::walkthrough::validator_env(s, u, garden),
+            )
+        };
+
+        let mut review = WorkUnit::pending("s:wr", "s", 2, "record");
+        review.catalog = Some("walkthrough_review".into());
+        review.tool_cmd = Some(vec!["wicked-garden".into()]);
+        review.validator = Some(approved(
+            bf::WALKTHROUGH_RESULT_CRITERION,
+            bf::WALKTHROUGH_RESULT_SCRIPT,
+        ));
+        let s = session(Some(&evidence));
+        let proof = evidence.join("wr");
+        std::fs::create_dir_all(&proof).unwrap();
+        let cases: [(&str, Option<String>, bool); 4] = [
+            (
+                "pass",
+                Some(r#"{"overall":"PASS","chapters":[{"key":"a","verdict":"PASS"}]}"#.into()),
+                true,
+            ),
+            (
+                "fail",
+                Some(r#"{"overall":"FAIL","chapters":[{"key":"a","verdict":"FAIL"}]}"#.into()),
+                false,
+            ),
+            (
+                "inconclusive",
+                Some(crate::walkthrough::inconclusive_result(
+                    "unjailed_host",
+                    "no jail",
+                )),
+                false,
+            ),
+            ("missing", None, false),
+        ];
+        for (name, body, passes) in cases {
+            let _ = std::fs::remove_file(proof.join("result.json"));
+            if let Some(b) = body {
+                std::fs::write(proof.join("result.json"), b).unwrap();
+            }
+            assert_eq!(
+                deny(&s, &review, None).is_none(),
+                passes,
+                "result pin, {name}"
+            );
+        }
+        // No evidence root on the run: the same PASS file elsewhere is never read.
+        std::fs::write(proof.join("result.json"), r#"{"overall":"PASS"}"#).unwrap();
+        assert!(
+            deny(&session(None), &review, None).is_some(),
+            "no evidence root denies"
+        );
+
+        // The author's lint: the garden's own verdict, through `WICKED_GARDEN_ROOT`.
+        let mut plan = WorkUnit::pending("s:wp", "s", 1, "author");
+        plan.catalog = Some("walkthrough_plan".into());
+        plan.validator = Some(approved(
+            bf::WALKTHROUGH_LINT_CRITERION,
+            bf::WALKTHROUGH_LINT_SCRIPT,
+        ));
+        let garden = |name: &str, exit: u8| {
+            let g = dir.join(name);
+            std::fs::create_dir_all(g.join("scripts")).unwrap();
+            let bin = g.join("scripts").join("wicked-garden");
+            // The lint is handed its author dir as `--root`: the stub checks it got exactly that.
+            let want = evidence.join("author").join("wp");
+            std::fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\n[ \"$4\" = \"--root\" ] && [ \"$5\" = '{}' ] || exit 9\nexit {exit}\n",
+                    want.display()
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            g
+        };
+        let ok = garden("garden-ok", 0);
+        let refuses = garden("garden-refuses", 1);
+        assert!(deny(&s, &plan, Some(&ok)).is_none(), "a clean lint passes");
+        assert!(
+            deny(&s, &plan, Some(&refuses)).is_some(),
+            "a refused storyline denies"
+        );
+        assert!(deny(&s, &plan, None).is_some(), "no garden root denies");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pinned_validator_denial_is_deny_dominates_and_fail_closed() {
         use crate::domain::WorkUnit;
@@ -2399,6 +2565,7 @@ mod resolve_tests {
             false,
             false,
             Vec::new(),
+            None,
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -2525,6 +2692,7 @@ mod resolve_tests {
             false,
             false,
             Vec::new(),
+            None,
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -2916,6 +3084,7 @@ mod resolve_tests {
             false,
             false,
             Vec::new(),
+            None,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());
@@ -3075,6 +3244,7 @@ mod judge_bench_tests {
             false,
             false,
             Vec::new(),
+            None,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {

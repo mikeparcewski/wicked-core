@@ -604,8 +604,14 @@ pub(crate) fn distribute_units_against_benched(
                 .iter()
                 .any(|c| c.key == d.assigned_cli && !seat_governs(c)))
         .then(|| {
+            // The walkthrough author is the other unit that needs a governed seat (WT-C1); name
+            // the unit by what it is, never "build" for every one (WT-C2, Copilot on #691).
+            let what = match u.catalog.as_deref() {
+                Some(crate::walkthrough::PLAN_CATALOG) => crate::walkthrough::PLAN_CATALOG,
+                _ => "build",
+            };
             format!(
-                "unit {} (build) runs on '{}', which does not enforce input governance \
+                "unit {} ({what}) runs on '{}', which does not enforce input governance \
                  (acp_input_governance=false or no gate-hook adapter): no eligible seat that \
                  enforces it admits this unit, so its tool calls run unchecked",
                 u.ord, d.assigned_cli

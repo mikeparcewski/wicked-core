@@ -143,6 +143,7 @@ fn launch(sid: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         plan: None,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     }
 }
 

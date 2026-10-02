@@ -153,6 +153,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             plan: None,
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .expect("launch");
 }
@@ -1655,6 +1656,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             plan: None,
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1824,6 +1826,7 @@ fn launch_member_run(e: &Engine, run: &str) {
             plan: None,
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .expect("launch");
 }
@@ -2597,6 +2600,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
             }))),
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .expect("launch");
 }
@@ -2986,6 +2990,7 @@ fn try_launch_plan(
         plan: Some(steps(body)),
         deliver_step,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     })
 }
 

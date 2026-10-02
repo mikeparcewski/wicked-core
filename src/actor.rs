@@ -1237,6 +1237,8 @@ pub(crate) fn run(
                     plan,
                     deliver_step,
                     exclude_seats,
+                    // Legacy path has no repo, so no walkthrough can run on it (WT-C2).
+                    evidence_root: _,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1340,6 +1342,13 @@ pub(crate) fn run(
                     // invalid write root is.
                     crate::path_policy::validate_extra_read_roots(
                         &spec.extra_read_roots,
+                        home.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                    // (WT-C2) The evidence root is a write root of the jailed walkthrough tool:
+                    // judged by the same rules, refused with NO session persisted.
+                    crate::walkthrough::validate_evidence_root(
+                        spec.evidence_root.as_deref(),
                         home.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
@@ -1546,6 +1555,8 @@ pub(crate) fn run(
                         team: None,
                         team_plan: None,
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
+                        // (WT-C2) Validated with the write roots above; in the launch record.
+                        evidence_root: spec.evidence_root.clone(),
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1671,6 +1682,7 @@ pub(crate) fn run(
                     true, // session stub already created + SessionStarted already emitted
                     in_process_governance().is_some(), // keep governed accurate even when unused today
                     Vec::new(),
+                    None,
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -1863,6 +1875,7 @@ pub(crate) fn run(
                         true, // session stub already created + SessionStarted already emitted
                         in_process_governance().is_some(), // keep governed accurate even when unused today
                         Vec::new(),
+                        None,
                     )
                 }) {
                     Err(e) => {
@@ -4092,6 +4105,9 @@ pub(crate) fn launch_run_inner(
         // The read mirror (core#294): same judgement, same synchronous refusal.
         crate::path_policy::validate_extra_read_roots(&spec.extra_read_roots, home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
+        // (WT-C2) The evidence root: same judgement, same synchronous refusal.
+        crate::walkthrough::validate_evidence_root(spec.evidence_root.as_deref(), home.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
@@ -4127,6 +4143,7 @@ pub(crate) fn launch_run_inner(
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
         crate::domain::normalize_exclude_seats(&spec.exclude_seats),
+        spec.evidence_root.clone(),
     )?;
     if let Some((state, _, _)) = team {
         let mut s = crate::domain::get_session(store, &run_id)?
@@ -8202,6 +8219,20 @@ fn dispatch_unit(
         // registered repo it was linked from — resolved HERE (the actor holds the store), applied
         // off-thread below before the push runs. `None` for every other tool unit.
         let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
+        // (WT-C2) A `walkthrough_review` unit: its proof root, declared env and the tree under
+        // review, resolved here (the actor holds the store; the snapshot writes git objects, so it
+        // is taken outside the jail). `None` for every other tool unit.
+        let record = (unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG))
+            .then(|| {
+                crate::walkthrough::record_launch(
+                    run_id,
+                    &session,
+                    unit,
+                    &units,
+                    walkthrough_tree(&*store, &session),
+                )
+            })
+            .flatten();
         // core#500 (F-BM-008): the child's STOP predicate — the run's launch identity, read the
         // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown flip it:
         // `tombstone_run` + `advance_launch_seq` inside `cancel_run` (covers all cancel callers),
@@ -8296,54 +8327,91 @@ fn dispatch_unit(
                     // on the lifted tree and PASSED (the report rides as this unit's evidence);
                     // conflict or failed re-verify ⇒ the unit FAILS here and the command never
                     // runs — the deliver gate never pushes a tree that was not verified.
-                    let emit_ev = |ev: CoreEvent| {
-                        let _ = tx.send(crate::command::Command::EmitEvent(ev));
-                    };
-                    let lifted = lift_ctx.as_ref().map(|ctx| {
-                        crate::deliver_lift::lift_and_reverify(
-                            ctx,
-                            &input.run_id,
-                            ord,
+                    if let Some(rec) = &record {
+                        // The skills generation the run was admitted against, else the ladder's.
+                        // A ladder that FAILED (or could not be read) is a refusal, never "no
+                        // garden": the recorder must not fall through to an unadmitted
+                        // `wicked-garden` on the daemon's PATH (Copilot on #697). Only a ladder
+                        // that found NO garden at all runs the fixed command from PATH.
+                        let garden: Result<Option<std::path::PathBuf>, String> =
+                            match admitted.as_ref() {
+                                Some(g) => Ok(Some(g.root.clone())),
+                                None => match crate::skills_snapshot::resolve_ladder() {
+                                    Ok(crate::skills_snapshot::Ladder::Root(g)) => Ok(Some(g.root)),
+                                    Ok(crate::skills_snapshot::Ladder::Absent) => Ok(None),
+                                    Ok(crate::skills_snapshot::Ladder::Failed(why)) => Err(why),
+                                    Err(e) => Err(e.to_string()),
+                                },
+                            };
+                        let (o, st, k) = run_walkthrough_record(
+                            &cmd,
+                            workdir.as_deref(),
+                            rec,
+                            garden
+                                .as_ref()
+                                .map(Option::as_deref)
+                                .map_err(String::as_str),
                             attempt,
-                            &emit_ev,
-                        )
-                    });
-                    match lifted {
-                        Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
-                        Some(Ok(clearance)) => {
-                            lift_checks = clearance.checks;
-                            lift_verified_tree = Some(clearance.verified_tree);
-                            // The verified tip rides to the script (Copilot on #433): its own
-                            // fetch + rebase + push can still race a remote that advances in
-                            // the window; with this it can refuse or re-verify a moved base.
-                            let env: Vec<(String, String)> = clearance
-                                .verified_base
-                                .map(|b| {
-                                    vec![(crate::deliver_lift::VERIFIED_BASE_ENV.to_string(), b)]
-                                })
-                                .unwrap_or_default();
-                            let (o, st, k) = run_tool_cmd(
-                                &cmd,
-                                workdir.as_deref(),
-                                &env,
-                                &stop,
-                                &on_spawn,
-                                &on_done,
-                            );
-                            killed = k;
-                            (o, st)
-                        }
-                        None => {
-                            let (o, st, k) = run_tool_cmd(
-                                &cmd,
-                                workdir.as_deref(),
-                                &[],
-                                &stop,
-                                &on_spawn,
-                                &on_done,
-                            );
-                            killed = k;
-                            (o, st)
+                            &crate::validator::loopback_jail,
+                            &stop,
+                            &on_spawn,
+                            &on_done,
+                        );
+                        killed = k;
+                        (o, st)
+                    } else {
+                        let emit_ev = |ev: CoreEvent| {
+                            let _ = tx.send(crate::command::Command::EmitEvent(ev));
+                        };
+                        let lifted = lift_ctx.as_ref().map(|ctx| {
+                            crate::deliver_lift::lift_and_reverify(
+                                ctx,
+                                &input.run_id,
+                                ord,
+                                attempt,
+                                &emit_ev,
+                            )
+                        });
+                        match lifted {
+                            Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
+                            Some(Ok(clearance)) => {
+                                lift_checks = clearance.checks;
+                                lift_verified_tree = Some(clearance.verified_tree);
+                                // The verified tip rides to the script (Copilot on #433): its own
+                                // fetch + rebase + push can still race a remote that advances in
+                                // the window; with this it can refuse or re-verify a moved base.
+                                let env: Vec<(String, String)> = clearance
+                                    .verified_base
+                                    .map(|b| {
+                                        vec![(
+                                            crate::deliver_lift::VERIFIED_BASE_ENV.to_string(),
+                                            b,
+                                        )]
+                                    })
+                                    .unwrap_or_default();
+                                let (o, st, k) = run_tool_cmd(
+                                    &cmd,
+                                    workdir.as_deref(),
+                                    &env,
+                                    &stop,
+                                    &on_spawn,
+                                    &on_done,
+                                );
+                                killed = k;
+                                (o, st)
+                            }
+                            None => {
+                                let (o, st, k) = run_tool_cmd(
+                                    &cmd,
+                                    workdir.as_deref(),
+                                    &[],
+                                    &stop,
+                                    &on_spawn,
+                                    &on_done,
+                                );
+                                killed = k;
+                                (o, st)
+                            }
                         }
                     }
                 }
@@ -8522,6 +8590,193 @@ fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
     refs
 }
 
+/// (WT-C2, DES-walkthrough-proof §4.4) Run the `walkthrough_review` Tool: jailed, loopback-only,
+/// writing only its proof root and a private temp dir, handed exactly the declared variables.
+///
+/// It returns `StepStatus::Ok` whenever it did not spawn the recorder, saying why: the verdict is
+/// the pinned result validator's (§4.3), and a failed Tool unit would go through the failover
+/// ladder and the triage judge, which can retry it — "green from retry-until-pass". A host with no
+/// `Sandboxed` launcher records nothing: the engine writes `result.json` as INCONCLUSIVE /
+/// `unjailed_host` (O4), and the validator denies with that reason.
+#[allow(clippy::too_many_arguments)]
+fn run_walkthrough_record(
+    cmd: &[String],
+    workdir: Option<&str>,
+    rec: &crate::walkthrough::RecordLaunch,
+    garden: Result<Option<&std::path::Path>, &str>,
+    attempt: u32,
+    jail: &dyn Fn(&[&std::path::Path]) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
+    use crate::walkthrough as wt;
+    use crate::workflow::StepStatus;
+    // Every refusal REPLACES the previous take's verdict with an INCONCLUSIVE one naming the
+    // cause, whenever the step's root is a plain directory it can safely write — a refused take
+    // must never leave a PASS for the validator to read (Copilot on #697). A root that is not
+    // safe to write is not read by the validator either (`walkthrough::validator_env`).
+    let refused = |cause: &str, why: String| {
+        let mut said = String::new();
+        if let Some(root) = rec.step_root.as_deref() {
+            if wt::check_proof_root(root).is_ok() {
+                let written = wt::retire_previous_result(root, attempt).and_then(|()| {
+                    std::fs::write(
+                        root.join(wt::RESULT_FILE),
+                        wt::inconclusive_result(cause, &why),
+                    )
+                });
+                if let Err(e) = written {
+                    said = format!(" (and the verdict file could not be replaced: {e})");
+                }
+            }
+        }
+        (
+            format!(
+                "walkthrough_review recorded nothing: {why}{said}. The pinned result validator \
+                 denies this step."
+            ),
+            StepStatus::Ok,
+            None,
+        )
+    };
+    let proof_root = match &rec.proof_root {
+        Ok(p) => p.clone(),
+        Err(why) => return refused(wt::ENGINE_REFUSED, why.clone()),
+    };
+    let garden_root = match garden {
+        Ok(root) => root,
+        Err(why) => {
+            return refused(
+                wt::ENGINE_REFUSED,
+                format!(
+                    "the skills generation could not be resolved ({why}); the recorder is never \
+                     run from an unadmitted garden"
+                ),
+            )
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&proof_root) {
+        return refused(
+            wt::ENGINE_REFUSED,
+            format!(
+                "the proof root {} could not be created: {e}",
+                proof_root.display()
+            ),
+        );
+    }
+    if let Err(why) = wt::check_proof_root(&proof_root) {
+        return refused(wt::ENGINE_REFUSED, why);
+    }
+    if let Err(e) = wt::retire_previous_result(&proof_root, attempt) {
+        // The previous take's verdict must never be read as this one's (codex review): remove it,
+        // and when even that fails, FAIL the unit — there is no trustworthy verdict to fold.
+        let current = proof_root.join(wt::RESULT_FILE);
+        if let Err(rm) = std::fs::remove_file(&current) {
+            if rm.kind() != std::io::ErrorKind::NotFound {
+                return (
+                    format!(
+                        "walkthrough_review could not retire the previous take's {}: {e}; nor \
+                         remove it: {rm}. Refusing to record over a verdict the validator would \
+                         read as this take's",
+                        wt::RESULT_FILE
+                    ),
+                    StepStatus::Failed,
+                    None,
+                );
+            }
+        }
+    }
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                wt::ENGINE_REFUSED,
+                format!("the recorder's private temp dir: {e}"),
+            )
+        }
+    };
+    let launcher = jail(&[proof_root.as_path(), tmp.path()]);
+    if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
+        let reason = format!(
+            "this host has no OS jail for the walkthrough recorder (sandbox level {}): a \
+             walkthrough never runs unjailed. Run it on macOS (sandbox-exec) or on Linux with \
+             bwrap installed",
+            launcher.level.as_wire()
+        );
+        let body = wt::inconclusive_result(wt::UNJAILED_HOST, &reason);
+        return match std::fs::write(proof_root.join(wt::RESULT_FILE), body) {
+            Ok(()) => (
+                format!("walkthrough_review: {}: {reason}", wt::UNJAILED_HOST),
+                StepStatus::Ok,
+                None,
+            ),
+            Err(e) => refused(
+                wt::UNJAILED_HOST,
+                format!(
+                    "{reason}; and {} could not be written: {e}",
+                    wt::RESULT_FILE
+                ),
+            ),
+        };
+    }
+    let tmp_s = tmp.path().to_string_lossy().into_owned();
+    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .map(|k| ((*k).to_string(), tmp_s.clone()))
+        .collect();
+    env.extend(rec.env.iter().cloned());
+    if let Some(root) = garden_root {
+        env.push((
+            crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
+            root.to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "PATH".to_string(),
+            crate::skills_snapshot::prepend_path_entry(
+                &root.join(crate::skills_snapshot::SCRIPTS_DIR),
+                std::env::var_os("PATH").as_deref(),
+                crate::skills_snapshot::PATH_LIST_SEPARATOR,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        ));
+    }
+    let out = run_tool_cmd_jailed(
+        cmd,
+        workdir,
+        &env,
+        Some(&launcher.wrapper),
+        stop,
+        on_spawn,
+        on_done,
+    );
+    drop(tmp);
+    out
+}
+
+/// The worktree's tree id for a walkthrough record, snapshotted on the actor thread at dispatch
+/// through the registered repo's pinned git dir (`worktree_guard::snapshot`) — OUTSIDE the jail,
+/// because computing a tree id writes git objects.
+fn walkthrough_tree(
+    store: &dyn wicked_apps_core::GraphStore,
+    session: &AgentSession,
+) -> Result<String, String> {
+    let wd = session
+        .workdir
+        .as_deref()
+        .ok_or_else(|| "the run has no worktree".to_string())?;
+    let root = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+        .map(|r| r.root_path)
+        .ok_or_else(|| "the run has no registered repository".to_string())?;
+    crate::worktree_guard::snapshot(std::path::Path::new(wd), std::path::Path::new(&root))
+        .map(|s| s.tree)
+        .map_err(|e| e.to_string())
+}
+
 /// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
 /// `(output, StepStatus)`. Exit 0 → `StepStatus::Ok`; anything else → `StepStatus::Failed`.
 /// Called off the actor thread (blocking subprocess). `extra_env` rides on top of the hardened
@@ -8650,6 +8905,22 @@ fn run_tool_cmd(
     on_spawn: &dyn Fn(u32),
     on_done: &dyn Fn(u32),
 ) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
+    run_tool_cmd_jailed(cmd, workdir, extra_env, None, stop, on_spawn, on_done)
+}
+
+/// [`run_tool_cmd`], optionally inside an OS jail (WT-C2): with `jail = Some(wrapper)` the argv is
+/// `<wrapper…> <cmd…>` and the child's environment is CLEARED to the validator allowlist before
+/// `extra_env` is applied — the walkthrough recorder is handed exactly the variables its caller
+/// declared, never the daemon's. `None` is today's unjailed spawn, byte-identical.
+fn run_tool_cmd_jailed(
+    cmd: &[String],
+    workdir: Option<&str>,
+    extra_env: &[(String, String)],
+    jail: Option<&[String]>,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
     use crate::workflow::StepStatus;
     use std::process::{Command, Stdio};
     let Some(bin) = cmd.first() else {
@@ -8676,8 +8947,19 @@ fn run_tool_cmd(
     } else {
         bin
     };
-    let mut proc = Command::new(bin);
-    proc.hardened().args(&cmd[1..]);
+    let mut proc = match jail.filter(|w| !w.is_empty()) {
+        Some(wrapper) => {
+            let mut p = Command::new(&wrapper[0]);
+            p.hardened().args(&wrapper[1..]).arg(bin).args(&cmd[1..]);
+            crate::validator::apply_minimal_env(&mut p);
+            p
+        }
+        None => {
+            let mut p = Command::new(bin);
+            p.hardened().args(&cmd[1..]);
+            p
+        }
+    };
     for (k, v) in extra_env {
         proc.env(k, v);
     }
@@ -9755,6 +10037,7 @@ fn replan_for_accepted_edit(
         true,
         in_process_governance().is_some(),
         Vec::new(),
+        None,
     )?;
     let distributions = crate::distribute::distribute_units_on_benched(
         &pre.units,
@@ -11223,6 +11506,7 @@ mod gate_pause_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -11477,6 +11761,7 @@ mod terminal_gate_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -11625,6 +11910,7 @@ retry the deliver phase";
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -12175,6 +12461,7 @@ mod substance_gate_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -13232,6 +13519,7 @@ mod request_changes_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -13309,6 +13597,7 @@ mod request_changes_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -14061,6 +14350,7 @@ mod code_evidence_floor_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -14432,6 +14722,7 @@ mod deliverable_floor_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -14956,6 +15247,7 @@ mod seat_failover_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -15602,6 +15894,7 @@ mod def_gate_disclosure_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -15711,6 +16004,7 @@ mod def_gate_disclosure_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -15809,6 +16103,7 @@ mod def_gate_disclosure_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -16130,6 +16425,7 @@ mod terminal_worktree_reap_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -16606,6 +16902,7 @@ mod terminal_worktree_reap_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -16780,6 +17077,7 @@ mod worker_code_graph_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         }
     }
 
@@ -17106,6 +17404,7 @@ mod project_graph_binding_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         }
     }
 
@@ -17856,6 +18155,7 @@ mod phase_boundary_governance_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -18316,6 +18616,7 @@ mod turn_timeout_vs_cancel_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -18514,6 +18815,7 @@ mod turn_timeout_vs_cancel_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -18576,6 +18878,7 @@ mod turn_timeout_vs_cancel_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -18656,6 +18959,7 @@ mod turn_timeout_vs_cancel_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -18692,6 +18996,336 @@ mod turn_timeout_vs_cancel_tests {
         let failed = crate::domain::UnitDenial::new("repo_checks", "exit 1");
         assert_eq!(super::denial_class(Some(&timeout), false), "floor_failed");
         assert_eq!(super::denial_class(Some(&failed), false), "floor_failed");
+    }
+}
+
+/// WT-C2 (DES-walkthrough-proof §4.4) — the `walkthrough_review` record Tool: jailed, loopback-only,
+/// writes only in its proof root and private temp dir, handed exactly the declared variables; on a
+/// host with no jail it records nothing and leaves an `unjailed_host` result for the validator.
+#[cfg(test)]
+mod walkthrough_record_tests {
+    use super::*;
+    use crate::walkthrough::{RecordLaunch, RESULT_FILE, UNJAILED_HOST};
+    use crate::workflow::StepStatus;
+
+    fn never() -> Option<&'static str> {
+        None
+    }
+    fn noop(_: u32) {}
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wt-c2-rec-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn launch(proof: &std::path::Path) -> RecordLaunch {
+        RecordLaunch {
+            proof_root: Ok(proof.to_path_buf()),
+            step_root: Some(proof.to_path_buf()),
+            env: vec![
+                ("WICKED_RUN_ID".into(), "run-wt".into()),
+                ("WICKED_RUN_UNIT".into(), "3".into()),
+                (
+                    "WICKED_EVIDENCE_ROOT".into(),
+                    proof.to_string_lossy().into_owned(),
+                ),
+                (
+                    "WICKED_TREE".into(),
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+                ),
+                (
+                    "WICKED_WALKTHROUGH_AUTHOR".into(),
+                    "/evidence/author/wp".into(),
+                ),
+            ],
+        }
+    }
+
+    /// The recorder runs in the REAL loopback jail (sandbox-exec on macOS, bwrap on the Linux CI
+    /// leg): its environment is exactly the allowlist plus the declared variables, a loopback bind
+    /// and connect succeed, a connect to a public address fails, and a write outside the proof root
+    /// (into the worktree) is refused while one inside lands.
+    #[cfg(unix)]
+    #[test]
+    fn the_recorder_runs_jailed_loopback_only_with_exactly_the_declared_env() {
+        let dir = scratch("jailed");
+        let proof = dir.join("evidence").join("wr");
+        let worktree = dir.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&proof).unwrap();
+        let probe_tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        if crate::validator::loopback_jail(&[proof.as_path(), probe_tmp.path()]).level
+            != crate::validator::SandboxLevel::Sandboxed
+        {
+            eprintln!(
+                "SKIP: no Sandboxed launcher on this host (the unjailed path is tested below)"
+            );
+            return;
+        }
+        let net = r#"
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
+c = socket.create_connection(("127.0.0.1", s.getsockname()[1]), timeout=5)
+a, _ = s.accept(); a.sendall(b"ok"); print("loopback", c.recv(2).decode())
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=5); print("egress OPEN")
+except OSError as e:
+    print("egress refused", type(e).__name__)
+try:
+    u = socket.socket(socket.AF_UNIX); u.settimeout(5); u.connect(UNIX_PATH); print("unix OPEN")
+except OSError as e:
+    print("unix refused", type(e).__name__)
+"#;
+        // A host service listening on a PATHNAME unix socket, where an ssh agent would put it
+        // (Copilot on #697): unreachable from the jail (macOS: the profile's network deny;
+        // Linux: bwrap masks the socket directories).
+        let sock_dir = std::path::PathBuf::from(format!("/tmp/ssh-wtc2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock = sock_dir.join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let net = net.replace("UNIX_PATH", &format!("{:?}", sock.to_string_lossy()));
+        let script = format!(
+            "env > \"$WICKED_EVIDENCE_ROOT/env.txt\"; \
+             python3 -c '{net}' > \"$WICKED_EVIDENCE_ROOT/net.txt\" 2>&1; \
+             (echo x > '{wt}/escaped.txt') 2>/dev/null; \
+             echo '{{\"overall\":\"PASS\"}}' > \"$WICKED_EVIDENCE_ROOT/{RESULT_FILE}\"",
+            wt = worktree.display()
+        );
+        let cmd = vec!["sh".to_string(), "-c".to_string(), script];
+        let (out, st, killed) = run_walkthrough_record(
+            &cmd,
+            Some(worktree.to_str().unwrap()),
+            &launch(&proof),
+            Ok(None),
+            0,
+            &crate::validator::loopback_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        assert!(killed.is_none());
+        let net = std::fs::read_to_string(proof.join("net.txt")).unwrap();
+        assert!(
+            net.contains("loopback ok"),
+            "loopback bind + connect: {net}"
+        );
+        assert!(
+            net.contains("egress refused"),
+            "public egress must fail: {net}"
+        );
+        assert!(
+            net.contains("unix refused"),
+            "a host unix socket must be unreachable: {net}"
+        );
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        assert!(
+            !worktree.join("escaped.txt").exists(),
+            "the worktree is not writable"
+        );
+        assert!(
+            proof.join(RESULT_FILE).exists(),
+            "the proof root is writable"
+        );
+
+        // Exactly the declared variables on top of the allowlist (and the shell's own).
+        let env = std::fs::read_to_string(proof.join("env.txt")).unwrap();
+        let keys: std::collections::BTreeSet<&str> = env
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .collect();
+        let declared = [
+            "WICKED_RUN_ID",
+            "WICKED_RUN_UNIT",
+            "WICKED_EVIDENCE_ROOT",
+            "WICKED_TREE",
+            "WICKED_WALKTHROUGH_AUTHOR",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+        ];
+        for k in declared {
+            assert!(keys.contains(k), "{k} must be handed over: {env}");
+        }
+        let allow = [
+            "PATH", "HOME", "LANG", "LC_ALL", "USER", "LOGNAME", // the validator allowlist
+            "PWD", "OLDPWD", "SHLVL", "_", // the shell's own
+        ];
+        for k in &keys {
+            assert!(
+                declared.contains(k) || allow.contains(k),
+                "undeclared variable {k} reached the recorder: {env}"
+            );
+        }
+        assert!(env.contains("WICKED_RUN_UNIT=3\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No jail ⇒ no walkthrough (O4): the command never runs, and the proof root's result is
+    /// INCONCLUSIVE / `unjailed_host`, which the pinned result validator denies.
+    #[cfg(unix)]
+    #[test]
+    fn an_unjailed_host_records_nothing_and_leaves_unjailed_host() {
+        let dir = scratch("unjailed");
+        let proof = dir.join("wr");
+        let marker = dir.join("ran.txt");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo ran > '{}'", marker.display()),
+        ];
+        let no_jail = |_: &[&std::path::Path]| crate::validator::SandboxLauncher {
+            wrapper: Vec::new(),
+            level: crate::validator::SandboxLevel::BestEffort,
+        };
+        let (out, st, _) = run_walkthrough_record(
+            &cmd,
+            None,
+            &launch(&proof),
+            Ok(None),
+            0,
+            &no_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        assert!(out.contains(UNJAILED_HOST), "{out}");
+        assert!(!marker.exists(), "the recorder must never run unjailed");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(proof.join(RESULT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(v["overall"], "INCONCLUSIVE");
+        assert_eq!(v["cause"], UNJAILED_HOST);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A previous take's PASS is moved aside before a new take: a re-take that records nothing can
+    /// never pass on the old verdict.
+    #[test]
+    fn a_retake_never_reads_the_previous_takes_result() {
+        let dir = scratch("retake");
+        let proof = dir.join("wr");
+        std::fs::create_dir_all(&proof).unwrap();
+        std::fs::write(proof.join(RESULT_FILE), r#"{"overall":"PASS"}"#).unwrap();
+        let no_jail = |_: &[&std::path::Path]| crate::validator::SandboxLauncher {
+            wrapper: Vec::new(),
+            level: crate::validator::SandboxLevel::BestEffort,
+        };
+        let (_, st, _) = run_walkthrough_record(
+            &["true".to_string()],
+            None,
+            &launch(&proof),
+            Ok(None),
+            2,
+            &no_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok);
+        assert!(std::fs::read_to_string(proof.join(RESULT_FILE))
+            .unwrap()
+            .contains(UNJAILED_HOST));
+        assert!(proof.join("result.before-attempt-2.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot on #697: a take refused BEFORE the jail (here: the tree could not be snapshotted)
+    /// replaces the previous take's PASS with an INCONCLUSIVE `engine_refused` verdict — the
+    /// validator can never read the old PASS as this take's.
+    #[test]
+    fn a_refused_take_replaces_the_previous_pass() {
+        let dir = scratch("refused-retake");
+        let proof = dir.join("wr");
+        std::fs::create_dir_all(&proof).unwrap();
+        std::fs::write(proof.join(RESULT_FILE), r#"{"overall":"PASS"}"#).unwrap();
+        let rec = RecordLaunch {
+            proof_root: Err("the worktree's tree could not be snapshotted at dispatch".into()),
+            step_root: Some(proof.clone()),
+            env: Vec::new(),
+        };
+        let (out, st, _) = run_walkthrough_record(
+            &["true".to_string()],
+            None,
+            &rec,
+            Ok(None),
+            3,
+            &crate::validator::loopback_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(proof.join(RESULT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(v["overall"], "INCONCLUSIVE");
+        assert_eq!(v["cause"], crate::walkthrough::ENGINE_REFUSED);
+        assert!(proof.join("result.before-attempt-3.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot on #697: a skills ladder that FAILED is a refusal — the fixed `wicked-garden`
+    /// command is never resolved from the daemon's PATH instead of the admitted generation.
+    #[test]
+    fn a_failed_skills_ladder_refuses_the_record() {
+        let dir = scratch("failed-ladder");
+        let proof = dir.join("wr");
+        std::fs::create_dir_all(&proof).unwrap();
+        let marker = dir.join("ran.txt");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo ran > '{}'", marker.display()),
+        ];
+        let (out, st, _) = run_walkthrough_record(
+            &cmd,
+            None,
+            &launch(&proof),
+            Err("the installed plugin is not a contained tree"),
+            0,
+            &crate::validator::loopback_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        assert!(out.contains("never run from an unadmitted garden"), "{out}");
+        assert!(!marker.exists(), "the recorder must not run");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(proof.join(RESULT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(v["cause"], crate::walkthrough::ENGINE_REFUSED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No proof root (repo-less run, no evidence root, no tree): nothing runs, the unit is `Ok`
+    /// with the reason, so the verdict stays the validator's (never the failover ladder's retry).
+    #[test]
+    fn no_proof_root_records_nothing_and_says_why() {
+        let rec = RecordLaunch {
+            proof_root: Err("the launcher minted no evidence root for this run".into()),
+            step_root: None,
+            env: Vec::new(),
+        };
+        let (out, st, k) = run_walkthrough_record(
+            &["true".to_string()],
+            None,
+            &rec,
+            Ok(None),
+            0,
+            &crate::validator::loopback_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok);
+        assert!(k.is_none());
+        assert!(out.contains("no evidence root"), "{out}");
     }
 }
 
@@ -19207,6 +19841,7 @@ mod dead_seat_park_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -19345,6 +19980,7 @@ mod plan_gate_confirm_tests {
                 ..TeamPlanState::default()
             }),
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("r:understand", "r", 1, "understand the problem");
@@ -19517,6 +20153,7 @@ mod catalog_alias_governance_tests {
             team: None,
             team_plan: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("r:{phase_id}"), "r", 1, "a unit");

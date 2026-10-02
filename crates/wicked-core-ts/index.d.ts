@@ -120,6 +120,14 @@ export interface LaunchOptions {
    * monitors), so it can only narrow the judge choice. Omit for today's behaviour.
    */
   excludeSeats?: Array<string>
+  /**
+   * (WT-C2) The run's evidence root — an absolute directory the launcher minted for this run
+   * (`<home>/.wicked/walkthroughs/<runId>`). The walkthrough author writes under
+   * `<root>/author/<step>/` (list `<root>/author` in `extraWriteRoots`); the jailed
+   * `walkthrough_review` Tool writes `<root>/<step>/`. Validated like a write root. Omit and no
+   * walkthrough can pass on the run.
+   */
+  evidenceRoot?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
