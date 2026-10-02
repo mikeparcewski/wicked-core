@@ -4739,6 +4739,29 @@ fn redrive_executing_sessions(
             emit_run_error(subscribers, &run_id, e);
             continue;
         }
+        // A unit the redrive ADVANCED onto gets the same benched-seat guard as one the cursor
+        // advances onto in a live run (`advance_or_pause`): a crash between a dead seat's bench
+        // and the next unit's dispatch must not hand that unit to the benched seat. A unit the
+        // crash interrupted is redriven where it was.
+        if advanced {
+            match reseat_off_benched_seat(store, subscribers, &sess, &units, sess.unit_ix) {
+                Ok(Reseat::NoSeat(why)) => {
+                    if let Some(unit) = units.get(sess.unit_ix) {
+                        if let Err(e) =
+                            park_unseatable_unit(store, subscribers, self_tx, &mut sess, unit, why)
+                        {
+                            emit_run_error(subscribers, &run_id, e);
+                        }
+                    }
+                    continue;
+                }
+                Ok(Reseat::Moved | Reseat::Unchanged) => {}
+                Err(e) => {
+                    emit_run_error(subscribers, &run_id, e);
+                    continue;
+                }
+            }
+        }
         // Emit CrashRecoveryRedrive before dispatch so the UI sees it before UnitDispatched
         // (which dispatch_unit emits internally). Guard: only emit when a unit exists at the
         // cursor — if not, the run is completing normally and no redrive badge should appear.
@@ -7054,6 +7077,41 @@ fn reseat_off_benched_seat(
     Ok(Reseat::Moved)
 }
 
+/// Pause the run ON `unit` at the dead-seat gate because [`reseat_off_benched_seat`] found no seat
+/// that may take it (core#464's one denial route: `gateEscalated {condition: dead_seat}` then the
+/// `escalation` pause; the unit was never seated, so the prompt offers sign-in, reassign or
+/// reject). Nothing is dispatched to the benched seat.
+fn park_unseatable_unit(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    self_tx: &Sender<Command>,
+    session: &mut crate::domain::AgentSession,
+    unit: &crate::domain::WorkUnit,
+    why: String,
+) -> anyhow::Result<()> {
+    let mut parked = unit.clone();
+    parked.denial_reason = Some(why.clone());
+    parked.denial = Some(crate::domain::UnitDenial::new(
+        crate::domain::DENIAL_SOURCE_DEAD_SEAT,
+        why,
+    ));
+    put_node(store, parked.to_node())?;
+    let attempt = session.attempt;
+    let note = denial_gate_note(session.human_confirm);
+    escalate_denied_unit(
+        store,
+        subscribers,
+        self_tx,
+        session,
+        &parked,
+        attempt,
+        false,
+        false,
+        false,
+        note,
+    )
+}
+
 /// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
 /// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
@@ -7165,27 +7223,7 @@ fn advance_or_pause(
     if let Reseat::NoSeat(why) =
         reseat_off_benched_seat(store, subscribers, &session, &units, unit_ix)?
     {
-        let mut parked = unit.clone();
-        parked.denial_reason = Some(why.clone());
-        parked.denial = Some(crate::domain::UnitDenial::new(
-            crate::domain::DENIAL_SOURCE_DEAD_SEAT,
-            why,
-        ));
-        put_node(store, parked.to_node())?;
-        let attempt = session.attempt;
-        let note = denial_gate_note(session.human_confirm);
-        escalate_denied_unit(
-            store,
-            subscribers,
-            self_tx,
-            &mut session,
-            &parked,
-            attempt,
-            false,
-            false,
-            false,
-            note,
-        )?;
+        park_unseatable_unit(store, subscribers, self_tx, &mut session, unit, why)?;
         return Ok(Progress::Paused);
     }
 
