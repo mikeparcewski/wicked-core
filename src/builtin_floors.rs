@@ -657,8 +657,12 @@ mod tests {
             if let Some(b) = body {
                 std::fs::write(root.join("result.json"), b).unwrap();
             }
+            use wicked_apps_core::spawn::HardenedCommand;
             let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(WALKTHROUGH_RESULT_SCRIPT).env_clear();
+            cmd.hardened()
+                .arg("-c")
+                .arg(WALKTHROUGH_RESULT_SCRIPT)
+                .env_clear();
             if name != "unset" {
                 cmd.env("WICKED_EVIDENCE_ROOT", &root);
             }
