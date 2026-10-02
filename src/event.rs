@@ -1083,6 +1083,28 @@ pub enum CoreEvent {
         /// no child was registered (e.g. the previous attempt had not yet spawned its child).
         previous_attempt_reaped: bool,
     },
+    /// A seat was BENCHED for this run by what it said while doing the run's work: a worker or a
+    /// judge refused on a classified dead-seat cause (`not_logged_in`, `quota_exhausted`,
+    /// `not_installed`, `approval_unavailable`). Emitted once per seat, when the bench is added to
+    /// `session.benched_seats`; the launcher's own bench (`source: "launcher"`) is never re-emitted
+    /// here because the launcher already knows it.
+    ///
+    /// Before core#590 S5 the per-phase ballots told the launcher which seats were dead before any
+    /// unit was routed (`councilSeatFailed`). With the ballots gone, a seat that looks signed in but
+    /// cannot work (out of quota, say) is found only when its first unit fails, and nothing on the
+    /// wire said so. This event is that signal, so a launcher can keep the seat out of the next
+    /// launch for a while instead of handing it work again.
+    SeatBenched {
+        session: String,
+        /// The unit whose worker or judge refused.
+        ord: u32,
+        /// The roster key of the benched seat.
+        cli: String,
+        /// The bench reason as persisted (`quota_exhausted (no success in the run)`).
+        reason: String,
+        /// Who benched it: `worker` or `judge`.
+        source: String,
+    },
     /// (core#500) A late `ApplyStepResult` from a killed or superseded tool attempt was silently
     /// discarded with no state change. Fires in two cases: (1) the run is already terminal when the
     /// result arrives — the killed attempt posted back AFTER `RunCancelled`; (2) the session's
@@ -1638,6 +1660,20 @@ impl CoreEvent {
                 "previousCli": previous_cli,
                 "newCli": new_cli,
                 "previousAttemptReaped": previous_attempt_reaped,
+            }),
+            CoreEvent::SeatBenched {
+                session,
+                ord,
+                cli,
+                reason,
+                source,
+            } => json!({
+                "type": "seatBenched",
+                "session": session,
+                "ord": ord,
+                "cli": cli,
+                "reason": reason,
+                "source": source,
             }),
             CoreEvent::ToolResultDiscarded {
                 session,

@@ -3435,6 +3435,17 @@ mod tests {
             ],
         );
         check(
+            CoreEvent::SeatBenched {
+                session: s(),
+                ord: 2,
+                cli: s(),
+                reason: s(),
+                source: s(),
+            },
+            "seatBenched",
+            &["type", "session", "ord", "cli", "reason", "source"],
+        );
+        check(
             CoreEvent::ToolResultDiscarded {
                 session: s(),
                 unit_ix: 0,

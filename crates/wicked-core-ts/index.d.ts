@@ -1019,6 +1019,11 @@ export declare class Subscription {
  * box without `bwrap`). The check results are real; a consumer folding enforcement must read
  * 'none' as UNENFORCED containment, never as a contained pass. 'best-effort' still means the
  * checks did NOT run.
+ * seatBenched {session, ord, cli, reason, source} (additive — a new `type` value, no existing shape
+ * changes): a seat was benched for the run by what its worker or judge said (`source: 'worker' |
+ * 'judge'`; `reason` the persisted bench reason, e.g. 'quota_exhausted (no success in the run)').
+ * Emitted once per seat, when the bench is added; a later unit planned on that seat is re-seated
+ * before it runs (`unitReassigned`). A launcher can keep the seat out of its next launches.
  */
 export interface CoreEventJson {
   type: string
