@@ -152,6 +152,25 @@ fn the_ops_watch_pack_ingests_and_its_warn_rules_fire_on_risky_calls_only() {
         "a Write's content is not a shell call: {:?}",
         claim.policy_ids
     );
+    // An ACP-shaped `Edit` whose raw input carries a `command` field (the bridge passes `rawInput`
+    // verbatim) is not a shell call either (Copilot on #701, round 2).
+    let edit = r#"{"tool_name":"Edit","tool_input":{"file_path":"/wt/a.rs","command":"sudo apt-get install jq"}}"#;
+    let (context, _) = pretool_context(edit, "wicked-agent/s/shared", "build");
+    let selected =
+        select_any(&store, "wicked-agent/s/shared", &["build"], &context).expect("select");
+    let claim = decide(&selected, "wicked-agent/s/shared", "build", &context, 1_000);
+    assert!(
+        claim.policy_ids.is_empty(),
+        "an Edit's command field is not a shell call: {:?}",
+        claim.policy_ids
+    );
+    // …while the same command on a codex-style `shell` tool does fire.
+    let shell = r#"{"tool_name":"shell","tool_input":{"command":"sudo apt-get install jq"}}"#;
+    let (context, _) = pretool_context(shell, "wicked-agent/s/shared", "build");
+    let selected =
+        select_any(&store, "wicked-agent/s/shared", &["build"], &context).expect("select");
+    let claim = decide(&selected, "wicked-agent/s/shared", "build", &context, 1_000);
+    assert_eq!(claim.policy_ids, vec!["OPS-WATCH-005".to_string()]);
     for &(id, cmd, want) in cases {
         let signals = SampleSignals {
             phase: Some("build".into()),

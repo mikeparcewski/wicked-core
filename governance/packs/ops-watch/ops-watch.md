@@ -27,8 +27,9 @@ units only: a unit that ran ungoverned emits `governanceUnenforced`, and the Wat
 "not checked" for it.
 
 Triggers are regexes over the canonical JSON of the evaluated tool call, anchored on its
-`"command"` field, so only a shell command can fire them: a `Write` whose content mentions `sudo`
-does not. The command is a JSON string there, so a newline reads as the two characters `\n`,
+`"command"` field AND on a shell tool name (`Bash`, `shell`, `execute`, …), so only a shell command
+can fire them: a `Write` whose content mentions `sudo` does not, and neither does an `Edit` whose
+arguments happen to carry a `command` field. The command is a JSON string there, so a newline reads as the two characters `\n`,
 which is why line-start matches accept `\\n` as well as a word boundary. `--force` is narrowed to the commands where it is
 destructive (`git push`, `git worktree remove`), as `GOV-FORCE-PUSH` does in the evals.
 
@@ -42,41 +43,41 @@ risky): precision 0.833, recall 1.000, F1 0.909 (floor 0.77). One false positive
   look: `rm -rf` of a path that does not start with `tmp`, `target`, `_` or a quoted variable
   (`tar`, `tarball` and `trash` do fire).
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:(\\n|\b)rm\s+-(rf|fr)\s+([^<_\s\\/t]|t([^am]|a([^r]|r([^g]|g([^e]|e[^t]))))|tm[^p]|<[^t]|/[^t]|/t[^m]|/tm[^p]))
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:(\\n|\b)rm\s+-(rf|fr)\s+([^<_\s\\/t]|t([^am]|a([^r]|r([^g]|g([^e]|e[^t]))))|tm[^p]|<[^t]|/[^t]|/t[^m]|/tm[^p]))|"command":"(?:[^"\\]|\\.)*?(?:(\\n|\b)rm\s+-(rf|fr)\s+([^<_\s\\/t]|t([^am]|a([^r]|r([^g]|g([^e]|e[^t]))))|tm[^p]|<[^t]|/[^t]|/t[^m]|/tm[^p])).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-002` (warn): A force push rewrites a remote branch's history.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bgit\s+push\b[^;&|\\]*\s(-f|--force)\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bgit\s+push\b[^;&|\\]*\s(-f|--force)\b)|"command":"(?:[^"\\]|\\.)*?(?:\bgit\s+push\b[^;&|\\]*\s(-f|--force)\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-003` (warn): Force-removing a git worktree discards whatever was uncommitted in it.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bgit\s+worktree\s+remove\b[^;&|\\]*\s(-f|--force)\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bgit\s+worktree\s+remove\b[^;&|\\]*\s(-f|--force)\b)|"command":"(?:[^"\\]|\\.)*?(?:\bgit\s+worktree\s+remove\b[^;&|\\]*\s(-f|--force)\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-004` (warn): Killing processes by name, or sending SIGKILL, can reach processes the
   run does not own.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:(\\n|\b)(pkill|killall)\s|(\\n|\b)kill\s+(-9|-KILL|-SIGKILL|-s\s+(KILL|SIGKILL)|-s\s+9)\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:(\\n|\b)(pkill|killall)\s|(\\n|\b)kill\s+(-9|-KILL|-SIGKILL|-s\s+(KILL|SIGKILL)|-s\s+9)\b)|"command":"(?:[^"\\]|\\.)*?(?:(\\n|\b)(pkill|killall)\s|(\\n|\b)kill\s+(-9|-KILL|-SIGKILL|-s\s+(KILL|SIGKILL)|-s\s+9)\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-005` (warn): `sudo` inside a governed run escalates past the run's boundary.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bsudo\s)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bsudo\s)|"command":"(?:[^"\\]|\\.)*?(?:\bsudo\s).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-006` (warn): `playwright install --with-deps` installs system packages: it changes
   the host, not the repository.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bplaywright\s+install\b[^;&|\\]*\s--with-deps\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bplaywright\s+install\b[^;&|\\]*\s--with-deps\b)|"command":"(?:[^"\\]|\\.)*?(?:\bplaywright\s+install\b[^;&|\\]*\s--with-deps\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-007` (warn): `npx --yes` downloads and runs a package without a prompt.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bnpx\s+(--yes|-y)\s)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bnpx\s+(--yes|-y)\s)|"command":"(?:[^"\\]|\\.)*?(?:\bnpx\s+(--yes|-y)\s).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-008` (warn): Piping a download into a shell runs code no one reviewed.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bcurl\b[^|;&\\]*\|\s*(ba|z)?sh\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bcurl\b[^|;&\\]*\|\s*(ba|z)?sh\b)|"command":"(?:[^"\\]|\\.)*?(?:\bcurl\b[^|;&\\]*\|\s*(ba|z)?sh\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-009` (warn): Publishing a package or cutting a release from inside a run leaves the
   machine.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bnpm\s+publish\b|\bgh\s+release\s+create\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bnpm\s+publish\b|\bgh\s+release\s+create\b)|"command":"(?:[^"\\]|\\.)*?(?:\bnpm\s+publish\b|\bgh\s+release\s+create\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-010` (warn): Merging a pull request from inside a run bypasses the operator's merge
   gate.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bgh\s+pr\s+merge\b)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bgh\s+pr\s+merge\b)|"command":"(?:[^"\\]|\\.)*?(?:\bgh\s+pr\s+merge\b).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 - `OPS-WATCH-011` (warn): A hard reset or a forced branch delete throws away commits.
   effect: warn
-  trigger: "command":"(?:[^"\\]|\\.)*?(?:\bgit\s+reset\s+--hard\b|\bgit\s+branch\s+-D\s)
+  trigger: (?:"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)".*?"command":"(?:[^"\\]|\\.)*?(?:\bgit\s+reset\s+--hard\b|\bgit\s+branch\s+-D\s)|"command":"(?:[^"\\]|\\.)*?(?:\bgit\s+reset\s+--hard\b|\bgit\s+branch\s+-D\s).*?"tool":"(?:Bash|bash|shell|Shell|execute|exec|exec_command|run_shell_command|run_terminal_cmd|terminal)")
 
 ## Sources
 
