@@ -138,35 +138,40 @@ pub struct TeamPlanState {
 
 /// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at
 /// `plan.compose` (`wicked_governance::rules_at_phase` over the derived plan context): the
-/// obligations of the held rules that fired, the advisory rules that applied, and any rule that
-/// denies the plan. Loaded by the actor (it holds the store); [`decide`] stays pure.
+/// obligations of the held rules that fired and the advisory rules that applied. Loaded by the
+/// actor (it holds the store); [`decide`] stays pure.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RulesEval {
     pub held: Vec<HeldObligation>,
     pub recalled: Vec<String>,
-    pub denied: Vec<String>,
 }
 
 impl RulesEval {
     /// `rules` as read for a plan: a fired `allow_with_conditions` rule contributes its
-    /// obligations, a fired `deny` rule refuses, a recall-only rule is recorded as considered.
+    /// obligations; a recall-only rule is recorded as considered. A plan.compose rule is
+    /// advisory or held — anything else is refused when written — so a fired row that is neither
+    /// (a `deny` / `allow` effect, or a held rule with no obligation, written before the check or
+    /// around it) becomes an obligation outside the vocabulary: floor fill refuses it naming the
+    /// rule, at compose and at a re-score alike (fail closed, one mechanism).
     pub(crate) fn from_phase_rules(rules: &wicked_governance::PhaseRules) -> Self {
         let mut out = RulesEval {
             recalled: rules.recalled.clone(),
             ..Default::default()
         };
         for p in &rules.fired {
+            let held = |token: &str| HeldObligation {
+                rule: p.id.clone(),
+                token: token.to_string(),
+            };
             match p.effect {
-                wicked_governance::Effect::Deny => out.denied.push(p.id.clone()),
-                wicked_governance::Effect::AllowWithConditions => {
-                    for token in &p.obligations {
-                        out.held.push(HeldObligation {
-                            rule: p.id.clone(),
-                            token: token.clone(),
-                        });
-                    }
+                wicked_governance::Effect::AllowWithConditions if !p.obligations.is_empty() => {
+                    out.held.extend(p.obligations.iter().map(|t| held(t)));
                 }
-                wicked_governance::Effect::Allow => out.recalled.push(p.id.clone()),
+                wicked_governance::Effect::AllowWithConditions => {
+                    out.held.push(held("(no obligation)"))
+                }
+                wicked_governance::Effect::Deny => out.held.push(held("effect:deny")),
+                wicked_governance::Effect::Allow => out.held.push(held("effect:allow")),
             }
         }
         out.recalled.sort();
@@ -326,16 +331,18 @@ pub(crate) fn rule_outcomes(
     held.sort();
     held.dedup();
     for rule in held {
-        let types: Vec<&str> = obligations
+        // A token is disabled when the override removed ANY phase it requires (floor fill treats
+        // either half of the walkthrough pair as the operator's own); the rule is `overridden`
+        // when every token it holds is disabled.
+        let disabled: Vec<bool> = obligations
             .iter()
             .filter(|o| o.rule == rule)
             .filter_map(|o| crate::plan::obligation_types(&o.token))
-            .flatten()
-            .copied()
+            .map(|types| types.iter().any(|t| removed.iter().any(|r| r == t)))
             .collect();
         let outcome = if filled.floor.is_empty() {
             RuleOutcomeKind::Recalled
-        } else if !types.is_empty() && types.iter().all(|t| removed.iter().any(|r| r == t)) {
+        } else if !disabled.is_empty() && disabled.iter().all(|d| *d) {
             RuleOutcomeKind::Overridden
         } else {
             RuleOutcomeKind::Applied
@@ -888,13 +895,6 @@ pub(crate) fn decide(
         deliver.is_some(),
     );
     let read = rules.eval(&context)?;
-    // A testing rule that denies the plan at compose refuses it, naming the rule.
-    if let Some(rule) = read.denied.first() {
-        return refuse(
-            events,
-            format!("rule {rule} denies this plan at plan.compose"),
-        );
-    }
     // The obligation ratchet: every held rule the run has fired, plus this proposal's.
     let obligations = union(&prior.obligations, &read.held);
     let recalled = union(&prior.recalled, &read.recalled);
@@ -1605,7 +1605,6 @@ mod tests {
                 token: "step:walkthrough".into(),
             }],
             recalled: vec!["TST-1001".into()],
-            denied: Vec::new(),
         }
     }
 
@@ -1768,23 +1767,44 @@ mod tests {
     #[test]
     fn wt_c3_a_denying_rule_refuses_and_an_overridden_rule_is_recorded() {
         let p = plan(json!({"steps": [{"catalog": "build"}], "touch": ["README.md"]}));
-        let deny = Fixed::new(
-            RulesEval {
-                denied: vec!["TST-DENY".into()],
-                ..RulesEval::default()
-            },
-            true,
-        );
-        let d = launch_decide(&p, &TeamPlanState::default(), &HumanConfirm::None, &deny);
-        assert!(
-            body_types(&d).contains(&ev::PLAN_REFUSED),
-            "{:?}",
-            body_types(&d)
-        );
-        let Verdict::Refused { reason } = d.verdict else {
-            panic!("refused")
+        // A fired deny (or allow) row at plan.compose — refused at write, so only a row written
+        // around the check — fails closed: the plan is refused naming the rule.
+        let policy = |id: &str, effect| wicked_governance::Policy {
+            id: id.into(),
+            kind: "testing".into(),
+            applies_to: vec![wicked_governance::PLAN_COMPOSE_PHASE.into()],
+            effect,
+            trigger: Default::default(),
+            obligations: Vec::new(),
+            criteria: String::new(),
+            severity: wicked_governance::Severity::Medium,
+            rule: String::new(),
+            retired: false,
         };
-        assert!(reason.contains("TST-DENY"), "{reason}");
+        for (id, effect) in [
+            ("TST-DENY", wicked_governance::Effect::Deny),
+            ("TST-ALLOW", wicked_governance::Effect::Allow),
+            ("TST-EMPTY", wicked_governance::Effect::AllowWithConditions),
+        ] {
+            let read = RulesEval::from_phase_rules(&wicked_governance::PhaseRules {
+                fired: vec![policy(id, effect)],
+                recalled: Vec::new(),
+            });
+            let src = Fixed::new(read, true);
+            let d = launch_decide(&p, &TeamPlanState::default(), &HumanConfirm::None, &src);
+            assert!(
+                body_types(&d).contains(&ev::PLAN_REFUSED),
+                "{:?}",
+                body_types(&d)
+            );
+            let Verdict::Refused { reason } = d.verdict else {
+                panic!("{id}: refused")
+            };
+            assert!(
+                reason.contains(id) && reason.contains("unknown_obligation"),
+                "{reason}"
+            );
+        }
         let over = plan(
             json!({"steps": [{"catalog": "build"}], "touch": ["README.md"],
             "override": {"remove": ["walkthrough_plan", "walkthrough_review"], "reason": "mine"}}),
@@ -1810,6 +1830,17 @@ mod tests {
             .steps
             .iter()
             .any(|s| s.catalog.starts_with("walkthrough")));
+        // Removing ONE half disables the pair too: the rule reads `overridden` (Copilot review).
+        let half = plan(
+            json!({"steps": [{"catalog": "build"}], "touch": ["README.md"],
+            "override": {"remove": ["walkthrough_review"], "reason": "mine"}}),
+        );
+        let d = launch_decide(&half, &TeamPlanState::default(), &HumanConfirm::All, &src);
+        let rules = d.state.pending.expect("held").rules;
+        assert_eq!(
+            rules[1].outcome,
+            crate::team::events::RuleOutcomeKind::Overridden
+        );
     }
 
     fn body_types(d: &Decided) -> Vec<&'static str> {

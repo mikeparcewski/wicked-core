@@ -2609,7 +2609,15 @@ pub(super) fn on_rescored(
     let band_rises = crate::plan_gate::floor_rises(tp, score, scored.destructive)
         && waiting.is_none_or(|r| r.score < score || (!r.destructive && scored.destructive));
     if !band_rises && new_obligations.is_empty() {
-        return Ok(());
+        // An advisory rule the settled diff newly applied raises nothing, but it was considered:
+        // ratchet it onto the run's record, where the next rev's `plan.accepted.rules` reads it.
+        if new_recalled.is_empty() {
+            return Ok(());
+        }
+        if let Some(tp) = session.team_plan.as_mut() {
+            tp.recalled = crate::plan_gate::union(&tp.recalled, &new_recalled);
+        }
+        return put_node(store, session.to_node());
     }
     let fact = crate::plan_gate::path_scored_diff(
         run_id,

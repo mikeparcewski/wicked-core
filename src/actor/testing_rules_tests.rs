@@ -107,6 +107,13 @@ fn a_rescore_that_newly_fires_a_held_rule_is_held_for_the_boundary() {
         "trigger": {"contains": "\"paths\":\\[[^\\]]*\"docs/payments/"}}))
     .unwrap();
     wicked_governance::register_rule(&mut store, &rule).unwrap();
+    // An advisory (recall-only) rule every project reads.
+    let advisory: wicked_governance::ConformanceRule = serde_json::from_value(serde_json::json!({
+        "id": "TST-1001", "rule_type": "policy", "statement": "Docs-only changes get the repo's checks only.",
+        "severity": "info", "confidence": 0.9, "steering_type": "testing",
+        "applies_to": ["plan.compose"], "trigger": {"contains": "\"kinds\":\\[\"docs\"\\]"}}))
+    .unwrap();
+    wicked_governance::register_rule(&mut store, &advisory).unwrap();
     let paths = vec!["docs/payments/refunds.md".to_string()];
     let tree = "0123456789abcdef0123456789abcdef01234567";
     super::on_rescored(&mut store, "r-pay", 1, 0, 1, tree, &paths).unwrap();
@@ -122,7 +129,15 @@ fn a_rescore_that_newly_fires_a_held_rule_is_held_for_the_boundary() {
     // A second re-score of the same diff adds nothing.
     super::on_rescored(&mut store, "r-pay", 1, 0, 2, tree, &paths).unwrap();
     assert_eq!(rescored(&store, "r-pay").unwrap().obligations.len(), 1);
-    // Another project's run: the rule is not its, and a docs diff raises no band.
+    assert_eq!(rescored(&store, "r-pay").unwrap().recalled, ["TST-1001"]);
+    // Another project's run: the held rule is not its, and a docs diff raises no band — but the
+    // advisory rule it newly applied is ratcheted onto its record (Copilot review).
     super::on_rescored(&mut store, "r-other", 1, 0, 1, tree, &paths).unwrap();
     assert!(rescored(&store, "r-other").is_none());
+    let tp = crate::domain::get_session(&store, "r-other")
+        .unwrap()
+        .unwrap()
+        .team_plan
+        .unwrap();
+    assert_eq!(tp.recalled, ["TST-1001"]);
 }
