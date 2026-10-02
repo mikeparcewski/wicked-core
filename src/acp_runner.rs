@@ -19417,6 +19417,50 @@ transport = "stdio"
         assert_eq!(recommended(&with_default), vec![Some(1)]);
     }
 
+    /// C3 (Copilot on #702): the recommendation is an index into the options AS DELIVERED. A
+    /// select of 101 options is cut to 100 at registration: a default in the cut tail recommends
+    /// nothing, while the last delivered option is recommended at its delivered index.
+    #[test]
+    #[cfg(unix)]
+    fn a_recommendation_the_option_cap_cut_is_not_delivered() {
+        let recommended = |commands: &[Command]| -> Vec<Option<u32>> {
+            commands
+                .iter()
+                .filter_map(|c| match c {
+                    Command::EmitEvent(crate::event::CoreEvent::ElicitationCreated {
+                        recommended,
+                        options,
+                        ..
+                    }) => {
+                        assert_eq!(options.as_ref().map(Vec::len), Some(100), "the cap holds");
+                        Some(*recommended)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let with_default = |default: &str, tag: &str| {
+            let mut fixture: Value = serde_json::from_str(ASK_USER_QUESTION_FIXTURE).unwrap();
+            let q = &mut fixture["single_select"]["requestedSchema"]["properties"]["question_0"];
+            let mut opts = vec![json!({"const": "Postgres", "title": "Postgres"})];
+            opts.extend(
+                (1..=100).map(|i| json!({"const": format!("o{i}"), "title": format!("o{i}")})),
+            );
+            q["oneOf"] = Value::Array(opts);
+            q["default"] = json!(default);
+            let (result, commands) =
+                run_ask_turn_replaying("ask_single", Some("Postgres"), &fixture.to_string(), tag);
+            assert_eq!(result.status, StepStatus::Ok, "{}", result.output);
+            recommended(&commands)
+        };
+        assert_eq!(with_default("o100", "-cut"), vec![None], "cut by the cap");
+        assert_eq!(
+            with_default("o99", "-kept"),
+            vec![Some(99)],
+            "the last delivered"
+        );
+    }
+
     /// core#594: a multi-select AskUserQuestion (`type: "array"`, options under
     /// `items.anyOf`) reaches the decider, and the chosen option goes back as a one-element
     /// ARRAY — the shape the adapter's schema declares.
