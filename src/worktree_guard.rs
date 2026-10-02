@@ -466,6 +466,50 @@ pub(crate) fn tree_changed_since(
     Ok(after.tree != baseline.tree)
 }
 
+/// (TR-W1b, DES-trigger-registry §4.4 row 4) At most this many changed paths ride a creator
+/// floor's `repoChecksEvaluated.changed`; the rest is `changed_truncated: true`.
+pub(crate) const CHANGED_PATHS_CAP: usize = 200;
+
+/// (TR-W1b) The paths that differ between the unit's dispatch BASELINE tree and `after_tree` (the
+/// tree its creator floor ran on), through the baseline's PINNED git dir — never the worktree's own
+/// `.git` file. Every way of editing is covered (a shell `sed` as much as a `Write` call): the
+/// trees are content, not tool calls. Repo-relative, `git diff-tree --name-status` statuses.
+/// `Ok(vec![])` when the trees are equal; `Err` when the baseline has no pin or git fails.
+pub(crate) fn changed_since(
+    worktree: &Path,
+    baseline: &WorktreeSnapshot,
+    after_tree: &str,
+) -> anyhow::Result<Vec<ChangedPath>> {
+    if after_tree == baseline.tree {
+        return Ok(Vec::new());
+    }
+    let git_dir = baseline
+        .git_dir
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the baseline snapshot carries no pinned git dir"))?;
+    let git_dir = Path::new(git_dir);
+    Ok(parse_name_status_z(&git(
+        worktree,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-status",
+            "--no-renames",
+            &baseline.tree,
+            after_tree,
+        ],
+        &[("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)],
+    )?))
+}
+
+/// (TR-W1b) Cut `changed` at [`CHANGED_PATHS_CAP`]: the kept paths and whether any were cut.
+pub(crate) fn capped(mut changed: Vec<ChangedPath>) -> (Vec<ChangedPath>, bool) {
+    let truncated = changed.len() > CHANGED_PATHS_CAP;
+    changed.truncate(CHANGED_PATHS_CAP);
+    (changed, truncated)
+}
+
 /// Parse `git diff-tree -r -z --name-status --no-renames` output: `<status>\0<path>\0` pairs.
 fn parse_name_status_z(raw: &[u8]) -> Vec<ChangedPath> {
     let mut out = Vec::new();
@@ -930,6 +974,67 @@ mod tests {
         let mut u = WorkUnit::pending("s:verify", "s", 4, "verify");
         u.worktree_guarded = true;
         u
+    }
+
+    /// TR-W1b: a creator's changed paths are the baseline tree against the floor's tree — every
+    /// way of editing (a shell redirect here, not a tool call), tracked or new, deletions too —
+    /// and nothing when the tree did not change; a baseline with no pinned git dir is an error.
+    #[test]
+    fn changed_since_lists_every_path_the_tree_changed_by_any_means() {
+        let wt = creator_worktree("changed-since");
+        let baseline = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert!(changed_since(&wt, &baseline, &baseline.tree)
+            .unwrap()
+            .is_empty());
+        // A shell-made edit to a tracked file, a new file and a deletion.
+        let sh = |script: &str| {
+            use wicked_apps_core::spawn::HardenedCommand;
+            let out = std::process::Command::new("sh")
+                .hardened()
+                .arg("-c")
+                .arg(script)
+                .current_dir(&wt)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{script}: {out:?}");
+        };
+        sh("echo '// via the shell' >> src/a.ts");
+        sh("echo c > src/c.ts");
+        sh("rm config/settings.local.json");
+        let after = snapshot(&wt, &repo_of(&wt)).unwrap();
+        let got: Vec<(String, String)> = changed_since(&wt, &baseline, &after.tree)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.status, c.path))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("D".to_string(), "config/settings.local.json".to_string()),
+                ("M".to_string(), "src/a.ts".to_string()),
+                ("A".to_string(), "src/c.ts".to_string()),
+            ]
+        );
+        let mut unpinned = baseline.clone();
+        unpinned.git_dir = None;
+        assert!(changed_since(&wt, &unpinned, &after.tree).is_err());
+    }
+
+    #[test]
+    fn changed_paths_are_capped_at_200_and_say_so() {
+        let paths = |n: usize| -> Vec<ChangedPath> {
+            (0..n)
+                .map(|i| ChangedPath {
+                    status: "A".into(),
+                    path: format!("f{i}"),
+                })
+                .collect()
+        };
+        let (kept, cut) = capped(paths(200));
+        assert_eq!((kept.len(), cut), (200, false));
+        let (kept, cut) = capped(paths(201));
+        assert_eq!((kept.len(), cut), (200, true));
+        assert_eq!(kept[199].path, "f199");
     }
 
     #[test]

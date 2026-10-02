@@ -4033,6 +4033,9 @@ mod tests {
                 floor: s(),
                 claim: None,
                 env: None,
+                // (TR-W1b) Absent on the wire when empty: the key set is unchanged.
+                changed: vec![],
+                changed_truncated: false,
             },
             "repoChecksEvaluated",
             &[

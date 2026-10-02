@@ -895,6 +895,9 @@ pub(crate) fn lift_and_reverify(
             floor: crate::repo_checks::FloorStage::Verify.as_wire().to_string(),
             claim: None,
             env: checks.env.clone(),
+            // (TR-W1b) Changed paths ride the CREATOR floor only.
+            changed: Vec::new(),
+            changed_truncated: false,
         });
         Err(text)
     };

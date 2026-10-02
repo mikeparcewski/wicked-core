@@ -1139,6 +1139,13 @@ pub(crate) fn apply_and_finish_unit(
         match &evidence.repo_checks {
             Some(report) => {
                 unit.repo_checks = Some(report.clone());
+                let verify_floor =
+                    unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit);
+                let (changed, changed_truncated) = if verify_floor {
+                    (Vec::new(), false)
+                } else {
+                    creator_changed_paths(unit, workdir.as_deref(), report)
+                };
                 emit(CoreEvent::RepoChecksEvaluated {
                     session: session_id.to_string(),
                     ord: unit.ord,
@@ -1154,16 +1161,17 @@ pub(crate) fn apply_and_finish_unit(
                     // (L1↔L2 contract, review-L2-505 / DES-L2 §4) The deliver TOOL unit runs the
                     // VERIFY floor over the tree it ships — its frame reads `verify`, never
                     // `creator`, exactly like a declared `repo_checks_floor` phase.
-                    floor:
-                        if unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit) {
-                            crate::repo_checks::FloorStage::Verify
-                        } else {
-                            crate::repo_checks::FloorStage::Creator
-                        }
-                        .as_wire()
-                        .to_string(),
+                    floor: if verify_floor {
+                        crate::repo_checks::FloorStage::Verify
+                    } else {
+                        crate::repo_checks::FloorStage::Creator
+                    }
+                    .as_wire()
+                    .to_string(),
                     claim: report.claim.clone(),
                     env: report.env.clone(),
+                    changed,
+                    changed_truncated,
                 });
                 if default_floor_refused_unsandboxed {
                     eprintln!(
@@ -1800,6 +1808,36 @@ pub(crate) fn apply_and_finish_unit(
         }
     });
     Ok(outcome)
+}
+
+/// (TR-W1b, DES-trigger-registry §4.4 row 4) The paths a creator unit changed, for its floor's
+/// `repoChecksEvaluated`: the unit's dispatch baseline tree against the tree its checks ran on
+/// (`RepoChecksReport::tree`), through the baseline's pinned git dir, capped at
+/// [`crate::worktree_guard::CHANGED_PATHS_CAP`] (`true` = cut). Empty when either tree is unknown,
+/// the trees are equal, or the diff fails (logged): a consumer reads "no paths", never a guess.
+fn creator_changed_paths(
+    unit: &crate::domain::WorkUnit,
+    workdir: Option<&str>,
+    report: &crate::repo_checks::RepoChecksReport,
+) -> (Vec<crate::worktree_guard::ChangedPath>, bool) {
+    let (Some(wd), Some(baseline), Some(after)) = (
+        workdir,
+        unit.worktree_baseline.as_ref(),
+        report.tree.as_deref(),
+    ) else {
+        return (Vec::new(), false);
+    };
+    match crate::worktree_guard::changed_since(std::path::Path::new(wd), baseline, after) {
+        Ok(changed) => crate::worktree_guard::capped(changed),
+        Err(e) => {
+            eprintln!(
+                "wicked-core: unit {}: the changed paths of its creator floor could not be \
+                 listed: {e}",
+                unit.ord
+            );
+            (Vec::new(), false)
+        }
+    }
 }
 
 /// Re-verify a unit's APPROVED pinned validator against the worktree (rev0.4 gate layer-1). Returns

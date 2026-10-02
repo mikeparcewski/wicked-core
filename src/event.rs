@@ -994,6 +994,13 @@ pub enum CoreEvent {
         /// (F-RC2-009, additive) The environment the checks ran under — read it beside a
         /// `floor_env_mismatch` check. `None` when the checks did not run.
         env: Option<crate::repo_checks::FloorEnv>,
+        /// (TR-W1b, additive) On a CREATOR floor: the paths the unit changed — its dispatch
+        /// baseline tree against the tree the checks ran on, through the pinned git dir — capped
+        /// at [`crate::worktree_guard::CHANGED_PATHS_CAP`]. Empty (absent on the wire) when the
+        /// tree did not change, on a verify floor, or when the diff could not be taken.
+        changed: Vec<crate::worktree_guard::ChangedPath>,
+        /// (TR-W1b, additive) `true` when `changed` was cut at the cap.
+        changed_truncated: bool,
     },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
@@ -2233,7 +2240,10 @@ impl CoreEvent {
                 floor,
                 claim,
                 env,
-            } => json!({
+                changed,
+                changed_truncated,
+            } => {
+                let mut v = json!({
                 "type": "repoChecksEvaluated",
                 "session": session,
                 "ord": ord,
@@ -2249,7 +2259,15 @@ impl CoreEvent {
                 "floor": floor,
                 "claim": claim.as_ref().map(claim_check_json),
                 "env": env.as_ref().map(floor_env_json),
-            }),
+                });
+                // (TR-W1b) Absent when the tree did not change, so an older frame and a no-change
+                // frame read the same.
+                if !changed.is_empty() {
+                    v["changed"] = json!(changed.iter().map(changed_path_json).collect::<Vec<_>>());
+                    v["changedTruncated"] = json!(changed_truncated);
+                }
+                v
+            }
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {
                 session,
@@ -2383,6 +2401,47 @@ impl CoreEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TR-W1b: `repoChecksEvaluated.changed` / `changedTruncated` ride the wire only when the
+    /// creator's tree changed — a no-change frame is byte-identical to one from before the field.
+    #[test]
+    fn repo_checks_changed_paths_are_on_the_wire_only_when_the_tree_changed() {
+        let frame = |changed: Vec<crate::worktree_guard::ChangedPath>, cut: bool| {
+            CoreEvent::RepoChecksEvaluated {
+                session: "s".into(),
+                ord: 2,
+                attempt: 0,
+                passed: true,
+                criterion: "c".into(),
+                checks: Vec::new(),
+                skipped: Vec::new(),
+                sandbox_level: "sandboxed".into(),
+                sandbox_error: None,
+                detect_error: None,
+                outcome: "passed".into(),
+                floor: "creator".into(),
+                claim: None,
+                env: None,
+                changed,
+                changed_truncated: cut,
+            }
+            .to_json()
+        };
+        let none = frame(Vec::new(), false);
+        assert!(none.get("changed").is_none() && none.get("changedTruncated").is_none());
+        let some = frame(
+            vec![crate::worktree_guard::ChangedPath {
+                status: "M".into(),
+                path: "src/a.rs".into(),
+            }],
+            true,
+        );
+        assert_eq!(
+            some["changed"],
+            serde_json::json!([{"status": "M", "path": "src/a.rs"}])
+        );
+        assert_eq!(some["changedTruncated"], true);
+    }
 
     /// The throttled live-output frame: camelCase tag `unitOutputDelta`, and `attempt` MUST ride
     /// alongside `session`/`ord`/`text` — it is what lets a consumer discard a superseded

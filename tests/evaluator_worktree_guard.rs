@@ -1027,6 +1027,36 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     assert_eq!(floor, "creator");
     assert_eq!(outcome, "failed");
     assert!(!passed);
+    // TR-W1b: the creator floor's frame names every path the fix changed — its dispatch baseline
+    // against the tree the checks ran on — on the wire too.
+    let frame = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::RepoChecksEvaluated {
+                ord: 3,
+                changed,
+                changed_truncated,
+                ..
+            } => Some((changed.clone(), *changed_truncated, ev.to_json())),
+            _ => None,
+        })
+        .expect("the creator floor's frame");
+    let named: Vec<(&str, &str)> = frame
+        .0
+        .iter()
+        .map(|c| (c.status.as_str(), c.path.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("M", "src/app.ts"),
+            ("A", "src/fix.ts"),
+            ("M", "src/lib.rs")
+        ]
+    );
+    assert!(!frame.1);
+    assert_eq!(frame.2["changed"][1]["path"], "src/fix.ts");
+    assert_eq!(frame.2["changedTruncated"], false);
     // The formatter runs first and is clean here; the regression is in the test set (core#551) —
     // at the creator floor of this unconfigured repo, the set derived from the touched crate
     // (core#482), its ids qualified by their binary (core#481).

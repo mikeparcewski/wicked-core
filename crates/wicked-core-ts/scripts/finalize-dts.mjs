@@ -126,6 +126,10 @@ const HAND_AUTHORED = `${BEGIN}
  * 'judge'\`; \`reason\` the persisted bench reason, e.g. 'quota_exhausted (no success in the run)').
  * Emitted once per seat, when the bench is added; a later unit planned on that seat is re-seated
  * before it runs (\`unitReassigned\`). A launcher can keep the seat out of its next launches.
+ * TR-W1b (additive): a CREATOR floor's repoChecksEvaluated carries \`changed: {status, path}[]\` —
+ * every path the unit changed (its dispatch baseline tree against the tree the checks ran on,
+ * repo-relative, \`git diff-tree --name-status\` statuses, any way of editing) — capped at 200, and
+ * \`changedTruncated: boolean\`. Both are ABSENT when the tree did not change and on a verify floor.
  */
 export interface CoreEventJson {
   type: string
