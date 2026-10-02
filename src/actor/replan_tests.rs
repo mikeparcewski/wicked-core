@@ -294,6 +294,7 @@ fn launch_on(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps, seats: &[&st
             plan: Some(p),
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .expect("launch");
 }
@@ -1549,6 +1550,7 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
             plan: Some(p),
             deliver_step: None,
             exclude_seats: Vec::new(),
+            evidence_root: None,
         })
         .unwrap();
     let scored = settled(&e, "rrepo", tev::PATH_SCORED, 1);

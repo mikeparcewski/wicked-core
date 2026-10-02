@@ -27,9 +27,15 @@
 //! | phase                                     | posture                 |
 //! |-------------------------------------------|-------------------------|
 //! | `executes_code: true`, Tool, prose-planned | [`WritePosture::Full`]  |
+//! | catalog `walkthrough_plan` (evaluator), BOUND | [`WritePosture::DeliverableRoots`] |
 //! | `executes_code: false`, evaluator/neutral  | [`WritePosture::ReadOnly`] |
 //! | `executes_code: false`, creator, BOUND     | [`WritePosture::DeliverableRoots`] |
 //! | `executes_code: false`, creator, UNBOUND   | [`WritePosture::Full`]  |
+//!
+//! The first row is the one evaluator that writes (WT-C1, DES-walkthrough-proof §4.3 B3): the
+//! walkthrough author writes its storyline into `<evidence root>/author/<step>/`, a declared
+//! extra write root, never the tree. It is keyed off the catalog id, never the prompt; unbound it
+//! stays read-only like every other evaluator.
 //!
 //! A creator keeps `Write`/`Edit` INSIDE its granted write roots and is refused everywhere else —
 //! the worktree included when there is one, because the guard would deny that change at the fold
@@ -37,7 +43,7 @@
 //! policy. An unbound creator has no tree to protect: its cwd is a throwaway sandbox and its
 //! deliverable a file in a declared root, so the ordinary filesystem boundary (cwd + the
 //! launch-validated extras) is the whole posture. Evaluators and recon rungs stay read-only: their
-//! verdict is their output.
+//! verdict is their output (the walkthrough author excepted, see the table).
 //!
 //! D14: since the plan stopped guarding creators (`worktree_guarded = !executes_code && !tool &&
 //! role != Creator`), a creator planned by this engine is never guarded and so gets
@@ -62,9 +68,10 @@ pub(crate) enum WritePosture {
     /// The ordinary filesystem boundary: the unit cwd plus the launch-validated extra write roots.
     /// No phase-level fence on top.
     Full,
-    /// A BOUND creator whose phase declared `executes_code: false`: write-class calls are allowed
-    /// inside the run's declared extra write roots and refused everywhere else, the worktree
-    /// (the tree under review) included.
+    /// A BOUND creator whose phase declared `executes_code: false`, or the bound walkthrough author
+    /// (catalog `walkthrough_plan`, an evaluator; WT-C1): write-class calls are allowed inside the
+    /// run's declared extra write roots and refused everywhere else, the worktree (the tree under
+    /// review) included.
     DeliverableRoots,
     /// An `executes_code: false` agent phase that does not play creator — an evaluator, a recon
     /// rung, a review: every write-class call is refused. `bash` stays (the phase must run the

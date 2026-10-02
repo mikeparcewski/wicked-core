@@ -743,6 +743,12 @@ pub struct LaunchOptions {
     /// (`claude#2`). UNIONED into the engine's computed exclusion (the work author, the team
     /// monitors), so it can only narrow the judge choice. Omit for today's behaviour.
     pub exclude_seats: Option<Vec<String>>,
+    /// (WT-C2) The run's evidence root — an absolute directory the launcher minted for this run
+    /// (`<home>/.wicked/walkthroughs/<runId>`). The walkthrough author writes under
+    /// `<root>/author/<step>/` (list `<root>/author` in `extraWriteRoots`); the jailed
+    /// `walkthrough_review` Tool writes `<root>/<step>/`. Validated like a write root. Omit and no
+    /// walkthrough can pass on the run.
+    pub evidence_root: Option<String>,
 }
 
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
@@ -794,6 +800,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         plan,
         deliver_step,
         exclude_seats: o.exclude_seats.unwrap_or_default(),
+        evidence_root: o.evidence_root,
     })
 }
 

@@ -426,6 +426,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         plan: None,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     })
     .expect("launch domain-extraction");
 }

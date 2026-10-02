@@ -70,6 +70,7 @@ fn fixture(
             ..TeamPlanState::default()
         }),
         exclude_seats: Vec::new(),
+        evidence_root: None,
     };
     put_node(store, session.to_node()).unwrap();
     for (i, (phase, st, last)) in units.iter().enumerate() {

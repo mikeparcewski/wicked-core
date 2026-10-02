@@ -122,6 +122,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         plan: None,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     }
 }
 
@@ -555,6 +556,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         plan: None,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     })
     .expect("launch the bug-shaped workflow");
 

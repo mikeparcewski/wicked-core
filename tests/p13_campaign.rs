@@ -641,6 +641,7 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         team: None,
         team_plan: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     }
 }
 

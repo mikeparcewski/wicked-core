@@ -446,6 +446,19 @@ pub(crate) struct SandboxLauncher {
 enum NetworkPolicy {
     Deny,
     Allow,
+    /// (WT-C2, DES-walkthrough-proof §4.4) Loopback only: connect to and bind on `localhost`, and
+    /// nothing else — the walkthrough recorder starts the app on a loopback port and drives it
+    /// there. macOS: the deny plus loopback allows; Linux bwrap: `--unshare-net` (the new network
+    /// namespace has only `lo`). No system-temp carve-out: the caller hands its private temp dir in
+    /// as a write root.
+    LoopbackOnly,
+}
+
+impl NetworkPolicy {
+    /// Whether the jail must cut the network (all of it, or all but loopback).
+    fn restricts(self) -> bool {
+        !matches!(self, NetworkPolicy::Allow)
+    }
 }
 
 /// The curated set of high-value secret directories whose READS the OS sandbox blocks (macOS
@@ -519,8 +532,16 @@ fn macos_sandbox_profile_for_roots(
 ) -> Option<String> {
     let primary = write_roots.first()?.canonicalize().ok()?;
     let mut p = String::from("(version 1)\n(allow default)\n");
-    if matches!(network, NetworkPolicy::Deny) {
+    if network.restricts() {
         p.push_str("(deny network*)\n");
+    }
+    if matches!(network, NetworkPolicy::LoopbackOnly) {
+        // After the deny, so these win for loopback only (A12, spiked on macOS 26: a loopback
+        // bind + connect succeeds, a connect to a public address is refused with EPERM, and no
+        // name resolves because the resolver's own traffic is refused).
+        p.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+        p.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+        p.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
     }
     // C3: explicitly DENY reads of the curated high-value secret dirs (after `allow default`, so the
     // deny wins for those paths). Resolved from HOME; SBPL-quoted like the cwd. Missing HOME ⇒ no rules.
@@ -585,6 +606,13 @@ fn detect_sandbox_launcher_for_roots(
     launcher_for_roots_masking(write_roots, network, secret_read_block_dirs())
 }
 
+/// (WT-C2) The jail the `walkthrough_review` Tool runs in: writes only under `write_roots`, network
+/// to loopback only, the curated secret dirs unreadable. Only a `Sandboxed` launcher jails it — a
+/// network-only `firejail` contains no writes — so the caller treats any other level as "no jail".
+pub(crate) fn loopback_jail(write_roots: &[&Path]) -> SandboxLauncher {
+    detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::LoopbackOnly)
+}
+
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
 /// Linux regression test uses (a home lacking some of the six) without touching the process env.
 fn launcher_for_roots_masking(
@@ -638,7 +666,8 @@ fn launcher_for_roots_masking(
                 "--die-with-parent".to_string(),
                 "--unshare-pid".to_string(),
             ];
-            if matches!(network, NetworkPolicy::Deny) {
+            if network.restricts() {
+                // LoopbackOnly too: bwrap brings `lo` up in the new namespace, and nothing else.
                 w.push("--unshare-net".to_string());
             }
             // C8 (revised, core#460 CI leg): NO `--tmpfs` over the system temp dir. A validator's
@@ -827,7 +856,7 @@ pub(crate) fn launcher_failure(wrapper: &[String], stderr_first_line: &str) -> O
 
 /// Apply the cross-platform env FLOOR: clear the child environment, then re-add only the non-secret
 /// allowlist ([`ENV_PASSTHROUGH`]) copied from the current process. Drops API keys / tokens / etc.
-fn apply_minimal_env(cmd: &mut Command) {
+pub(crate) fn apply_minimal_env(cmd: &mut Command) {
     cmd.env_clear();
     for key in ENV_PASSTHROUGH {
         if let Some(val) = std::env::var_os(key) {
@@ -1204,6 +1233,21 @@ pub fn run_validator_reporting(
     cwd: &Path,
     db_path: Option<&str>,
 ) -> anyhow::Result<(ValidatorOutcome, SandboxLevel)> {
+    run_validator_reporting_with_env(v, cwd, db_path, &[])
+}
+
+/// [`run_validator_reporting`] with explicit variables injected into the cleared child env, in the
+/// pattern of `WICKED_COVERAGE_DB` — never a passthrough. The walkthrough validators are the one
+/// caller (WT-C2, DES-walkthrough-proof §4.3 B1): `WICKED_EVIDENCE_ROOT` = the step's root, and
+/// for the author's lint `WICKED_GARDEN_ROOT` = the skills generation
+/// ([`crate::walkthrough::validator_env`]). Set after the allowlist, so they cannot be shadowed
+/// by it; the engine's own variables (`WICKED_ESTATE_DB`, …) are still stripped below.
+pub fn run_validator_reporting_with_env(
+    v: &DeterministicValidator,
+    cwd: &Path,
+    db_path: Option<&str>,
+    extra_env: &[(String, String)],
+) -> anyhow::Result<(ValidatorOutcome, SandboxLevel)> {
     if !v.approved {
         anyhow::bail!(
             "refusing to run an UNAPPROVED validator (fail-closed): an LLM-authored script must be \
@@ -1270,6 +1314,9 @@ pub fn run_validator_reporting(
     cmd.env("TMPDIR", tmp.path())
         .env("TMP", tmp.path())
         .env("TEMP", tmp.path());
+    for (k, val) in extra_env {
+        cmd.env(k, val);
+    }
     // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
     // relying on PATH — essential in CI where the binary is invoked by absolute path.
     //

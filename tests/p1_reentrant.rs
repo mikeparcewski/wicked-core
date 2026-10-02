@@ -137,6 +137,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         plan: None,
         deliver_step: None,
         exclude_seats: Vec::new(),
+        evidence_root: None,
     }
 }
 
