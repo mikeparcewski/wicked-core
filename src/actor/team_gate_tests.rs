@@ -152,6 +152,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch");
 }
@@ -1653,6 +1654,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1821,6 +1823,7 @@ fn launch_member_run(e: &Engine, run: &str) {
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch");
 }
@@ -2593,6 +2596,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
                 "touch": ["src/sso.rs"]
             }))),
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch");
 }
@@ -2981,6 +2985,7 @@ fn try_launch_plan(
         project_graph: None,
         plan: Some(steps(body)),
         deliver_step,
+        exclude_seats: Vec::new(),
     })
 }
 

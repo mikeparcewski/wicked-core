@@ -82,6 +82,7 @@ fn spec(session_id: &str, problem: &str, human_confirm: HumanConfirm) -> LaunchS
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     }
 }
 

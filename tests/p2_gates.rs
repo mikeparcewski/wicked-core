@@ -94,6 +94,7 @@ fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     }
 }
 

@@ -11812,6 +11812,7 @@ mod project_graph_end_to_end_tests {
             project_graph: pg,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         };
 
         // 1. BOUND.

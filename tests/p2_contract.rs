@@ -191,6 +191,7 @@ fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> Launc
         project_graph: None,
         plan: None,
         deliver_step: None,
+        exclude_seats: Vec::new(),
     }
 }
 

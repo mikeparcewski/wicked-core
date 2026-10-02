@@ -455,6 +455,7 @@ pub(crate) fn pre_distribute(
         benched_seats: Vec::new(),
         team: None,
         team_plan: None,
+        exclude_seats: Vec::new(),
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -465,6 +466,8 @@ pub(crate) fn pre_distribute(
             session.run_branch = existing.run_branch;
             session.base_commit = existing.base_commit;
             session.benched_seats = existing.benched_seats;
+            // (EP-K3) The launch's judge exclusion is the run's, recorded on the stub.
+            session.exclude_seats = existing.exclude_seats;
             // (DES-TEAMING-002 T3) The team state (P1's transport, path floor and gate counter)
             // and the plan state are the run's, not the plan's: a plan written onto a launch stub
             // (or re-planned at an edit) keeps them.

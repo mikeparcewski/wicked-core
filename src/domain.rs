@@ -225,6 +225,26 @@ pub struct AgentSession {
     /// [`RunTeamState::gate_seq`] (one counter for every team gate). `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_plan: Option<crate::plan_gate::TeamPlanState>,
+    /// (EP-K3, DES-artifact-editor-plugins §7.6) Seats the launcher asked the engine never to
+    /// convene as a JUDGE on this run (`LaunchSpec::exclude_seats`): cli keys or seat instances,
+    /// trimmed, empties dropped. Unioned into every unit's judge exclusion, so it can only NARROW
+    /// the choice — it never removes the work author or a team monitor. Persisted so a
+    /// resume/redrive keeps it. `#[serde(default)]` + skip-if-empty: older sessions read `[]` and
+    /// a run without it serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_seats: Vec<String>,
+}
+
+/// (EP-K3) A launch's `exclude_seats` as the session keeps it: trimmed, empties dropped, first-seen
+/// order, no repeats.
+pub fn normalize_exclude_seats(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in raw.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !out.iter().any(|o| o == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
 }
 
 /// A team run's durable team state ([`AgentSession::team`], DES-TEAMING-002 §4.7). Written by the
@@ -849,6 +869,12 @@ pub struct WorkUnit {
     /// serialize byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<UnitTeamSnapshot>,
+    /// (EP-K3) The run's launch-time judge exclusion ([`AgentSession::exclude_seats`]), stamped by
+    /// the actor at dispatch so it rides to the worker (in-process or over the bus) with the
+    /// unit. The judge selection unions it into its exclusion set. Skip-if-empty: every other
+    /// unit serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_seats: Vec<String>,
     /// (T6, DES-002 §8.8) Set for a member's step (`owner: team`) of a team run: the member seat
     /// and the PA's review state. Skip-if-none: every other unit serializes byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1128,6 +1154,7 @@ impl WorkUnit {
             rework_of: None,
             rework_amendment: None,
             status: UnitStatus::Pending,
+            exclude_seats: Vec::new(),
         }
     }
 
@@ -1460,7 +1487,30 @@ mod tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         }
+    }
+
+    /// EP-K3: a session with no launch exclusion serializes WITHOUT the key (byte-identical to a
+    /// pre-K3 row), an old row reads `[]`, and a set exclusion round-trips. The launch's list is
+    /// normalized: trimmed, empties dropped, first-seen order, no repeats.
+    #[test]
+    fn exclude_seats_is_absent_when_empty_and_round_trips_when_set() {
+        let s = sample_session();
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("exclude_seats").is_none(), "{v}");
+        let back: AgentSession = serde_json::from_value(v).unwrap();
+        assert!(back.exclude_seats.is_empty());
+        let mut set = sample_session();
+        set.exclude_seats = vec!["codex".into(), "claude#2".into()];
+        let v = serde_json::to_value(&set).unwrap();
+        assert_eq!(v["exclude_seats"], serde_json::json!(["codex", "claude#2"]));
+        let back: AgentSession = serde_json::from_value(v).unwrap();
+        assert_eq!(back.exclude_seats, ["codex", "claude#2"]);
+        assert_eq!(
+            normalize_exclude_seats(&[" codex ".into(), "".into(), "pi".into(), "codex".into()]),
+            ["codex", "pi"]
+        );
     }
 
     #[test]

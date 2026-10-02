@@ -87,6 +87,7 @@ impl RunSpec {
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         }
     }
 }
@@ -2305,6 +2306,7 @@ mod tests {
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
+            exclude_seats: Vec::new(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         put_node(
@@ -2470,6 +2472,7 @@ mod tests {
                 benched_seats: Vec::new(),
                 team: None,
                 team_plan: None,
+                exclude_seats: Vec::new(),
             };
             put_node(&mut store, session.to_node()).unwrap();
             put_node(

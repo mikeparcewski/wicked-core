@@ -119,6 +119,7 @@ mod tests {
             rework_of: None,
             rework_amendment: None,
             catalog: None,
+            exclude_seats: Vec::new(),
         }
     }
 

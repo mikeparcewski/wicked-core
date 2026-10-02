@@ -105,6 +105,7 @@ mod tests {
             rework_of: None,
             rework_amendment: None,
             catalog: None,
+            exclude_seats: Vec::new(),
         }
     }
 
@@ -364,6 +365,7 @@ mod tests {
             project_graph: None,
             plan: None,
             deliver_step: None,
+            exclude_seats: Vec::new(),
         })
         .expect("launch_run must not fail");
 

@@ -1027,18 +1027,32 @@ fn run_unit_and_judge_on(
         .unwrap_or_default();
     // Instance AND cli key: excluding `claude#2` excludes a `claude` seat too.
     let mut team_excluded: Vec<String> = Vec::new();
-    for a in &team_authors {
+    // (EP-K3) The launch's judge exclusion is UNIONED in (never replaces): it can only narrow.
+    for a in team_authors.iter().chain(&input.unit.exclude_seats) {
         for k in [a.as_str(), crate::team::runner::seat_key(a)] {
             if !team_excluded.iter().any(|e| e == k) {
                 team_excluded.push(k.to_string());
             }
         }
     }
-    let monitors_note = if team_authors.is_empty() {
+    // What the bus-path request names as excluded: the team monitors plus the launch exclusion.
+    let mut bus_excluded: Vec<String> = team_authors.clone();
+    for s in &input.unit.exclude_seats {
+        if !bus_excluded.contains(s) {
+            bus_excluded.push(s.clone());
+        }
+    }
+    let mut monitors_note = if team_authors.is_empty() {
         String::new()
     } else {
         format!(" and the team monitors [{}]", team_authors.join(", "))
     };
+    if !input.unit.exclude_seats.is_empty() {
+        monitors_note.push_str(&format!(
+            " and the launch-excluded seats [{}]",
+            input.unit.exclude_seats.join(", ")
+        ));
+    }
     // (F-7R2-006 / review RT-1) The seats a JUDGE may run under: the registry seats the RUN
     // configured (`run_roster`, when the caller knows it), minus the run's bench, minus every
     // seat the launcher's health probe declared unusable — a signed-out seat cannot render a
@@ -1242,7 +1256,7 @@ fn run_unit_and_judge_on(
                     input.attempt,
                     &bus_path,
                     work_author,
-                    &team_authors,
+                    &bus_excluded,
                 ));
             }
             // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
@@ -2985,6 +2999,97 @@ mod tests {
     /// WROTE the work. `run_unit_and_judge` computes the work author from the unit's `assigned_cli` and
     /// excludes BOTH it and the deterministic author when selecting the judge seat. Proven via a recording
     /// stub that captures the assigned_cli of every dispatched unit — the LAST is the judge.
+    /// EP-K3 (DES-artifact-editor-plugins §7.6): a launch-time `exclude_seats` is UNIONED into
+    /// the judge exclusion. A listed seat (by cli key, or by an instance of it) is never the judge;
+    /// the list can only narrow the choice — the work author stays excluded whatever it says — and
+    /// an empty list behaves as today.
+    #[test]
+    fn a_launch_excluded_seat_is_never_the_judge_and_cannot_unexclude_the_author() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Rec {
+            seen: Mutex<Vec<Option<String>>>,
+        }
+        impl StepRunner for Rec {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(input.unit.assigned_cli.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nrecorded\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-core-k3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let judge_with = |exclude: &[&str]| -> (Option<String>, bool) {
+            let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+            unit.assigned_cli = Some("agy".into());
+            unit.validator = Some(crate::validator::DeterministicValidator {
+                criterion: "the work is correct".into(),
+                script: "test -f x".into(),
+                approved: true,
+            });
+            unit.exclude_seats = exclude.iter().map(|s| s.to_string()).collect();
+            let input = StepInput {
+                run_id: "r".into(),
+                unit_ix: 0,
+                attempt: 0,
+                unit,
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let rec = Arc::new(Rec::default());
+            let runner: Arc<dyn StepRunner> = rec.clone();
+            let roster = vec![
+                seat("claude", "claude -p {PROMPT}"),
+                seat("agy", "agy run {PROMPT}"),
+                seat("pi", "pi ask {PROMPT}"),
+                seat("codex", "codex exec {PROMPT}"),
+            ];
+            let noop: &DeltaSink = &|_: &str| {};
+            let (_out, verdict, _ev) =
+                run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+            let seen = rec.seen.lock().unwrap();
+            // The first run is the work unit itself; a judge, when one ran, is the second.
+            (seen.get(1).cloned().flatten(), verdict.is_some())
+        };
+        // Today: the first seat distinct from the det author (claude) and the author (agy).
+        assert_eq!(judge_with(&[]).0.as_deref(), Some("pi"));
+        // A launch-excluded seat is skipped, by cli key or by an instance of it.
+        assert_eq!(judge_with(&["pi"]).0.as_deref(), Some("codex"));
+        assert_eq!(judge_with(&["pi#2"]).0.as_deref(), Some("codex"));
+        // It only narrows: excluding every other seat leaves NO judge — never the author.
+        let (judge, ran) = judge_with(&["pi", "codex"]);
+        assert_eq!(
+            judge, None,
+            "no distinct judge remains, so none is convened"
+        );
+        assert!(!ran, "the judge is skipped, not run as a self-grade");
+        // Naming the author or a nonsense seat changes nothing about the author's exclusion.
+        assert_eq!(judge_with(&["agy", "nope"]).0.as_deref(), Some("pi"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn agent_judge_excludes_the_work_author_seat_c1() {
         use crate::workflow::{StepOutput, StepRunner};
