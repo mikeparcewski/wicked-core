@@ -745,6 +745,19 @@ pub struct LaunchOptions {
     pub exclude_seats: Option<Vec<String>>,
 }
 
+/// The body of `Core.considerRules` over the store at `db_path` (read-only).
+fn consider_rules_at(db_path: &str, query_json: &str) -> Result<String, String> {
+    use wicked_governance::{consider_rules, RuleQuery};
+    let store = wicked_apps_core::open_store_ro(Some(db_path)).map_err(|e| format!("{e:#}"))?;
+    let query: RuleQuery = if query_json.trim().is_empty() {
+        RuleQuery::default()
+    } else {
+        serde_json::from_str(query_json).map_err(|e| format!("bad_query: {e}"))?
+    };
+    let c = consider_rules(&store, &query).map_err(|e| format!("{e:#}"))?;
+    serde_json::to_string(&c).map_err(|e| e.to_string())
+}
+
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
@@ -2361,6 +2374,20 @@ impl Core {
         })
     }
 
+    /// (DC-S1, DES-decision-capture §4.2.2 / §4.7) "Considered · set aside": the ONE
+    /// implementation of project matching crew reads (no second read transport). `query_json` is a
+    /// JSON `RuleQuery` (language, layer, framework, severity, rule_type, steering_type, and
+    /// `projects`: the asking run's or chat's projects); empty = no facet filters and no projects.
+    /// Resolves to `{ in_force: ConformanceRule[], set_aside: [{ id, statement, reason:
+    /// "out_of_scope"|"replaced"|"retired" }] }`. Read-only connection — never blocks the actor.
+    /// Crew probes for this method before sending a query with `projects` (an older engine's
+    /// `RuleQuery` rejects the field).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn consider_rules(&self, query_json: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || consider_rules_at(&db_path, &query_json).map_err(err))
+    }
+
     /// Judge and record ONE brokered MCP call (DES-MCP-TOOLS-001 §6 step 3; crew's broker calls
     /// this before it invokes anything). `request_json` is `{ token, call: { server, tool, args?,
     /// annotations?, classOverride?, registered, kind?, carrier? } }` — `token` is the worker's
@@ -2668,6 +2695,57 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (DC-S1) `Core.considerRules()`: the binding answers the governance split as JSON — a
+    /// project rule is in force for its own project and set aside `out_of_scope` for another, a
+    /// global rule is in force for both, and a malformed query is refused, never widened.
+    #[test]
+    fn consider_rules_answers_in_force_and_set_aside_per_project() {
+        let dir = std::env::temp_dir().join(format!("core-ts-consider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("c.db").to_str().unwrap().to_string();
+        let _ = wicked_apps_core::emit::hermetic_test_spool();
+        {
+            let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+            let rule = |id: &str, project: Option<&str>| wicked_governance::ConformanceRule {
+                id: id.to_string(),
+                rule_type: wicked_governance::RuleType::Pattern,
+                statement: format!("s {id}"),
+                severity: wicked_governance::ConfSeverity::Warn,
+                targets: wicked_governance::Targets {
+                    project: project.map(str::to_string),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            wicked_governance::register_rule(&mut store, &rule("PAT-001", None)).unwrap();
+            wicked_governance::register_rule(&mut store, &rule("proposal:a", Some("proj_a")))
+                .unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&consider_rules_at(&db, r#"{"projects":["proj_a"]}"#).unwrap())
+                .unwrap();
+        let ids = |k: &str| -> Vec<String> {
+            v[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids("in_force"), ["PAT-001", "proposal:a"]);
+        assert!(v["set_aside"].as_array().unwrap().is_empty());
+        let v: serde_json::Value =
+            serde_json::from_str(&consider_rules_at(&db, r#"{"projects":["proj_b"]}"#).unwrap())
+                .unwrap();
+        assert_eq!(v["in_force"][0]["id"], "PAT-001");
+        assert_eq!(v["set_aside"][0]["id"], "proposal:a");
+        assert_eq!(v["set_aside"][0]["reason"], "out_of_scope");
+        assert!(consider_rules_at(&db, r#"{"projectz":[]}"#)
+            .unwrap_err()
+            .starts_with("bad_query"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// (DES-TEAMING-002 T8) `Core.catalog()`: the fifteen entries, in catalog order, each with
     /// the picker's keys.

@@ -133,6 +133,13 @@
       "worker_read": "none"
     },
     {
+      "name": "decisions",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/decisions/ledger.ts — join(crewStateHome(), 'decisions') (DES-decision-capture §4.2.1: one 0600 JSONL ledger per project holding the operator's words; lands with crew DC-S4a)",
+      "worker_read": "none"
+    },
+    {
       "name": "mcp",
       "kind": "dir",
       "owner": "crew",

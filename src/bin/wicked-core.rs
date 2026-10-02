@@ -51,11 +51,13 @@
 //!       # when residue is found (0 clean, 1 operational error) — run with the same --dir as ingest
 //!   wicked-core rules recall [--language L] [--layer L] [--framework F] \
 //!       [--severity info|warn|error|critical] [--rule-type pattern|policy] \
-//!       [--type <steering-type>] [--json]
+//!       [--type <steering-type>] [--project P[,Q]] [--json]
 //!       # the AW-17 recall-REPORT: the conformance rules that APPLY to the query facets,
 //!       # severity-ordered (critical→info, then weight desc, then id), each citing rule id +
 //!       # provenance ref (the wiki URI a CI comment links to). --type is the STEERING facet
 //!       # (architecture|development|security|testing|operations|compliance|design-ux).
+//!       # --project (DC-S1): the projects to recall for; a project-scoped rule is recalled
+//!       # only for its own project, and without --project recall serves global rules only.
 //!       # Read-only, and strictly a report: exit 0 even when rules match
 //!       # (v1 never blocks — arch-R15); 1 = operational error only
 //!   wicked-core rules list [--type <t>] [--include-retired] [--language L] [--layer L] \
@@ -199,11 +201,13 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          WRITES to every cli lane store.\n\
          wicked-core rules recall [--db <F>] [--language <L>] [--layer <L>] [--framework <F>] \
          [--severity info|warn|error|critical] [--rule-type pattern|policy] \
-         [--type <steering-type>] [--json]\n  \
+         [--type <steering-type>] [--project <P[,Q]>] [--json]\n  \
          The AW-17 recall-REPORT: the conformance rules that APPLY to the query facets, \
          severity-ordered (critical→info, then weight desc, then id), each citing rule id + \
          provenance ref (the wiki URI a CI comment links to). --type filters on the STEERING type \
-         (architecture|development|security|testing|operations|compliance|design-ux). READ-ONLY, \
+         (architecture|development|security|testing|operations|compliance|design-ux); --project \
+         names the projects to recall for (a project-scoped rule is recalled only for its own \
+         project; without --project, global rules only). READ-ONLY, \
          and strictly a report: exit 0 even when rules match (v1 of \
          the CI conformance seam never blocks — arch-R15); 1 = operational error only.\n\
          wicked-core rules list [--db <F>] [--type <steering-type>] [--include-retired] \
@@ -2039,6 +2043,16 @@ fn parse_rule_query(args: &[String], cmd: &str) -> wicked_governance::RuleQuery 
         severity,
         rule_type,
         steering_type,
+        // (DC-S1) `--project P[,Q]`: the projects to recall for (a project-scoped rule is
+        // recalled only for its own project; omitted = global rules only on `recall`).
+        projects: facet("--project")
+            .map(|v| {
+                v.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

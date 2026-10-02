@@ -1,0 +1,21 @@
+{
+  "$comment": "DES-decision-capture §4.2.2 / §4.6: the ONE golden fixture for project-scoped rule matching. Copied byte-identical into wicked-estate (rules.recall `projects`); a test in each repo runs every case. Semantics: a rule with no targets.project applies everywhere; a rule with targets.project = P matches only a query whose projects contains P; a query with empty projects matches no project-scoped rule. Retired rules are never recalled. Expected ids are in recall order (severity desc, weight desc, id).",
+  "version": 1,
+  "rules": [
+    {"id": "PAT-900", "rule_type": "pattern", "statement": "global rule", "severity": "warn", "confidence": 1.0},
+    {"id": "proposal:p-alpha", "rule_type": "pattern", "statement": "alpha only", "severity": "warn", "confidence": 1.0, "targets": {"project": "proj_alpha"}},
+    {"id": "proposal:p-beta", "rule_type": "pattern", "statement": "beta only", "severity": "error", "confidence": 1.0, "targets": {"project": "proj_beta"}},
+    {"id": "proposal:p-alpha-rust", "rule_type": "pattern", "statement": "alpha, rust only", "severity": "info", "confidence": 1.0, "targets": {"project": "proj_alpha", "language": "rust"}},
+    {"id": "proposal:p-alpha-old", "rule_type": "pattern", "statement": "alpha, withdrawn", "severity": "critical", "confidence": 1.0, "targets": {"project": "proj_alpha"}, "retired": true}
+  ],
+  "cases": [
+    {"name": "no projects: globals only", "query": {}, "expect": ["PAT-900"]},
+    {"name": "empty projects list: globals only", "query": {"projects": []}, "expect": ["PAT-900"]},
+    {"name": "one project", "query": {"projects": ["proj_alpha"]}, "expect": ["PAT-900", "proposal:p-alpha", "proposal:p-alpha-rust"]},
+    {"name": "the other project", "query": {"projects": ["proj_beta"]}, "expect": ["proposal:p-beta", "PAT-900"]},
+    {"name": "a run in both projects", "query": {"projects": ["proj_alpha", "proj_beta"]}, "expect": ["proposal:p-beta", "PAT-900", "proposal:p-alpha", "proposal:p-alpha-rust"]},
+    {"name": "an unknown project", "query": {"projects": ["proj_gamma"]}, "expect": ["PAT-900"]},
+    {"name": "project facet composes with language", "query": {"projects": ["proj_alpha"], "language": "python"}, "expect": ["PAT-900", "proposal:p-alpha"]},
+    {"name": "project facet composes with severity", "query": {"projects": ["proj_alpha", "proj_beta"], "severity": "error"}, "expect": ["proposal:p-beta"]}
+  ]
+}
