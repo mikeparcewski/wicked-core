@@ -189,3 +189,14 @@ fn the_straight_through_path_refuses_an_exclusion_instead_of_dropping_it() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Pre-main arming of the hermetic emit spool (core#311): engine paths under test fire
+/// fire-and-forget `wicked.*` emissions, which must land in a per-process temp file, never in the
+/// operator's real replay queue. `harness_hygiene.rs` fails the suite if a binary lacks this.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
