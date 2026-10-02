@@ -3074,6 +3074,7 @@ mod judge_bench_tests {
             None,
             false,
             false,
+            Vec::new(),
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {
