@@ -831,9 +831,18 @@ pub struct Consideration {
 /// `out_of_scope`; everything else is in force. Both lists keep recall order.
 pub fn consider_rules(store: &dyn GraphRead, query: &RuleQuery) -> anyhow::Result<Consideration> {
     let all = scan_rules(store, query, true, true, ProjectMatch::Ignore)?;
-    let replaced: std::collections::BTreeSet<&str> = all
+    // `replaced` is read off EVERY live rule in the store, not only the ones this query's facets
+    // match: a successor may differ in severity, language or type from what it replaces, and the
+    // predecessor is replaced all the same (codex review on DC-S1).
+    let live = scan_rules(
+        store,
+        &RuleQuery::default(),
+        false,
+        true,
+        ProjectMatch::Ignore,
+    )?;
+    let replaced: std::collections::BTreeSet<&str> = live
         .iter()
-        .filter(|r| !r.retired)
         .flat_map(|r| r.supersedes.iter().map(String::as_str))
         .collect();
     let mut in_force = Vec::new();
@@ -1002,6 +1011,46 @@ mod tests {
         let wire = serde_json::to_value(&c).unwrap();
         assert_eq!(wire["set_aside"][0]["reason"], "out_of_scope");
         assert_eq!(wire["set_aside"][1]["reason"], "replaced");
+    }
+
+    /// A successor that the query's other facets do NOT match still replaces its predecessor
+    /// (codex review on DC-S1): `replaced` reads every live rule, not the filtered set.
+    #[test]
+    fn a_successor_outside_the_query_facets_still_replaces() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut new = rule(
+            "PAT-021",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            Targets::default(),
+        );
+        new.supersedes = vec!["PAT-020".into()];
+        register_rule(&mut store, &new).unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-020",
+                RuleType::Pattern,
+                ConfSeverity::Warn,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        let c = consider_rules(
+            &store,
+            &RuleQuery {
+                severity: Some(ConfSeverity::Warn),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(c.in_force.is_empty(), "{:?}", ids(&c.in_force));
+        assert_eq!(c.set_aside.len(), 1);
+        assert_eq!(
+            (c.set_aside[0].id.as_str(), c.set_aside[0].reason),
+            ("PAT-020", SetAsideReason::Replaced)
+        );
     }
 
     /// Byte-identical serialisation: a rule that uses none of the new fields serializes exactly as
