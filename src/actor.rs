@@ -7187,6 +7187,10 @@ fn advance_or_pause(
     // (DES-TEAMING-002 T4, §8.7) THE revision hook: every advance goes through here, so a held
     // diff re-score or the PA's held `PLAN` lines are applied before anything is dispatched —
     // after a fold, a dispute answer, a member step's acceptance or a gate alike.
+    // (WT-C3) A held re-score that fired a testing rule the floor cannot honour fails the run
+    // (fail closed), never a logged error the run goes on past.
+    team_gate::refuse_unholdable_rules(&*store, run_id)
+        .map_err(|e| e.context("the diff re-score fired a testing rule the plan cannot honour"))?;
     if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
         // Log it and show it: the run goes on with the plan it has.
         emit_run_error(subscribers, run_id, e);

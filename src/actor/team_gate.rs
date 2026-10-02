@@ -2972,6 +2972,34 @@ pub(super) fn propose_plan(
     })
 }
 
+/// (WT-C3) A re-score held for this boundary that fired a testing rule floor fill cannot honour —
+/// an obligation outside the closed vocabulary, which only a row written around the write-time
+/// check can carry (a `deny` / `allow` effect, a held rule with no obligation) — FAILS THE RUN
+/// here, before the revision hook would drop the raise and run on under its old floor: the
+/// compose-time refusal's mid-run twin (fail closed, naming the rule).
+pub(super) fn refuse_unholdable_rules(store: &dyn GraphStore, run_id: &str) -> anyhow::Result<()> {
+    let Some(session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(());
+    };
+    let Some(r) = session.team_plan.as_ref().and_then(|t| t.rescored.as_ref()) else {
+        return Ok(());
+    };
+    if let Some(o) = r
+        .obligations
+        .iter()
+        .find(|o| crate::plan::obligation_types(&o.token).is_none())
+    {
+        anyhow::bail!(
+            "{}",
+            crate::plan::PlanRefusal::UnknownObligation {
+                rule: o.rule.clone(),
+                token: o.token.clone(),
+            }
+        );
+    }
+    Ok(())
+}
+
 /// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
 /// `advance_or_pause`, which calls this first — the fold's, a dispute answer's, a member step's
 /// acceptance, a gate's. It applies what is held (the human's edits, then a diff re-score that

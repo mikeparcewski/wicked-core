@@ -141,3 +141,53 @@ fn a_rescore_that_newly_fires_a_held_rule_is_held_for_the_boundary() {
         .unwrap();
     assert_eq!(tp.recalled, ["TST-1001"]);
 }
+
+/// (Copilot review) A held re-score carrying an obligation outside the vocabulary (a `deny` row
+/// written around the write-time check) fails the run at the boundary, naming the rule — the
+/// raise is never dropped while the run goes on under its old floor.
+#[test]
+fn a_held_rescore_with_an_unholdable_rule_fails_the_boundary() {
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    let mut store = open_store(Some(":memory:")).unwrap();
+    let mut s = session("r-bad");
+    super::refuse_unholdable_rules(&store, "r-bad").unwrap();
+    let fact = crate::plan_gate::path_scored_diff(
+        "r-bad",
+        1,
+        0,
+        1,
+        Some("t"),
+        &crate::review_scale::assess_intent(
+            true,
+            Some(&["README.md"]),
+            crate::review_scale::Graph::Unavailable("none".into()),
+            None,
+        ),
+        0,
+    )
+    .unwrap();
+    s.team_plan.as_mut().unwrap().rescored = Some(crate::plan_gate::DiffRescore {
+        ord: 1,
+        attempt: 0,
+        rescore_seq: 1,
+        score: 0,
+        destructive: false,
+        fact: crate::plan_gate::queued_facts(&[fact])
+            .unwrap()
+            .pop()
+            .unwrap(),
+        obligations: vec![crate::plan::HeldObligation {
+            rule: "TST-DENY".into(),
+            token: "effect:deny".into(),
+        }],
+        recalled: Vec::new(),
+    });
+    put_node(&mut store, s.to_node()).unwrap();
+    let err = super::refuse_unholdable_rules(&store, "r-bad")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("TST-DENY") && err.contains("unknown_obligation"),
+        "{err}"
+    );
+}
