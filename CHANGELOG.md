@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.34** — 2026-10-01 — patch release carrying **one** engine change since 0.7.33, on main
+  tip `7e0abf4`. **A seat benched mid-run is never handed another unit of that run, and the bench is on
+  the wire (#689).** crew 0.7.45's post-publish smoke (wicked-ci S04, run 36946090323) found it: since
+  #590 S5 removed the routing ballots, a seat that reads signed in but cannot work (the smoke's copilot,
+  out of quota) was planned onto both review units and dispatched for both. A later unit planned on a
+  seat the run has benched is now re-seated before it runs (`unitReassigned`). With no eligible seat
+  left, the run pauses on that unit at the dead-seat gate. A crash redrive does the same. The new
+  additive event `seatBenched {session, ord, cli, reason, source}` names each in-run bench once, so
+  wicked-crew 0.7.46 can keep the seat out of its next launches for a bounded window. No other change
+  since 0.7.33 (`d706986`); the lockfile re-stamp #688 is packaging only.
 - **core-ts 0.7.33** — 2026-10-01 — npm release carrying the **sixty-seven** engine changes since
   0.7.30, on main tip `00545af`; the last of them, #687, is lint-only (clean under clippy 1.99, no
   behaviour change). Supersedes the never-tagged 0.7.31 (#681) and 0.7.32 (#683) cuts,
@@ -64,6 +74,7 @@ Two release tracks share this file, newest entry first regardless of track:
   approval-policy bench-and-fail-over (#670), and `Core.busEmit`/`Core.busRead` (#631).
   Platform note: the Windows leg of CI is the only flaky one (#589) and Windows is **not** a
   supported platform for governed runs.
+- **A seat benched mid-run is never handed another unit of that run, and the bench is on the wire (`seatBenched`).** Since #590 S5 removed the per-phase ballots, nothing finds a dead seat before routing: a seat that looks signed in but cannot work (out of quota, say) is planned onto units, refuses the first one, and is benched for the run (`source: "worker"`) while that unit fails over. The later units planned on the same seat were still dispatched to it, one dead turn and one failover each: crew 0.7.45's release smoke (wicked-ci S04, run 36946090323) dispatched the quota-exhausted copilot for units 2 and 4. When the cursor advances onto a unit whose seat the run has benched, `advance_or_pause` now re-seats it first with the failover ladder's own rule (`next_failover_seat` over the eligible roster, restricted to the seats the unit's skills admit, judged on the template the unit will run, so a review never lands on the seat that built its work) and emits `unitReassigned`; a crash redrive that advances onto such a unit does the same. With no eligible seat left the run PAUSES on the unit at the dead-seat gate before anything is dispatched to the benched seat (the unit was never seated, so the prompt offers sign-in, reassign or reject). An operator's explicit reassign and a gate's approve-and-retry still dispatch where the operator said. New additive event `seatBenched {session, ord, cli, reason, source}`, emitted once per seat when a worker or judge refusal benches it, so a launcher can keep the seat out of its next launches. Tests: `a_seat_benched_mid_run_is_never_dispatched_again_and_its_later_unit_is_re_seated` (fails on the previous main: the dead seat is dispatched twice and no `seatBenched` frame is emitted) `with_no_live_seat_left_the_run_pauses_plainly_at_the_dead_seat_gate`, `a_later_unit_with_no_eligible_seat_left_pauses_instead_of_reaching_the_benched_seat` and the judge path's `a_judge_refusal_benches_the_seat_once_and_emits_seat_benched`.
 
 
 - **A deliver strand never reaches the triage judge, and a judge can never re-run the deliver unit (ship re-proof N4).** With an operator present (`human_confirm` not `None`, i.e. every studio launch), a deliver failure carrying the `LIFT-CONFLICT` marker fell past the deterministic deliver-refusal arm into the attempt-0 LLM triage, whose `retry` re-dispatched the deliver unit: a second push with no gate (re-proof run, `stepFailed`/`failureTriaged` seq 364-376). A strand now skips every automatic remedy (trust-grant self-heal, triage, the retried-attempt gate) and takes the terminal path on every `human_confirm`, as it already did for `None`. Independently, `filter_triage_decision` turns any `retry`/`retry_with_flag` of a deliver unit into an escalation, so no future path into triage can re-open an ungated re-push.

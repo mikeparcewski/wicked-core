@@ -677,6 +677,26 @@ fn seat_candidates(
         .collect()
 }
 
+/// Whether the roster seat `key` may take `unit` as far as its skills say (core#401), judged the
+/// way routing judged it: a unit whose skills are Claude-only goes only to a claude seat; every
+/// other unit, and a tool unit, goes anywhere. For a MID-RUN re-seat (`actor::reseat_off_benched_seat`),
+/// where the distribution's own candidate list is gone: `clis` is the registry roster the run
+/// resolves invocations from. With no skills snapshot to judge against, the unit is unconstrained,
+/// exactly as routing treats it. `invocation` is the template the unit WILL carry on that seat, so
+/// the wrapped carrier's identity is judged on what will actually run (the [`seat_is_claude`] rule).
+pub(crate) fn seat_admits_unit(unit: &WorkUnit, key: &str, invocation: Option<String>) -> bool {
+    if unit.tool_cmd.is_some() || unit.skill_ref.as_deref().is_none_or(str::is_empty) {
+        return true;
+    }
+    let Some(snapshot) = crate::skills_snapshot::routing_snapshot() else {
+        return true;
+    };
+    match crate::skills_snapshot::seat_requirement(&snapshot, unit.skill_ref.as_deref()) {
+        SeatRequirement::Any => true,
+        SeatRequirement::ClaudeOnly { .. } => seat_runs_claude(key, invocation),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only: how many seat judgements [`seat_is_claude`] has made on THIS thread.
@@ -703,12 +723,18 @@ thread_local! {
 /// never take a Claude-only review. The INVOCATION stays the instance's own (`invocation_of(clis,
 /// key)`): what the seat EXECUTES is per-instance, what it IS is per-cli.
 fn seat_is_claude(clis: &[AgenticCli], key: &str) -> bool {
-    use crate::skills_snapshot::WorkerCli;
     #[cfg(test)]
     SEAT_JUDGEMENTS.with(|n| n.set(n.get() + 1));
+    seat_runs_claude(key, invocation_of(clis, key))
+}
+
+/// [`seat_is_claude`]'s judgement for one seat and the template it will run: both carriers'
+/// identity resolutions must say claude.
+fn seat_runs_claude(key: &str, invocation: Option<String>) -> bool {
+    use crate::skills_snapshot::WorkerCli;
     let cli_key = model_of(key);
     let acp = crate::acp_runner::acp_seat_identity(cli_key);
-    let wrapped = crate::execute_wrapped::wrapped_seat_identity(cli_key, invocation_of(clis, key));
+    let wrapped = crate::execute_wrapped::wrapped_seat_identity(cli_key, invocation);
     matches!(acp, WorkerCli::Claude) && matches!(wrapped, WorkerCli::Claude)
 }
 

@@ -1008,6 +1008,7 @@ pub(crate) fn apply_and_finish_unit(
             // newer serializer) benches as written — deny wins.
             let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
             let mut changed = false;
+            let mut newly_benched: Vec<CoreEvent> = Vec::new();
             for (seat, token) in judge_benches {
                 let why = match wicked_council::types::SeatFailureReason::from_token(&token) {
                     Some(reason) => crate::domain::transcript_bench_reason(
@@ -1024,17 +1025,31 @@ pub(crate) fn apply_and_finish_unit(
                     );
                     continue;
                 };
-                changed |= crate::domain::bench_seat(
+                if crate::domain::bench_seat(
                     &mut session.benched_seats,
                     crate::domain::BenchedSeat {
+                        cli: seat.clone(),
+                        reason: why.clone(),
+                        source: "judge".to_string(),
+                    },
+                ) {
+                    changed = true;
+                    // The bench on the wire, once (see `CoreEvent::SeatBenched`) — emitted only
+                    // after the session write below, so no frame claims a bench the store lacks.
+                    newly_benched.push(CoreEvent::SeatBenched {
+                        session: session_id.to_string(),
+                        ord: unit.ord,
                         cli: seat,
                         reason: why,
                         source: "judge".to_string(),
-                    },
-                );
+                    });
+                }
             }
             if changed {
                 put_node(store, session.to_node())?;
+            }
+            for ev in newly_benched {
+                emit(ev);
             }
         }
     }
@@ -2979,6 +2994,140 @@ mod resolve_tests {
                 .unwrap()
                 .id,
             "bug"
+        );
+    }
+}
+
+#[cfg(test)]
+mod judge_bench_tests {
+    use super::*;
+    use wicked_council::types::{Category, Confidence, InputMode};
+
+    fn cli(key: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: key.into(),
+            alt_binaries: Vec::new(),
+            headless_invocation: format!("{key} -p {{PROMPT}}"),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: Vec::new(),
+            trust_flags: Vec::new(),
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            health: None,
+        }
+    }
+
+    /// A JUDGE seat that refused on quota is benched for the run (`source: "judge"`) and the bench
+    /// is on the wire once, as `seatBenched`, with the persisted reason. A second refusal by the
+    /// same seat adds nothing and emits nothing (the bench is already there; the first reason
+    /// wins). The frame is emitted after the session write (the code orders it so), and the bench
+    /// is read back from the store here.
+    #[test]
+    fn a_judge_refusal_benches_the_seat_once_and_emits_seat_benched() {
+        let sid = "judge-bench-once";
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("j")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+        )
+        .expect("plan");
+        let evidence = crate::workflow::UnitEvidence {
+            judge_refusals: vec![
+                crate::workflow::JudgeRefusal {
+                    seat: "j".into(),
+                    reason: "quota_exhausted".into(),
+                },
+                // The same seat again (a second judge rotation): already benched, so no frame.
+                crate::workflow::JudgeRefusal {
+                    seat: "j".into(),
+                    reason: "not_logged_in".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let first = {
+            let mut seen: Vec<CoreEvent> = Vec::new();
+            let output = crate::workflow::stub_output(&units[0]);
+            let mut emit = |e: CoreEvent| seen.push(e);
+            apply_and_finish_unit(
+                &mut store,
+                &mut units[0],
+                &output,
+                &workflow_id,
+                EntityMode::Shared,
+                sid,
+                0,
+                false,
+                false,
+                &cli_keys,
+                None,
+                &evidence,
+                &mut emit,
+                None,
+            )
+            .expect("apply");
+            seen
+        };
+        let benched: Vec<(String, String, String)> = first
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::SeatBenched {
+                    session,
+                    cli,
+                    reason,
+                    source,
+                    ..
+                } if session == sid => Some((cli.clone(), reason.clone(), source.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            benched,
+            vec![(
+                "j".to_string(),
+                "quota_exhausted (no success in the run)".to_string(),
+                "judge".to_string()
+            )],
+            "exactly one seatBenched frame for the judge seat, with the first reason: {first:?}"
+        );
+        let session = crate::domain::get_session(&store, sid)
+            .expect("read")
+            .expect("the run is on record");
+        assert!(
+            session
+                .benched_seats
+                .iter()
+                .any(|b| b.cli == "j" && b.source == "judge"),
+            "the bench is persisted: {:?}",
+            session.benched_seats
         );
     }
 }
