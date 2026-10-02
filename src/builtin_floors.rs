@@ -141,10 +141,15 @@ pub const WALKTHROUGH_RESULT_CRITERION: &str =
 /// The `walkthrough_review` pin's script: reads one small result file, so the validator bound holds
 /// whatever the chapter count. A missing file, a non-PASS overall or any FAIL/INCONCLUSIVE verdict
 /// denies.
-pub const WALKTHROUGH_RESULT_SCRIPT: &str = "test -n \"${WICKED_EVIDENCE_ROOT}\" && test -f \"${WICKED_EVIDENCE_ROOT}/result.json\" && grep -Eq '\"overall\":\"PASS\"' \"${WICKED_EVIDENCE_ROOT}/result.json\" && ! grep -Eq '\"verdict\":\"(FAIL|INCONCLUSIVE)\"' \"${WICKED_EVIDENCE_ROOT}/result.json\"";
+///
+/// Hardened from the DES's verbatim script (codex review on WT-C1): whitespace around `:` is
+/// tolerated in both directions, and a FAIL/INCONCLUSIVE `overall` anywhere denies too, so a
+/// pretty-printed result cannot hide a failing verdict and a stray `"overall":"PASS"` beside a
+/// failing one cannot pass. Deny dominates.
+pub const WALKTHROUGH_RESULT_SCRIPT: &str = "test -n \"${WICKED_EVIDENCE_ROOT}\" && test -f \"${WICKED_EVIDENCE_ROOT}/result.json\" && grep -Eq '\"overall\"[[:space:]]*:[[:space:]]*\"PASS\"' \"${WICKED_EVIDENCE_ROOT}/result.json\" && ! grep -Eq '\"(overall|verdict)\"[[:space:]]*:[[:space:]]*\"(FAIL|INCONCLUSIVE)\"' \"${WICKED_EVIDENCE_ROOT}/result.json\"";
 
 /// The APPROVED pin the `walkthrough_review` catalog entry carries.
-pub const WALKTHROUGH_RESULT_PIN: &str = "f1b20e8ee671a619";
+pub const WALKTHROUGH_RESULT_PIN: &str = "cd95e6e0acdb4d8b";
 
 /// The two authored (UNAPPROVED) walkthrough validators, lint then result.
 #[must_use]
@@ -600,6 +605,65 @@ mod tests {
                 "denylist-dirty: {}",
                 v.script
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WT-C1: the result script's verdict table, run through `sh -c` against fixture roots (the
+    /// engine-side `WICKED_EVIDENCE_ROOT` injection and the run under `run_validator_reporting`
+    /// are WT-C2). PASS passes; FAIL, INCONCLUSIVE, a missing file, an unset root, a
+    /// pretty-printed failing verdict and a contradictory `overall` all deny.
+    #[cfg(unix)]
+    #[test]
+    fn the_walkthrough_result_script_passes_only_a_clean_pass() {
+        let dir = scratch("walkthrough-result");
+        let cases: [(&str, Option<&str>, bool); 8] = [
+            (
+                "pass",
+                Some(r#"{"overall":"PASS","chapters":[{"verdict":"PASS"}]}"#),
+                true,
+            ),
+            (
+                "pass-pretty",
+                Some("{\n  \"overall\": \"PASS\",\n  \"chapters\": [{ \"verdict\": \"PASS\" }]\n}"),
+                true,
+            ),
+            (
+                "fail",
+                Some(r#"{"overall":"FAIL","chapters":[{"verdict":"FAIL"}]}"#),
+                false,
+            ),
+            (
+                "inconclusive",
+                Some(r#"{"overall":"PASS","chapters":[{"verdict":"INCONCLUSIVE"}]}"#),
+                false,
+            ),
+            (
+                "pretty-fail",
+                Some("{\"overall\":\"PASS\",\"chapters\":[{\"verdict\": \"FAIL\"}]}"),
+                false,
+            ),
+            (
+                "contradictory",
+                Some(r#"{"overall":"FAIL","meta":{"overall":"PASS"}}"#),
+                false,
+            ),
+            ("missing", None, false),
+            ("unset", None, false),
+        ];
+        for (name, body, want) in cases {
+            let root = dir.join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            if let Some(b) = body {
+                std::fs::write(root.join("result.json"), b).unwrap();
+            }
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(WALKTHROUGH_RESULT_SCRIPT).env_clear();
+            if name != "unset" {
+                cmd.env("WICKED_EVIDENCE_ROOT", &root);
+            }
+            let ok = cmd.status().unwrap().success();
+            assert_eq!(ok, want, "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

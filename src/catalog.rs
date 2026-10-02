@@ -528,7 +528,7 @@ mod tests {
             ("produce", j("build"), j("creator"), j("auto"), j("value"), None, false, j("agent"), None),
             ("test", j("test"), j("evaluator"), hci.clone(), j("execution"), f, false, j("agent"), None),
             ("walkthrough_plan", j("test"), j("evaluator"), j("auto"), j("execution"), Some("1aa3f15487018f68"), false, j("agent"), Some("wicked-garden-demo")),
-            ("walkthrough_review", j("test"), j("neutral"), j("auto"), j("execution"), Some("f1b20e8ee671a619"), false, j("tool"), None),
+            ("walkthrough_review", j("test"), j("neutral"), j("auto"), j("execution"), Some("cd95e6e0acdb4d8b"), false, j("tool"), None),
             ("review", j("review"), j("evaluator"), j("auto"), j("execution"), f, false, j("agent"), None),
             ("critique", j("review"), j("evaluator"), j("auto"), j("execution"), None, false, j("agent"), None),
             (
