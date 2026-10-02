@@ -340,8 +340,9 @@ fn editor_default_ids() -> Result<Vec<String>, EditorGrantError> {
 
 /// Seed the pack's rules into the store, INSERT-ONLY: a rule already present (its ledger edited by
 /// an approval, or retired by the operator) is left exactly as it is, so a restart never undoes an
-/// approval or resurrects a retired rule. Written straight to the store in one batch, like the MCP
-/// seed, so the actor's boot path never waits on the bus. Returns how many rules were inserted.
+/// approval or resurrects a retired rule. Written straight to the store (autocommit), never through
+/// `register_rule`, so the actor's boot path never waits on the bus. Returns how many rules were
+/// inserted.
 pub(crate) fn seed_editor_defaults(
     store: &mut dyn wicked_apps_core::GraphStore,
 ) -> anyhow::Result<usize> {
@@ -363,9 +364,11 @@ pub(crate) fn seed_editor_defaults(
     if nodes.is_empty() {
         return Ok(0);
     }
-    store.begin_batch()?;
+    // Autocommit, not an explicit batch (Copilot on #704): the store has no rollback, so a
+    // failed batch would leave a transaction open for a later write to commit or trip over. A
+    // partial seed still fails CLOSED — the grants read verifies every pack rule is present — and
+    // the next boot inserts what is missing.
     store.upsert_nodes(&nodes)?;
-    store.commit_batch()?;
     Ok(nodes.len())
 }
 
