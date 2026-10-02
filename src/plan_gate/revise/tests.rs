@@ -63,6 +63,9 @@ fn accepted(steps: Value, score: u8, hc: &HumanConfirm) -> TeamPlanState {
                 steps: p.steps,
                 floor_override: None,
                 proposal_id: p.proposal_id,
+                touch: Vec::new(),
+                touch_truncated: false,
+                touch_source: None,
             });
             s.accepted_rev = p.rev;
             s.accepted_high_risk = p.high_risk;
@@ -354,4 +357,27 @@ fn t4_e_the_plan_line_grammar() {
         }
         Change::Floor(_) => unreachable!(),
     }
+}
+
+/// TR-W1a (Copilot review on #693): a revision of an accepted rev persisted BEFORE the touch
+/// fields existed keeps the inherited touch, sourced `user` — never a non-empty touch labelled
+/// `none`.
+#[test]
+fn w1a_a_revision_of_a_pre_w1a_accepted_rev_keeps_its_touch_as_user() {
+    let hc = HumanConfirm::None;
+    let mut s = accepted(
+        json!([{"catalog":"understand"},{"catalog":"build"},{"catalog":"review"}]),
+        25,
+        &hc,
+    );
+    // Strip the stamp the way a row persisted before W1a reads back.
+    let a = s.accepted.as_mut().unwrap();
+    a.touch = Vec::new();
+    a.touch_truncated = false;
+    a.touch_source = None;
+    let r = revise("r", &s, floor(50), &["understand".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Accepted { .. }));
+    let acc = r.state.accepted.as_ref().unwrap();
+    assert_eq!(acc.touch, ["src/x.rs"]);
+    assert_eq!(acc.touch_source, Some(TouchSource::User));
 }

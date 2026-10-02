@@ -26,7 +26,9 @@ use super::{
 };
 use crate::domain::HumanConfirm;
 use crate::plan::{AddedBy, PlanStep, PlanSteps};
-use crate::team::events::{self as ev, ProposalKind, ProposalSource, ReviseReason, TeamEvent};
+use crate::team::events::{
+    self as ev, ProposalKind, ProposalSource, ReviseReason, TeamEvent, TouchSource,
+};
 use crate::workflow::WorkflowDef;
 
 /// At most this many `PLAN+` lines are taken from one step's output.
@@ -234,6 +236,15 @@ pub(crate) fn revise(
         (None, Some(a)) => a.steps.clone(),
         (None, None) => anyhow::bail!("run {run_id} has no accepted plan to revise"),
     };
+    // (TR-W1a) A revision's plan keeps its base's declared touch (a change adds steps only), so
+    // its touch source is the base's.
+    let base_touch_source = match (&prior.pending, &prior.accepted) {
+        (Some(p), _) => p.touch_source.unwrap_or(TouchSource::User),
+        // A pre-W1a accepted row recorded no source: its declared touch reads as `user`, the
+        // same fallback `with_touch` and gate approval use (Copilot review on #693).
+        (None, Some(a)) => a.touch_source.unwrap_or(TouchSource::User),
+        (None, None) => TouchSource::None,
+    };
     let mut events = Vec::new();
     let (additions, proposal_id, reason, score, destructive, by_human) = match change {
         Change::Floor(r) => {
@@ -418,16 +429,22 @@ pub(crate) fn revise(
     let pid = proposal_id.unwrap_or_default();
     match needs {
         None => {
-            state.accepted = Some(AcceptedPlan {
-                rev,
-                by: if by_human { "human" } else { "engine" }.to_string(),
-                band: filled.band.clone(),
-                high_risk: filled.high_risk,
-                auto,
-                steps: filled.steps.clone(),
-                floor_override: filled.floor_override.clone(),
-                proposal_id: pid,
-            });
+            state.accepted = Some(
+                AcceptedPlan {
+                    rev,
+                    by: if by_human { "human" } else { "engine" }.to_string(),
+                    band: filled.band.clone(),
+                    high_risk: filled.high_risk,
+                    auto,
+                    steps: filled.steps.clone(),
+                    floor_override: filled.floor_override.clone(),
+                    proposal_id: pid,
+                    touch: Vec::new(),
+                    touch_truncated: false,
+                    touch_source: None,
+                }
+                .with_touch(prior.accepted.as_ref(), base_touch_source),
+            );
             state.accepted_rev = rev;
             state.accepted_high_risk = filled.high_risk;
             state.approved_high_risk |= by_human && filled.high_risk;
@@ -462,6 +479,7 @@ pub(crate) fn revise(
                 floor_added,
                 gate_id: None,
                 refusal: None,
+                touch_source: Some(base_touch_source),
             });
             Ok(Revised {
                 state,

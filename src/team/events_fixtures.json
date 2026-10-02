@@ -187,7 +187,12 @@
     ],
     "reason": "docs-only change"
    },
-   "proposal_id": "p-0123456789abcdef0123456789abcdef"
+   "proposal_id": "p-0123456789abcdef0123456789abcdef",
+   "touch": [
+    "src/team/",
+    "src/actor.rs"
+   ],
+   "touch_source": "pa_scope"
   }
  },
  {

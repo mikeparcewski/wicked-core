@@ -195,6 +195,10 @@ fn plan_accepted(session: &AgentSession, units: &[WorkUnit], plan_rev: u32) -> T
                 .collect(),
             override_: None,
             proposal_id: None,
+            // A run with no plan state declared no scope (TR-W1a).
+            touch: Vec::new(),
+            touch_truncated: false,
+            touch_source: Some(crate::team::events::TouchSource::None),
         }),
     )
 }

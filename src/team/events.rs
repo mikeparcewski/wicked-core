@@ -656,6 +656,23 @@ pub struct PlanRevised {
     pub added: Vec<PlanStep>,
 }
 
+/// Where an accepted plan's declared touch set came from (TR-W1a, DES-trigger-registry §4.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchSource {
+    /// The launch plan (or a human edit of it at the gate) declared it.
+    User,
+    /// The PA's scope answer declared it (X1: a creator plan launched with none).
+    PaScope,
+    /// Reserved: a touch set the floor itself supplies. No engine path emits it yet.
+    FloorDefault,
+    /// No declared scope: a scope-drift check is "not checked" on this run.
+    None,
+}
+
+/// The most paths `plan.accepted.touch` carries (the `plan.proposed.touch` cap).
+pub const ACCEPTED_TOUCH_CAP: usize = 64;
+
 /// 5 — `plan.accepted` (E).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanAccepted {
@@ -668,6 +685,17 @@ pub struct PlanAccepted {
     #[serde(rename = "override")]
     pub override_: Option<PlanOverride>,
     pub proposal_id: Option<String>,
+    /// (TR-W1a) The accepted proposal's declared touch set, unioned with every earlier accepted
+    /// rev's, first-seen order, at most [`ACCEPTED_TOUCH_CAP`] paths. Absent on an old row and
+    /// when nothing was declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touch: Vec<String>,
+    /// (TR-W1a) The union exceeded [`ACCEPTED_TOUCH_CAP`] and was cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub touch_truncated: bool,
+    /// (TR-W1a) Where the touch set came from. Absent on an old row (read as `none`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touch_source: Option<TouchSource>,
 }
 
 /// 6 — `plan.refused` (E).

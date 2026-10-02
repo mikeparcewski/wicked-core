@@ -31,6 +31,9 @@ fn fixture(
         steps: plan(serde_json::json!({ "steps": steps })),
         floor_override: None,
         proposal_id: "p-fixture".into(),
+        touch: Vec::new(),
+        touch_truncated: false,
+        touch_source: None,
     };
     let session = AgentSession {
         intent_amendments: Vec::new(),
@@ -298,6 +301,7 @@ fn an_edit_while_a_plan_awaits_approval_is_refused() {
             floor_added: Vec::new(),
             gate_id: Some("g-r-1".into()),
             refusal: None,
+            touch_source: None,
         });
     });
     let e = propose_plan(

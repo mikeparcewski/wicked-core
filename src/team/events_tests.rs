@@ -85,6 +85,22 @@ fn every_fixture_round_trips_by_value() {
     }
 }
 
+/// TR-W1a: a `plan.accepted` row written before the touch fields existed deserialises (touch
+/// empty, not truncated, no source) and serialises back byte-identical; the fixture carrying them
+/// round-trips too (above).
+#[test]
+fn an_old_plan_accepted_row_without_touch_still_round_trips() {
+    let mut old = fixture(PLAN_ACCEPTED);
+    for k in ["touch", "touch_truncated", "touch_source"] {
+        old.as_object_mut().unwrap().remove(k);
+    }
+    let ev = TeamEvent::from_payload(PLAN_ACCEPTED, &old).expect("an old row deserialises");
+    assert_eq!(ev.to_payload().unwrap(), old);
+    let fx = fixture(PLAN_ACCEPTED);
+    assert_eq!(fx["touch"], json!(["src/team/", "src/actor.rs"]));
+    assert_eq!(fx["touch_source"], "pa_scope");
+}
+
 #[test]
 fn a_payload_missing_a_field_or_naming_an_unknown_type_is_refused() {
     let mut p = fixture(FINDING_RAISED);
