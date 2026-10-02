@@ -30,7 +30,8 @@ use crate::domain::HumanConfirm;
 use crate::plan::{AddedBy, FloorOverride, PlanRefusal, PlanStep, PlanSteps};
 use crate::review_scale::{Assessment, Graph};
 use crate::team::events::{
-    self as ev, ApprovalReason, GateDecision, ProposalKind, ProposalSource, TeamEvent,
+    self as ev, ApprovalReason, GateDecision, ProposalKind, ProposalSource, TeamEvent, TouchSource,
+    ACCEPTED_TOUCH_CAP,
 };
 use crate::workflow::WorkflowDef;
 
@@ -164,6 +165,62 @@ pub struct AcceptedPlan {
     pub steps: PlanSteps,
     pub floor_override: Option<FloorOverride>,
     pub proposal_id: String,
+    /// (TR-W1a) The declared touch of this rev unioned with every earlier accepted rev's
+    /// ([`AcceptedPlan::with_touch`]), at most `ACCEPTED_TOUCH_CAP` paths. Published on
+    /// `plan.accepted.touch`; scoring never reads it. Old rows: empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touch: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub touch_truncated: bool,
+    /// (TR-W1a) Where the touch came from; `None` on a row persisted before the field existed
+    /// (published as `none`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touch_source: Option<TouchSource>,
+}
+
+impl AcceptedPlan {
+    /// (TR-W1a) Stamp this rev's `touch` / `touch_truncated` / `touch_source`: `prior`'s touch
+    /// (the run's previously accepted rev, if any) followed by this rev's declared
+    /// `steps.touch`, first-seen order, cut at `ACCEPTED_TOUCH_CAP`. `source` names where THIS
+    /// rev's declared touch came from; a rev that declares none keeps `prior`'s source, and an
+    /// empty union is `none`.
+    pub(crate) fn with_touch(mut self, prior: Option<&AcceptedPlan>, source: TouchSource) -> Self {
+        let mut union: Vec<String> = Vec::new();
+        let mut truncated = prior.is_some_and(|p| p.touch_truncated);
+        let own: &[String] = self.steps.touch.as_deref().unwrap_or_default();
+        let earlier: &[String] = prior.map(|p| p.touch.as_slice()).unwrap_or_default();
+        for path in earlier.iter().chain(own) {
+            if union.contains(path) {
+                continue;
+            }
+            if union.len() == ACCEPTED_TOUCH_CAP {
+                truncated = true;
+                break;
+            }
+            union.push(path.clone());
+        }
+        self.touch_source = Some(if union.is_empty() {
+            TouchSource::None
+        } else if own.is_empty() {
+            prior
+                .and_then(|p| p.touch_source)
+                .unwrap_or(TouchSource::None)
+        } else {
+            source
+        });
+        self.touch = union;
+        self.touch_truncated = truncated;
+        self
+    }
+}
+
+/// The touch source of a proposal's own declared touch (TR-W1a): the PA's scope answer
+/// (`Understand`) is `pa_scope`; a launch plan, a gate edit or a human edit is `user`.
+pub(crate) fn touch_source_of(source: &ProposalSource) -> TouchSource {
+    match source {
+        ProposalSource::Understand { .. } => TouchSource::PaScope,
+        _ => TouchSource::User,
+    }
 }
 
 /// A built fact waiting for the run's path (its `bus_emit` event type and payload).
@@ -277,6 +334,10 @@ pub struct PendingPlan {
     pub gate_id: Option<String>,
     /// The last refused edit's reason, shown in the re-opened gate's prompt.
     pub refusal: Option<String>,
+    /// (TR-W1a) Where the held plan's declared touch came from, carried to its acceptance.
+    /// `None` on a row persisted before the field existed (read as `user` on approval).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub touch_source: Option<TouchSource>,
 }
 
 /// Which row of the approval matrix a plan event is (§8.6).
@@ -629,16 +690,22 @@ pub(crate) fn decide(
             };
             // `plan.accepted` is P1's required transition, published before the rev's first
             // dispatch from this record (`actor::team_gate`).
-            state.accepted = Some(AcceptedPlan {
-                rev,
-                by: by.to_string(),
-                band: filled.band.clone(),
-                high_risk: filled.high_risk,
-                auto,
-                steps: filled.steps.clone(),
-                floor_override: filled.floor_override.clone(),
-                proposal_id: proposal_id.clone(),
-            });
+            state.accepted = Some(
+                AcceptedPlan {
+                    rev,
+                    by: by.to_string(),
+                    band: filled.band.clone(),
+                    high_risk: filled.high_risk,
+                    auto,
+                    steps: filled.steps.clone(),
+                    floor_override: filled.floor_override.clone(),
+                    proposal_id: proposal_id.clone(),
+                    touch: Vec::new(),
+                    touch_truncated: false,
+                    touch_source: None,
+                }
+                .with_touch(prior.accepted.as_ref(), touch_source_of(&proposal.source)),
+            );
             state.accepted_rev = rev;
             state.accepted_high_risk = filled.high_risk;
             state.approved_high_risk |= proposal.approved_by_human && filled.high_risk;
@@ -669,6 +736,7 @@ pub(crate) fn decide(
                 reason: reason.as_str().to_string(),
                 gate_id: None,
                 refusal: None,
+                touch_source: Some(touch_source_of(&proposal.source)),
             });
             Ok(Decided {
                 state,
@@ -818,16 +886,25 @@ pub(crate) fn approve_pending(
         now,
     )?;
     let mut next = state.clone();
-    next.accepted = Some(AcceptedPlan {
-        rev: p.rev,
-        by: "human".to_string(),
-        band: p.band.clone(),
-        high_risk: p.high_risk,
-        auto: is_auto(human_confirm),
-        steps: p.steps.clone(),
-        floor_override: p.floor_override.clone(),
-        proposal_id: p.proposal_id.clone(),
-    });
+    next.accepted = Some(
+        AcceptedPlan {
+            rev: p.rev,
+            by: "human".to_string(),
+            band: p.band.clone(),
+            high_risk: p.high_risk,
+            auto: is_auto(human_confirm),
+            steps: p.steps.clone(),
+            floor_override: p.floor_override.clone(),
+            proposal_id: p.proposal_id.clone(),
+            touch: Vec::new(),
+            touch_truncated: false,
+            touch_source: None,
+        }
+        .with_touch(
+            state.accepted.as_ref(),
+            p.touch_source.unwrap_or(TouchSource::User),
+        ),
+    );
     next.accepted_rev = p.rev;
     next.accepted_high_risk = p.high_risk;
     next.approved_high_risk |= p.high_risk;
@@ -985,10 +1062,7 @@ fn path_scored(
 /// `plan.accepted` for an accepted rev (§6 row 5): the composed steps with their provenance, the
 /// band, `high_risk`, the mode and the recorded override — all engine-computed.
 pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow::Result<TeamEvent> {
-    build(
-        ev::PLAN_ACCEPTED,
-        envelope(run_id, &a.by, None, None, now),
-        json!({
+    let mut body = json!({
             "plan_rev": a.rev,
             "workflow_id": per_run_def_id(run_id, a.rev),
             "band": a.band,
@@ -998,7 +1072,20 @@ pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow:
             "override": a.floor_override,
             // A floor raise composes no proposal (§6 row 4): `null`, never an empty id.
             "proposal_id": (!a.proposal_id.is_empty()).then_some(&a.proposal_id),
-        }),
+            // (TR-W1a) Always named on a new row; an absent key is an old engine.
+            "touch_source": a.touch_source.unwrap_or(TouchSource::None),
+    });
+    // (TR-W1a) Omitted when empty / not cut, exactly as the wire struct skips them.
+    if !a.touch.is_empty() {
+        body["touch"] = json!(a.touch);
+    }
+    if a.touch_truncated {
+        body["touch_truncated"] = json!(true);
+    }
+    build(
+        ev::PLAN_ACCEPTED,
+        envelope(run_id, &a.by, None, None, now),
+        body,
     )
 }
 
@@ -1200,6 +1287,96 @@ mod tests {
 
     fn body_types(d: &Decided) -> Vec<&'static str> {
         d.events.iter().map(TeamEvent::event_type).collect()
+    }
+
+    /// TR-W1a (DES-trigger-registry §4.9): `plan.accepted` carries the accepted rev's declared
+    /// touch set and where it came from — a launch plan's own touch is `user`, a PA scope
+    /// answer's is `pa_scope`, no declared scope is `none` — unioned with every earlier accepted
+    /// rev's touch and capped at 64 paths with `touch_truncated`.
+    #[test]
+    fn plan_accepted_carries_the_accepted_touch_and_its_source() {
+        let accept = |by: &str, source: ProposalSource, p: PlanSteps, prior: &TeamPlanState| {
+            let d = decide(
+                "r1",
+                Proposal {
+                    by: by.into(),
+                    source,
+                    kind: ProposalKind::Initial,
+                    preset: None,
+                    plan: p.clone(),
+                    reviewing_ord: None,
+                    approved_by_human: false,
+                },
+                prior,
+                &HumanConfirm::None,
+                &scored_for(&p),
+                1,
+            )
+            .unwrap();
+            assert!(matches!(d.verdict, Verdict::Accepted { .. }));
+            let acc = d.state.accepted.clone().expect("accepted");
+            let payload = plan_accepted("r1", &acc, 1).unwrap().to_payload().unwrap();
+            (d.state, payload)
+        };
+        let launch = || ProposalSource::Launch {
+            session_id: "r1".into(),
+        };
+        let read_only = |touch: serde_json::Value| {
+            plan(json!({"steps": [{"catalog": "understand", "id": "u"}], "touch": touch}))
+        };
+
+        // A launch plan's own declared touch: `user`.
+        let (state, p) = accept(
+            "human",
+            launch(),
+            read_only(json!(["src/a.rs", "docs/"])),
+            &TeamPlanState::default(),
+        );
+        assert_eq!(p["touch"], json!(["src/a.rs", "docs/"]));
+        assert_eq!(p["touch_source"], "user");
+        assert!(p.get("touch_truncated").is_none(), "{p}");
+
+        // A later accepted rev unions the earlier rev's touch (order kept, no repeats).
+        let (_, p) = accept(
+            "human",
+            launch(),
+            read_only(json!(["docs/", "src/b.rs"])),
+            &state,
+        );
+        assert_eq!(p["touch"], json!(["src/a.rs", "docs/", "src/b.rs"]));
+        assert_eq!(p["touch_source"], "user");
+
+        // The PA's scope answer: `pa_scope`.
+        let (_, p) = accept(
+            "claude#1",
+            ProposalSource::Understand { ord: 1, attempt: 0 },
+            read_only(json!(["src/c.rs"])),
+            &TeamPlanState::default(),
+        );
+        assert_eq!(p["touch_source"], "pa_scope");
+        assert_eq!(p["touch"], json!(["src/c.rs"]));
+
+        // No declared scope: `none`, and no touch key.
+        let (_, p) = accept(
+            "human",
+            launch(),
+            plan(json!({"steps": [{"catalog": "understand", "id": "u"}]})),
+            &TeamPlanState::default(),
+        );
+        assert_eq!(p["touch_source"], "none");
+        assert!(p.get("touch").is_none(), "{p}");
+
+        // Capped at 64 paths, flagged.
+        let many: Vec<String> = (0..70).map(|i| format!("src/f{i}.rs")).collect();
+        let (_, p) = accept(
+            "human",
+            launch(),
+            read_only(json!(many)),
+            &TeamPlanState::default(),
+        );
+        assert_eq!(p["touch"].as_array().unwrap().len(), 64);
+        assert_eq!(p["touch"][63], "src/f63.rs");
+        assert_eq!(p["touch_truncated"], true);
     }
 
     /// The matrix binds a PA-composed plan exactly as it binds a user plan (T3: "on a PA plan and

@@ -63,6 +63,9 @@ fn accepted(steps: Value, score: u8, hc: &HumanConfirm) -> TeamPlanState {
                 steps: p.steps,
                 floor_override: None,
                 proposal_id: p.proposal_id,
+                touch: Vec::new(),
+                touch_truncated: false,
+                touch_source: None,
             });
             s.accepted_rev = p.rev;
             s.accepted_high_risk = p.high_risk;

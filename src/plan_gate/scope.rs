@@ -162,6 +162,10 @@ pub(crate) fn scope_rev(
         steps,
         floor_override: None,
         proposal_id: String::new(),
+        // The scope rev runs the read-only scope step alone: nothing declared yet (TR-W1a).
+        touch: Vec::new(),
+        touch_truncated: false,
+        touch_source: Some(crate::team::events::TouchSource::None),
     });
     state.scope = Some(ScopeHold {
         plan: plan.clone(),

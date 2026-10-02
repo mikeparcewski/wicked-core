@@ -19257,6 +19257,7 @@ mod plan_gate_confirm_tests {
             floor_added: Vec::new(),
             gate_id: Some("g-r-1".into()),
             refusal: None,
+            touch_source: None,
         }
     }
 

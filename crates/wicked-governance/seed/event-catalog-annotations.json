@@ -130,7 +130,7 @@
   },
   "wicked.team.plan.accepted": {
     "trigger": "E: composed, floor-filled, approved or auto-released (required transition)",
-    "payload": "`plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`, `touch` (≤64, omitted when empty), `touch_truncated` (only when cut), `touch_source` (`user`/`pa_scope`/`floor_default`/`none`; absent on an old row); key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.plan.refused": {
     "trigger": "E: compose refused a proposal; the run keeps its accepted rev",
