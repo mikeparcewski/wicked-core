@@ -3741,6 +3741,7 @@ mod tests {
                 tool_name: s(),
                 decision: "allow".to_string(),
                 denying_policy: None,
+                fired_policies: vec![],
             },
             "governanceHookFired",
             &[
@@ -3750,6 +3751,7 @@ mod tests {
                 "attempt",
                 "toolName",
                 "decision",
+                "firedPolicies",
                 "denyingPolicy",
             ],
         );
