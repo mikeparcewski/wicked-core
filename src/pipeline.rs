@@ -71,6 +71,7 @@ pub fn run_session(
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
         false, // stub not yet created
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
+        Vec::new(),
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -407,6 +408,10 @@ pub(crate) fn pre_distribute(
     // must never read the GOV_DB_PATH thread-local directly, because thread-locals do not
     // propagate to spawned threads (including the sync/test path where it is unset).
     governed: bool,
+    // (EP-K3) The launch's judge exclusion, recorded on a session this call CREATES (no stub):
+    // in the same write as the session, never a later one. A launch stub's own value is carried
+    // forward instead (`session_already_started`).
+    exclude_seats: Vec<String>,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -455,7 +460,7 @@ pub(crate) fn pre_distribute(
         benched_seats: Vec::new(),
         team: None,
         team_plan: None,
-        exclude_seats: Vec::new(),
+        exclude_seats,
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -831,6 +836,10 @@ pub(crate) fn plan_and_distribute(
     // GOV_DB_PATH thread-local internally. Pass in_process_governance().is_some() from the
     // calling thread; the sync/test path correctly gets false when GOV_DB_PATH is not set.
     governed: bool,
+    // (EP-K3) The launch's judge exclusion, recorded on a session this call CREATES (no stub):
+    // in the same write as the session, never a later one. A launch stub's own value is carried
+    // forward instead (`session_already_started`).
+    exclude_seats: Vec<String>,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -851,6 +860,7 @@ pub(crate) fn plan_and_distribute(
         workflow_registry,
         session_already_started,
         governed,
+        exclude_seats,
     )?;
     let distributions = distribute::distribute_units_on(&pre.units, clis, session_id)?;
     apply_distributions(store, &mut pre, distributions, emit)?;
@@ -2388,6 +2398,7 @@ mod resolve_tests {
             Some(&registry),
             false,
             false,
+            Vec::new(),
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -2513,6 +2524,7 @@ mod resolve_tests {
             Some(&registry),
             false,
             false,
+            Vec::new(),
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -2903,6 +2915,7 @@ mod resolve_tests {
             None,
             false,
             false,
+            Vec::new(),
         )
         .expect("plans");
         assert!(!planned.units.is_empty());

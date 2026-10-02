@@ -1670,6 +1670,7 @@ pub(crate) fn run(
                     Some(&registry),
                     true, // session stub already created + SessionStarted already emitted
                     in_process_governance().is_some(), // keep governed accurate even when unused today
+                    Vec::new(),
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -1861,6 +1862,7 @@ pub(crate) fn run(
                         Some(team_registry.as_ref().unwrap_or(&registry)),
                         true, // session stub already created + SessionStarted already emitted
                         in_process_governance().is_some(), // keep governed accurate even when unused today
+                        Vec::new(),
                     )
                 }) {
                     Err(e) => {
@@ -4124,20 +4126,12 @@ pub(crate) fn launch_run_inner(
         Some(team.as_ref().map_or(registry, |(_, _, reg)| reg)),
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
+        crate::domain::normalize_exclude_seats(&spec.exclude_seats),
     )?;
     if let Some((state, _, _)) = team {
         let mut s = crate::domain::get_session(store, &run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} planned no session"))?;
         s.team_plan = Some(state);
-        put_node(store, s.to_node())?;
-    }
-    // (EP-K3) This path builds its session in `plan_and_distribute` (no launch stub): record the
-    // launch's judge exclusion on it before the first dispatch.
-    let exclude_seats = crate::domain::normalize_exclude_seats(&spec.exclude_seats);
-    if !exclude_seats.is_empty() {
-        let mut s = crate::domain::get_session(store, &run_id)?
-            .ok_or_else(|| anyhow::anyhow!("run {run_id} planned no session"))?;
-        s.exclude_seats = exclude_seats;
         put_node(store, s.to_node())?;
     }
     match advance_or_pause(
@@ -9760,6 +9754,7 @@ fn replan_for_accepted_edit(
         Some(&scoped),
         true,
         in_process_governance().is_some(),
+        Vec::new(),
     )?;
     let distributions = crate::distribute::distribute_units_on_benched(
         &pre.units,
