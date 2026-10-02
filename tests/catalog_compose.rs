@@ -455,7 +455,8 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
         "gate_type": "value", "validator_pin": "p", "executes_code": true, "skill_ref": "s",
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
-        "added_by": "floor", "floor_reason": "band 20-39 requires build"});
+        "added_by": "floor", "floor_reason": "band 20-39 requires build",
+        "floor_rule": "TST-1002"});
     let parsed: wicked_core::PlanStep = serde_json::from_value(full_step).unwrap();
     let mut keys: Vec<String> = serde_json::to_value(&parsed)
         .unwrap()
@@ -645,7 +646,8 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
             FieldRule::Identity => {}
             // A record of how the step entered the plan: compose ignores it (T2, §8.5).
             FieldRule::Record => {
-                let record = json!({"added_by": "floor", "floor_reason": "band 20-39 requires x"});
+                let record = json!({"added_by": "floor", "floor_reason": "band 20-39 requires x",
+                                    "floor_rule": "TST-1002"});
                 let def = compose_one("full", record).unwrap_or_else(|e| panic!("{field}: {e}"));
                 assert_eq!(def, compose_one("full", json!({})).unwrap(), "{field}");
             }

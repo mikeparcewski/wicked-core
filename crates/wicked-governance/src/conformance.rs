@@ -351,6 +351,13 @@ impl ConformanceRule {
                 );
             }
         }
+        // INV-S4 (WT-C3): a plan.compose rule is advisory, or held with the closed vocabulary.
+        crate::engine::check_plan_compose_rule(
+            &self.id,
+            &self.applies_to,
+            self.effect,
+            &self.obligations,
+        )?;
         Ok(())
     }
 

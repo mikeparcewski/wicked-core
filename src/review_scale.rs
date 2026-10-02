@@ -971,6 +971,17 @@ fn git_unquote(raw: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// (WT-C3) The `kinds` token of one path in a plan context: `docs`, `test`, `config` or `code`
+/// ([`classify`], the one classifier the score reads).
+pub(crate) fn kind_name(path: &str) -> &'static str {
+    match classify(path) {
+        Kind::Docs => "docs",
+        Kind::Test => "test",
+        Kind::Config => "config",
+        Kind::Code => "code",
+    }
+}
+
 fn classify(path: &str) -> Kind {
     let t = &THRESHOLDS;
     let name = path.rsplit('/').next().unwrap_or(path);

@@ -45,6 +45,13 @@ pub struct DiffRescore {
     pub destructive: bool,
     /// Its `path.scored{basis:"diff"}`, published first at the boundary.
     pub fact: QueuedFact,
+    /// (WT-C3) The obligations of held testing rules the settled diff newly fired (the context
+    /// re-derived from the diff's paths): they join the floor through the same `floor_raised`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<crate::plan::HeldObligation>,
+    /// (WT-C3) Advisory testing rules the settled diff newly applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recalled: Vec<String>,
 }
 
 /// The settled diff's score (§8.7): the changed paths read as S4 signals against the run's graph,
@@ -60,6 +67,26 @@ pub(crate) fn diff_score_for_run(
         floor_override: None,
     };
     super::intent_score_for_run(&plan, repo_root, base_commit)
+}
+
+/// (WT-C3) The re-score to hold for the next boundary, given the one already `waiting`: the
+/// highest score and any destructive signal are kept (the ratchet never loses a waiting raise),
+/// the obligations and advisory rules accumulate, and the `path.scored` fact published first is
+/// the fresh one when its band rises (`band_rises`), else the waiting one.
+pub(crate) fn hold_rescore(
+    waiting: Option<&DiffRescore>,
+    fresh: DiffRescore,
+    band_rises: bool,
+) -> DiffRescore {
+    let Some(w) = waiting else {
+        return fresh;
+    };
+    let mut held = if band_rises { fresh.clone() } else { w.clone() };
+    held.score = w.score.max(fresh.score);
+    held.destructive = w.destructive || fresh.destructive;
+    held.obligations = super::union(&w.obligations, &fresh.obligations);
+    held.recalled = super::union(&w.recalled, &fresh.recalled);
+    held
 }
 
 /// Whether a score lands the run in a higher floor than its ratcheted one (§8.5: the band only
@@ -246,12 +273,16 @@ pub(crate) fn revise(
         (None, None) => TouchSource::None,
     };
     let mut events = Vec::new();
+    let mut obligations = prior.obligations.clone();
+    let mut recalled = prior.recalled.clone();
     let (additions, proposal_id, reason, score, destructive, by_human) = match change {
         Change::Floor(r) => {
             events.push(TeamEvent::from_payload(
                 &r.fact.event_type,
                 &r.fact.payload,
             )?);
+            obligations = super::union(&obligations, &r.obligations);
+            recalled = super::union(&recalled, &r.recalled);
             (
                 Vec::new(),
                 None,
@@ -300,13 +331,22 @@ pub(crate) fn revise(
     let destructive = prior.destructive || destructive;
     // Provenance is output-only (floor fill refuses a step that supplies it): the base plan's is
     // set aside and restored on the same steps afterwards.
-    let mut provenance: HashMap<String, (Option<AddedBy>, Option<String>)> = HashMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut provenance: HashMap<String, (Option<AddedBy>, Option<String>, Option<String>)> =
+        HashMap::new();
     let mut steps: Vec<PlanStep> = base
         .steps
         .iter()
         .cloned()
         .map(|mut s| {
-            provenance.insert(s.id.clone(), (s.added_by.take(), s.floor_reason.take()));
+            provenance.insert(
+                s.id.clone(),
+                (
+                    s.added_by.take(),
+                    s.floor_reason.take(),
+                    s.floor_rule.take(),
+                ),
+            );
             s
         })
         .collect();
@@ -341,17 +381,21 @@ pub(crate) fn revise(
             destructive,
             human_confirm,
             deliver: deliver.as_deref(),
+            obligations: &obligations,
+            ran: done,
         },
     ) {
         Ok(f) => f,
         Err(r) => return refuse(events, refusal_text(&r)),
     };
     for s in &mut filled.steps.steps {
-        if let Some((by, why)) = provenance.get(&s.id) {
+        if let Some((by, why, rule)) = provenance.get(&s.id) {
             s.added_by = *by;
             s.floor_reason = why.clone();
+            s.floor_rule = rule.clone();
         }
     }
+    let rules = super::rule_outcomes(&obligations, &recalled, &filled);
     // The done prefix's catalog positions: a new step before any of them is late (§8.7).
     let done_pos: Vec<Option<usize>> = done
         .iter()
@@ -426,6 +470,8 @@ pub(crate) fn revise(
     state.rev = rev;
     state.max_score = max_score;
     state.destructive = destructive;
+    state.obligations = obligations;
+    state.recalled = recalled;
     let pid = proposal_id.unwrap_or_default();
     match needs {
         None => {
@@ -442,6 +488,7 @@ pub(crate) fn revise(
                     touch: Vec::new(),
                     touch_truncated: false,
                     touch_source: None,
+                    rules,
                 }
                 .with_touch(prior.accepted.as_ref(), base_touch_source),
             );
@@ -480,6 +527,7 @@ pub(crate) fn revise(
                 gate_id: None,
                 refusal: None,
                 touch_source: Some(base_touch_source),
+                rules,
             });
             Ok(Revised {
                 state,

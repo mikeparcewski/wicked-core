@@ -551,6 +551,9 @@ pub struct PlanStep {
     pub added_by: Option<AddedBy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_reason: Option<String>,
+    /// (WT-C3) The held testing rule that made floor fill add the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_rule: Option<String>,
     /// On `plan.revised.added`: the step's catalog position precedes a done step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late: Option<bool>,
@@ -696,6 +699,27 @@ pub struct PlanAccepted {
     /// (TR-W1a) Where the touch set came from. Absent on an old row (read as `none`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub touch_source: Option<TouchSource>,
+    /// (WT-C3, DES-walkthrough-proof §4.12) Every testing rule this rev was composed under and
+    /// what came of it. Absent when no rule applied (and on an old row).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleOutcome>,
+}
+
+/// (WT-C3) One rule on `plan.accepted.rules`: `applied` (a held rule whose obligations are in
+/// the plan), `recalled` (an advisory rule that applied), `overridden` (a held rule whose every
+/// obligation the floor override removed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleOutcome {
+    pub id: String,
+    pub outcome: RuleOutcomeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleOutcomeKind {
+    Applied,
+    Recalled,
+    Overridden,
 }
 
 /// 6 — `plan.refused` (E).

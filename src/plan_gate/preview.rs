@@ -61,6 +61,7 @@ pub(crate) fn preview_plan(
     repo_root: Option<&std::path::Path>,
     base_commit: Option<&str>,
     deliver_step: Option<&PlanStep>,
+    rules: &dyn super::RuleSource,
 ) -> anyhow::Result<PlanPreview> {
     // The launch's synchronous checks, then its decision — the same calls, in the same order.
     if let Err(r) = super::precheck(plan, deliver_step, human_confirm) {
@@ -102,6 +103,7 @@ pub(crate) fn preview_plan(
         },
         human_confirm,
         &scored,
+        rules,
         0,
     )?;
     if let super::Verdict::Refused { reason } = decided.verdict {
@@ -151,7 +153,7 @@ mod tests {
     }
 
     fn preview_of(p: &PlanSteps, hc: &HumanConfirm) -> anyhow::Result<PlanPreview> {
-        preview_plan(p, hc, None, None, None)
+        preview_plan(p, hc, None, None, None, &crate::plan_gate::NoRules)
     }
 
     fn preview(v: Value, hc: HumanConfirm) -> Value {
@@ -329,6 +331,7 @@ mod tests {
             None,
             None,
             Some(&d),
+            &crate::plan_gate::NoRules,
         )
         .unwrap();
         assert!(p.floor.contains(&"deliver".to_string()), "{:?}", p.floor);
@@ -343,7 +346,7 @@ mod tests {
             &HumanConfirm::All,
             None,
             None,
-            Some(&d),
+            Some(&d), &crate::plan_gate::NoRules,
         )
         .is_err());
     }

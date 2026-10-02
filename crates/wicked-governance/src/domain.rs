@@ -126,6 +126,13 @@ impl Policy {
                 );
             }
         }
+        // (WT-C3) A plan.compose rule names only the closed obligation vocabulary.
+        crate::engine::check_plan_compose_rule(
+            &self.id,
+            &self.applies_to,
+            Some(self.effect),
+            &self.obligations,
+        )?;
         Ok(())
     }
 }

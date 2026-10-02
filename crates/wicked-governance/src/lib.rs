@@ -47,7 +47,8 @@ mod steering;
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
     claim_from_node, claim_symbol, claim_to_node, conform, decide, decide_as, register_policy,
-    retire_policy, select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
+    retire_policy, rules_at_phase, select, select_any, PhaseRules, EVALUATOR_IDENTITY,
+    EV_CONFORMANCE_RECORDED_LITERAL, PLAN_COMPOSE_OBLIGATIONS, PLAN_COMPOSE_PHASE,
 };
 
 // Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B),
@@ -697,5 +698,95 @@ mod tests {
             !recovered.retired,
             "absent must mean active — the policy was enforcing when it was written"
         );
+    }
+
+    /// WT-C3 (DES-walkthrough-proof §4.12): `rules_at_phase` reads the unified store at one
+    /// phase with the DC-S1 project facet — a project rule only for a run in its project, a
+    /// global rule everywhere — splits fired held rules from advisory (recall-only) ones, and
+    /// skips retired rules, rules whose trigger misses, and rules whose `excludes` names the phase.
+    #[test]
+    fn wt_c3_rules_at_phase_applies_the_project_facet_and_splits_held_from_advisory() {
+        let rule = |v: serde_json::Value| -> ConformanceRule { serde_json::from_value(v).unwrap() };
+        let base = |id: &str| {
+            serde_json::json!({"id": id, "rule_type": "policy", "statement": format!("{id} statement"),
+                "severity": "warn", "confidence": 0.9, "steering_type": "testing",
+                "applies_to": [PLAN_COMPOSE_PHASE]})
+        };
+        let mut store = SqliteStore::in_memory().unwrap();
+        let mut held = base("TST-1002");
+        held["effect"] = serde_json::json!("allow_with_conditions");
+        held["trigger"] = serde_json::json!({"contains": r#""kinds":\[[^\]]*"(code|config)""#});
+        held["obligations"] = serde_json::json!(["step:test", "step:walkthrough"]);
+        register_rule(&mut store, &rule(held)).unwrap();
+        let mut project_rule = base("TST-P");
+        project_rule["effect"] = serde_json::json!("allow_with_conditions");
+        project_rule["obligations"] = serde_json::json!(["step:security_review"]);
+        project_rule["targets"] = serde_json::json!({"project": "proj-pay"});
+        register_rule(&mut store, &rule(project_rule)).unwrap();
+        let mut advisory = base("TST-1001");
+        advisory["trigger"] = serde_json::json!({"contains": r#""kinds":\["docs"\]"#});
+        register_rule(&mut store, &rule(advisory)).unwrap();
+        let mut excluded = base("TST-X");
+        excluded["excludes"] = serde_json::json!([PLAN_COMPOSE_PHASE]);
+        register_rule(&mut store, &rule(excluded)).unwrap();
+        let mut retired = base("TST-R");
+        retired["retired"] = serde_json::json!(true);
+        register_rule(&mut store, &rule(retired)).unwrap();
+
+        let code = serde_json::json!({"kinds": ["code"], "paths": ["src/pay.ts"]});
+        let docs = serde_json::json!({"kinds": ["docs"], "paths": ["README.md"]});
+        let ids = |r: &PhaseRules| r.fired.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+
+        let r = rules_at_phase(&store, PLAN_COMPOSE_PHASE, &[], &code).unwrap();
+        assert_eq!(ids(&r), ["TST-1002"]);
+        assert!(r.recalled.is_empty(), "{:?}", r.recalled);
+        let r = rules_at_phase(&store, PLAN_COMPOSE_PHASE, &["proj-pay".into()], &code).unwrap();
+        assert_eq!(ids(&r), ["TST-1002", "TST-P"]);
+        let r = rules_at_phase(&store, PLAN_COMPOSE_PHASE, &["proj-other".into()], &docs).unwrap();
+        assert!(ids(&r).is_empty());
+        assert_eq!(r.recalled, ["TST-1001"]);
+        // Another phase reads none of them.
+        let r = rules_at_phase(&store, "build", &["proj-pay".into()], &code).unwrap();
+        assert!(r.fired.is_empty() && r.recalled.is_empty());
+    }
+
+    /// WT-C3 (§4.12 S7): the obligation vocabulary of a held `plan.compose` rule is closed —
+    /// an unknown token is refused when the rule (or the policy) is written; other phases keep
+    /// their free-form obligations.
+    #[test]
+    fn wt_c3_an_unknown_plan_compose_obligation_is_refused_at_write() {
+        let rule = |applies: &str, ob: &str| -> ConformanceRule {
+            serde_json::from_value(serde_json::json!({"id": "TST-9", "rule_type": "policy",
+                "statement": "s", "severity": "warn", "confidence": 0.9, "steering_type": "testing",
+                "applies_to": [applies], "effect": "allow_with_conditions", "obligations": [ob]}))
+            .unwrap()
+        };
+        let err = rule(PLAN_COMPOSE_PHASE, "check:lint")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("check:lint") && err.contains("TST-9"), "{err}");
+        rule(PLAN_COMPOSE_PHASE, "step:walkthrough")
+            .validate()
+            .unwrap();
+        rule("build", "notify-secops").validate().unwrap();
+        let mut p = allow_with_conditions_policy();
+        p.applies_to = vec![PLAN_COMPOSE_PHASE.into()];
+        assert!(
+            p.validate().is_err(),
+            "a policy is held to the same vocabulary"
+        );
+        // Plan compose is not a gate: `deny` / `allow` mean nothing there, and a held rule owes
+        // at least one obligation (codex review).
+        let mut deny = rule(PLAN_COMPOSE_PHASE, "step:test");
+        deny.effect = Some(Effect::Deny);
+        let err = deny.validate().unwrap_err().to_string();
+        assert!(err.contains("Deny"), "{err}");
+        let mut empty = rule(PLAN_COMPOSE_PHASE, "step:test");
+        empty.obligations.clear();
+        assert!(empty.validate().is_err());
+        let mut advisory = rule(PLAN_COMPOSE_PHASE, "anything");
+        advisory.effect = None;
+        advisory.validate().unwrap();
     }
 }
