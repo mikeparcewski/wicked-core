@@ -8601,11 +8601,29 @@ fn run_walkthrough_record(
 ) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
     use crate::walkthrough as wt;
     use crate::workflow::StepStatus;
-    let refused = |why: String| {
+    // Every refusal REPLACES the previous take's verdict with an INCONCLUSIVE one naming the
+    // cause, whenever the step's root is a plain directory it can safely write — a refused take
+    // must never leave a PASS for the validator to read (Copilot on #697). A root that is not
+    // safe to write is not read by the validator either (`walkthrough::validator_env`).
+    let refused = |cause: &str, why: String| {
+        let mut said = String::new();
+        if let Some(root) = rec.step_root.as_deref() {
+            if wt::check_proof_root(root).is_ok() {
+                let written = wt::retire_previous_result(root, attempt).and_then(|()| {
+                    std::fs::write(
+                        root.join(wt::RESULT_FILE),
+                        wt::inconclusive_result(cause, &why),
+                    )
+                });
+                if let Err(e) = written {
+                    said = format!(" (and the verdict file could not be replaced: {e})");
+                }
+            }
+        }
         (
             format!(
-                "walkthrough_review recorded nothing: {why}. The pinned result validator denies \
-                 this step."
+                "walkthrough_review recorded nothing: {why}{said}. The pinned result validator \
+                 denies this step."
             ),
             StepStatus::Ok,
             None,
@@ -8613,16 +8631,19 @@ fn run_walkthrough_record(
     };
     let proof_root = match &rec.proof_root {
         Ok(p) => p.clone(),
-        Err(why) => return refused(why.clone()),
+        Err(why) => return refused(wt::ENGINE_REFUSED, why.clone()),
     };
     if let Err(e) = std::fs::create_dir_all(&proof_root) {
-        return refused(format!(
-            "the proof root {} could not be created: {e}",
-            proof_root.display()
-        ));
+        return refused(
+            wt::ENGINE_REFUSED,
+            format!(
+                "the proof root {} could not be created: {e}",
+                proof_root.display()
+            ),
+        );
     }
     if let Err(why) = wt::check_proof_root(&proof_root) {
-        return refused(why);
+        return refused(wt::ENGINE_REFUSED, why);
     }
     if let Err(e) = wt::retire_previous_result(&proof_root, attempt) {
         // The previous take's verdict must never be read as this one's (codex review): remove it,
@@ -8645,7 +8666,12 @@ fn run_walkthrough_record(
     }
     let tmp = match crate::repo_checks::PrivateTmp::create() {
         Ok(t) => t,
-        Err(e) => return refused(format!("the recorder's private temp dir: {e}")),
+        Err(e) => {
+            return refused(
+                wt::ENGINE_REFUSED,
+                format!("the recorder's private temp dir: {e}"),
+            )
+        }
     };
     let launcher = jail(&[proof_root.as_path(), tmp.path()]);
     if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
@@ -8662,10 +8688,13 @@ fn run_walkthrough_record(
                 StepStatus::Ok,
                 None,
             ),
-            Err(e) => refused(format!(
-                "{reason}; and {} could not be written: {e}",
-                wt::RESULT_FILE
-            )),
+            Err(e) => refused(
+                wt::UNJAILED_HOST,
+                format!(
+                    "{reason}; and {} could not be written: {e}",
+                    wt::RESULT_FILE
+                ),
+            ),
         };
     }
     let tmp_s = tmp.path().to_string_lossy().into_owned();
@@ -18971,6 +19000,7 @@ mod walkthrough_record_tests {
     fn launch(proof: &std::path::Path) -> RecordLaunch {
         RecordLaunch {
             proof_root: Ok(proof.to_path_buf()),
+            step_root: Some(proof.to_path_buf()),
             env: vec![
                 ("WICKED_RUN_ID".into(), "run-wt".into()),
                 ("WICKED_RUN_UNIT".into(), "3".into()),
@@ -19020,7 +19050,20 @@ try:
     socket.create_connection(("1.1.1.1", 80), timeout=5); print("egress OPEN")
 except OSError as e:
     print("egress refused", type(e).__name__)
+try:
+    u = socket.socket(socket.AF_UNIX); u.settimeout(5); u.connect(UNIX_PATH); print("unix OPEN")
+except OSError as e:
+    print("unix refused", type(e).__name__)
 "#;
+        // A host service listening on a PATHNAME unix socket, where an ssh agent would put it
+        // (Copilot on #697): unreachable from the jail (macOS: the profile's network deny;
+        // Linux: bwrap masks the socket directories).
+        let sock_dir = std::path::PathBuf::from(format!("/tmp/ssh-wtc2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let sock = sock_dir.join("agent.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let net = net.replace("UNIX_PATH", &format!("{:?}", sock.to_string_lossy()));
         let script = format!(
             "env > \"$WICKED_EVIDENCE_ROOT/env.txt\"; \
              python3 -c '{net}' > \"$WICKED_EVIDENCE_ROOT/net.txt\" 2>&1; \
@@ -19051,6 +19094,11 @@ except OSError as e:
             net.contains("egress refused"),
             "public egress must fail: {net}"
         );
+        assert!(
+            net.contains("unix refused"),
+            "a host unix socket must be unreachable: {net}"
+        );
+        let _ = std::fs::remove_dir_all(&sock_dir);
         assert!(
             !worktree.join("escaped.txt").exists(),
             "the worktree is not writable"
@@ -19163,12 +19211,48 @@ except OSError as e:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Copilot on #697: a take refused BEFORE the jail (here: the tree could not be snapshotted)
+    /// replaces the previous take's PASS with an INCONCLUSIVE `engine_refused` verdict — the
+    /// validator can never read the old PASS as this take's.
+    #[test]
+    fn a_refused_take_replaces_the_previous_pass() {
+        let dir = scratch("refused-retake");
+        let proof = dir.join("wr");
+        std::fs::create_dir_all(&proof).unwrap();
+        std::fs::write(proof.join(RESULT_FILE), r#"{"overall":"PASS"}"#).unwrap();
+        let rec = RecordLaunch {
+            proof_root: Err("the worktree's tree could not be snapshotted at dispatch".into()),
+            step_root: Some(proof.clone()),
+            env: Vec::new(),
+        };
+        let (out, st, _) = run_walkthrough_record(
+            &["true".to_string()],
+            None,
+            &rec,
+            None,
+            3,
+            &crate::validator::loopback_jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(proof.join(RESULT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(v["overall"], "INCONCLUSIVE");
+        assert_eq!(v["cause"], crate::walkthrough::ENGINE_REFUSED);
+        assert!(proof.join("result.before-attempt-3.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// No proof root (repo-less run, no evidence root, no tree): nothing runs, the unit is `Ok`
     /// with the reason, so the verdict stays the validator's (never the failover ladder's retry).
     #[test]
     fn no_proof_root_records_nothing_and_says_why() {
         let rec = RecordLaunch {
             proof_root: Err("the launcher minted no evidence root for this run".into()),
+            step_root: None,
             env: Vec::new(),
         };
         let (out, st, k) = run_walkthrough_record(

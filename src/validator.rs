@@ -606,6 +606,45 @@ fn detect_sandbox_launcher_for_roots(
     launcher_for_roots_masking(write_roots, network, secret_read_block_dirs())
 }
 
+/// (WT-C2) The directories a loopback-only bwrap jail masks with an empty tmpfs so the recorder
+/// cannot reach host services over PATHNAME unix sockets: `/run` and `/var/run` (when real
+/// directories), and under each of `temp_dirs` the socket directories tools create there
+/// (`.X11-unix`, `.ICE-unix`, `ssh-*`, `tmux-*`). A directory holding one of `write_roots` is never
+/// masked — the jail's own roots stay reachable. macOS needs none of this: its profile's
+/// `(deny network*)` already refuses a unix-socket connect.
+fn loopback_socket_masks(
+    write_roots: &[std::path::PathBuf],
+    temp_dirs: &[&Path],
+) -> Vec<std::path::PathBuf> {
+    let real_dir = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .map(|m| m.is_dir() && !m.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    let mut out: Vec<std::path::PathBuf> = ["/run", "/var/run"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .filter(|p| real_dir(p))
+        .collect();
+    for tmp in temp_dirs {
+        let Ok(entries) = std::fs::read_dir(tmp) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let socketish = name == ".X11-unix"
+                || name == ".ICE-unix"
+                || name.starts_with("ssh-")
+                || name.starts_with("tmux-");
+            if socketish && real_dir(&e.path()) {
+                out.push(e.path());
+            }
+        }
+    }
+    out.retain(|m| !write_roots.iter().any(|r| r.starts_with(m)));
+    out
+}
+
 /// (WT-C2) The jail the `walkthrough_review` Tool runs in: writes only under `write_roots`, network
 /// to loopback only, the curated secret dirs unreadable. Only a `Sandboxed` launcher jails it — a
 /// network-only `firejail` contains no writes — so the caller treats any other level as "no jail".
@@ -688,6 +727,16 @@ fn launcher_for_roots_masking(
             for dir in secret_dirs.into_iter().filter(|d| d.is_dir()) {
                 w.push("--tmpfs".to_string());
                 w.push(dir.to_string_lossy().to_string());
+            }
+            // (WT-C2, Copilot on #697) `--unshare-net` isolates abstract unix sockets but not
+            // PATHNAME ones, which the read-only `/` still exposes (`/run/docker.sock`, the user's
+            // `/run/user/<uid>` bus, an ssh agent under `/tmp`). Loopback-only hides the usual
+            // socket directories behind an empty tmpfs; the write roots, bound below, still win.
+            if matches!(network, NetworkPolicy::LoopbackOnly) {
+                for dir in loopback_socket_masks(&roots, &[Path::new("/tmp")]) {
+                    w.push("--tmpfs".to_string());
+                    w.push(dir.to_string_lossy().to_string());
+                }
             }
             // P8 #9 / core#217: rw-bind the coverage store's dir (outside the run dir) so opening its
             // WAL-mode SQLite db can create -wal/-shm/journal there. `--ro-bind / /` above makes it
@@ -3482,6 +3531,32 @@ mod tests {
     /// write access to the store's DIRECTORY (for `-wal`/`-shm`/journal). The macOS profile must grant it when an
     /// `extra_write` dir is supplied — else the deny-writes floor blocks the open ("unable to open
     /// database file") and the coverage gate can never pass on the governed daemon path.
+    /// WT-C2 (Copilot on #697): the loopback-only bwrap jail masks the socket directories — and
+    /// never one that holds a write root.
+    #[test]
+    fn loopback_masks_socket_dirs_but_never_a_write_root() {
+        let base = std::env::temp_dir().join(format!("wt-c2-masks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in [".X11-unix", "ssh-abc", "tmux-501", "keep", "ssh-holds-root"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let root = base.join("ssh-holds-root").join("proof");
+        std::fs::create_dir_all(&root).unwrap();
+        let masks = loopback_socket_masks(std::slice::from_ref(&root), &[base.as_path()]);
+        for d in [".X11-unix", "ssh-abc", "tmux-501"] {
+            assert!(
+                masks.contains(&base.join(d)),
+                "{d} must be masked: {masks:?}"
+            );
+        }
+        assert!(!masks.contains(&base.join("keep")));
+        assert!(
+            !masks.contains(&base.join("ssh-holds-root")),
+            "a dir holding a write root stays reachable"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn macos_profile_grants_write_to_an_extra_dir_only_when_supplied() {
         let base = std::env::temp_dir();

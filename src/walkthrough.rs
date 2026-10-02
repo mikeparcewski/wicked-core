@@ -58,6 +58,9 @@ pub(crate) const AUTHOR_SUBDIR: &str = "author";
 pub(crate) const RESULT_FILE: &str = "result.json";
 /// `result.json`'s `cause` on a host that cannot jail the recorder.
 pub(crate) const UNJAILED_HOST: &str = "unjailed_host";
+/// `result.json`'s `cause` when the engine refused to start the recorder for any other reason (no
+/// worktree, no tree snapshot, an unsafe proof root, no private temp dir).
+pub(crate) const ENGINE_REFUSED: &str = "engine_refused";
 
 /// Validate a launch's evidence root by the rules every launch-declared write root obeys
 /// (absolute, outside the engine's config/pin tree, `path_policy`). `None` is valid: such a run
@@ -128,6 +131,11 @@ pub(crate) fn validator_env(
     let Some(root) = step_root(session, unit) else {
         return env;
     };
+    // The proof root is read only when it is a plain directory under its evidence root: a link
+    // planted there must never aim the result check at a PASS elsewhere (Copilot on #697).
+    if is(unit, REVIEW_CATALOG) && check_proof_root(&root).is_err() {
+        return env;
+    }
     env.push((
         EVIDENCE_ROOT_ENV.to_string(),
         root.to_string_lossy().into_owned(),
@@ -177,6 +185,10 @@ pub(crate) fn author_step_for<'a>(review: &WorkUnit, units: &'a [WorkUnit]) -> O
 pub(crate) struct RecordLaunch {
     /// The proof root, or why there is none.
     pub(crate) proof_root: Result<PathBuf, String>,
+    /// The step's root whenever it is computable — set even when `proof_root` is an `Err` (no
+    /// worktree, no tree), so a refused take still replaces the previous take's verdict there
+    /// instead of leaving it for the validator (Copilot on #697).
+    pub(crate) step_root: Option<PathBuf>,
     /// The declared variables, in a fixed order (see the module docs).
     pub(crate) env: Vec<(String, String)>,
 }
@@ -193,6 +205,7 @@ pub(crate) fn record_launch(
     if !is(unit, REVIEW_CATALOG) {
         return None;
     }
+    let root = step_root(session, unit);
     let proof_root = if session.workdir.is_none() {
         Err("the run has no worktree (a repo-less run records no walkthrough)".to_string())
     } else if session.evidence_root.is_none() {
@@ -233,7 +246,11 @@ pub(crate) fn record_launch(
             ));
         }
     }
-    Some(RecordLaunch { proof_root, env })
+    Some(RecordLaunch {
+        proof_root,
+        step_root: root,
+        env,
+    })
 }
 
 /// Check, at use time, that a proof root is a real directory directly under its evidence root —
@@ -370,6 +387,8 @@ mod tests {
     #[test]
     fn the_validators_are_handed_the_step_root_and_the_lint_the_garden_root() {
         let ev = ev();
+        // The proof root is handed over only when it is a plain directory.
+        std::fs::create_dir_all(Path::new(&ev).join("wr")).unwrap();
         let s = session(Some(&ev), Some("/wt"));
         let garden = Path::new("/garden/gen-7");
         let plan = unit("wp", 1, Some(PLAN_CATALOG));
@@ -548,6 +567,31 @@ mod tests {
             .contains("not a plain directory"));
         std::fs::write(evidence.join("file"), "x").unwrap();
         assert!(check_proof_root(&evidence.join("file")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot on #697: the result check is never pointed at a planted link — no root is handed
+    /// over, so the script's own `test -n` denies.
+    #[cfg(unix)]
+    #[test]
+    fn the_result_check_is_not_handed_a_planted_link() {
+        let dir = std::env::temp_dir().join(format!("wt-c2-vlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let evidence = dir.join("evidence");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(RESULT_FILE), r#"{"overall":"PASS"}"#).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, evidence.join("wr")).unwrap();
+        let s = session(Some(evidence.to_str().unwrap()), Some("/wt"));
+        assert!(validator_env(&s, &unit("wr", 2, Some(REVIEW_CATALOG)), None).is_empty());
+        std::fs::remove_file(evidence.join("wr")).unwrap();
+        std::fs::create_dir_all(evidence.join("wr")).unwrap();
+        assert_eq!(
+            validator_env(&s, &unit("wr", 2, Some(REVIEW_CATALOG)), None).len(),
+            1,
+            "a plain proof root is handed over"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
