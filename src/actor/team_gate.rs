@@ -189,6 +189,7 @@ fn plan_accepted(session: &AgentSession, units: &[WorkUnit], plan_rev: u32) -> T
                         gate: None,
                         added_by: None,
                         floor_reason: None,
+                        floor_rule: None,
                         late: None,
                     }
                 })
@@ -199,6 +200,7 @@ fn plan_accepted(session: &AgentSession, units: &[WorkUnit], plan_rev: u32) -> T
             touch: Vec::new(),
             touch_truncated: false,
             touch_source: Some(crate::team::events::TouchSource::None),
+            rules: Vec::new(),
         }),
     )
 }
@@ -2565,13 +2567,57 @@ pub(super) fn on_rescored(
         session.base_commit.as_deref(),
     );
     let score = scored.assessment.score;
-    if !crate::plan_gate::floor_rises(tp, score, scored.destructive) {
-        return Ok(());
-    }
-    if let Some(r) = &tp.rescored {
-        if r.score >= score && (r.destructive || !scored.destructive) {
+    // (WT-C3, DES-walkthrough-proof §4.12) The settled diff re-derives the testing-rule context
+    // (a re-score only runs for a teamed run, so its kinds are the diff's own): a held rule that
+    // fires now and did not before raises the floor through the same `floor_raised`.
+    let waiting = tp.rescored.as_ref();
+    let max_score = tp.max_score.max(score);
+    let destructive = tp.destructive || scored.destructive;
+    let context = crate::plan_gate::plan_context(
+        &crate::project::member_projects(&*store, crate::project::MEMBER_KIND_RUN, run_id)?,
+        paths,
+        true,
+        scored
+            .assessment
+            .signals
+            .as_ref()
+            .is_some_and(|s| s.critical),
+        destructive,
+        &crate::review_scale::floor_for(max_score, destructive).band,
+        tp.deliver_step.is_some(),
+    );
+    let read = crate::plan_gate::RuleSource::eval(
+        &crate::plan_gate::StoreRules::for_run(&*store, run_id, None, true)?,
+        &context,
+    )?;
+    let known = crate::plan_gate::union(
+        &tp.obligations,
+        waiting.map_or(&[][..], |r| r.obligations.as_slice()),
+    );
+    let new_obligations: Vec<crate::plan::HeldObligation> = read
+        .held
+        .iter()
+        .filter(|o| !known.contains(o))
+        .cloned()
+        .collect();
+    let new_recalled: Vec<String> = read
+        .recalled
+        .iter()
+        .filter(|r| !tp.recalled.contains(r) && waiting.is_none_or(|w| !w.recalled.contains(r)))
+        .cloned()
+        .collect();
+    let band_rises = crate::plan_gate::floor_rises(tp, score, scored.destructive)
+        && waiting.is_none_or(|r| r.score < score || (!r.destructive && scored.destructive));
+    if !band_rises && new_obligations.is_empty() {
+        // An advisory rule the settled diff newly applied raises nothing, but it was considered:
+        // ratchet it onto the run's record, where the next rev's `plan.accepted.rules` reads it.
+        if new_recalled.is_empty() {
             return Ok(());
         }
+        if let Some(tp) = session.team_plan.as_mut() {
+            tp.recalled = crate::plan_gate::union(&tp.recalled, &new_recalled);
+        }
+        return put_node(store, session.to_node());
     }
     let fact = crate::plan_gate::path_scored_diff(
         run_id,
@@ -2582,16 +2628,24 @@ pub(super) fn on_rescored(
         &scored.assessment,
         crate::interaction::now_millis(),
     )?;
-    let rescored = crate::plan_gate::DiffRescore {
-        ord,
-        attempt,
-        rescore_seq,
-        score,
-        destructive: scored.destructive,
-        fact: crate::plan_gate::queued_facts(&[fact])?
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
-    };
+    // The waiting raise is never lost: the highest score and any destructive signal are kept,
+    // the obligations (and advisory rules) accumulate.
+    let rescored = crate::plan_gate::hold_rescore(
+        waiting,
+        crate::plan_gate::DiffRescore {
+            ord,
+            attempt,
+            rescore_seq,
+            score,
+            destructive: scored.destructive,
+            fact: crate::plan_gate::queued_facts(&[fact])?
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
+            obligations: new_obligations,
+            recalled: new_recalled,
+        },
+        band_rises,
+    );
     if let Some(tp) = session.team_plan.as_mut() {
         tp.rescored = Some(rescored);
     }
@@ -2739,6 +2793,12 @@ pub(super) fn apply_scope(
         // the settled diff); an un-teamed repo run's declared scope would never be corrected.
         session.team.as_ref().is_some_and(RunTeamState::is_teamed),
         &session.human_confirm,
+        &crate::plan_gate::StoreRules::for_run(
+            &*store,
+            run_id,
+            None,
+            session.team.as_ref().is_some_and(RunTeamState::is_teamed),
+        )?,
         now,
     )?;
     let def = match decided.verdict {
@@ -2910,6 +2970,34 @@ pub(super) fn propose_plan(
         high_risk,
         floor_added,
     })
+}
+
+/// (WT-C3) A re-score held for this boundary that fired a testing rule floor fill cannot honour —
+/// an obligation outside the closed vocabulary, which only a row written around the write-time
+/// check can carry (a `deny` / `allow` effect, a held rule with no obligation) — FAILS THE RUN
+/// here, before the revision hook would drop the raise and run on under its old floor: the
+/// compose-time refusal's mid-run twin (fail closed, naming the rule).
+pub(super) fn refuse_unholdable_rules(store: &dyn GraphStore, run_id: &str) -> anyhow::Result<()> {
+    let Some(session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(());
+    };
+    let Some(r) = session.team_plan.as_ref().and_then(|t| t.rescored.as_ref()) else {
+        return Ok(());
+    };
+    if let Some(o) = r
+        .obligations
+        .iter()
+        .find(|o| crate::plan::obligation_types(&o.token).is_none())
+    {
+        anyhow::bail!(
+            "{}",
+            crate::plan::PlanRefusal::UnknownObligation {
+                rule: o.rule.clone(),
+                token: o.token.clone(),
+            }
+        );
+    }
+    Ok(())
 }
 
 /// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
@@ -3192,3 +3280,7 @@ mod replan_tests;
 #[cfg(test)]
 #[path = "propose_tests.rs"]
 mod propose_tests;
+
+#[cfg(test)]
+#[path = "testing_rules_tests.rs"]
+mod testing_rules_tests;

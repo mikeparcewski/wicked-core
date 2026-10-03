@@ -45,6 +45,7 @@ fn accepted(steps: Value, score: u8, hc: &HumanConfirm) -> TeamPlanState {
             assessment: assessment(score),
             destructive: false,
         },
+        &crate::plan_gate::NoRules,
         0,
     )
     .unwrap();
@@ -66,6 +67,7 @@ fn accepted(steps: Value, score: u8, hc: &HumanConfirm) -> TeamPlanState {
                 touch: Vec::new(),
                 touch_truncated: false,
                 touch_source: None,
+                rules: Vec::new(),
             });
             s.accepted_rev = p.rev;
             s.accepted_high_risk = p.high_risk;
@@ -86,6 +88,8 @@ fn floor(score: u8) -> Change {
             .unwrap()
             .pop()
             .unwrap(),
+        obligations: Vec::new(),
+        recalled: Vec::new(),
     })
 }
 
@@ -380,4 +384,149 @@ fn w1a_a_revision_of_a_pre_w1a_accepted_rev_keeps_its_touch_as_user() {
     let acc = r.state.accepted.as_ref().unwrap();
     assert_eq!(acc.touch, ["src/x.rs"]);
     assert_eq!(acc.touch_source, Some(TouchSource::User));
+}
+
+/// WT-C3 (DES-walkthrough-proof §4.12): a diff re-score that newly fires a held rule, with no
+/// band change, revises the plan through the same `floor_raised`: the rule's pair is added after
+/// the cursor with its `floor_rule`, the obligation is ratcheted onto the run's state, and the
+/// accepted rev records the rule `applied`.
+#[test]
+fn wt_c3_a_rescore_that_newly_fires_a_held_rule_raises_the_floor_with_its_pair() {
+    let hc = HumanConfirm::None;
+    let s = accepted(
+        json!([{"catalog":"understand"},{"catalog":"build"},{"catalog":"review"}]),
+        25,
+        &hc,
+    );
+    assert!(s.obligations.is_empty());
+    let Change::Floor(mut r) = floor(25) else {
+        unreachable!()
+    };
+    r.obligations = vec![crate::plan::HeldObligation {
+        rule: "TST-1002".into(),
+        token: "step:walkthrough".into(),
+    }];
+    let out = revise(
+        "r",
+        &s,
+        Change::Floor(r),
+        &["understand".into(), "build".into()],
+        &hc,
+        Some(2),
+        0,
+    )
+    .unwrap();
+    let b = revised(&out);
+    assert_eq!(b.reason, ReviseReason::FloorRaised);
+    assert_eq!(
+        (b.from_band.as_str(), b.to_band.as_str()),
+        ("20-39", "20-39")
+    );
+    let added: Vec<(&str, Option<&str>)> = b
+        .added
+        .iter()
+        .map(|s| (s.catalog.as_str(), s.floor_rule.as_deref()))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            ("walkthrough_plan", Some("TST-1002")),
+            ("walkthrough_review", Some("TST-1002"))
+        ]
+    );
+    assert_eq!(
+        def_ids(&out),
+        [
+            "understand",
+            "build",
+            "walkthrough_plan",
+            "walkthrough_review",
+            "review"
+        ]
+    );
+    assert_eq!(out.state.obligations.len(), 1);
+    let rules = &out.state.accepted.as_ref().unwrap().rules;
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, "TST-1002");
+}
+
+/// WT-C3 (§4.8): a PA-added creator after a walkthrough that already ran gets a new pair after
+/// it (the plan never removes the done one).
+#[test]
+fn wt_c3_a_creator_added_after_a_done_walkthrough_gets_a_new_pair() {
+    let hc = HumanConfirm::None;
+    let s = accepted(
+        json!([{"catalog":"build"},{"catalog":"walkthrough_plan"},{"catalog":"walkthrough_review"},
+               {"catalog":"review"}]),
+        25,
+        &hc,
+    );
+    let done: Vec<String> = ["build", "walkthrough_plan", "walkthrough_review", "review"]
+        .map(String::from)
+        .to_vec();
+    let out = revise(
+        "r",
+        &s,
+        Change::Steps {
+            by: "a".into(),
+            source: ProposalSource::PlanBlock {
+                ord: 4,
+                attempt: 0,
+                plan_block_seq: 1,
+            },
+            kind: ProposalKind::Change,
+            reason: Some(ReviseReason::PaAdded),
+            steps: vec![PlanStep {
+                catalog: "build".into(),
+                id: "fix".into(),
+                ..PlanStep::default()
+            }],
+        },
+        &done,
+        &hc,
+        Some(4),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        def_ids(&out),
+        [
+            "build",
+            "walkthrough_plan",
+            "walkthrough_review",
+            "review",
+            "fix",
+            "walkthrough_plan-floor",
+            "walkthrough_review-floor"
+        ]
+    );
+}
+
+/// WT-C3 (codex review): holding a re-score never loses the waiting raise — a later lower but
+/// destructive diff keeps the waiting score (90) and adds the destructive signal; obligations
+/// accumulate; the fact published first is the fresh one only when its band rises.
+#[test]
+fn wt_c3_holding_a_rescore_keeps_the_highest_waiting_score() {
+    let ob = |r: &str| crate::plan::HeldObligation {
+        rule: r.into(),
+        token: "step:test".into(),
+    };
+    let Change::Floor(mut waiting) = floor(90) else {
+        unreachable!()
+    };
+    waiting.obligations = vec![ob("A")];
+    let Change::Floor(mut fresh) = floor(20) else {
+        unreachable!()
+    };
+    fresh.destructive = true;
+    fresh.rescore_seq = 2;
+    fresh.obligations = vec![ob("B")];
+    let held = hold_rescore(Some(&waiting), fresh.clone(), true);
+    assert_eq!((held.score, held.destructive), (90, true));
+    assert_eq!(held.rescore_seq, 2, "the band rose: the fresh fact leads");
+    assert_eq!(held.obligations, [ob("A"), ob("B")]);
+    let held = hold_rescore(Some(&waiting), fresh.clone(), false);
+    assert_eq!(held.rescore_seq, 1, "no band rise: the waiting fact stays");
+    assert_eq!((held.score, held.destructive), (90, true));
+    assert_eq!(hold_rescore(None, fresh.clone(), false), fresh);
 }

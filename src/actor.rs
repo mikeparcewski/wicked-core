@@ -3967,6 +3967,10 @@ fn team_plan_at_launch(
         return register_launch_plan(store, registry, spec, state, def, persist).map(Some);
     }
     let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);
+    // (WT-C3) A launch is not teamed yet (teaming is positive evidence: an acknowledged
+    // `path.started`), so its testing-rule context fails closed on `kinds`.
+    let rules =
+        crate::plan_gate::StoreRules::for_run(&*store, run_id, spec.project_id.as_deref(), false)?;
     let decided = crate::plan_gate::decide(
         run_id,
         crate::plan_gate::Proposal {
@@ -3983,6 +3987,7 @@ fn team_plan_at_launch(
         &prior,
         &spec.human_confirm,
         &scored,
+        &rules,
         crate::interaction::now_millis(),
     )?;
     // The facts follow the run's `path.started` onto the bus (P1): queued on the plan state and
@@ -4047,12 +4052,20 @@ fn preview_launch_plan(
     // The plan as the launch resolves it (a preset name resolves per project; a plan is itself).
     let (plan, _) = crate::plan_gate::launch_plan(&*store, Some(&plan), None, project_id)?
         .ok_or_else(|| anyhow::anyhow!("the preview carries no plan"))?;
+    // (WT-C3) The testing rules a launch filed in `project_id` would compose under; a preview
+    // is not teamed (no run exists), so its kinds fail closed exactly as the launch's do.
+    let rules = crate::plan_gate::StoreRules {
+        store: &*store,
+        projects: project_id.map(str::to_string).into_iter().collect(),
+        teamed: false,
+    };
     let preview = crate::plan_gate::preview_plan(
         &plan,
         human_confirm,
         repo_root,
         base_commit,
         deliver_step.as_ref(),
+        &rules,
     )?;
     // The launch's planning checks on the exact def it would run (tool preflight, base skill,
     // repo binding, unit limit, validator attach): a plan the launch would refuse is refused here.
@@ -7174,6 +7187,10 @@ fn advance_or_pause(
     // (DES-TEAMING-002 T4, §8.7) THE revision hook: every advance goes through here, so a held
     // diff re-score or the PA's held `PLAN` lines are applied before anything is dispatched —
     // after a fold, a dispute answer, a member step's acceptance or a gate alike.
+    // (WT-C3) A held re-score that fired a testing rule the floor cannot honour fails the run
+    // (fail closed), never a logged error the run goes on past.
+    team_gate::refuse_unholdable_rules(&*store, run_id)
+        .map_err(|e| e.context("the diff re-score fired a testing rule the plan cannot honour"))?;
     if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
         // Log it and show it: the run goes on with the plan it has.
         emit_run_error(subscribers, run_id, e);
@@ -9883,6 +9900,15 @@ fn stage_edit(
         state,
         &session.human_confirm,
         &scored,
+        &crate::plan_gate::StoreRules::for_run(
+            &*store,
+            run_id,
+            None,
+            session
+                .team
+                .as_ref()
+                .is_some_and(crate::domain::RunTeamState::is_teamed),
+        )?,
         now,
     )?;
     match decided.verdict {
@@ -18411,6 +18437,8 @@ mod prior_context_tests {
                 destructive: false,
                 human_confirm: &crate::domain::HumanConfirm::None,
                 deliver: None,
+                obligations: &[],
+                ran: &[],
             },
         )
         .unwrap();
@@ -19942,6 +19970,7 @@ mod plan_gate_confirm_tests {
             gate_id: Some("g-r-1".into()),
             refusal: None,
             touch_source: None,
+            rules: Vec::new(),
         }
     }
 

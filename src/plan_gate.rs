@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::domain::HumanConfirm;
-use crate::plan::{AddedBy, FloorOverride, PlanRefusal, PlanStep, PlanSteps};
+use crate::plan::{AddedBy, FloorOverride, HeldObligation, PlanRefusal, PlanStep, PlanSteps};
 use crate::review_scale::{Assessment, Graph};
 use crate::team::events::{
     self as ev, ApprovalReason, GateDecision, ProposalKind, ProposalSource, TeamEvent, TouchSource,
@@ -41,8 +41,8 @@ mod scope;
 pub(crate) use preview::preview_plan;
 pub use preview::PlanPreview;
 pub(crate) use revise::{
-    changes_from_output, diff_score_for_run, floor_rises, path_scored_diff, plan_lines_of, revise,
-    Change, DiffRescore, Outcome, PlanLines,
+    changes_from_output, diff_score_for_run, floor_rises, hold_rescore, path_scored_diff,
+    plan_lines_of, revise, Change, DiffRescore, Outcome, PlanLines,
 };
 pub(crate) use scope::{
     decide_scoped, needs_pa_scope, scope_lines_of, scope_rev, with_scope_step, SCOPE_STEP_ID,
@@ -127,6 +127,240 @@ pub struct TeamPlanState {
     /// boundary, where the plan is scored from the PA's answer and decided as the initial plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<ScopeHold>,
+    /// (WT-C3, DES-walkthrough-proof §4.12) The obligations of every held testing rule the run's
+    /// plans have fired, ratcheted like `max_score`: a rule that fired once binds every later rev.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<HeldObligation>,
+    /// (WT-C3) Every advisory (recall-only) testing rule that applied to one of the run's plans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recalled: Vec<String>,
+}
+
+/// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at
+/// `plan.compose` (`wicked_governance::rules_at_phase` over the derived plan context): the
+/// obligations of the held rules that fired and the advisory rules that applied. Loaded by the
+/// actor (it holds the store); [`decide`] stays pure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RulesEval {
+    pub held: Vec<HeldObligation>,
+    pub recalled: Vec<String>,
+}
+
+impl RulesEval {
+    /// `rules` as read for a plan: a fired `allow_with_conditions` rule contributes its
+    /// obligations; a recall-only rule is recorded as considered. A plan.compose rule is
+    /// advisory or held — anything else is refused when written — so a fired row that is neither
+    /// (a `deny` / `allow` effect, or a held rule with no obligation, written before the check or
+    /// around it) becomes an obligation outside the vocabulary: floor fill refuses it naming the
+    /// rule, at compose and at a re-score alike (fail closed, one mechanism).
+    pub(crate) fn from_phase_rules(rules: &wicked_governance::PhaseRules) -> Self {
+        let mut out = RulesEval {
+            recalled: rules.recalled.clone(),
+            ..Default::default()
+        };
+        for p in &rules.fired {
+            let held = |token: &str| HeldObligation {
+                rule: p.id.clone(),
+                token: token.to_string(),
+            };
+            match p.effect {
+                wicked_governance::Effect::AllowWithConditions if !p.obligations.is_empty() => {
+                    out.held.extend(p.obligations.iter().map(|t| held(t)));
+                }
+                wicked_governance::Effect::AllowWithConditions => {
+                    out.held.push(held("(no obligation)"))
+                }
+                wicked_governance::Effect::Deny => out.held.push(held("effect:deny")),
+                wicked_governance::Effect::Allow => out.held.push(held("effect:allow")),
+            }
+        }
+        out.recalled.sort();
+        out.recalled.dedup();
+        out
+    }
+}
+
+/// (WT-C3) Where [`decide`] reads the `plan.compose` testing rules from: the actor's store for
+/// the run's projects ([`StoreRules`]), or nothing ([`NoRules`]: a preview pending the PA's
+/// scope, and the pure-pipeline tests).
+pub(crate) trait RuleSource {
+    /// The projects the run is filed in.
+    fn projects(&self) -> &[String];
+    /// The run is teamed on positive evidence, so its diff re-score corrects the declared touch.
+    fn teamed(&self) -> bool;
+    /// The rules for one plan context.
+    fn eval(&self, context: &Value) -> anyhow::Result<RulesEval>;
+}
+
+/// No testing rules: every plan composes on the band floor alone (also a pending-scope preview,
+/// whose rules are read only once the PA has scoped it).
+pub(crate) struct NoRules;
+
+impl RuleSource for NoRules {
+    fn projects(&self) -> &[String] {
+        &[]
+    }
+    fn teamed(&self) -> bool {
+        false
+    }
+    fn eval(&self, _: &Value) -> anyhow::Result<RulesEval> {
+        Ok(RulesEval::default())
+    }
+}
+
+/// The testing rules in the engine's governance store for a run's projects.
+pub(crate) struct StoreRules<'a> {
+    pub store: &'a dyn wicked_apps_core::GraphRead,
+    pub projects: Vec<String>,
+    pub teamed: bool,
+}
+
+impl<'a> StoreRules<'a> {
+    /// The rules for `run_id`: its `crew.run` project memberships read from the store (never
+    /// env), plus the launch's own `project_id` (a launch is filed as it lands); a store error
+    /// propagates (fail closed, never a silent narrowing).
+    pub(crate) fn for_run(
+        store: &'a dyn wicked_apps_core::GraphRead,
+        run_id: &str,
+        launch_project: Option<&str>,
+        teamed: bool,
+    ) -> anyhow::Result<Self> {
+        let mut projects =
+            crate::project::member_projects(store, crate::project::MEMBER_KIND_RUN, run_id)?;
+        if let Some(p) = launch_project {
+            if !projects.iter().any(|q| q == p) {
+                projects.push(p.to_string());
+            }
+        }
+        Ok(StoreRules {
+            store,
+            projects,
+            teamed,
+        })
+    }
+}
+
+impl RuleSource for StoreRules<'_> {
+    fn projects(&self) -> &[String] {
+        &self.projects
+    }
+    fn teamed(&self) -> bool {
+        self.teamed
+    }
+    fn eval(&self, context: &Value) -> anyhow::Result<RulesEval> {
+        let rules = wicked_governance::rules_at_phase(
+            self.store,
+            wicked_governance::PLAN_COMPOSE_PHASE,
+            &self.projects,
+            context,
+        )?;
+        Ok(RulesEval::from_phase_rules(&rules))
+    }
+}
+
+/// `prior` followed by every entry of `more` it lacks (first-seen order): the obligation and
+/// recall ratchets only grow.
+pub(crate) fn union<T: Clone + PartialEq>(prior: &[T], more: &[T]) -> Vec<T> {
+    let mut out = prior.to_vec();
+    for m in more {
+        if !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
+/// (WT-C3) The engine-derived plan context a `plan.compose` rule's trigger reads
+/// (DES-walkthrough-proof §4.12 B5): never declared by the plan. `kinds` is the set of `classify`
+/// results over `paths` — failing closed to `["code"]` when there is no path or the run is not
+/// (yet) teamed, since only a teamed run's diff re-score can correct an under-declared touch.
+/// `project` is the first project the run is filed in (sorted), `null` for an unfiled run.
+pub(crate) fn plan_context(
+    projects: &[String],
+    paths: &[String],
+    teamed: bool,
+    critical: bool,
+    destructive: bool,
+    band: &str,
+    deliver: bool,
+) -> Value {
+    let kinds: Vec<&str> = if teamed && !paths.is_empty() {
+        let mut k: Vec<&str> = paths
+            .iter()
+            .map(|p| crate::review_scale::kind_name(p))
+            .collect();
+        k.sort();
+        k.dedup();
+        k
+    } else {
+        vec!["code"]
+    };
+    let mut sorted = projects.to_vec();
+    sorted.sort();
+    json!({
+        "project": sorted.first(),
+        "kinds": kinds,
+        "paths": paths.iter().take(PLAN_CONTEXT_PATHS_CAP).collect::<Vec<_>>(),
+        "critical": critical,
+        "destructive": destructive,
+        "band": band,
+        "deliver": deliver,
+    })
+}
+
+/// At most this many paths ride a plan context (a trigger is a regex over its JSON).
+pub(crate) const PLAN_CONTEXT_PATHS_CAP: usize = 200;
+
+/// (WT-C3) `plan.accepted.rules` for a floor fill under `obligations` and `recalled`: each held
+/// rule `applied`, or `overridden` when the override removed every type it requires (or
+/// `recalled` when the plan changes nothing, so nothing was owed); each advisory rule
+/// `recalled`. In id order.
+pub(crate) fn rule_outcomes(
+    obligations: &[HeldObligation],
+    recalled: &[String],
+    filled: &crate::plan::FloorFilled,
+) -> Vec<crate::team::events::RuleOutcome> {
+    use crate::team::events::{RuleOutcome, RuleOutcomeKind};
+    let removed: &[String] = filled
+        .floor_override
+        .as_ref()
+        .map_or(&[], |o| o.remove.as_slice());
+    let mut out: Vec<RuleOutcome> = Vec::new();
+    let mut held: Vec<&str> = obligations.iter().map(|o| o.rule.as_str()).collect();
+    held.sort();
+    held.dedup();
+    for rule in held {
+        // A token is disabled when the override removed ANY phase it requires (floor fill treats
+        // either half of the walkthrough pair as the operator's own); the rule is `overridden`
+        // when every token it holds is disabled.
+        let disabled: Vec<bool> = obligations
+            .iter()
+            .filter(|o| o.rule == rule)
+            .filter_map(|o| crate::plan::obligation_types(&o.token))
+            .map(|types| types.iter().any(|t| removed.iter().any(|r| r == t)))
+            .collect();
+        let outcome = if filled.floor.is_empty() {
+            RuleOutcomeKind::Recalled
+        } else if !disabled.is_empty() && disabled.iter().all(|d| *d) {
+            RuleOutcomeKind::Overridden
+        } else {
+            RuleOutcomeKind::Applied
+        };
+        out.push(RuleOutcome {
+            id: rule.to_string(),
+            outcome,
+        });
+    }
+    for id in recalled {
+        if !out.iter().any(|o| &o.id == id) {
+            out.push(RuleOutcome {
+                id: id.clone(),
+                outcome: RuleOutcomeKind::Recalled,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// A mid-run human edit (`Core::propose_plan`) waiting for the next step boundary.
@@ -176,6 +410,9 @@ pub struct AcceptedPlan {
     /// (published as `none`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub touch_source: Option<TouchSource>,
+    /// (WT-C3) The testing rules this rev was composed under (`plan.accepted.rules`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::team::events::RuleOutcome>,
 }
 
 impl AcceptedPlan {
@@ -346,6 +583,9 @@ pub struct PendingPlan {
     /// `None` on a row persisted before the field existed (read as `user` on approval).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub touch_source: Option<TouchSource>,
+    /// (WT-C3) The testing rules the held plan was composed under, carried to its acceptance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::team::events::RuleOutcome>,
 }
 
 /// Which row of the approval matrix a plan event is (§8.6).
@@ -599,6 +839,7 @@ pub(crate) fn decide(
     prior: &TeamPlanState,
     human_confirm: &HumanConfirm,
     scored: &Scored,
+    rules: &dyn RuleSource,
     now: i64,
 ) -> anyhow::Result<Decided> {
     let auto = is_auto(human_confirm);
@@ -637,6 +878,25 @@ pub(crate) fn decide(
     // §8.5 ratchet: the floor band is the maximum any score of the run has reached.
     let max_score = prior.max_score.max(scored.assessment.score);
     let destructive = prior.destructive || scored.destructive;
+    // (WT-C3, DES-walkthrough-proof §4.12) The testing rules, read at compose against the
+    // engine-derived context of this proposal.
+    let context = plan_context(
+        rules.projects(),
+        plan.touch.as_deref().unwrap_or_default(),
+        rules.teamed(),
+        scored
+            .assessment
+            .signals
+            .as_ref()
+            .is_some_and(|s| s.critical),
+        destructive,
+        &crate::review_scale::floor_for(max_score, destructive).band,
+        deliver.is_some(),
+    );
+    let read = rules.eval(&context)?;
+    // The obligation ratchet: every held rule the run has fired, plus this proposal's.
+    let obligations = union(&prior.obligations, &read.held);
+    let recalled = union(&prior.recalled, &read.recalled);
     let filled = match crate::plan::floor_fill(
         crate::catalog::catalog(),
         &plan,
@@ -645,11 +905,14 @@ pub(crate) fn decide(
             destructive,
             human_confirm,
             deliver: deliver.as_deref(),
+            obligations: &obligations,
+            ran: &[],
         },
     ) {
         Ok(f) => f,
         Err(r) => return refuse(events, refusal_text(&r)),
     };
+    let rules = rule_outcomes(&obligations, &recalled, &filled);
     if let Err(why) = check_deliver_steps(&filled.steps) {
         return refuse(events, why);
     }
@@ -686,6 +949,8 @@ pub(crate) fn decide(
     state.rev = rev;
     state.max_score = max_score;
     state.destructive = destructive;
+    state.obligations = obligations;
+    state.recalled = recalled;
     if proposal.preset.is_some() {
         state.preset = proposal.preset.clone();
     }
@@ -711,6 +976,7 @@ pub(crate) fn decide(
                     touch: Vec::new(),
                     touch_truncated: false,
                     touch_source: None,
+                    rules,
                 }
                 .with_touch(prior.accepted.as_ref(), touch_source_of(&proposal.source)),
             );
@@ -745,6 +1011,7 @@ pub(crate) fn decide(
                 gate_id: None,
                 refusal: None,
                 touch_source: Some(touch_source_of(&proposal.source)),
+                rules,
             });
             Ok(Decided {
                 state,
@@ -806,11 +1073,7 @@ pub(crate) fn precheck(
         Some(why)
     } else if one_source.is_some() {
         one_source
-    } else if let Some(s) = plan
-        .steps
-        .iter()
-        .find(|s| s.added_by.is_some() || s.floor_reason.is_some())
-    {
+    } else if let Some(s) = plan.steps.iter().find(|s| s.has_provenance()) {
         Some(refusal_text(&PlanRefusal::ProvenanceSupplied {
             step: s.id.clone(),
             catalog: s.catalog.clone(),
@@ -907,6 +1170,7 @@ pub(crate) fn approve_pending(
             touch: Vec::new(),
             touch_truncated: false,
             touch_source: None,
+            rules: p.rules.clone(),
         }
         .with_touch(
             state.accepted.as_ref(),
@@ -999,6 +1263,9 @@ fn wire_step(s: &PlanStep) -> Value {
     if let Some(r) = &s.floor_reason {
         o.insert("floor_reason".into(), json!(r));
     }
+    if let Some(r) = &s.floor_rule {
+        o.insert("floor_rule".into(), json!(r));
+    }
     v
 }
 
@@ -1089,6 +1356,10 @@ pub(crate) fn plan_accepted(run_id: &str, a: &AcceptedPlan, now: i64) -> anyhow:
     }
     if a.touch_truncated {
         body["touch_truncated"] = json!(true);
+    }
+    // (WT-C3) Omitted when no rule applied, exactly as the wire struct skips it.
+    if !a.rules.is_empty() {
+        body["rules"] = json!(a.rules);
     }
     build(
         ev::PLAN_ACCEPTED,
@@ -1293,6 +1564,284 @@ mod tests {
         intent_score(p, Graph::Unavailable("no repo".into()))
     }
 
+    /// WT-C3: a rule source that answers with fixed rules and records every context it was
+    /// asked about.
+    struct Fixed {
+        rules: RulesEval,
+        projects: Vec<String>,
+        teamed: bool,
+        asked: std::cell::RefCell<Vec<Value>>,
+    }
+
+    impl Fixed {
+        fn new(rules: RulesEval, teamed: bool) -> Self {
+            Fixed {
+                rules,
+                projects: vec!["proj-b".into(), "proj-a".into()],
+                teamed,
+                asked: Default::default(),
+            }
+        }
+    }
+
+    impl RuleSource for Fixed {
+        fn projects(&self) -> &[String] {
+            &self.projects
+        }
+        fn teamed(&self) -> bool {
+            self.teamed
+        }
+        fn eval(&self, context: &Value) -> anyhow::Result<RulesEval> {
+            self.asked.borrow_mut().push(context.clone());
+            Ok(self.rules.clone())
+        }
+    }
+
+    fn walkthrough_rule() -> RulesEval {
+        RulesEval {
+            held: vec![HeldObligation {
+                rule: "TST-1002".into(),
+                token: "step:walkthrough".into(),
+            }],
+            recalled: vec!["TST-1001".into()],
+        }
+    }
+
+    fn launch_decide(
+        p: &PlanSteps,
+        prior: &TeamPlanState,
+        hc: &HumanConfirm,
+        rules: &dyn RuleSource,
+    ) -> Decided {
+        decide(
+            "r1",
+            Proposal {
+                by: "human".into(),
+                source: ProposalSource::Launch {
+                    session_id: "r1".into(),
+                },
+                kind: ProposalKind::Initial,
+                preset: None,
+                plan: p.clone(),
+                reviewing_ord: None,
+                approved_by_human: false,
+            },
+            prior,
+            hc,
+            &scored_for(p),
+            rules,
+            1,
+        )
+        .unwrap()
+    }
+
+    /// WT-C3 (§4.12 B5): the rules are read against the ENGINE-derived context — `kinds` from
+    /// the declared touch on a teamed run, failing closed to `["code"]` on a run not (yet) teamed
+    /// or with no touch; the band the ratcheted score lands in; the run's first project.
+    #[test]
+    fn wt_c3_rules_are_read_against_the_derived_plan_context() {
+        let p = plan(json!({"steps": [{"catalog": "build"}], "touch": ["README.md", "docs/x.md"]}));
+        let teamed = Fixed::new(RulesEval::default(), true);
+        launch_decide(&p, &TeamPlanState::default(), &HumanConfirm::None, &teamed);
+        let ctx = teamed.asked.borrow()[0].clone();
+        assert_eq!(
+            ctx,
+            json!({"project": "proj-a", "kinds": ["docs"], "paths": ["README.md", "docs/x.md"],
+                   "critical": false, "destructive": false, "band": "0-19", "deliver": false})
+        );
+        let unteamed = Fixed::new(RulesEval::default(), false);
+        launch_decide(
+            &p,
+            &TeamPlanState::default(),
+            &HumanConfirm::None,
+            &unteamed,
+        );
+        assert_eq!(unteamed.asked.borrow()[0]["kinds"], json!(["code"]));
+        let no_touch = plan(json!({"steps": [{"catalog": "understand"}], "touch": []}));
+        launch_decide(
+            &no_touch,
+            &TeamPlanState::default(),
+            &HumanConfirm::None,
+            &teamed,
+        );
+        assert_eq!(teamed.asked.borrow()[1]["kinds"], json!(["code"]));
+        // A kinds-mixed touch is the sorted set.
+        let mixed = plan_context(
+            &[],
+            &[
+                "src/a.rs".into(),
+                "a.json".into(),
+                "tests/t.rs".into(),
+                "README.md".into(),
+            ],
+            true,
+            false,
+            false,
+            "40-69",
+            true,
+        );
+        assert_eq!(mixed["kinds"], json!(["code", "config", "docs", "test"]));
+        assert_eq!(mixed["project"], Value::Null);
+        assert_eq!(mixed["deliver"], true);
+    }
+
+    /// WT-C3: a fired held rule's pair is in the accepted plan with its `floor_rule`, the
+    /// obligation is ratcheted onto the run's state, and `plan.accepted.rules` records it
+    /// `applied` beside the advisory rule `recalled`. A later rev keeps the obligation even when
+    /// its own context fires nothing.
+    #[test]
+    fn wt_c3_a_held_rule_is_applied_recorded_and_ratcheted() {
+        let p = plan(json!({"steps": [{"catalog": "build"}], "touch": ["README.md"]}));
+        let src = Fixed::new(walkthrough_rule(), true);
+        let d = launch_decide(&p, &TeamPlanState::default(), &HumanConfirm::None, &src);
+        assert!(matches!(d.verdict, Verdict::Accepted { .. }));
+        let acc = d.state.accepted.clone().unwrap();
+        let wt: Vec<(&str, Option<&str>)> = acc
+            .steps
+            .steps
+            .iter()
+            .filter(|s| s.catalog.starts_with("walkthrough"))
+            .map(|s| (s.catalog.as_str(), s.floor_rule.as_deref()))
+            .collect();
+        assert_eq!(
+            wt,
+            [
+                ("walkthrough_plan", Some("TST-1002")),
+                ("walkthrough_review", Some("TST-1002"))
+            ]
+        );
+        let payload = plan_accepted("r1", &acc, 1).unwrap().to_payload().unwrap();
+        assert_eq!(
+            payload["rules"],
+            json!([{"id": "TST-1001", "outcome": "recalled"},
+                   {"id": "TST-1002", "outcome": "applied"}])
+        );
+        let wire_wp = payload["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["catalog"] == "walkthrough_plan")
+            .unwrap()
+            .clone();
+        assert_eq!(wire_wp["floor_rule"], "TST-1002");
+        assert_eq!(
+            wire_wp["floor_reason"],
+            "rule TST-1002 requires walkthrough_plan"
+        );
+        // The typed wire reads it back.
+        let ev = plan_accepted("r1", &acc, 1).unwrap();
+        let TeamBody::PlanAccepted(body) = &ev.body else {
+            panic!("plan.accepted")
+        };
+        assert_eq!(body.rules.len(), 2);
+        // The ratchet: the next rev fires nothing and still owes the pair.
+        let none = Fixed::new(RulesEval::default(), true);
+        let d2 = launch_decide(&p, &d.state, &HumanConfirm::None, &none);
+        let acc2 = d2.state.accepted.unwrap();
+        assert!(acc2
+            .steps
+            .steps
+            .iter()
+            .any(|s| s.catalog == "walkthrough_review"));
+        assert_eq!(d2.state.obligations, d.state.obligations);
+        assert_eq!(acc2.rules.len(), 2);
+    }
+
+    /// WT-C3: no rule ⇒ the wire is unchanged (`plan.accepted` has no `rules` key, no step a
+    /// `floor_rule`).
+    #[test]
+    fn wt_c3_without_rules_plan_accepted_is_unchanged() {
+        let p = plan(json!({"steps": [{"catalog": "build"}], "touch": ["README.md"]}));
+        let d = launch_decide(&p, &TeamPlanState::default(), &HumanConfirm::None, &NoRules);
+        let payload = plan_accepted("r1", &d.state.accepted.unwrap(), 1)
+            .unwrap()
+            .to_payload()
+            .unwrap();
+        assert!(payload.get("rules").is_none(), "{payload}");
+        assert!(!payload.to_string().contains("floor_rule"), "{payload}");
+    }
+
+    /// WT-C3: a rule that denies at compose refuses the plan, naming it; an override that
+    /// removes the rule's whole pair (manual mode) records it `overridden`.
+    #[test]
+    fn wt_c3_a_denying_rule_refuses_and_an_overridden_rule_is_recorded() {
+        let p = plan(json!({"steps": [{"catalog": "build"}], "touch": ["README.md"]}));
+        // A fired deny (or allow) row at plan.compose — refused at write, so only a row written
+        // around the check — fails closed: the plan is refused naming the rule.
+        let policy = |id: &str, effect| wicked_governance::Policy {
+            id: id.into(),
+            kind: "testing".into(),
+            applies_to: vec![wicked_governance::PLAN_COMPOSE_PHASE.into()],
+            effect,
+            trigger: Default::default(),
+            obligations: Vec::new(),
+            criteria: String::new(),
+            severity: wicked_governance::Severity::Medium,
+            rule: String::new(),
+            retired: false,
+        };
+        for (id, effect) in [
+            ("TST-DENY", wicked_governance::Effect::Deny),
+            ("TST-ALLOW", wicked_governance::Effect::Allow),
+            ("TST-EMPTY", wicked_governance::Effect::AllowWithConditions),
+        ] {
+            let read = RulesEval::from_phase_rules(&wicked_governance::PhaseRules {
+                fired: vec![policy(id, effect)],
+                recalled: Vec::new(),
+            });
+            let src = Fixed::new(read, true);
+            let d = launch_decide(&p, &TeamPlanState::default(), &HumanConfirm::None, &src);
+            assert!(
+                body_types(&d).contains(&ev::PLAN_REFUSED),
+                "{:?}",
+                body_types(&d)
+            );
+            let Verdict::Refused { reason } = d.verdict else {
+                panic!("{id}: refused")
+            };
+            assert!(
+                reason.contains(id) && reason.contains("unknown_obligation"),
+                "{reason}"
+            );
+        }
+        let over = plan(
+            json!({"steps": [{"catalog": "build"}], "touch": ["README.md"],
+            "override": {"remove": ["walkthrough_plan", "walkthrough_review"], "reason": "mine"}}),
+        );
+        let src = Fixed::new(walkthrough_rule(), true);
+        let d = launch_decide(&over, &TeamPlanState::default(), &HumanConfirm::All, &src);
+        let pending = d.state.pending.expect("a manual-mode plan is held");
+        assert_eq!(
+            pending.rules,
+            [
+                crate::team::events::RuleOutcome {
+                    id: "TST-1001".into(),
+                    outcome: crate::team::events::RuleOutcomeKind::Recalled,
+                },
+                crate::team::events::RuleOutcome {
+                    id: "TST-1002".into(),
+                    outcome: crate::team::events::RuleOutcomeKind::Overridden,
+                },
+            ]
+        );
+        assert!(!pending
+            .steps
+            .steps
+            .iter()
+            .any(|s| s.catalog.starts_with("walkthrough")));
+        // Removing ONE half disables the pair too: the rule reads `overridden` (Copilot review).
+        let half = plan(
+            json!({"steps": [{"catalog": "build"}], "touch": ["README.md"],
+            "override": {"remove": ["walkthrough_review"], "reason": "mine"}}),
+        );
+        let d = launch_decide(&half, &TeamPlanState::default(), &HumanConfirm::All, &src);
+        let rules = d.state.pending.expect("held").rules;
+        assert_eq!(
+            rules[1].outcome,
+            crate::team::events::RuleOutcomeKind::Overridden
+        );
+    }
+
     fn body_types(d: &Decided) -> Vec<&'static str> {
         d.events.iter().map(TeamEvent::event_type).collect()
     }
@@ -1318,6 +1867,7 @@ mod tests {
                 prior,
                 &HumanConfirm::None,
                 &scored_for(&p),
+                &crate::plan_gate::NoRules,
                 1,
             )
             .unwrap();
@@ -1457,6 +2007,7 @@ mod tests {
                 &prior,
                 &HumanConfirm::None,
                 &scored_for(&read_only),
+                &crate::plan_gate::NoRules,
                 1,
             )
             .unwrap();
@@ -1491,6 +2042,7 @@ mod tests {
                 &prior,
                 &HumanConfirm::None,
                 &scored_for(&creator),
+                &crate::plan_gate::NoRules,
                 1,
             )
             .unwrap();
@@ -1512,6 +2064,7 @@ mod tests {
                 &prior,
                 &HumanConfirm::Before(1),
                 &scored_for(&read_only),
+                &crate::plan_gate::NoRules,
                 1,
             )
             .unwrap();
@@ -1548,6 +2101,7 @@ mod tests {
             &TeamPlanState::default(),
             &HumanConfirm::None,
             &s,
+            &crate::plan_gate::NoRules,
             1,
         )
         .unwrap();
@@ -1575,6 +2129,7 @@ mod tests {
             &TeamPlanState::default(),
             &HumanConfirm::None,
             &scored_for(&p),
+            &crate::plan_gate::NoRules,
             1,
         )
         .unwrap();

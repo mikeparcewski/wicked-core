@@ -166,6 +166,7 @@ pub(crate) fn scope_rev(
         touch: Vec::new(),
         touch_truncated: false,
         touch_source: Some(crate::team::events::TouchSource::None),
+        rules: Vec::new(),
     });
     state.scope = Some(ScopeHold {
         plan: plan.clone(),
@@ -403,6 +404,7 @@ pub(crate) fn decide_scoped(
     base_commit: Option<&str>,
     diff_rescored: bool,
     human_confirm: &HumanConfirm,
+    rules: &dyn super::RuleSource,
     now: i64,
 ) -> anyhow::Result<Decided> {
     let hold = prior
@@ -441,6 +443,7 @@ pub(crate) fn decide_scoped(
         &base,
         human_confirm,
         &scored,
+        rules,
         now,
     )
 }

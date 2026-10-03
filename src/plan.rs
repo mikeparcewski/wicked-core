@@ -513,6 +513,19 @@ pub struct PlanStep {
     /// `added_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_reason: Option<String>,
+    /// (WT-C3, DES-walkthrough-proof §4.12) The held testing rule whose obligation made floor
+    /// fill add the step (`"TST-1002"`); `None` for a band-floor step or an authored one.
+    /// Output-only, as `added_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_rule: Option<String>,
+}
+
+impl PlanStep {
+    /// The step carries a provenance field (`added_by`, `floor_reason`, `floor_rule`): written
+    /// by floor fill only, so an authored step that supplies one is refused.
+    pub fn has_provenance(&self) -> bool {
+        self.added_by.is_some() || self.floor_reason.is_some() || self.floor_rule.is_some()
+    }
 }
 
 /// Deserialize a PRESENT field (value or `null`) as `Some(..)`, so an absent field (`None`, via
@@ -589,6 +602,9 @@ pub enum PlanRefusal {
     DeliverIdReserved { step: String, catalog: String },
     /// More than one `deliver` step: a plan delivers once.
     DeliverDuplicate { step: String },
+    /// (WT-C3) A held testing rule that fired at compose names an obligation outside the closed
+    /// vocabulary (`wicked_governance::PLAN_COMPOSE_OBLIGATIONS`).
+    UnknownObligation { rule: String, token: String },
 }
 
 /// The phase id the engine's deliver protections key on (`deliver_lift::DELIVER_PHASE_ID`).
@@ -622,6 +638,7 @@ impl PlanRefusal {
             PlanRefusal::EvaluatorPrecedesCreator { .. } => "evaluator_precedes_creator",
             PlanRefusal::DeliverIdReserved { .. } => "deliver_id_reserved",
             PlanRefusal::DeliverDuplicate { .. } => "deliver_duplicate",
+            PlanRefusal::UnknownObligation { .. } => "unknown_obligation",
         }
     }
 }
@@ -720,8 +737,8 @@ impl std::fmt::Display for PlanRefusal {
             ),
             PlanRefusal::ProvenanceSupplied { step, catalog } => write!(
                 f,
-                "{r}: step {step} ({catalog}) supplies added_by or floor_reason — provenance is \
-                 written by floor fill only"
+                "{r}: step {step} ({catalog}) supplies added_by, floor_reason or floor_rule — \
+                 provenance is written by floor fill only"
             ),
             PlanRefusal::EvaluatorPrecedesCreator { step, creator } => write!(
                 f,
@@ -737,6 +754,11 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::DeliverDuplicate { step } => write!(
                 f,
                 "{r}: step {step} is a second `deliver` step — a plan delivers once"
+            ),
+            PlanRefusal::UnknownObligation { rule, token } => write!(
+                f,
+                "{r}: rule {rule} requires {token:?}, which is not a plan obligation (one of \
+                 step:walkthrough, step:test, step:security_review) — fix or retire the rule"
             ),
         }
     }
@@ -767,7 +789,8 @@ pub enum FieldRule {
     RunOnly,
     /// Never changes; the entry's own value is a no-op.
     Fixed,
-    /// A record of how the step entered the plan (`added_by`, `floor_reason`). Output-only:
+    /// A record of how the step entered the plan (`added_by`, `floor_reason`, `floor_rule`).
+    /// Output-only:
     /// [`floor_fill`] refuses it on input and writes it itself; `compose` ignores it.
     Record,
 }
@@ -775,7 +798,7 @@ pub enum FieldRule {
 /// Every [`PlanStep`] field and its [`FieldRule`] — the one table `compose` applies
 /// ([`apply_step`] has one arm per row, in this order). A test pins that the table covers every
 /// `PlanStep` field and that each rule refuses what it forbids.
-pub const STEP_FIELD_RULES: [(&str, FieldRule); 17] = [
+pub const STEP_FIELD_RULES: [(&str, FieldRule); 18] = [
     ("catalog", FieldRule::Identity),
     ("id", FieldRule::Identity),
     ("role", FieldRule::Fixed),
@@ -793,6 +816,7 @@ pub const STEP_FIELD_RULES: [(&str, FieldRule); 17] = [
     ("owner", FieldRule::Free),
     ("added_by", FieldRule::Record),
     ("floor_reason", FieldRule::Record),
+    ("floor_rule", FieldRule::Record),
 ];
 
 /// A gate's position on the §8.3 ladder: `auto` < `human_confirm_if` <
@@ -1026,7 +1050,7 @@ fn apply_step(
     if let Some(owner) = step.owner {
         phase.owner = owner;
     }
-    // added_by, floor_reason — Record: nothing to apply.
+    // added_by, floor_reason, floor_rule — Record: nothing to apply.
     Ok(phase)
 }
 
@@ -1048,6 +1072,36 @@ pub struct FloorInput<'a> {
     /// `Some(cmd)` for a run that delivers (`deliver: "pr"`): the command a floor-added `deliver`
     /// step runs (the catalog's `deliver` entry carries none). `None`: the floor has no `deliver`.
     pub deliver: Option<&'a [String]>,
+    /// (WT-C3, DES-walkthrough-proof §4.12) The obligations of every held testing rule the run
+    /// has fired so far (ratcheted: never dropped). Each token's phases join the computed floor.
+    pub obligations: &'a [HeldObligation],
+    /// The ids of the plan's steps already dispatched or done, in running order (a mid-run
+    /// revision's done prefix; empty at compose). The walkthrough-after-last-creator rule reads
+    /// the plan in RUNNING order: the done prefix, then every other step in plan order.
+    pub ran: &'a [String],
+}
+
+/// (WT-C3) One obligation of a held `plan.compose` testing rule that fired for the run: the rule
+/// and the token it requires (`step:walkthrough`). Persisted on the run's plan state (the
+/// ratchet), and what [`FloorInput::obligations`] carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldObligation {
+    pub rule: String,
+    pub token: String,
+}
+
+/// The catalog types one obligation token puts in the floor (DES-walkthrough-proof §4.12 S7: the
+/// closed, add-only vocabulary); `None` for a token outside it.
+pub fn obligation_types(token: &str) -> Option<&'static [&'static str]> {
+    match token {
+        "step:walkthrough" => Some(&[
+            crate::catalog::WALKTHROUGH_PLAN,
+            crate::catalog::WALKTHROUGH_REVIEW,
+        ]),
+        "step:test" => Some(&["test"]),
+        "step:security_review" => Some(&["security_review"]),
+        _ => None,
+    }
 }
 
 /// A floor-filled, composed plan (the body of `plan.accepted`, §6).
@@ -1065,6 +1119,9 @@ pub struct FloorFilled {
     pub high_risk: bool,
     /// The override as recorded (`plan.accepted.override`); manual mode only.
     pub floor_override: Option<FloorOverride>,
+    /// (WT-C3) The floor types only a held rule put in the floor (not the band's), each with the
+    /// first rule that required it, in floor order.
+    pub policy_floor: Vec<(String, String)>,
 }
 
 /// The floor phase types a plan owes for a band's `phases` (§8.5): empty for a plan with no creator
@@ -1118,17 +1175,23 @@ pub fn worst_case_floor_additions(
 /// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
 /// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
 /// Every authored step comes out `added_by: plan`; a step that supplies provenance is refused.
+///
+/// (WT-C3, DES-walkthrough-proof §4.12) The computed floor is the band's floor UNION the catalog
+/// types of every held testing-rule obligation ([`FloorInput::obligations`]), for a plan with a
+/// creator step; a type only a rule requires carries that rule as `floor_rule`. A floor override
+/// may exempt a rule-added type in manual mode even in a high-risk band (O5); a pinned BAND floor
+/// phase stays unremovable there. And in any plan that contains a walkthrough pair, the last
+/// `walkthrough_review` must run after the plan's last creator step (read in running order, see
+/// [`FloorInput::ran`]): otherwise a new pair is inserted after that creator.
 pub fn floor_fill(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
     input: FloorInput<'_>,
 ) -> Result<FloorFilled, PlanRefusal> {
-    // Provenance is output-only: an author never supplies `added_by` / `floor_reason`.
-    if let Some(s) = plan
-        .steps
-        .iter()
-        .find(|s| s.added_by.is_some() || s.floor_reason.is_some())
-    {
+    use crate::catalog::{WALKTHROUGH_PLAN, WALKTHROUGH_REVIEW};
+    // Provenance is output-only: an author never supplies `added_by` / `floor_reason` /
+    // `floor_rule`.
+    if let Some(s) = plan.steps.iter().find(|s| s.has_provenance()) {
         return Err(PlanRefusal::ProvenanceSupplied {
             step: s.id.clone(),
             catalog: s.catalog.clone(),
@@ -1136,12 +1199,45 @@ pub fn floor_fill(
     }
     let row = crate::review_scale::floor_for(input.score, input.destructive);
     let entry = |c: &str| catalog.iter().find(|e| e.id == c);
+    let order = |c: &str| catalog.iter().position(|e| e.id == c);
     // §8.5: a plan with no creator step has an empty floor and is never high risk.
     let creator = plan.has_creator_in(catalog);
     let high_risk = creator && row.high_risk;
-    let floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
-    // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned phase
-    // in a high-risk band. It exempts floor types from the fill; it removes no authored step.
+    let band_floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
+    // (WT-C3) Every obligation token is judged (an unknown one refuses the plan, naming its
+    // rule); its types join the floor of a plan that changes something.
+    let mut policy_floor: Vec<(String, String)> = Vec::new();
+    for o in input.obligations {
+        let Some(types) = obligation_types(&o.token) else {
+            return Err(PlanRefusal::UnknownObligation {
+                rule: o.rule.clone(),
+                token: o.token.clone(),
+            });
+        };
+        if !creator {
+            continue;
+        }
+        for ty in types {
+            if !band_floor.iter().any(|b| b == ty) && !policy_floor.iter().any(|(t, _)| t == ty) {
+                policy_floor.push((ty.to_string(), o.rule.clone()));
+            }
+        }
+    }
+    let mut floor = band_floor.clone();
+    floor.extend(policy_floor.iter().map(|(t, _)| t.clone()));
+    // Both halves are in catalog order; the union is too (a stable sort keeps the band's own
+    // order, whose `produce` / `critique` substitutions sit in their catalog slots).
+    floor.sort_by_key(|t| order(t));
+    policy_floor.sort_by_key(|(t, _)| order(t));
+    let rule_of = |ty: &str| {
+        policy_floor
+            .iter()
+            .find(|(t, _)| t == ty)
+            .map(|(_, r)| r.clone())
+    };
+    // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned BAND
+    // floor phase in a high-risk band. It exempts floor types from the fill; it removes no
+    // authored step.
     let mut exempt: Vec<&str> = Vec::new();
     if let Some(ov) = &plan.floor_override {
         if matches!(input.human_confirm, crate::domain::HumanConfirm::None) {
@@ -1155,17 +1251,28 @@ pub fn floor_fill(
             if !floor.contains(c) {
                 return Err(PlanRefusal::OverrideNotInFloor { catalog: c.clone() });
             }
-            if high_risk && e.validator_pin.is_some() {
+            if high_risk && e.validator_pin.is_some() && band_floor.contains(c) {
                 return Err(PlanRefusal::OverrideRemovesPinned { catalog: c.clone() });
             }
             exempt.push(c);
         }
     }
-    let order = |c: &str| catalog.iter().position(|e| e.id == c);
     let mut steps: Vec<PlanStep> = plan.steps.clone();
     for s in &mut steps {
         s.added_by = Some(AddedBy::Plan);
     }
+    let fresh_id = |steps: &[PlanStep], ty: &str| {
+        let mut id = ty.to_string();
+        let mut n = 1;
+        while steps.iter().any(|s| s.id == id) {
+            id = match n {
+                1 => format!("{ty}-floor"),
+                n => format!("{ty}-floor-{n}"),
+            };
+            n += 1;
+        }
+        id
+    };
     for (k, ty) in floor.iter().enumerate() {
         if exempt.contains(&ty.as_str()) || steps.iter().any(|s| &s.catalog == ty) {
             continue;
@@ -1185,15 +1292,7 @@ pub fn floor_fill(
             .iter()
             .rposition(|s| order(&s.catalog) < order(ty))
             .map_or(lo, |i| lo + i + 1);
-        let mut id = ty.clone();
-        let mut n = 1;
-        while steps.iter().any(|s| s.id == id) {
-            id = match n {
-                1 => format!("{ty}-floor"),
-                n => format!("{ty}-floor-{n}"),
-            };
-            n += 1;
-        }
+        let id = fresh_id(&steps, ty);
         let executor = (ty == "deliver")
             .then(|| {
                 input
@@ -1201,6 +1300,11 @@ pub fn floor_fill(
                     .map(|cmd| crate::workflow::PhaseExecutor::Tool { cmd: cmd.to_vec() })
             })
             .flatten();
+        let floor_rule = rule_of(ty);
+        let floor_reason = match &floor_rule {
+            Some(rule) => format!("rule {rule} requires {ty}"),
+            None => format!("band {} requires {ty}", row.band),
+        };
         steps.insert(
             at,
             PlanStep {
@@ -1208,7 +1312,8 @@ pub fn floor_fill(
                 id,
                 executor,
                 added_by: Some(AddedBy::Floor),
-                floor_reason: Some(format!("band {} requires {ty}", row.band)),
+                floor_reason: Some(floor_reason),
+                floor_rule,
                 ..PlanStep::default()
             },
         );
@@ -1224,6 +1329,64 @@ pub fn floor_fill(
             });
         }
     }
+    // (WT-C3, §4.8) Walkthrough after the last creator: in RUNNING order (the done prefix as it
+    // ran, then every other step in plan order), the plan's last `walkthrough_review` must come
+    // after its last creator step, so the proof binds the tree that ships. A creator added after
+    // a walkthrough (by the PA, a member, a human edit or the ratchet) gets a new pair after it.
+    // An override that exempts either half says the walkthrough is the operator's own (O5).
+    let pair_exempt = exempt.contains(&WALKTHROUGH_PLAN) || exempt.contains(&WALKTHROUGH_REVIEW);
+    // The pair is keyed on its proof step: a plan with no `walkthrough_review` has no walkthrough
+    // to keep current (a lone authored `walkthrough_plan` records nothing).
+    if !pair_exempt && steps.iter().any(|s| s.catalog == WALKTHROUGH_REVIEW) {
+        let run_pos = |steps: &[PlanStep], i: usize| {
+            input
+                .ran
+                .iter()
+                .position(|d| d == &steps[i].id)
+                .unwrap_or(input.ran.len() + i)
+        };
+        let last_creator = (0..steps.len())
+            .filter(|&i| is_creator_step(catalog, &steps[i]))
+            .max_by_key(|&i| run_pos(&steps, i));
+        let last_review = (0..steps.len())
+            .filter(|&i| steps[i].catalog == WALKTHROUGH_REVIEW)
+            .map(|i| run_pos(&steps, i))
+            .max()
+            .unwrap_or(0);
+        if let Some(c) = last_creator {
+            if last_review < run_pos(&steps, c) {
+                let mut at = c + 1;
+                while at < steps.len()
+                    && steps[at].catalog != DELIVER_ID
+                    && !is_creator_step(catalog, &steps[at])
+                    && order(&steps[at].catalog) < order(WALKTHROUGH_PLAN)
+                {
+                    at += 1;
+                }
+                let creator_id = steps[c].id.clone();
+                let floor_rule = rule_of(WALKTHROUGH_PLAN).or_else(|| rule_of(WALKTHROUGH_REVIEW));
+                for (n, ty) in [WALKTHROUGH_PLAN, WALKTHROUGH_REVIEW]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let id = fresh_id(&steps, ty);
+                    steps.insert(
+                        at + n,
+                        PlanStep {
+                            catalog: ty.to_string(),
+                            id,
+                            added_by: Some(AddedBy::Floor),
+                            floor_reason: Some(format!(
+                                "the walkthrough comes after the last creator step ({creator_id})"
+                            )),
+                            floor_rule: floor_rule.clone(),
+                            ..PlanStep::default()
+                        },
+                    );
+                }
+            }
+        }
+    }
     let filled = PlanSteps {
         steps,
         touch: plan.touch.clone(),
@@ -1237,6 +1400,7 @@ pub fn floor_fill(
         floor,
         high_risk,
         floor_override: plan.floor_override.clone(),
+        policy_floor,
     })
 }
 
@@ -2340,6 +2504,8 @@ mod tests {
                     destructive: false,
                     human_confirm: hc,
                     deliver,
+                    obligations: &[],
+                    ran: &[],
                 },
             )
         }
@@ -2540,6 +2706,8 @@ mod tests {
                     destructive: true,
                     human_confirm: &AUTO,
                     deliver: None,
+                    obligations: &[],
+                    ran: &[],
                 },
             )
             .unwrap();
@@ -2800,6 +2968,363 @@ mod tests {
                 assert!(!f.high_risk, "{body}");
                 assert!(f.floor.is_empty(), "{body}");
             }
+        }
+    }
+
+    /// WT-C3 (DES-walkthrough-proof §4.12, §4.8): the testing-rule obligations floor fill reads,
+    /// the walkthrough-after-last-creator rule, and the override over a policy-added pair.
+    mod floor_fill_wt_c3 {
+        use super::*;
+        use crate::domain::HumanConfirm;
+        use serde_json::json;
+
+        const AUTO: HumanConfirm = HumanConfirm::None;
+        const MANUAL: HumanConfirm = HumanConfirm::All;
+
+        fn plan(v: serde_json::Value) -> PlanSteps {
+            serde_json::from_value(v).expect("plan parses")
+        }
+
+        fn held(rule: &str, tokens: &[&str]) -> Vec<HeldObligation> {
+            tokens
+                .iter()
+                .map(|t| HeldObligation {
+                    rule: rule.into(),
+                    token: t.to_string(),
+                })
+                .collect()
+        }
+
+        fn fill(
+            p: &PlanSteps,
+            score: u8,
+            hc: &HumanConfirm,
+            obligations: &[HeldObligation],
+            ran: &[String],
+        ) -> Result<FloorFilled, PlanRefusal> {
+            floor_fill(
+                crate::catalog::catalog(),
+                p,
+                FloorInput {
+                    score,
+                    destructive: false,
+                    human_confirm: hc,
+                    deliver: None,
+                    obligations,
+                    ran,
+                },
+            )
+        }
+
+        /// `(catalog, id, added_by, floor_rule)` per step.
+        fn rows(f: &FloorFilled) -> Vec<(String, String, AddedBy, Option<String>)> {
+            f.steps
+                .steps
+                .iter()
+                .map(|s| {
+                    (
+                        s.catalog.clone(),
+                        s.id.clone(),
+                        s.added_by.unwrap(),
+                        s.floor_rule.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        fn r(
+            c: &str,
+            id: &str,
+            by: AddedBy,
+            rule: Option<&str>,
+        ) -> (String, String, AddedBy, Option<String>) {
+            (c.into(), id.into(), by, rule.map(str::to_string))
+        }
+
+        /// A held rule's obligations join the band floor in catalog order, each carrying the rule
+        /// as `floor_rule` and a reason that names it; the authored steps are all kept.
+        #[test]
+        fn obligations_are_inserted_in_catalog_order_with_their_rule() {
+            let p = plan(
+                json!({"steps": [{"catalog": "build", "id": "build"}, {"catalog": "deliver", "id": "deliver",
+                "executor": {"type": "tool", "cmd": ["true"]}}]}),
+            );
+            let f = fill(
+                &p,
+                30,
+                &AUTO,
+                &held("TST-1002", &["step:test", "step:walkthrough"]),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(
+                rows(&f),
+                [
+                    r("build", "build", AddedBy::Plan, None),
+                    r("test", "test", AddedBy::Floor, Some("TST-1002")),
+                    r(
+                        "walkthrough_plan",
+                        "walkthrough_plan",
+                        AddedBy::Floor,
+                        Some("TST-1002")
+                    ),
+                    r(
+                        "walkthrough_review",
+                        "walkthrough_review",
+                        AddedBy::Floor,
+                        Some("TST-1002")
+                    ),
+                    r("review", "review", AddedBy::Floor, None),
+                    r("deliver", "deliver", AddedBy::Plan, None),
+                ]
+            );
+            assert_eq!(
+                f.steps.steps[1].floor_reason.as_deref(),
+                Some("rule TST-1002 requires test")
+            );
+            assert_eq!(
+                f.steps.steps[4].floor_reason.as_deref(),
+                Some("band 20-39 requires review")
+            );
+            assert_eq!(
+                f.floor,
+                [
+                    "build",
+                    "test",
+                    "walkthrough_plan",
+                    "walkthrough_review",
+                    "review"
+                ]
+            );
+            assert_eq!(
+                f.policy_floor,
+                [
+                    ("test".to_string(), "TST-1002".to_string()),
+                    ("walkthrough_plan".to_string(), "TST-1002".to_string()),
+                    ("walkthrough_review".to_string(), "TST-1002".to_string()),
+                ]
+            );
+        }
+
+        /// A type the band already requires stays the band's (no `floor_rule`), and a step the
+        /// author already placed is never replaced or removed.
+        #[test]
+        fn an_obligation_the_band_or_the_author_already_covers_adds_nothing() {
+            let p = plan(
+                json!({"steps": [{"catalog": "build", "id": "build"}, {"catalog": "test", "id": "my-test"}]}),
+            );
+            let f = fill(&p, 30, &AUTO, &held("R1", &["step:test"]), &[]).unwrap();
+            assert_eq!(
+                rows(&f),
+                [
+                    r("build", "build", AddedBy::Plan, None),
+                    r("test", "my-test", AddedBy::Plan, None),
+                    r("review", "review", AddedBy::Floor, None),
+                ]
+            );
+            // 70-100 requires security_review itself: the rule adds no second one, no floor_rule.
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = fill(&p, 90, &AUTO, &held("R2", &["step:security_review"]), &[]).unwrap();
+            let sec: Vec<_> = rows(&f)
+                .into_iter()
+                .filter(|x| x.0 == "security_review")
+                .collect();
+            assert_eq!(
+                sec,
+                [r(
+                    "security_review",
+                    "security_review",
+                    AddedBy::Floor,
+                    None
+                )]
+            );
+        }
+
+        /// An obligation outside the closed vocabulary refuses the plan, naming the rule.
+        #[test]
+        fn an_unknown_obligation_token_refuses_naming_the_rule() {
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let e = fill(&p, 30, &AUTO, &held("TST-9", &["check:lint"]), &[]).unwrap_err();
+            assert_eq!(e.reason(), "unknown_obligation");
+            let text = e.to_string();
+            assert!(
+                text.contains("rule TST-9") && text.contains("check:lint"),
+                "{text}"
+            );
+            // Judged even on a plan that changes nothing (the rule is broken either way).
+            let p = plan(json!({"steps": [{"catalog": "understand", "id": "understand"}]}));
+            assert_eq!(
+                fill(&p, 0, &AUTO, &held("TST-9", &["check:lint"]), &[])
+                    .unwrap_err()
+                    .reason(),
+                "unknown_obligation"
+            );
+        }
+
+        /// A plan with no creator step owes no floor: a fired rule inserts nothing.
+        #[test]
+        fn a_plan_that_changes_nothing_owes_no_obligation() {
+            let p = plan(json!({"steps": [{"catalog": "understand", "id": "understand"}]}));
+            let f = fill(&p, 30, &AUTO, &held("TST-1002", &["step:walkthrough"]), &[]).unwrap();
+            assert_eq!(
+                rows(&f),
+                [r("understand", "understand", AddedBy::Plan, None)]
+            );
+            assert!(f.floor.is_empty() && f.policy_floor.is_empty());
+        }
+
+        /// (§4.8) A creator that RUNS after the plan's last walkthrough (a mid-run revision whose
+        /// done prefix already holds the pair) gets a new pair after it, in running order.
+        #[test]
+        fn a_later_creator_re_inserts_the_pair_after_it() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "build", "id": "fix"},
+                {"catalog": "test", "id": "test"},
+                {"catalog": "walkthrough_plan", "id": "walkthrough_plan"},
+                {"catalog": "walkthrough_review", "id": "walkthrough_review"},
+                {"catalog": "review", "id": "review"}]}));
+            let ran: Vec<String> = [
+                "build",
+                "test",
+                "walkthrough_plan",
+                "walkthrough_review",
+                "review",
+            ]
+            .map(String::from)
+            .to_vec();
+            let f = fill(
+                &p,
+                30,
+                &AUTO,
+                &held("TST-1002", &["step:walkthrough"]),
+                &ran,
+            )
+            .unwrap();
+            let ids: Vec<&str> = f.steps.steps.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                [
+                    "build",
+                    "fix",
+                    "test",
+                    "walkthrough_plan-floor",
+                    "walkthrough_review-floor",
+                    "walkthrough_plan",
+                    "walkthrough_review",
+                    "review"
+                ]
+            );
+            let wp = &f.steps.steps[3];
+            assert_eq!(wp.added_by, Some(AddedBy::Floor));
+            assert_eq!(wp.floor_rule.as_deref(), Some("TST-1002"));
+            assert_eq!(
+                wp.floor_reason.as_deref(),
+                Some("the walkthrough comes after the last creator step (fix)")
+            );
+            // Without the done prefix the same plan is already in order: nothing is added.
+            let f = fill(&p, 30, &AUTO, &held("TST-1002", &["step:walkthrough"]), &[]).unwrap();
+            assert_eq!(f.steps.steps.len(), 6);
+        }
+
+        /// (§4.8) An authored pair BEFORE a later creator in plan order is followed by a new one.
+        #[test]
+        fn an_authored_pair_before_a_creator_gets_a_pair_after_it() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "walkthrough_plan", "id": "walkthrough_plan"},
+                {"catalog": "walkthrough_review", "id": "walkthrough_review"},
+                {"catalog": "produce", "id": "polish"}]}));
+            let f = fill(&p, 10, &AUTO, &[], &[]).unwrap();
+            let ids: Vec<&str> = f.steps.steps.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                [
+                    "build",
+                    "walkthrough_plan",
+                    "walkthrough_review",
+                    "polish",
+                    "walkthrough_plan-floor",
+                    "walkthrough_review-floor"
+                ]
+            );
+            assert_eq!(
+                f.steps.steps[4].floor_rule, None,
+                "no rule: the pair was the author's"
+            );
+        }
+
+        /// A lone authored `walkthrough_plan` (no review: no proof to keep current) before a later
+        /// creator adds nothing (codex review).
+        #[test]
+        fn a_lone_walkthrough_plan_is_not_a_pair() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "walkthrough_plan", "id": "walkthrough_plan"},
+                {"catalog": "produce", "id": "polish"}]}));
+            let f = fill(&p, 10, &AUTO, &[], &[]).unwrap();
+            let ids: Vec<&str> = f.steps.steps.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, ["build", "walkthrough_plan", "polish"]);
+        }
+
+        /// (O5) The override exempts a POLICY-added pair in manual mode even in a high-risk band;
+        /// a pinned BAND floor phase stays unremovable there; auto mode refuses any override.
+        #[test]
+        fn the_override_covers_a_policy_pair_never_a_band_pin_and_never_in_auto() {
+            let ob = held("TST-1002", &["step:walkthrough"]);
+            let over = |remove: &[&str]| {
+                plan(json!({"steps": [{"catalog": "build", "id": "build"}],
+                    "override": {"remove": remove, "reason": "the walkthrough is mine"}}))
+            };
+            let f = fill(
+                &over(&["walkthrough_plan", "walkthrough_review"]),
+                90,
+                &MANUAL,
+                &ob,
+                &[],
+            )
+            .unwrap();
+            assert!(f.high_risk);
+            assert!(
+                !f.steps
+                    .steps
+                    .iter()
+                    .any(|s| s.catalog.starts_with("walkthrough")),
+                "{:?}",
+                rows(&f)
+            );
+            assert_eq!(
+                fill(&over(&["security_review"]), 90, &MANUAL, &ob, &[]).unwrap_err(),
+                PlanRefusal::OverrideRemovesPinned {
+                    catalog: "security_review".into()
+                }
+            );
+            assert_eq!(
+                fill(&over(&["walkthrough_review"]), 90, &AUTO, &ob, &[]).unwrap_err(),
+                PlanRefusal::OverrideInAutoMode
+            );
+            // Exempting one half leaves the pair the operator's: no re-insert of the other.
+            let f = fill(&over(&["walkthrough_review"]), 90, &MANUAL, &ob, &[]).unwrap();
+            let wt: Vec<&str> = f
+                .steps
+                .steps
+                .iter()
+                .filter(|s| s.catalog.starts_with("walkthrough"))
+                .map(|s| s.id.as_str())
+                .collect();
+            assert_eq!(wt, ["walkthrough_plan"]);
+        }
+
+        /// `floor_rule` is provenance: an author that supplies it is refused.
+        #[test]
+        fn a_step_that_supplies_floor_rule_is_refused() {
+            let p = plan(
+                json!({"steps": [{"catalog": "build", "id": "build", "floor_rule": "TST-1002"}]}),
+            );
+            assert_eq!(
+                fill(&p, 10, &AUTO, &[], &[]).unwrap_err().reason(),
+                "provenance_supplied"
+            );
         }
     }
 }

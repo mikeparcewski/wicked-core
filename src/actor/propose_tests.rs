@@ -34,6 +34,7 @@ fn fixture(
         touch: Vec::new(),
         touch_truncated: false,
         touch_source: None,
+        rules: Vec::new(),
     };
     let session = AgentSession {
         intent_amendments: Vec::new(),
@@ -304,6 +305,7 @@ fn an_edit_while_a_plan_awaits_approval_is_refused() {
             gate_id: Some("g-r-1".into()),
             refusal: None,
             touch_source: None,
+            rules: Vec::new(),
         });
     });
     let e = propose_plan(

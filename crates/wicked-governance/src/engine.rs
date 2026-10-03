@@ -272,6 +272,140 @@ pub fn select_any(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// plan.compose — the testing rules the engine reads when it composes a plan (WT-C3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `applies_to` token a testing rule names to be read at plan compose and at every diff
+/// re-score (DES-walkthrough-proof §4.12).
+pub const PLAN_COMPOSE_PHASE: &str = "plan.compose";
+
+/// The closed, add-only obligation vocabulary of a HELD `plan.compose` rule (§4.12 S7): each
+/// token names floor phases the engine inserts. Anything else is refused when the rule is written
+/// and, for a row that predates the check, refuses the plan at compose naming the rule.
+pub const PLAN_COMPOSE_OBLIGATIONS: [&str; 3] =
+    ["step:walkthrough", "step:test", "step:security_review"];
+
+/// The rules that apply at one phase for a run's projects and a context, split by how they bind.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PhaseRules {
+    /// Effect-bearing rules whose trigger fired, in precedence order (severity desc, id asc).
+    pub fired: Vec<Policy>,
+    /// Recall-only rules (no `effect`) that apply here and whose trigger, if any, matches: the
+    /// advisory rules the run "considered" (sorted by id).
+    pub recalled: Vec<String>,
+}
+
+/// (WT-C3) The rules for `phase` that apply to a run filed in `projects`, judged against
+/// `context`: the same unified store SELECT reads, with the project facet applied the way recall
+/// applies it (DC-S1: a project rule only for a run in its project; a rule with no project
+/// everywhere). Legacy `Other(POLICY)` rows carry no project and apply everywhere, as in
+/// [`select_any`]. Retired rules and rules whose `excludes` names `phase` never apply.
+pub fn rules_at_phase(
+    store: &dyn GraphRead,
+    phase: &str,
+    projects: &[String],
+    context: &serde_json::Value,
+) -> anyhow::Result<PhaseRules> {
+    let context_json = canonical_context(context);
+    let rule_query = SymbolQuery {
+        kinds: vec![NodeKind::Rule],
+        ..Default::default()
+    };
+    let mut out = PhaseRules::default();
+    let mut unified_ids: std::collections::BTreeSet<String> = Default::default();
+    for node in store.find_symbols(&rule_query)? {
+        if node.symbol != synthetic_symbol(crate::CONFORMANCE_RULE, &node.name) {
+            continue;
+        }
+        let rule = crate::ConformanceRule::from_node(&node)?;
+        if rule.effect.is_some() {
+            unified_ids.insert(rule.id.clone());
+        }
+        if rule.retired
+            || !rule.applies_to.iter().any(|p| p == phase)
+            || rule.excludes.iter().any(|x| x == phase)
+        {
+            continue;
+        }
+        if let Some(p) = &rule.targets.project {
+            if !projects.iter().any(|q| q == p) {
+                continue;
+            }
+        }
+        match crate::steering::policy_view(&rule) {
+            Some(policy) => {
+                if triggers(&policy.trigger, &context_json) {
+                    out.fired.push(policy);
+                }
+            }
+            None => {
+                if rule
+                    .trigger
+                    .as_ref()
+                    .is_none_or(|t| triggers(t, &context_json))
+                {
+                    out.recalled.push(rule.id.clone());
+                }
+            }
+        }
+    }
+    for policy in crate::steering::legacy_policies(store)? {
+        if unified_ids.contains(&policy.id)
+            || policy.retired
+            || !policy.applies_to.iter().any(|p| p == phase)
+        {
+            continue;
+        }
+        if triggers(&policy.trigger, &context_json) {
+            out.fired.push(policy);
+        }
+    }
+    out.fired.sort_by(by_precedence);
+    out.recalled.sort();
+    out.recalled.dedup();
+    Ok(out)
+}
+
+/// The write-time half of the closed vocabulary (§4.12 S6-S7): a rule that applies at
+/// [`PLAN_COMPOSE_PHASE`] is either advisory (no effect) or HELD — `allow_with_conditions` with
+/// obligations drawn only from [`PLAN_COMPOSE_OBLIGATIONS`]. Plan compose is not a gate: a `deny`
+/// or `allow` effect there means nothing, so it is refused rather than silently ignored.
+pub(crate) fn check_plan_compose_rule(
+    id: &str,
+    applies_to: &[String],
+    effect: Option<Effect>,
+    obligations: &[String],
+) -> anyhow::Result<()> {
+    if !applies_to.iter().any(|p| p == PLAN_COMPOSE_PHASE) {
+        return Ok(());
+    }
+    match effect {
+        None => return Ok(()),
+        Some(Effect::AllowWithConditions) => {}
+        Some(other) => anyhow::bail!(
+            "rule {id:?} applies at {PLAN_COMPOSE_PHASE} with effect {other:?}: a testing rule is \
+             advisory (no effect) or held (allow_with_conditions + obligations)"
+        ),
+    }
+    if obligations.is_empty() {
+        anyhow::bail!(
+            "rule {id:?} is held at {PLAN_COMPOSE_PHASE} with no obligation: name one of \
+             {PLAN_COMPOSE_OBLIGATIONS:?}"
+        );
+    }
+    if let Some(bad) = obligations
+        .iter()
+        .find(|o| !PLAN_COMPOSE_OBLIGATIONS.contains(&o.as_str()))
+    {
+        anyhow::bail!(
+            "rule {id:?} applies at {PLAN_COMPOSE_PHASE} with obligation {bad:?}, which is not one \
+             of {PLAN_COMPOSE_OBLIGATIONS:?}"
+        );
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DECIDE — the deterministic engine (NO model)
 // ─────────────────────────────────────────────────────────────────────────────
 

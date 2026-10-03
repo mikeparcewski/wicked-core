@@ -1555,9 +1555,10 @@ impl Core {
 
     /// (DES-TEAMING-002 T8 (e)) Preview a launch of `plan`: what the launch would compute, with
     /// nothing persisted or published — the launch's synchronous refusals, the intent score, floor
-    /// fill, approval matrix and the def's planning checks. `project_id` is passed to the launch's
-    /// plan resolution, which only a preset NAME depends on, so it does not change a plan's
-    /// preview. `repo_ref` names the registered repo the launch would run on; for a behavioural
+    /// fill, approval matrix and the def's planning checks. `project_id` resolves a preset NAME
+    /// as the launch does, and selects the project's `plan.compose` testing rules (WT-C3): a rule
+    /// can raise the floor (add a step) or refuse the preview, exactly as it would the launch. A
+    /// plan pending the PA's scope reads no rule yet. `repo_ref` names the registered repo the launch would run on; for a behavioural
     /// touch set the score reads that repo's code graph at the base a launch would start from, read
     /// locally with NO fetch (the local remote-default tip, else HEAD — the launch fetches first,
     /// so a stale clone may start further on). No usable graph: `graph: "unavailable"` and the
