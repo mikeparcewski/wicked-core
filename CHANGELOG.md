@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.36** — 2026-10-03 — npm release carrying the **three** changes since 0.7.35, on
+  main tip `694dca4` (R-B of the 2026-09 build plan). All new wire fields are additive. The new plan
+  and plan-step fields are `serde(default)`, so an old stored row reads as before.
+  **Testing-rule floor (#714 WT-C3)** — the engine reads `plan.compose` testing rules itself
+  (`rules_at_phase`, project-scoped) against a plan context it derives: `kinds` from the touch set,
+  failing closed to `["code"]` when the run is not teamed. A held rule (`allow_with_conditions`)
+  adds floor steps from the closed vocabulary `step:walkthrough` / `step:test` /
+  `step:security_review`. An inserted step names its rule in the new output-only `floor_rule`, and
+  `plan.accepted` carries `rules` (applied / recalled / overridden). A diff re-score that newly
+  fires a held rule raises the floor through `plan.revised{floor_raised}`. A walkthrough pair is
+  re-inserted after the last creator step. In manual mode the floor override may remove a
+  policy-added step, even in a high-risk band. An unknown obligation refuses the plan and names the
+  rule.
+  **Event catalog (#715 TR-W3)** — crew's `wicked.crew.watch_finding.raised` / `.cleared` join
+  `EVENTS.md` and the bus SPEC block (catalog only, no engine change).
+  **Testing starter (#717 WT-C4)** — `crates/wicked-governance/seed/testing` ships TST-1001..1003
+  as advisory testing rules for `wicked-core rules ingest`, and `STEERING.md` gains § Testing rules.
+  Nothing is boot-seeded. The lockfile re-stamp #713 is packaging only.
 - **core-ts 0.7.35** — 2026-10-02 — npm release carrying the **nine** engine changes since 0.7.34, on
   main tip `c98f283`: the held W2 slices and the W3 core slices of the 2026-09 build plan. All new wire
   fields are additive. The new session and plan fields are `serde(default)`, so an old stored row
