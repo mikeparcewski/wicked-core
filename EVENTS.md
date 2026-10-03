@@ -60,8 +60,8 @@
 | `PLAN_PROPOSED` | `wicked.team.plan.proposed` | `src/team/events.rs:46` | no | — |
 | `PLAN_REFUSED` | `wicked.team.plan.refused` | `src/team/events.rs:49` | no | — |
 | `PLAN_REVISED` | `wicked.team.plan.revised` | `src/team/events.rs:47` | no | — |
-| `RUN_LAUNCHED` | `wicked.crew.run.launched` | `src/bus.rs:830` | no | `src/bus.rs` |
-| `RUN_REQUESTED` | `wicked.crew.run.requested` | `src/bus.rs:828` | no | — |
+| `RUN_LAUNCHED` | `wicked.crew.run.launched` | `src/bus.rs:1095` | no | `src/bus.rs` |
+| `RUN_REQUESTED` | `wicked.crew.run.requested` | `src/bus.rs:1093` | no | — |
 | `STEP_CLAIMED` | `wicked.team.step.claimed` | `src/team/events.rs:52` | no | — |
 | `STEP_COMPLETED` | `wicked.team.step.completed` | `src/team/events.rs:60` | no | — |
 | `STEP_REVIEWED` | `wicked.team.step.reviewed` | `src/team/events.rs:61` | no | — |
@@ -137,7 +137,6 @@ e.g. the requester side of `wicked.crew.run.requested`, is outside this scan).
 - `wicked.gate.eval.requested` — wicked-core, wicked-garden
 - `wicked.gate.eval.responded` — wicked-core, wicked-garden
 - `wicked.interactive.chat.posted` — wicked-crew, wicked-interactive
-- `wicked.interactive.demo.requested` — wicked-crew, wicked-interactive
 - `wicked.interactive.doc.created` — wicked-crew, wicked-interactive
 - `wicked.interactive.draft.completed` — wicked-crew, wicked-interactive
 - `wicked.interactive.edit.completed` — wicked-crew, wicked-interactive
@@ -184,6 +183,8 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.crew.run.requested` | `core:src/bus.rs` (const — **no emit seam**)<br>`garden:scripts/_bus.py` (registry) | Governed run intent (human CLI / scheduler / campaign); `domain` stamp = the requester's own — the engine's launch poller matches by event type, not domain | `workflow?`, `problem`, `args?` (payload contract in `wicked-core src/bus.rs`) |
 | `wicked.crew.task.completed` | `core:src/cli_runner.rs` (const)<br>`garden:scripts/_bus.py` (registry) | Workflow unit completion (verdict in payload); `domain` stamp `wicked-core` | run/unit ids + verdict |
 | `wicked.crew.task.dispatched` | `core:src/cli_runner.rs` (const)<br>`garden:scripts/_bus.py` (registry) | Workflow unit handoff to a governed worker; `domain` stamp `wicked-core` | run/unit ids + dispatch descriptor |
+| `wicked.crew.watch_finding.cleared` | `crew:packages/crew/src/watch/events.ts` (const) | crew's watch registry: the condition resolved, the operator dismissed it, or a roll-up replaced it | `watch_id`, `entry_id`, `entry_version`, `project_id?`, `reason` (`resolved` / `dismissed` + `dismissed_by` / `rolled_up` + `replaced_by`); key: the raised row's `watch_id` + `cleared`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.crew.watch_finding.raised` | `crew:packages/crew/src/watch/events.ts` (const) | crew's watch registry (Watchtower): a check produced a finding, a flag or a proposal (DES-trigger-registry §4.5) | `watch_id`, `entry_id`, `entry_version`, `check`, `kind`, `severity`, `watch_kind`, `attach`, `project_id?`, `sentence`, `facts`, `anchor`, `evidence[]`, `model`, `rolled_up`; key: `run_id` or `-`, `entry_id`, `entry_version`, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`; `domain` stamp `wicked-crew`, subdomain `watch` |
 | `wicked.crew.workflow.completed` | `core:crates/wicked-apps-core/src/lib.rs` (const — **no emit seam**) | — | — |
 | `wicked.crew.workflow.started` | `core:crates/wicked-apps-core/src/lib.rs` (const — **no emit seam**) | — | — |
 
@@ -265,7 +266,7 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.interactive.artifact.published` | `interactive:src/artifact/publish.js` (emit) | Artifact published (`src/artifact/publish.js`) | artifact/document ids |
 | `wicked.interactive.artifact.validation_failed` | `interactive:src/artifact/validate.js` (emit) | Artifact failed validation (`src/artifact/validate.js`) | artifact id + failure detail |
 | `wicked.interactive.chat.posted` | `crew:packages/crew/src/interactive/chat-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `chat`; owners: ui, agent; UI-emittable | — |
-| `wicked.interactive.demo.requested` | `crew:packages/crew/src/interactive/demo-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `demo`; owners: ui, agent; UI-emittable | — |
+| `wicked.interactive.demo.requested` | `interactive:src/service/events.js` (registry) | subdomain `demo`; owners: ui, agent; UI-emittable | — |
 | `wicked.interactive.doc.created` | `crew:packages/crew/src/interactive/draft-events.ts` (mirror)<br>`interactive:src/artifact/create.js` (emit)<br>`interactive:src/service/events.js` (registry) | subdomain `docs`; owners: service | — |
 | `wicked.interactive.doc.retired` | `interactive:src/service/events.js` (registry) | subdomain `docs`; owners: service | — |
 | `wicked.interactive.draft.completed` | `crew:packages/crew/src/interactive/draft-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `generation`; owners: agent, crew | — |
@@ -277,7 +278,7 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.interactive.feedback.processed` | `crew:packages/crew/src/interactive/edit-events.ts` (mirror)<br>`interactive:src/service/events.js` (registry) | subdomain `feedback`; owners: service | — |
 | `wicked.interactive.feedback.submitted` | `interactive:src/service/events.js` (registry) | subdomain `feedback`; owners: ui; UI-emittable | — |
 | `wicked.interactive.question.answered` | `interactive:src/service/events.js` (registry) | subdomain `chat`; owners: ui; UI-emittable | — |
-| `wicked.interactive.review.completed` | `interactive:src/service/events.js` (registry) | subdomain `review`; owners: agent | — |
+| `wicked.interactive.review.completed` | `interactive:src/service/events.js` (registry) | subdomain `review`; owners: agent, crew | — |
 | `wicked.interactive.review.requested` | `interactive:src/service/events.js` (registry) | subdomain `review`; owners: ui, agent; UI-emittable | — |
 | `wicked.interactive.source.attached` | `interactive:src/service/events.js` (registry) | subdomain `sources`; owners: ui; UI-emittable | — |
 | `wicked.interactive.source.removed` | `interactive:src/service/events.js` (registry) | subdomain `sources`; owners: ui; UI-emittable | — |
@@ -321,7 +322,7 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | `wicked.team.path.ended` | `core:src/team/events.rs` (const — **no emit seam**) | E: the run reached a terminal state | `status`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
 | `wicked.team.path.scored` | `core:src/team/events.rs` (const — **no emit seam**) | E: intent score at plan time; diff re-score from the supervisor's `TeamRescored` | `score_source`, `basis`, `score`, `deterministic`, `reasons`, `model`, `signals`, `plan`, `tree`; key: `score_source`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
 | `wicked.team.path.started` | `core:src/team/events.rs` (const — **no emit seam**) | E: launch admitted, PA seat known (required transition) | `cli`, `selection`, `roster`, `request`, `workflow`, `plan`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
-| `wicked.team.plan.accepted` | `core:src/team/events.rs` (const — **no emit seam**) | E: composed, floor-filled, approved or auto-released (required transition) | `plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`, `touch` (≤64, omitted when empty), `touch_truncated` (only when cut), `touch_source` (`user`/`pa_scope`/`floor_default`/`none`; absent on an old row); key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
+| `wicked.team.plan.accepted` | `core:src/team/events.rs` (const — **no emit seam**) | E: composed, floor-filled, approved or auto-released (required transition) | `plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`, `touch` (≤64, omitted when empty), `touch_truncated` (only when cut), `touch_source` (`user`/`pa_scope`/`floor_default`/`none`; absent on an old row), `rules` (`[{id, outcome: applied/recalled/overridden}]`, the testing rules the rev was composed under; omitted when empty); a floor-added step may carry `floor_rule`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
 | `wicked.team.plan.proposed` | `core:src/team/events.rs` (const — **no emit seam**) | E: a plan or plan change was submitted (command or step result) | `proposal_id`, `base_rev`, `kind`, `preset`, `steps`, `monitors`, `asks`, `touch`, `override`, `rationale`; key: `proposal_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
 | `wicked.team.plan.refused` | `core:src/team/events.rs` (const — **no emit seam**) | E: compose refused a proposal; the run keeps its accepted rev | `proposal_id`, `base_rev`, `reason`; key: `proposal_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
 | `wicked.team.plan.revised` | `core:src/team/events.rs` (const — **no emit seam**) | E: the plan grew (floor raised, PA added, member request) | `plan_rev`, `proposal_id`, `reason`, `from_band`, `to_band`, `high_risk`, `added`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re` |
@@ -355,10 +356,10 @@ home of the catalog; this file is the engine-side view plus the drift report.
 | wicked-garden | `scripts/qe/lib/gate.mjs` | emit |
 | wicked-ledger | `lib/bus-emit.mjs` | emit |
 | wicked-crew | `packages/crew/src/projects/events.ts` | const |
+| wicked-crew | `packages/crew/src/watch/events.ts` | const |
 | wicked-crew | `packages/crew/src/interactive/chat-events.ts` | mirror |
 | wicked-crew | `packages/crew/src/interactive/edit-events.ts` | mirror |
 | wicked-crew | `packages/crew/src/interactive/draft-events.ts` | mirror |
-| wicked-crew | `packages/crew/src/interactive/demo-events.ts` | mirror |
 | wicked-interactive | `src/service/events.js` | registry |
 | wicked-interactive | `src/artifact/create.js` | emit |
 | wicked-interactive | `src/artifact/publish.js` | emit |

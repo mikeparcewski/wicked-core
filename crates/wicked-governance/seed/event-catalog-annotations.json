@@ -130,7 +130,7 @@
   },
   "wicked.team.plan.accepted": {
     "trigger": "E: composed, floor-filled, approved or auto-released (required transition)",
-    "payload": "`plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`, `touch` (≤64, omitted when empty), `touch_truncated` (only when cut), `touch_source` (`user`/`pa_scope`/`floor_default`/`none`; absent on an old row); key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`plan_rev`, `workflow_id`, `band`, `high_risk`, `mode`, `steps`, `override`, `proposal_id`, `touch` (≤64, omitted when empty), `touch_truncated` (only when cut), `touch_source` (`user`/`pa_scope`/`floor_default`/`none`; absent on an old row), `rules` (`[{id, outcome: applied/recalled/overridden}]`, the testing rules the rev was composed under; omitted when empty); a floor-added step may carry `floor_rule`; key: `plan_rev`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.plan.refused": {
     "trigger": "E: compose refused a proposal; the run keeps its accepted rev",
@@ -211,5 +211,13 @@
   "wicked.team.path.ended": {
     "trigger": "E: the run reached a terminal state",
     "payload": "`status`; key: run; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+  },
+  "wicked.crew.watch_finding.raised": {
+    "trigger": "crew's watch registry (Watchtower): a check produced a finding, a flag or a proposal (DES-trigger-registry §4.5)",
+    "payload": "`watch_id`, `entry_id`, `entry_version`, `check`, `kind`, `severity`, `watch_kind`, `attach`, `project_id?`, `sentence`, `facts`, `anchor`, `evidence[]`, `model`, `rolled_up`; key: `run_id` or `-`, `entry_id`, `entry_version`, `subject`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`; `domain` stamp `wicked-crew`, subdomain `watch`"
+  },
+  "wicked.crew.watch_finding.cleared": {
+    "trigger": "crew's watch registry: the condition resolved, the operator dismissed it, or a roll-up replaced it",
+    "payload": "`watch_id`, `entry_id`, `entry_version`, `project_id?`, `reason` (`resolved` / `dismissed` + `dismissed_by` / `rolled_up` + `replaced_by`); key: the raised row's `watch_id` + `cleared`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   }
 }
