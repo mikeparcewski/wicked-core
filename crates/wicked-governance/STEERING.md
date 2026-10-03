@@ -75,7 +75,7 @@ half of the retired standalone `Policy` (`src/domain.rs`):
 | `excludes` | string[] | **exclusion** — phases/tools this rule is never selected for (the inclusion twin) |
 | `weight` | f32, default 1.0 | ordering within a severity band + gate priority |
 | `effect` | `deny` \| `allow_with_conditions` \| `allow` (optional) | **absent ⇒ recall-only** — the rule informs, never gates |
-| `trigger` | `{contains: regex}` (optional) | when an effect-bearing rule fires (over the canonical JSON of the evaluated context) |
+| `trigger` | `{contains: regex}` (optional) | when an effect-bearing rule fires (over the canonical JSON of the evaluated context); at `plan.compose` it also decides when an advisory rule is considered (§ Testing rules) |
 | `obligations` | string[] | conditions the caller must satisfy under `allow_with_conditions` |
 | `criteria` | string | frozen acceptance-criteria text (becomes the claim's `criteria`) |
 | `symbol_ref` | optional | the code that enforces the rule — `rules relink` derives the `Governs` edge |
@@ -106,6 +106,73 @@ orthogonal — every type can hold guidance and gates alike.
 A tool-calling policy sits naturally in `operations` (run discipline) and moves to
 `security` when its intent is threat-shaped — pick by what the rule protects, not by which
 subsystem checks it.
+
+## Testing rules — what a plan must carry (`plan.compose`)
+
+A testing rule is an ordinary steering rule that says which steps a plan must carry for the
+change it makes: `steering_type: testing`, `applies_to: ["plan.compose"]`, optionally
+project-scoped (`targets.project` — a project rule applies only to a run filed in that
+project), and a `trigger` regex over the canonical JSON of the **engine-derived** plan
+context. The engine reads these rules itself when it composes a plan and again at every diff
+re-score (`rules_at_phase` in `src/engine.rs`); no crew hand-off.
+
+The context is derived, never declared by the plan:
+
+```json
+{ "project": "proj-pay", "kinds": ["code", "config"], "paths": ["src/checkout/pay.ts"],
+  "critical": false, "destructive": false, "band": "40-69", "deliver": true }
+```
+
+- `kinds` is the sorted set of `docs` / `test` / `config` / `code` over the touch set. A run
+  that is not (yet) teamed, or that declares no touch, reads as `["code"]` (fail closed).
+- On a teamed run the context is recomputed from the settled diff at every re-score, so an
+  under-declared touch set is corrected by the real diff.
+- A UI string in a `.tsx` file is `code`: `kinds` cannot see copy inside a code file.
+
+**Advisory or held** — the only two shapes a `plan.compose` rule may take:
+
+| Studio switch | Encoding | What happens |
+|---|---|---|
+| "Hold work to it" **off** (the default) | no `effect` (recall-only) | The rule is *considered*: when its trigger matches, `plan.accepted.rules` records it `recalled`. Nothing is inserted |
+| "Hold work to it" **on** | `effect: allow_with_conditions` + non-empty `obligations` | When its trigger matches, its obligations join the floor: the steps are inserted with `added_by: floor` and `floor_rule: <id>`, and `plan.accepted.rules` records it `applied` (or `overridden`) |
+
+- The obligation vocabulary is closed and add-only: `step:walkthrough` (the
+  `walkthrough_plan` + `walkthrough_review` pair, placed after the last creator step),
+  `step:test`, `step:security_review`.
+- A rule is refused when it is written with `deny` / `allow` at `plan.compose`, or held
+  with no obligation or with a token outside the vocabulary. A row that predates the check
+  refuses the plan at compose, naming the rule.
+- Obligations on a rule without `effect` are inert, and their tokens are checked only when
+  the rule is held. They record what holding the rule would bind, so the hold switch only adds
+  the effect.
+- A held rule that newly fires on a re-score raises the floor through
+  `plan.revised{reason: "floor_raised"}`, applied at the next step boundary.
+- "Your own plan wins": in manual mode, `plan.floor_override.remove` with a reason removes a
+  policy-added step, even in a high-risk band. It never removes a band-floor pinned phase.
+- Evals credit only `deny`, so a held testing rule is not counted as a catch (see
+  [TESTING.md](./TESTING.md)).
+- The markdown doc lane cannot express a testing rule: it has no `obligations` key and
+  refuses a `trigger:` without an effect. Testing rules go through the JSON lane, the
+  individual editor, or crew's Steering API.
+
+**The starter** — three advisory rules, shipped in
+[`seed/testing/rules/testing-starter.json`](./seed/testing/rules/testing-starter.json):
+
+| Id | Statement | Trigger (over the context) | Obligations when held |
+|---|---|---|---|
+| `TST-1001` | Docs-only changes get the repo's checks only. | `kinds` is exactly `["docs"]` | none (advisory only) |
+| `TST-1002` | A change to code or config gets Test plus a walkthrough review by a different helper. | `kinds` holds `code` or `config` | `step:test`, `step:walkthrough` |
+| `TST-1003` | Payments, data, security and delivery paths get a security review. | a word of a path (split on `/`, `_`, `.`, `-`) starts with a risk word (`pay`, `billing`, `checkout`, `invoice`, `auth`, `secur`, `secret`, `credential`, `crypt`, `migration`, `schema`, `deliver`, `deploy`, `release`) | `step:security_review` |
+
+```sh
+wicked-core rules ingest crates/wicked-governance/seed/testing --db <store>
+wicked-core rules recall --db <store> --type testing      # TST-1001..1003, no effect
+```
+
+- A daemon-held store is never CLI-written. Post the same rows through crew's
+  `/api/v1/governance/rules` instead (§ Seed & fan out).
+- TST-1003's risk words are a starting point. Replace them with your project's own risk paths
+  in a project-scoped copy.
 
 ---
 

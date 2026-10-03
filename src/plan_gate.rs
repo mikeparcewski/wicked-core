@@ -2186,4 +2186,134 @@ mod tests {
             5
         );
     }
+
+    /// WT-C4 (DES-walkthrough-proof §4.12 S5): the shipped testing starter, read by the engine
+    /// against the contexts it derives itself. Advisory as shipped: TST-1001 for a docs-only
+    /// touch, TST-1002 for code or config, TST-1003 for a risk path (a path word, split on `/`,
+    /// `_`, `.` and `-`, starts with a risk word, never a mid-word substring like `display`);
+    /// nothing binds. Held (the studio
+    /// switch: `allow_with_conditions` over the obligations the starter carries), the same
+    /// contexts bind exactly the documented obligations.
+    #[test]
+    fn wt_c4_the_testing_starter_reads_against_derived_plan_contexts() {
+        let _ = wicked_apps_core::emit::hermetic_test_spool();
+        let seed: Value = serde_json::from_str(include_str!(
+            "../crates/wicked-governance/seed/testing/rules/testing-starter.json"
+        ))
+        .unwrap();
+        let rules = wicked_governance::normalize_bundle(&seed, "filesystem").unwrap();
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        for r in &rules {
+            wicked_governance::register_rule(&mut store, r).unwrap();
+        }
+        let eval = |store: &dyn wicked_apps_core::GraphRead, teamed: bool, paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            let ctx = plan_context(&[], &paths, teamed, false, false, "20-39", false);
+            StoreRules {
+                store,
+                projects: vec![],
+                teamed,
+            }
+            .eval(&ctx)
+            .unwrap()
+        };
+        let recalled = |store: &dyn wicked_apps_core::GraphRead, teamed: bool, paths: &[&str]| {
+            let r = eval(store, teamed, paths);
+            assert!(r.held.is_empty(), "the starter ships advisory: {r:?}");
+            r.recalled
+        };
+        assert_eq!(
+            recalled(&store, true, &["README.md", "docs/x.md"]),
+            ["TST-1001"]
+        );
+        assert_eq!(recalled(&store, true, &["src/a.rs"]), ["TST-1002"]);
+        assert_eq!(recalled(&store, true, &["a.json"]), ["TST-1002"]);
+        assert_eq!(
+            recalled(&store, true, &["README.md", "src/a.rs"]),
+            ["TST-1002"]
+        );
+        assert!(recalled(&store, true, &["tests/t.rs"]).is_empty());
+        assert_eq!(
+            recalled(&store, true, &["src/checkout/pay.ts"]),
+            ["TST-1002", "TST-1003"]
+        );
+        assert_eq!(
+            recalled(&store, true, &["docs/payments/refunds.md"]),
+            ["TST-1001", "TST-1003"]
+        );
+        assert_eq!(
+            recalled(&store, true, &["src/auth_token.rs", "db/migrations/1.sql"]),
+            ["TST-1002", "TST-1003"]
+        );
+        assert_eq!(
+            recalled(&store, true, &["src/display.rs", "src/replay.ts"]),
+            ["TST-1002"]
+        );
+        // Every documented risk word fires at the start of the path and after each separator,
+        // and never inside a word (codex review: pin the regex both ways).
+        for w in [
+            "pay",
+            "billing",
+            "checkout",
+            "invoice",
+            "auth",
+            "secur",
+            "secret",
+            "credential",
+            "crypt",
+            "migration",
+            "schema",
+            "deliver",
+            "deploy",
+            "release",
+        ] {
+            for path in [
+                format!("{w}x.rs"),
+                format!("src/{w}x.rs"),
+                format!("src/a_{w}x.rs"),
+                format!("src/a.{w}x"),
+                format!("src/a-{w}x.rs"),
+                format!("src/{}x.rs", w.to_uppercase()),
+                format!("src/{w}/a.rs"),
+                format!("src/a_{w}.rs"),
+                format!("src/{w}"),
+            ] {
+                let r = recalled(&store, true, &[path.as_str()]);
+                assert!(r.contains(&"TST-1003".to_string()), "{path}: {r:?}");
+            }
+            let inside = format!("src/x{w}.rs");
+            let r = recalled(&store, true, &[inside.as_str()]);
+            assert!(!r.contains(&"TST-1003".to_string()), "{inside}: {r:?}");
+        }
+        // Un-teamed, kinds fail closed to code: a docs touch still reads as a code change.
+        assert_eq!(recalled(&store, false, &["README.md"]), ["TST-1002"]);
+
+        // Held: the switch adds the effect; the obligations are the ones the starter carries.
+        for r in &rules {
+            if r.obligations.is_empty() {
+                continue;
+            }
+            let mut held = r.clone();
+            held.effect = Some(wicked_governance::Effect::AllowWithConditions);
+            held.validate().unwrap();
+            wicked_governance::register_rule(&mut store, &held).unwrap();
+        }
+        let ob = |rule: &str, token: &str| HeldObligation {
+            rule: rule.into(),
+            token: token.into(),
+        };
+        let r = eval(&store, true, &["src/checkout/pay.ts"]);
+        assert_eq!(
+            r.held,
+            [
+                ob("TST-1002", "step:test"),
+                ob("TST-1002", "step:walkthrough"),
+                ob("TST-1003", "step:security_review"),
+            ]
+        );
+        assert!(r.recalled.is_empty(), "{:?}", r.recalled);
+        let r = eval(&store, true, &["docs/guide.md"]);
+        assert!(r.held.is_empty());
+        assert_eq!(r.recalled, ["TST-1001"]);
+    }
 }

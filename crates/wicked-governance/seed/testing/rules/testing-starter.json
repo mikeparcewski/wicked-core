@@ -1,0 +1,75 @@
+{
+  "metadata": {
+    "schema_version": "1.1.0",
+    "source": "wicked-core testing starter (DES-walkthrough-proof 4.12 S5)"
+  },
+  "rules": [
+    {
+      "id": "TST-1001",
+      "rule_type": "policy",
+      "statement": "Docs-only changes get the repo's checks only.",
+      "severity": "info",
+      "confidence": 0.9,
+      "steering_type": "testing",
+      "applies_to": [
+        "plan.compose"
+      ],
+      "trigger": {
+        "contains": "\"kinds\":\\[\"docs\"\\]"
+      },
+      "provenance": {
+        "ref": "crates/wicked-governance/seed/testing/rules/testing-starter.json#TST-1001",
+        "source_kinds": [
+          "doc"
+        ]
+      }
+    },
+    {
+      "id": "TST-1002",
+      "rule_type": "policy",
+      "statement": "A change to code or config gets Test plus a walkthrough review by a different helper.",
+      "severity": "warn",
+      "confidence": 0.9,
+      "steering_type": "testing",
+      "applies_to": [
+        "plan.compose"
+      ],
+      "trigger": {
+        "contains": "\"kinds\":\\[[^\\]]*\"(code|config)\""
+      },
+      "provenance": {
+        "ref": "crates/wicked-governance/seed/testing/rules/testing-starter.json#TST-1002",
+        "source_kinds": [
+          "doc"
+        ]
+      },
+      "obligations": [
+        "step:test",
+        "step:walkthrough"
+      ]
+    },
+    {
+      "id": "TST-1003",
+      "rule_type": "policy",
+      "statement": "Payments, data, security and delivery paths get a security review.",
+      "severity": "warn",
+      "confidence": 0.9,
+      "steering_type": "testing",
+      "applies_to": [
+        "plan.compose"
+      ],
+      "trigger": {
+        "contains": "\"paths\":\\[[^\\]]*\"(?:[^\"]*[/_.-])?(?i:pay|billing|checkout|invoice|auth|secur|secret|credential|crypt|migration|schema|deliver|deploy|release)"
+      },
+      "provenance": {
+        "ref": "crates/wicked-governance/seed/testing/rules/testing-starter.json#TST-1003",
+        "source_kinds": [
+          "doc"
+        ]
+      },
+      "obligations": [
+        "step:security_review"
+      ]
+    }
+  ]
+}
