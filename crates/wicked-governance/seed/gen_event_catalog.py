@@ -21,8 +21,8 @@ Seams scanned (all machine-readable; see SEAMS below):
   wicked-garden   `scripts/_bus.py` BUS_EVENT_MAP (registry) and
                   `scripts/qe/lib/gate.mjs` literals (emit)
   wicked-ledger   `lib/bus-emit.mjs` literals (emit)
-  wicked-crew     `packages/crew/src/projects/events.ts` consts (producer) and
-                  `packages/crew/src/interactive/*-events.ts` consts (consumer
+  wicked-crew     `packages/crew/src/{projects,watch}/events.ts` consts (producer)
+                  and `packages/crew/src/interactive/*-events.ts` consts (consumer
                   mirrors of wicked-interactive's registry)
   wicked-interactive  `src/service/events.js` EVENT_TYPES (registry) and
                   `src/artifact/{create,publish,validate}.js` literals (emit)
