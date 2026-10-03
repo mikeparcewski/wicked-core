@@ -508,8 +508,10 @@ export declare class Core {
    * What a launch of `planJson` (`{ steps, touch?, override? }`) with `humanConfirm` on
    * `repoRef` (the registered repo the launch would run on) with `deliverStepJson` (the
    * launch's deliver step) would compute, persisting and publishing nothing — the launch's own
-   * precheck, intent score, floor fill, approval matrix and planning checks. `projectId` only
-   * matters to a preset name, so it does not change a plan's preview. For a behavioural touch
+   * precheck, intent score, floor fill, approval matrix and planning checks. `projectId` resolves a
+   * preset name and selects the project's `plan.compose` testing rules, which can raise the
+   * floor or refuse the preview as they would the launch (a plan pending the PA's scope reads
+   * no rule yet). For a behavioural touch
    * set the score reads `repoRef`'s code graph at the base a launch would start from, read
    * locally with NO fetch (the local remote-default tip, else HEAD).
    * Resolves to JSON `{ score, deterministic, reasons, destructive, band, high_risk, floor,

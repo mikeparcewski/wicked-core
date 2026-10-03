@@ -181,8 +181,8 @@ impl RulesEval {
 }
 
 /// (WT-C3) Where [`decide`] reads the `plan.compose` testing rules from: the actor's store for
-/// the run's projects ([`StoreRules`]), or nothing ([`NoRules`]: a preview without a store, and
-/// the pure-pipeline tests).
+/// the run's projects ([`StoreRules`]), or nothing ([`NoRules`]: a preview pending the PA's
+/// scope, and the pure-pipeline tests).
 pub(crate) trait RuleSource {
     /// The projects the run is filed in.
     fn projects(&self) -> &[String];
@@ -192,11 +192,10 @@ pub(crate) trait RuleSource {
     fn eval(&self, context: &Value) -> anyhow::Result<RulesEval>;
 }
 
-/// No testing rules: every plan composes on the band floor alone.
-#[cfg(test)]
+/// No testing rules: every plan composes on the band floor alone (also a pending-scope preview,
+/// whose rules are read only once the PA has scoped it).
 pub(crate) struct NoRules;
 
-#[cfg(test)]
 impl RuleSource for NoRules {
     fn projects(&self) -> &[String] {
         &[]

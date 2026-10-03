@@ -84,6 +84,9 @@ pub(crate) fn preview_plan(
         )
     };
     let plan = &plan;
+    // (WT-C3) The launch of a plan the PA will scope reads no testing rule until the PA's settled
+    // touch and teamed status decide it at the scope step's boundary, so neither does its preview.
+    let rules: &dyn super::RuleSource = if scoping { &super::NoRules } else { rules };
     let decided = super::decide(
         PREVIEW_RUN,
         super::Proposal {
@@ -272,6 +275,58 @@ mod tests {
             ),
             (json!("unavailable"), json!(100), json!("high_risk"))
         );
+    }
+
+    /// (WT-C3) A plan the PA will scope is decided from the PA's settled touch at the scope step's
+    /// boundary, so the launch reads no testing rule at launch. Its preview reads none either: a
+    /// code-triggered rule cannot refuse, or add obligations to, a pending-scope preview.
+    #[test]
+    fn a_pending_scope_preview_reads_no_testing_rule() {
+        struct Refusing(std::cell::Cell<usize>);
+        impl crate::plan_gate::RuleSource for Refusing {
+            fn projects(&self) -> &[String] {
+                &[]
+            }
+            fn teamed(&self) -> bool {
+                false
+            }
+            fn eval(&self, _: &Value) -> anyhow::Result<crate::plan_gate::RulesEval> {
+                self.0.set(self.0.get() + 1);
+                Ok(crate::plan_gate::RulesEval {
+                    held: vec![crate::plan::HeldObligation {
+                        rule: "TST-9".into(),
+                        token: "effect:deny".into(),
+                    }],
+                    recalled: vec![],
+                })
+            }
+        }
+        let rules = Refusing(Default::default());
+        let p = preview_plan(
+            &plan(json!({"steps": [{"catalog": "build"}]})),
+            &HumanConfirm::None,
+            None,
+            None,
+            None,
+            &rules,
+        )
+        .expect("a pending-scope preview is not refused by a rule the launch has not read");
+        assert_eq!(p.graph, "pending_pa_scope");
+        assert_eq!(rules.0.get(), 0, "no rule read while the scope is pending");
+        // A declared plan reads the rules, as its launch does.
+        let declared = preview_plan(
+            &plan(json!({"steps": [{"catalog": "build"}], "touch": ["docs/a.md"]})),
+            &HumanConfirm::None,
+            None,
+            None,
+            None,
+            &rules,
+        );
+        assert!(
+            declared.is_err(),
+            "the declared plan is refused by the rule"
+        );
+        assert!(rules.0.get() > 0);
     }
 
     /// The launch's refusals are the preview's: an override in auto mode, an unknown catalog id,
