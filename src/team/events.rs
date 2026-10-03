@@ -700,7 +700,7 @@ pub struct PlanAccepted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub touch_source: Option<TouchSource>,
     /// (WT-C3, DES-walkthrough-proof §4.12) Every testing rule this rev was composed under and
-    /// what came of it. Absent when no rule applied (and on an old row).
+    /// what came of it (applied, recalled or overridden). Omitted when empty (and on an old row).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleOutcome>,
 }
