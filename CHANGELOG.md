@@ -14,6 +14,28 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.37** — 2026-10-04 — npm release carrying the **six** engine fixes since 0.7.36, on
+  main tip `0f419c3` (the defects the dogfood run and the reel takes found). No wire shape changes.
+  **Seat-specific auth (#721, #718)** — an ACP turn refused with `data.errorKind:
+  "authentication_failed"` (an expired OAuth session) is an auth refusal like `-32000`: no
+  single-shot fallback, the seat is benched and the unit fails over to an eligible signed-in seat.
+  A retried launch failure that only that seat's carrier meets offers reassignment by name instead
+  of "Another CLI meets the same environment".
+  **A refused write after a passing floor (#725, #716)** — a blocked filesystem-boundary write
+  (`engine:filesystem-boundary-write`) on a unit whose deterministic floor ran and passed is
+  disclosed as `workerToolCallDenied`, not a denial. The `boundary_deny` prompt says Approve
+  re-runs the phase and why this refusal denied.
+  **Post-build role (#722, #712)** — Neutral, non-code steps after the build (floor-inserted
+  `test_plan` / `design`) carry a `PHASE ROLE:` preamble: not the creator, writes refused,
+  creator-addressed context is input.
+  **Seeded packs (#723, #709, #705)** — `rules ingest` of `mcp-defaults` / `editor-defaults`
+  keeps the boot-seeded rules as stored (approvals and retirements survive). The MCP boot seed
+  writes without an explicit batch.
+  **Project rules (#724, #698)** — a malformed `crew.run` membership of the run fails its
+  project-rule read closed instead of dropping the project.
+  **Schemas (#727, #699)** — conformance-rules 1.2.0 (`$id`, title, accepted versions) and
+  bundle 1.2.1.
+
 - **core-ts 0.7.36** — 2026-10-03 — npm release carrying the **three** changes since 0.7.35, on
   main tip `694dca4` (R-B of the 2026-09 build plan). All new wire fields are additive. The new plan
   and plan-step fields are `serde(default)`, so an old stored row reads as before.
