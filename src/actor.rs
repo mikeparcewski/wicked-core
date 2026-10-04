@@ -12861,13 +12861,109 @@ mod substance_gate_tests {
             )
         );
         assert_eq!(paused.2, "escalation");
+        // (core#716) The prompt says what Approve DOES (a re-run of the phase, not an
+        // acceptance of the captured output) and why this deny denied.
         assert!(
             paused.3.contains("DENIED by input governance")
-                && paused.3.contains("output was captured"),
+                && paused.3.contains("never ran")
+                && paused.3.contains("Approve RE-RUNS the")
+                && paused.3.contains("the captured output is not accepted"),
             "{}",
             paused.3
         );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+    }
+
+    /// core#716 — a refused filesystem-boundary WRITE (the call never ran) on a unit whose
+    /// deterministic floor RAN and PASSED does not deny the unit: it is disclosed as
+    /// `workerToolCallDenied` and the unit completes (dogfood run `3580f771`: the build floor
+    /// passed and one refused exploratory `Bash` probe outside the worktree cost a full creator
+    /// retry). A vacuous floor (a passing report that ran no check) does not count: the same
+    /// refusal still denies.
+    #[test]
+    fn a_refused_boundary_write_does_not_deny_a_unit_whose_floor_passed() {
+        let run = |name: &str, checks: serde_json::Value| {
+            let run_id = format!("boundary-floor-{name}-{}", std::process::id());
+            let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(&mut store, &run_id, PhaseRole::Creator);
+            let claim = wicked_apps_core::ConformanceClaim {
+                claim_id: "boundary-deny:unit-1".into(),
+                scope: format!("wicked-agent/{run_id}/unit/x"),
+                phase: "unit-1".into(),
+                policy_ids: vec!["engine:filesystem-boundary-write".into()],
+                decision: wicked_apps_core::Decision::Deny,
+                obligations: vec![
+                    "path outside this unit's boundary: /home/op/.wicked-vault/x (write)".into(),
+                ],
+                evaluated_context_ref: "sha256:boundary".into(),
+                criteria: "filesystem boundary: outside (write)".into(),
+                evaluator_identity: "wicked-governance-boundary".into(),
+                evaluated_at: 1_750_000_000,
+            };
+            let path = crate::gate_hook::decisions_path_for(&run_id, 0);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string(&claim).unwrap()),
+            )
+            .unwrap();
+            let report: crate::repo_checks::RepoChecksReport =
+                serde_json::from_value(serde_json::json!({
+                    "detected": [], "checks": checks, "skipped": [], "passed": true,
+                    "sandbox_level": "none"
+                }))
+                .unwrap();
+            let mut subs = crate::event_log::EventSink::default();
+            let (esub, erx) = channel();
+            subs.push(esub);
+            let (applied, _session, unit) = fold_inner(
+                &mut store,
+                &mut subs,
+                &run_id,
+                &"built the feature; the repo's checks pass on the tree. ".repeat(6),
+                false,
+                crate::workflow::UnitEvidence {
+                    repo_checks: Some(report),
+                    ..Default::default()
+                },
+            );
+            let evs = drain_events(&erx);
+            let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+            (applied, unit, evs)
+        };
+        let (applied, unit, evs) = run(
+            "passed",
+            serde_json::json!([{
+                "name": "test", "argv": ["cargo", "test"], "source": "Cargo.toml",
+                "exit_code": 0, "timed_out": false, "duration_ms": 1200,
+                "stdout_tail": "test result: ok", "stderr_tail": ""
+            }]),
+        );
+        assert!(
+            !matches!(applied, StepApplied::Paused) && unit.status != UnitStatus::Rejected,
+            "a refused write that never ran must not deny a unit whose floor passed: {:?} {:?}",
+            unit.status,
+            unit.denial
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::WorkerToolCallDenied { remedy, reason, .. }
+                    if remedy.contains("core#716") && reason.contains("(write)")
+            )),
+            "the refusal is disclosed, never dropped: {evs:?}"
+        );
+        // A passing report that ran NO check is no floor: the refusal still denies.
+        let (applied, unit, _) = run("vacuous", serde_json::json!([]));
+        assert!(
+            matches!(applied, StepApplied::Paused),
+            "a vacuous floor still denies"
+        );
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("input_governance")
+        );
     }
 
     /// core#464: the output gate's own policy Deny — the original "a governance deny halts the
