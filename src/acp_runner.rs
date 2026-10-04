@@ -3210,7 +3210,9 @@ fn read_bounded_frame<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result
 /// sent (via [`RpcServerError`]), never by pattern-matching a rendered message.
 const AUTH_REQUIRED_CODE: i64 = -32000;
 
-/// Whether a turn error is the bridge's AUTHENTICATION refusal — see [`turn_auth_refusal`].
+/// Whether a turn error is the bridge's AUTHENTICATION refusal — see [`turn_auth_refusal`] (the
+/// production reader; this predicate is the tests' spelling of it).
+#[cfg(test)]
 fn is_auth_required_error(e: &anyhow::Error) -> bool {
     turn_auth_refusal(e).is_some()
 }
