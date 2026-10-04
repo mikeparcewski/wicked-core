@@ -1166,6 +1166,28 @@ mod tests {
     use super::*;
     use wicked_apps_core::open_store;
 
+    /// core#705 — the boot seed writes WITHOUT an explicit batch: `GraphStore` has no rollback, so
+    /// a failed write inside `begin_batch`…`commit_batch` would leave a transaction open on the
+    /// actor's boot path. Structural (no store double can fail a real SQLite upsert on demand):
+    /// the seed's own body holds no batch call. The needles are built by concatenation so this
+    /// test's text cannot satisfy the search.
+    #[test]
+    fn the_mcp_seed_writes_without_an_explicit_batch() {
+        let src = include_str!("mcp_gate.rs");
+        let start = src
+            .find(concat!("pub(crate) fn ", "seed_mcp_defaults("))
+            .expect("the seed is in this file");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("the seed's body ends")];
+        for needle in [concat!("begin_", "batch("), concat!("commit_", "batch(")] {
+            assert!(!body.contains(needle), "seed_mcp_defaults calls `{needle}`");
+        }
+        // …and still seeds, insert-only.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let first = seed_mcp_defaults(&mut store).unwrap();
+        assert!(first > 0);
+        assert_eq!(seed_mcp_defaults(&mut store).unwrap(), 0, "insert-only");
+    }
+
     fn unit(posture: WritePosture, role: PhaseRole, seat: &str, mode: McpMode) -> McpUnit {
         McpUnit {
             run_id: "mcp-test".to_string(),
