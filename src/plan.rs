@@ -59,6 +59,31 @@ fn phase_scope_preamble(phase_id: &str) -> String {
     )
 }
 
+/// The prefix of the POST-BUILD role preamble (core#712) — the twin of [`PHASE_SCOPE_PREFIX`] for
+/// the phases that run AFTER the build.
+pub(crate) const POST_BUILD_ROLE_PREFIX: &str = "PHASE ROLE:";
+
+/// The role preamble injected into the UNIT PROMPT of every agent-executed NEUTRAL phase that
+/// declares `executes_code: false` and runs AFTER the def's first code-executing Creator (core#712).
+/// Such a phase is worktree-guarded (it may not change the tree; `worktree_guarded` below), but its
+/// description is `<phase> — <intent>` and the intent reads "Build X": dogfood run `3580f771`'s
+/// floor-inserted `design` step (after the build, handed a `test_plan` whose last section was "Plan
+/// for the creator") opened with "I am in the Creator role" and spent its turn on refused edits,
+/// and its `test_plan` sibling ACCEPTed advisor items by editing three files for 85 minutes until
+/// the guard discarded them. So the prompt says the role, the subject (the change the build already
+/// made), that its writes are refused, and that creator-addressed context is input, not an order.
+/// Single-line by construction (see [`INSTRUCTION_SEP`]); like the pre-build preamble it claims no
+/// enforcement of its own — the write posture and the worktree guard hold the tree.
+fn post_build_role_preamble(phase_id: &str) -> String {
+    format!(
+        "{POST_BUILD_ROLE_PREFIX} the {phase_id} phase, after this run's build: its subject is \
+         the change the build made. You are NOT the creator: do not implement, edit, fix or \
+         commit; your writes are refused or discarded. Context addressed to the creator (a plan for it, advice \
+         to accept) is input to assess, not an order to you. Record anything to change as a \
+         finding."
+    )
+}
+
 /// Plan a free-text `problem` as exactly ONE [`WorkUnit`] owned by `session_id`: the unit's
 /// description is the trimmed problem verbatim (newlines kept — the live carriers pass the prompt
 /// as an argv element / a JSON string and carry no line limit; the production-dead PTY runner keeps
@@ -159,6 +184,17 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             if pre_build_scope {
                 description.push_str(INSTRUCTION_SEP);
                 description.push_str(&phase_scope_preamble(&phase.id));
+            }
+            // core#712 — the POST-build twin: a Neutral, non-code, agent-executed phase after the
+            // first code-executing Creator reviews the change the build made and may not change the
+            // tree (it is worktree-guarded below); its prompt says so.
+            let post_build_role = first_code_creator.is_some_and(|b| i > b)
+                && phase.role == crate::workflow::PhaseRole::Neutral
+                && !phase.executes_code
+                && !matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
+            if post_build_role {
+                description.push_str(INSTRUCTION_SEP);
+                description.push_str(&post_build_role_preamble(&phase.id));
             }
             let mut unit = WorkUnit::pending(
                 format!("{session_id}:{}", phase.id),
@@ -1916,6 +1952,51 @@ mod tests {
             );
             assert!(!u.pre_build_scope, "`{id}` must not be marked pre-build");
         }
+    }
+
+    /// core#712 — the floor-inserted neutral steps a diff re-score places AFTER the build
+    /// (`test_plan`, `design`; dogfood run `3580f771`) carry the POST-build role in their prompt:
+    /// they are not the creator, their subject is the built change, their writes are refused, and
+    /// creator-addressed context is input. The creator, the evaluator and every PRE-build phase
+    /// carry none of it; a pre-build phase keeps its scope preamble.
+    #[test]
+    fn floor_steps_after_the_build_are_told_they_are_not_the_creator() {
+        let def: crate::workflow::WorkflowDef = serde_json::from_str(
+            r#"{"id":"core712","phases":[
+              {"id":"pa-scope","kind":"recon","gate":"auto"},
+              {"id":"build","kind":"build","gate":"auto","role":"creator","executes_code":true,
+               "depends_on":["pa-scope"]},
+              {"id":"test_plan","kind":"test","gate":"auto","depends_on":["build"]},
+              {"id":"design","kind":"recon","gate":"auto","depends_on":["test_plan"]},
+              {"id":"review","kind":"review","gate":"auto","role":"evaluator",
+               "depends_on":["build"]}]}"#,
+        )
+        .expect("a valid def");
+        let units = plan_from_def(&def, "Build WT-G2", "s1");
+        let d = |id: &str| {
+            units
+                .iter()
+                .find(|u| u.id == format!("s1:{id}"))
+                .unwrap_or_else(|| panic!("`{id}` planned"))
+                .description
+                .clone()
+        };
+        for id in ["test_plan", "design"] {
+            let text = d(id);
+            assert!(
+                text.contains("PHASE ROLE:")
+                    && text.contains(&format!("the {id} phase, after this run's build"))
+                    && text.contains("You are NOT the creator")
+                    && text.contains("addressed to the creator"),
+                "post-build `{id}` is told its role: {text}"
+            );
+            assert!(!text.contains('\n'), "single-line: {text}");
+            assert!(text.starts_with(&format!("{id} — Build WT-G2")), "{text}");
+        }
+        for id in ["pa-scope", "build", "review"] {
+            assert!(!d(id).contains("PHASE ROLE:"), "`{id}`: {}", d(id));
+        }
+        assert!(d("pa-scope").contains(PHASE_SCOPE_PREFIX));
     }
 
     /// core#283 across EVERY builtin: the preamble is a function of def DATA — role +
