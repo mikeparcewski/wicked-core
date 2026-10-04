@@ -1279,6 +1279,34 @@ fn rules_ingest_cmd(args: &[String]) {
     let root = std::path::Path::new(&dir);
     let mut n_policies = 0usize;
     let mut n_rules = 0usize;
+    // (core#709) The rule ids the BOOT SEED owns (the `mcp-defaults` / `editor-defaults` packs'
+    // ledgers and posture rules). The seed is insert-only for them, so the stored copy carries the
+    // operator's state — approved tokens in a ledger's `excludes`, a retired posture row — and a
+    // re-ingest of the pack must not reset it: an id the seed owns that is ALREADY in the store is
+    // kept as it is, never re-registered. A seed-owned id the store lacks is registered as usual.
+    let seeded = match wicked_core::boot_seeded_rule_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            fail(&format!(
+                "rules ingest: reading the boot-seeded rule ids failed: {e}"
+            ));
+            return;
+        }
+    };
+    let mut kept_by_seed: Vec<String> = Vec::new();
+    let mut seed_owned_and_stored = |store: &dyn wicked_apps_core::GraphRead,
+                                     id: &str|
+     -> anyhow::Result<bool> {
+        if !seeded.contains(id) {
+            return Ok(false);
+        }
+        let symbol = wicked_apps_core::synthetic_symbol(wicked_governance::CONFORMANCE_RULE, id);
+        let stored = store.get_node(&symbol)?.is_some();
+        if stored {
+            kept_by_seed.push(id.to_string());
+        }
+        Ok(stored)
+    };
     // Rule ids seen across BOTH conformance lanes (JSON bundles + markdown docs). ingest_from
     // enforces INV-C3 within each adapter; this set extends it across the two, because a
     // cross-lane duplicate would silently overwrite at register (same `conformance_rule/<id>`).
@@ -1292,6 +1320,17 @@ fn rules_ingest_cmd(args: &[String]) {
             Ok(rules) => {
                 for r in &rules {
                     seen_rule_ids.insert(r.id.clone());
+                    match seed_owned_and_stored(&store, &r.id) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            fail(&format!(
+                                "rules ingest: reading the stored rule {} failed: {e}",
+                                r.id
+                            ));
+                            return;
+                        }
+                    }
                     if let Err(e) = wicked_governance::register_rule(&mut store, r) {
                         fail(&format!(
                             "rules ingest: register conformance rule {} failed: {e}",
@@ -1327,6 +1366,17 @@ fn rules_ingest_cmd(args: &[String]) {
                             r.provenance.reference.as_deref().unwrap_or("?")
                         ));
                         return;
+                    }
+                    match seed_owned_and_stored(&store, &r.id) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            fail(&format!(
+                                "rules ingest: reading the stored rule {} failed: {e}",
+                                r.id
+                            ));
+                            return;
+                        }
                     }
                     if let Err(e) = wicked_governance::register_rule(&mut store, r) {
                         fail(&format!(
@@ -1432,7 +1482,15 @@ fn rules_ingest_cmd(args: &[String]) {
         }
     }
 
-    if n_policies == 0 && n_rules == 0 {
+    if !kept_by_seed.is_empty() {
+        println!(
+            "rules ingest: kept {} boot-seeded rule(s) as stored (approvals and retirements \
+             survive a re-ingest): {}",
+            kept_by_seed.len(),
+            kept_by_seed.join(", ")
+        );
+    }
+    if n_policies == 0 && n_rules == 0 && kept_by_seed.is_empty() {
         fail(&format!(
             "rules ingest: NO policies or conformance rules found under {dir} (expected \
              <dir>/policies/*.json, <dir>/rules/*.json, and/or frontmattered markdown rule docs \

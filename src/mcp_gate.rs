@@ -1131,9 +1131,9 @@ pub(crate) fn mcp_default_rules() -> anyhow::Result<Vec<wicked_governance::Confo
 /// approval, or retired by the operator) is left exactly as it is, so a restart never undoes an
 /// approval or resurrects a retired rule. Returns how many rules were inserted.
 ///
-/// Written straight to the store in one batch, NOT through `register_rule`: that path also emits
-/// `wicked.estate.rule.ingested` on the bus, synchronously, and this runs on the actor's boot path,
-/// which must never wait on a busy or locked bus (`tests/bus_handoff.rs`).
+/// Written straight to the store (one autocommit upsert), NOT through `register_rule`: that path
+/// also emits `wicked.estate.rule.ingested` on the bus, synchronously, and this runs on the actor's
+/// boot path, which must never wait on a busy or locked bus (`tests/bus_handoff.rs`).
 pub(crate) fn seed_mcp_defaults(
     store: &mut dyn wicked_apps_core::GraphStore,
 ) -> anyhow::Result<usize> {
@@ -1155,9 +1155,11 @@ pub(crate) fn seed_mcp_defaults(
     if nodes.is_empty() {
         return Ok(0);
     }
-    store.begin_batch()?;
+    // Autocommit, not an explicit batch (core#705, the twin of `seed_editor_defaults`): the store
+    // has no rollback, so a failed `upsert_nodes` inside a batch would leave a transaction open on
+    // the actor's boot path for a later write to commit or trip over. A partial seed still fails
+    // CLOSED — `require_defaults` checks every posture rule — and the next boot inserts the rest.
     store.upsert_nodes(&nodes)?;
-    store.commit_batch()?;
     Ok(nodes.len())
 }
 
