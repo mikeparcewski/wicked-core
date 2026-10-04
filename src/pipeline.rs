@@ -1410,6 +1410,38 @@ pub(crate) fn apply_and_finish_unit(
             });
         }
     }
+    // (core#716) A blocked filesystem-boundary WRITE the fold did NOT deny on, because the unit's
+    // floor passed (`fold_input_denial_after_floor`): disclosed here with the tool named, exactly
+    // as an advisory refusal is — never silently dropped. Read off the same log the fold read, for
+    // every unit the fold discounted one on (governed by its runner or not, as the fold is).
+    if floor_passed {
+        for rec in crate::gate_hook::collect_hook_decisions(
+            session_id,
+            attempt,
+            &crate::scope::unit_phase(unit.ord),
+        ) {
+            if let Some((reason, command)) = rec.boundary_write_refusal() {
+                emit(CoreEvent::WorkerToolCallDenied {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    cli: unit
+                        .assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string()),
+                    carrier: rec
+                        .carrier
+                        .clone()
+                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                    role: crate::write_posture::role_wire(unit.role).to_string(),
+                    tool: rec.tool_name.clone(),
+                    command,
+                    reason,
+                    remedy: crate::gate_hook::BOUNDARY_WRITE_AFTER_FLOOR_NOTE.to_string(),
+                });
+            }
+        }
+    }
     if governed {
         let phase = crate::scope::unit_phase(unit.ord);
         for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
@@ -1503,31 +1535,6 @@ pub(crate) fn apply_and_finish_unit(
             // and, for the `Bash` arm, the command (the record carries both; `(unknown)` never),
             // so the wrapped carrier's Bash denies surface as `workerToolCallDenied` exactly as
             // the ACP bridge's do — not on `governanceHookFired{deny}` alone.
-            // (core#716) A blocked filesystem-boundary WRITE on a unit whose floor passed: the
-            // fold did not deny on it (`fold_input_denial_after_floor`), so it is disclosed here,
-            // with the tool named, exactly as an advisory refusal is — never silently dropped.
-            if floor_passed {
-                if let Some((reason, command)) = rec.boundary_write_refusal() {
-                    emit(CoreEvent::WorkerToolCallDenied {
-                        session: session_id.to_string(),
-                        ord: unit.ord,
-                        attempt,
-                        cli: unit
-                            .assigned_cli
-                            .clone()
-                            .unwrap_or_else(|| "claude".to_string()),
-                        carrier: rec
-                            .carrier
-                            .clone()
-                            .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
-                        role: crate::write_posture::role_wire(unit.role).to_string(),
-                        tool: rec.tool_name.clone(),
-                        command,
-                        reason,
-                        remedy: crate::gate_hook::BOUNDARY_WRITE_AFTER_FLOOR_NOTE.to_string(),
-                    });
-                }
-            }
             if let Some((reason, command)) = rec.phase_scope_refusal() {
                 emit(CoreEvent::WorkerToolCallDenied {
                     session: session_id.to_string(),
