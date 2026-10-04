@@ -176,6 +176,42 @@ mod tests {
         }
     }
 
+    /// core#699 — a schema never documents a contract version newer than the one it declares: every
+    /// `v<x.y.z>` a schema's own text cites (a field's "v1.2.0 (DC-S1): …" note) is at most its
+    /// `$id` segment. DC-S1 added `targets.project` / `supersedes` to conformance-rules as "v1.2.0"
+    /// while the `$id`, title and accepted `metadata.schema_version`s stayed at 1.1.0, so a 1.2.0
+    /// document had no version to carry.
+    #[test]
+    fn no_schema_documents_a_version_newer_than_its_id() {
+        let key = |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+        for (name, raw) in SCHEMA_BUNDLE {
+            let id_ver = id_version(name, &parsed(name, raw));
+            let bytes = raw.as_bytes();
+            let mut cited: Vec<String> = Vec::new();
+            for (i, _) in raw.match_indices('v') {
+                // `v` + digits.digits.digits, not inside a word (`prev1.2.3` is not a citation).
+                if i > 0 && bytes[i - 1].is_ascii_alphanumeric() {
+                    continue;
+                }
+                let tail: String = raw[i + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                let tail = tail.trim_end_matches('.');
+                if tail.split('.').count() == 3 && tail.split('.').all(|p| !p.is_empty()) {
+                    cited.push(tail.to_string());
+                }
+            }
+            for v in cited {
+                assert!(
+                    key(&v) <= key(&id_ver),
+                    "{name} documents v{v} but its $id declares {id_ver} — bump the $id, title, \
+                     accepted metadata.schema_version and the bundle VERSION together"
+                );
+            }
+        }
+    }
+
     /// The crate's fail-closed INV-C4 vocabulary is now VALIDATED against the schema it claims to
     /// mirror: `VALID_SOURCE_KINDS` == the shared `$defs/provenance.source_kinds` enum in BOTH the
     /// conformance-rules and domain-model schemas. This is what "live owner" means — the enforcing
