@@ -1179,7 +1179,17 @@ mod tests {
         let start = src
             .find(concat!("pub(crate) fn ", "seed_mcp_defaults("))
             .expect("the seed is in this file");
-        let body = &src[start..start + src[start..].find("\n}\n").expect("the seed's body ends")];
+        // Up to the fn's closing brace at column 0 — line-based, so a CRLF checkout (Windows
+        // `core.autocrlf`) reads the same.
+        let body: String = src[start..]
+            .lines()
+            .take_while(|l| l.trim_end() != "}")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("upsert_nodes("),
+            "the seed's body was read: {body}"
+        );
         for needle in [concat!("begin_", "batch("), concat!("commit_", "batch(")] {
             assert!(!body.contains(needle), "seed_mcp_defaults calls `{needle}`");
         }
