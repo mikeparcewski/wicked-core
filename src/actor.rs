@@ -6673,11 +6673,15 @@ fn denial_gate_prompt(
                      floor said.",
                 )
             };
+            let lead = if refused_call {
+                format!("a tool call was refused{tool}")
+            } else {
+                "its governance evidence failed".to_string()
+            };
             format!(
-                "Unit {ord} was DENIED by input governance — a tool call was refused{tool}: {}. \
-                 {what} {why} Approve RE-RUNS the `{phase}` phase from the start under the same \
-                 policies (a retry; the captured output is not accepted), or reject to cancel the \
-                 run{note}",
+                "Unit {ord} was DENIED by input governance — {lead}: {}. {what} {why} Approve \
+                 RE-RUNS the `{phase}` phase from the start under the same policies (a retry; \
+                 the captured output is not accepted), or reject to cancel the run{note}",
                 reason_head(reason)
             )
         }
