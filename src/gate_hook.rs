@@ -6946,7 +6946,7 @@ mod tests {
             "wf/unit-2",
             "unit-2",
             "Bash",
-            "path outside this unit's boundary: /home/op/.wicked-vault/config.json (write)",
+            "path outside this unit's boundary: /srv/elsewhere/.wicked-vault/config.json (write)",
             true,
         );
         let fold = |store: &mut dyn GraphStore, attempt: u32, floor_passed: bool| {
