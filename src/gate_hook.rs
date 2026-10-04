@@ -3490,7 +3490,7 @@ const BOUNDARY_EVALUATOR: &str = "wicked-governance-boundary";
 /// [`BOUNDARY_READ_DENY_PREFIX`] and [`PHASE_SCOPE_DENY_PREFIX`], so a claim carrying this prefix —
 /// or any other deny the fold/drain ever sees — is treated as fatal. `append_boundary_deny` reaches
 /// here whenever `is_write` is set; there is no third writer-side category.
-const BOUNDARY_WRITE_DENY_PREFIX: &str = "boundary-deny:";
+pub(crate) const BOUNDARY_WRITE_DENY_PREFIX: &str = "boundary-deny:";
 /// Claim-id prefix for an ADVISORY boundary deny: a READ outside the sandbox. The tool-call is STILL
 /// blocked (the worker never reads the file), but a blocked read leaks nothing and the worker adapts,
 /// so it is recorded for audit and does NOT fail the unit (P8 #10 / core#219). Whether the blocked

@@ -6640,15 +6640,44 @@ fn denial_gate_prompt(
                 .map(|t| format!(" (`{t}`)"))
                 .unwrap_or_default();
             // (core#716) Say what Approve DOES — it re-runs the phase, it does not accept the
-            // captured output — and why this refusal denied when a refused READ does not.
+            // captured output — and why THIS refusal denied when a refused read does not.
             let phase = unit.phase_id().unwrap_or("this");
+            let blocked_write = unit.denial.as_ref().is_some_and(|d| {
+                d.claim_id
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(crate::gate_hook::BOUNDARY_WRITE_DENY_PREFIX))
+                    && d.rule_ids
+                        .iter()
+                        .any(|r| r == crate::gate_hook::BOUNDARY_WRITE_RULE_ID)
+            });
+            // A recorded refusal carries its claim; the fail-closed evidence arms (no log, a
+            // tampered log, a write-root that changed) carry none and are not "a call that never
+            // ran".
+            let refused_call = unit.denial.as_ref().is_some_and(|d| d.claim_id.is_some());
+            let (what, why) = if blocked_write {
+                (
+                    "The refused call never ran; the phase's output was captured.",
+                    "A refused write outside the unit's boundary denies a unit whose deterministic \
+                     floor did not pass or did not run, as here (a refused read is only disclosed).",
+                )
+            } else if refused_call {
+                (
+                    "The refused call never ran; the phase's output was captured.",
+                    "This refusal denies the unit whatever its floor said (only a refused read, or \
+                     a refused boundary write on a unit whose floor passed, is disclosed instead).",
+                )
+            } else {
+                (
+                    "The phase's output was captured.",
+                    "The unit's governance evidence did not hold, which denies it whatever its \
+                     floor said.",
+                )
+            };
             format!(
                 "Unit {ord} was DENIED by input governance — a tool call was refused{tool}: {}. \
-                 The refused call never ran. A refused read is only disclosed; a refused write \
-                 (or a policy deny) denies the unit unless its deterministic floor passed, and \
-                 this unit's did not pass or did not run. Approve RE-RUNS the `{phase}` phase \
-                 from the start under the same policies (a retry; the captured output is not \
-                 accepted), or reject to cancel the run{note}",
+                 {what} {why} Approve RE-RUNS the `{phase}` phase from the start under the same \
+                 policies (a retry; the captured output is not accepted), or reject to cancel the \
+                 run{note}",
                 reason_head(reason)
             )
         }
