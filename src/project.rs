@@ -726,6 +726,44 @@ mod tests {
             .is_empty());
     }
 
+    /// core#698 — a malformed membership node of THIS run fails the read (never a silently
+    /// omitted project: its rules would drop off the unit's claim), while a malformed node of
+    /// ANOTHER run is not this run's problem.
+    #[test]
+    fn a_malformed_own_membership_fails_the_read_and_anothers_does_not() {
+        let mut store = mem_store();
+        let p = create_project(&mut store, "p", None, 1).unwrap();
+        for run in ["run-a", "run-b"] {
+            attach_member(
+                &mut store,
+                MemberSpec {
+                    project_id: p.id.clone(),
+                    member_kind: MEMBER_KIND_RUN.into(),
+                    member_ref: run.into(),
+                    meta: None,
+                    attached_by: "api".into(),
+                },
+                2,
+            )
+            .unwrap();
+        }
+        // Corrupt run-b's membership: its project id is no longer a string.
+        let sym = synthetic_symbol(PROJECT_MEMBER, &member_id(&p.id, MEMBER_KIND_RUN, "run-b"));
+        let mut node = store.get_node(&sym).unwrap().expect("run-b's membership");
+        node.metadata
+            .insert("project_id".into(), serde_json::json!(42));
+        put_node(&mut store, node).unwrap();
+
+        assert_eq!(
+            member_projects(&store, MEMBER_KIND_RUN, "run-a").unwrap(),
+            vec![p.id.clone()],
+            "another run's malformed membership does not reach this run"
+        );
+        let err = member_projects(&store, MEMBER_KIND_RUN, "run-b")
+            .expect_err("a malformed own membership fails closed, not as no project");
+        assert!(err.to_string().contains("unreadable"), "{err:#}");
+    }
+
     #[test]
     fn ids_are_time_sortable_and_list_is_newest_first() {
         let a = mint_project_id(1_000);
