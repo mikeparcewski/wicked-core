@@ -1351,13 +1351,28 @@ pub(crate) fn apply_and_finish_unit(
     // unit properties — so a claude-assigned STUB/test unit (which never armed) is never false-denied for
     // a missing log. It gates evidence-integrity fail-closure: a governed unit whose armed marker is
     // missing (erased/never-fired) DENIES; an ungoverned unit's fold is inert.
-    let hook_denial = crate::gate_hook::fold_input_denial_with_activity(
+    // (core#716) Whether the unit's DETERMINISTIC floor ran AND passed on this attempt: its pinned
+    // validator passed, or the repository's checks RAN (at least one check — a report with no
+    // detected check is no floor) and passed, fresh or carried forward on this very tree. With
+    // it, a blocked filesystem-boundary write (a call refused before it ran) is disclosed, not a
+    // denial: the floor re-derived the work from the tree, and the write-root witness still denies
+    // a write that escaped. No floor, a vacuous one, or a failing one keeps the blocked write
+    // unit-fatal.
+    let checks_passed_for_fold = evidence
+        .repo_checks
+        .as_ref()
+        .or(carried.as_ref())
+        .is_some_and(|r| r.passed && !r.checks.is_empty());
+    let floor_passed =
+        deterministic_pass && !guard_denied && (unit.validator.is_some() || checks_passed_for_fold);
+    let hook_denial = crate::gate_hook::fold_input_denial_after_floor(
         store,
         session_id,
         attempt,
         &crate::scope::unit_phase(unit.ord),
         governed,
         tool_activity,
+        floor_passed,
     )?;
     // Capture whether the hook denied NOW, before `hook_denial` is moved into the deny-dominance
     // fold below and its source identity is lost in `validator_denial`. The actor uses this flag to
@@ -1393,6 +1408,38 @@ pub(crate) fn apply_and_finish_unit(
                 reason,
                 remedy,
             });
+        }
+    }
+    // (core#716) A blocked filesystem-boundary WRITE the fold did NOT deny on, because the unit's
+    // floor passed (`fold_input_denial_after_floor`): disclosed here with the tool named, exactly
+    // as an advisory refusal is — never silently dropped. Read off the same log the fold read, for
+    // every unit the fold discounted one on (governed by its runner or not, as the fold is).
+    if floor_passed {
+        for rec in crate::gate_hook::collect_hook_decisions(
+            session_id,
+            attempt,
+            &crate::scope::unit_phase(unit.ord),
+        ) {
+            if let Some((reason, command)) = rec.boundary_write_refusal() {
+                emit(CoreEvent::WorkerToolCallDenied {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    cli: unit
+                        .assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string()),
+                    carrier: rec
+                        .carrier
+                        .clone()
+                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                    role: crate::write_posture::role_wire(unit.role).to_string(),
+                    tool: rec.tool_name.clone(),
+                    command,
+                    reason,
+                    remedy: crate::gate_hook::BOUNDARY_WRITE_AFTER_FLOOR_NOTE.to_string(),
+                });
+            }
         }
     }
     if governed {
