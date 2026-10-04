@@ -3905,6 +3905,26 @@ pub(crate) fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
             && claim.claim_id.starts_with(MCP_DENY_PREFIX))
 }
 
+/// (core#716) The `workerToolCallDenied.remedy` of a blocked boundary write the fold disclosed
+/// instead of denying: what happened, and why the unit was not denied for it.
+pub(crate) const BOUNDARY_WRITE_AFTER_FLOOR_NOTE: &str =
+    "the write outside the unit's boundary was refused and never ran; the unit's deterministic \
+     floor passed on the tree it left, so the refusal is disclosed, not a denial (core#716)";
+
+/// (core#716) Whether a Deny claim is a BLOCKED filesystem-boundary WRITE — the call was refused
+/// before it ran (the carrier never executed it), recorded by [`append_boundary_deny`] under
+/// [`BOUNDARY_WRITE_RULE_ID`]. Keyed on the evaluator identity, the claim-id prefix AND the rule id,
+/// so an estate-fence deny (its own rule id), a policy deny, an infra deny or a fail-closed evidence
+/// deny never matches. Such a claim stays unit-fatal by default ([`is_advisory_deny`] excludes it);
+/// [`fold_input_denial_after_floor`] alone discloses it instead of denying, and only when the
+/// unit's deterministic floor ran and passed on the attempt it was refused in.
+pub(crate) fn is_blocked_boundary_write(claim: &ConformanceClaim) -> bool {
+    claim.decision == Decision::Deny
+        && claim.evaluator_identity == BOUNDARY_EVALUATOR
+        && claim.claim_id.starts_with(BOUNDARY_WRITE_DENY_PREFIX)
+        && claim.policy_ids.iter().any(|p| p == BOUNDARY_WRITE_RULE_ID)
+}
+
 /// If `v` is an armed-marker object, the phase it marks; else `None`. Checks the ROOT key
 /// (`v.get(ARMED_MARKER_KEY)`), NOT a substring — a substring match would let a crafted claim whose
 /// `criteria`/`obligations` merely CONTAIN the marker string be silently skipped by the fold, bypassing
@@ -4010,6 +4030,24 @@ impl HookDecisionRecord {
             self.obligations[0].clone(),
             self.obligations[1].clone(),
             self.obligations[2].clone(),
+        ))
+    }
+
+    /// (core#716) Whether this record is a blocked filesystem-boundary WRITE — `(reason, command)`
+    /// when it is (`command` empty: the boundary recorder files the reason only). The unit gate
+    /// discloses it as `workerToolCallDenied` when the unit's floor passed and the fold therefore
+    /// did not deny on it ([`fold_input_denial_after_floor`]).
+    pub fn boundary_write_refusal(&self) -> Option<(String, String)> {
+        if self.decision != "deny"
+            || self.evaluator != BOUNDARY_EVALUATOR
+            || !self.claim_id.starts_with(BOUNDARY_WRITE_DENY_PREFIX)
+            || self.denying_policy.as_deref() != Some(BOUNDARY_WRITE_RULE_ID)
+        {
+            return None;
+        }
+        Some((
+            self.obligations.first().cloned().unwrap_or_default(),
+            self.obligations.get(1).cloned().unwrap_or_default(),
         ))
     }
 
@@ -4176,6 +4214,36 @@ pub fn fold_input_denial_with_activity(
     governed: bool,
     tool_activity: bool,
 ) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
+    fold_input_denial_after_floor(
+        store,
+        run_id,
+        attempt,
+        phase,
+        governed,
+        tool_activity,
+        false,
+    )
+}
+
+/// [`fold_input_denial_with_activity`] told whether the unit's DETERMINISTIC FLOOR ran and passed on
+/// this attempt (core#716). When it did, a [`is_blocked_boundary_write`] claim does not deny the
+/// unit: the refused call never ran, the post-hoc write-root witness below still denies any write
+/// that DID escape, and the floor re-derived the work from the tree itself — so the blocked call
+/// changed nothing the gate judges. Dogfood run `3580f771` lost a full creator retry this way: the
+/// build floor passed (`npm ci`, the repo's pytest runner) and one exploratory `Bash` probe of a
+/// path outside the worktree, refused, denied the unit. The claim is still conformed (audit) and the
+/// unit gate discloses it as `workerToolCallDenied`. Every other deny keeps its weight, and with no
+/// floor (or a failing one) a blocked write denies exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_input_denial_after_floor(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    attempt: u32,
+    phase: &str,
+    governed: bool,
+    tool_activity: bool,
+    floor_passed: bool,
+) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
     // Every denial this fold produces is an input-governance deny for `phase`.
     let fail_closed = |reason: String| {
         let mut d = crate::domain::UnitDenial::new("input_governance", reason);
@@ -4279,7 +4347,12 @@ pub fn fold_input_denial_with_activity(
         // was blocked, nothing landed or leaked, and the worker adapts. Whether the blocked call
         // MATTERED is judged by the unit's OUTPUT gate and its required deliverables, not by this
         // containment event.
-        if denial.is_none() && claim.decision == Decision::Deny && !is_advisory_deny(&claim) {
+        let disclosed_after_floor = floor_passed && is_blocked_boundary_write(&claim);
+        if denial.is_none()
+            && claim.decision == Decision::Deny
+            && !is_advisory_deny(&claim)
+            && !disclosed_after_floor
+        {
             denial = Some(crate::domain::UnitDenial {
                 source: "input_governance".to_string(),
                 reason: format!(
@@ -6851,6 +6924,87 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a Deny whose criteria contains the marker string is NOT skipped (no substring bypass)"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// core#716 — a blocked filesystem-boundary WRITE on a unit whose deterministic floor PASSED is
+    /// disclosed, not a denial (dogfood run `3580f771`: the build floor passed and one refused
+    /// exploratory `Bash` probe outside the worktree denied the unit). Without a passing floor the
+    /// same claim still denies; an estate-fence deny under the same `boundary-deny:` prefix, a
+    /// policy deny and the fail-closed evidence arms are never discounted by a floor.
+    #[test]
+    fn a_blocked_boundary_write_does_not_deny_a_unit_whose_floor_passed() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("core716-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p0 = decisions_path_for(&run_id, 0);
+        write_armed_marker(&p0, "unit-2").unwrap();
+        write_hook_fired(&p0, "unit-2");
+        append_boundary_deny(
+            p0.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            "path outside this unit's boundary: /home/op/.wicked-vault/config.json (write)",
+            true,
+        );
+        let fold = |store: &mut dyn GraphStore, attempt: u32, floor_passed: bool| {
+            fold_input_denial_after_floor(
+                store,
+                &run_id,
+                attempt,
+                "unit-2",
+                true,
+                true,
+                floor_passed,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            fold(&mut store, 0, true),
+            None,
+            "a refused write that never ran does not deny a unit whose floor passed"
+        );
+        let d = fold(&mut store, 0, false).expect("no passing floor: the blocked write denies");
+        assert_eq!(d.claim_id.as_deref(), Some("boundary-deny:unit-2"));
+        // The record the unit gate discloses it from names the reason.
+        let recs = collect_hook_decisions(&run_id, 0, "unit-2");
+        assert!(
+            recs.iter().any(|r| r
+                .boundary_write_refusal()
+                .is_some_and(|(why, _)| why.contains("(write)"))),
+            "{recs:?}"
+        );
+
+        // A POLICY deny beside it still denies with the floor passed.
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker(&p1, "unit-2").unwrap();
+        write_hook_fired(&p1, "unit-2");
+        let mut policy = allow_claim("ev-policy", "unit-2");
+        policy.decision = Decision::Deny;
+        append_decision(&p1, &policy).unwrap();
+        assert!(
+            fold(&mut store, 1, true).is_some(),
+            "a policy deny is never discounted by a floor"
+        );
+
+        // An estate-fence FATAL deny rides `boundary-deny:` too, under its own rule id: not discounted.
+        let p2 = decisions_path_for(&run_id, 2);
+        write_armed_marker(&p2, "unit-2").unwrap();
+        write_hook_fired(&p2, "unit-2");
+        append_estate_deny(
+            p2.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            &format!("{ESTATE_DENY_REASON_PREFIX} write-path estate command"),
+            "wicked-estate index",
+            true,
+        );
+        assert!(
+            fold(&mut store, 2, true).is_some(),
+            "an estate-fence write deny is never discounted by a floor"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }

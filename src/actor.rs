@@ -6639,10 +6639,16 @@ fn denial_gate_prompt(
                 .and_then(|d| d.denied_tool.as_deref())
                 .map(|t| format!(" (`{t}`)"))
                 .unwrap_or_default();
+            // (core#716) Say what Approve DOES — it re-runs the phase, it does not accept the
+            // captured output — and why this refusal denied when a refused READ does not.
+            let phase = unit.phase_id().unwrap_or("this");
             format!(
                 "Unit {ord} was DENIED by input governance — a tool call was refused{tool}: {}. \
-                 The phase's output was captured. Approve to retry the phase under the same \
-                 policies, or reject to cancel the run{note}",
+                 The refused call never ran. A refused read is only disclosed; a refused write \
+                 (or a policy deny) denies the unit unless its deterministic floor passed, and \
+                 this unit's did not pass or did not run. Approve RE-RUNS the `{phase}` phase \
+                 from the start under the same policies (a retry; the captured output is not \
+                 accepted), or reject to cancel the run{note}",
                 reason_head(reason)
             )
         }
