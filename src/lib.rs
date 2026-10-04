@@ -51,6 +51,20 @@ pub use editor_gate::{
     EditorGrant, EditorGrantError, EditorGrantRequest, EditorGrants, EDITOR_PERMISSIONS,
 };
 pub use mcp_gate::evaluate_mcp_output_json;
+
+/// (core#709) The conformance-rule ids the BOOT SEED owns — the `mcp-defaults` and
+/// `editor-defaults` packs' JSON rules (their approvals ledgers `MCP-FIRST-USE` / `EDITOR-GRANTS`
+/// and their posture rules). The boot seed is insert-only for these ids, so the store's copy
+/// carries the operator's state (approved tokens in a ledger's `excludes`, a retired posture row);
+/// `rules ingest` of either pack must honour the same contract instead of re-registering them over
+/// that state.
+pub fn boot_seeded_rule_ids() -> anyhow::Result<std::collections::BTreeSet<String>> {
+    Ok(mcp_gate::mcp_default_rules()?
+        .into_iter()
+        .chain(editor_gate::editor_default_rules()?)
+        .map(|r| r.id)
+        .collect())
+}
 mod mcp_isolation;
 mod memory;
 mod output_throttle;

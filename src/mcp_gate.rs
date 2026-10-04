@@ -1131,9 +1131,9 @@ pub(crate) fn mcp_default_rules() -> anyhow::Result<Vec<wicked_governance::Confo
 /// approval, or retired by the operator) is left exactly as it is, so a restart never undoes an
 /// approval or resurrects a retired rule. Returns how many rules were inserted.
 ///
-/// Written straight to the store in one batch, NOT through `register_rule`: that path also emits
-/// `wicked.estate.rule.ingested` on the bus, synchronously, and this runs on the actor's boot path,
-/// which must never wait on a busy or locked bus (`tests/bus_handoff.rs`).
+/// Written straight to the store (one autocommit upsert), NOT through `register_rule`: that path
+/// also emits `wicked.estate.rule.ingested` on the bus, synchronously, and this runs on the actor's
+/// boot path, which must never wait on a busy or locked bus (`tests/bus_handoff.rs`).
 pub(crate) fn seed_mcp_defaults(
     store: &mut dyn wicked_apps_core::GraphStore,
 ) -> anyhow::Result<usize> {
@@ -1155,9 +1155,11 @@ pub(crate) fn seed_mcp_defaults(
     if nodes.is_empty() {
         return Ok(0);
     }
-    store.begin_batch()?;
+    // Autocommit, not an explicit batch (core#705, the twin of `seed_editor_defaults`): the store
+    // has no rollback, so a failed `upsert_nodes` inside a batch would leave a transaction open on
+    // the actor's boot path for a later write to commit or trip over. A partial seed still fails
+    // CLOSED — `require_defaults` checks every posture rule — and the next boot inserts the rest.
     store.upsert_nodes(&nodes)?;
-    store.commit_batch()?;
     Ok(nodes.len())
 }
 
@@ -1165,6 +1167,38 @@ pub(crate) fn seed_mcp_defaults(
 mod tests {
     use super::*;
     use wicked_apps_core::open_store;
+
+    /// core#705 — the boot seed writes WITHOUT an explicit batch: `GraphStore` has no rollback, so
+    /// a failed write inside `begin_batch`…`commit_batch` would leave a transaction open on the
+    /// actor's boot path. Structural (no store double can fail a real SQLite upsert on demand):
+    /// the seed's own body holds no batch call. The needles are built by concatenation so this
+    /// test's text cannot satisfy the search.
+    #[test]
+    fn the_mcp_seed_writes_without_an_explicit_batch() {
+        let src = include_str!("mcp_gate.rs");
+        let start = src
+            .find(concat!("pub(crate) fn ", "seed_mcp_defaults("))
+            .expect("the seed is in this file");
+        // Up to the fn's closing brace at column 0 — line-based, so a CRLF checkout (Windows
+        // `core.autocrlf`) reads the same.
+        let body: String = src[start..]
+            .lines()
+            .take_while(|l| l.trim_end() != "}")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("upsert_nodes("),
+            "the seed's body was read: {body}"
+        );
+        for needle in [concat!("begin_", "batch("), concat!("commit_", "batch(")] {
+            assert!(!body.contains(needle), "seed_mcp_defaults calls `{needle}`");
+        }
+        // …and still seeds, insert-only.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let first = seed_mcp_defaults(&mut store).unwrap();
+        assert!(first > 0);
+        assert_eq!(seed_mcp_defaults(&mut store).unwrap(), 0, "insert-only");
+    }
 
     fn unit(posture: WritePosture, role: PhaseRole, seat: &str, mode: McpMode) -> McpUnit {
         McpUnit {
