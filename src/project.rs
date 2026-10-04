@@ -472,6 +472,14 @@ pub fn list_members(store: &dyn GraphRead, project_id: &str) -> anyhow::Result<V
 
 /// The project ids holding a LIVE membership for `(member_kind, member_ref)` — the reverse read
 /// the daemon uses to tag a run's frames and scope its memory (many-to-many by design; §9.4).
+///
+/// (core#698) STRICT for this member's own nodes, lenient for everyone else's: a membership node is
+/// attributed to `(member_kind, member_ref)` by those two raw metadata fields, BEFORE it is decoded,
+/// and an attributed node that does not decode is an `Err` — never a silently omitted project. The
+/// read feeds the run's project-rule recall (`execute.rs`, `plan_gate`), so dropping a malformed
+/// own membership was a silent NARROWING on an enforcement path (the project's rules left off the
+/// unit's claim). A node attributed to another member is skipped undecoded, so a decode error on
+/// another run's membership cannot deny this one.
 pub fn member_projects(
     store: &dyn GraphRead,
     member_kind: &str,
@@ -481,15 +489,24 @@ pub fn member_projects(
         kinds: vec![NodeKind::Other(PROJECT_MEMBER.to_string())],
         ..Default::default()
     };
-    let mut ids: Vec<String> = store
-        .find_symbols(&query)?
-        .iter()
-        .filter_map(|n| ProjectMember::from_node(n).ok())
-        .filter(|m| {
-            m.member_kind == member_kind && m.member_ref == member_ref && m.detached_at.is_none()
-        })
-        .map(|m| m.project_id)
-        .collect();
+    let raw_is = |n: &Node, field: &str, want: &str| {
+        n.metadata.get(field).and_then(serde_json::Value::as_str) == Some(want)
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for n in store.find_symbols(&query)?.iter() {
+        if !(raw_is(n, "member_kind", member_kind) && raw_is(n, "member_ref", member_ref)) {
+            continue;
+        }
+        let m = ProjectMember::from_node(n).map_err(|e| {
+            anyhow::anyhow!(
+                "the {member_kind} membership of {member_ref:?} is unreadable ({e}); refusing to \
+                 read its projects as fewer than they are"
+            )
+        })?;
+        if m.detached_at.is_none() {
+            ids.push(m.project_id);
+        }
+    }
     ids.sort();
     ids.dedup();
     Ok(ids)
