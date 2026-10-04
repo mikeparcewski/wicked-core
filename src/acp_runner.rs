@@ -8924,6 +8924,22 @@ mod tests {
         assert!(!is_auth_required_error(&text_only));
     }
 
+    /// core#718 (red half) — claude-agent-acp's `authentication_failed` error kind on an
+    /// `internalError` is an auth refusal.
+    #[test]
+    fn an_authentication_failed_error_kind_is_an_auth_refusal() {
+        let expired = anyhow::Error::new(RpcServerError {
+            code: Some(-32603),
+            raw: "{\"code\":-32603,\"message\":\"Failed to authenticate: OAuth session expired \
+                  and could not be refreshed\",\"data\":{\"errorKind\":\"authentication_failed\"}}"
+                .into(),
+        });
+        assert!(
+            is_auth_required_error(&expired),
+            "an authentication_failed errorKind is an auth refusal"
+        );
+    }
+
     #[test]
     fn transient_cli_failures_are_recognized_and_deterministic_ones_are_not() {
         // The wrapped runner's nonzero-exit + could-not-run messages, and network signatures.
