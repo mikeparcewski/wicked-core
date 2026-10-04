@@ -523,10 +523,17 @@ pub fn member_projects(
                  read its projects as fewer than they are"
             )
         })?;
-        // An id match whose decoded fields name ANOTHER member is that member's node (a hash
-        // collision cannot be ruled out by construction); only this member's rows count.
+        // Attributed by its id, but its fields name ANOTHER member: the node contradicts itself
+        // (a corrupted `member_ref`), so it is unreadable as this member's — never skipped, which
+        // would read the run as unfiled. (Only an id match can get here: a field match agrees.)
         if m.member_kind != member_kind || m.member_ref != member_ref {
-            continue;
+            anyhow::bail!(
+                "the {member_kind} membership of {member_ref:?} is inconsistent (node {} names \
+                 {} {:?}); refusing to read its projects as fewer than they are",
+                n.name,
+                m.member_kind,
+                m.member_ref
+            );
         }
         if m.detached_at.is_none() {
             ids.push(m.project_id);
@@ -834,6 +841,29 @@ mod tests {
             member_projects(&store, MEMBER_KIND_RUN, "run-a").unwrap(),
             vec![p.id.clone()]
         );
+
+        // …nor can rewriting its member_ref to ANOTHER run's (a well-typed corruption): its id
+        // still says it is run-d's, so run-d's read fails closed.
+        attach_member(
+            &mut store,
+            MemberSpec {
+                project_id: p.id.clone(),
+                member_kind: MEMBER_KIND_RUN.into(),
+                member_ref: "run-d".into(),
+                meta: None,
+                attached_by: "api".into(),
+            },
+            4,
+        )
+        .unwrap();
+        let sym = synthetic_symbol(PROJECT_MEMBER, &member_id(&p.id, MEMBER_KIND_RUN, "run-d"));
+        let mut node = store.get_node(&sym).unwrap().expect("run-d's membership");
+        node.metadata
+            .insert("member_ref".into(), serde_json::json!("run-x"));
+        put_node(&mut store, node).unwrap();
+        let err = member_projects(&store, MEMBER_KIND_RUN, "run-d")
+            .expect_err("a membership whose id is run-d's but names run-x fails closed");
+        assert!(err.to_string().contains("inconsistent"), "{err:#}");
     }
 
     #[test]
