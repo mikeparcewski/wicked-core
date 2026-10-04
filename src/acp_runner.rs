@@ -3210,12 +3210,46 @@ fn read_bounded_frame<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result
 /// sent (via [`RpcServerError`]), never by pattern-matching a rendered message.
 const AUTH_REQUIRED_CODE: i64 = -32000;
 
-/// Whether a turn error is the bridge's `-32000 Authentication required` refusal (crew#267) —
-/// matched on the CODE via downcast, never on display text. Pure so the classification is
-/// testable without a live bridge.
+/// Whether a turn error is the bridge's AUTHENTICATION refusal — see [`turn_auth_refusal`].
 fn is_auth_required_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<RpcServerError>()
-        .is_some_and(|se| se.code == Some(AUTH_REQUIRED_CODE))
+    turn_auth_refusal(e).is_some()
+}
+
+/// The SDK's categorical error kind for a turn whose credentials were rejected (claude-agent-acp
+/// sends it as `error.data.errorKind` on an `internalError`).
+const AUTH_FAILED_ERROR_KIND: &str = "authentication_failed";
+
+/// Classify a turn error as an AUTHENTICATION refusal, by protocol facts only — the error frame's
+/// CODE or its structured `data.errorKind`, read off the downcast [`RpcServerError`], never a
+/// rendered message. Pure so the classification is testable without a live bridge.
+///
+/// - `-32000 Authentication required` (crew#267) → [`fallback_kind::AUTH_REQUIRED`];
+/// - (core#718) an `internalError` whose `data.errorKind` is `authentication_failed` →
+///   [`fallback_kind::AUTH_FAILED`]: claude-agent-acp's answer to a turn whose OAuth session expired
+///   and could not be refreshed (dogfood run `3580f771` took this as a session death, fell back to
+///   a wrapped carrier that could not be governed, and parked at a gate claiming every seat would
+///   fail the same way).
+///
+/// `Some((kind, message))` carries the bridge's own `error.message` (empty when it sent none), so
+/// the unit's refusal names the cause in the seat's words.
+fn turn_auth_refusal(e: &anyhow::Error) -> Option<(&'static str, String)> {
+    let se = e.downcast_ref::<RpcServerError>()?;
+    let frame: Option<Value> = serde_json::from_str(&se.raw).ok();
+    let message = frame
+        .as_ref()
+        .and_then(|f| f.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if se.code == Some(AUTH_REQUIRED_CODE) {
+        return Some((fallback_kind::AUTH_REQUIRED, message));
+    }
+    let kind = frame
+        .as_ref()
+        .and_then(|f| f.get("data"))
+        .and_then(|d| d.get("errorKind"))
+        .and_then(Value::as_str);
+    (kind == Some(AUTH_FAILED_ERROR_KIND)).then_some((fallback_kind::AUTH_FAILED, message))
 }
 
 /// A JSON-RPC error frame from the agent, kept structured so a caller can react to the CODE
@@ -8159,13 +8193,16 @@ impl AcpStepRunner {
                 self.drop_session(&run_id);
                 // crew#267: an auth refusal is NOT a session death — name it, so the operator's
                 // fix (restore worker auth) is visible instead of a generic bridge post-mortem.
-                let auth_required = is_auth_required_error(&e);
-                if auth_required {
-                    // (F-7R2-019) The turn was refused with `-32000 Authentication required`:
+                if let Some((auth_kind, bridge_message)) = turn_auth_refusal(&e) {
+                    // (F-7R2-019) The turn was refused as UNAUTHENTICATED — `-32000
+                    // Authentication required`, or (core#718) an `authentication_failed` error
+                    // kind such as an OAuth session that expired and could not be refreshed:
                     // named AUTH, and NO single-shot fallback — the wrapped carrier runs under
                     // the SAME worker home and needs the same sign-in, so it would only burn a
                     // second refusal. The unit fails with the operator's one-time fix in its
-                    // output; the actor benches the seat for the run.
+                    // output; the actor benches the seat for the run and the unit fails over to
+                    // an eligible seat (the cause is this seat's credentials, not the run's
+                    // environment).
                     // core#591: the home THIS seat runs in — an instance signs in its own.
                     let home_hint = wicked_apps_core::spawn::seat_config_for_seat(
                         wicked_apps_core::spawn::SeatCli::Claude,
@@ -8176,26 +8213,32 @@ impl AcpStepRunner {
                     .map_or_else(worker_config_home, Ok)
                     .map(|d| d.display().to_string())
                     .unwrap_or_else(|_| "~/.wicked-worker/claude".to_string());
+                    let login = format!("CLAUDE_CONFIG_DIR=\"{home_hint}\" claude login");
+                    let cause = if bridge_message.trim().is_empty() {
+                        "the turn was refused with -32000 Authentication required".to_string()
+                    } else {
+                        format!("the turn was refused: {}", bridge_message.trim())
+                    };
                     let reason = format!(
                         "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
-                         (crew#267). One-time fix: run `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude \
-                         login` yourself, then every worker stays logged in. NOT falling back to \
-                         the single-shot wrapped carrier — it runs under the SAME worker home, so \
-                         it needs the same sign-in (F-7R2-019)"
+                         (crew#267; {cause}). One-time fix: run `{login}` yourself, then every \
+                         worker stays logged in. NOT falling back to the single-shot wrapped \
+                         carrier — it runs under the SAME worker home, so it needs the same \
+                         sign-in (F-7R2-019)"
                     );
                     eprintln!("{reason}");
                     self.emit_event(CoreEvent::AcpFallback {
                         session: run_id.clone(),
                         cli_key: cli_key.clone(),
                         reason: reason.clone(),
-                        fallback_kind: fallback_kind::AUTH_REQUIRED.to_string(),
+                        fallback_kind: auth_kind.to_string(),
                     });
                     emit(&format!("{reason}\n"));
                     return auth_refusal(
                         input,
                         &cli_key,
-                        fallback_kind::AUTH_REQUIRED,
-                        "the turn was refused with -32000 Authentication required",
+                        auth_kind,
+                        &format!("{cause}; sign it in with `{login}`"),
                     );
                 }
                 let (reason, kind) = {
@@ -8924,8 +8967,13 @@ mod tests {
         assert!(!is_auth_required_error(&text_only));
     }
 
-    /// core#718 (red half) — claude-agent-acp's `authentication_failed` error kind on an
-    /// `internalError` is an auth refusal.
+    /// core#718 — claude-agent-acp answers a turn whose OAuth session expired with an
+    /// `internalError` (-32603) carrying the SDK's categorical `data.errorKind:
+    /// "authentication_failed"` (dogfood run `3580f771`: "Failed to authenticate: OAuth session
+    /// expired and could not be refreshed"). That is a seat-specific AUTH refusal — a protocol
+    /// fact like -32000, not a grep — so it takes the auth path (no single-shot fallback; the
+    /// actor benches the seat and the unit fails over). Every other `errorKind` (a rate limit, a
+    /// server error) stays a session death, and the bridge's message rides the reason.
     #[test]
     fn an_authentication_failed_error_kind_is_an_auth_refusal() {
         let expired = anyhow::Error::new(RpcServerError {
@@ -8938,6 +8986,37 @@ mod tests {
             is_auth_required_error(&expired),
             "an authentication_failed errorKind is an auth refusal"
         );
+        assert_eq!(
+            turn_auth_refusal(&expired),
+            Some((
+                fallback_kind::AUTH_FAILED,
+                "Failed to authenticate: OAuth session expired and could not be refreshed"
+                    .to_string()
+            ))
+        );
+        let required = anyhow::Error::new(RpcServerError {
+            code: Some(AUTH_REQUIRED_CODE),
+            raw: "{\"code\":-32000,\"message\":\"Authentication required\"}".into(),
+        });
+        assert_eq!(
+            turn_auth_refusal(&required).map(|(k, _)| k),
+            Some(fallback_kind::AUTH_REQUIRED)
+        );
+        for other in [
+            "{\"code\":-32603,\"message\":\"slow down\",\"data\":{\"errorKind\":\"rate_limit\"}}",
+            "{\"code\":-32603,\"message\":\"Failed to authenticate MCP server x\"}",
+            "not json at all",
+        ] {
+            let e = anyhow::Error::new(RpcServerError {
+                code: Some(-32603),
+                raw: other.into(),
+            });
+            assert!(!is_auth_required_error(&e), "{other}");
+        }
+        // The kind in plain text without the structured frame is not a protocol fact.
+        assert!(!is_auth_required_error(&anyhow::anyhow!(
+            "{{\"data\":{{\"errorKind\":\"authentication_failed\"}}}}"
+        )));
     }
 
     #[test]

@@ -4926,7 +4926,22 @@ fn next_failover_seat(
     unit_ix: usize,
     roster: &[String],
 ) -> Option<String> {
-    let unit = units.get(unit_ix)?;
+    reassign_candidates(units, unit_ix, roster)
+        .into_iter()
+        .next()
+}
+
+/// (core#718) Every seat of `roster`, in order, that may take unit `unit_ix` over: not one that
+/// already worker-failed it, and not the creator seat of a unit it depends on (evaluator ≠
+/// creator). [`next_failover_seat`] takes the first; a seat-specific failure gate names them all.
+fn reassign_candidates(
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+    roster: &[String],
+) -> Vec<String> {
+    let Some(unit) = units.get(unit_ix) else {
+        return Vec::new();
+    };
     let creator_seats: std::collections::HashSet<String> = units
         .iter()
         .filter(|u| {
@@ -4941,8 +4956,18 @@ fn next_failover_seat(
         .collect();
     roster
         .iter()
-        .find(|c| !unit.worker_failed_clis.contains(c) && !creator_seats.contains(*c))
+        .filter(|c| !unit.worker_failed_clis.contains(c) && !creator_seats.contains(*c))
         .cloned()
+        .collect()
+}
+
+/// (core#718) Whether a failed launch's output is the SEAT's own refusal rather than the run's
+/// environment: today, the wrapped carrier refusing to run a governed claude unit ungoverned
+/// because the host's org settings allow only managed hooks (core#653) — claude's carrier alone
+/// meets that; another seat launches on its own. Read off the engine's own refusal sentence, never
+/// a worker's prose (the launch never started a worker).
+fn seat_specific_launch_failure(output: &str) -> bool {
+    output.contains(crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL)
 }
 
 /// Apply one worker step's output on the single-writer thread: gate the unit, advance the cursor,
@@ -5602,11 +5627,28 @@ fn apply_step_result(
                 // refusal: fence, snapshot, environment, permission). The triage judge already
                 // ruled on attempt 0; the operator decides again here — never `sessionFailed`.
                 let raw_excerpt: String = failure_detail_excerpt(output.output.trim());
-                let why = format!(
-                    "Unit {ord} failed again on attempt {} before its work was judged: \
-                     {raw_excerpt}",
-                    output.attempt + 1
-                );
+                let failed_cli = unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string());
+                // (core#718) A launch failure that is the SEAT's own (its carrier cannot run a
+                // governed unit on this host) is not the environment's: another seat does not
+                // meet it, so the gate names the seat and offers the reassign instead of
+                // withholding it.
+                let seat_specific = seat_specific_launch_failure(&output.output);
+                let why = if seat_specific {
+                    format!(
+                        "Unit {ord} ({failed_cli}) could not start on attempt {}: the cause is \
+                         specific to seat '{failed_cli}' — {raw_excerpt}",
+                        output.attempt + 1
+                    )
+                } else {
+                    format!(
+                        "Unit {ord} failed again on attempt {} before its work was judged: \
+                         {raw_excerpt}",
+                        output.attempt + 1
+                    )
+                };
                 unit.status = crate::domain::UnitStatus::Rejected;
                 unit.denial_reason = Some(why.clone());
                 unit.denial = Some(crate::domain::UnitDenial::new(
@@ -5625,11 +5667,38 @@ fn apply_step_result(
                         failure_kind: crate::event::StepFailureKind::WorkerError,
                     },
                 );
-                let prompt = format!(
-                    "{why}. Fix the cause, then approve to retry (optionally amend), or reject \
-                     to stop the run. Another CLI meets the same environment, so reassigning \
-                     does not fix a launch refusal."
-                );
+                let prompt = if seat_specific {
+                    let others = reassign_candidates(
+                        &units,
+                        output.unit_ix,
+                        &eligible_roster_keys(&session),
+                    )
+                    .into_iter()
+                    .filter(|c| c != &failed_cli)
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>();
+                    let remedy = if others.is_empty() {
+                        "no other eligible seat is configured for this run, so fix the seat"
+                            .to_string()
+                    } else {
+                        format!(
+                            "reassign the unit to {} and approve to retry it there (your \
+                             amendment rides the retry), or fix the seat",
+                            others.join(" or ")
+                        )
+                    };
+                    format!(
+                        "{why}. Another seat runs on its own carrier, so this is not a refusal \
+                         every seat meets: {remedy}, then approve to retry (optionally amend); \
+                         or reject to stop the run."
+                    )
+                } else {
+                    format!(
+                        "{why}. Fix the cause, then approve to retry (optionally amend), or \
+                         reject to stop the run. Another CLI meets the same environment, so \
+                         reassigning does not fix a launch refusal."
+                    )
+                };
                 pause_for_human(
                     store,
                     subscribers,
