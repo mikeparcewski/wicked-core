@@ -178,7 +178,7 @@ mod tests {
 
     /// core#699 — a schema never documents a contract version newer than the one it declares: every
     /// `v<x.y.z>` a schema's own text cites (a field's "v1.2.0 (DC-S1): …" note) is at most its
-    /// `$id` segment. DC-S1 added `targets.project` / `projects` to conformance-rules as "v1.2.0"
+    /// `$id` segment. DC-S1 added `targets.project` / `supersedes` to conformance-rules as "v1.2.0"
     /// while the `$id`, title and accepted `metadata.schema_version`s stayed at 1.1.0, so a 1.2.0
     /// document had no version to carry.
     #[test]

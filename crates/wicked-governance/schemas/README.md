@@ -9,22 +9,25 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
 
 | File | Role | Own contract version (`$id` / `metadata.schema_version`) |
 |---|---|---|
-| `conformance-rules.schema.json` | PRESCRIPTIVE rules applied TO code — the wire format `ConformanceRule` mirrors | 1.1.0 |
+| `conformance-rules.schema.json` | PRESCRIPTIVE rules applied TO code — the wire format `ConformanceRule` mirrors | 1.2.0 |
 | `domain-model.schema.json` | DESCRIPTIVE domain model mined FROM code — garden STEERS on it | 1.0.0 |
 | `coverage.schema.json` | Front-half coverage report wire shape | 1.0.0 |
 | `vocabulary.schema.json` | Domain vocabulary spine | 1.0.0 |
-| `VERSION` | Semver of the whole **bundle** (currently `1.2.0`) | — |
+| `VERSION` | Semver of the whole **bundle** (currently `1.2.1`) | — |
 
 ## Version semantics (two versions, deliberately)
 
 - **Bundle version** (`VERSION` file): bumps when ANY file in the bundle changes
   (additive optional field = patch; new required field = minor; invariant change
-  = major). Currently `1.2.0` (1.0.0→1.1.0 added `conformance-rules.schema.json`
-  to the bundle — archive commit 75735b9).
+  = major). Currently `1.2.1` (1.0.0→1.1.0 added `conformance-rules.schema.json`
+  to the bundle — archive commit 75735b9; 1.2.0→1.2.1 is the additive, optional
+  DC-S1 project-rule fields of conformance-rules 1.2.0).
 - **Per-schema contract version** (the `$id` version segment and each schema's
   `metadata.schema_version` const): the version a *document* carries and a
   consumer validates against. Independent of the bundle semver — the schemas say
-  so themselves. `conformance-rules` is at `1.1.0` (the 1.1.0→1.2.0 bundle bump: the
+  so themselves. `conformance-rules` is at `1.2.0`: 1.2.0 (core#699, bundle 1.2.1) adds the
+  OPTIONAL DC-S1 project-rule fields `targets.project` and `supersedes` and widens
+  `metadata.schema_version` to `enum [1.0.0, 1.1.0, 1.2.0]`; 1.1.0 (the 1.1.0→1.2.0 bundle bump: the
   STEERING unification added the optional steering fields — steering_type / applies_to /
   excludes / weight / effect / trigger / obligations / criteria / retired — relaxed the id
   pattern outside the reserved `PAT-`/`POL-` namespace, and widened `metadata.schema_version`
