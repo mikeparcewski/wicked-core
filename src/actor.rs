@@ -12933,7 +12933,8 @@ mod substance_gate_tests {
                 policy_ids: vec!["engine:filesystem-boundary-write".into()],
                 decision: wicked_apps_core::Decision::Deny,
                 obligations: vec![
-                    "path outside this unit's boundary: /srv/elsewhere/.wicked-vault/x (write)".into(),
+                    "path outside this unit's boundary: /srv/elsewhere/.wicked-vault/x (write)"
+                        .into(),
                 ],
                 evaluated_context_ref: "sha256:boundary".into(),
                 criteria: "filesystem boundary: outside (write)".into(),
