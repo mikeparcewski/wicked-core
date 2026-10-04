@@ -472,24 +472,73 @@ pub fn list_members(store: &dyn GraphRead, project_id: &str) -> anyhow::Result<V
 
 /// The project ids holding a LIVE membership for `(member_kind, member_ref)` — the reverse read
 /// the daemon uses to tag a run's frames and scope its memory (many-to-many by design; §9.4).
+///
+/// (core#698) STRICT for this member's own nodes, lenient for everyone else's: a membership node is
+/// ATTRIBUTED to `(member_kind, member_ref)` before it is decoded, and an attributed node that does
+/// not decode is an `Err` — never a silently omitted project. The read feeds the run's project-rule
+/// recall (`execute.rs`, `plan_gate`), so dropping a malformed own membership was a silent
+/// NARROWING on an enforcement path (the project's rules left off the unit's claim). A node is
+/// attributed when ANY of its identities says it is this member's, so corrupting one field cannot
+/// hide it: its raw `member_kind` + `member_ref`; or its node id, which is derived from
+/// `(project_id, member_kind, member_ref)` ([`member_id`]) — checked against its own raw
+/// `project_id` and against every project node's id. A node attributed to another member is
+/// skipped undecoded, so a decode error on another run's membership cannot deny this one.
 pub fn member_projects(
     store: &dyn GraphRead,
     member_kind: &str,
     member_ref: &str,
 ) -> anyhow::Result<Vec<String>> {
+    let raw_str = |n: &Node, field: &str| -> Option<String> {
+        n.metadata
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    // The node id this member's membership in project `p` would carry.
+    let own_id = |p: &str| member_id(p, member_kind, member_ref);
+    let candidate_ids: std::collections::HashSet<String> = store
+        .find_symbols(&SymbolQuery {
+            kinds: vec![NodeKind::Other(PROJECT.to_string())],
+            ..Default::default()
+        })?
+        .iter()
+        .map(|p| own_id(&p.name))
+        .collect();
     let query = SymbolQuery {
         kinds: vec![NodeKind::Other(PROJECT_MEMBER.to_string())],
         ..Default::default()
     };
-    let mut ids: Vec<String> = store
-        .find_symbols(&query)?
-        .iter()
-        .filter_map(|n| ProjectMember::from_node(n).ok())
-        .filter(|m| {
-            m.member_kind == member_kind && m.member_ref == member_ref && m.detached_at.is_none()
-        })
-        .map(|m| m.project_id)
-        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for n in store.find_symbols(&query)?.iter() {
+        let by_fields = raw_str(n, "member_kind").as_deref() == Some(member_kind)
+            && raw_str(n, "member_ref").as_deref() == Some(member_ref);
+        let by_id = candidate_ids.contains(&n.name)
+            || raw_str(n, "project_id").is_some_and(|p| own_id(&p) == n.name);
+        if !(by_fields || by_id) {
+            continue;
+        }
+        let m = ProjectMember::from_node(n).map_err(|e| {
+            anyhow::anyhow!(
+                "the {member_kind} membership of {member_ref:?} is unreadable ({e}); refusing to \
+                 read its projects as fewer than they are"
+            )
+        })?;
+        // Attributed by its id, but its fields name ANOTHER member: the node contradicts itself
+        // (a corrupted `member_ref`), so it is unreadable as this member's — never skipped, which
+        // would read the run as unfiled. (Only an id match can get here: a field match agrees.)
+        if m.member_kind != member_kind || m.member_ref != member_ref {
+            anyhow::bail!(
+                "the {member_kind} membership of {member_ref:?} is inconsistent (node {} names \
+                 {} {:?}); refusing to read its projects as fewer than they are",
+                n.name,
+                m.member_kind,
+                m.member_ref
+            );
+        }
+        if m.detached_at.is_none() {
+            ids.push(m.project_id);
+        }
+    }
     ids.sort();
     ids.dedup();
     Ok(ids)
@@ -724,6 +773,97 @@ mod tests {
         assert!(member_projects(&store, "crew.run", "shared-repo")
             .unwrap()
             .is_empty());
+    }
+
+    /// core#698 — a malformed membership node of THIS run fails the read (never a silently
+    /// omitted project: its rules would drop off the unit's claim), while a malformed node of
+    /// ANOTHER run is not this run's problem.
+    #[test]
+    fn a_malformed_own_membership_fails_the_read_and_anothers_does_not() {
+        let mut store = mem_store();
+        let p = create_project(&mut store, "p", None, 1).unwrap();
+        for run in ["run-a", "run-b"] {
+            attach_member(
+                &mut store,
+                MemberSpec {
+                    project_id: p.id.clone(),
+                    member_kind: MEMBER_KIND_RUN.into(),
+                    member_ref: run.into(),
+                    meta: None,
+                    attached_by: "api".into(),
+                },
+                2,
+            )
+            .unwrap();
+        }
+        // Corrupt run-b's membership: its project id is no longer a string.
+        let sym = synthetic_symbol(PROJECT_MEMBER, &member_id(&p.id, MEMBER_KIND_RUN, "run-b"));
+        let mut node = store.get_node(&sym).unwrap().expect("run-b's membership");
+        node.metadata
+            .insert("project_id".into(), serde_json::json!(42));
+        put_node(&mut store, node).unwrap();
+
+        assert_eq!(
+            member_projects(&store, MEMBER_KIND_RUN, "run-a").unwrap(),
+            vec![p.id.clone()],
+            "another run's malformed membership does not reach this run"
+        );
+        let err = member_projects(&store, MEMBER_KIND_RUN, "run-b")
+            .expect_err("a malformed own membership fails closed, not as no project");
+        assert!(err.to_string().contains("unreadable"), "{err:#}");
+
+        // Corrupting the very fields the attribution reads (member_ref no longer a string, the
+        // project id too) cannot hide the node either: its id is derived from the member.
+        attach_member(
+            &mut store,
+            MemberSpec {
+                project_id: p.id.clone(),
+                member_kind: MEMBER_KIND_RUN.into(),
+                member_ref: "run-c".into(),
+                meta: None,
+                attached_by: "api".into(),
+            },
+            3,
+        )
+        .unwrap();
+        let sym = synthetic_symbol(PROJECT_MEMBER, &member_id(&p.id, MEMBER_KIND_RUN, "run-c"));
+        let mut node = store.get_node(&sym).unwrap().expect("run-c's membership");
+        node.metadata
+            .insert("member_ref".into(), serde_json::json!(42));
+        node.metadata
+            .insert("project_id".into(), serde_json::json!(null));
+        put_node(&mut store, node).unwrap();
+        assert!(
+            member_projects(&store, MEMBER_KIND_RUN, "run-c").is_err(),
+            "a membership whose member_ref and project_id are corrupt is still this run's"
+        );
+        assert_eq!(
+            member_projects(&store, MEMBER_KIND_RUN, "run-a").unwrap(),
+            vec![p.id.clone()]
+        );
+
+        // …nor can rewriting its member_ref to ANOTHER run's (a well-typed corruption): its id
+        // still says it is run-d's, so run-d's read fails closed.
+        attach_member(
+            &mut store,
+            MemberSpec {
+                project_id: p.id.clone(),
+                member_kind: MEMBER_KIND_RUN.into(),
+                member_ref: "run-d".into(),
+                meta: None,
+                attached_by: "api".into(),
+            },
+            4,
+        )
+        .unwrap();
+        let sym = synthetic_symbol(PROJECT_MEMBER, &member_id(&p.id, MEMBER_KIND_RUN, "run-d"));
+        let mut node = store.get_node(&sym).unwrap().expect("run-d's membership");
+        node.metadata
+            .insert("member_ref".into(), serde_json::json!("run-x"));
+        put_node(&mut store, node).unwrap();
+        let err = member_projects(&store, MEMBER_KIND_RUN, "run-d")
+            .expect_err("a membership whose id is run-d's but names run-x fails closed");
+        assert!(err.to_string().contains("inconsistent"), "{err:#}");
     }
 
     #[test]
