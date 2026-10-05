@@ -2052,7 +2052,10 @@ fn an_output_target_survives_the_fold_finding_of_and_the_finding_serde() {
         "a tree finding spells no target: {vt}"
     );
 
-    let ledger = fold(&[TeamRow { event_id: 1, event: ev }]);
+    let ledger = fold(&[TeamRow {
+        event_id: 1,
+        event: ev,
+    }]);
     assert_eq!(ledger.findings.len(), 1);
     assert_eq!(ledger.findings[0].finding.target, FindingTarget::Output);
 }
