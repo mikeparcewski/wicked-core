@@ -43,10 +43,10 @@ use super::events::{
 };
 use super::publish::{LiveTeamRun, PublishOutcome, TeamBus, TeamConfig};
 use super::{
-    cap_utf8, confirm, kind_may_change_tree, locate, parse_reply, AttachCtx, FinalPass, Finding,
-    FindingBook, FindingStatus, LedgerMonitor, MonitorHost, MonitorScope, MonitorStatus,
-    RawFinding, Rejected, ReplyKind, Repo, Severity, TeamLedger, TeamLimits, TeamPlan, UnitKey,
-    Verdict,
+    cap_utf8, confirm, kind_may_change_tree, locate, parse_reply, repo_relative, AttachCtx,
+    FinalPass, Finding, FindingBook, FindingStatus, LedgerMonitor, MonitorHost, MonitorScope,
+    MonitorStatus, RawFinding, Rejected, ReplyKind, Repo, Severity, TeamLedger, TeamLimits,
+    TeamPlan, UnitKey, Verdict,
 };
 use crate::bus::BusDb;
 use crate::decision::{DecisionRequest, DecisionVerdict};
@@ -1108,7 +1108,10 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
         };
         // `path` must be the step id the prompt named — a finding that cites a repo path is not a
         // finding on the answer, however its evidence reads — and the line must be byte-exact.
-        if f.path != job.step_id
+        // Compared as the parser spells a path (`repo_relative`: `./answer-1` is `answer-1`); a
+        // step id the parser cannot spell at all is compared verbatim (codex review of #739 r4).
+        let want = repo_relative(&job.step_id).unwrap_or_else(|| job.step_id.clone());
+        if f.path != want
             || f.evidence.len() > super::EVIDENCE_CAP
             || !confirm(Some(&shown), f.line, &f.evidence)
         {

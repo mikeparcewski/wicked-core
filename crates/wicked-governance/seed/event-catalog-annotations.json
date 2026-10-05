@@ -154,7 +154,7 @@
   },
   "wicked.team.finding.raised": {
     "trigger": "S: a confirmed, above-bar, first-seen finding",
-    "payload": "`raise_seq`, `finding_id`, `member_id`, `severity`, `target` (`tree` default, or `output`), `path`, `line`, `evidence`, `claim`, `suggestion`, `tree`, `in_diff`, `corroborated_by`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`raise_seq`, `finding_id`, `member_id`, `severity`, `target` (`tree` default, or `output`; the id hashes the repo path for `tree`, `output:<step id>` for `output`), `path`, `line`, `evidence`, `claim`, `suggestion`, `tree`, `in_diff`, `corroborated_by`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.advice.delivered": {
     "trigger": "R: one row per finding per delivery (mid-turn steer, step boundary, attempt end)",

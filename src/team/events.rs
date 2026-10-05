@@ -1131,9 +1131,10 @@ pub struct PathRepicked {
 // Each type below deserializes through a mirror that omits its computed fields (an incoming one
 // is ignored as an unknown key) and recomputes them. The computed fields:
 //   TeamLedger.teamPause            ⇐ pauses(finalPass, findings)          (team.rs)
-//   Finding.findingId               ⇐ finding_id_anchored(path, anchor, evidence) (team.rs)
-//   FindingRaised.finding_id        ⇐ finding_id_anchored(path, anchor, evidence)
-//   FindingRaised.line_key          ⇐ line_key(path, evidence)             (T6)
+//   Finding.findingId               ⇐ finding_id_for(target, path, anchor, evidence) (team.rs):
+//                                     tree hashes the repo path, output hashes `output:<step id>`
+//   FindingRaised.finding_id        ⇐ finding_id_for(target, path, anchor, evidence)
+//   FindingRaised.line_key          ⇐ line_key(path, evidence)             (T6; the bare path)
 //   PathScored.score                ⇐ min(100, deterministic + model.add)
 //   PathScored.plan                 ⇐ S4 plan_for(score)
 //   LedgerFolded.final_pass         ⇐ ledger.finalPass

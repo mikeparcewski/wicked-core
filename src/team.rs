@@ -543,7 +543,7 @@ fn parse_finding(json: &str) -> Option<RawFinding> {
 
 /// `path` as a repo-relative, forward-slash path — `None` for an absolute path, a `..`
 /// component, or an empty one.
-fn repo_relative(path: &str) -> Option<String> {
+pub(crate) fn repo_relative(path: &str) -> Option<String> {
     let p = path.replace('\\', "/");
     let p = p.trim_start_matches("./");
     if p.is_empty() || p.starts_with('/') || p.contains(':') {
