@@ -101,6 +101,94 @@ fn an_old_plan_accepted_row_without_touch_still_round_trips() {
     assert_eq!(fx["touch_source"], "pa_scope");
 }
 
+/// ASK-K3a (DES-ASK-TEAM-CHAT-001 §6 rows 11', 15', 7'): the three shapes that gained a field
+/// re-serialise an OLD row byte-identical (`target` absent = tree, `outcome` absent = answered,
+/// `seat` a string), and the new values round-trip: an output-target finding, a non-answered
+/// help row with `answer: null`, an absent-reviewer row with `seat: null` and a minted key.
+#[test]
+fn the_three_widened_shapes_keep_old_rows_byte_identical_and_carry_the_new_values() {
+    let old = fixture(FINDING_RAISED);
+    assert!(
+        old.get("target").is_none(),
+        "the tree fixture predates the field"
+    );
+    let ev = TeamEvent::from_payload(FINDING_RAISED, &old).unwrap();
+    assert_eq!(ev.to_payload().unwrap(), old);
+    let TeamBody::FindingRaised(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!(b.target, FindingTarget::Tree);
+    let output = fixtures()
+        .into_iter()
+        .find(|(t, p)| t == FINDING_RAISED && p["target"] == json!("output"))
+        .expect("an output-target fixture")
+        .1;
+    let ev = TeamEvent::from_payload(FINDING_RAISED, &output).unwrap();
+    let TeamBody::FindingRaised(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!(
+        (b.target, b.path.as_str()),
+        (FindingTarget::Output, "answer-1")
+    );
+    assert_eq!(ev.to_payload().unwrap(), output);
+
+    let old = fixture(HELP_ANSWERED);
+    assert!(old.get("outcome").is_none() && old["answer"].is_string());
+    let ev = TeamEvent::from_payload(HELP_ANSWERED, &old).unwrap();
+    assert_eq!(ev.to_payload().unwrap(), old);
+    let timed_out = fixtures()
+        .into_iter()
+        .find(|(t, p)| t == HELP_ANSWERED && p["outcome"] == json!("timed_out"))
+        .expect("a timed_out fixture")
+        .1;
+    let ev = TeamEvent::from_payload(HELP_ANSWERED, &timed_out).unwrap();
+    let TeamBody::HelpAnswered(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!(
+        (b.outcome, b.answer.as_deref()),
+        (HelpOutcome::TimedOut, None)
+    );
+    assert_eq!(b.error.as_deref(), Some("member turn exceeded 240 s"));
+    assert_eq!(ev.to_payload().unwrap(), timed_out);
+
+    let old = fixture(MEMBER_JOINED);
+    assert!(old["seat"].is_string());
+    let ev = TeamEvent::from_payload(MEMBER_JOINED, &old).unwrap();
+    assert_eq!(ev.to_payload().unwrap(), old);
+    let absent = fixtures()
+        .into_iter()
+        .find(|(t, p)| t == MEMBER_JOINED && p["seat"].is_null())
+        .expect("an absent-reviewer fixture")
+        .1;
+    let ev = TeamEvent::from_payload(MEMBER_JOINED, &absent).unwrap();
+    let TeamBody::MemberJoined(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!((b.seat.as_deref(), b.open_seq), (None, 2));
+    assert_eq!(
+        ev.key().unwrap(),
+        key_member_joined("r1", 3, 1, "m1", 2),
+        "the absent reviewer keeps a valid, minted key"
+    );
+    assert_eq!(ev.to_payload().unwrap(), absent);
+}
+
+/// ASK-K3a: the two widened enums are closed sets too — an unknown `target` or `outcome` token
+/// is refused at parse, exactly like every other §6 enum.
+#[test]
+fn a_bad_target_or_outcome_token_is_refused_at_parse() {
+    for (t, field) in [(FINDING_RAISED, "target"), (HELP_ANSWERED, "outcome")] {
+        let mut p = fixture(t);
+        p[field] = json!("bogus");
+        assert!(
+            TeamEvent::from_payload(t, &p).is_err(),
+            "{t}.{field} = \"bogus\" must not parse"
+        );
+    }
+}
+
 #[test]
 fn a_payload_missing_a_field_or_naming_an_unknown_type_is_refused() {
     let mut p = fixture(FINDING_RAISED);
@@ -272,6 +360,18 @@ fn every_fixture_keys_to_its_fixed_value() {
         (
             "wicked.team.path.repicked",
             "6801a7c425b0492bae48fc28bb7538fd",
+        ),
+        (
+            "wicked.team.finding.raised",
+            "90d0992402c6961990fd4132ba689970",
+        ),
+        (
+            "wicked.team.help.answered",
+            "b894dd61906c0914cb64544de00a69bc",
+        ),
+        (
+            "wicked.team.member.joined",
+            "6c4b6dbd19e6db42c358e9e1557e1d7f",
         ),
     ];
     let all = fixtures();
@@ -685,7 +785,7 @@ impl Stream {
             TeamBody::MemberJoined(MemberJoined {
                 member_id: member.into(),
                 open_seq: 1,
-                seat: seat.into(),
+                seat: Some(seat.into()),
                 role: tok("monitor"),
                 status: tok("attached"),
                 reason: "team plan monitors=1".into(),
@@ -719,6 +819,7 @@ impl Stream {
                 anchor: None,
                 anchor_source: None,
                 severity: tok(severity),
+                target: Default::default(),
                 path: "src/retire.ts".into(),
                 line: 40 + seq,
                 evidence: EVIDENCE.into(),
@@ -1330,6 +1431,9 @@ fn an_unknown_token_in_any_enum_field_is_rejected_at_parse() {
     // Computed fields are not in this list: they are recomputed at parse, so an incoming token
     // there is ignored, not refused (`ledger.folded.final_pass`, `path.scored.plan`; see the
     // computed-field tests). Their source fields are covered instead.
+    // `finding.raised.target` and `help.answered.outcome` are omitted on the wire at their
+    // defaults, so the first fixture of each type lacks them; their bad tokens are refused in
+    // `a_bad_target_or_outcome_token_is_refused_at_parse` below.
     let cases: [(&str, &str); 24] = [
         (PATH_STARTED, "selection"),
         (PATH_REPICKED, "selection"),

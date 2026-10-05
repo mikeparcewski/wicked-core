@@ -581,7 +581,7 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
                 b.help_id,
                 cap_utf8(&question(&b.help_id).unwrap_or_default(), 512),
                 r.event.env.by,
-                cap_utf8(&b.answer, 2 * 1024),
+                cap_utf8(b.answer.as_deref().unwrap_or(""), 2 * 1024),
                 if b.evidence.is_empty() {
                     String::new()
                 } else {
