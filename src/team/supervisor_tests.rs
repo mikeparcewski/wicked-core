@@ -2334,6 +2334,31 @@ fn a_carried_tree_high_is_not_superseded_when_the_settled_tree_is_unavailable() 
     h.pump();
     let raised = h.rows(tev::FINDING_RAISED);
     assert_eq!(raised.len(), 1, "{raised:#?}");
+    // The process restarts: a new supervisor (booted after the claim) finds attempt 1 dead and
+    // carries its unresolved HIGH into attempt 2 (t6_b's dance), sharing the output stash.
+    let floor = h.rows(tev::PATH_STARTED).len() as i64; // any id at/below the first row
+    let _ = floor;
+    let mut cfg = sup_cfg(&h.rig);
+    cfg.boot_ms = crate::interaction::now_millis() + 1;
+    cfg.outputs = h.outputs.clone();
+    std::thread::sleep(Duration::from_millis(5));
+    let host_b = Arc::new(FakeHost::new(|_, _| Ok("DONE".into())));
+    let mut b = SupervisorCore::new(cfg, host_b.clone(), h.council.clone());
+    b.arm(&LiveTeamRun {
+        run_id: RUN.into(),
+        status: crate::domain::SessionStatus::Executing,
+        team: crate::domain::RunTeamState {
+            transport: Some(Transport::Bus),
+            stream_floor: Some(1),
+            ..Default::default()
+        },
+        roster: vec!["claude#1".into(), "claude#2".into()],
+    });
+    let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
+    let (cursor, _) = replay(&mut b, &h.rig.bus, tail, None);
+    h.core = b;
+    h.host = host_b;
+    h.cursor = cursor;
     // Attempt 2: bound, baseline missing (the producer's empty git_dir shape), an answer on record.
     let wd = h.fx.dir.to_string_lossy().into_owned();
     h.publish(&fixture_with(tev::STEP_CLAIMED, 0, RUN, |p| {
@@ -2349,16 +2374,10 @@ fn a_carried_tree_high_is_not_superseded_when_the_settled_tree_is_unavailable() 
     h.pump();
     h.complete_with_output(3, 2, "claude#1", "build", ANSWER);
     h.pump();
-    let carried: Vec<&Value> = h
+    let carried: Vec<Value> = h
         .rows(tev::FINDING_RAISED)
-        .iter()
-        .filter(|r| r["attempt"] == 2)
-        .cloned()
-        .collect::<Vec<_>>()
-        .iter()
-        .collect::<Vec<_>>()
         .into_iter()
-        .map(|v| Box::leak(Box::new(v.clone())) as &Value)
+        .filter(|r| r["attempt"] == 2)
         .collect();
     assert_eq!(carried.len(), 1, "the HIGH is carried into attempt 2");
     assert_eq!(carried[0]["carried_from_attempt"], 1);
