@@ -14,6 +14,38 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.7.38** — 2026-10-05 — npm release carrying the **ASK-K core slices** (DES-ASK-TEAM-CHAT-001:
+  an ask starts a path — DES-TEAMING-002 applied to studio's Ask entry point) since 0.7.37, on main
+  tip 02b08c3. Wire changes are additive (`serde(default)`; old rows read as before); one new event
+  type.
+  **Authority (#733 T0)** — DES-TEAMING-002 rev 15 (a first-creator PA `PLAN+` may carry `touch`,
+  [A-7] re-answered; §8.6 the "crosses into work" row `first_creator`; a gate edit over a held
+  proposal is additive or the whole plan) and DES-TEAMING-001 rev 14 (the severity bar is
+  target-specific: tree `{high, medium}`, output `{medium}`).
+  **PA selection (#734 K1a)** — `LaunchSpec.primary` chosen or random; `path.started.selection`;
+  every `owner:pa` unit on the PA; re-pick on a seat-caused failure publishes the new type
+  **`wicked.team.path.repicked`** (keyed `pick_seq`) and redispatches as attempt+1.
+  **Plan fields (#735 K1b)** — `PlanSteps.monitors.asked` on a user plan; `PlanStep.budget_secs`
+  (TightenOnly) threaded to the unit and both carriers as `min(env ceiling, step budget)`.
+  **Approve applies held revisions (#736 K2a)** — `confirm_gate(Approve)` at a def/terminal gate
+  applies a held plan edit before choosing the cursor unit.
+  **Event shapes (#737 K3a)** — `finding.raised.target` (`tree` default | `output`);
+  `help.answered.outcome` (`answered` default | `timed_out` | `failed` | `no_member`, `answer`
+  nullable, `error`); `member.joined.seat` nullable with a minted `member_id`/`open_seq`;
+  `Finding.target` carried through the fold.
+  **First creator (#738 K2b)** — a PA change adding the path's first creator step may carry `touch`,
+  is scored as an intent score (`path.scored{basis:"intent"}`), unions into `plan.accepted.touch`
+  as `pa_scope`, and requires approval in every mode (`gate.opened.reason:"first_creator"`); a
+  "Not now" edit keeps the accepted rev and its empty floor and drops the proposal's units; a
+  same-id replacement is planned fresh.
+  **Output review (#739 K3b)** — the final pass reviews a step's OUTPUT when its tree is unchanged:
+  findings cite a line of the answer at the `medium` bar (`finding.raised{target:"output"}`, ids in
+  their own namespace), re-confirmed against the shown text; help turns publish their outcome; the
+  absent reviewer is on the record; the runner hands the output to the supervisor in-process.
+  **Boundary renderer (#740 K3c)** — `[team advice]` renders a non-answered help by its outcome and
+  the PA's own `plan.refused`; answers first, by priority, carried across the seat's windows;
+  `step.completed.answers_presented` (optional) says the block reached a seat turn.
+
 - **core-ts 0.7.37** — 2026-10-04 — npm release carrying the **six** engine fixes since 0.7.36, on
   main tip `0f419c3` (the defects the dogfood run and the reel takes found). No wire shape changes.
   **Seat-specific auth (#721, #718)** — an ACP turn refused with `data.errorKind:
