@@ -556,6 +556,9 @@ pub struct PlanStep {
     /// A raised gate, as the workflow's externally tagged `GateSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Value>,
+    /// (ASK-K1b) The step's wall budget in seconds, lowered from the carrier's ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_secs: Option<u64>,
     /// On a composed plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_by: Option<AddedBy>,
@@ -635,7 +638,7 @@ pub struct PathScored {
     pub tree: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorsAsk {
     pub asked: u8,
 }

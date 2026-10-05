@@ -1213,7 +1213,10 @@ impl SupervisorCore {
         match &row.event.body {
             TeamBody::PlanProposed(b) => {
                 let st = self.runs.get_mut(&run_id).expect("armed");
-                st.asked = b.monitors.asked;
+                // (ASK-K1b) The ask RATCHETS: a later proposal (a PA `PLAN+`, a human edit adding
+                // one step) restates no ask, and must never drop the reviewer the launch asked
+                // for — the ratchet is the §8.5 rule ("it only goes up") applied to members.
+                st.asked = st.asked.max(b.monitors.asked);
             }
             TeamBody::PlanAccepted(b) => {
                 let st = self.runs.get_mut(&run_id).expect("armed");

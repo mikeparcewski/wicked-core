@@ -784,6 +784,12 @@ pub struct WorkUnit {
     /// of an owner-omitted def serialize byte-identically.
     #[serde(default, skip_serializing_if = "crate::workflow::StepOwner::is_pa")]
     pub owner: crate::workflow::StepOwner,
+    /// (DES-ASK-TEAM-CHAT-001 §4.4, ASK-K1b) The unit's wall budget in seconds, carried from the
+    /// backing phase's [`budget_secs`](crate::workflow::PhaseDef::budget_secs) at plan time like
+    /// [`Self::gate`]; every carrier runs the attempt under `min(ceiling, budget)`
+    /// (`workflow::effective_timeout`). `None` (skipped on the wire) keeps the ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_secs: Option<u64>,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -1155,6 +1161,7 @@ impl WorkUnit {
             gate: crate::workflow::GateSpec::default(),
             role: crate::workflow::PhaseRole::default(),
             owner: crate::workflow::StepOwner::default(),
+            budget_secs: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

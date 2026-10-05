@@ -388,6 +388,7 @@ fn plan_accepted(session: &AgentSession, units: &[WorkUnit], plan_rev: u32) -> T
                         owner: None,
                         depends_on: None,
                         gate: None,
+                        budget_secs: None,
                         added_by: None,
                         floor_reason: None,
                         floor_rule: None,

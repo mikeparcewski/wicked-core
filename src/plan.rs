@@ -238,6 +238,7 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // worktree diff — the fold has no route back to the def, so like role/gate/deps the
             // declaration must ride the unit.
             unit.executes_code = phase.executes_code;
+            unit.budget_secs = phase.budget_secs;
             // (BC-80, core#535) Carry the phase's `requires_capture_report` declaration for the
             // same reason `executes_code` rides the unit: the fold that reads the capture marker
             // has no route back to the def.
@@ -432,6 +433,12 @@ pub struct PlanSteps {
     /// A floor override (§8.5): manual mode only, refused in auto mode.
     #[serde(default, rename = "override", skip_serializing_if = "Option::is_none")]
     pub floor_override: Option<FloorOverride>,
+    /// (DES-ASK-TEAM-CHAT-001 §4.6, ASK-K1b; §6.1 `plan.proposed.monitors`) The plan's own ask for
+    /// members: the supervisor's target is `min(max(band monitors, asked), MAX_MONITORS)`, so a
+    /// read-only plan (the lowest band, no monitors of its own) with `asked: 1` gets a reviewer.
+    /// Absent = 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitors: Option<crate::team::events::MonitorsAsk>,
 }
 
 impl PlanSteps {
@@ -520,6 +527,10 @@ pub struct PlanStep {
     /// May be raised to `true`; never lowered on an entry that sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executes_code: Option<bool>,
+    /// (ASK-K1b) The step's wall budget in seconds: may only LOWER the entry's (an entry with no
+    /// budget takes any; the carrier's ceiling still applies above it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -584,6 +595,8 @@ pub enum PlanRefusal {
     RoleChanged { step: String, catalog: String },
     /// The step's gate is weaker than its entry's.
     GateLowered { step: String, catalog: String },
+    /// (ASK-K1b) The step's `budget_secs` is larger than its entry's.
+    BudgetLoosened { step: String, catalog: String },
     /// The step clears the pin of an entry that carries one.
     PinRemoved { step: String, catalog: String },
     /// The step sets a pin other than the one its entry carries (a swap, even to an approved pin).
@@ -653,6 +666,7 @@ impl PlanRefusal {
             PlanRefusal::UnknownCatalogEntry { .. } => "unknown_catalog_entry",
             PlanRefusal::RoleChanged { .. } => "role_changed",
             PlanRefusal::GateLowered { .. } => "gate_lowered",
+            PlanRefusal::BudgetLoosened { .. } => "budget_loosened",
             PlanRefusal::PinRemoved { .. } => "pin_removed",
             PlanRefusal::PinChanged { .. } => "pin_changed",
             PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
@@ -691,6 +705,13 @@ impl std::fmt::Display for PlanRefusal {
                 "{r}: step {step} sets a role other than {catalog}'s — a step never changes role \
                  (evaluator ≠ creator is a property of the catalog)"
             ),
+            PlanRefusal::BudgetLoosened { step, catalog } => {
+                write!(
+                    f,
+                    "{r}: step {step} may not loosen budget_secs on {catalog} — a step may only \
+                     lower it"
+                )
+            }
             PlanRefusal::GateLowered { step, catalog } => {
                 write!(
                     f,
@@ -834,7 +855,7 @@ pub enum FieldRule {
 /// Every [`PlanStep`] field and its [`FieldRule`] — the one table `compose` applies
 /// ([`apply_step`] has one arm per row, in this order). A test pins that the table covers every
 /// `PlanStep` field and that each rule refuses what it forbids.
-pub const STEP_FIELD_RULES: [(&str, FieldRule); 18] = [
+pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("catalog", FieldRule::Identity),
     ("id", FieldRule::Identity),
     ("role", FieldRule::Fixed),
@@ -842,6 +863,7 @@ pub const STEP_FIELD_RULES: [(&str, FieldRule); 18] = [
     ("gate", FieldRule::TightenOnly),
     ("validator_pin", FieldRule::SetIfUnset),
     ("executes_code", FieldRule::TightenOnly),
+    ("budget_secs", FieldRule::TightenOnly),
     ("required_deliverables", FieldRule::TightenOnly),
     ("executor", FieldRule::ToolEntriesOnly),
     ("instructions", FieldRule::SetIfUnset),
@@ -1010,6 +1032,13 @@ fn apply_step(
             return refuse(|step, catalog| PlanRefusal::ExecutesCodeLowered { step, catalog });
         }
         phase.executes_code = code;
+    }
+    // budget_secs — TightenOnly: lower the entry's wall budget, never raise it (ASK-K1b).
+    if let Some(budget) = step.budget_secs {
+        if entry.budget_secs.is_some_and(|own| budget > own) {
+            return refuse(|step, catalog| PlanRefusal::BudgetLoosened { step, catalog });
+        }
+        phase.budget_secs = Some(budget);
     }
     // required_deliverables — TightenOnly: a superset of the entry's.
     if let Some(deliverables) = &step.required_deliverables {
@@ -1427,6 +1456,7 @@ pub fn floor_fill(
         steps,
         touch: plan.touch.clone(),
         floor_override: plan.floor_override.clone(),
+        monitors: plan.monitors.clone(),
     };
     let def = compose(catalog, &filled)?;
     Ok(FloorFilled {
@@ -1647,6 +1677,94 @@ mod tests {
         };
         assert!(marked("build"), "feature/build is the executes_code phase");
         assert!(!marked("clarify") && !marked("design") && !marked("adversarial-review"));
+    }
+
+    /// (DES-ASK-TEAM-CHAT-001 §4.4, ASK-K1b) `budget_secs` composes: a step lowers an entry that
+    /// has none to its own value, lowers one that has a budget, may not raise it (named refusal),
+    /// and the composed phase's budget lands on the unit like its gate — the `understand`
+    /// answer shape (gate raised, budget 600) composes as one plan step, no new catalog entry.
+    #[test]
+    fn budget_secs_composes_tighten_only_and_lands_on_the_unit() {
+        use crate::workflow::GateSpec;
+        let catalog = crate::catalog::catalog();
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "understand", "id": "answer-1",
+             "gate": {"human_confirm": {"unconditional": true}}, "budget_secs": 600},
+            {"catalog": "understand", "id": "answer-2"}
+        ], "monitors": {"asked": 1}}))
+        .unwrap();
+        assert_eq!(plan.monitors.as_ref().map(|m| m.asked), Some(1));
+        let def = compose(catalog, &plan).expect("the answer shape composes");
+        assert_eq!(def.phases[0].budget_secs, Some(600));
+        assert_eq!(
+            def.phases[0].gate,
+            GateSpec::HumanConfirm {
+                unconditional: true
+            }
+        );
+        assert_eq!(
+            def.phases[1].budget_secs, None,
+            "an unbudgeted step keeps the ceiling"
+        );
+        let units = plan_from_def(&def, "what does retire do", "r1");
+        assert_eq!(
+            units[0].budget_secs,
+            Some(600),
+            "the unit carries the phase's budget"
+        );
+        assert_eq!(units[1].budget_secs, None);
+        // On an entry WITH a budget: lower is fine, equal restates, higher is refused by name.
+        let mut budgeted = catalog.to_vec();
+        budgeted
+            .iter_mut()
+            .find(|e| e.id == "understand")
+            .unwrap()
+            .budget_secs = Some(300);
+        let lower: PlanSteps = serde_json::from_value(
+            serde_json::json!({"steps": [{"catalog": "understand", "id": "understand", "budget_secs": 120}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            compose(&budgeted, &lower).unwrap().phases[0].budget_secs,
+            Some(120)
+        );
+        let raise: PlanSteps = serde_json::from_value(
+            serde_json::json!({"steps": [{"catalog": "understand", "id": "understand", "budget_secs": 301}]}),
+        )
+        .unwrap();
+        let err = compose(&budgeted, &raise).unwrap_err();
+        assert_eq!(err.reason(), "budget_loosened");
+        assert_eq!(
+            err.to_string(),
+            "budget_loosened: step understand may not loosen budget_secs on understand — a step \
+             may only lower it"
+        );
+        // An absent field on the wire stays absent (byte-identical old plans).
+        let bare: PlanSteps =
+            serde_json::from_value(serde_json::json!({"steps": [{"catalog": "understand"}]}))
+                .unwrap();
+        let v = serde_json::to_value(&bare).unwrap();
+        assert!(v.get("monitors").is_none() && v["steps"][0].get("budget_secs").is_none());
+    }
+
+    /// (ASK-K1b) The carrier's wall budget is `min(ceiling, budget)`: a budget lowers the ceiling,
+    /// never raises it, and no budget keeps it.
+    #[test]
+    fn effective_timeout_is_the_lower_of_the_ceiling_and_the_budget() {
+        use crate::workflow::effective_timeout;
+        use std::time::Duration;
+        let ceiling = Duration::from_secs(7200);
+        assert_eq!(effective_timeout(ceiling, None), ceiling);
+        assert_eq!(
+            effective_timeout(ceiling, Some(600)),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            effective_timeout(ceiling, Some(9000)),
+            ceiling,
+            "never raised"
+        );
+        assert_eq!(effective_timeout(ceiling, Some(0)), Duration::ZERO);
     }
 
     /// core#468: the base skill lands on every AGENT unit — def-driven and prose-planned alike —

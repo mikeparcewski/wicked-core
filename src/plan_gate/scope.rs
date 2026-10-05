@@ -141,6 +141,7 @@ pub(crate) fn scope_rev(
     }
     let steps = PlanSteps {
         steps: vec![scope_step(plan, unbound)],
+        monitors: None,
         touch: None,
         floor_override: None,
     };
@@ -352,6 +353,7 @@ pub(crate) fn scope_score(
         Ok(Declared::Touch(touch)) => {
             let plan = PlanSteps {
                 steps: hold.plan.steps.clone(),
+                monitors: None,
                 touch: Some(touch.clone()),
                 floor_override: None,
             };
@@ -426,6 +428,7 @@ pub(crate) fn decide_scoped(
         steps,
         touch,
         floor_override: hold.plan.floor_override.clone(),
+        monitors: hold.plan.monitors.clone(),
     };
     let mut base = prior.clone();
     base.scope = None;

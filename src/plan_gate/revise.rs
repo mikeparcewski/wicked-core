@@ -63,6 +63,7 @@ pub(crate) fn diff_score_for_run(
 ) -> Scored {
     let plan = PlanSteps {
         steps: Vec::new(),
+        monitors: None,
         touch: Some(paths.to_vec()),
         floor_override: None,
     };
@@ -239,6 +240,7 @@ pub(crate) fn running_order(logical: &PlanSteps, done: &[String]) -> Result<Plan
         steps,
         touch: logical.touch.clone(),
         floor_override: logical.floor_override.clone(),
+        monitors: logical.monitors.clone(),
     })
 }
 
@@ -304,6 +306,8 @@ pub(crate) fn revise(
                 steps: steps.clone(),
                 touch: None,
                 floor_override: None,
+                // A change restates no ask: the supervisor keeps the highest ask it has seen.
+                monitors: None,
             };
             events.push(plan_proposed(
                 run_id, &by, &pid, base_rev, kind, None, &proposed, now,
@@ -368,6 +372,7 @@ pub(crate) fn revise(
         steps,
         touch: base.touch.clone(),
         floor_override: base.floor_override.clone(),
+        monitors: base.monitors.clone(),
     });
     if proposal_id.is_some() && merged.steps.len() == base.steps.len() {
         return refuse(events, "the proposal adds no step".to_string());
