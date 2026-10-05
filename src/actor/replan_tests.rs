@@ -1782,9 +1782,25 @@ fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
             },
         )
         .expect("the edit is an answer");
-    wait_for("the replacement to dispatch", || {
-        e.worker.calls().iter().any(|c| c.2 == "rep:understand")
-    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !e.worker.calls().iter().any(|c| c.2 == "rep:understand") {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !e.worker.calls().iter().any(|c| c.2 == "rep:understand") {
+        let v = view(&e, "rep");
+        panic!(
+            "the replacement never dispatched: status {:?} unit_ix {} attempt {}; units {:?}; awaiting {:?}; dispatched {:?}; accepted {:?}; refused {:?}; decided {:?}",
+            v.session.status,
+            v.session.unit_ix,
+            v.session.attempt,
+            v.units.iter().map(|u| (u.id.clone(), u.ord, u.catalog.clone(), format!("{:?}", u.status))).collect::<Vec<_>>(),
+            e.awaiting("rep"),
+            e.worker.calls(),
+            payloads(&e, "rep", tev::PLAN_ACCEPTED).iter().map(|p| (p["plan_rev"].clone(), step_ids(&p["steps"]))).collect::<Vec<_>>(),
+            payloads(&e, "rep", tev::PLAN_REFUSED),
+            payloads(&e, "rep", tev::GATE_DECIDED),
+        );
+    }
     let units = view(&e, "rep").units;
     let fresh = units
         .iter()

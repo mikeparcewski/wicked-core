@@ -3425,8 +3425,12 @@ pub(super) fn revise_units(
             && o.validator == u.validator
             && o.budget_secs == u.budget_secs
     };
+    // Only an id the plan no longer has leaves the store; a same-id step of a different shape is
+    // a replacement planned FRESH below, whose node overwrites the old one (the launch-gate edit's
+    // own order: write the plan's units, then remove the ids it dropped) — removing first and
+    // inserting under the same id left the run with no unit to dispatch.
     for o in &old[cursor..] {
-        if !planned.iter().any(|u| same_phase(o, u)) {
+        if !planned.iter().any(|u| u.id == o.id) {
             store.remove_file(&o.to_node().location.file)?;
         }
     }
