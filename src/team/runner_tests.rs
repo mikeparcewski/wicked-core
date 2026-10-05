@@ -1367,3 +1367,464 @@ fn t6_j_no_direct_team_channel_is_left_in_src() {
     }
     assert!(hits.is_empty(), "{hits:#?}");
 }
+
+// ── ASK-K3c (DES-ASK-TEAM-CHAT-001 §4.5, §4.7): the boundary renders the team's non-answers ────
+
+/// The `[team advice]` block renders a non-answered `help.answered` by its OUTCOME — "did not
+/// answer (timed out)" with the reason, never an empty "answers:" line — and a `plan.refused` of
+/// the PA's OWN proposal with its reason; a refusal of someone else's proposal is not the PA's
+/// business. Both are shown once: a later step of the same seat has already seen them (the same
+/// stateless dedup every team answer uses).
+#[test]
+fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_once() {
+    let rig = rig("k3c");
+    let run = "k3c";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    // An attempt that reached its boundary and finished: its claim cuts a window (K3c round 4).
+    let complete = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                p["answers_presented"] = json!(true);
+            }),
+        )
+    };
+    claim(1);
+    // `help_id` is minted from `help_seq` (T2 §6.1): read it off the row as published.
+    let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
+        p["ord"] = json!(1);
+        p["attempt"] = json!(0);
+        p["by"] = json!("claude#1");
+        p["question"] = json!("does the retire flow cancel its fetch?");
+    });
+    publish(&rig, &asked);
+    let help_id = asked.to_payload().unwrap()["help_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    publish(
+        &rig,
+        &fixture_with(tev::HELP_ANSWERED, 1, run, |p| {
+            assert_eq!(p["outcome"], "timed_out", "fixture #1 is the timed-out row");
+            p["ord"] = json!(1);
+            p["attempt"] = json!(0);
+            p["by"] = json!("claude#2");
+            p["help_id"] = json!(help_id);
+            p["error"] = json!("member turn exceeded 240 s");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_PROPOSED, 0, run, |p| {
+            p["by"] = json!("claude#1");
+            p["proposal_id"] = json!("p-own");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-own");
+            p["reason"] =
+                json!("no repo bound: the path has no worktree for a step that executes code");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-other");
+            p["reason"] = json!("someone else's");
+        }),
+    );
+    complete(1);
+    let c2 = claim(2);
+    let claimed = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 2,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-2".into(),
+        stream_floor: floor,
+        claimed_id: c2,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    let text = boundary(&claimed).block.expect("a block").output;
+    assert!(
+        text.contains("does the retire flow cancel its fetch?"),
+        "{text}"
+    );
+    assert!(
+        text.contains("claude#2 did not answer (timed out): member turn exceeded 240 s"),
+        "{text}"
+    );
+    assert!(!text.contains("answers: "), "{text}");
+    assert!(
+        text.contains("your plan proposal p-own was refused: no repo bound"),
+        "{text}"
+    );
+    assert!(!text.contains("p-other"), "{text}");
+    // A later step of the same seat was already shown both.
+    complete(2);
+    let c3 = claim(3);
+    let later = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..claimed
+    };
+    assert!(boundary(&later)
+        .block
+        .is_none_or(|b| !b.output.contains("did not answer") && !b.output.contains("p-own")));
+}
+
+/// (codex review of #740) The boundary owns the rows between the seat's previous claim and its
+/// own: an answer that lands AFTER this claim (between the claim and the boundary read) is not
+/// this boundary's — it renders at the seat's next boundary, once — and an answer before the
+/// previous claim was that boundary's. Nothing renders twice, nothing stateful.
+#[test]
+fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders_once() {
+    let rig = rig("k3cwin");
+    let run = "k3cwin";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    // An attempt that reached its boundary and finished: its claim cuts a window (K3c round 4).
+    let complete = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                p["answers_presented"] = json!(true);
+            }),
+        )
+    };
+    let c1 = claim(1);
+    let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
+        p["ord"] = json!(1);
+        p["attempt"] = json!(0);
+        p["by"] = json!("claude#1");
+        p["question"] = json!("late question");
+    });
+    publish(&rig, &asked);
+    let help_id = asked.to_payload().unwrap()["help_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    publish(
+        &rig,
+        &fixture_with(tev::HELP_ANSWERED, 0, run, |p| {
+            p["ord"] = json!(1);
+            p["attempt"] = json!(0);
+            p["by"] = json!("claude#2");
+            p["help_id"] = json!(help_id);
+            p["answer"] = json!("late answer");
+        }),
+    );
+    let at_c1 = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 1,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-1".into(),
+        stream_floor: floor,
+        claimed_id: c1,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    assert!(
+        boundary(&at_c1)
+            .block
+            .is_none_or(|b| !b.output.contains("late answer")),
+        "a row after the claim is the next boundary's"
+    );
+    complete(1);
+    let c2 = claim(2);
+    let at_c2 = Claimed {
+        ord: 2,
+        claimed_id: c2,
+        step_id: "answer-2".into(),
+        ..at_c1
+    };
+    let text = boundary(&at_c2).block.expect("a block").output;
+    assert!(text.contains("late answer"), "{text}");
+    complete(2);
+    let c3 = claim(3);
+    let at_c3 = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..at_c2
+    };
+    assert!(boundary(&at_c3)
+        .block
+        .is_none_or(|b| !b.output.contains("late answer")));
+}
+
+/// (codex review of #740 round 2) The team's answers are fitted by priority within the cap: the
+/// PA's own refusal renders even when eight long help answers would fill the block, and what did
+/// not fit is counted, never silently cut; findings get only the remaining room, and a finding
+/// that does not fit under a reduced cap is `rest` (no `advice.delivered` for cut text).
+#[test]
+fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
+    let rig = rig("k3ccap");
+    let run = "k3ccap";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    // An attempt that reached its boundary and finished: its claim cuts a window (K3c round 4).
+    let complete = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                p["answers_presented"] = json!(true);
+            }),
+        )
+    };
+    claim(1);
+    for n in 0..8u32 {
+        let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
+            p["ord"] = json!(1);
+            p["attempt"] = json!(0);
+            p["by"] = json!("claude#1");
+            p["help_seq"] = json!(n + 1);
+            p["question"] = json!("q".repeat(500));
+        });
+        publish(&rig, &asked);
+        let help_id = asked.to_payload().unwrap()["help_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        publish(
+            &rig,
+            &fixture_with(tev::HELP_ANSWERED, 0, run, |p| {
+                p["ord"] = json!(1);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#2");
+                p["help_id"] = json!(help_id);
+                p["answer_id"] = json!(format!("t-{n}"));
+                p["answer"] = json!("a".repeat(2000));
+            }),
+        );
+    }
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_PROPOSED, 0, run, |p| {
+            p["by"] = json!("claude#1");
+            p["proposal_id"] = json!("p-late");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-late");
+            p["reason"] = json!("no repo bound");
+        }),
+    );
+    complete(1);
+    let c2 = claim(2);
+    let claimed = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 2,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-2".into(),
+        stream_floor: floor,
+        claimed_id: c2,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    let text = boundary(&claimed).block.expect("a block").output;
+    assert!(text.len() <= crate::team::ADVICE_TEXT_CAP, "{}", text.len());
+    assert!(
+        text.contains("your plan proposal p-late was refused"),
+        "the refusal outranks the help answers"
+    );
+    assert!(
+        text.contains("more answers did not fit; see the stream"),
+        "the omitted answers are counted"
+    );
+    // What did not fit carries to the seat's next boundary (round 3): nothing is lost to the cap.
+    complete(2);
+    let c3 = claim(3);
+    let next = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..claimed
+    };
+    let text3 = boundary(&next).block.expect("the carried answers").output;
+    assert!(
+        text3.contains("you asked: qqq") && !text3.contains("p-late"),
+        "the carried help answers render once, the refusal not again"
+    );
+    let shown_total =
+        text.matches("you asked: qqq").count() + text3.matches("you asked: qqq").count();
+    complete(3);
+    let c4 = claim(4);
+    let after = Claimed {
+        ord: 4,
+        claimed_id: c4,
+        step_id: "answer-4".into(),
+        ..next
+    };
+    let rest = boundary(&after)
+        .block
+        .map(|b| b.output.matches("you asked: qqq").count())
+        .unwrap_or(0);
+    assert_eq!(
+        shown_total + rest,
+        8,
+        "every help answer renders exactly once"
+    );
+    let f = Finding {
+        finding_id: String::new(),
+        monitor_id: "m1".into(),
+        seat: "claude#2".into(),
+        severity: Severity::High,
+        path: "src/x.rs".into(),
+        line: 1,
+        evidence: "x".into(),
+        claim: "c".repeat(400),
+        suggestion: None,
+        tree: "t".into(),
+        in_diff: true,
+        checkpoint_seq: 0,
+        anchor: String::new(),
+        carried_from_attempt: None,
+        target: Default::default(),
+    };
+    let (block, sent, rest) =
+        crate::team::advice_block_within(vec![crate::team::Advice { finding: f }], 100);
+    assert!(block.is_empty() && sent.is_empty() && rest.len() == 1);
+}
+
+/// (codex review of #740 rounds 5–6) A completion that does NOT say its answers were presented
+/// (the boundary could not read the stream, or a repo-checks re-run skipped the seat) cuts no
+/// window: the rows carry on to the next boundary; a presented completion cuts.
+#[test]
+fn k3c_an_unpresented_completion_cuts_no_window() {
+    let rig = rig("k3cunp");
+    let run = "k3cunp";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    let complete = |ord: u32, presented: bool| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                if presented {
+                    p["answers_presented"] = json!(true);
+                }
+            }),
+        )
+    };
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_PROPOSED, 0, run, |p| {
+            p["by"] = json!("claude#1");
+            p["proposal_id"] = json!("p-unp");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-unp");
+            p["reason"] = json!("no repo bound");
+        }),
+    );
+    claim(1);
+    complete(1, false); // the boundary at 1 could not read the stream: nothing was presented
+    let c2 = claim(2);
+    let at_c2 = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 2,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-2".into(),
+        stream_floor: floor,
+        claimed_id: c2,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    let text = boundary(&at_c2).block.expect("a block").output;
+    assert!(
+        text.contains("p-unp"),
+        "an unpresented window carries on: {text}"
+    );
+    complete(2, true);
+    let c3 = claim(3);
+    let at_c3 = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..at_c2
+    };
+    assert!(boundary(&at_c3)
+        .block
+        .is_none_or(|b| !b.output.contains("p-unp")));
+}

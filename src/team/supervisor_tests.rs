@@ -383,6 +383,8 @@ impl Harness {
             p["step_id"] = json!(step);
             p["status"] = json!(status);
             p["output_ref"] = json!(format!("unit:{RUN}:{ord}:{attempt}"));
+            // (ASK-K3c) The harness's completions presented their boundary block.
+            p["answers_presented"] = json!(true);
         }))
     }
 
@@ -1511,7 +1513,9 @@ fn t6_e_a_help_line_is_asked_answered_and_rendered_at_the_next_boundary() {
     let text = b.block.expect("a block").output;
     assert!(text.contains("use the retry helper"), "{text}");
     assert!(text.contains("which helper retries a fetch?"), "{text}");
-    // A later step of the same seat was already shown it.
+    // A later step of the same seat was already shown it — once the step that showed it has
+    // completed (ASK-K3c: a claim with no `step.completed` of its own presented nothing).
+    h.complete_step(4, 0, "claude#1", "test", "ok");
     let later_id = h.claim_step(5, 0, "claude#1", "review", false);
     let later = super::super::runner::Claimed {
         ord: 5,

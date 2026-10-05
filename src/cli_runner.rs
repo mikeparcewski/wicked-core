@@ -934,9 +934,13 @@ fn run_unit_and_judge_on(
         }
     };
     // The step-boundary injector (§8.9): the advice every carrier receives, as prior context.
+    // (ASK-K3c) Whether the boundary's team answers reached a seat turn: the stream read
+    // succeeded and the seat ran (not a repo-checks re-run). Stamped on `step.completed`.
+    let mut boundary_read = false;
     let advised: Option<StepInput> = match &attempt_team {
         crate::team::runner::Attempt::Claimed(c) => {
             let b = crate::team::runner::boundary(c);
+            boundary_read = b.unread.is_none();
             if let Some(why) = &b.unread {
                 eprintln!(
                     "wicked-core: unit {}: team advice unavailable at the step boundary ({why}); \
@@ -997,7 +1001,15 @@ fn run_unit_and_judge_on(
     let mut team_snapshot: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
         crate::team::runner::Attempt::NotTeam => None,
         crate::team::runner::Attempt::Local(s) => Some((**s).clone()),
-        crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete(c, &output)),
+        // Presented = the block was built from a read stream AND a seat turn consumed it: a
+        // repo-checks re-run never runs the seat, and a carrier that refused the launch before
+        // any prompt (a skills refusal) returns a failed output with no turn behind it (codex
+        // review of #740 round 7) — only an `Ok` turn proves the seat saw its prior context.
+        crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete_with(
+            c,
+            &output,
+            boundary_read && floor_rerun.is_none() && output.status == StepStatus::Ok,
+        )),
     };
     // DES-002 §8.8: the PA's review of a member's step is team evidence, never the gate — the
     // member's step already had its gate (its creator, the member, excluded). No judge, no floor:

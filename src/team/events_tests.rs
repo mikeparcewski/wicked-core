@@ -921,6 +921,7 @@ impl Stream {
                 tree: Some("t-final".into()),
                 output_bytes: 10,
                 output_ref: "unit:r1:3:1".into(),
+                answers_presented: true,
             }),
         )
     }

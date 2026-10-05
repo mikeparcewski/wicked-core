@@ -1340,23 +1340,43 @@ fn advice_entry(f: &Finding) -> String {
 /// entry is always included, truncated to fit if it alone is over the cap, so a single oversized
 /// finding can never wedge the queue.
 pub(crate) fn advice_block(advice: Vec<Advice>) -> (String, Vec<Advice>, Vec<Advice>) {
-    let budget = ADVICE_TEXT_CAP.saturating_sub(ADVICE_HEADER.len() + ADVICE_FOOTER.len());
+    advice_block_within(advice, ADVICE_TEXT_CAP)
+}
+
+/// [`advice_block`] within `cap` bytes: the boundary renders the team's answers first (they have
+/// no delivery row to make them retry) and gives the findings what is left — a finding that does
+/// not fit is `rest`, not `sent`, so its `advice.delivered` is never published for text that was
+/// cut (ASK-K3c, codex review of #740).
+pub(crate) fn advice_block_within(
+    advice: Vec<Advice>,
+    cap: usize,
+) -> (String, Vec<Advice>, Vec<Advice>) {
+    // With the WHOLE cap the first entry is always sent, truncated if it must be: a finding
+    // larger than the cap would otherwise never deliver. With a reduced cap (the team's answers
+    // took room) nothing is forced: a finding that does not fit is `rest`, and the next boundary
+    // — its answers already shown — has the whole cap for it (codex review of #740 round 2).
+    let whole = cap >= ADVICE_TEXT_CAP;
+    let budget = cap.saturating_sub(ADVICE_HEADER.len() + ADVICE_FOOTER.len());
     let mut body = String::new();
     let mut sent = Vec::new();
     let mut rest = Vec::new();
     for a in advice {
         let entry = advice_entry(&a.finding);
-        if !rest.is_empty() || (!sent.is_empty() && body.len() + entry.len() > budget) {
+        let fits = body.len() + entry.len() <= budget;
+        if !rest.is_empty() || (!fits && (!sent.is_empty() || !whole)) {
             rest.push(a);
             continue;
         }
-        if sent.is_empty() && entry.len() > budget {
+        if !fits {
             body.push_str(&cap_utf8(&entry, budget.saturating_sub(1)));
             body.push('\n');
         } else {
             body.push_str(&entry);
         }
         sent.push(a);
+    }
+    if sent.is_empty() {
+        return (String::new(), sent, rest);
     }
     (format!("{ADVICE_HEADER}{body}{ADVICE_FOOTER}"), sent, rest)
 }

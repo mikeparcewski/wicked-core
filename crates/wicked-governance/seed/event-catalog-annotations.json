@@ -178,7 +178,7 @@
   },
   "wicked.team.step.completed": {
     "trigger": "R: the step's turn returned",
-    "payload": "`step_id`, `status`, `tree`, `output_bytes`, `output_ref`; key: `step_id`, attempt, by; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`step_id`, `status`, `tree`, `output_bytes`, `output_ref`, `answers_presented` (omitted when false: the boundary block reached a seat turn); key: `step_id`, attempt, by; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.step.reviewed": {
     "trigger": "R: the PA accepted or rejected a member's step (`STEP` line)",

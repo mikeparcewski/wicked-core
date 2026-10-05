@@ -502,7 +502,7 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
         .into_iter()
         .filter(|(k, f)| !injected.contains(&(*k, f.finding_id.clone())))
         .collect();
-    let answers = team_answers(&stream.rows, claimed);
+    let answers = team_answers(&stream.rows, claimed, super::ADVICE_TEXT_CAP);
     if pending.is_empty() && answers.is_empty() {
         return Boundary::default();
     }
@@ -510,15 +510,15 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
         .iter()
         .map(|(_, f)| super::Advice { finding: f.clone() })
         .collect();
-    let (mut text, sent, _rest) = if advice.is_empty() {
+    // (ASK-K3c) The team's answers first: a help outcome or the PA's own refusal has no
+    // `advice.delivered` row to bring it back if the cap cuts it, a finding does.
+    let mut text = answers;
+    let (block, sent, _rest) = if advice.is_empty() {
         (String::new(), Vec::new(), Vec::new())
     } else {
-        super::advice_block(advice)
+        super::advice_block_within(advice, super::ADVICE_TEXT_CAP.saturating_sub(text.len()))
     };
-    if !answers.is_empty() {
-        let room = super::ADVICE_TEXT_CAP.saturating_sub(text.len());
-        text.push_str(&cap_utf8(&answers, room));
-    }
+    text.push_str(&block);
     let delivery_id = tev::delivery_id_boundary(&claimed.step_id, claimed.attempt);
     let mut rendered = Vec::new();
     for a in &sent {
@@ -574,55 +574,150 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
 /// The team's answers the PA has not been shown yet (§8.9): `help.answered`, `council.ruled` and
 /// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
 /// than its own claim) — a claim after the row means that step's boundary read it.
-fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
-    let later_claim = |event_id: i64| {
-        rows.iter().any(|r| {
-            r.event_id > event_id
-                && r.event_id != claimed.claimed_id
+/// (ASK-K3c) One rendered team answer is at most this long, so that any entry fits an otherwise
+/// empty `[team advice]` window (the 8 KB `ADVICE_TEXT_CAP` minus header and footer).
+const ANSWER_ENTRY_CAP: usize = 3 * 1024;
+/// The joined evidence citations of one help answer, in the rendered line.
+const ANSWER_EVIDENCE_CAP: usize = 1024;
+
+fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
+    // (ASK-K3c, codex review of #740 rounds 1–3) Every answer renders at exactly ONE boundary of
+    // the seat, statelessly: this seat's claims on the stream cut it into windows; each window's
+    // rows plus what earlier windows could not fit are packed by priority into the cap, and what
+    // still does not fit carries to the next window. Replaying that packing over the seat's
+    // earlier claims tells this boundary exactly what is still unshown — no delivery row, the
+    // same answer after a restart.
+    // Only a claim whose attempt COMPLETED cut a window: it reached its boundary and presented
+    // what it packed. A claim with no `step.completed` of its own (the process died between the
+    // claim and the boundary, or the attempt was redriven) presented nothing, so its rows stay
+    // in the next window (codex review of #740 round 4). The current claim always cuts.
+    // And only a completion that says its boundary block was PRESENTED (`answers_presented`: the
+    // stream read succeeded and a seat turn ran) — an attempt told "advice unavailable", or a
+    // repo-checks re-run that skipped the seat, showed nothing (round 5): its rows carry on.
+    let completed: BTreeSet<(Option<u32>, Option<u32>)> = rows
+        .iter()
+        .filter(|r| {
+            matches!(&r.event.body, TeamBody::StepCompleted(b) if b.answers_presented)
+                && r.event.env.by == claimed.by
+        })
+        .map(|r| (r.event.env.ord, r.event.env.attempt))
+        .collect();
+    let mut seat_claims: Vec<i64> = rows
+        .iter()
+        .filter(|r| {
+            r.event_id < claimed.claimed_id
                 && r.event.env.by == claimed.by
                 && matches!(r.event.body, TeamBody::StepClaimed(_))
+                && completed.contains(&(r.event.env.ord, r.event.env.attempt))
         })
-    };
+        .map(|r| r.event_id)
+        .collect();
+    seat_claims.sort_unstable();
+    seat_claims.push(claimed.claimed_id);
     let question = |help_id: &str| {
         rows.iter().find_map(|r| match &r.event.body {
             TeamBody::HelpRequested(h) if h.help_id == help_id => Some(h.question.clone()),
             _ => None,
         })
     };
-    let mut out = String::new();
+    // (ASK-K3c) The PA's own proposals: a `plan.refused` of one of them is the engine telling the
+    // PA its `PLAN+` did not take (one seat on the roster, no repo for a step that executes code,
+    // a malformed step), rendered once like every other answer here.
+    let own_proposals: BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| match &r.event.body {
+            TeamBody::PlanProposed(p) if r.event.env.by == claimed.by => {
+                Some(p.proposal_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    // Rows are rendered by priority within `cap` — the PA's own refusals first (small and
+    // decisive), then help, councils, change requests — each whole or not at all, and what did
+    // not fit is counted in a closing line, never silently cut (codex review of #740 round 2).
+    // Every entry is bounded at ANSWER_ENTRY_CAP so any entry fits an empty window: a row that
+    // could never fit would otherwise sit in the carry forever (round 4).
+    let mut entries: Vec<(i64, u8, String)> = Vec::new();
     for r in rows {
-        if later_claim(r.event_id) {
+        if r.event_id >= claimed.claimed_id {
             continue;
         }
+        let at = r.event_id;
         match &r.event.body {
-            TeamBody::HelpAnswered(b) => out.push_str(&format!(
-                "- help {} — you asked: {}\n  {} answers: {}{}\n",
-                b.help_id,
-                cap_utf8(&question(&b.help_id).unwrap_or_default(), 512),
-                r.event.env.by,
-                cap_utf8(b.answer.as_deref().unwrap_or(""), 2 * 1024),
-                if b.evidence.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (evidence: {})", b.evidence.join(", "))
-                }
+            // (ASK-K3c, DES-ASK-TEAM-CHAT-001 §4.5) A help row is rendered by its OUTCOME: the
+            // answer when the member answered, else the fact that it did not and why — never an
+            // empty "answers:" line (codex review of #737).
+            TeamBody::HelpAnswered(b) => {
+                let asked = cap_utf8(&question(&b.help_id).unwrap_or_default(), 512);
+                let reply = match &b.outcome {
+                    tev::HelpOutcome::Answered => format!(
+                        "{} answers: {}{}",
+                        r.event.env.by,
+                        cap_utf8(b.answer.as_deref().unwrap_or(""), 2 * 1024),
+                        if b.evidence.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " (evidence: {})",
+                                cap_utf8(&b.evidence.join(", "), ANSWER_EVIDENCE_CAP)
+                            )
+                        }
+                    ),
+                    other => format!(
+                        "{} did not answer ({}){}",
+                        r.event.env.by,
+                        match other {
+                            tev::HelpOutcome::TimedOut => "timed out",
+                            tev::HelpOutcome::Failed => "the turn failed",
+                            tev::HelpOutcome::NoMember => "no other helper is signed in to answer",
+                            tev::HelpOutcome::Answered => unreachable!(),
+                        },
+                        b.error
+                            .as_deref()
+                            .filter(|e| !e.is_empty())
+                            .map(|e| format!(": {}", cap_utf8(e, 512)))
+                            .unwrap_or_default()
+                    ),
+                };
+                entries.push((
+                    at,
+                    1,
+                    format!("- help {} — you asked: {}\n  {}\n", b.help_id, asked, reply),
+                ));
+            }
+            TeamBody::PlanRefused(b) if own_proposals.contains(b.proposal_id.as_str()) => entries
+                .push((
+                    at,
+                    0,
+                    format!(
+                        "- your plan proposal {} was refused: {}\n",
+                        b.proposal_id,
+                        cap_utf8(&b.reason, 512)
+                    ),
+                )),
+            TeamBody::CouncilRuled(b) => entries.push((
+                at,
+                2,
+                format!(
+                    "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
+                    b.subject,
+                    r.event.env.ord.unwrap_or_default(),
+                    r.event.env.attempt.unwrap_or_default(),
+                    token(&b.verdict).to_ascii_uppercase(),
+                    b.reason
+                        .map(|x| format!(" ({})", token(&x)))
+                        .unwrap_or_default(),
+                    if b.dissent.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — dissent: {}", cap_utf8(&b.dissent.join(" | "), 512))
+                    }
+                ),
             )),
-            TeamBody::CouncilRuled(b) => out.push_str(&format!(
-                "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
-                b.subject,
-                r.event.env.ord.unwrap_or_default(),
-                r.event.env.attempt.unwrap_or_default(),
-                token(&b.verdict).to_ascii_uppercase(),
-                b.reason
-                    .map(|x| format!(" ({})", token(&x)))
-                    .unwrap_or_default(),
-                if b.dissent.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — dissent: {}", cap_utf8(&b.dissent.join(" | "), 512))
-                }
-            )),
-            TeamBody::ChangeRequested(b) => out.push_str(&format!(
+            TeamBody::ChangeRequested(b) => entries.push((
+                at,
+                3,
+                format!(
                 "- change requested {} by {}: steps [{}] — {}. Answer `PLAN {}: ACCEPT` and on the \
                  next line the steps you accept as `PLAN+ {{\"steps\":[{{\"catalog\":\"…\"}}]}}`, \
                  or `PLAN {}: DECLINE — <why>`.\n",
@@ -636,14 +731,79 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
                 cap_utf8(&b.reason, 512),
                 b.change_id,
                 b.change_id
+            ),
             )),
             _ => {}
         }
     }
-    if out.is_empty() {
-        return out;
+    if entries.is_empty() {
+        return String::new();
     }
-    format!("\n[team answers · ADVISORY: the team's replies since your last step]\n{out}")
+    let entries: Vec<(i64, u8, String)> = entries
+        .into_iter()
+        .map(|(at, p, line)| {
+            if line.len() <= ANSWER_ENTRY_CAP {
+                (at, p, line)
+            } else {
+                const SUFFIX: &str = " … (cut; see the stream)\n";
+                let mut cut = cap_utf8(&line, ANSWER_ENTRY_CAP - SUFFIX.len());
+                cut.push_str(SUFFIX);
+                (at, p, cut)
+            }
+        })
+        .collect();
+    const HEADER: &str = "\n[team answers · ADVISORY: the team's replies since your last step]\n";
+    let footer = |n: usize| format!("- (+{n} more answers did not fit; see the stream)\n");
+    // Pack one window: by priority, then stream order; whole lines only. Returns (shown, unshown).
+    let pack = |mut pending: Vec<(i64, u8, String)>| -> (Vec<String>, Vec<(i64, u8, String)>) {
+        pending.sort_by_key(|(at, p, _)| (*p, *at));
+        // The footer is reserved at the width of the LARGEST count this window could omit.
+        let budget = cap.saturating_sub(HEADER.len() + footer(pending.len()).len());
+        let mut used = 0usize;
+        let mut shown = Vec::new();
+        let mut unshown = Vec::new();
+        for e in pending {
+            if used + e.2.len() > budget {
+                unshown.push(e);
+                continue;
+            }
+            used += e.2.len();
+            shown.push(e.2);
+        }
+        (shown, unshown)
+    };
+    let mut carry: Vec<(i64, u8, String)> = Vec::new();
+    let mut prev = 0i64;
+    let mut rendered: Vec<String> = Vec::new();
+    let mut omitted = 0usize;
+    for claim in seat_claims {
+        let mut window: Vec<(i64, u8, String)> = std::mem::take(&mut carry);
+        window.extend(
+            entries
+                .iter()
+                .filter(|(at, _, _)| *at > prev && *at < claim)
+                .cloned(),
+        );
+        let (shown, unshown) = pack(window);
+        if claim == claimed.claimed_id {
+            omitted = unshown.len();
+            rendered = shown;
+        } else {
+            carry = unshown;
+        }
+        prev = claim;
+    }
+    if rendered.is_empty() && omitted == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in rendered {
+        out.push_str(&line);
+    }
+    if omitted > 0 {
+        out.push_str(&footer(omitted));
+    }
+    format!("{HEADER}{out}")
 }
 
 fn completion(status: StepStatus) -> StepCompletion {
@@ -702,11 +862,24 @@ fn attempt_rows(claimed: &Claimed) -> anyhow::Result<(Vec<TeamRow>, usize)> {
 /// After the turn: publish `step.completed`, then wait (bounded) for S's `ledger.folded` of this
 /// attempt (§8.11). On timeout, synthesize DES-001 §4.7's fail-closed ledger from the attempt's
 /// own rows WITHOUT publishing it. The result is the attempt's snapshot for `UnitEvidence.team`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn complete(claimed: &Claimed, output: &StepOutput) -> UnitTeamSnapshot {
+    complete_with(claimed, output, true)
+}
+
+/// [`complete`] stating whether the attempt's boundary block was presented to a seat turn
+/// (`step.completed.answers_presented`, ASK-K3c): false when the boundary could not read the
+/// stream or the seat never ran (a repo-checks re-run), so the seat's next boundary re-renders.
+pub fn complete_with(
+    claimed: &Claimed,
+    output: &StepOutput,
+    answers_presented: bool,
+) -> UnitTeamSnapshot {
     complete_at(
         claimed,
         output,
         Instant::now() + claimed.runner.final_pass_budget,
+        answers_presented,
     )
 }
 
@@ -862,7 +1035,12 @@ fn publish_turn_lines(claimed: &Claimed, output: &StepOutput) {
     }
 }
 
-fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> UnitTeamSnapshot {
+fn complete_at(
+    claimed: &Claimed,
+    output: &StepOutput,
+    deadline: Instant,
+    answers_presented: bool,
+) -> UnitTeamSnapshot {
     let output_ref = format!(
         "unit:{}:{}:{}",
         claimed.run_id, claimed.ord, claimed.attempt
@@ -890,6 +1068,7 @@ fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> Uni
             tree: None,
             output_bytes: output.output.len() as u64,
             output_ref,
+            answers_presented,
         }),
     };
     let mut completed_id: Option<i64> = None;
