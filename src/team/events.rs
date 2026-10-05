@@ -952,6 +952,13 @@ pub struct StepCompleted {
     pub tree: Option<String>,
     pub output_bytes: u64,
     pub output_ref: String,
+    /// (ASK-K3c) Whether this attempt's `[team advice]` boundary block — the team's answers since
+    /// the seat's last step — was built from a successful stream read AND handed to a seat turn.
+    /// The boundary renderer cuts a seat's answer windows only at completions that carry it: an
+    /// attempt whose boundary could not read the stream, or a repo-checks re-run that skipped the
+    /// seat turn, presented nothing. Omitted when false (old rows read as false).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answers_presented: bool,
 }
 
 /// 18 — `step.reviewed` (R). The envelope's `(ord, attempt)` is the REVIEW attempt (the PA's turn
