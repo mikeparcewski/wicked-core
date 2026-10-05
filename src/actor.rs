@@ -10735,6 +10735,34 @@ pub(crate) fn confirm_gate(
                     }
                 }
             }
+            // (DES-ASK-TEAM-CHAT-001 §3, ASK-K2a) THE revision hook (DES-TEAMING-002 §8.7 "every
+            // advance goes through here"), reached from the gate too: a plan edit held while the
+            // run waited at this gate — `Core::propose_plan` → `team_plan.edits`, or the PA's own
+            // held lines — is applied BEFORE the cursor unit is chosen. Without it a one-step path
+            // paused at its terminal gate would `finalize_run` past the step the operator just
+            // added (the §3 fixture: propose `answer-2`, approve → the run completed). Same guard
+            // as the advance (`apply_held_revision`: cursor Pending/Distributed or absent); a run
+            // with nothing held is byte-identical. A revision the matrix holds for approval opens
+            // its own `plan_approval` gate and the run stays paused on it.
+            let rev_before = session.team_plan.as_ref().map_or(0, |t| t.accepted_rev);
+            if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
+                emit_run_error(subscribers, run_id, e);
+            }
+            let session = crate::domain::get_session(store, run_id)?
+                .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+            if session
+                .team_plan
+                .as_ref()
+                .is_some_and(|t| t.pending.is_some())
+            {
+                return Ok(SessionStatus::AwaitingHuman);
+            }
+            // A revision was accepted here: its `plan.accepted` is a P1 REQUIRED transition that
+            // `gate_before_dispatch` publishes before the rev's first dispatch, which the direct
+            // dispatch below never reaches. So the revised run advances through the one hook
+            // instead, with the cursor unit released from the gates this approve answered — the
+            // plan-gate release's own move (`finish_release` → `advance_or_pause`, `released_ord`).
+            let revised = session.team_plan.as_ref().map_or(0, |t| t.accepted_rev) > rev_before;
             // Clear the pause → Executing, then dispatch the cursor unit directly (bypass should_pause
             // so it doesn't immediately re-pause on the same unit).
             let mut s = session;
@@ -10833,6 +10861,46 @@ pub(crate) fn confirm_gate(
                 },
             );
             in_flight.insert(run_id.to_string());
+            if revised {
+                // (ASK-K2a) Release the cursor unit from the human gates this approve answered and
+                // advance through the one hook: it publishes the new rev's `plan.accepted`
+                // (required) and dispatches on acknowledgement — exactly once, at attempt 0.
+                let mut released = crate::domain::get_session(store, run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+                if let Some(tp) = released.team_plan.as_mut() {
+                    tp.released_ord = Some(ord);
+                }
+                put_node(store, released.to_node())?;
+                return match advance_or_pause(
+                    store,
+                    subscribers,
+                    runner,
+                    self_tx,
+                    run_id,
+                    s.unit_ix,
+                    lifecycle_maps,
+                    actor_maps,
+                    process_gen,
+                    is_acp,
+                ) {
+                    Ok(Progress::Dispatched) | Ok(Progress::Deferred) => {
+                        Ok(SessionStatus::Executing)
+                    }
+                    Ok(Progress::Paused) => {
+                        in_flight.remove(run_id);
+                        Ok(SessionStatus::AwaitingHuman)
+                    }
+                    Ok(Progress::Done) => {
+                        in_flight.remove(run_id);
+                        finalize_run(store, subscribers, runner, self_tx, run_id)?;
+                        Ok(SessionStatus::Completed)
+                    }
+                    Err(e) => {
+                        in_flight.remove(run_id);
+                        Err(e)
+                    }
+                };
+            }
             match dispatch_unit(
                 store,
                 subscribers,
