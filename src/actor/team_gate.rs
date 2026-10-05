@@ -311,6 +311,11 @@ pub(super) fn repick_primary(
         pick_seq: seq,
     });
     rotate_first(&mut session.clis, |k| k == to);
+    // The plan state's roster too: a re-plan at a later gate edit re-distributes from it, and
+    // must not put the seat that just failed back in front.
+    if let Some(tp) = session.team_plan.as_mut() {
+        rotate_roster_values(&mut tp.roster, to);
+    }
     // The template the PA steps carry on the new seat: the launch roster's own when a unit of
     // this run already carries it, else the registry's (as `reseat_off_benched_seat` does).
     let invocation = units

@@ -416,6 +416,20 @@ fn a_pa_seat_failure_repicks_the_pa_and_redispatches_on_the_other_seat() {
     assert_eq!(r["by"], json!("engine"));
     let v = view(&rig.core, "rp");
     assert_eq!(v.session.clis, ["b", "a"], "the roster follows the pick");
+    let plan_roster: Vec<&str> = v
+        .session
+        .team_plan
+        .as_ref()
+        .expect("a team plan")
+        .roster
+        .iter()
+        .map(|c| c["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        plan_roster,
+        ["b", "a"],
+        "the plan state's roster (the re-plan's) follows too"
+    );
     let pick = v
         .session
         .team
