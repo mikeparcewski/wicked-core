@@ -1001,10 +1001,14 @@ fn run_unit_and_judge_on(
     let mut team_snapshot: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
         crate::team::runner::Attempt::NotTeam => None,
         crate::team::runner::Attempt::Local(s) => Some((**s).clone()),
+        // Presented = the block was built from a read stream AND a seat turn consumed it: a
+        // repo-checks re-run never runs the seat, and a carrier that refused the launch before
+        // any prompt (a skills refusal) returns a failed output with no turn behind it (codex
+        // review of #740 round 7) — only an `Ok` turn proves the seat saw its prior context.
         crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete_with(
             c,
             &output,
-            boundary_read && floor_rerun.is_none(),
+            boundary_read && floor_rerun.is_none() && output.status == StepStatus::Ok,
         )),
     };
     // DES-002 §8.8: the PA's review of a member's step is team evidence, never the gate — the
