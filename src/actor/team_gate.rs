@@ -3455,7 +3455,7 @@ pub(super) fn revise_units(
                 k.denial_reason = o.denial_reason.clone();
                 k.denial = o.denial.clone();
                 k.phase_status = o.phase_status.clone();
-                k.capture_report = o.capture_report.clone();
+                k.capture_report = o.capture_report;
                 k.worker_failed_clis = o.worker_failed_clis.clone();
                 k.team_run = o.team_run;
                 k.team = o.team.clone();
