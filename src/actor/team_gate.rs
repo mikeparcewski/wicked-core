@@ -3408,22 +3408,38 @@ pub(super) fn revise_units(
     // proposal had added — never one that ran: their units leave the store, as the launch-gate
     // edit's do (`replan_for_accepted_edit`). A "Not now" over a first-creator proposal
     // otherwise left the creator and its floor units stored and dispatchable.
-    let in_plan: std::collections::HashSet<&str> = planned.iter().map(|u| u.id.as_str()).collect();
-    for u in old[cursor..]
-        .iter()
-        .filter(|u| !in_plan.contains(u.id.as_str()))
-    {
-        store.remove_file(&u.to_node().location.file)?;
+    // A stored unit is KEPT only for a planned step of the same id AND the same phase shape; a
+    // step that reuses an id for different work (a whole-plan amendment's id-less `understand`
+    // defaulting onto a declined `build`'s id) is a replacement: the old unit leaves the store
+    // and the new one is planned fresh (codex review of #738 round 4).
+    let same_phase = |o: &crate::domain::WorkUnit, u: &crate::domain::WorkUnit| {
+        o.id == u.id
+            && o.catalog == u.catalog
+            && o.stage == u.stage
+            && o.role == u.role
+            && o.owner == u.owner
+            && o.gate == u.gate
+            && o.executes_code == u.executes_code
+            && o.tool_cmd == u.tool_cmd
+            && o.skill_ref == u.skill_ref
+            && o.validator == u.validator
+            && o.budget_secs == u.budget_secs
+    };
+    for o in &old[cursor..] {
+        if !planned.iter().any(|u| same_phase(o, u)) {
+            store.remove_file(&o.to_node().location.file)?;
+        }
     }
     let mut kept = Vec::new();
     let mut fresh = Vec::new();
     let mut fresh_dists = Vec::new();
     for (mut u, d) in planned.into_iter().zip(dists).skip(cursor) {
         let floor = ran_at(u.ord);
-        match old.iter().find(|o| o.id == u.id) {
+        match old.iter().find(|o| same_phase(o, &u)) {
             Some(o) => {
                 let mut k = o.clone();
                 k.ord = u.ord;
+                k.description = u.description.clone();
                 k.last_attempt = k.last_attempt.max(floor);
                 // (ASK-K2b; codex review of #738 round 3) The plan it now belongs to decides what
                 // it depends on: a kept evaluator whose creator the amendment replaced must point

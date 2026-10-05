@@ -1736,3 +1736,78 @@ fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
     assert!(payloads(&e, "nn", tev::PLAN_REFUSED).is_empty());
     release_all(&w);
 }
+
+/// (codex review of #738 round 4) A whole-plan amendment may reuse a declined step's id for
+/// DIFFERENT work: the held `produce:understand` (a creator step under an odd id) is dropped and
+/// the human's id-less `understand` defaults onto that id. The stored unit is a replacement, not
+/// a kept creator: it is planned fresh as the neutral `understand`, never dispatched as the
+/// declined `produce`.
+#[test]
+fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"understand"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("k2brep", w.clone());
+    launch(
+        &e,
+        "rep",
+        HumanConfirm::None,
+        plan(json!({"steps": [{"catalog": "understand", "id": "answer-1"}]})),
+    );
+    e.wait_awaiting("rep", "plan_approval", 1);
+    let held = view(&e, "rep").units;
+    let old = held
+        .iter()
+        .find(|u| u.id == "rep:understand")
+        .expect("the held produce under the id `understand`");
+    assert_eq!(old.catalog.as_deref(), Some("produce"));
+    assert_eq!(old.role, crate::workflow::PhaseRole::Creator);
+    e.core
+        .confirm_gate(
+            "rep",
+            HumanDecision::EditPlan {
+                plan: plan(json!({"steps": [
+                    {"catalog": "understand", "id": "answer-1"},
+                    {"catalog": "understand"}
+                ]})),
+            },
+        )
+        .expect("the edit is an answer");
+    wait_for("the replacement to dispatch", || {
+        e.worker.calls().iter().any(|c| c.2 == "rep:understand")
+    });
+    let units = view(&e, "rep").units;
+    let fresh = units
+        .iter()
+        .find(|u| u.id == "rep:understand")
+        .expect("the human's understand step");
+    assert_eq!(fresh.catalog.as_deref(), Some("understand"), "{fresh:?}");
+    assert_eq!(fresh.role, crate::workflow::PhaseRole::Neutral);
+    assert!(!fresh.executes_code);
+    assert_eq!(
+        units.len(),
+        2,
+        "{:?}",
+        units.iter().map(|u| &u.id).collect::<Vec<_>>()
+    );
+    let accepted = payloads(&e, "rep", tev::PLAN_ACCEPTED);
+    let last = accepted.last().unwrap();
+    assert!(
+        !last["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["catalog"] == "produce"),
+        "{last}"
+    );
+    release_all(&w);
+}
