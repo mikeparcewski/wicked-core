@@ -3127,6 +3127,8 @@ pub(super) fn propose_plan(
             kind: crate::team_events::ProposalKind::Edit,
             reason: None,
             steps: plan.steps.clone(),
+            touch: None,
+            scoring: None,
         },
         &done,
         &human_confirm,
@@ -3258,14 +3260,27 @@ pub(super) fn apply_held_revision(
             kind: crate::team_events::ProposalKind::Edit,
             reason: None,
             steps: edit.steps.clone(),
+            touch: None,
+            scoring: None,
         });
     }
     if let Some(r) = prior.rescored.clone() {
         changes.push(crate::plan_gate::Change::Floor(r));
     }
+    // (rev 15, ASK-K2b) A PA change that crosses into work is scored as an intent score against
+    // the run's graph: the actor hands the scope (it holds the session; `revise` stays pure).
+    let scope = crate::plan_gate::ScoreScope {
+        repo_root: session
+            .repo_ref
+            .as_deref()
+            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+            .map(|r| std::path::PathBuf::from(r.root_path)),
+        base_commit: session.base_commit.clone(),
+    };
     for l in &prior.plan_lines {
-        changes.extend(crate::plan_gate::changes_from_output(
-            &l.text, &l.by, l.ord, l.attempt,
+        changes.extend(crate::plan_gate::with_scoring(
+            crate::plan_gate::changes_from_output(&l.text, &l.by, l.ord, l.attempt),
+            &scope,
         ));
     }
     // What was held is taken, whatever comes of it.
@@ -3389,16 +3404,78 @@ pub(super) fn revise_units(
             .find(|o| o.ord == ord)
             .and_then(|o| o.last_attempt)
     };
+    // (ASK-K2b; codex review of #738) A revision accepted at a gate may DROP steps a held
+    // proposal had added — never one that ran: their units leave the store, as the launch-gate
+    // edit's do (`replan_for_accepted_edit`). A "Not now" over a first-creator proposal
+    // otherwise left the creator and its floor units stored and dispatchable.
+    // A stored unit is KEPT only for a planned step of the same id AND the same phase shape; a
+    // step that reuses an id for different work (a whole-plan amendment's id-less `understand`
+    // defaulting onto a declined `build`'s id) is a replacement: the old unit leaves the store
+    // and the new one is planned fresh (codex review of #738 round 4).
+    let same_phase = |o: &crate::domain::WorkUnit, u: &crate::domain::WorkUnit| {
+        o.id == u.id
+            && o.catalog == u.catalog
+            && o.stage == u.stage
+            && o.role == u.role
+            && o.owner == u.owner
+            && o.gate == u.gate
+            && o.executes_code == u.executes_code
+            && o.tool_cmd == u.tool_cmd
+            && o.skill_ref == u.skill_ref
+            && o.validator == u.validator
+            && o.budget_secs == u.budget_secs
+    };
+    // Only an id the plan no longer has leaves the store; a same-id step of a different shape is
+    // a replacement planned FRESH below, whose node overwrites the old one (the launch-gate edit's
+    // own order: write the plan's units, then remove the ids it dropped) — removing first and
+    // inserting under the same id left the run with no unit to dispatch.
+    for o in &old[cursor..] {
+        if !planned.iter().any(|u| u.id == o.id) {
+            store.remove_file(&o.to_node().location.file)?;
+        }
+    }
     let mut kept = Vec::new();
     let mut fresh = Vec::new();
     let mut fresh_dists = Vec::new();
     for (mut u, d) in planned.into_iter().zip(dists).skip(cursor) {
         let floor = ran_at(u.ord);
-        match old.iter().find(|o| o.id == u.id) {
+        match old.iter().find(|o| same_phase(o, &u)) {
             Some(o) => {
-                let mut k = o.clone();
-                k.ord = u.ord;
-                k.last_attempt = k.last_attempt.max(floor);
+                // (ASK-K2b; codex review of #738 rounds 3–5) The plan it now belongs to decides
+                // every PLANNED attribute — dependencies, description, and the flags derived from
+                // the surrounding phases (`repo_checks_floor`, `pre_build_scope`, `default_floor`,
+                // …) — so the kept unit is the NEW unit carrying the OLD unit's run state: what it
+                // did, who ran it, what it was denied, its team and worktree records, its reworks.
+                let mut k = u.clone();
+                k.status = o.status;
+                k.assigned_cli = o.assigned_cli.clone();
+                k.assigned_invocation = o.assigned_invocation.clone();
+                k.council_task_ref = o.council_task_ref.clone();
+                k.routing = o.routing.clone();
+                k.denial_reason = o.denial_reason.clone();
+                k.denial = o.denial.clone();
+                k.phase_status = o.phase_status.clone();
+                // Execution provenance the pipeline writes after a unit ran (its phase, claim
+                // and collection links; the seats it excluded) — codex review of #738 round 6.
+                k.phase_ref = o.phase_ref.clone();
+                k.conformance_ref = o.conformance_ref.clone();
+                k.collection_scope = o.collection_scope.clone();
+                k.exclude_seats = o.exclude_seats.clone();
+                k.capture_report = o.capture_report;
+                k.worker_failed_clis = o.worker_failed_clis.clone();
+                k.team_run = o.team_run;
+                k.team = o.team.clone();
+                k.member_step = o.member_step.clone();
+                k.scope_warnings = o.scope_warnings.clone();
+                k.worktree_guarded = o.worktree_guarded;
+                k.worktree_baseline = o.worktree_baseline.clone();
+                k.worktree_mutation = o.worktree_mutation.clone();
+                k.notes_root = o.notes_root.clone();
+                k.run_base_commit = o.run_base_commit.clone();
+                k.repo_checks = o.repo_checks.clone();
+                k.rework_of = o.rework_of;
+                k.rework_amendment = o.rework_amendment.clone();
+                k.last_attempt = o.last_attempt.max(floor);
                 kept.push(k);
             }
             None => {

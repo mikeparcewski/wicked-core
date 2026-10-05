@@ -42,7 +42,7 @@ pub(crate) use preview::preview_plan;
 pub use preview::PlanPreview;
 pub(crate) use revise::{
     changes_from_output, diff_score_for_run, floor_rises, hold_rescore, path_scored_diff,
-    plan_lines_of, revise, Change, DiffRescore, Outcome, PlanLines,
+    plan_lines_of, revise, with_scoring, Change, DiffRescore, Outcome, PlanLines, ScoreScope,
 };
 pub(crate) use scope::{
     decide_scoped, needs_pa_scope, scope_lines_of, scope_rev, with_scope_step, SCOPE_STEP_ID,
@@ -599,6 +599,9 @@ pub(crate) enum PlanEvent {
         previous_high_risk: bool,
         /// A human approved a high-risk rev of this run.
         approved_high_risk: bool,
+        /// (DES-TEAMING-002 rev 15, ASK-K2b) The revision crosses INTO WORK: a `kind:"change"`
+        /// that adds the first creator step to an accepted plan that had none.
+        first_creator: bool,
     },
 }
 
@@ -623,6 +626,18 @@ pub(crate) fn approval(
             Ok(Some(ApprovalReason::Override))
         };
     }
+    // (rev 15) Crossing into work is the row symmetric to crossing into high risk: approval in
+    // EVERY mode under its own reason (manual mode included — the row, not the mode, is why the
+    // gate opened; codex review of #738), and the more specific reason when the high-risk row
+    // fires too — the gate payload still says `high_risk: true`. "Chat first": work never starts
+    // from a conversation on the engine's say-so.
+    if let PlanEvent::Revision {
+        first_creator: true,
+        ..
+    } = event
+    {
+        return Ok(Some(ApprovalReason::FirstCreator));
+    }
     if !auto {
         return Ok(Some(ApprovalReason::ManualMode));
     }
@@ -631,6 +646,7 @@ pub(crate) fn approval(
         PlanEvent::Revision {
             previous_high_risk,
             approved_high_risk,
+            ..
         } => match (high_risk, previous_high_risk, approved_high_risk) {
             (false, _, _) => None,
             (true, false, _) => Some(ApprovalReason::IntoHighRisk),
@@ -931,6 +947,7 @@ pub(crate) fn decide(
         PlanEvent::Revision {
             previous_high_risk: prior.accepted_high_risk,
             approved_high_risk: prior.approved_high_risk,
+            first_creator: false,
         }
     };
     let needs = approval(
@@ -1541,6 +1558,7 @@ mod tests {
         let into = PlanEvent::Revision {
             previous_high_risk: false,
             approved_high_risk: false,
+            first_creator: false,
         };
         assert_eq!(approval(false, true, false, into), Ok(Some(ManualMode)));
         assert_eq!(approval(true, true, false, into), Ok(Some(IntoHighRisk)));
@@ -1548,6 +1566,7 @@ mod tests {
         let stays = PlanEvent::Revision {
             previous_high_risk: true,
             approved_high_risk: true,
+            first_creator: false,
         };
         assert_eq!(approval(false, true, false, stays), Ok(Some(ManualMode)));
         assert_eq!(approval(true, true, false, stays), Ok(None));
@@ -1555,12 +1574,14 @@ mod tests {
         let never = PlanEvent::Revision {
             previous_high_risk: true,
             approved_high_risk: false,
+            first_creator: false,
         };
         assert_eq!(approval(true, true, false, never), Ok(Some(HighRisk)));
         // Any other revision: manual approval, auto proceeds.
         let other = PlanEvent::Revision {
             previous_high_risk: false,
             approved_high_risk: false,
+            first_creator: false,
         };
         assert_eq!(approval(false, false, false, other), Ok(Some(ManualMode)));
         assert_eq!(approval(true, false, false, other), Ok(None));

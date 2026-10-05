@@ -1668,3 +1668,161 @@ fn t8_r4_the_preview_does_not_fetch_the_remote() {
 
 #[path = "scope_tests.rs"]
 mod scope_tests;
+
+// ── ASK-K2b (codex review of #738, round 2): "Not now" at the first-creator gate, end to end ───
+
+/// The PA's `PLAN+` at `answer-1`'s boundary adds the path's first creator step (`produce`, an
+/// artifact: no worktree needed) with a touch; the revision is held and the gate opens
+/// `plan_approval{reason:"first_creator"}` with the proposal's units already in the store. The
+/// human's "Not now" is an edit naming only the accepted steps: the next rev is accepted by the
+/// human, creator-less, the proposal's `docs` unit and its floor units are GONE from the store
+/// (never dispatchable), nothing is refused, and the run goes on to `answer-2`.
+#[test]
+fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"docs"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("k2bnn", w.clone());
+    let steps = json!({"steps": [
+        {"catalog": "understand", "id": "answer-1"},
+        {"catalog": "understand", "id": "answer-2"}
+    ]});
+    launch(&e, "nn", HumanConfirm::None, plan(steps.clone()));
+    e.wait_awaiting("nn", "plan_approval", 1);
+    let opened = settled(&e, "nn", tev::GATE_OPENED, 2);
+    assert!(
+        opened
+            .iter()
+            .any(|g| g["kind"] == "plan_approval" && g["reason"] == "first_creator"),
+        "{opened:?}"
+    );
+    let held: Vec<String> = view(&e, "nn").units.iter().map(|u| u.id.clone()).collect();
+    assert!(
+        held.iter().any(|u| u.ends_with(":docs")),
+        "the held proposal's units are in the store: {held:?}"
+    );
+    let status = e
+        .core
+        .confirm_gate("nn", HumanDecision::EditPlan { plan: plan(steps) })
+        .expect("the edit is an answer");
+    assert_ne!(status, crate::SessionStatus::Failed);
+    wait_for("answer-2 to dispatch", || {
+        e.worker.calls().iter().any(|c| c.2 == "nn:answer-2")
+    });
+    let units: Vec<String> = view(&e, "nn").units.iter().map(|u| u.id.clone()).collect();
+    assert_eq!(
+        units,
+        ["nn:answer-1", "nn:answer-2"],
+        "the declined proposal's units are gone"
+    );
+    let accepted = payloads(&e, "nn", tev::PLAN_ACCEPTED);
+    let last = accepted.last().unwrap();
+    assert_eq!(step_ids(&last["steps"]), ["answer-1", "answer-2"]);
+    assert_eq!(last["by"], "human");
+    let decided = payloads(&e, "nn", tev::GATE_DECIDED);
+    assert!(
+        decided.iter().any(|d| d["decision"] == "human_amended"),
+        "{decided:?}"
+    );
+    assert!(payloads(&e, "nn", tev::PLAN_REFUSED).is_empty());
+    release_all(&w);
+}
+
+/// (codex review of #738 round 4) A whole-plan amendment may reuse a declined step's id for
+/// DIFFERENT work: the held `produce:design` (a creator step under an odd id) is dropped and the
+/// human's id-less `design` defaults onto that id. The stored unit is a replacement, not a kept
+/// creator: it is planned fresh as the catalog's `design`, never dispatched as the declined
+/// `produce`.
+#[test]
+fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
+    let w = Worker::scripted(|i, _| {
+        if i.unit.id.ends_with(":answer-1") {
+            turn(
+                &pa_output(
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"design"}],"touch":["docs/x.md"]}"#,
+                ),
+                None,
+            )
+        } else {
+            turn("answered", None)
+        }
+    });
+    let mut e = engine("k2brep", w.clone());
+    launch(
+        &e,
+        "rep",
+        HumanConfirm::None,
+        plan(json!({"steps": [{"catalog": "understand", "id": "answer-1"}]})),
+    );
+    e.wait_awaiting("rep", "plan_approval", 1);
+    let held = view(&e, "rep").units;
+    let old = held
+        .iter()
+        .find(|u| u.id == "rep:design")
+        .expect("the held produce under the id `design`");
+    assert_eq!(old.catalog.as_deref(), Some("produce"));
+    assert_eq!(old.role, crate::workflow::PhaseRole::Creator);
+    e.core
+        .confirm_gate(
+            "rep",
+            HumanDecision::EditPlan {
+                plan: plan(json!({"steps": [
+                    {"catalog": "understand", "id": "answer-1"},
+                    {"catalog": "design"}
+                ]})),
+            },
+        )
+        .expect("the edit is an answer");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && !e.worker.calls().iter().any(|c| c.2 == "rep:design") {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !e.worker.calls().iter().any(|c| c.2 == "rep:design") {
+        let v = view(&e, "rep");
+        panic!(
+            "the replacement never dispatched: status {:?} unit_ix {} attempt {}; units {:?}; awaiting {:?}; dispatched {:?}; accepted {:?}; refused {:?}; decided {:?}",
+            v.session.status,
+            v.session.unit_ix,
+            v.session.attempt,
+            v.units.iter().map(|u| (u.id.clone(), u.ord, u.catalog.clone(), format!("{:?}", u.status))).collect::<Vec<_>>(),
+            e.awaiting("rep"),
+            e.worker.calls(),
+            payloads(&e, "rep", tev::PLAN_ACCEPTED).iter().map(|p| (p["plan_rev"].clone(), step_ids(&p["steps"]))).collect::<Vec<_>>(),
+            payloads(&e, "rep", tev::PLAN_REFUSED),
+            payloads(&e, "rep", tev::GATE_DECIDED),
+        );
+    }
+    let units = view(&e, "rep").units;
+    let fresh = units
+        .iter()
+        .find(|u| u.id == "rep:design")
+        .expect("the human's design step");
+    assert_eq!(fresh.catalog.as_deref(), Some("design"), "{fresh:?}");
+    assert_ne!(fresh.catalog.as_deref(), Some("produce"));
+    assert_eq!(
+        units.len(),
+        2,
+        "{:?}",
+        units.iter().map(|u| &u.id).collect::<Vec<_>>()
+    );
+    let accepted = payloads(&e, "rep", tev::PLAN_ACCEPTED);
+    let last = accepted.last().unwrap();
+    assert!(
+        !last["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["catalog"] == "produce"),
+        "{last}"
+    );
+    release_all(&w);
+}
