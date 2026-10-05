@@ -8065,7 +8065,8 @@ impl AcpStepRunner {
             &prompt,
             prior_outputs,
             emit,
-            self.timeout,
+            // (ASK-K1b) The ceiling, lowered to the unit's own budget when its phase set one.
+            crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs),
             Arc::clone(&self.elicitation_maps),
             &run_id,
             input.elicitation_epoch,
@@ -16341,6 +16342,7 @@ No further next steps — both questions fully answered.";
             gate: Default::default(),
             role: Default::default(),
             owner: Default::default(),
+            budget_secs: None,
             validator: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),

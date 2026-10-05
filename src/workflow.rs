@@ -43,6 +43,20 @@ pub struct PriorUnitOutput {
 /// Everything a worker needs to do one unit's *slow* work, pre-loaded by the actor so the worker
 /// holds **no store handle** (the single-writer invariant). In P1 the slow work is the stub; P4a's
 /// real backend runs the wrapped-CLI subprocess against `workdir`.
+/// (DES-ASK-TEAM-CHAT-001 §4.4, ASK-K1b) The wall budget one unit turn runs under: the carrier's
+/// ceiling (`WICKED_UNIT_TIMEOUT_SECS`, read once at construction) lowered to the unit's own
+/// `budget_secs` when its phase set one. A step may only LOWER the ceiling — `budget_secs` is
+/// TightenOnly on the plan — so this is `min`, never a raise. Shared by every carrier.
+pub fn effective_timeout(
+    ceiling: std::time::Duration,
+    budget_secs: Option<u64>,
+) -> std::time::Duration {
+    match budget_secs {
+        Some(b) => ceiling.min(std::time::Duration::from_secs(b)),
+        None => ceiling,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StepInput {
     pub run_id: String,
@@ -748,6 +762,13 @@ pub struct PhaseDef {
     /// Whether this phase runs code (drives worktree provisioning + code-tool mode).
     #[serde(default)]
     pub executes_code: bool,
+    /// (DES-ASK-TEAM-CHAT-001 §4.4, ASK-K1b) The phase's wall budget in seconds: the carrier's
+    /// ceiling (`WICKED_UNIT_TIMEOUT_SECS`) is lowered to it for every attempt of the unit. `None`
+    /// (the default; no shipped entry sets one) keeps the ceiling. A plan step may only LOWER it
+    /// (`plan::STEP_FIELD_RULES`, TightenOnly). `skip_serializing_if`: an absent budget stays
+    /// absent on the wire, so defs authored before the field serialize back byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_secs: Option<u64>,
     /// (BC-80, core#535) Whether this phase must REPORT what it captured: its output carries a
     /// machine-readable `wicked-capture-report {derived, submitted, failed}` marker
     /// ([`crate::validator::parse_capture_report`]), and the gate fold DENIES the unit when the
@@ -828,6 +849,7 @@ impl PhaseDef {
             gate_type: None,
             gate: GateSpec::Auto,
             executes_code: false,
+            budget_secs: None,
             requires_capture_report: false,
             verified_evidence: false,
             required_deliverables: Vec::new(),

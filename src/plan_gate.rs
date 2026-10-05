@@ -1257,6 +1257,9 @@ fn wire_step(s: &PlanStep) -> Value {
     if let Some(g) = &s.gate {
         o.insert("gate".into(), json!(g));
     }
+    if let Some(b) = s.budget_secs {
+        o.insert("budget_secs".into(), json!(b));
+    }
     if let Some(a) = &s.added_by {
         o.insert("added_by".into(), json!(a));
     }
@@ -1293,7 +1296,11 @@ fn plan_proposed(
             "kind": kind,
             "preset": preset,
             "steps": wire_steps(plan),
-            "monitors": {"asked": 0},
+            // (ASK-K1b) The plan's own ask; the supervisor ratchets it, never lowers it.
+            "monitors": plan
+                .monitors
+                .clone()
+                .unwrap_or(crate::team::events::MonitorsAsk { asked: 0 }),
             "asks": [],
             "touch": plan.touch.clone().unwrap_or_default(),
             "override": plan.floor_override,
@@ -1389,6 +1396,7 @@ pub(crate) fn edits_refused(
         );
         let plan = PlanSteps {
             steps: e.steps.clone(),
+            monitors: None,
             touch: None,
             floor_override: None,
         };
@@ -1485,6 +1493,38 @@ mod tests {
 
     fn plan(v: serde_json::Value) -> PlanSteps {
         serde_json::from_value(v).unwrap()
+    }
+
+    /// (DES-ASK-TEAM-CHAT-001 §4.6, ASK-K1b) The plan's `monitors.asked` rides `plan.proposed`
+    /// (T2 §6.1's payload); a plan without one says 0, byte-identical to before.
+    #[test]
+    fn plan_proposed_carries_the_plans_monitor_ask() {
+        let asked = plan(json!({"steps": [{"catalog": "understand"}], "monitors": {"asked": 1}}));
+        let ev = plan_proposed(
+            "r1",
+            "human",
+            "p-1",
+            None,
+            ProposalKind::Initial,
+            None,
+            &asked,
+            7,
+        )
+        .unwrap();
+        assert_eq!(ev.to_payload().unwrap()["monitors"], json!({"asked": 1}));
+        let bare = plan(json!({"steps": [{"catalog": "understand"}]}));
+        let ev = plan_proposed(
+            "r1",
+            "human",
+            "p-2",
+            None,
+            ProposalKind::Initial,
+            None,
+            &bare,
+            7,
+        )
+        .unwrap();
+        assert_eq!(ev.to_payload().unwrap()["monitors"], json!({"asked": 0}));
     }
 
     /// DES-TEAMING-002 §8.6's approval matrix, row by row (fixed expectations from the table).

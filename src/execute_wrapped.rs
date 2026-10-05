@@ -2187,7 +2187,9 @@ impl WrappedCliStepRunner {
             // ungoverned unit or a daemon with no broker gets neither variable.
             let mcp_channel = crate::mcp_gate::arm_worker_mcp_channel(&mut cmd, input);
             let cancel_token = self.register_token(input);
-            let bounded = run_bounded(cmd, self.timeout, emit, adapter, Some(cancel_token.clone()));
+            // (ASK-K1b) The ceiling, lowered to the unit's own budget when its phase set one.
+            let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
+            let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
             drop(mcp_channel);
             match bounded {

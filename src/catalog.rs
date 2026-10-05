@@ -479,6 +479,7 @@ fn entry(
         gate_type: Some(gate_type),
         gate,
         executes_code,
+        budget_secs: None,
         verified_evidence: false,
         required_deliverables: Vec::new(),
         depends_on: Vec::new(),

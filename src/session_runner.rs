@@ -741,6 +741,7 @@ mod tests {
             gate: GateSpec::default(),
             role: PhaseRole::default(),
             owner: Default::default(),
+            budget_secs: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,
