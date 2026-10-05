@@ -435,7 +435,8 @@ pub struct PlanSteps {
     pub floor_override: Option<FloorOverride>,
     /// (DES-ASK-TEAM-CHAT-001 §4.6, ASK-K1b; §6.1 `plan.proposed.monitors`) The plan's own ask for
     /// members: the supervisor's target is `min(max(band monitors, asked), MAX_MONITORS)`, so a
-    /// read-only plan (band 0–19, 0 monitors) with `asked: 1` gets a reviewer. Absent = 0.
+    /// read-only plan (the lowest band, no monitors of its own) with `asked: 1` gets a reviewer.
+    /// Absent = 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitors: Option<crate::team::events::MonitorsAsk>,
 }
@@ -854,7 +855,7 @@ pub enum FieldRule {
 /// Every [`PlanStep`] field and its [`FieldRule`] — the one table `compose` applies
 /// ([`apply_step`] has one arm per row, in this order). A test pins that the table covers every
 /// `PlanStep` field and that each rule refuses what it forbids.
-pub const STEP_FIELD_RULES: [(&str, FieldRule); 19] = [
+pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("catalog", FieldRule::Identity),
     ("id", FieldRule::Identity),
     ("role", FieldRule::Fixed),

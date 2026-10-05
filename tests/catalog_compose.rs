@@ -649,7 +649,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
             ),
         ),
     ]);
-    for (field, rule) in STEP_FIELD_RULES {
+    for &(field, rule) in STEP_FIELD_RULES {
         match rule {
             FieldRule::Identity => {}
             // A record of how the step entered the plan: compose ignores it (T2, §8.5).
