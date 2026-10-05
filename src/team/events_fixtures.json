@@ -704,5 +704,21 @@
    "re": null,
    "status": "completed"
   }
+ },
+ {
+  "type": "wicked.team.path.repicked",
+  "payload": {
+   "run_id": "r1",
+   "ord": 1,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000026,
+   "re": null,
+   "from": "claude#1",
+   "to": "codex",
+   "reason": "timed_out",
+   "selection": "random",
+   "pick_seq": 1
+  }
  }
 ]

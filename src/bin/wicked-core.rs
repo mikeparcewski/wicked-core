@@ -554,6 +554,7 @@ fn main() {
                 deliver_step: None,
                 exclude_seats: Vec::new(),
                 evidence_root: None,
+                primary: None,
             });
             println!(
                 "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
@@ -873,6 +874,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        primary: None,
     }) {
         Ok(id) => id,
         Err(e) => {

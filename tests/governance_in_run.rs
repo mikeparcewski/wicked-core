@@ -322,6 +322,7 @@ fn a_denied_tool_call_gates_the_session() {
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        primary: None,
     })
     .unwrap();
 
@@ -413,6 +414,7 @@ fn a_shell_hostile_session_id_is_rejected_at_launch() {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: None,
         });
         assert!(
             res.is_err(),

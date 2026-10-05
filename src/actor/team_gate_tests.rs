@@ -154,6 +154,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
         })
         .expect("launch");
 }
@@ -1680,6 +1681,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1850,6 +1852,7 @@ fn launch_member_run(e: &Engine, run: &str) {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
         })
         .expect("launch");
 }
@@ -2624,6 +2627,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
         })
         .expect("launch");
 }
@@ -3014,6 +3018,7 @@ fn try_launch_plan(
         deliver_step,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
     })
 }
 
@@ -3147,4 +3152,128 @@ fn a_released_deliver_unit_still_stops_at_its_deliver_gate() {
         open_gate_kinds(&e.db, "r10d") == vec!["deliver".to_string()]
     });
     assert_eq!(status(&e, "r10d"), Some(SessionStatus::AwaitingHuman));
+}
+
+// ── DES-ASK-TEAM-CHAT-001 §4.1 (ASK-K1a): the PA pick, pure ──────────────────────────────────────
+
+fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
+    LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "pick".into(),
+        clis,
+        entity_mode: crate::EntityMode::Shared,
+        session_id: "rpick".into(),
+        human_confirm: HumanConfirm::None,
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: None,
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+        plan: None,
+        deliver_step: None,
+        exclude_seats: Vec::new(),
+        evidence_root: None,
+        primary: primary.map(str::to_string),
+    }
+}
+
+fn keys(spec: &LaunchSpec) -> Vec<&str> {
+    spec.clis.iter().map(|c| c.key.as_str()).collect()
+}
+
+/// A chosen seat goes first; the others keep their order; the pick says `chosen`.
+#[test]
+fn a_chosen_primary_is_rotated_first_and_recorded_chosen() {
+    let mut spec = pick_spec(vec![cli("a"), cli("b"), cli("c")], Some("c"));
+    let pick = super::pick_primary(&mut spec, true)
+        .unwrap()
+        .expect("a pick");
+    assert_eq!(
+        (pick.cli.as_str(), pick.selection.as_str(), pick.pick_seq),
+        ("c", "chosen", 0)
+    );
+    assert_eq!(keys(&spec), ["c", "a", "b"]);
+    // A legacy run honours a choice too (the roster order is what it runs on).
+    let mut legacy = pick_spec(vec![cli("a"), cli("b")], Some("b"));
+    let pick = super::pick_primary(&mut legacy, false)
+        .unwrap()
+        .expect("a pick");
+    assert_eq!(pick.selection, "chosen");
+    assert_eq!(keys(&legacy), ["b", "a"]);
+}
+
+/// A key that is not on the roster refuses the launch — never a silent first-seat fall-back.
+#[test]
+fn a_primary_not_on_the_roster_refuses_the_launch() {
+    let mut spec = pick_spec(vec![cli("a"), cli("b")], Some("zed"));
+    let err = super::pick_primary(&mut spec, true).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "primary seat `zed` is not on the roster [a, b]"
+    );
+    assert_eq!(keys(&spec), ["a", "b"], "nothing moved");
+}
+
+/// A legacy run with no choice is untouched: no pick, the roster as the launcher gave it.
+#[test]
+fn a_legacy_run_without_a_choice_keeps_its_roster_and_records_no_pick() {
+    let mut spec = pick_spec(vec![cli("b"), cli("a")], None);
+    assert!(super::pick_primary(&mut spec, false).unwrap().is_none());
+    assert_eq!(keys(&spec), ["b", "a"]);
+}
+
+/// A team run with no choice draws at random over the roster: over many runs every seat is drawn,
+/// the draw is first on the roster, the pick says `random`, and an unusable seat is never drawn
+/// while a usable one exists.
+#[test]
+fn a_team_run_without_a_choice_draws_every_seat_at_random_and_rotates_it_first() {
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..300 {
+        let mut spec = pick_spec(vec![cli("a"), cli("b"), cli("c")], None);
+        spec.session_id = format!("r{i}");
+        let pick = super::pick_primary(&mut spec, true)
+            .unwrap()
+            .expect("a pick");
+        assert_eq!(pick.selection, "random");
+        assert_eq!(pick.pick_seq, 0);
+        assert_eq!(keys(&spec)[0], pick.cli, "the pick is first");
+        let rest: Vec<&str> = keys(&spec)[1..].to_vec();
+        let want: Vec<&str> = ["a", "b", "c"]
+            .into_iter()
+            .filter(|k| *k != pick.cli)
+            .collect();
+        assert_eq!(rest, want, "the others keep their order");
+        seen.insert(pick.cli.clone());
+    }
+    assert_eq!(
+        seen.len(),
+        3,
+        "300 draws over three seats draw each at least once: {seen:?}"
+    );
+    let mut unusable = cli("a");
+    unusable.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
+    for i in 0..50 {
+        let mut spec = pick_spec(vec![unusable.clone(), cli("b")], None);
+        spec.session_id = format!("u{i}");
+        let pick = super::pick_primary(&mut spec, true)
+            .unwrap()
+            .expect("a pick");
+        assert_eq!(
+            pick.cli, "b",
+            "an unusable seat is never the draw while a usable one exists"
+        );
+    }
+}
+
+/// `WICKED_TEAM_PICK_SEED` makes the draw a pure function of the seed and the run id (tests
+/// only); the function is exercised directly so no test here touches the process environment.
+#[test]
+fn the_seeded_draw_is_a_pure_function_of_seed_and_run() {
+    let a = super::seeded_index(3, "r1", "s1");
+    assert_eq!(a, super::seeded_index(3, "r1", "s1"));
+    assert!(a < 3);
+    let differs = (0..50).any(|i| super::seeded_index(3, &format!("r{i}"), "s1") != a);
+    assert!(differs, "the run id moves the draw");
 }

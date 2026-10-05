@@ -1244,6 +1244,9 @@ pub(crate) fn run(
                     exclude_seats,
                     // Legacy path has no repo, so no walkthrough can run on it (WT-C2).
                     evidence_root: _,
+                    // Legacy path is no team path: it names no PA (ASK-K1a). A chosen seat is
+                    // refused below with the plan it would have led, never silently dropped.
+                    primary,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1264,6 +1267,12 @@ pub(crate) fn run(
                              path does not carry a judge exclusion"
                         ))
                     }
+                    // (ASK-K1a) A chosen PA is a team fact (`path.started`): refused here rather
+                    // than silently dropped — the straight-through path publishes no path.
+                    Ok(None) if primary.is_some() => Err(anyhow::anyhow!(
+                        "a launch with a primary seat must use launch_run: the straight-through \
+                         path starts no team path to record the pick on"
+                    )),
                     Ok(None) if deliver_step.is_none() => Ok(()),
                     Ok(_) => Err(anyhow::anyhow!(
                         "a plan or preset launch must use launch_run: its plan_approval gate \
@@ -1756,6 +1765,8 @@ pub(crate) fn run(
                 workdir,
                 base_commit,
             } => {
+                // (ASK-K1a) The roster is re-ordered with the PA pick first, below.
+                let mut spec = spec;
                 // The worktree-creation worker finished successfully. Update the Planning stub with
                 // the resolved workdir, then proceed with pre_distribute + council distribution
                 // (same logic as ContinueLaunch — SessionStarted already emitted).
@@ -1859,6 +1870,28 @@ pub(crate) fn run(
                     Ok(None) => (Ok(spec.workflow.clone()), None),
                     Err(e) => (Err(e), None),
                 };
+                // (DES-ASK-TEAM-CHAT-001 §4.1; T2 §8.1) The PA: the launcher's choice, or — on a
+                // team run — a uniform random draw. The roster is re-ordered with the pick first
+                // BEFORE `pre_distribute` reads it, and the stub's plan-state roster and team
+                // state record it, so the stub carried forward names the pick on `path.started`
+                // and every PA step lands on it. A key not on the roster fails the launch here.
+                let team_workflow = team_workflow.and_then(|workflow| {
+                    let primary = team_gate::pick_primary(&mut spec, team_registry.is_some())?;
+                    if let Some(p) = primary {
+                        if let Some(mut s) = crate::domain::get_session(&store, &run_id)? {
+                            if let Some(tp) = s.team_plan.as_mut() {
+                                team_gate::rotate_roster_values(&mut tp.roster, &p.cli);
+                            }
+                            if s.team_plan.is_some() {
+                                s.team
+                                    .get_or_insert_with(crate::domain::RunTeamState::default)
+                                    .primary = Some(p);
+                            }
+                            put_node(&mut store, s.to_node())?;
+                        }
+                    }
+                    Ok(workflow)
+                });
                 match team_workflow.and_then(|workflow| {
                     pipeline::pre_distribute(
                         &mut store,
@@ -4088,7 +4121,7 @@ pub(crate) fn launch_run_inner(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
-    spec: LaunchSpec,
+    mut spec: LaunchSpec,
     registry: &crate::workflow::WorkflowRegistry,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
@@ -4136,7 +4169,14 @@ pub(crate) fn launch_run_inner(
         .as_deref()
         .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
         .map(|r| std::path::PathBuf::from(r.root_path));
-    let team = team_plan_at_launch(store, registry, &spec, repo_root.as_deref(), None, false)?;
+    let mut team = team_plan_at_launch(store, registry, &spec, repo_root.as_deref(), None, false)?;
+    // (DES-ASK-TEAM-CHAT-001 §4.1; T2 §8.1) The PA: the launcher's choice, or — on a team run — a
+    // uniform random draw. The roster (and the plan state's copy of it) is re-ordered with the
+    // pick first BEFORE anything is planned or distributed, so `clis.first()` is the PA everywhere.
+    let primary = team_gate::pick_primary(&mut spec, team.is_some())?;
+    if let (Some(p), Some((state, _, _))) = (&primary, team.as_mut()) {
+        team_gate::rotate_roster_values(&mut state.roster, &p.cli);
+    }
     let workflow = match &team {
         Some((_, id, _)) => Some(id.clone()),
         None => spec.workflow.clone(),
@@ -4167,6 +4207,13 @@ pub(crate) fn launch_run_inner(
         let mut s = crate::domain::get_session(store, &run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} planned no session"))?;
         s.team_plan = Some(state);
+        // The pick is a team fact: recorded on the team state so `path.started` names it and a
+        // re-pick counts from it. A legacy run with a chosen seat keeps only the rotated roster.
+        if let Some(p) = primary {
+            s.team
+                .get_or_insert_with(crate::domain::RunTeamState::default)
+                .primary = Some(p);
+        }
         put_node(store, s.to_node())?;
     }
     match advance_or_pause(
@@ -5242,10 +5289,24 @@ fn apply_step_result(
     // (`UnitOutputCaptured.step_status` above) so automation can act on the platform's own
     // timeout without ever converting an operator's cancel into an auto-failover — do NOT add
     // an auto-failover here keyed on the shared branch (616c8661).
+    //
+    // (DES-ASK-TEAM-CHAT-001 §4.1, F2) The ONE exception is keyed on the TEAM PA STEP, not the
+    // branch: a PA step of a team run that hit the ceiling is a SEAT failure the path survives
+    // when another eligible seat can take the PA's place — it takes the failover ladder below,
+    // which re-picks the PA (`path.repicked`) and redispatches the step as attempt+1. With no
+    // other seat it takes this backstop exactly as before.
+    let pa_timed_out =
+        output.status == crate::workflow::StepStatus::TimedOut && team_gate::is_pa_step(unit) && {
+            let seat = unit.assigned_cli.as_deref().unwrap_or("claude");
+            eligible_roster_keys(&session)
+                .iter()
+                .any(|k| k != seat && !unit.worker_failed_clis.contains(k))
+        };
     if matches!(
         output.status,
         crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
-    ) {
+    ) && !pa_timed_out
+    {
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
@@ -5343,7 +5404,10 @@ fn apply_step_result(
     //      via the existing reassign surface;
     //   3. anything unclassified → fail as before.
     // Attempt 0 only, so a repeat refusal after the fix falls through to a real failure.
-    if output.status == crate::workflow::StepStatus::Failed {
+    // (ASK-K1a) A team PA step's `timed_out` with another eligible seat enters here too: it is a
+    // seat failure the ladder below re-picks the PA for; every other `timed_out` took the
+    // backstop above and never reaches this point.
+    if output.status == crate::workflow::StepStatus::Failed || pa_timed_out {
         // (F-7R2-006) An AUTHENTICATION refusal from the worker (`Not logged in`, `401
         // Unauthorized`, an ACP `unauthenticated`/`auth_failed` handshake refusal — the council's
         // own `SeatFailureReason::classify` signatures) BENCHES the seat for the run before any
@@ -5710,7 +5774,11 @@ fn apply_step_result(
                     prompt,
                 )?;
                 return Ok(StepApplied::Paused);
-            } else if human_present && seat_refusal.is_none() && output.attempt == 0 {
+            } else if human_present
+                && seat_refusal.is_none()
+                && output.attempt == 0
+                && !pa_timed_out
+            {
                 // UNRECOGNIZED failure → agent triage (the generalization of the signature
                 // table): a distinct judge seat reads the error and decides the remedy.
                 // (core#461) A CLASSIFIED seat refusal is not unrecognized: the seat is dead for
@@ -5846,7 +5914,8 @@ fn apply_step_result(
         // moves to a seat that can take it instead of parking at a human gate per unit.
         if unit.tool_cmd.is_none()
             && (crate::acp_runner::is_worker_originated_failure(&output.output)
-                || seat_refusal.is_some())
+                || seat_refusal.is_some()
+                || pa_timed_out)
         {
             let failed_cli = unit
                 .assigned_cli
@@ -5864,6 +5933,28 @@ fn apply_step_result(
             // Immutable selection ends the `unit` borrow; the branch re-borrows before mutating.
             let next_seat = next_failover_seat(&units, unit_ix, &eligible_roster_keys(&session));
             if let Some(next) = next_seat {
+                // (DES-ASK-TEAM-CHAT-001 §4.1) A PA step of a team run moving seats moves the
+                // PA: the roster, the pending PA steps and the record follow, and the change is a
+                // team fact (`path.repicked`), because `path.started.cli` is one.
+                if units.get(unit_ix).is_some_and(team_gate::is_pa_step) {
+                    let reason = if pa_timed_out {
+                        "timed_out".to_string()
+                    } else if let Some(r) = &seat_refusal {
+                        r.as_str().to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    team_gate::repick_primary(
+                        store,
+                        &mut session,
+                        &mut units,
+                        unit_ix,
+                        output.attempt,
+                        &failed_cli,
+                        &next,
+                        &reason,
+                    )?;
+                }
                 let invocation = crate::registry_roster()
                     .into_iter()
                     .find(|c| c.key == next)

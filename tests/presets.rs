@@ -154,6 +154,7 @@ fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        primary: None,
     }
 }
 

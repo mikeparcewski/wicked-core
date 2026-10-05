@@ -241,6 +241,7 @@ fn launch(core: &Core, name: &str, repo: &Path, sid: &str) -> std::sync::mpsc::R
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        primary: None,
     })
     .expect("launch");
     events

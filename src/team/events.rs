@@ -66,9 +66,12 @@ pub const LEDGER_FOLDED: &str = "wicked.team.ledger.folded";
 pub const GATE_OPENED: &str = "wicked.team.gate.opened";
 pub const GATE_DECIDED: &str = "wicked.team.gate.decided";
 pub const PATH_ENDED: &str = "wicked.team.path.ended";
+/// (DES-ASK-TEAM-CHAT-001 §4.1, §6 #26) The PA changed mid-path: a seat-caused failure of a PA
+/// step on a roster with another eligible seat re-pins the creator seat.
+pub const PATH_REPICKED: &str = "wicked.team.path.repicked";
 
-/// The 25 types, in DES-002 §6 table order.
-pub const ALL_TYPES: [&str; 25] = [
+/// The 26 types, in DES-002 §6 table order (#26 `path.repicked`, DES-ASK-TEAM-CHAT-001 §6).
+pub const ALL_TYPES: [&str; 26] = [
     PATH_STARTED,
     PATH_SCORED,
     PLAN_PROPOSED,
@@ -94,6 +97,7 @@ pub const ALL_TYPES: [&str; 25] = [
     GATE_OPENED,
     GATE_DECIDED,
     PATH_ENDED,
+    PATH_REPICKED,
 ];
 
 /// The one component that publishes a type (DES-002 §7).
@@ -112,7 +116,7 @@ pub fn owner(event_type: &str) -> Option<Owner> {
     use Owner::{Engine as E, Runner as R, Supervisor as S};
     Some(match event_type {
         PATH_STARTED | PATH_SCORED | PLAN_PROPOSED | PLAN_REVISED | PLAN_ACCEPTED
-        | PLAN_REFUSED | GATE_OPENED | GATE_DECIDED | PATH_ENDED => E,
+        | PLAN_REFUSED | GATE_OPENED | GATE_DECIDED | PATH_ENDED | PATH_REPICKED => E,
         MEMBER_JOINED | MEMBER_LEFT | FINDING_RAISED | HELP_ANSWERED | CHANGE_REQUESTED
         | FINDING_SETTLED | COUNCIL_CALLED | COUNCIL_RULED | LEDGER_FOLDED => S,
         STEP_CLAIMED | CHECKPOINT_REACHED | ADVICE_DELIVERED | ADVICE_ANSWERED | HELP_REQUESTED
@@ -262,6 +266,12 @@ pub fn key_gate_decided(run_id: &str, gate_id: &str) -> String {
 
 pub fn key_path_ended(run_id: &str) -> String {
     team_key(PATH_ENDED, run_id, &[])
+}
+
+/// `path.repicked` is keyed by the engine's per-run re-pick counter (`pick_seq`), never by the
+/// seats named — the same two seats may swap twice.
+pub fn key_path_repicked(run_id: &str, pick_seq: u32) -> String {
+    team_key(PATH_REPICKED, run_id, &[&pick_seq.to_string()])
 }
 
 // ── Producer-assigned ids that feed the keys (DES-002 §6.1) ──────────────────────────────────────
@@ -1037,6 +1047,22 @@ pub struct PathEnded {
     pub status: PathStatus,
 }
 
+/// 26 — `path.repicked` (E; DES-ASK-TEAM-CHAT-001 §4.1). The envelope's `(ord, attempt)` is the PA
+/// step whose attempt ended for a seat cause; the step is redispatched as attempt+1 on `to`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathRepicked {
+    /// The seat that was the PA.
+    pub from: String,
+    /// The seat that is the PA now (the run's creator seat for every later PA step).
+    pub to: String,
+    /// Why (`timed_out`, `failed`, a seat refusal's class), in the engine's own words.
+    pub reason: String,
+    /// Always `random`: a re-pick is never the operator's choice.
+    pub selection: Selection,
+    /// The engine's per-run re-pick counter, from 1: the key.
+    pub pick_seq: u32,
+}
+
 // ── Wire mirrors: computed fields are never read from input (review of #616, round 5) ────────────
 //
 // Each type below deserializes through a mirror that omits its computed fields (an incoming one
@@ -1239,6 +1265,7 @@ bodies! {
     GateOpened(GateOpened) = GATE_OPENED,
     GateDecided(GateDecided) = GATE_DECIDED,
     PathEnded(PathEnded) = PATH_ENDED,
+    PathRepicked(PathRepicked) = PATH_REPICKED,
 }
 
 /// One team event: the envelope plus its body.
@@ -1358,6 +1385,7 @@ fn key_parts_of(ev: &TeamEvent) -> Result<String> {
         TeamBody::GateOpened(b) => key_gate_opened(run, &b.gate_id),
         TeamBody::GateDecided(b) => key_gate_decided(run, &b.gate_id),
         TeamBody::PathEnded(_) => key_path_ended(run),
+        TeamBody::PathRepicked(b) => key_path_repicked(run, b.pick_seq),
     })
 }
 
