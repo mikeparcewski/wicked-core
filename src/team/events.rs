@@ -395,6 +395,49 @@ wire_enum! {
     pub enum ScoreBasis { Intent = "intent", Diff = "diff" }
 }
 wire_enum! {
+    /// `finding.raised.target` (DES-ASK-TEAM-CHAT-001 §4.6, ASK-K3a; DES-TEAMING-001 rev 14 §4.6
+    /// step 2): what the finding cites — a line of the settled tree (`tree`, the bar `{high,
+    /// medium}`) or a line of the step's output (`output`, the bar `{medium}`).
+    pub enum FindingTarget { Tree = "tree", Output = "output" }
+}
+// `wire_enum!` owns the derive list, so the default is spelled here.
+#[allow(clippy::derivable_impls)]
+impl Default for FindingTarget {
+    fn default() -> Self {
+        FindingTarget::Tree
+    }
+}
+impl FindingTarget {
+    /// The wire default: a `tree` target is omitted, so a row written before the field existed
+    /// re-serialises byte-identical.
+    pub fn is_tree(&self) -> bool {
+        matches!(self, FindingTarget::Tree)
+    }
+}
+wire_enum! {
+    /// `help.answered.outcome` (DES-ASK-TEAM-CHAT-001 §4.5, ASK-K3a): the help turn's terminal
+    /// outcome, a fact on the row S owns — never inferred from a missing row.
+    pub enum HelpOutcome {
+        Answered = "answered",
+        TimedOut = "timed_out",
+        Failed = "failed",
+        NoMember = "no_member"
+    }
+}
+// `wire_enum!` owns the derive list, so the default is spelled here.
+#[allow(clippy::derivable_impls)]
+impl Default for HelpOutcome {
+    fn default() -> Self {
+        HelpOutcome::Answered
+    }
+}
+impl HelpOutcome {
+    /// The wire default: `answered` is omitted, so an old row re-serialises byte-identical.
+    pub fn is_answered(&self) -> bool {
+        matches!(self, HelpOutcome::Answered)
+    }
+}
+wire_enum! {
     /// `path.scored.plan.depth` (S4 `Depth`).
     pub enum ScoreDepth { None = "none", Standard = "standard", Deep = "deep" }
 }
@@ -748,7 +791,12 @@ pub struct PlanRefused {
 pub struct MemberJoined {
     pub member_id: String,
     pub open_seq: u32,
-    pub seat: String,
+    /// The member's seat instance; `null` (ASK-K3a) on a `status:"failed"` row the supervisor
+    /// publishes when NO distinct seat exists to seat the member on (one signed-in seat): the
+    /// `member_id` / `open_seq` are still minted for the slot it tried to seat, so the row keeps
+    /// a valid §6.1 key. Old rows always carried a seat and deserialise unchanged.
+    #[serde(default)]
+    pub seat: Option<String>,
     pub role: MemberRole,
     pub status: AttachStatus,
     pub reason: String,
@@ -815,6 +863,10 @@ pub struct FindingRaised {
     pub anchor_source: Option<AnchorSource>,
     /// The bar: `high` | `medium`; anything else is refused at parse.
     pub severity: Severity,
+    /// (ASK-K3a) What the finding cites: `tree` (default; omitted on the wire) or `output` — for
+    /// an output target `path` is the step id and `line` a line of the step's output.
+    #[serde(default, skip_serializing_if = "FindingTarget::is_tree")]
+    pub target: FindingTarget,
     pub path: String,
     pub line: u32,
     pub evidence: String,
@@ -869,8 +921,16 @@ pub struct HelpAnswered {
     pub help_id: String,
     /// S's member-turn id.
     pub answer_id: String,
-    pub answer: String,
+    /// The member's answer; `null` (ASK-K3a) when `outcome` is not `answered`.
+    pub answer: Option<String>,
     pub evidence: Vec<String>,
+    /// (ASK-K3a) The help turn's terminal outcome; `answered` (the default) is omitted on the
+    /// wire, so an old row re-serialises byte-identical.
+    #[serde(default, skip_serializing_if = "HelpOutcome::is_answered")]
+    pub outcome: HelpOutcome,
+    /// (ASK-K3a) Why, for a non-`answered` outcome; omitted when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// 16 — `change.requested` (S).
@@ -1126,6 +1186,9 @@ struct FindingRaisedWire {
     anchor: Option<String>,
     anchor_source: Option<AnchorSource>,
     severity: Severity,
+    /// Additive (ASK-K3a): a payload that predates it is a tree target.
+    #[serde(default)]
+    target: FindingTarget,
     path: String,
     line: u32,
     evidence: String,
@@ -1153,6 +1216,7 @@ impl From<FindingRaisedWire> for FindingRaised {
             anchor: w.anchor,
             anchor_source: w.anchor_source,
             severity: w.severity,
+            target: w.target,
             path: w.path,
             line: w.line,
             evidence: w.evidence,
@@ -1542,10 +1606,10 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
         }
         match &row.event.body {
             TeamBody::MemberJoined(b) => {
-                let m = monitor_entry(&mut monitors, &b.member_id, &b.seat);
+                let m = monitor_entry(&mut monitors, &b.member_id, b.seat.as_deref().unwrap_or(""));
                 if b.open_seq >= m.open_seq {
                     m.open_seq = b.open_seq;
-                    m.seat = b.seat.clone();
+                    m.seat = b.seat.clone().unwrap_or_default();
                     m.joined_failed = (b.status == AttachStatus::Failed).then(|| b.error.clone());
                 }
             }
@@ -1573,6 +1637,7 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                     checkpoint_seq: 0,
                     anchor: b.anchor.clone().unwrap_or_default(),
                     carried_from_attempt: b.carried_from_attempt,
+                    target: b.target,
                 },
                 corroborated_by: b.corroborated_by.clone(),
                 injected: false,

@@ -489,7 +489,7 @@ impl UnitTeam {
             body: TeamBody::MemberJoined(MemberJoined {
                 member_id: id.to_string(),
                 open_seq,
-                seat: seat.to_string(),
+                seat: Some(seat.to_string()),
                 role: MemberRole::Monitor,
                 status: if error.is_some() {
                     AttachStatus::Failed
@@ -660,6 +660,7 @@ impl UnitTeam {
                     tev::AnchorSource::Hunk
                 }),
                 severity: f.severity,
+                target: f.target,
                 path: f.path.clone(),
                 line: f.line,
                 evidence: f.evidence.clone(),
@@ -757,6 +758,9 @@ impl UnitTeam {
                         checkpoint_seq: done.checkpoint_seq,
                         anchor: c.anchor,
                         carried_from_attempt: None,
+                        // (ASK-K3a) Every batch today reviews the settled tree; K3b adds the
+                        // output target.
+                        target: tev::FindingTarget::Tree,
                     };
                     if let super::Admit::New(lf, seq) = self.book.admit(finding) {
                         let f = lf.finding.clone();
@@ -1708,8 +1712,11 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
         body: TeamBody::HelpAnswered(HelpAnswered {
             help_id: job.help_id.clone(),
             answer_id,
-            answer,
+            answer: Some(answer),
             evidence,
+            // (ASK-K3a) The member answered; K3b publishes the non-answered outcomes.
+            outcome: tev::HelpOutcome::Answered,
+            error: None,
         }),
     };
     let _ = Publisher::new(pub_.clone()).publish(&ev);

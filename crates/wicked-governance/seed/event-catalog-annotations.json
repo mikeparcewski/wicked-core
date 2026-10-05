@@ -138,7 +138,7 @@
   },
   "wicked.team.member.joined": {
     "trigger": "S: a monitor session opened (or failed to)",
-    "payload": "`member_id`, `open_seq`, `seat`, `role`, `status`, `reason`, `error`; key: ord, attempt, `member_id`, `open_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`member_id`, `open_seq`, `seat` (null on a `failed` row with no distinct seat), `role`, `status`, `reason`, `error`; key: ord, attempt, `member_id`, `open_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.member.left": {
     "trigger": "S: a monitor session closed (completed, budget exhausted, failed, timed out)",
@@ -154,7 +154,7 @@
   },
   "wicked.team.finding.raised": {
     "trigger": "S: a confirmed, above-bar, first-seen finding",
-    "payload": "`raise_seq`, `finding_id`, `member_id`, `severity`, `path`, `line`, `evidence`, `claim`, `suggestion`, `tree`, `in_diff`, `corroborated_by`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`raise_seq`, `finding_id`, `member_id`, `severity`, `target` (`tree` default, or `output`), `path`, `line`, `evidence`, `claim`, `suggestion`, `tree`, `in_diff`, `corroborated_by`; key: ord, attempt, `raise_seq`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.advice.delivered": {
     "trigger": "R: one row per finding per delivery (mid-turn steer, step boundary, attempt end)",
@@ -170,7 +170,7 @@
   },
   "wicked.team.help.answered": {
     "trigger": "S: a member answers a help request",
-    "payload": "`help_id`, `answer_id`, `answer`, `evidence`; key: `help_id`, `answer_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`help_id`, `answer_id`, `answer` (null when not answered), `evidence`, `outcome` (`answered` default, `timed_out`, `failed` or `no_member`), `error`; key: `help_id`, `answer_id`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.change.requested": {
     "trigger": "S: a member asks for plan steps",

@@ -1151,6 +1151,12 @@ pub struct Finding {
     /// (T6) The attempt that first raised it, when it was carried into a redriven attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_from_attempt: Option<u32>,
+    /// (ASK-K3a) What the finding cites: a line of the settled tree (`tree`, omitted on the wire)
+    /// or a line of the step's output (`output`: `path` is the step id, `line` a line of the
+    /// output). Carried through the fold, the boundary and a redrive's carry, so a re-raise keeps
+    /// the target it was confirmed against (codex review of #737).
+    #[serde(default, skip_serializing_if = "events::FindingTarget::is_tree")]
+    pub target: events::FindingTarget,
 }
 
 /// [`Finding`] as it arrives: no `findingId` (an incoming one is ignored and recomputed).
@@ -1171,6 +1177,8 @@ pub struct FindingWire {
     anchor: String,
     #[serde(default)]
     carried_from_attempt: Option<u32>,
+    #[serde(default)]
+    target: events::FindingTarget,
 }
 
 impl From<FindingWire> for Finding {
@@ -1190,6 +1198,7 @@ impl From<FindingWire> for Finding {
             checkpoint_seq: 0,
             anchor: w.anchor,
             carried_from_attempt: w.carried_from_attempt,
+            target: w.target,
         }
     }
 }

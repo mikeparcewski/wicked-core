@@ -720,5 +720,68 @@
    "selection": "random",
    "pick_seq": 1
   }
+ },
+ {
+  "type": "wicked.team.finding.raised",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#2",
+   "at": 1758700000026,
+   "re": null,
+   "raise_seq": 5,
+   "finding_id": "f-3f16b20f4131ddc7",
+   "member_id": "m1",
+   "line_key": "l-3f16b20f4131ddc7",
+   "anchor": null,
+   "anchor_source": "none",
+   "severity": "medium",
+   "target": "output",
+   "path": "answer-1",
+   "line": 2,
+   "evidence": "The retire flow cancels its fetch on unmount.",
+   "claim": "the answer asserts cancellation the code does not show",
+   "suggestion": "cite the effect cleanup",
+   "tree": "t-k",
+   "in_diff": false,
+   "corroborated_by": [],
+   "carried_from_attempt": null
+  }
+ },
+ {
+  "type": "wicked.team.help.answered",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#2",
+   "at": 1758700000027,
+   "re": "help.requested#h-173a7b6f9ad38fce2f578afd2aa1be38",
+   "help_id": "h-173a7b6f9ad38fce2f578afd2aa1be38",
+   "answer_id": "t-8",
+   "answer": null,
+   "evidence": [],
+   "outcome": "timed_out",
+   "error": "member turn exceeded 240 s"
+  }
+ },
+ {
+  "type": "wicked.team.member.joined",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "engine",
+   "at": 1758700000028,
+   "re": null,
+   "member_id": "m1",
+   "open_seq": 2,
+   "seat": null,
+   "role": "monitor",
+   "status": "failed",
+   "reason": "no distinct signed-in seat",
+   "error": "only claude is signed in"
+  }
  }
 ]

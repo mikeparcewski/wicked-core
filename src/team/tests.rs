@@ -24,6 +24,7 @@ fn f(id: &str, severity: Severity) -> Finding {
         checkpoint_seq: 1,
         anchor: String::new(),
         carried_from_attempt: None,
+        target: Default::default(),
     }
 }
 

@@ -152,6 +152,7 @@ pub(crate) fn finding_of(env: &Envelope, b: &tev::FindingRaised) -> Finding {
         checkpoint_seq: 0,
         anchor: b.anchor.clone().unwrap_or_default(),
         carried_from_attempt: b.carried_from_attempt,
+        target: b.target,
     }
 }
 
@@ -581,7 +582,7 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
                 b.help_id,
                 cap_utf8(&question(&b.help_id).unwrap_or_default(), 512),
                 r.event.env.by,
-                cap_utf8(&b.answer, 2 * 1024),
+                cap_utf8(b.answer.as_deref().unwrap_or(""), 2 * 1024),
                 if b.evidence.is_empty() {
                     String::new()
                 } else {
