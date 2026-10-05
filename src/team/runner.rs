@@ -574,6 +574,12 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
 /// The team's answers the PA has not been shown yet (§8.9): `help.answered`, `council.ruled` and
 /// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
 /// than its own claim) — a claim after the row means that step's boundary read it.
+/// (ASK-K3c) One rendered team answer is at most this long, so that any entry fits an otherwise
+/// empty `[team advice]` window (the 8 KB `ADVICE_TEXT_CAP` minus header and footer).
+const ANSWER_ENTRY_CAP: usize = 3 * 1024;
+/// The joined evidence citations of one help answer, in the rendered line.
+const ANSWER_EVIDENCE_CAP: usize = 1024;
+
 fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // (ASK-K3c, codex review of #740 rounds 1–3) Every answer renders at exactly ONE boundary of
     // the seat, statelessly: this seat's claims on the stream cut it into windows; each window's
@@ -581,19 +587,30 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // still does not fit carries to the next window. Replaying that packing over the seat's
     // earlier claims tells this boundary exactly what is still unshown — no delivery row, the
     // same answer after a restart.
+    // Only a claim whose attempt COMPLETED cut a window: it reached its boundary and presented
+    // what it packed. A claim with no `step.completed` of its own (the process died between the
+    // claim and the boundary, or the attempt was redriven) presented nothing, so its rows stay
+    // in the next window (codex review of #740 round 4). The current claim always cuts.
+    let completed = |ord: Option<u32>, attempt: Option<u32>| {
+        rows.iter().any(|r| {
+            matches!(r.event.body, TeamBody::StepCompleted(_))
+                && r.event.env.by == claimed.by
+                && r.event.env.ord == ord
+                && r.event.env.attempt == attempt
+        })
+    };
     let mut seat_claims: Vec<i64> = rows
         .iter()
         .filter(|r| {
-            r.event_id <= claimed.claimed_id
+            r.event_id < claimed.claimed_id
                 && r.event.env.by == claimed.by
                 && matches!(r.event.body, TeamBody::StepClaimed(_))
+                && completed(r.event.env.ord, r.event.env.attempt)
         })
         .map(|r| r.event_id)
         .collect();
     seat_claims.sort_unstable();
-    if !seat_claims.contains(&claimed.claimed_id) {
-        seat_claims.push(claimed.claimed_id);
-    }
+    seat_claims.push(claimed.claimed_id);
     let question = |help_id: &str| {
         rows.iter().find_map(|r| match &r.event.body {
             TeamBody::HelpRequested(h) if h.help_id == help_id => Some(h.question.clone()),
@@ -615,6 +632,8 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // Rows are rendered by priority within `cap` — the PA's own refusals first (small and
     // decisive), then help, councils, change requests — each whole or not at all, and what did
     // not fit is counted in a closing line, never silently cut (codex review of #740 round 2).
+    // Every entry is bounded at ANSWER_ENTRY_CAP so any entry fits an empty window: a row that
+    // could never fit would otherwise sit in the carry forever (round 4).
     let mut entries: Vec<(i64, u8, String)> = Vec::new();
     for r in rows {
         if r.event_id >= claimed.claimed_id {
@@ -635,7 +654,10 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
                         if b.evidence.is_empty() {
                             String::new()
                         } else {
-                            format!(" (evidence: {})", b.evidence.join(", "))
+                            format!(
+                                " (evidence: {})",
+                                cap_utf8(&b.evidence.join(", "), ANSWER_EVIDENCE_CAP)
+                            )
                         }
                     ),
                     other => format!(
@@ -714,6 +736,18 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     if entries.is_empty() {
         return String::new();
     }
+    let entries: Vec<(i64, u8, String)> = entries
+        .into_iter()
+        .map(|(at, p, line)| {
+            if line.len() <= ANSWER_ENTRY_CAP {
+                (at, p, line)
+            } else {
+                let mut cut = cap_utf8(&line, ANSWER_ENTRY_CAP - 24);
+                cut.push_str(" … (cut; see the stream)\n");
+                (at, p, cut)
+            }
+        })
+        .collect();
     const HEADER: &str = "\n[team answers · ADVISORY: the team's replies since your last step]\n";
     let footer = |n: usize| format!("- (+{n} more answers did not fit; see the stream)\n");
     // Pack one window: by priority, then stream order; whole lines only. Returns (shown, unshown).
