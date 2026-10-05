@@ -124,6 +124,7 @@ fn spec(sid: &str, workflow: &str) -> LaunchSpec {
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
+        primary: None,
     }
 }
 

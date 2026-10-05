@@ -24,12 +24,13 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::domain::{
-    PendingStage, PendingTeamFact, RunTeamState, TeamBlocked, UnitTeamSnapshot, WorkUnit,
+    PendingStage, PendingTeamFact, PrimaryPick, RunTeamState, TeamBlocked, UnitTeamSnapshot,
+    WorkUnit,
 };
 use crate::team::events::{
     self as tev, Envelope, GateDecided, GateDecision, GateKind, GateOpened, GateOpenedKind,
-    LedgerSource, PathEnded, PathStarted, PathStatus, PlanAccepted, PlanMode, PlanStep, Selection,
-    TeamBody, TeamEvent, Transport,
+    LedgerSource, PathEnded, PathRepicked, PathStarted, PathStatus, PlanAccepted, PlanMode,
+    PlanStep, Selection, TeamBody, TeamEvent, Transport,
 };
 use crate::team::publish::{Exhausted, PublisherReq, TeamBus, TeamLink, TeamToken};
 
@@ -143,11 +144,20 @@ fn event(run_id: &str, body: TeamBody) -> TeamEvent {
 }
 
 fn path_started(session: &AgentSession) -> TeamEvent {
+    // (DES-ASK-TEAM-CHAT-001 §4.1; T2 §8.1) The pick the launch recorded; a run launched before
+    // the pick existed names its first seat as chosen (what it always did).
+    let pick = session.team.as_ref().and_then(|t| t.primary.as_ref());
     event(
         &session.id,
         TeamBody::PathStarted(PathStarted {
-            cli: session.clis.first().cloned().unwrap_or_default(),
-            selection: Selection::Chosen,
+            cli: pick
+                .map(|p| p.cli.clone())
+                .or_else(|| session.clis.first().cloned())
+                .unwrap_or_default(),
+            selection: match pick.map(|p| p.selection.as_str()) {
+                Some(PICK_RANDOM) => Selection::Random,
+                _ => Selection::Chosen,
+            },
             roster: session.clis.clone(),
             request: crate::team::cap_utf8(&session.problem, 8 * 1024),
             // (T3, codex round 7) What the launch named, from its durable plan state: the preset,
@@ -159,6 +169,197 @@ fn path_started(session: &AgentSession) -> TeamEvent {
                 .is_some_and(|t| t.preset.is_none()),
         }),
     )
+}
+
+/// `path.started.selection` / `PrimaryPick.selection` tokens.
+pub(crate) const PICK_CHOSEN: &str = "chosen";
+pub(crate) const PICK_RANDOM: &str = "random";
+
+/// (DES-ASK-TEAM-CHAT-001 §4.1; DES-TEAMING-002 §8.1) Pick the PA at launch and put it FIRST on
+/// the roster, before anything is planned or distributed, so `clis.first()` is the PA everywhere
+/// (`distribute::teamed_distribution`, `path.started`, the re-plan roster).
+///
+/// - `spec.primary` names a seat ⇒ `chosen`; a key not on the roster refuses the launch (never a
+///   silent fall-back to the first seat).
+/// - no choice on a TEAM run ⇒ `random`: uniform over the roster's usable seats (a seat the
+///   launcher marked unusable is benched by distribution anyway; with none usable, over all).
+/// - no choice on a legacy run ⇒ `None`: the roster order stands, as it always did.
+pub(crate) fn pick_primary(
+    spec: &mut crate::LaunchSpec,
+    team_run: bool,
+) -> anyhow::Result<Option<PrimaryPick>> {
+    let cli = match spec.primary.as_deref() {
+        Some(key) => {
+            if !spec.clis.iter().any(|c| c.key == key) {
+                anyhow::bail!(
+                    "primary seat `{key}` is not on the roster [{}]",
+                    spec.clis
+                        .iter()
+                        .map(|c| c.key.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            PrimaryPick {
+                cli: key.to_string(),
+                selection: PICK_CHOSEN.to_string(),
+                pick_seq: 0,
+            }
+        }
+        None if team_run => {
+            let usable: Vec<&str> = spec
+                .clis
+                .iter()
+                .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+                .map(|c| c.key.as_str())
+                .collect();
+            let pool: Vec<&str> = if usable.is_empty() {
+                spec.clis.iter().map(|c| c.key.as_str()).collect()
+            } else {
+                usable
+            };
+            if pool.is_empty() {
+                return Ok(None); // an empty roster is refused by distribution, not here
+            }
+            PrimaryPick {
+                cli: pool[random_index(pool.len(), &spec.session_id)].to_string(),
+                selection: PICK_RANDOM.to_string(),
+                pick_seq: 0,
+            }
+        }
+        None => return Ok(None),
+    };
+    rotate_first(&mut spec.clis, |c| c.key == cli.cli);
+    Ok(Some(cli))
+}
+
+/// Uniform in `0..n`. `WICKED_TEAM_PICK_SEED` (tests only) makes the draw a pure function of the
+/// seed and the run id; unset, it is the OS's randomness (`RandomState`), no new dependency.
+fn random_index(n: usize, run_id: &str) -> usize {
+    use std::hash::{BuildHasher, Hasher};
+    debug_assert!(n > 0);
+    match std::env::var("WICKED_TEAM_PICK_SEED") {
+        Ok(seed) => seeded_index(n, run_id, &seed),
+        Err(_) => {
+            (std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+                % n as u64) as usize
+        }
+    }
+}
+
+/// The seeded arm of [`random_index`]: a pure function of `(seed, run_id)`.
+pub(crate) fn seeded_index(n: usize, run_id: &str, seed: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h);
+    run_id.hash(&mut h);
+    (h.finish() % n as u64) as usize
+}
+
+/// Move the first item `is` matches to the front; the others keep their order.
+pub(crate) fn rotate_first<T>(items: &mut [T], is: impl Fn(&T) -> bool) {
+    if let Some(i) = items.iter().position(is) {
+        items[..=i].rotate_right(1);
+    }
+}
+
+/// The plan state's roster (`AgenticCli` JSON) re-ordered with `key` first, like the roster.
+pub(crate) fn rotate_roster_values(roster: &mut [serde_json::Value], key: &str) {
+    rotate_first(roster, |v| v["key"].as_str() == Some(key));
+}
+
+/// A step the PA performs on a team run: an agent step it owns (`owner: pa`) that is not an
+/// evaluator (the fence seats those distinctly) and not a member's step under review.
+pub(crate) fn is_pa_step(u: &WorkUnit) -> bool {
+    u.team_run
+        && u.tool_cmd.is_none()
+        && u.owner == crate::workflow::StepOwner::Pa
+        && u.role != crate::workflow::PhaseRole::Evaluator
+        && u.member_step.is_none()
+}
+
+/// (DES-ASK-TEAM-CHAT-001 §4.1, F2) The PA changed: `to` becomes the run's PA — the roster is
+/// re-ordered with it first, every not-yet-run PA step that sat on `from` follows it, the pick is
+/// recorded with the next `pick_seq`, and the fact is published as `path.repicked` keyed by that
+/// counter (E). The caller re-seats and redispatches the failed step itself (the failover ladder,
+/// `reseat_off_benched_seat`'s move). Nothing here touches member or evaluator seats.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn repick_primary(
+    store: &mut dyn GraphStore,
+    session: &mut AgentSession,
+    units: &mut [WorkUnit],
+    unit_ix: usize,
+    attempt: u32,
+    from: &str,
+    to: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let seq = session
+        .team
+        .as_ref()
+        .and_then(|t| t.primary.as_ref())
+        .map_or(0, |p| p.pick_seq)
+        + 1;
+    session
+        .team
+        .get_or_insert_with(RunTeamState::default)
+        .primary = Some(PrimaryPick {
+        cli: to.to_string(),
+        selection: PICK_RANDOM.to_string(),
+        pick_seq: seq,
+    });
+    rotate_first(&mut session.clis, |k| k == to);
+    // The plan state's roster too: a re-plan at a later gate edit re-distributes from it, and
+    // must not put the seat that just failed back in front.
+    if let Some(tp) = session.team_plan.as_mut() {
+        rotate_roster_values(&mut tp.roster, to);
+    }
+    // The template the PA steps carry on the new seat: the launch roster's own when a unit of
+    // this run already carries it, else the registry's (as `reseat_off_benched_seat` does).
+    let invocation = units
+        .iter()
+        .find(|u| u.assigned_cli.as_deref() == Some(to) && u.assigned_invocation.is_some())
+        .and_then(|u| u.assigned_invocation.clone())
+        .or_else(|| {
+            crate::registry_roster()
+                .iter()
+                .find(|c| c.key == to)
+                .map(|c| c.headless_invocation.clone())
+        });
+    for (ix, u) in units.iter_mut().enumerate() {
+        if ix == unit_ix
+            || !is_pa_step(u)
+            || u.assigned_cli.as_deref() != Some(from)
+            || !matches!(
+                u.status,
+                crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+            )
+        {
+            continue;
+        }
+        u.assigned_cli = Some(to.to_string());
+        u.assigned_invocation = invocation.clone();
+        put_node(store, u.to_node())?;
+    }
+    let ord = units.get(unit_ix).map(|u| u.ord);
+    if publishes(session) {
+        let mut ev = event(
+            &session.id,
+            TeamBody::PathRepicked(PathRepicked {
+                from: from.to_string(),
+                to: to.to_string(),
+                reason: reason.to_string(),
+                selection: Selection::Random,
+                pick_seq: seq,
+            }),
+        );
+        ev.env.ord = ord;
+        ev.env.attempt = Some(attempt);
+        publish_fire(ev);
+    }
+    Ok(())
 }
 
 /// `plan.accepted` for the launch's composed plan. The steps name each unit's phase; the scored

@@ -367,6 +367,7 @@ mod tests {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: None,
         })
         .expect("launch_run must not fail");
 

@@ -749,6 +749,12 @@ pub struct LaunchOptions {
     /// `walkthrough_review` Tool writes `<root>/<step>/`. Validated like a write root. Omit and no
     /// walkthrough can pass on the run.
     pub evidence_root: Option<String>,
+    /// (DES-ASK-TEAM-CHAT-001 §4.1; DES-TEAMING-002 §8.1; wicked-core-ts ≥ the release carrying
+    /// ASK-K1a) The PA seat the launcher CHOSE — a `key` of `clisJson`. Omit and a TEAM run (a plan
+    /// or a preset) gets one drawn uniformly at random among the roster's usable seats
+    /// (`path.started{selection:"random"}`); a legacy run keeps the roster's first seat. A key not
+    /// on the roster REJECTS the launch. The roster is re-ordered so the pick is first.
+    pub primary: Option<String>,
 }
 
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
@@ -801,6 +807,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         deliver_step,
         exclude_seats: o.exclude_seats.unwrap_or_default(),
         evidence_root: o.evidence_root,
+        primary: o.primary,
     })
 }
 

@@ -128,6 +128,14 @@ export interface LaunchOptions {
    * walkthrough can pass on the run.
    */
   evidenceRoot?: string
+  /**
+   * (DES-ASK-TEAM-CHAT-001 §4.1; DES-TEAMING-002 §8.1; wicked-core-ts ≥ the release carrying
+   * ASK-K1a) The PA seat the launcher CHOSE — a `key` of `clisJson`. Omit and a TEAM run (a plan
+   * or a preset) gets one drawn uniformly at random among the roster's usable seats
+   * (`path.started{selection:"random"}`); a legacy run keeps the roster's first seat. A key not
+   * on the roster REJECTS the launch. The roster is re-ordered so the pick is first.
+   */
+  primary?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real

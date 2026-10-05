@@ -335,6 +335,13 @@ pub struct LaunchSpec {
     /// (absolute, outside the engine's config/pin tree) and persisted on the session. `None` ⇒ no
     /// walkthrough can pass on this run (its pinned validators fail closed).
     pub evidence_root: Option<String>,
+    /// (DES-ASK-TEAM-CHAT-001 §4.1; DES-TEAMING-002 §8.1) The PA seat the launcher CHOSE — a key
+    /// of `clis`. `None` ⇒ for a TEAM run (a plan or a preset) the engine draws one uniformly at
+    /// random among the roster's usable seats and `path.started` says `selection:"random"`; a
+    /// legacy (un-planned) run keeps the roster's first seat. A key not on the roster REJECTS
+    /// the launch. The roster is re-ordered so the pick is first: every `owner:"pa"` unit of a
+    /// team run lands on it (`distribute::teamed_distribution`).
+    pub primary: Option<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -2035,6 +2042,7 @@ mod tests {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: None,
         })
         .expect("launch");
         let runs = vec!["held".to_string(), "ghost".to_string()];

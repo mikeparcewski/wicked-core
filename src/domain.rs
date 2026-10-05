@@ -264,6 +264,18 @@ pub fn normalize_exclude_seats(raw: &[String]) -> Vec<String> {
 /// **Positive evidence only.** A run is teamed ([`RunTeamState::is_teamed`]) only when its
 /// transport is `bus` AND its `path.started` was acknowledged (`stream_floor` set). An unset
 /// transport is "not decided yet", never "teamed": the actor dispatches nothing while it is unset.
+/// (DES-ASK-TEAM-CHAT-001 §4.1; DES-TEAMING-002 §8.1) The run's PA seat and how it was picked.
+/// Persisted on the team state so a resume, a re-plan and `path.started` read the same pick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryPick {
+    /// The PA seat (`claude`, `codex`, `claude#2`): the run's creator seat.
+    pub cli: String,
+    /// `chosen` (the launch named it) or `random` (the engine drew it, or re-picked it).
+    pub selection: String,
+    /// How many re-picks the run has had (`0` at launch); `path.repicked.pick_seq` is this value.
+    pub pick_seq: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunTeamState {
     /// `bus` once `path.started` is on the bus; `none` for an un-teamed run; unset until decided.
@@ -297,6 +309,10 @@ pub struct RunTeamState {
     /// re-issues the end (DES-TEAMING-002 §4.1, review of #623 round 3).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ended: bool,
+    /// (DES-ASK-TEAM-CHAT-001 §4.1) The PA seat and its selection; `None` for a run launched
+    /// before the pick existed (its PA is the roster's first seat, as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<PrimaryPick>,
     /// (T6) The open `team_dispute` gate, while the run is paused on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispute: Option<DisputeGate>,

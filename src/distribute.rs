@@ -436,6 +436,33 @@ pub(crate) fn distribute_units_against_benched(
     let pa = team_run
         .then(|| clis.first().map(|c| c.key.clone()))
         .flatten();
+    // (DES-ASK-TEAM-CHAT-001 §4.1; DES-TEAMING-002 §8.1) The PA is the run's CREATOR seat: every
+    // step it owns (`owner: pa`; not an evaluator — the fence below seats those distinctly — and
+    // not a Tool) lands on it whatever order `governed_first` gave the unit's candidates, when the
+    // PA admits the unit. The roster already has the pick first (`team_gate::pick_primary` rotated
+    // it; a re-pick rotates it again), so `clis.first()` IS the pick.
+    if let Some(pa) = pa.as_deref() {
+        for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
+            if u.tool_cmd.is_some()
+                || u.owner != crate::workflow::StepOwner::Pa
+                || u.role == crate::workflow::PhaseRole::Evaluator
+                || d.assigned_cli == pa
+            {
+                continue;
+            }
+            let admits = match cands {
+                Some((eligible, _)) => eligible.iter().any(|c| c.key == pa),
+                None => true,
+            };
+            if admits {
+                d.assigned_invocation = invocation_of(clis, pa);
+                d.routing = RoutingInfo::Teamed {
+                    winner: pa.to_string(),
+                };
+                d.assigned_cli = pa.to_string();
+            }
+        }
+    }
     // (DES-TEAMING-002 §8.8, seam T6) A member's step (`owner: team`) of a team run runs on a
     // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
     // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
@@ -2356,6 +2383,41 @@ mod tests {
             Some(DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE)
         );
     }
+    /// (DES-ASK-TEAM-CHAT-001 §4.1; T2 §8.1) The PA is the run's creator seat: on a team run every
+    /// step the PA owns lands on the roster's FIRST seat (the pick, rotated there at launch) even
+    /// when `governed_first` would order a governing seat ahead of it for a build unit; the
+    /// evaluator still goes to a distinct seat. A legacy run keeps the governed-first order.
+    #[test]
+    fn a_team_runs_pa_steps_land_on_the_rosters_first_seat_whatever_governance_ordered() {
+        let roster = [acp_seat("codex", false), acp_seat("claude", true)];
+        assert!(!seat_governs(&roster[0]) && seat_governs(&roster[1]));
+        let team =
+            distribute_units_against_benched(&team_build_and_review(), &roster, "r1", None, &[])
+                .expect("routes");
+        assert_eq!(team[0].assigned_cli, "codex", "the PA builds");
+        assert_eq!(
+            team[0].routing,
+            RoutingInfo::Teamed {
+                winner: "codex".into()
+            }
+        );
+        assert_eq!(
+            team[0].assigned_invocation.as_deref(),
+            Some("codex -p {PROMPT}")
+        );
+        assert_eq!(
+            team[1].assigned_cli, "claude",
+            "the review is seat-distinct"
+        );
+        let legacy =
+            distribute_units_against_benched(&build_and_review(), &roster, "r1", None, &[])
+                .expect("routes");
+        assert_eq!(
+            legacy[0].assigned_cli, "claude",
+            "legacy: the governing seat builds"
+        );
+    }
+
     /// D1 (codex on #618): a TOOL build unit is no creator seat. Its `assigned_cli` is its own
     /// program token (`tool_distribution`), which here equals the only seat key (`claude`); a
     /// team run must not read that as "the review grades its creator" and refuse the plan.

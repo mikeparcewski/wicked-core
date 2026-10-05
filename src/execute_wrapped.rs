@@ -11814,6 +11814,7 @@ mod project_graph_end_to_end_tests {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            primary: None,
         };
 
         // 1. BOUND.

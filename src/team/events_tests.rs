@@ -1,6 +1,6 @@
 //! DES-TEAMING-002 T1 acceptance: (a) four segments, (b) value-compared round trips, (c) `fold`
 //! on DES-001's fixtures #8, #11, #15, #16 a–k, (d) `fold` under duplicates, (e) the §4.1 key
-//! vectors, (g) the §6.1 identity rule over all 25 types plus the key-builder source guard.
+//! vectors, (g) the §6.1 identity rule over all 26 types plus the key-builder source guard.
 //! Every expected value is fixed here; the keys were computed by an independent transcription of
 //! the §4.1 algorithm, not by the code under test.
 
@@ -55,7 +55,7 @@ fn every_type_is_four_segments_under_wicked_team() {
         );
         assert!(seen.insert(t), "{t} listed twice");
     }
-    assert_eq!(seen.len(), 25);
+    assert_eq!(seen.len(), 26);
 }
 
 /// DES-002 §7 assertion 1: each type has exactly one owner, as the matrix assigns it.
@@ -63,7 +63,7 @@ fn every_type_is_four_segments_under_wicked_team() {
 fn every_type_has_the_one_owner_the_matrix_assigns() {
     use Owner::{Engine as E, Runner as R, Supervisor as S};
     let matrix = [
-        E, E, E, E, E, E, S, S, R, R, S, R, R, R, S, S, R, R, S, S, S, S, E, E, E,
+        E, E, E, E, E, E, S, S, R, R, S, R, R, R, S, S, R, R, S, S, S, S, E, E, E, E,
     ];
     for (t, want) in ALL_TYPES.iter().zip(matrix) {
         assert_eq!(owner(t), Some(want), "{t}");
@@ -77,7 +77,7 @@ fn every_type_has_the_one_owner_the_matrix_assigns() {
 fn every_fixture_round_trips_by_value() {
     let all = fixtures();
     let covered: std::collections::BTreeSet<&str> = all.iter().map(|(t, _)| t.as_str()).collect();
-    assert_eq!(covered.len(), 25, "a fixture per type");
+    assert_eq!(covered.len(), 26, "a fixture per type");
     for (t, payload) in &all {
         let ev = TeamEvent::from_payload(t, payload).unwrap_or_else(|e| panic!("{t}: {e:#}"));
         assert_eq!(ev.event_type(), t.as_str());
@@ -269,6 +269,10 @@ fn every_fixture_keys_to_its_fixed_value() {
             "e4b13241087ea34f29f7508ab089b566",
         ),
         ("wicked.team.path.ended", "8741e4e2305194adf64fedb610c1d12a"),
+        (
+            "wicked.team.path.repicked",
+            "6801a7c425b0492bae48fc28bb7538fd",
+        ),
     ];
     let all = fixtures();
     assert_eq!(all.len(), want.len());
@@ -341,7 +345,7 @@ fn a_keyed_type_with_a_null_ord_has_no_key() {
     assert!(ev.key().is_err());
 }
 
-// ── (g) the §6.1 identity rule, table-driven over all 25 types ───────────────────────────────────
+// ── (g) the §6.1 identity rule, table-driven over all 26 types ───────────────────────────────────
 
 /// Set the producer-assigned part of a fixture to the `n`th value. Returns the payload keys that
 /// part lives in (every other key must be identical between two requests).
@@ -458,6 +462,10 @@ fn identity_table() -> Vec<(&'static str, Assign)> {
         (PATH_ENDED, |p, n| {
             p["run_id"] = json!(format!("r{n}"));
             &["run_id"]
+        }),
+        (PATH_REPICKED, |p, n| {
+            p["pick_seq"] = json!(n);
+            &["pick_seq"]
         }),
     ]
 }
@@ -1322,8 +1330,9 @@ fn an_unknown_token_in_any_enum_field_is_rejected_at_parse() {
     // Computed fields are not in this list: they are recomputed at parse, so an incoming token
     // there is ignored, not refused (`ledger.folded.final_pass`, `path.scored.plan`; see the
     // computed-field tests). Their source fields are covered instead.
-    let cases: [(&str, &str); 23] = [
+    let cases: [(&str, &str); 24] = [
         (PATH_STARTED, "selection"),
+        (PATH_REPICKED, "selection"),
         (PATH_SCORED, "basis"),
         (PLAN_PROPOSED, "kind"),
         (PLAN_REVISED, "reason"),
