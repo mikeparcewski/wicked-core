@@ -114,6 +114,42 @@ pub struct TeamConfig {
     pub final_pass_budget: Duration,
     /// (T5) The gate wait's poll interval ([`super::runner::GATE_POLL`]).
     pub gate_poll: Duration,
+    /// (ASK-K3b) The step outputs the runner holds for the supervisor's final pass, by
+    /// `step.completed.output_ref` ([`OutputStash`]). Shared by the runner and the supervisor of
+    /// one process.
+    pub outputs: OutputStash,
+}
+
+/// (ASK-K3b, DES-ASK-TEAM-CHAT-001 §4.6) A step's output text, keyed by its
+/// `step.completed.output_ref` (`unit:<run>:<ord>:<attempt>`), from the runner's turn end to its
+/// fold. The final pass of a step that changed no tree reviews the OUTPUT, and it runs BEFORE the
+/// fold writes the `work_output` record that ref otherwise resolves to (the fold waits for the
+/// ledger the pass publishes), so the runner hands the text over here first and drops it when
+/// its gate wait returns. In-process by design: a restart kills the attempt (DES-TEAMING-002
+/// §4.7) and a dead attempt gets no final pass.
+#[derive(Debug, Clone, Default)]
+pub struct OutputStash(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>);
+
+impl OutputStash {
+    pub fn put(&self, output_ref: &str, text: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(output_ref.to_string(), text.to_string());
+    }
+    pub fn get(&self, output_ref: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(output_ref)
+            .cloned()
+    }
+    pub fn remove(&self, output_ref: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(output_ref);
+    }
 }
 
 impl TeamConfig {
@@ -134,6 +170,7 @@ impl TeamConfig {
                 .final_pass_budget
                 .max(super::runner::MIN_GATE_WAIT),
             gate_poll: super::runner::GATE_POLL,
+            outputs: OutputStash::default(),
         }
     }
 
@@ -146,6 +183,7 @@ impl TeamConfig {
             attempt_wait: ATTEMPT_WAIT,
             final_pass_budget: crate::team::FINAL_PASS_BUDGET,
             gate_poll: super::runner::GATE_POLL,
+            outputs: OutputStash::default(),
         }
     }
 

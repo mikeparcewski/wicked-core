@@ -199,6 +199,9 @@ pub struct SupervisorConfig {
     /// (T4) The engine's command channel: the supervisor's diff re-scores go to the actor as
     /// `Command::TeamRescored` (§8.7). `None` = no re-score is sent.
     pub(crate) engine: Option<Sender<crate::command::Command>>,
+    /// (ASK-K3b) The runner's stashed step outputs, read at the final pass of a step that
+    /// changed no tree ([`super::publish::OutputStash`]).
+    pub outputs: super::publish::OutputStash,
 }
 
 impl SupervisorConfig {
@@ -217,6 +220,7 @@ impl SupervisorConfig {
             tail: None,
             publish_bound: cfg.bound(),
             engine: None,
+            outputs: cfg.outputs.clone(),
         })
     }
 
@@ -474,7 +478,10 @@ impl UnitTeam {
         )
     }
 
-    fn joined(&mut self, i: Option<usize>, id: &str, seat: &str, error: Option<String>) {
+    /// `seat: None` (ASK-K3b, DES-ASK-TEAM-CHAT-001 §4.6) is the absent member: the plan asked
+    /// for one and NO distinct seat exists to seat it on — the row is still minted for the slot
+    /// (`member_id`, `open_seq`), so it keeps a valid key and the thread can say so.
+    fn joined(&mut self, i: Option<usize>, id: &str, seat: Option<&str>, error: Option<String>) {
         let open_seq = match i {
             Some(i) => {
                 self.monitors[i].open_seq += 1;
@@ -483,13 +490,16 @@ impl UnitTeam {
             None => 1,
         };
         let key = self.key();
-        let reason = format!("team plan monitors={}", self.ctx.plan.monitors);
+        let reason = match seat {
+            Some(_) => format!("team plan monitors={}", self.ctx.plan.monitors),
+            None => "no distinct signed-in seat".to_string(),
+        };
         let ev = TeamEvent {
-            env: env_of(&key, seat, None),
+            env: env_of(&key, seat.unwrap_or("engine"), None),
             body: TeamBody::MemberJoined(MemberJoined {
                 member_id: id.to_string(),
                 open_seq,
-                seat: Some(seat.to_string()),
+                seat: seat.map(str::to_string),
                 role: MemberRole::Monitor,
                 status: if error.is_some() {
                     AttachStatus::Failed
@@ -516,22 +526,39 @@ impl UnitTeam {
         if want == 0 {
             return;
         }
-        let Some(baseline) = self
-            .ctx
-            .baseline_tree
-            .clone()
-            .filter(|_| self.ctx.repo.is_some())
-        else {
-            let candidates = self.ctx.plan.candidates.clone();
-            for (i, seat) in candidates.iter().take(want).enumerate() {
-                self.joined(
-                    None,
-                    &format!("m{}", i + 1),
-                    seat,
-                    Some("no worktree baseline".to_string()),
-                );
-            }
+        // (ASK-K3b) The plan asked for a member and the roster has no seat but the PA's: the
+        // absence is on the record with a minted identity (one signed-in seat is the common
+        // single-user case; the thread renders "No reviewer — only <seat> is signed in").
+        if self.ctx.plan.candidates.is_empty() {
+            self.joined(
+                None,
+                "m1",
+                None,
+                Some(format!(
+                    "the roster has no seat distinct from the PA ({})",
+                    self.ctx.creator
+                )),
+            );
             return;
+        }
+        let baseline = match (&self.ctx.repo, &self.ctx.baseline_tree) {
+            (Some(_), Some(b)) => b.clone(),
+            // (ASK-K3b, §4.6) An unbound unit has no tree to diff, so its members review the
+            // step's OUTPUT at the final pass (the one general rule); admitted with no baseline,
+            // and no checkpoint batch is ever due for it (`due_batches`).
+            (None, _) => String::new(),
+            (Some(_), None) => {
+                let candidates = self.ctx.plan.candidates.clone();
+                for (i, seat) in candidates.iter().take(want).enumerate() {
+                    self.joined(
+                        None,
+                        &format!("m{}", i + 1),
+                        Some(seat),
+                        Some("no worktree baseline".to_string()),
+                    );
+                }
+                return;
+            }
         };
         let mut admitted = 0;
         let candidates = self.ctx.plan.candidates.clone();
@@ -548,7 +575,7 @@ impl UnitTeam {
                 host.admitted(seat).err()
             };
             if let Some(why) = refusal {
-                self.joined(None, &id, seat, Some(why));
+                self.joined(None, &id, Some(seat), Some(why));
                 continue;
             }
             admitted += 1;
@@ -636,6 +663,8 @@ impl UnitTeam {
             repo: self.ctx.repo.clone(),
             budget,
             diff_cap: cap,
+            step_id: self.ctx.step_id.clone(),
+            output: None,
         }
     }
 
@@ -703,7 +732,7 @@ impl UnitTeam {
                 self.monitors[slot].id.clone(),
                 self.monitors[slot].seat.clone(),
             );
-            self.joined(Some(slot), &id, &seat, opened.err());
+            self.joined(Some(slot), &id, Some(&seat), opened.err());
         }
         match done.outcome {
             BatchOutcome::OpenFailed(e) => {
@@ -758,9 +787,7 @@ impl UnitTeam {
                         checkpoint_seq: done.checkpoint_seq,
                         anchor: c.anchor,
                         carried_from_attempt: None,
-                        // (ASK-K3a) Every batch today reviews the settled tree; K3b adds the
-                        // output target.
-                        target: tev::FindingTarget::Tree,
+                        target: c.target,
                     };
                     if let super::Admit::New(lf, seq) = self.book.admit(finding) {
                         let f = lf.finding.clone();
@@ -840,6 +867,10 @@ pub struct BatchJob {
     repo: Option<Repo>,
     budget: Duration,
     diff_cap: usize,
+    step_id: String,
+    /// (ASK-K3b, §4.6) `Some` = the OUTPUT target: the step changed no tree (or has none), so
+    /// the batch reviews the worker's answer, not a diff. Set by the final pass only.
+    output: Option<String>,
 }
 
 /// A confirmed, above-bar finding a batch found, before dedup.
@@ -849,6 +880,7 @@ struct Candidate {
     severity: Severity,
     in_diff: bool,
     anchor: String,
+    target: tev::FindingTarget,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -893,6 +925,9 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
         opened,
         outcome,
     };
+    if let Some(text) = job.output.as_deref() {
+        return review_output(job, text, host);
+    }
     let Some(repo) = job.repo.as_ref() else {
         return done(
             None,
@@ -987,6 +1022,7 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
             severity,
             in_diff,
             anchor,
+            target: tev::FindingTarget::Tree,
         });
     }
     done(
@@ -998,6 +1034,108 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
             changes: super::parse_change_lines(&reply),
         },
     )
+}
+
+/// (ASK-K3b; DES-ASK-TEAM-CHAT-001 §4.6; DES-TEAMING-001 rev 14 §4.6 step 2) The final batch over
+/// a step's OUTPUT: the member is shown the worker's answer (capped at `diff_cap`, truncation
+/// disclosed) with the step criterion, and every `FINDING` goes through the same parse → bar →
+/// confirm pipeline as a diff batch, against the answer text instead of a tree file: `path` is
+/// the step id, `line` a line of the answer, `evidence` that exact line or the finding is
+/// `unconfirmed`. The bar is `{medium}`: a `high` is recorded `medium` (an answer passes no work
+/// through the gate, so a HIGH has no referent — T1 §6.3), `low` is `belowBar` as today.
+fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDone {
+    let done = |opened, outcome| BatchDone {
+        key: job.key.clone(),
+        slot: job.slot,
+        checkpoint_seq: job.checkpoint_seq,
+        opened,
+        outcome,
+    };
+    let mut opened = None;
+    if job.needs_open {
+        let r = host.open(&job.pool_key, &job.seat, &job.scope);
+        opened = Some(r.clone());
+        if let Err(e) = r {
+            return done(opened, BatchOutcome::OpenFailed(e));
+        }
+    }
+    let shown = shown_output(text, job.diff_cap);
+    let mut prompt = job.header.clone().unwrap_or_default();
+    prompt.push_str(&format!(
+        "
+[final pass: the worker's turn has ended and this step (`{step}`) changed no tree —          review the worker's ANSWER against the step criterion]
+         Report only defects you can pin to ONE line of the answer: `path` is the step id          `{step}`, `line` the 1-based line number IN THE ANSWER below, `evidence` the exact text          of that line. A repo path named inside the answer is not confirmed here. The bar is          `medium`: nothing leaves the machine from an answer, so a `high` is recorded as          `medium`.
+",
+        step = job.step_id
+    ));
+    if shown.len() < text.len() {
+        prompt.push_str(&format!(
+            "The answer is shown truncated at {} of {} bytes.
+",
+            shown.len(),
+            text.len()
+        ));
+    }
+    prompt.push_str(
+        "```answer
+",
+    );
+    prompt.push_str(&shown);
+    prompt.push_str(
+        "
+```
+",
+    );
+    let started = Instant::now();
+    let reply = match host.turn(&job.pool_key, &prompt, job.budget) {
+        Ok(r) => r,
+        Err(error) => {
+            let timed_out = started.elapsed() >= job.budget;
+            return done(opened, BatchOutcome::TurnFailed { error, timed_out });
+        }
+    };
+    let (parsed, malformed) = parse_reply(&reply);
+    let mut rejected = Rejected {
+        malformed,
+        ..Rejected::default()
+    };
+    let mut candidates = Vec::new();
+    for mut f in parsed {
+        let Some(severity) = Severity::parse(&f.severity) else {
+            rejected.below_bar += 1;
+            continue;
+        };
+        if f.evidence.len() > super::EVIDENCE_CAP || !confirm(Some(&shown), f.line, &f.evidence) {
+            rejected.unconfirmed += 1;
+            continue;
+        }
+        let severity = match severity {
+            Severity::High => Severity::Medium,
+            s => s,
+        };
+        f.path = job.step_id.clone();
+        candidates.push(Candidate {
+            raw: f,
+            severity,
+            in_diff: true,
+            anchor: String::new(),
+            target: tev::FindingTarget::Output,
+        });
+    }
+    done(
+        opened,
+        BatchOutcome::Reviewed {
+            tree: job.final_tree.clone().unwrap_or_default(),
+            candidates,
+            rejected,
+            changes: super::parse_change_lines(&reply),
+        },
+    )
+}
+
+/// The answer text as the member sees it (and is confirmed against): capped at `cap` bytes.
+fn shown_output(text: &str, cap: usize) -> String {
+    cap_utf8(text, cap)
 }
 
 // ── The run's stream, as the supervisor keeps it ────────────────────────────────────────────────
@@ -1383,6 +1521,7 @@ impl SupervisorCore {
                         .map(|((_, a), s)| (*a, s.by.clone()))
                         .collect(),
                     pa: st.pa.clone(),
+                    output: self.cfg.outputs.get(&b.output_ref),
                 }))];
             }
             TeamBody::LedgerFolded(_) => {
@@ -1531,9 +1670,15 @@ impl SupervisorCore {
                 u.summon(&*self.host);
             }
             let mut took_titles = false;
+            // (ASK-K3b) An unbound unit has no tree: its members review the output at the final
+            // pass and no checkpoint batch is due.
+            let unbound = u.ctx.repo.is_none();
             for i in 0..u.monitors.len() {
                 let limits = self.cfg.limits;
                 let m = &mut u.monitors[i];
+                if unbound {
+                    m.pending = false;
+                }
                 if !m.pending || m.in_flight || m.state == SlotState::Failed {
                     continue;
                 }
@@ -1653,6 +1798,31 @@ pub struct HelpJob {
 /// published — the question stays unanswered on the stream, and the PA was told only members
 /// answer (a human-directed question is S1 elicitation).
 pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
+    // (ASK-K3a/K3b, DES-ASK-TEAM-CHAT-001 §4.5) Every terminal outcome of a help turn is a fact
+    // on the row S owns — `help.answered{outcome}` — never an inference from a missing row: a
+    // consumer cannot tell a timeout from a dead transport from a turn still running otherwise.
+    let publish = |seat: &str, answer: Option<String>, evidence: Vec<String>, outcome, error| {
+        let answer_id = format!(
+            "t-{}",
+            crate::bus::deterministic_key(&[&job.key.0, &job.help_id, seat])
+        );
+        let ev = TeamEvent {
+            env: env_of(
+                &job.key,
+                seat,
+                Some(format!("help.requested#{}", job.help_id)),
+            ),
+            body: TeamBody::HelpAnswered(HelpAnswered {
+                help_id: job.help_id.clone(),
+                answer_id,
+                answer,
+                evidence,
+                outcome,
+                error,
+            }),
+        };
+        let _ = Publisher::new(pub_.clone()).publish(&ev);
+    };
     let Some(seat) = job
         .candidates
         .iter()
@@ -1662,6 +1832,13 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
         eprintln!(
             "wicked-core: team: help {} of {}:{}:{} has no admitted member to answer it",
             job.help_id, job.key.0, job.key.1, job.key.2
+        );
+        publish(
+            "engine",
+            None,
+            Vec::new(),
+            tev::HelpOutcome::NoMember,
+            Some("no admitted member seat to answer it".to_string()),
         );
         return;
     };
@@ -1676,6 +1853,13 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
     };
     if let Err(e) = host.open(&pool_key, &seat, &scope) {
         eprintln!("wicked-core: team: help member {seat} did not open ({e})");
+        publish(
+            &seat,
+            None,
+            Vec::new(),
+            tev::HelpOutcome::Failed,
+            Some(format!("the member did not open: {e}")),
+        );
         return;
     }
     let prompt = format!(
@@ -1686,40 +1870,50 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
          Reply with your answer, then one line `EVIDENCE: <path:line>` per citation, then DONE.\n",
         job.question, job.context
     );
+    let started = Instant::now();
     let reply = host.turn(&pool_key, &prompt, job.budget);
     host.close(&pool_key);
     let reply = match reply {
         Ok(r) => r,
         Err(e) => {
             eprintln!("wicked-core: team: help member {seat} turn failed ({e})");
+            let timed_out = started.elapsed() >= job.budget;
+            publish(
+                &seat,
+                None,
+                Vec::new(),
+                if timed_out {
+                    tev::HelpOutcome::TimedOut
+                } else {
+                    tev::HelpOutcome::Failed
+                },
+                Some(if timed_out {
+                    format!("member turn exceeded {} s", job.budget.as_secs())
+                } else {
+                    e
+                }),
+            );
             return;
         }
     };
     let (answer, evidence) = super::parse_help_answer(&reply);
     if answer.is_empty() {
+        publish(
+            &seat,
+            None,
+            Vec::new(),
+            tev::HelpOutcome::Failed,
+            Some("the member replied without an answer".to_string()),
+        );
         return;
     }
-    let answer_id = format!(
-        "t-{}",
-        crate::bus::deterministic_key(&[&job.key.0, &job.help_id, &seat])
+    publish(
+        &seat,
+        Some(answer),
+        evidence,
+        tev::HelpOutcome::Answered,
+        None,
     );
-    let ev = TeamEvent {
-        env: env_of(
-            &job.key,
-            &seat,
-            Some(format!("help.requested#{}", job.help_id)),
-        ),
-        body: TeamBody::HelpAnswered(HelpAnswered {
-            help_id: job.help_id.clone(),
-            answer_id,
-            answer: Some(answer),
-            evidence,
-            // (ASK-K3a) The member answered; K3b publishes the non-answered outcomes.
-            outcome: tev::HelpOutcome::Answered,
-            error: None,
-        }),
-    };
-    let _ = Publisher::new(pub_.clone()).publish(&ev);
 }
 
 // ── The final pass (DES-001 §4.7, DES-002 §8.11) ────────────────────────────────────────────────
@@ -1740,6 +1934,9 @@ pub struct FinalPassJob {
     /// Every attempt of the unit and who ran it (the member of a reviewed step).
     members: BTreeMap<u32, String>,
     pa: String,
+    /// (ASK-K3b) The step's output as the runner left it (`step.completed.output_ref`), when
+    /// this process ran the attempt; the final pass reviews it if the tree did not change.
+    output: Option<String>,
 }
 
 impl FinalPassJob {
@@ -1893,24 +2090,41 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
         rescore(&job.unit, true);
     }
 
-    // 1–3 (S2): the final batch per member over the settled tree, and re-confirmation.
+    // 1–3 (S2): the final batch per member over the settled target, and re-confirmation.
+    // (ASK-K3b, §4.6) ONE rule picks the target: the settled diff when the tree changed, else the
+    // step's output (when this process ran the attempt and left it). Not an ask rule: any
+    // read-only team unit with a member is reviewed on its output the same way.
     if job.ok {
         let prepared = {
             let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
-            match u.ctx.repo.clone() {
-                None => {
-                    u.summon(host);
+            let snapshot = match u.ctx.repo.clone() {
+                None => Ok(None),
+                Some(repo) => repo.snapshot().map(|t| Some((repo, t))),
+            };
+            match snapshot {
+                Err(e) => {
+                    for m in &mut u.monitors {
+                        m.error = Some(format!("final snapshot failed: {e}"));
+                    }
                     None
                 }
-                Some(repo) => match repo.snapshot() {
-                    Err(e) => {
-                        for m in &mut u.monitors {
-                            m.error = Some(format!("final snapshot failed: {e}"));
-                        }
+                Ok(snap) => {
+                    u.summon(host);
+                    let t_final = snap.as_ref().map(|(_, t)| t.clone());
+                    let tree_changed = match (&t_final, &u.ctx.baseline_tree) {
+                        (Some(t), Some(b)) => t != b,
+                        _ => false,
+                    };
+                    let shown = if tree_changed {
                         None
-                    }
-                    Ok(t_final) => {
-                        u.summon(host);
+                    } else {
+                        job.output
+                            .as_deref()
+                            .map(|o| shown_output(o, job.limits.diff_cap))
+                    };
+                    if t_final.is_none() && shown.is_none() {
+                        None
+                    } else {
                         let mut jobs = Vec::new();
                         for i in 0..u.monitors.len() {
                             let m = &mut u.monitors[i];
@@ -1922,19 +2136,21 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                                 continue;
                             }
                             m.in_flight = true;
-                            jobs.push(u.job(
+                            let mut b = u.job(
                                 i,
-                                Some(t_final.clone()),
+                                t_final.clone(),
                                 job.limits.monitor_turn_budget,
                                 job.limits.diff_cap,
-                            ));
+                            );
+                            b.output = shown.clone();
+                            jobs.push(b);
                         }
-                        Some((repo, t_final, jobs))
+                        Some((snap.map(|(r, _)| r), t_final, shown, jobs))
                     }
-                },
+                }
             }
         };
-        if let Some((repo, t_final, jobs)) = prepared {
+        if let Some((repo, t_final, shown, jobs)) = prepared {
             for mut b in jobs {
                 if clock.expired() {
                     timed_out = true;
@@ -1953,7 +2169,15 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
             let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
             let mut superseded = Vec::new();
             for (i, f) in u.book.findings.iter().enumerate() {
-                let text = repo.file(&t_final, &f.finding.path);
+                // Re-confirm each finding against what it cites: the settled tree, or the
+                // answer text the member was shown.
+                let text = match f.finding.target {
+                    tev::FindingTarget::Output => shown.clone(),
+                    tev::FindingTarget::Tree => match (&repo, &t_final) {
+                        (Some(r), Some(t)) => r.file(t, &f.finding.path),
+                        _ => None,
+                    },
+                };
                 let seq = u.book.raises[i];
                 match locate(text.as_deref(), f.finding.line, &f.finding.evidence) {
                     Some(n) => {
@@ -1963,15 +2187,18 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                 }
             }
             for (seq, f) in superseded {
+                let settled_on = match (f.target, &t_final) {
+                    (tev::FindingTarget::Output, _) => "settled output".to_string(),
+                    (tev::FindingTarget::Tree, Some(t)) => format!("settled tree {t}"),
+                    (tev::FindingTarget::Tree, None) => "settled tree".to_string(),
+                };
                 let ev = TeamEvent {
                     env: env_of(&key, &f.seat, Some(format!("finding.raised#{seq}"))),
                     body: TeamBody::FindingSettled(FindingSettled {
                         raise_seq: seq,
                         finding_id: f.finding_id.clone(),
                         status: SettledStatus::Superseded,
-                        reason: format!(
-                            "its evidence text is gone from the settled tree {t_final}"
-                        ),
+                        reason: format!("its evidence text is gone from the {settled_on}"),
                         final_line: None,
                     }),
                 };

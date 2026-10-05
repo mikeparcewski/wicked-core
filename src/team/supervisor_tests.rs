@@ -245,6 +245,7 @@ pub(crate) fn sup_cfg(rig: &Rig) -> SupervisorConfig {
         tail: None,
         publish_bound: Duration::from_millis(500),
         engine: None,
+        outputs: super::super::publish::OutputStash::default(),
     }
 }
 
@@ -261,6 +262,8 @@ struct Harness {
     host: Arc<FakeHost>,
     council: Arc<FakeCouncil>,
     cursor: i64,
+    /// (ASK-K3b) The runner side of the output hand-off: tests put a step's output here.
+    outputs: super::super::publish::OutputStash,
 }
 
 impl Harness {
@@ -273,7 +276,9 @@ impl Harness {
         let fx = Fixture::new(name, "src/lib.rs", LIB);
         let host = Arc::new(FakeHost::new(|_, _| Ok("DONE".into())));
         let council = Arc::new(council);
-        let core = SupervisorCore::new(cfg(&rig), host.clone(), council.clone());
+        let cfg = cfg(&rig);
+        let outputs = cfg.outputs.clone();
+        let core = SupervisorCore::new(cfg, host.clone(), council.clone());
         Self {
             rig,
             fx,
@@ -281,6 +286,7 @@ impl Harness {
             host,
             council,
             cursor: 0,
+            outputs,
         }
     }
 
@@ -376,7 +382,16 @@ impl Harness {
             p["at"] = json!(crate::interaction::now_millis());
             p["step_id"] = json!(step);
             p["status"] = json!(status);
+            p["output_ref"] = json!(format!("unit:{RUN}:{ord}:{attempt}"));
         }))
+    }
+
+    /// (ASK-K3b) What the runner does at a turn's end: leave the output under its ref, then
+    /// publish `step.completed{status:"ok"}` naming it.
+    fn complete_with_output(&self, ord: u32, attempt: u32, by: &str, step: &str, output: &str) {
+        self.outputs
+            .put(&format!("unit:{RUN}:{ord}:{attempt}"), output);
+        self.complete_step(ord, attempt, by, step, "ok");
     }
 
     /// Read every new row, apply it, and run every job it makes due, inline, until quiet.
@@ -1804,4 +1819,349 @@ fn t4_f_an_attempt_is_rescored_at_most_eleven_times() {
     assert!(r.admit("final", end, true).is_none());
     assert!(!r.may_start(end + RESCORE_MIN_INTERVAL));
     assert_eq!(r.count(), 11);
+}
+
+// ── DES-ASK-TEAM-CHAT-001 §4.5 / §4.6 (ASK-K3b, part 1): absent reviewer, help outcomes ────────
+
+/// §4.6 "absent, and said so — with an identity": the plan asks for a member (band 20-39 ⇒ 1)
+/// and the roster has no seat but the PA's. The supervisor publishes ONE
+/// `member.joined{status:"failed", seat:null, member_id:"m1", open_seq:1}` — a valid §6.1 key,
+/// minted for the slot it tried to seat — opens no session, and the fold still lands.
+#[test]
+fn an_absent_reviewer_is_on_the_record_with_a_minted_key() {
+    let mut h = Harness::new("absent");
+    h.start("claude#1", &["claude#1"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    let j = &joined[0];
+    assert_eq!(j["status"], "failed");
+    assert!(j["seat"].is_null(), "no seat: {j}");
+    assert_eq!(
+        (j["member_id"].as_str(), j["open_seq"].as_u64()),
+        (Some("m1"), Some(1))
+    );
+    assert_eq!(j["reason"], "no distinct signed-in seat");
+    assert!(j["error"].as_str().unwrap().contains("claude#1"), "{j}");
+    assert_eq!(j["by"], "engine");
+    assert!(h.host.opens.lock().unwrap().is_empty(), "nothing opens");
+    // Parsed back, the row keys like any member row (DES-002 §6.1 #7).
+    let ev = TeamEvent::from_payload(tev::MEMBER_JOINED, j).unwrap();
+    assert_eq!(
+        ev.key().unwrap(),
+        tev::key_member_joined(RUN, 3, 1, "m1", 1)
+    );
+}
+
+fn help_scaffold(
+    h: &Harness,
+    floor: i64,
+) -> (super::super::runner::Claimed, crate::workflow::StepOutput) {
+    let runner = super::super::runner::TeamRunner::from_config(
+        &TeamConfig::new(Some(h.rig.bus.clone()), Some(h.rig.outbox.clone()))
+            .with_schedule(vec![Duration::from_millis(20); 3])
+            .with_attempt_wait(Duration::from_millis(30))
+            .with_final_pass_budget(Duration::from_millis(50))
+            .with_gate_poll(Duration::from_millis(10)),
+    )
+    .unwrap();
+    let claimed_id = h.claim(3, 1, "claude#1");
+    let claimed = super::super::runner::Claimed {
+        runner,
+        run_id: RUN.into(),
+        ord: 3,
+        attempt: 1,
+        by: "claude#1".into(),
+        step_id: "build".into(),
+        stream_floor: floor,
+        claimed_id,
+        reviewing: None,
+        criterion: "the handler cancels stale fetches".into(),
+    };
+    let out = crate::workflow::StepOutput {
+        run_id: RUN.into(),
+        unit_ix: 3,
+        attempt: 1,
+        output: "work done\nHELP: which helper retries a fetch?\n".into(),
+        status: crate::workflow::StepStatus::Ok,
+        usage: None,
+        files: vec![],
+        tools: vec![],
+        governed: false,
+    };
+    (claimed, out)
+}
+
+/// §4.5 (codex #8): a `HELP:` with no admitted member to answer it is a FACT on the row S owns —
+/// `help.answered{outcome:"no_member", answer:null}` keyed by the help id — never an inference
+/// from a missing row.
+#[test]
+fn a_help_question_with_no_admitted_member_is_answered_no_member() {
+    let mut h = Harness::new("helpnone");
+    h.host.unadmitted.lock().unwrap().push("claude#2".into());
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "0-19");
+    let (claimed, out) = help_scaffold(&h, floor);
+    let _ = super::super::runner::complete(&claimed, &out);
+    let asked = h.rows(tev::HELP_REQUESTED);
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    h.pump();
+    let answered = h.rows(tev::HELP_ANSWERED);
+    assert_eq!(answered.len(), 1, "{answered:#?}");
+    let a = &answered[0];
+    assert_eq!(a["help_id"], asked[0]["help_id"]);
+    assert_eq!(a["outcome"], "no_member");
+    assert!(a["answer"].is_null());
+    assert!(
+        a["error"].as_str().unwrap().contains("no admitted member"),
+        "{a}"
+    );
+    assert!(h.host.opens.lock().unwrap().is_empty(), "no member opened");
+}
+
+/// §4.5: a member whose turn FAILS answers `help.answered{outcome:"failed"}` with the error; the
+/// row keeps the help id and a producer-assigned answer id.
+#[test]
+fn a_help_turn_that_fails_is_answered_failed() {
+    let mut h = Harness::new("helpfail");
+    h.host.set_reply(|_, p| {
+        if p.contains("asks the team for help") {
+            Err("the adapter died".into())
+        } else {
+            Ok("DONE".into())
+        }
+    });
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "0-19");
+    let (claimed, out) = help_scaffold(&h, floor);
+    let _ = super::super::runner::complete(&claimed, &out);
+    h.pump();
+    let answered = h.rows(tev::HELP_ANSWERED);
+    assert_eq!(answered.len(), 1, "{answered:#?}");
+    let a = &answered[0];
+    assert_eq!(a["outcome"], "failed");
+    assert!(a["answer"].is_null());
+    assert_eq!(a["by"], "claude#2");
+    assert_eq!(a["error"], "the adapter died");
+    assert!(a["answer_id"].as_str().unwrap().starts_with("t-"));
+}
+
+// ── DES-ASK-TEAM-CHAT-001 §4.6 (ASK-K3b, part 2): the output target ────────────────────────────
+
+const ANSWER: &str = "The handler keeps the old fetch.\nIt never cancels a stale request.\nSo the count can go backwards.\n";
+
+/// A member that, shown an ANSWER, raises a `high` on its line 2, a `low` on line 1, a `medium`
+/// whose evidence is not in the answer, and a `medium` citing a repo line — and answers every
+/// other prompt with `DONE`.
+fn output_reviewer(step: &str) -> impl Fn(&str, &str) -> Result<String, String> + Send + Sync {
+    let step = step.to_string();
+    move |_, p| {
+        if p.contains("review the worker's ANSWER") {
+            Ok(format!(
+                "{}\n{}\n{}\n{}\nDONE",
+                finding_line(
+                    "high",
+                    &step,
+                    2,
+                    "It never cancels a stale request.",
+                    "the answer contradicts the criterion"
+                ),
+                finding_line("low", &step, 1, "The handler keeps the old fetch.", "style"),
+                finding_line(
+                    "medium",
+                    &step,
+                    3,
+                    "this line is not in the answer",
+                    "made up"
+                ),
+                finding_line(
+                    "medium",
+                    "src/lib.rs",
+                    2,
+                    "fn b() {",
+                    "a repo line is not the answer"
+                ),
+            ))
+        } else {
+            Ok("DONE".into())
+        }
+    }
+}
+
+/// §4.6: a step that changed no tree gets its final pass over its OUTPUT. The member is shown the
+/// answer (no diff); a `high` on a line of it is raised `finding.raised{target:"output",
+/// severity:"medium"}` (T1 rev 14 §4.6 step 2: the output bar is `medium`) with `path` the step
+/// id and `line` the line of the answer; `low` is `belowBar`; a line not in the answer, and a repo
+/// line, are `unconfirmed`. Nothing pauses and no council is called; the hold round still settles
+/// the unanswered finding and its `final_line` is re-confirmed against the answer.
+#[test]
+fn an_answer_step_that_changed_no_tree_is_reviewed_on_its_output() {
+    let mut h = Harness::new("output");
+    h.host.set_reply(output_reviewer("answer-1"));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim_step(3, 1, "claude#1", "answer-1", true);
+    h.complete_with_output(3, 1, "claude#1", "answer-1", ANSWER);
+    h.pump();
+    let prompts = h.host.prompts_matching("review the worker's ANSWER");
+    assert_eq!(prompts.len(), 1, "one member, one final batch");
+    assert!(
+        prompts[0].contains("```answer\n") && prompts[0].contains(ANSWER.trim_end()),
+        "{}",
+        prompts[0]
+    );
+    assert!(!prompts[0].contains("```diff"), "{}", prompts[0]);
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    let f = &raised[0];
+    assert_eq!(f["target"], "output");
+    assert_eq!(
+        f["severity"], "medium",
+        "a high on an answer is recorded medium"
+    );
+    assert_eq!(
+        (f["path"].as_str(), f["line"].as_u64()),
+        (Some("answer-1"), Some(2))
+    );
+    assert_eq!(f["evidence"], "It never cancels a stale request.");
+    assert_eq!(f["by"], "claude#2");
+    let ledger = h.folded(3, 1);
+    assert_eq!(ledger.final_pass, FinalPass::Completed);
+    assert!(!ledger.team_pause, "medium never pauses");
+    assert_eq!(
+        (ledger.rejected.below_bar, ledger.rejected.unconfirmed),
+        (1, 2),
+        "{:?}",
+        ledger.rejected
+    );
+    assert_eq!(ledger.findings.len(), 1);
+    assert_eq!(
+        ledger.findings[0].finding.target,
+        tev::FindingTarget::Output
+    );
+    assert_eq!(ledger.findings[0].final_line, Some(2));
+    assert!(
+        h.rows(tev::COUNCIL_CALLED).is_empty(),
+        "no council over an answer"
+    );
+    let settled = h.rows(tev::FINDING_SETTLED);
+    assert_eq!(settled.len(), 1, "{settled:#?}");
+    assert_eq!(settled[0]["status"], "held");
+}
+
+/// §4.6 "not ask-specific": an UNBOUND read-only unit (no repo) with a member is reviewed on its
+/// output by the same rule — the member is admitted (no "no worktree baseline" refusal), attaches
+/// at the final pass and raises on the answer.
+#[test]
+fn an_unbound_step_with_a_member_is_reviewed_on_its_output() {
+    let mut h = Harness::new("unbound");
+    h.host.set_reply(output_reviewer("survey-repo"));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim_step(3, 1, "claude#1", "survey-repo", false);
+    h.complete_with_output(3, 1, "claude#1", "survey-repo", ANSWER);
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    assert_eq!(
+        (joined[0]["status"].as_str(), joined[0]["seat"].as_str()),
+        (Some("attached"), Some("claude#2"))
+    );
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    assert_eq!(
+        (raised[0]["target"].as_str(), raised[0]["path"].as_str()),
+        (Some("output"), Some("survey-repo"))
+    );
+    assert_eq!(h.folded(3, 1).final_pass, FinalPass::Completed);
+}
+
+/// The other half of the rule: a step that CHANGED the tree is reviewed on its diff even when its
+/// output is on record — the member sees the diff, not the answer, and the finding is a tree
+/// finding (no `target` on the wire).
+#[test]
+fn a_step_that_changed_the_tree_is_reviewed_on_its_diff_even_with_an_output_on_record() {
+    let mut h = Harness::new("treewins");
+    h.host.set_reply(|_, p| {
+        if p.contains("this is the settled tree") {
+            Ok(format!(
+                "{}\nDONE",
+                finding_line("medium", "src/lib.rs", 3, "    let x = 2;", "x changed")
+            ))
+        } else {
+            Ok("DONE".into())
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.complete_with_output(3, 1, "claude#1", "build", ANSWER);
+    h.pump();
+    assert!(h
+        .host
+        .prompts_matching("review the worker's ANSWER")
+        .is_empty());
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    assert!(
+        raised[0].get("target").is_none(),
+        "a tree finding spells no target: {}",
+        raised[0]
+    );
+    assert_eq!(raised[0]["path"], "src/lib.rs");
+}
+
+/// A step that changed no tree and whose output this process never saw (another process ran the
+/// attempt, or the runner left none) gets the tree pass as before: the batch is `Skipped` on the
+/// unchanged tree and the ledger folds with no finding (T6 unchanged).
+#[test]
+fn an_unchanged_tree_with_no_output_on_record_folds_as_before() {
+    let mut h = Harness::new("nooutput");
+    h.host.set_reply(output_reviewer("answer-1"));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim_step(3, 1, "claude#1", "answer-1", true);
+    h.complete_step(3, 1, "claude#1", "answer-1", "ok");
+    h.pump();
+    assert_eq!(h.host.turn_count(), 0, "nothing to review, no member turn");
+    let ledger = h.folded(3, 1);
+    assert_eq!(ledger.final_pass, FinalPass::Completed);
+    assert!(ledger.findings.is_empty());
+}
+
+/// §4.5 (codex #8): a member turn that runs past `MONITOR_TURN_BUDGET` answers
+/// `help.answered{outcome:"timed_out"}` with the budget in `error`.
+#[test]
+fn a_help_turn_past_its_budget_is_answered_timed_out() {
+    let mut h = Harness::with(
+        "helpslow",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.limits.monitor_turn_budget = Duration::from_millis(30);
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    h.host.set_reply(|_, p| {
+        if p.contains("asks the team for help") {
+            std::thread::sleep(Duration::from_millis(60));
+            Err("the turn was abandoned".into())
+        } else {
+            Ok("DONE".into())
+        }
+    });
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "0-19");
+    let (claimed, out) = help_scaffold(&h, floor);
+    let _ = super::super::runner::complete(&claimed, &out);
+    h.pump();
+    let answered = h.rows(tev::HELP_ANSWERED);
+    assert_eq!(answered.len(), 1, "{answered:#?}");
+    assert_eq!(answered[0]["outcome"], "timed_out");
+    assert!(answered[0]["answer"].is_null());
+    assert!(
+        answered[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("exceeded 0 s"),
+        "{}",
+        answered[0]
+    );
 }
