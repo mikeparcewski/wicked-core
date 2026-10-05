@@ -862,6 +862,7 @@ fn attempt_rows(claimed: &Claimed) -> anyhow::Result<(Vec<TeamRow>, usize)> {
 /// After the turn: publish `step.completed`, then wait (bounded) for S's `ledger.folded` of this
 /// attempt (§8.11). On timeout, synthesize DES-001 §4.7's fail-closed ledger from the attempt's
 /// own rows WITHOUT publishing it. The result is the attempt's snapshot for `UnitEvidence.team`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn complete(claimed: &Claimed, output: &StepOutput) -> UnitTeamSnapshot {
     complete_with(claimed, output, true)
 }
