@@ -350,13 +350,16 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                 .phase_id()
                 .map(str::to_string)
                 .unwrap_or_else(|| step_id.clone()),
+            // (ASK-K3b) A step with no validator pin still has a criterion for its members: the
+            // unit's description — the composed step's instructions, i.e. the question an answer
+            // step was asked (codex review of #739).
             criterion: cap_utf8(
                 input
                     .unit
                     .validator
                     .as_ref()
                     .map(|v| v.criterion.as_str())
-                    .unwrap_or(""),
+                    .unwrap_or(&input.unit.description),
                 2 * 1024,
             ),
             baseline_tree: baseline.map(|b| b.tree.clone()),

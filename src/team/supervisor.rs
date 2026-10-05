@@ -543,11 +543,12 @@ impl UnitTeam {
         }
         let baseline = match (&self.ctx.repo, &self.ctx.baseline_tree) {
             (Some(_), Some(b)) => b.clone(),
-            // (ASK-K3b, §4.6) An unbound unit has no tree to diff, so its members review the
+            // (ASK-K3b, §4.6) An UNBOUND unit has no tree to diff, so its members review the
             // step's OUTPUT at the final pass (the one general rule); admitted with no baseline,
-            // and no checkpoint batch is ever due for it (`due_batches`).
-            (None, _) => String::new(),
-            (Some(_), None) => {
+            // and no checkpoint batch is ever due for it (`due_batches`). A bound unit whose
+            // baseline was not taken is refused as today: its tree may have changed unseen.
+            (None, _) if !self.ctx.bound => String::new(),
+            _ => {
                 let candidates = self.ctx.plan.candidates.clone();
                 for (i, seat) in candidates.iter().take(want).enumerate() {
                     self.joined(
@@ -1105,7 +1106,12 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
             rejected.below_bar += 1;
             continue;
         };
-        if f.evidence.len() > super::EVIDENCE_CAP || !confirm(Some(&shown), f.line, &f.evidence) {
+        // `path` must be the step id the prompt named — a finding that cites a repo path is not a
+        // finding on the answer, however its evidence reads — and the line must be byte-exact.
+        if f.path != job.step_id
+            || f.evidence.len() > super::EVIDENCE_CAP
+            || !confirm(Some(&shown), f.line, &f.evidence)
+        {
             rejected.unconfirmed += 1;
             continue;
         }
@@ -1113,11 +1119,11 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
             Severity::High => Severity::Medium,
             s => s,
         };
-        f.path = job.step_id.clone();
+        // T1 rev 14 §4.6 step 3: an output finding is `inDiff:false` with an empty anchor.
         candidates.push(Candidate {
             raw: f,
             severity,
-            in_diff: true,
+            in_diff: false,
             anchor: String::new(),
             target: tev::FindingTarget::Output,
         });
@@ -1492,6 +1498,7 @@ impl SupervisorCore {
                             creator: env.by.clone(),
                             plan: TeamPlan::default(),
                             repo: None,
+                            bound: false,
                             baseline_tree: None,
                             criterion: String::new(),
                             phase: String::new(),
@@ -1563,6 +1570,7 @@ impl SupervisorCore {
             creator: env.by.clone(),
             plan: st.plan(),
             repo,
+            bound: b.repo.as_ref().is_some_and(|r| !r.git_dir.is_empty()),
             baseline_tree: b.baseline_tree.clone(),
             criterion: b.criterion.clone(),
             phase: b.phase.clone(),
@@ -1672,7 +1680,7 @@ impl SupervisorCore {
             let mut took_titles = false;
             // (ASK-K3b) An unbound unit has no tree: its members review the output at the final
             // pass and no checkpoint batch is due.
-            let unbound = u.ctx.repo.is_none();
+            let unbound = u.ctx.repo.is_none() && !u.ctx.bound;
             for i in 0..u.monitors.len() {
                 let limits = self.cfg.limits;
                 let m = &mut u.monitors[i];
@@ -1872,12 +1880,14 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
     );
     let started = Instant::now();
     let reply = host.turn(&pool_key, &prompt, job.budget);
+    // The turn's own elapsed time decides timed_out vs failed — not the close that follows.
+    let elapsed = started.elapsed();
     host.close(&pool_key);
     let reply = match reply {
         Ok(r) => r,
         Err(e) => {
             eprintln!("wicked-core: team: help member {seat} turn failed ({e})");
-            let timed_out = started.elapsed() >= job.budget;
+            let timed_out = elapsed >= job.budget;
             publish(
                 &seat,
                 None,
@@ -2115,12 +2125,17 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                         (Some(t), Some(b)) => t != b,
                         _ => false,
                     };
+                    // The answer as the member sees it (and every output finding is
+                    // re-confirmed against), capped once here; the batch gets the RAW text so it
+                    // can disclose the truncation (codex review of #739).
+                    let answer = job
+                        .output
+                        .as_deref()
+                        .map(|o| shown_output(o, job.limits.diff_cap));
                     let shown = if tree_changed {
                         None
                     } else {
-                        job.output
-                            .as_deref()
-                            .map(|o| shown_output(o, job.limits.diff_cap))
+                        job.output.clone()
                     };
                     if t_final.is_none() && shown.is_none() {
                         None
@@ -2145,12 +2160,12 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                             b.output = shown.clone();
                             jobs.push(b);
                         }
-                        Some((snap.map(|(r, _)| r), t_final, shown, jobs))
+                        Some((snap.map(|(r, _)| r), t_final, answer, jobs))
                     }
                 }
             }
         };
-        if let Some((repo, t_final, shown, jobs)) = prepared {
+        if let Some((repo, t_final, answer, jobs)) = prepared {
             for mut b in jobs {
                 if clock.expired() {
                     timed_out = true;
@@ -2170,9 +2185,10 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
             let mut superseded = Vec::new();
             for (i, f) in u.book.findings.iter().enumerate() {
                 // Re-confirm each finding against what it cites: the settled tree, or the
-                // answer text the member was shown.
+                // answer text the member was shown — a carried output finding of a dead attempt
+                // is re-confirmed against THIS attempt's answer even when its tree changed.
                 let text = match f.finding.target {
-                    tev::FindingTarget::Output => shown.clone(),
+                    tev::FindingTarget::Output => answer.clone(),
                     tev::FindingTarget::Tree => match (&repo, &t_final) {
                         (Some(r), Some(t)) => r.file(t, &f.finding.path),
                         _ => None,

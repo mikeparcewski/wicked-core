@@ -1979,8 +1979,8 @@ fn output_reviewer(step: &str) -> impl Fn(&str, &str) -> Result<String, String> 
                     "medium",
                     "src/lib.rs",
                     2,
-                    "fn b() {",
-                    "a repo line is not the answer"
+                    "It never cancels a stale request.",
+                    "a repo path is not the answer, however its evidence reads"
                 ),
             ))
         } else {
@@ -2038,6 +2038,10 @@ fn an_answer_step_that_changed_no_tree_is_reviewed_on_its_output() {
     assert_eq!(
         ledger.findings[0].finding.target,
         tev::FindingTarget::Output
+    );
+    assert!(
+        !ledger.findings[0].finding.in_diff,
+        "T1 rev 14: inDiff false on an answer"
     );
     assert_eq!(ledger.findings[0].final_line, Some(2));
     assert!(
@@ -2164,4 +2168,87 @@ fn a_help_turn_past_its_budget_is_answered_timed_out() {
         "{}",
         answered[0]
     );
+}
+
+/// (codex review of #739) A BOUND unit whose dispatch baseline was not taken is not an unbound
+/// unit: its members are refused "no worktree baseline" as before (its tree may have changed
+/// unseen), and nothing reviews its output at the medium bar.
+#[test]
+fn a_bound_unit_without_a_baseline_keeps_the_no_baseline_refusal() {
+    let mut h = Harness::new("nobase");
+    h.host.set_reply(output_reviewer("answer-1"));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    let (wd, gd) = (
+        h.fx.dir.to_string_lossy().into_owned(),
+        h.fx.repo.git_dir.to_string_lossy().into_owned(),
+    );
+    h.publish(&fixture_with(tev::STEP_CLAIMED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(1);
+        p["by"] = json!("claude#1");
+        p["at"] = json!(crate::interaction::now_millis());
+        p["step_id"] = json!("answer-1");
+        p["criterion"] = json!("the handler cancels stale fetches");
+        p["baseline_tree"] = Value::Null;
+        p["repo"] = json!({"workdir": wd, "git_dir": gd});
+    }));
+    h.complete_with_output(3, 1, "claude#1", "answer-1", ANSWER);
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    assert_eq!(joined[0]["status"], "failed");
+    assert_eq!(joined[0]["error"], "no worktree baseline", "{}", joined[0]);
+    assert_eq!(
+        joined[0]["seat"], "claude#2",
+        "a real seat was refused, not the absent row"
+    );
+    assert_eq!(h.host.turn_count(), 0, "no member turn, no output review");
+    assert!(h.rows(tev::FINDING_RAISED).is_empty());
+}
+
+/// (codex review of #739) An answer over `DIFF_CAP` is shown truncated AND SAID SO; a finding on
+/// a line past the cap is `unconfirmed` (the member never saw it).
+#[test]
+fn a_capped_answer_discloses_its_truncation() {
+    let mut h = Harness::with(
+        "capped",
+        |rig| {
+            let mut c = sup_cfg(rig);
+            c.limits.diff_cap = 64;
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    h.host.set_reply(|_, p| {
+        if p.contains("review the worker's ANSWER") {
+            Ok(format!(
+                "{}\nDONE",
+                finding_line(
+                    "medium",
+                    "answer-1",
+                    3,
+                    "So the count can go backwards.",
+                    "past the cap"
+                )
+            ))
+        } else {
+            Ok("DONE".into())
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim_step(3, 1, "claude#1", "answer-1", true);
+    h.complete_with_output(3, 1, "claude#1", "answer-1", ANSWER);
+    h.pump();
+    let prompts = h.host.prompts_matching("review the worker's ANSWER");
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].contains(&format!("shown truncated at 64 of {} bytes", ANSWER.len())),
+        "{}",
+        prompts[0]
+    );
+    assert!(
+        h.rows(tev::FINDING_RAISED).is_empty(),
+        "a line past the cap is unconfirmed"
+    );
+    assert_eq!(h.folded(3, 1).rejected.unconfirmed, 1);
 }

@@ -1023,6 +1023,10 @@ pub struct AttachCtx {
     /// `None` when the unit is unbound or its dispatch baseline was not taken: not monitored,
     /// and said so.
     pub repo: Option<Repo>,
+    /// (ASK-K3b) Whether the unit runs in a worktree at all (`step.claimed.repo` present). A
+    /// BOUND unit whose baseline was not taken keeps today's refusal ("no worktree baseline");
+    /// only an UNBOUND unit's members review its output with no tree (codex review of #739).
+    pub bound: bool,
     /// The unit's dispatch baseline tree.
     pub baseline_tree: Option<String>,
     pub criterion: String,
