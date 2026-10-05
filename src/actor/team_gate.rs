@@ -3425,6 +3425,10 @@ pub(super) fn revise_units(
                 let mut k = o.clone();
                 k.ord = u.ord;
                 k.last_attempt = k.last_attempt.max(floor);
+                // (ASK-K2b; codex review of #738 round 3) The plan it now belongs to decides what
+                // it depends on: a kept evaluator whose creator the amendment replaced must point
+                // at the replacement, not at a unit that just left the store.
+                k.depends_on = u.depends_on.clone();
                 kept.push(k);
             }
             None => {
