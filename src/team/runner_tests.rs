@@ -1367,3 +1367,113 @@ fn t6_j_no_direct_team_channel_is_left_in_src() {
     }
     assert!(hits.is_empty(), "{hits:#?}");
 }
+
+// ── ASK-K3c (DES-ASK-TEAM-CHAT-001 §4.5, §4.7): the boundary renders the team's non-answers ────
+
+/// The `[team advice]` block renders a non-answered `help.answered` by its OUTCOME — "did not
+/// answer (timed out)" with the reason, never an empty "answers:" line — and a `plan.refused` of
+/// the PA's OWN proposal with its reason; a refusal of someone else's proposal is not the PA's
+/// business. Both are shown once: a later step of the same seat has already seen them (the same
+/// stateless dedup every team answer uses).
+#[test]
+fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_once() {
+    let rig = rig("k3c");
+    let run = "k3c";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    claim(1);
+    // `help_id` is minted from `help_seq` (T2 §6.1): read it off the row as published.
+    let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
+        p["ord"] = json!(1);
+        p["attempt"] = json!(0);
+        p["by"] = json!("claude#1");
+        p["question"] = json!("does the retire flow cancel its fetch?");
+    });
+    publish(&rig, &asked);
+    let help_id = asked.to_payload().unwrap()["help_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    publish(
+        &rig,
+        &fixture_with(tev::HELP_ANSWERED, 1, run, |p| {
+            assert_eq!(p["outcome"], "timed_out", "fixture #1 is the timed-out row");
+            p["ord"] = json!(1);
+            p["attempt"] = json!(0);
+            p["by"] = json!("claude#2");
+            p["help_id"] = json!(help_id);
+            p["error"] = json!("member turn exceeded 240 s");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_PROPOSED, 0, run, |p| {
+            p["by"] = json!("claude#1");
+            p["proposal_id"] = json!("p-own");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-own");
+            p["reason"] =
+                json!("no repo bound: the path has no worktree for a step that executes code");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-other");
+            p["reason"] = json!("someone else's");
+        }),
+    );
+    let c2 = claim(2);
+    let claimed = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 2,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-2".into(),
+        stream_floor: floor,
+        claimed_id: c2,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    let text = boundary(&claimed).block.expect("a block").output;
+    assert!(
+        text.contains("does the retire flow cancel its fetch?"),
+        "{text}"
+    );
+    assert!(
+        text.contains("claude#2 did not answer (timed out): member turn exceeded 240 s"),
+        "{text}"
+    );
+    assert!(!text.contains("answers: "), "{text}");
+    assert!(
+        text.contains("your plan proposal p-own was refused: no repo bound"),
+        "{text}"
+    );
+    assert!(!text.contains("p-other"), "{text}");
+    // A later step of the same seat was already shown both.
+    let c3 = claim(3);
+    let later = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..claimed
+    };
+    assert!(boundary(&later)
+        .block
+        .is_none_or(|b| !b.output.contains("did not answer") && !b.output.contains("p-own")));
+}

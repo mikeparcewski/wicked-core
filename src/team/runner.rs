@@ -589,24 +589,67 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
             _ => None,
         })
     };
+    // (ASK-K3c) The PA's own proposals: a `plan.refused` of one of them is the engine telling the
+    // PA its `PLAN+` did not take (one seat on the roster, no repo for a step that executes code,
+    // a malformed step), rendered once like every other answer here.
+    let own_proposals: BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| match &r.event.body {
+            TeamBody::PlanProposed(p) if r.event.env.by == claimed.by => {
+                Some(p.proposal_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
     let mut out = String::new();
     for r in rows {
         if later_claim(r.event_id) {
             continue;
         }
         match &r.event.body {
-            TeamBody::HelpAnswered(b) => out.push_str(&format!(
-                "- help {} — you asked: {}\n  {} answers: {}{}\n",
-                b.help_id,
-                cap_utf8(&question(&b.help_id).unwrap_or_default(), 512),
-                r.event.env.by,
-                cap_utf8(b.answer.as_deref().unwrap_or(""), 2 * 1024),
-                if b.evidence.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (evidence: {})", b.evidence.join(", "))
-                }
-            )),
+            // (ASK-K3c, DES-ASK-TEAM-CHAT-001 §4.5) A help row is rendered by its OUTCOME: the
+            // answer when the member answered, else the fact that it did not and why — never an
+            // empty "answers:" line (codex review of #737).
+            TeamBody::HelpAnswered(b) => {
+                let asked = cap_utf8(&question(&b.help_id).unwrap_or_default(), 512);
+                let reply = match &b.outcome {
+                    tev::HelpOutcome::Answered => format!(
+                        "{} answers: {}{}",
+                        r.event.env.by,
+                        cap_utf8(b.answer.as_deref().unwrap_or(""), 2 * 1024),
+                        if b.evidence.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (evidence: {})", b.evidence.join(", "))
+                        }
+                    ),
+                    other => format!(
+                        "{} did not answer ({}){}",
+                        r.event.env.by,
+                        match other {
+                            tev::HelpOutcome::TimedOut => "timed out",
+                            tev::HelpOutcome::Failed => "the turn failed",
+                            tev::HelpOutcome::NoMember => "no other helper is signed in to answer",
+                            tev::HelpOutcome::Answered => unreachable!(),
+                        },
+                        b.error
+                            .as_deref()
+                            .filter(|e| !e.is_empty())
+                            .map(|e| format!(": {}", cap_utf8(e, 512)))
+                            .unwrap_or_default()
+                    ),
+                };
+                out.push_str(&format!(
+                    "- help {} — you asked: {}\n  {}\n",
+                    b.help_id, asked, reply
+                ));
+            }
+            TeamBody::PlanRefused(b) if own_proposals.contains(b.proposal_id.as_str()) => out
+                .push_str(&format!(
+                    "- your plan proposal {} was refused: {}\n",
+                    b.proposal_id,
+                    cap_utf8(&b.reason, 512)
+                )),
             TeamBody::CouncilRuled(b) => out.push_str(&format!(
                 "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
                 b.subject,
