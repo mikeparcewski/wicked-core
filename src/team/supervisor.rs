@@ -1101,7 +1101,7 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
         ..Rejected::default()
     };
     let mut candidates = Vec::new();
-    for mut f in parsed {
+    for f in parsed {
         let Some(severity) = Severity::parse(&f.severity) else {
             rejected.below_bar += 1;
             continue;
