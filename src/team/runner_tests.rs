@@ -1477,3 +1477,84 @@ fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_onc
         .block
         .is_none_or(|b| !b.output.contains("did not answer") && !b.output.contains("p-own")));
 }
+
+/// (codex review of #740) The boundary owns the rows between the seat's previous claim and its
+/// own: an answer that lands AFTER this claim (between the claim and the boundary read) is not
+/// this boundary's — it renders at the seat's next boundary, once — and an answer before the
+/// previous claim was that boundary's. Nothing renders twice, nothing stateful.
+#[test]
+fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders_once() {
+    let rig = rig("k3cwin");
+    let run = "k3cwin";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    let c1 = claim(1);
+    let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
+        p["ord"] = json!(1);
+        p["attempt"] = json!(0);
+        p["by"] = json!("claude#1");
+        p["question"] = json!("late question");
+    });
+    publish(&rig, &asked);
+    let help_id = asked.to_payload().unwrap()["help_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    publish(
+        &rig,
+        &fixture_with(tev::HELP_ANSWERED, 0, run, |p| {
+            p["ord"] = json!(1);
+            p["attempt"] = json!(0);
+            p["by"] = json!("claude#2");
+            p["help_id"] = json!(help_id);
+            p["answer"] = json!("late answer");
+        }),
+    );
+    let at_c1 = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 1,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-1".into(),
+        stream_floor: floor,
+        claimed_id: c1,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    assert!(
+        boundary(&at_c1)
+            .block
+            .is_none_or(|b| !b.output.contains("late answer")),
+        "a row after the claim is the next boundary's"
+    );
+    let c2 = claim(2);
+    let at_c2 = Claimed {
+        ord: 2,
+        claimed_id: c2,
+        step_id: "answer-2".into(),
+        ..at_c1
+    };
+    let text = boundary(&at_c2).block.expect("a block").output;
+    assert!(text.contains("late answer"), "{text}");
+    let c3 = claim(3);
+    let at_c3 = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..at_c2
+    };
+    assert!(boundary(&at_c3)
+        .block
+        .is_none_or(|b| !b.output.contains("late answer")));
+}

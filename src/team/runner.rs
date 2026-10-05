@@ -510,15 +510,15 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
         .iter()
         .map(|(_, f)| super::Advice { finding: f.clone() })
         .collect();
-    let (mut text, sent, _rest) = if advice.is_empty() {
+    // (ASK-K3c) The team's answers first: a help outcome or the PA's own refusal has no
+    // `advice.delivered` row to bring it back if the cap cuts it, a finding does.
+    let mut text = cap_utf8(&answers, super::ADVICE_TEXT_CAP);
+    let (block, sent, _rest) = if advice.is_empty() {
         (String::new(), Vec::new(), Vec::new())
     } else {
-        super::advice_block(advice)
+        super::advice_block_within(advice, super::ADVICE_TEXT_CAP.saturating_sub(text.len()))
     };
-    if !answers.is_empty() {
-        let room = super::ADVICE_TEXT_CAP.saturating_sub(text.len());
-        text.push_str(&cap_utf8(&answers, room));
-    }
+    text.push_str(&block);
     let delivery_id = tev::delivery_id_boundary(&claimed.step_id, claimed.attempt);
     let mut rendered = Vec::new();
     for a in &sent {
@@ -575,14 +575,22 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
 /// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
 /// than its own claim) — a claim after the row means that step's boundary read it.
 fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
-    let later_claim = |event_id: i64| {
-        rows.iter().any(|r| {
-            r.event_id > event_id
-                && r.event_id != claimed.claimed_id
+    // (ASK-K3c, codex review of #740) The window this boundary owns: the rows between this seat's
+    // PREVIOUS claim and its own. A row before the window was this seat's earlier boundary's to
+    // render; one after it (landed between this claim and this read) is the next boundary's. So
+    // every answer renders at exactly one boundary of the seat, with no delivery row — stateless
+    // under restart, since both claims are on the stream.
+    let previous_claim = rows
+        .iter()
+        .filter(|r| {
+            r.event_id < claimed.claimed_id
                 && r.event.env.by == claimed.by
                 && matches!(r.event.body, TeamBody::StepClaimed(_))
         })
-    };
+        .map(|r| r.event_id)
+        .max()
+        .unwrap_or(0);
+    let later_claim = |event_id: i64| event_id <= previous_claim || event_id >= claimed.claimed_id;
     let question = |help_id: &str| {
         rows.iter().find_map(|r| match &r.event.body {
             TeamBody::HelpRequested(h) if h.help_id == help_id => Some(h.question.clone()),
