@@ -10054,6 +10054,8 @@ fn stage_edit(
                 kind: crate::team_events::ProposalKind::Edit,
                 reason: None,
                 steps: edit.steps,
+                touch: None,
+                scoring: None,
             },
             &done,
             &session.human_confirm,

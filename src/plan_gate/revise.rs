@@ -175,7 +175,34 @@ pub(crate) enum Change {
         /// ratchet still apply).
         reason: Option<ReviseReason>,
         steps: Vec<PlanStep>,
+        /// (DES-TEAMING-002 rev 15, ASK-K2b) The touch set a PA `PLAN+` declared for the work it
+        /// proposes. Read only when the change adds the path's FIRST creator step (scored as an
+        /// intent score, unioned into `plan.accepted.touch` with `touch_source:"pa_scope"`);
+        /// any other change keeps its base's touch (rev 14). `None` for a human edit.
+        touch: Option<Vec<String>>,
+        /// (ASK-K2b) What the first-creator score reads: the run's repo root and base commit,
+        /// filled by the actor (it holds the session). `None` ⇒ no graph ⇒ fail closed at 100.
+        scoring: Option<ScoreScope>,
     },
+}
+
+/// (ASK-K2b) Where a first-creator change's intent score reads its graph from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ScoreScope {
+    pub repo_root: Option<std::path::PathBuf>,
+    pub base_commit: Option<String>,
+}
+
+/// Stamp `scope` on every PA change (`kind:"change"`) of `changes`; human edits carry none.
+pub(crate) fn with_scoring(mut changes: Vec<Change>, scope: &ScoreScope) -> Vec<Change> {
+    for c in &mut changes {
+        if let Change::Steps { kind, scoring, .. } = c {
+            if *kind == ProposalKind::Change {
+                *scoring = Some(scope.clone());
+            }
+        }
+    }
+    changes
 }
 
 /// What [`revise`] did.
@@ -277,45 +304,115 @@ pub(crate) fn revise(
     let mut events = Vec::new();
     let mut obligations = prior.obligations.clone();
     let mut recalled = prior.recalled.clone();
-    let (additions, proposal_id, reason, score, destructive, by_human) = match change {
-        Change::Floor(r) => {
-            events.push(TeamEvent::from_payload(
-                &r.fact.event_type,
-                &r.fact.payload,
-            )?);
-            obligations = super::union(&obligations, &r.obligations);
-            recalled = super::union(&recalled, &r.recalled);
-            (
-                Vec::new(),
-                None,
-                Some(ReviseReason::FloorRaised),
-                r.score,
-                r.destructive,
-                false,
-            )
-        }
-        Change::Steps {
-            by,
-            source,
-            kind,
-            reason,
-            steps,
-        } => {
-            let pid = ev::mint_proposal_id(run_id, &by, &source);
-            let proposed = PlanSteps {
-                steps: steps.clone(),
-                touch: None,
-                floor_override: None,
-                // A change restates no ask: the supervisor keeps the highest ask it has seen.
-                monitors: None,
-            };
-            events.push(plan_proposed(
-                run_id, &by, &pid, base_rev, kind, None, &proposed, now,
-            )?);
-            let human = reason.is_none();
-            (steps, Some(pid), reason, 0, false, human)
-        }
-    };
+    let (additions, proposal_id, reason, score, destructive, by_human, pa_touch, first_creator) =
+        match change {
+            Change::Floor(r) => {
+                events.push(TeamEvent::from_payload(
+                    &r.fact.event_type,
+                    &r.fact.payload,
+                )?);
+                obligations = super::union(&obligations, &r.obligations);
+                recalled = super::union(&recalled, &r.recalled);
+                (
+                    Vec::new(),
+                    None,
+                    Some(ReviseReason::FloorRaised),
+                    r.score,
+                    r.destructive,
+                    false,
+                    None,
+                    false,
+                )
+            }
+            Change::Steps {
+                by,
+                source,
+                kind,
+                reason,
+                steps,
+                touch,
+                scoring,
+            } => {
+                let pid = ev::mint_proposal_id(run_id, &by, &source);
+                let human = reason.is_none();
+                let catalog = crate::catalog::catalog();
+                // (rev 15, ASK-K2b) A PA change that adds the path's FIRST creator step crosses into
+                // work: it may declare what the work touches, and that touch is scored as an intent
+                // score (X1's scorer and fail-closed rule: no touch, no repo or no graph ⇒ 100, "the
+                // PA declared no scope"). Any other change carries `[]` and keeps its base's touch.
+                let crosses_into_work = !human
+                    && kind == ProposalKind::Change
+                    && !base.has_creator_in(catalog)
+                    && steps
+                        .iter()
+                        .any(|s| crate::plan::is_creator_step(catalog, s));
+                let pa_touch = if crosses_into_work {
+                    touch.filter(|t| !t.is_empty())
+                } else {
+                    None
+                };
+                let proposed = PlanSteps {
+                    steps: steps.clone(),
+                    touch: pa_touch.clone(),
+                    floor_override: None,
+                    // A change restates no ask: the supervisor keeps the highest ask it has seen.
+                    monitors: None,
+                };
+                events.push(plan_proposed(
+                    run_id, &by, &pid, base_rev, kind, None, &proposed, now,
+                )?);
+                let (score, destructive) = if crosses_into_work {
+                    let scope = scoring.unwrap_or_default();
+                    let mut for_score = base.clone();
+                    for_score.steps.extend(steps.iter().cloned());
+                    for_score.touch = pa_touch.clone();
+                    let scored = super::intent_score_for_run(
+                        &for_score,
+                        scope.repo_root.as_deref(),
+                        scope.base_commit.as_deref(),
+                    );
+                    events.push(super::path_scored(run_id, &pid, &scored.assessment, now)?);
+                    // (§4.7 F11) A step that executes code needs a worktree: refused on a repo-less
+                    // path, on the record, before anything is planned.
+                    if scope.repo_root.is_none()
+                        && steps.iter().any(|s| {
+                            catalog
+                                .iter()
+                                .find(|e| e.id == s.catalog)
+                                .is_some_and(|e| s.executes_code.unwrap_or(e.executes_code))
+                        })
+                    {
+                        events.push(plan_refused(
+                            run_id,
+                            &pid,
+                            base_rev,
+                            "no repo bound: the path has no worktree for a step that executes code",
+                            now,
+                        )?);
+                        return Ok(Revised {
+                            state: prior.clone(),
+                            events,
+                            outcome: Outcome::Refused {
+                                reason: "no repo bound".to_string(),
+                            },
+                        });
+                    }
+                    (scored.assessment.score, scored.destructive)
+                } else {
+                    (0, false)
+                };
+                (
+                    steps,
+                    Some(pid),
+                    reason,
+                    score,
+                    destructive,
+                    human,
+                    pa_touch,
+                    crosses_into_work,
+                )
+            }
+        };
     let refuse = |mut events: Vec<TeamEvent>, reason: String| -> anyhow::Result<Revised> {
         if let Some(pid) = &proposal_id {
             events.push(plan_refused(run_id, pid, base_rev, &reason, now)?);
@@ -368,9 +465,16 @@ pub(crate) fn revise(
         }
         insert_by_catalog(&mut steps, s);
     }
+    // (rev 15) The rev's own declared touch is the PA's when it scoped the first creator step;
+    // `with_touch` unions it with every earlier accepted rev's.
+    let touch_source = if pa_touch.is_some() {
+        TouchSource::PaScope
+    } else {
+        base_touch_source
+    };
     let merged = super::with_default_ids(&PlanSteps {
         steps,
-        touch: base.touch.clone(),
+        touch: pa_touch.or_else(|| base.touch.clone()),
         floor_override: base.floor_override.clone(),
         monitors: base.monitors.clone(),
     });
@@ -441,6 +545,7 @@ pub(crate) fn revise(
             PlanEvent::Revision {
                 previous_high_risk: prior.accepted_high_risk,
                 approved_high_risk: prior.approved_high_risk,
+                first_creator,
             },
         ) {
             Ok(n) => n.map(|r| r.as_str().to_string()),
@@ -495,7 +600,7 @@ pub(crate) fn revise(
                     touch_source: None,
                     rules,
                 }
-                .with_touch(prior.accepted.as_ref(), base_touch_source),
+                .with_touch(prior.accepted.as_ref(), touch_source),
             );
             state.accepted_rev = rev;
             state.accepted_high_risk = filled.high_risk;
@@ -531,7 +636,7 @@ pub(crate) fn revise(
                 floor_added,
                 gate_id: None,
                 refusal: None,
-                touch_source: Some(base_touch_source),
+                touch_source: Some(touch_source),
                 rules,
             });
             Ok(Revised {
@@ -548,8 +653,12 @@ pub(crate) fn revise(
 pub(crate) enum PlanLine {
     /// `PLAN <change_id>: ACCEPT|DECLINE — <reason>`: the PA's answer to a member's request.
     Answer { change_id: String, accept: bool },
-    /// `PLAN+ {"steps":[…],"reason":"…"}`: steps to add, on one line.
-    Block { steps: Vec<PlanStep> },
+    /// `PLAN+ {"steps":[…],"touch":[…],"reason":"…"}`: steps to add, on one line; `touch` is the
+    /// scope of the work a first creator step proposes (rev 15), ignored on any other block.
+    Block {
+        steps: Vec<PlanStep>,
+        touch: Option<Vec<String>>,
+    },
 }
 
 /// The PA's `PLAN` lines, in order. A `PLAN+` whose JSON does not parse into at least one step is
@@ -558,6 +667,8 @@ pub(crate) fn parse_plan_lines(output: &str) -> Vec<PlanLine> {
     #[derive(Deserialize)]
     struct Block {
         steps: Vec<PlanStep>,
+        #[serde(default)]
+        touch: Option<Vec<String>>,
         #[serde(default)]
         #[allow(dead_code)]
         reason: String,
@@ -573,7 +684,10 @@ pub(crate) fn parse_plan_lines(output: &str) -> Vec<PlanLine> {
             if let Ok(b) = serde_json::from_str::<Block>(json.trim()) {
                 if !b.steps.is_empty() {
                     blocks += 1;
-                    out.push(PlanLine::Block { steps: b.steps });
+                    out.push(PlanLine::Block {
+                        steps: b.steps,
+                        touch: b.touch,
+                    });
                 }
             }
         } else if let Some(rest) = line.strip_prefix("PLAN ") {
@@ -613,7 +727,7 @@ pub(crate) fn changes_from_output(output: &str, by: &str, ord: u32, attempt: u32
             PlanLine::Answer { change_id, accept } => {
                 accepted = accept.then_some(change_id);
             }
-            PlanLine::Block { steps } => {
+            PlanLine::Block { steps, touch } => {
                 seq += 1;
                 let (source, reason) = match accepted.take() {
                     Some(change_id) => (
@@ -635,6 +749,8 @@ pub(crate) fn changes_from_output(output: &str, by: &str, ord: u32, attempt: u32
                     kind: ProposalKind::Change,
                     reason: Some(reason),
                     steps,
+                    touch,
+                    scoring: None,
                 });
             }
         }

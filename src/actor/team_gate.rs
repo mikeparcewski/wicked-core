@@ -3127,6 +3127,8 @@ pub(super) fn propose_plan(
             kind: crate::team_events::ProposalKind::Edit,
             reason: None,
             steps: plan.steps.clone(),
+            touch: None,
+            scoring: None,
         },
         &done,
         &human_confirm,
@@ -3258,14 +3260,27 @@ pub(super) fn apply_held_revision(
             kind: crate::team_events::ProposalKind::Edit,
             reason: None,
             steps: edit.steps.clone(),
+            touch: None,
+            scoring: None,
         });
     }
     if let Some(r) = prior.rescored.clone() {
         changes.push(crate::plan_gate::Change::Floor(r));
     }
+    // (rev 15, ASK-K2b) A PA change that crosses into work is scored as an intent score against
+    // the run's graph: the actor hands the scope (it holds the session; `revise` stays pure).
+    let scope = crate::plan_gate::ScoreScope {
+        repo_root: session
+            .repo_ref
+            .as_deref()
+            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+            .map(|r| std::path::PathBuf::from(r.root_path)),
+        base_commit: session.base_commit.clone(),
+    };
     for l in &prior.plan_lines {
-        changes.extend(crate::plan_gate::changes_from_output(
-            &l.text, &l.by, l.ord, l.attempt,
+        changes.extend(crate::plan_gate::with_scoring(
+            crate::plan_gate::changes_from_output(&l.text, &l.by, l.ord, l.attempt),
+            &scope,
         ));
     }
     // What was held is taken, whatever comes of it.

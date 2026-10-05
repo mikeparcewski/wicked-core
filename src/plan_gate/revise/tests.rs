@@ -315,6 +315,8 @@ fn t4_a_proposal_adding_nothing_is_refused() {
         kind: ProposalKind::Change,
         reason: Some(ReviseReason::PaAdded),
         steps: plan(json!({"steps":[{"catalog":"review","id":"review"}]})).steps,
+        touch: None,
+        scoring: None,
     };
     let r = revise("r", &s, change, &["build".into()], &hc, Some(1), 0).unwrap();
     assert!(matches!(r.outcome, Outcome::Refused { .. }));
@@ -481,6 +483,8 @@ fn wt_c3_a_creator_added_after_a_done_walkthrough_gets_a_new_pair() {
                 id: "fix".into(),
                 ..PlanStep::default()
             }],
+            touch: None,
+            scoring: None,
         },
         &done,
         &hc,
@@ -529,4 +533,235 @@ fn wt_c3_holding_a_rescore_keeps_the_highest_waiting_score() {
     assert_eq!(held.rescore_seq, 1, "no band rise: the waiting fact stays");
     assert_eq!((held.score, held.destructive), (90, true));
     assert_eq!(hold_rescore(None, fresh.clone(), false), fresh);
+}
+
+// ── DES-TEAMING-002 rev 15 / DES-ASK-TEAM-CHAT-001 §4.3, §4.7 (ASK-K2b): crossing into work ─────
+
+fn pa_block(steps: &str, touch: Option<&str>, scoring: Option<ScoreScope>) -> Change {
+    let mut changes = changes_from_output(
+        &format!(
+            "PLAN+ {{\"steps\":{steps}{}}}",
+            touch.map(|t| format!(",\"touch\":{t}")).unwrap_or_default()
+        ),
+        "a",
+        1,
+        0,
+    );
+    assert_eq!(changes.len(), 1);
+    let mut c = changes.pop().unwrap();
+    if let Change::Steps { scoring: s, .. } = &mut c {
+        *s = scoring;
+    }
+    c
+}
+
+fn body<'a, T>(r: &'a Revised, pick: impl Fn(&'a TeamBody) -> Option<T>) -> Vec<T> {
+    r.events.iter().filter_map(|e| pick(&e.body)).collect()
+}
+
+/// A PA `PLAN+` that adds the path's FIRST creator step to an accepted creator-less plan crosses
+/// into work: its `touch` rides `plan.proposed`, it is scored as an intent score
+/// (`path.scored{basis:"intent", score_source:"intent:<pid>"}` — 100 with no graph to read, X1's
+/// fail-closed rule), it is HELD for approval in auto mode with reason `first_creator`, and the
+/// held rev's touch source is `pa_scope`.
+#[test]
+fn a_first_creator_pa_change_is_scored_from_its_touch_and_held_as_first_creator() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    assert!(!s.accepted.as_ref().unwrap().steps.has_creator());
+    let change = pa_block(
+        r#"[{"catalog":"build","id":"build"}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope {
+            repo_root: Some(std::env::temp_dir()),
+            base_commit: None,
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Held { .. }),
+        "crossing into work pauses in auto mode"
+    );
+    let proposed = body(&r, |b| match b {
+        TeamBody::PlanProposed(p) => Some(p.clone()),
+        _ => None,
+    });
+    assert_eq!(proposed.len(), 1);
+    assert_eq!(proposed[0].kind, ProposalKind::Change);
+    assert_eq!(proposed[0].touch, ["src/retire.ts"]);
+    let scored = body(&r, |b| match b {
+        TeamBody::PathScored(p) => Some(p.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        scored.len(),
+        1,
+        "one intent score for the first creator step"
+    );
+    assert_eq!(scored[0].basis, crate::team::events::ScoreBasis::Intent);
+    assert_eq!(
+        scored[0].score_source,
+        format!("intent:{}", proposed[0].proposal_id)
+    );
+    assert_eq!(scored[0].score, 100, "no graph to read: fail closed");
+    let pending = r.state.pending.as_ref().expect("held");
+    assert_eq!(pending.reason, "first_creator");
+    assert_eq!(pending.touch_source, Some(TouchSource::PaScope));
+    assert_eq!(
+        pending.steps.touch.as_deref(),
+        Some(&["src/retire.ts".to_string()][..])
+    );
+    assert!(
+        pending.high_risk,
+        "100 is high risk; the reason stays the more specific row"
+    );
+    assert_eq!(r.state.max_score, 100, "the ratchet records it");
+}
+
+/// The second creator addition (the accepted plan already has one) is an ordinary change: no
+/// re-score, below high risk it proceeds in auto mode, and its touch is not read (`[]`).
+#[test]
+fn a_later_creator_addition_is_not_scored_and_proceeds_below_high_risk() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"build"},{"catalog":"review"}]), 25, &hc);
+    let change = pa_block(
+        r#"[{"catalog":"produce","id":"docs"}]"#,
+        Some(r#"["docs/x.md"]"#),
+        Some(ScoreScope::default()),
+    );
+    let r = revise("r", &s, change, &["build".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Accepted { .. }));
+    assert!(body(&r, |b| matches!(b, TeamBody::PathScored(_)).then_some(())).is_empty());
+    let proposed = body(&r, |b| match b {
+        TeamBody::PlanProposed(p) => Some(p.clone()),
+        _ => None,
+    });
+    assert!(
+        proposed[0].touch.is_empty(),
+        "rev 14: a change that is not the first creator carries []"
+    );
+    let a = r.state.accepted.as_ref().unwrap();
+    assert_eq!(
+        a.touch_source,
+        Some(TouchSource::User),
+        "the base's source stands"
+    );
+    assert_eq!(
+        a.touch,
+        ["src/x.rs"],
+        "the launch's declared touch, unchanged"
+    );
+}
+
+/// A PA change that adds no creator step never carries a touch, even when its block spells one.
+#[test]
+fn a_read_only_pa_change_ignores_a_declared_touch() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let change = pa_block(
+        r#"[{"catalog":"understand","id":"answer-2"}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope::default()),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "read-only additions proceed"
+    );
+    let proposed = body(&r, |b| match b {
+        TeamBody::PlanProposed(p) => Some(p.clone()),
+        _ => None,
+    });
+    assert!(proposed[0].touch.is_empty());
+    assert!(body(&r, |b| matches!(b, TeamBody::PathScored(_)).then_some(())).is_empty());
+    assert_eq!(r.state.max_score, 0, "nothing was scored");
+}
+
+/// A human edit that adds the first creator step is still the human's own (rev 14): accepted as
+/// the next rev with no score and no gate — the first-creator row is about the PA's `kind:"change"`.
+#[test]
+fn a_human_edit_adding_the_first_creator_step_stays_human_accepted() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let change = Change::Steps {
+        by: "human".into(),
+        source: ProposalSource::Edit {
+            request_id: "req-1".into(),
+        },
+        kind: ProposalKind::Edit,
+        reason: None,
+        steps: plan(json!({"steps":[{"catalog":"build","id":"build"}]})).steps,
+        touch: None,
+        scoring: None,
+    };
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Accepted { .. }));
+    assert!(body(&r, |b| matches!(b, TeamBody::PathScored(_)).then_some(())).is_empty());
+    assert_eq!(r.state.accepted.as_ref().unwrap().by, "human");
+}
+
+/// (§4.7 F11) On a repo-less path a first creator step that EXECUTES CODE has no worktree: the
+/// proposal is refused on the record (`plan.refused`, "no repo bound") and the run keeps its rev.
+#[test]
+fn a_code_executing_first_creator_step_on_a_repo_less_path_is_refused() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let change = pa_block(
+        r#"[{"catalog":"build","id":"build"}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope {
+            repo_root: None,
+            base_commit: None,
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    match &r.outcome {
+        Outcome::Refused { reason } => assert_eq!(reason, "no repo bound"),
+        _ => panic!("a code-executing step with no worktree must be refused"),
+    }
+    let refused = body(&r, |b| match b {
+        TeamBody::PlanRefused(p) => Some(p.reason.clone()),
+        _ => None,
+    });
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0].starts_with("no repo bound"), "{}", refused[0]);
+    assert_eq!(r.state, s, "the run keeps its accepted rev");
+    // `produce` (an artifact, no code) on the same path is scored and held, not refused.
+    let docs = pa_block(
+        r#"[{"catalog":"produce","id":"docs"}]"#,
+        Some(r#"["docs/x.md"]"#),
+        Some(ScoreScope::default()),
+    );
+    let r = revise("r", &s, docs, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Held { .. }));
+}
+
+/// (§4.3 "a declined proposal leaves the accepted rev alone") The floor is computed on the
+/// ACCEPTED plan: a creator-less plan has an empty floor whatever band the run has recorded, so
+/// after a held first-creator proposal is not taken the accepted rev stands with nothing to add.
+#[test]
+fn a_creator_less_accepted_plan_has_an_empty_floor_at_any_recorded_band() {
+    let hc = HumanConfirm::None;
+    let answer = plan(json!({"steps":[{"catalog":"understand","id":"answer-1"}]}));
+    for score in [0u8, 45, 100] {
+        let filled = crate::plan::floor_fill(
+            crate::catalog::catalog(),
+            &answer,
+            crate::plan::FloorInput {
+                score,
+                destructive: false,
+                human_confirm: &hc,
+                deliver: None,
+                obligations: &[],
+                ran: &[],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            filled.steps.steps.len(),
+            1,
+            "band of {score}: nothing added"
+        );
+        assert!(!filled.high_risk, "never high risk without a creator step");
+    }
 }
