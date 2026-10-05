@@ -2029,9 +2029,13 @@ fn an_answer_step_that_changed_no_tree_is_reviewed_on_its_output() {
     assert_eq!(ledger.final_pass, FinalPass::Completed);
     assert!(!ledger.team_pause, "medium never pauses");
     assert_eq!(
-        (ledger.rejected.below_bar, ledger.rejected.unconfirmed),
-        (1, 2),
-        "{:?}",
+        (
+            ledger.rejected.below_bar,
+            ledger.rejected.unconfirmed,
+            ledger.rejected.malformed
+        ),
+        (1, 1, 1),
+        "low below the bar; a line not in the answer unconfirmed; a repo path malformed: {:?}",
         ledger.rejected
     );
     assert_eq!(ledger.findings.len(), 1);
@@ -2410,4 +2414,20 @@ fn a_carried_tree_high_is_not_superseded_when_the_settled_tree_is_unavailable() 
             .any(|c| c["attempt"] == 2),
         "the council was convened on attempt 2"
     );
+}
+
+/// (codex review of #739 round 6) A step id a repo path could never spell (`answer:1`) is still a
+/// valid output target: the member cites it verbatim and the finding is raised.
+#[test]
+fn an_output_finding_on_a_colon_step_id_is_raised() {
+    let mut h = Harness::new("colonid");
+    h.host.set_reply(output_reviewer("answer:1"));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim_step(3, 1, "claude#1", "answer:1", true);
+    h.complete_with_output(3, 1, "claude#1", "answer:1", ANSWER);
+    h.pump();
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    assert_eq!(raised[0]["path"], "answer:1");
+    assert_eq!(raised[0]["target"], "output");
 }

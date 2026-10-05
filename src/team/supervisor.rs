@@ -43,7 +43,7 @@ use super::events::{
 };
 use super::publish::{LiveTeamRun, PublishOutcome, TeamBus, TeamConfig};
 use super::{
-    cap_utf8, confirm, kind_may_change_tree, locate, parse_reply, repo_relative, AttachCtx,
+    cap_utf8, confirm, kind_may_change_tree, locate, parse_reply, parse_reply_for_step, AttachCtx,
     FinalPass, Finding, FindingBook, FindingStatus, LedgerMonitor, MonitorHost, MonitorScope,
     MonitorStatus, RawFinding, Rejected, ReplyKind, Repo, Severity, TeamLedger, TeamLimits,
     TeamPlan, UnitKey, Verdict,
@@ -1095,7 +1095,10 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
             return done(opened, BatchOutcome::TurnFailed { error, timed_out });
         }
     };
-    let (parsed, malformed) = parse_reply(&reply);
+    // `path` must be the step id the prompt named, verbatim (a step id is not a repo path and may
+    // carry characters one may not): a finding that cites anything else is malformed here, and a
+    // finding on the answer is confirmed byte-exact against the text the member was shown.
+    let (parsed, malformed) = parse_reply_for_step(&reply, &job.step_id);
     let mut rejected = Rejected {
         malformed,
         ..Rejected::default()
@@ -1106,15 +1109,7 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
             rejected.below_bar += 1;
             continue;
         };
-        // `path` must be the step id the prompt named — a finding that cites a repo path is not a
-        // finding on the answer, however its evidence reads — and the line must be byte-exact.
-        // Compared as the parser spells a path (`repo_relative`: `./answer-1` is `answer-1`); a
-        // step id the parser cannot spell at all is compared verbatim (codex review of #739 r4).
-        let want = repo_relative(&job.step_id).unwrap_or_else(|| job.step_id.clone());
-        if f.path != want
-            || f.evidence.len() > super::EVIDENCE_CAP
-            || !confirm(Some(&shown), f.line, &f.evidence)
-        {
+        if f.evidence.len() > super::EVIDENCE_CAP || !confirm(Some(&shown), f.line, &f.evidence) {
             rejected.unconfirmed += 1;
             continue;
         }
