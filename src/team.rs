@@ -497,13 +497,28 @@ impl Rejected {
 /// A monitor reply's `FINDING` lines, parsed strictly. Returns the parsed findings and the count
 /// of `FINDING` lines that were malformed. Every other line — `DONE`, prose — is ignored.
 pub fn parse_reply(text: &str) -> (Vec<RawFinding>, u32) {
+    parse_reply_with(text, repo_relative)
+}
+
+/// (ASK-K3b) `parse_reply` for an OUTPUT target: `path` is the step id the prompt named, spelled
+/// verbatim — a step id may carry characters a repo path may not (`answer:1`), and a repo-path
+/// rule would make every correctly cited finding malformed (codex review of #739 round 6). Any
+/// other path is rejected here, as unconfirmed-by-construction.
+pub fn parse_reply_for_step(text: &str, step_id: &str) -> (Vec<RawFinding>, u32) {
+    parse_reply_with(text, |p| (p == step_id).then(|| step_id.to_string()))
+}
+
+fn parse_reply_with(
+    text: &str,
+    path_rule: impl Fn(&str) -> Option<String>,
+) -> (Vec<RawFinding>, u32) {
     let mut out = Vec::new();
     let mut malformed = 0;
     for line in text.lines() {
         let Some(rest) = line.trim().strip_prefix("FINDING ") else {
             continue;
         };
-        match parse_finding(rest.trim()) {
+        match parse_finding(rest.trim(), &path_rule) {
             Some(f) => out.push(f),
             None => malformed += 1,
         }
@@ -511,7 +526,7 @@ pub fn parse_reply(text: &str) -> (Vec<RawFinding>, u32) {
     (out, malformed)
 }
 
-fn parse_finding(json: &str) -> Option<RawFinding> {
+fn parse_finding(json: &str, path_rule: &impl Fn(&str) -> Option<String>) -> Option<RawFinding> {
     let v: Value = serde_json::from_str(json).ok()?;
     let obj = v.as_object()?;
     let text = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
@@ -519,7 +534,7 @@ fn parse_finding(json: &str) -> Option<RawFinding> {
     if !matches!(severity.as_str(), "high" | "medium" | "low") {
         return None;
     }
-    let path = repo_relative(&text("path")?)?;
+    let path = path_rule(&text("path")?)?;
     let line = u32::try_from(obj.get("line")?.as_u64()?).ok()?;
     if line == 0 {
         return None;
@@ -543,7 +558,7 @@ fn parse_finding(json: &str) -> Option<RawFinding> {
 
 /// `path` as a repo-relative, forward-slash path — `None` for an absolute path, a `..`
 /// component, or an empty one.
-fn repo_relative(path: &str) -> Option<String> {
+pub(crate) fn repo_relative(path: &str) -> Option<String> {
     let p = path.replace('\\', "/");
     let p = p.trim_start_matches("./");
     if p.is_empty() || p.starts_with('/') || p.contains(':') {
@@ -563,6 +578,24 @@ fn repo_relative(path: &str) -> Option<String> {
 /// A file-level finding (`anchor == ""`) keeps the pre-anchor spelling, sha256(`path` ‖ `\n` ‖
 /// normalized `evidence`), so every id minted before T6 stays the same id: two findings in one
 /// file with different anchors still differ from each other and from the file-level one.
+/// (ASK-K3b) The one id rule for every target: a tree finding hashes its repo path; an output
+/// finding (DES-ASK-TEAM-CHAT-001 §4.6; `path` is a step id) hashes `output:<step id>`, so it can
+/// never share an identity with a tree finding on a file of that name. Every minting site — the
+/// book, the wire readers — goes through here (codex review of #739, rounds 2–3).
+pub fn finding_id_for(
+    target: events::FindingTarget,
+    path: &str,
+    anchor: &str,
+    evidence: &str,
+) -> String {
+    match target {
+        events::FindingTarget::Output => {
+            finding_id_anchored(&format!("output:{path}"), anchor, evidence)
+        }
+        events::FindingTarget::Tree => finding_id_anchored(path, anchor, evidence),
+    }
+}
+
 pub fn finding_id_anchored(path: &str, anchor: &str, evidence: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -900,7 +933,16 @@ impl FindingBook {
     /// `anchor` and `evidence` (whatever the caller put there is replaced), so dedup and the id
     /// agree by construction.
     pub fn admit(&mut self, mut finding: Finding) -> Admit {
-        let id = finding_id_anchored(&finding.path, &finding.anchor, &finding.evidence);
+        // (ASK-K3b) An output finding's `path` is a step id: it is minted in its own namespace so
+        // it can never share an identity with a tree finding on a file of that name (codex review
+        // of #739 round 2: a collision would fold a confirmed tree HIGH into a carried output
+        // MEDIUM and let the answer's re-confirmation supersede it).
+        let id = finding_id_for(
+            finding.target,
+            &finding.path,
+            &finding.anchor,
+            &finding.evidence,
+        );
         if let Some(&i) = self.index.get(&id) {
             let f = &mut self.findings[i];
             // The same monitor raising it again — as its author or as a corroborator — is a
@@ -1020,9 +1062,14 @@ pub struct AttachCtx {
     /// The creator's seat instance (the `step.claimed` `by`) — never a monitor of its own step.
     pub creator: String,
     pub plan: TeamPlan,
-    /// `None` when the unit is unbound or its dispatch baseline was not taken: not monitored,
-    /// and said so.
+    /// `None` when the unit is unbound or its dispatch baseline was not taken. A BOUND unit with
+    /// no baseline is not monitored, and said so (`member.joined{status:"failed"}`, "no worktree
+    /// baseline"); an UNBOUND unit's members review its OUTPUT at the final pass (ASK-K3b).
     pub repo: Option<Repo>,
+    /// (ASK-K3b) Whether the unit runs in a worktree at all (`step.claimed.repo` present). A
+    /// BOUND unit whose baseline was not taken keeps today's refusal ("no worktree baseline");
+    /// only an UNBOUND unit's members review its output with no tree (codex review of #739).
+    pub bound: bool,
     /// The unit's dispatch baseline tree.
     pub baseline_tree: Option<String>,
     pub criterion: String,
@@ -1184,7 +1231,7 @@ pub struct FindingWire {
 impl From<FindingWire> for Finding {
     fn from(w: FindingWire) -> Self {
         Finding {
-            finding_id: finding_id_anchored(&w.path, &w.anchor, &w.evidence),
+            finding_id: finding_id_for(w.target, &w.path, &w.anchor, &w.evidence),
             monitor_id: w.monitor_id,
             seat: w.seat,
             severity: w.severity,

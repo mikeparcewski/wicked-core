@@ -71,6 +71,20 @@ pub struct TeamRunner {
     schedule: Vec<Duration>,
     final_pass_budget: Duration,
     gate_poll: Duration,
+    /// (ASK-K3b) Where this runner leaves a step's output for the supervisor's final pass.
+    outputs: super::publish::OutputStash,
+}
+
+/// (ASK-K3b) Drops the stashed output when the runner's gate wait returns, whichever way.
+struct StashedOutput<'a> {
+    stash: &'a super::publish::OutputStash,
+    output_ref: String,
+}
+
+impl Drop for StashedOutput<'_> {
+    fn drop(&mut self) {
+        self.stash.remove(&self.output_ref);
+    }
 }
 
 impl TeamRunner {
@@ -89,6 +103,7 @@ impl TeamRunner {
             },
             final_pass_budget: cfg.final_pass_budget,
             gate_poll: cfg.gate_poll,
+            outputs: cfg.outputs.clone(),
         })
     }
 
@@ -335,13 +350,16 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                 .phase_id()
                 .map(str::to_string)
                 .unwrap_or_else(|| step_id.clone()),
+            // (ASK-K3b) A step with no validator pin still has a criterion for its members: the
+            // unit's description — the composed step's instructions, i.e. the question an answer
+            // step was asked (codex review of #739).
             criterion: cap_utf8(
                 input
                     .unit
                     .validator
                     .as_ref()
                     .map(|v| v.criterion.as_str())
-                    .unwrap_or(""),
+                    .unwrap_or(&input.unit.description),
                 2 * 1024,
             ),
             baseline_tree: baseline.map(|b| b.tree.clone()),
@@ -845,6 +863,18 @@ fn publish_turn_lines(claimed: &Claimed, output: &StepOutput) {
 }
 
 fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> UnitTeamSnapshot {
+    let output_ref = format!(
+        "unit:{}:{}:{}",
+        claimed.run_id, claimed.ord, claimed.attempt
+    );
+    // (ASK-K3b, §4.6) The text `output_ref` names is readable by S from here until this wait
+    // returns: the final pass of a step that changed no tree reviews it, before the fold writes
+    // the record the ref otherwise resolves to.
+    claimed.runner.outputs.put(&output_ref, &output.output);
+    let _stashed = StashedOutput {
+        stash: &claimed.runner.outputs,
+        output_ref: output_ref.clone(),
+    };
     publish_turn_lines(claimed, output);
     let completed = TeamEvent {
         env: envelope(
@@ -859,10 +889,7 @@ fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> Uni
             status: completion(output.status),
             tree: None,
             output_bytes: output.output.len() as u64,
-            output_ref: format!(
-                "unit:{}:{}:{}",
-                claimed.run_id, claimed.ord, claimed.attempt
-            ),
+            output_ref,
         }),
     };
     let mut completed_id: Option<i64> = None;
