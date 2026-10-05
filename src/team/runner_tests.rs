@@ -1391,6 +1391,20 @@ fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_onc
             }),
         )
     };
+    // An attempt that reached its boundary and finished: its claim cuts a window (K3c round 4).
+    let complete = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+            }),
+        )
+    };
     claim(1);
     // `help_id` is minted from `help_seq` (T2 §6.1): read it off the row as published.
     let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
@@ -1437,6 +1451,7 @@ fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_onc
             p["reason"] = json!("someone else's");
         }),
     );
+    complete(1);
     let c2 = claim(2);
     let claimed = Claimed {
         runner: runner(&rig),
@@ -1466,6 +1481,7 @@ fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_onc
     );
     assert!(!text.contains("p-other"), "{text}");
     // A later step of the same seat was already shown both.
+    complete(2);
     let c3 = claim(3);
     let later = Claimed {
         ord: 3,
@@ -1495,6 +1511,20 @@ fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders
                 p["attempt"] = json!(0);
                 p["by"] = json!("claude#1");
                 p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    // An attempt that reached its boundary and finished: its claim cuts a window (K3c round 4).
+    let complete = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
             }),
         )
     };
@@ -1538,6 +1568,7 @@ fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders
             .is_none_or(|b| !b.output.contains("late answer")),
         "a row after the claim is the next boundary's"
     );
+    complete(1);
     let c2 = claim(2);
     let at_c2 = Claimed {
         ord: 2,
@@ -1547,6 +1578,7 @@ fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders
     };
     let text = boundary(&at_c2).block.expect("a block").output;
     assert!(text.contains("late answer"), "{text}");
+    complete(2);
     let c3 = claim(3);
     let at_c3 = Claimed {
         ord: 3,
@@ -1576,6 +1608,20 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
                 p["attempt"] = json!(0);
                 p["by"] = json!("claude#1");
                 p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    // An attempt that reached its boundary and finished: its claim cuts a window (K3c round 4).
+    let complete = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
             }),
         )
     };
@@ -1619,6 +1665,7 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
             p["reason"] = json!("no repo bound");
         }),
     );
+    complete(1);
     let c2 = claim(2);
     let claimed = Claimed {
         runner: runner(&rig),
@@ -1643,6 +1690,7 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
         "the omitted answers are counted"
     );
     // What did not fit carries to the seat's next boundary (round 3): nothing is lost to the cap.
+    complete(2);
     let c3 = claim(3);
     let next = Claimed {
         ord: 3,
@@ -1657,6 +1705,7 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
     );
     let shown_total =
         text.matches("you asked: qqq").count() + text3.matches("you asked: qqq").count();
+    complete(3);
     let c4 = claim(4);
     let after = Claimed {
         ord: 4,
