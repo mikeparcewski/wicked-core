@@ -2390,9 +2390,24 @@ fn a_carried_tree_high_is_not_superseded_when_the_settled_tree_is_unavailable() 
         settled.is_empty(),
         "no settled tree, so nothing is superseded: {settled:#?}"
     );
+    // It stands for the gate: unanswered, held by its member, ruled on by the council (the
+    // harness's council says YES, so the run goes on) — never superseded for lack of a tree.
     let ledger = h.folded(3, 2);
+    let f = ledger
+        .findings
+        .iter()
+        .find(|f| f.finding.severity == Severity::High)
+        .expect("the carried HIGH is in the ledger");
+    assert_eq!(f.finding.carried_from_attempt, Some(1));
+    assert_eq!(f.status, FindingStatus::Unanswered, "{f:?}");
     assert!(
-        ledger.team_pause,
-        "the unresolved carried HIGH still pauses: {ledger:?}"
+        f.dispute.is_some(),
+        "the council ruled on it, not a supersession: {f:?}"
+    );
+    assert!(
+        h.rows(tev::COUNCIL_CALLED)
+            .iter()
+            .any(|c| c["attempt"] == 2),
+        "the council was convened on attempt 2"
     );
 }
