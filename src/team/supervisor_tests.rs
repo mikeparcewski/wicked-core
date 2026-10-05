@@ -383,6 +383,8 @@ impl Harness {
             p["step_id"] = json!(step);
             p["status"] = json!(status);
             p["output_ref"] = json!(format!("unit:{RUN}:{ord}:{attempt}"));
+            // (ASK-K3c) The harness's completions presented their boundary block.
+            p["answers_presented"] = json!(true);
         }))
     }
 

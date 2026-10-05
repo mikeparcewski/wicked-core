@@ -591,15 +591,14 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // what it packed. A claim with no `step.completed` of its own (the process died between the
     // claim and the boundary, or the attempt was redriven) presented nothing, so its rows stay
     // in the next window (codex review of #740 round 4). The current claim always cuts.
-    // Known limit (round 5, disclosed, not fixed): completion is the only stateless evidence of
-    // presentation the stream carries — the design publishes no delivery row for answers (N2) —
-    // so an attempt whose boundary could not read the stream (it was told "advice unavailable")
-    // or a repo-checks rerun that skipped the seat turn counts as presented. Both are the
-    // channel's existing disclosure modes; a delivery row for answers would be a new fact.
+    // And only a completion that says its boundary block was PRESENTED (`answers_presented`: the
+    // stream read succeeded and a seat turn ran) — an attempt told "advice unavailable", or a
+    // repo-checks re-run that skipped the seat, showed nothing (round 5): its rows carry on.
     let completed: BTreeSet<(Option<u32>, Option<u32>)> = rows
         .iter()
         .filter(|r| {
-            matches!(r.event.body, TeamBody::StepCompleted(_)) && r.event.env.by == claimed.by
+            matches!(&r.event.body, TeamBody::StepCompleted(b) if b.answers_presented)
+                && r.event.env.by == claimed.by
         })
         .map(|r| (r.event.env.ord, r.event.env.attempt))
         .collect();
@@ -864,10 +863,22 @@ fn attempt_rows(claimed: &Claimed) -> anyhow::Result<(Vec<TeamRow>, usize)> {
 /// attempt (§8.11). On timeout, synthesize DES-001 §4.7's fail-closed ledger from the attempt's
 /// own rows WITHOUT publishing it. The result is the attempt's snapshot for `UnitEvidence.team`.
 pub fn complete(claimed: &Claimed, output: &StepOutput) -> UnitTeamSnapshot {
+    complete_with(claimed, output, true)
+}
+
+/// [`complete`] stating whether the attempt's boundary block was presented to a seat turn
+/// (`step.completed.answers_presented`, ASK-K3c): false when the boundary could not read the
+/// stream or the seat never ran (a repo-checks re-run), so the seat's next boundary re-renders.
+pub fn complete_with(
+    claimed: &Claimed,
+    output: &StepOutput,
+    answers_presented: bool,
+) -> UnitTeamSnapshot {
     complete_at(
         claimed,
         output,
         Instant::now() + claimed.runner.final_pass_budget,
+        answers_presented,
     )
 }
 
@@ -1023,7 +1034,12 @@ fn publish_turn_lines(claimed: &Claimed, output: &StepOutput) {
     }
 }
 
-fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> UnitTeamSnapshot {
+fn complete_at(
+    claimed: &Claimed,
+    output: &StepOutput,
+    deadline: Instant,
+    answers_presented: bool,
+) -> UnitTeamSnapshot {
     let output_ref = format!(
         "unit:{}:{}:{}",
         claimed.run_id, claimed.ord, claimed.attempt
@@ -1051,6 +1067,7 @@ fn complete_at(claimed: &Claimed, output: &StepOutput, deadline: Instant) -> Uni
             tree: None,
             output_bytes: output.output.len() as u64,
             output_ref,
+            answers_presented,
         }),
     };
     let mut completed_id: Option<i64> = None;

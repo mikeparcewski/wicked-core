@@ -1402,6 +1402,7 @@ fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_onc
                 p["step_id"] = json!(format!("answer-{ord}"));
                 p["status"] = json!("ok");
                 p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                p["answers_presented"] = json!(true);
             }),
         )
     };
@@ -1525,6 +1526,7 @@ fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders
                 p["step_id"] = json!(format!("answer-{ord}"));
                 p["status"] = json!("ok");
                 p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                p["answers_presented"] = json!(true);
             }),
         )
     };
@@ -1622,6 +1624,7 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
                 p["step_id"] = json!(format!("answer-{ord}"));
                 p["status"] = json!("ok");
                 p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                p["answers_presented"] = json!(true);
             }),
         )
     };
@@ -1742,4 +1745,86 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
     let (block, sent, rest) =
         crate::team::advice_block_within(vec![crate::team::Advice { finding: f }], 100);
     assert!(block.is_empty() && sent.is_empty() && rest.len() == 1);
+}
+
+/// (codex review of #740 rounds 5–6) A completion that does NOT say its answers were presented
+/// (the boundary could not read the stream, or a repo-checks re-run skipped the seat) cuts no
+/// window: the rows carry on to the next boundary; a presented completion cuts.
+#[test]
+fn k3c_an_unpresented_completion_cuts_no_window() {
+    let rig = rig("k3cunp");
+    let run = "k3cunp";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    let complete = |ord: u32, presented: bool| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_COMPLETED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+                p["status"] = json!("ok");
+                p["output_ref"] = json!(format!("unit:{run}:{ord}:0"));
+                if presented {
+                    p["answers_presented"] = json!(true);
+                }
+            }),
+        )
+    };
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_PROPOSED, 0, run, |p| {
+            p["by"] = json!("claude#1");
+            p["proposal_id"] = json!("p-unp");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-unp");
+            p["reason"] = json!("no repo bound");
+        }),
+    );
+    claim(1);
+    complete(1, false); // the boundary at 1 could not read the stream: nothing was presented
+    let c2 = claim(2);
+    let at_c2 = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 2,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-2".into(),
+        stream_floor: floor,
+        claimed_id: c2,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    let text = boundary(&at_c2).block.expect("a block").output;
+    assert!(
+        text.contains("p-unp"),
+        "an unpresented window carries on: {text}"
+    );
+    complete(2, true);
+    let c3 = claim(3);
+    let at_c3 = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..at_c2
+    };
+    assert!(boundary(&at_c3)
+        .block
+        .is_none_or(|b| !b.output.contains("p-unp")));
 }
