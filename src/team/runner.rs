@@ -152,6 +152,7 @@ pub(crate) fn finding_of(env: &Envelope, b: &tev::FindingRaised) -> Finding {
         checkpoint_seq: 0,
         anchor: b.anchor.clone().unwrap_or_default(),
         carried_from_attempt: b.carried_from_attempt,
+        target: b.target,
     }
 }
 

@@ -193,6 +193,7 @@ fn authored_ledger() -> TeamLedger {
                 checkpoint_seq: 0,
                 anchor: String::new(),
                 carried_from_attempt: None,
+                target: Default::default(),
             },
             final_line: None,
             corroborated_by: vec!["claude#3".into()],

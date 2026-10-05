@@ -2018,3 +2018,41 @@ fn a_forged_help_id_is_re_minted_from_help_seq() {
     assert_eq!(b.help_id, mint_help_id("r1", 3, 1, "claude#1", 2));
     assert_eq!(ev.key().unwrap(), "db018ea3f7b6cdba96216480d387476d");
 }
+
+/// (codex review of #737, finding 1) The target survives every consumer that turns a row into a
+/// `Finding`: the fold (`ledger.findings[].finding.target`), the runner's `finding_of` (the steer
+/// point, the boundary and the supervisor's carry) and the `Finding` serde (`target` spelled only
+/// when it is `output`), so a redriven attempt re-raises an output finding as an output finding
+/// and never re-confirms a step id against the tree.
+#[test]
+fn an_output_target_survives_the_fold_finding_of_and_the_finding_serde() {
+    let (_, output) = fixtures()
+        .into_iter()
+        .find(|(t, p)| t == FINDING_RAISED && p["target"] == json!("output"))
+        .expect("an output-target fixture");
+    let ev = TeamEvent::from_payload(FINDING_RAISED, &output).unwrap();
+    let TeamBody::FindingRaised(b) = &ev.body else {
+        panic!()
+    };
+    let f = crate::team::runner::finding_of(&ev.env, b);
+    assert_eq!(f.target, FindingTarget::Output);
+    let v = serde_json::to_value(&f).unwrap();
+    assert_eq!(v["target"], json!("output"));
+    let back: crate::team::Finding = serde_json::from_value(v).unwrap();
+    assert_eq!(back.target, FindingTarget::Output);
+
+    let tree = fixture(FINDING_RAISED);
+    let ev_t = TeamEvent::from_payload(FINDING_RAISED, &tree).unwrap();
+    let TeamBody::FindingRaised(bt) = &ev_t.body else {
+        panic!()
+    };
+    let vt = serde_json::to_value(crate::team::runner::finding_of(&ev_t.env, bt)).unwrap();
+    assert!(
+        vt.get("target").is_none(),
+        "a tree finding spells no target: {vt}"
+    );
+
+    let ledger = fold(&[TeamRow { event_id: 1, event: ev }]);
+    assert_eq!(ledger.findings.len(), 1);
+    assert_eq!(ledger.findings[0].finding.target, FindingTarget::Output);
+}

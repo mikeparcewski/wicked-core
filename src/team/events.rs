@@ -1637,6 +1637,7 @@ pub fn fold(rows: &[TeamRow]) -> TeamLedger {
                     checkpoint_seq: 0,
                     anchor: b.anchor.clone().unwrap_or_default(),
                     carried_from_attempt: b.carried_from_attempt,
+                    target: b.target,
                 },
                 corroborated_by: b.corroborated_by.clone(),
                 injected: false,

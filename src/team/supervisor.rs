@@ -660,8 +660,7 @@ impl UnitTeam {
                     tev::AnchorSource::Hunk
                 }),
                 severity: f.severity,
-                // (ASK-K3a) Every finding today cites the settled tree; K3b raises `output`.
-                target: tev::FindingTarget::Tree,
+                target: f.target,
                 path: f.path.clone(),
                 line: f.line,
                 evidence: f.evidence.clone(),
@@ -759,6 +758,9 @@ impl UnitTeam {
                         checkpoint_seq: done.checkpoint_seq,
                         anchor: c.anchor,
                         carried_from_attempt: None,
+                        // (ASK-K3a) Every batch today reviews the settled tree; K3b adds the
+                        // output target.
+                        target: tev::FindingTarget::Tree,
                     };
                     if let super::Admit::New(lf, seq) = self.book.admit(finding) {
                         let f = lf.finding.clone();
