@@ -1078,3 +1078,36 @@ fn an_additive_gate_edit_keeps_the_held_proposal_and_adds_its_own_step() {
         "the kept creator keeps its touch"
     );
 }
+
+/// (codex #738 round 5) A read-only `PLAN+` held first (manual mode) does not relabel the first
+/// creator step that follows it at the same boundary: the gate opens `first_creator`.
+#[test]
+fn a_first_creator_change_over_an_already_held_revision_keeps_its_reason() {
+    let hc = HumanConfirm::Before(99);
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let first = pa_block(
+        r#"[{"catalog":"understand","id":"answer-2"}]"#,
+        None,
+        Some(ScoreScope::default()),
+    );
+    let r1 = revise("r", &s, first, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r1.outcome, Outcome::Held { .. }));
+    assert_eq!(r1.state.pending.as_ref().unwrap().reason, "manual_mode");
+    let second = pa_block(
+        r#"[{"catalog":"produce","id":"docs"}]"#,
+        Some(r#"["docs/x.md"]"#),
+        Some(ScoreScope::default()),
+    );
+    let r2 = revise(
+        "r",
+        &r1.state,
+        second,
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(matches!(r2.outcome, Outcome::Held { .. }));
+    assert_eq!(r2.state.pending.as_ref().unwrap().reason, "first_creator");
+}

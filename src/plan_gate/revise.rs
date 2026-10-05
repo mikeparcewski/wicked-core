@@ -628,8 +628,15 @@ pub(crate) fn revise(
     let needs = if by_human {
         None
     } else if let Some(p) = &prior.pending {
-        // A plan already held at this boundary stays held: the gate covers every revision.
-        Some(p.reason.clone())
+        // A plan already held at this boundary stays held: the gate covers every revision —
+        // under the more specific reason when this change crosses into work (rev 15; codex
+        // review of #738 round 5: a read-only `PLAN+` held first must not relabel the first
+        // creator step `manual_mode`).
+        Some(if first_creator {
+            ApprovalReason::FirstCreator.as_str().to_string()
+        } else {
+            p.reason.clone()
+        })
     } else {
         match approval(
             auto,

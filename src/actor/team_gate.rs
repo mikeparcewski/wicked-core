@@ -3441,14 +3441,35 @@ pub(super) fn revise_units(
         let floor = ran_at(u.ord);
         match old.iter().find(|o| same_phase(o, &u)) {
             Some(o) => {
-                let mut k = o.clone();
-                k.ord = u.ord;
-                k.description = u.description.clone();
-                k.last_attempt = k.last_attempt.max(floor);
-                // (ASK-K2b; codex review of #738 round 3) The plan it now belongs to decides what
-                // it depends on: a kept evaluator whose creator the amendment replaced must point
-                // at the replacement, not at a unit that just left the store.
-                k.depends_on = u.depends_on.clone();
+                // (ASK-K2b; codex review of #738 rounds 3–5) The plan it now belongs to decides
+                // every PLANNED attribute — dependencies, description, and the flags derived from
+                // the surrounding phases (`repo_checks_floor`, `pre_build_scope`, `default_floor`,
+                // …) — so the kept unit is the NEW unit carrying the OLD unit's run state: what it
+                // did, who ran it, what it was denied, its team and worktree records, its reworks.
+                let mut k = u.clone();
+                k.status = o.status;
+                k.assigned_cli = o.assigned_cli.clone();
+                k.assigned_invocation = o.assigned_invocation.clone();
+                k.council_task_ref = o.council_task_ref.clone();
+                k.routing = o.routing.clone();
+                k.denial_reason = o.denial_reason.clone();
+                k.denial = o.denial.clone();
+                k.phase_status = o.phase_status.clone();
+                k.capture_report = o.capture_report.clone();
+                k.worker_failed_clis = o.worker_failed_clis.clone();
+                k.team_run = o.team_run;
+                k.team = o.team.clone();
+                k.member_step = o.member_step.clone();
+                k.scope_warnings = o.scope_warnings.clone();
+                k.worktree_guarded = o.worktree_guarded;
+                k.worktree_baseline = o.worktree_baseline.clone();
+                k.worktree_mutation = o.worktree_mutation.clone();
+                k.notes_root = o.notes_root.clone();
+                k.run_base_commit = o.run_base_commit.clone();
+                k.repo_checks = o.repo_checks.clone();
+                k.rework_of = o.rework_of;
+                k.rework_amendment = o.rework_amendment.clone();
+                k.last_attempt = o.last_attempt.max(floor);
                 kept.push(k);
             }
             None => {
