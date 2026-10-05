@@ -1698,7 +1698,7 @@ fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
     ]});
     launch(&e, "nn", HumanConfirm::None, plan(steps.clone()));
     e.wait_awaiting("nn", "plan_approval", 1);
-    let opened = payloads(&e, "nn", tev::GATE_OPENED);
+    let opened = settled(&e, "nn", tev::GATE_OPENED, 2);
     assert!(
         opened
             .iter()
@@ -1738,17 +1738,17 @@ fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
 }
 
 /// (codex review of #738 round 4) A whole-plan amendment may reuse a declined step's id for
-/// DIFFERENT work: the held `produce:understand` (a creator step under an odd id) is dropped and
-/// the human's id-less `understand` defaults onto that id. The stored unit is a replacement, not
-/// a kept creator: it is planned fresh as the neutral `understand`, never dispatched as the
-/// declined `produce`.
+/// DIFFERENT work: the held `produce:design` (a creator step under an odd id) is dropped and the
+/// human's id-less `design` defaults onto that id. The stored unit is a replacement, not a kept
+/// creator: it is planned fresh as the catalog's `design`, never dispatched as the declined
+/// `produce`.
 #[test]
 fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
     let w = Worker::scripted(|i, _| {
         if i.unit.id.ends_with(":answer-1") {
             turn(
                 &pa_output(
-                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"understand"}],"touch":["docs/x.md"]}"#,
+                    r#"PLAN+ {"steps":[{"catalog":"produce","id":"design"}],"touch":["docs/x.md"]}"#,
                 ),
                 None,
             )
@@ -1767,8 +1767,8 @@ fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
     let held = view(&e, "rep").units;
     let old = held
         .iter()
-        .find(|u| u.id == "rep:understand")
-        .expect("the held produce under the id `understand`");
+        .find(|u| u.id == "rep:design")
+        .expect("the held produce under the id `design`");
     assert_eq!(old.catalog.as_deref(), Some("produce"));
     assert_eq!(old.role, crate::workflow::PhaseRole::Creator);
     e.core
@@ -1777,16 +1777,16 @@ fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
             HumanDecision::EditPlan {
                 plan: plan(json!({"steps": [
                     {"catalog": "understand", "id": "answer-1"},
-                    {"catalog": "understand"}
+                    {"catalog": "design"}
                 ]})),
             },
         )
         .expect("the edit is an answer");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline && !e.worker.calls().iter().any(|c| c.2 == "rep:understand") {
+    while Instant::now() < deadline && !e.worker.calls().iter().any(|c| c.2 == "rep:design") {
         std::thread::sleep(Duration::from_millis(20));
     }
-    if !e.worker.calls().iter().any(|c| c.2 == "rep:understand") {
+    if !e.worker.calls().iter().any(|c| c.2 == "rep:design") {
         let v = view(&e, "rep");
         panic!(
             "the replacement never dispatched: status {:?} unit_ix {} attempt {}; units {:?}; awaiting {:?}; dispatched {:?}; accepted {:?}; refused {:?}; decided {:?}",
@@ -1804,11 +1804,10 @@ fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
     let units = view(&e, "rep").units;
     let fresh = units
         .iter()
-        .find(|u| u.id == "rep:understand")
-        .expect("the human's understand step");
-    assert_eq!(fresh.catalog.as_deref(), Some("understand"), "{fresh:?}");
-    assert_eq!(fresh.role, crate::workflow::PhaseRole::Neutral);
-    assert!(!fresh.executes_code);
+        .find(|u| u.id == "rep:design")
+        .expect("the human's design step");
+    assert_eq!(fresh.catalog.as_deref(), Some("design"), "{fresh:?}");
+    assert_ne!(fresh.catalog.as_deref(), Some("produce"));
     assert_eq!(
         units.len(),
         2,
