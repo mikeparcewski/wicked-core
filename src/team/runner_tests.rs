@@ -1642,6 +1642,37 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
         text.contains("more answers did not fit; see the stream"),
         "the omitted answers are counted"
     );
+    // What did not fit carries to the seat's next boundary (round 3): nothing is lost to the cap.
+    let c3 = claim(3);
+    let next = Claimed {
+        ord: 3,
+        claimed_id: c3,
+        step_id: "answer-3".into(),
+        ..claimed
+    };
+    let text3 = boundary(&next).block.expect("the carried answers").output;
+    assert!(
+        text3.contains("you asked: qqq") && !text3.contains("p-late"),
+        "the carried help answers render once, the refusal not again"
+    );
+    let shown_total =
+        text.matches("you asked: qqq").count() + text3.matches("you asked: qqq").count();
+    let c4 = claim(4);
+    let after = Claimed {
+        ord: 4,
+        claimed_id: c4,
+        step_id: "answer-4".into(),
+        ..next
+    };
+    let rest = boundary(&after)
+        .block
+        .map(|b| b.output.matches("you asked: qqq").count())
+        .unwrap_or(0);
+    assert_eq!(
+        shown_total + rest,
+        8,
+        "every help answer renders exactly once"
+    );
     let f = Finding {
         finding_id: String::new(),
         monitor_id: "m1".into(),

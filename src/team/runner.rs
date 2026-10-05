@@ -575,22 +575,25 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
 /// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
 /// than its own claim) — a claim after the row means that step's boundary read it.
 fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
-    // (ASK-K3c, codex review of #740) The window this boundary owns: the rows between this seat's
-    // PREVIOUS claim and its own. A row before the window was this seat's earlier boundary's to
-    // render; one after it (landed between this claim and this read) is the next boundary's. So
-    // every answer renders at exactly one boundary of the seat, with no delivery row — stateless
-    // under restart, since both claims are on the stream.
-    let previous_claim = rows
+    // (ASK-K3c, codex review of #740 rounds 1–3) Every answer renders at exactly ONE boundary of
+    // the seat, statelessly: this seat's claims on the stream cut it into windows; each window's
+    // rows plus what earlier windows could not fit are packed by priority into the cap, and what
+    // still does not fit carries to the next window. Replaying that packing over the seat's
+    // earlier claims tells this boundary exactly what is still unshown — no delivery row, the
+    // same answer after a restart.
+    let mut seat_claims: Vec<i64> = rows
         .iter()
         .filter(|r| {
-            r.event_id < claimed.claimed_id
+            r.event_id <= claimed.claimed_id
                 && r.event.env.by == claimed.by
                 && matches!(r.event.body, TeamBody::StepClaimed(_))
         })
         .map(|r| r.event_id)
-        .max()
-        .unwrap_or(0);
-    let later_claim = |event_id: i64| event_id <= previous_claim || event_id >= claimed.claimed_id;
+        .collect();
+    seat_claims.sort_unstable();
+    if !seat_claims.contains(&claimed.claimed_id) {
+        seat_claims.push(claimed.claimed_id);
+    }
     let question = |help_id: &str| {
         rows.iter().find_map(|r| match &r.event.body {
             TeamBody::HelpRequested(h) if h.help_id == help_id => Some(h.question.clone()),
@@ -612,11 +615,12 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // Rows are rendered by priority within `cap` — the PA's own refusals first (small and
     // decisive), then help, councils, change requests — each whole or not at all, and what did
     // not fit is counted in a closing line, never silently cut (codex review of #740 round 2).
-    let mut entries: Vec<(u8, String)> = Vec::new();
+    let mut entries: Vec<(i64, u8, String)> = Vec::new();
     for r in rows {
-        if later_claim(r.event_id) {
+        if r.event_id >= claimed.claimed_id {
             continue;
         }
+        let at = r.event_id;
         match &r.event.body {
             // (ASK-K3c, DES-ASK-TEAM-CHAT-001 §4.5) A help row is rendered by its OUTCOME: the
             // answer when the member answered, else the fact that it did not and why — never an
@@ -651,12 +655,14 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
                     ),
                 };
                 entries.push((
+                    at,
                     1,
                     format!("- help {} — you asked: {}\n  {}\n", b.help_id, asked, reply),
                 ));
             }
             TeamBody::PlanRefused(b) if own_proposals.contains(b.proposal_id.as_str()) => entries
                 .push((
+                    at,
                     0,
                     format!(
                         "- your plan proposal {} was refused: {}\n",
@@ -707,30 +713,55 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
         return String::new();
     }
     const HEADER: &str = "\n[team answers · ADVISORY: the team's replies since your last step]\n";
-    let total = entries.len();
-    let mut ordered: Vec<(usize, u8, String)> = entries
-        .into_iter()
-        .enumerate()
-        .map(|(i, (p, l))| (i, p, l))
-        .collect();
-    ordered.sort_by_key(|(i, p, _)| (*p, *i));
-    // Room for the closing count line on every path.
-    let reserve = "- (+NNNN more answers did not fit; see the stream)\n".len();
-    let budget = cap.saturating_sub(HEADER.len() + reserve);
-    let mut out = String::new();
-    let mut shown = 0usize;
-    for (_, _, line) in ordered {
-        if out.len() + line.len() > budget {
-            continue;
+    let footer = |n: usize| format!("- (+{n} more answers did not fit; see the stream)\n");
+    // Pack one window: by priority, then stream order; whole lines only. Returns (shown, unshown).
+    let pack = |mut pending: Vec<(i64, u8, String)>| -> (Vec<String>, Vec<(i64, u8, String)>) {
+        pending.sort_by_key(|(at, p, _)| (*p, *at));
+        // The footer is reserved at the width of the LARGEST count this window could omit.
+        let budget = cap.saturating_sub(HEADER.len() + footer(pending.len()).len());
+        let mut used = 0usize;
+        let mut shown = Vec::new();
+        let mut unshown = Vec::new();
+        for e in pending {
+            if used + e.2.len() > budget {
+                unshown.push(e);
+                continue;
+            }
+            used += e.2.len();
+            shown.push(e.2);
         }
-        out.push_str(&line);
-        shown += 1;
+        (shown, unshown)
+    };
+    let mut carry: Vec<(i64, u8, String)> = Vec::new();
+    let mut prev = 0i64;
+    let mut rendered: Vec<String> = Vec::new();
+    let mut omitted = 0usize;
+    for claim in seat_claims {
+        let mut window: Vec<(i64, u8, String)> = std::mem::take(&mut carry);
+        window.extend(
+            entries
+                .iter()
+                .filter(|(at, _, _)| *at > prev && *at < claim)
+                .cloned(),
+        );
+        let (shown, unshown) = pack(window);
+        if claim == claimed.claimed_id {
+            omitted = unshown.len();
+            rendered = shown;
+        } else {
+            carry = unshown;
+        }
+        prev = claim;
     }
-    if shown < total {
-        out.push_str(&format!(
-            "- (+{} more answers did not fit; see the stream)\n",
-            total - shown
-        ));
+    if rendered.is_empty() && omitted == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for line in rendered {
+        out.push_str(&line);
+    }
+    if omitted > 0 {
+        out.push_str(&footer(omitted));
     }
     format!("{HEADER}{out}")
 }
