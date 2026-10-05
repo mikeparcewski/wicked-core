@@ -497,13 +497,28 @@ impl Rejected {
 /// A monitor reply's `FINDING` lines, parsed strictly. Returns the parsed findings and the count
 /// of `FINDING` lines that were malformed. Every other line — `DONE`, prose — is ignored.
 pub fn parse_reply(text: &str) -> (Vec<RawFinding>, u32) {
+    parse_reply_with(text, repo_relative)
+}
+
+/// (ASK-K3b) `parse_reply` for an OUTPUT target: `path` is the step id the prompt named, spelled
+/// verbatim — a step id may carry characters a repo path may not (`answer:1`), and a repo-path
+/// rule would make every correctly cited finding malformed (codex review of #739 round 6). Any
+/// other path is rejected here, as unconfirmed-by-construction.
+pub fn parse_reply_for_step(text: &str, step_id: &str) -> (Vec<RawFinding>, u32) {
+    parse_reply_with(text, |p| (p == step_id).then(|| step_id.to_string()))
+}
+
+fn parse_reply_with(
+    text: &str,
+    path_rule: impl Fn(&str) -> Option<String>,
+) -> (Vec<RawFinding>, u32) {
     let mut out = Vec::new();
     let mut malformed = 0;
     for line in text.lines() {
         let Some(rest) = line.trim().strip_prefix("FINDING ") else {
             continue;
         };
-        match parse_finding(rest.trim()) {
+        match parse_finding(rest.trim(), &path_rule) {
             Some(f) => out.push(f),
             None => malformed += 1,
         }
@@ -511,7 +526,7 @@ pub fn parse_reply(text: &str) -> (Vec<RawFinding>, u32) {
     (out, malformed)
 }
 
-fn parse_finding(json: &str) -> Option<RawFinding> {
+fn parse_finding(json: &str, path_rule: &impl Fn(&str) -> Option<String>) -> Option<RawFinding> {
     let v: Value = serde_json::from_str(json).ok()?;
     let obj = v.as_object()?;
     let text = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
@@ -519,7 +534,7 @@ fn parse_finding(json: &str) -> Option<RawFinding> {
     if !matches!(severity.as_str(), "high" | "medium" | "low") {
         return None;
     }
-    let path = repo_relative(&text("path")?)?;
+    let path = path_rule(&text("path")?)?;
     let line = u32::try_from(obj.get("line")?.as_u64()?).ok()?;
     if line == 0 {
         return None;
