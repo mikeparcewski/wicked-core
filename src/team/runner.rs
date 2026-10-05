@@ -671,6 +671,7 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
                     ),
                 )),
             TeamBody::CouncilRuled(b) => entries.push((
+                at,
                 2,
                 format!(
                     "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
@@ -689,6 +690,7 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
                 ),
             )),
             TeamBody::ChangeRequested(b) => entries.push((
+                at,
                 3,
                 format!(
                 "- change requested {} by {}: steps [{}] — {}. Answer `PLAN {}: ACCEPT` and on the \
