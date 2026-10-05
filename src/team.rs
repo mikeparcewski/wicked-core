@@ -1047,8 +1047,9 @@ pub struct AttachCtx {
     /// The creator's seat instance (the `step.claimed` `by`) — never a monitor of its own step.
     pub creator: String,
     pub plan: TeamPlan,
-    /// `None` when the unit is unbound or its dispatch baseline was not taken: not monitored,
-    /// and said so.
+    /// `None` when the unit is unbound or its dispatch baseline was not taken. A BOUND unit with
+    /// no baseline is not monitored, and said so (`member.joined{status:"failed"}`, "no worktree
+    /// baseline"); an UNBOUND unit's members review its OUTPUT at the final pass (ASK-K3b).
     pub repo: Option<Repo>,
     /// (ASK-K3b) Whether the unit runs in a worktree at all (`step.claimed.repo` present). A
     /// BOUND unit whose baseline was not taken keeps today's refusal ("no worktree baseline");

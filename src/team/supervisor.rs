@@ -1817,10 +1817,13 @@ pub struct HelpJob {
     budget: Duration,
 }
 
-/// Run a help turn: the first admitted candidate answers on a fresh read-only session, and its
-/// answer is published as `help.answered` (S). No admitted member, or a failed turn: nothing is
-/// published — the question stays unanswered on the stream, and the PA was told only members
-/// answer (a human-directed question is S1 elicitation).
+/// Run one member turn for a `help.requested` row (DES-002 §8.8 Support) and publish its
+/// terminal outcome as `help.answered{outcome}` (ASK-K3b, DES-ASK-TEAM-CHAT-001 §4.5): `answered`
+/// with the member's text and evidence; `no_member` when no admitted member can take it (the PA
+/// was told only members answer — a human-directed question is S1 elicitation); `failed` when
+/// the member did not open, its turn failed, or it replied without an answer; `timed_out` when
+/// the turn ran past its budget. One row per help id, always: a consumer never infers an outcome
+/// from a missing row.
 pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
     // (ASK-K3a/K3b, DES-ASK-TEAM-CHAT-001 §4.5) Every terminal outcome of a help turn is a fact
     // on the row S owns — `help.answered{outcome}` — never an inference from a missing row: a
