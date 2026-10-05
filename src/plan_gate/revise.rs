@@ -21,8 +21,8 @@ use serde_json::json;
 
 use super::{
     approval, build, deliver_cmd, envelope, is_auto, per_run_def_id, plan_proposed, plan_refused,
-    refusal_text, wire_step, AcceptedPlan, PendingPlan, PlanEvent, QueuedFact, Scored,
-    TeamPlanState,
+    refusal_text, wire_step, AcceptedPlan, ApprovalReason, PendingPlan, PlanEvent, QueuedFact,
+    Scored, TeamPlanState,
 };
 use crate::domain::HumanConfirm;
 use crate::plan::{AddedBy, PlanStep, PlanSteps};
