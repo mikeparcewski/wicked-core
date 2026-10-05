@@ -1558,3 +1558,108 @@ fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders
         .block
         .is_none_or(|b| !b.output.contains("late answer")));
 }
+
+/// (codex review of #740 round 2) The team's answers are fitted by priority within the cap: the
+/// PA's own refusal renders even when eight long help answers would fill the block, and what did
+/// not fit is counted, never silently cut; findings get only the remaining room, and a finding
+/// that does not fit under a reduced cap is `rest` (no `advice.delivered` for cut text).
+#[test]
+fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
+    let rig = rig("k3ccap");
+    let run = "k3ccap";
+    let floor = start(&rig, run);
+    let claim = |ord: u32| {
+        publish(
+            &rig,
+            &fixture_with(tev::STEP_CLAIMED, 0, run, |p| {
+                p["ord"] = json!(ord);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#1");
+                p["step_id"] = json!(format!("answer-{ord}"));
+            }),
+        )
+    };
+    claim(1);
+    for n in 0..8u32 {
+        let asked = fixture_with(tev::HELP_REQUESTED, 0, run, |p| {
+            p["ord"] = json!(1);
+            p["attempt"] = json!(0);
+            p["by"] = json!("claude#1");
+            p["help_seq"] = json!(n + 1);
+            p["question"] = json!("q".repeat(500));
+        });
+        publish(&rig, &asked);
+        let help_id = asked.to_payload().unwrap()["help_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        publish(
+            &rig,
+            &fixture_with(tev::HELP_ANSWERED, 0, run, |p| {
+                p["ord"] = json!(1);
+                p["attempt"] = json!(0);
+                p["by"] = json!("claude#2");
+                p["help_id"] = json!(help_id);
+                p["answer_id"] = json!(format!("t-{n}"));
+                p["answer"] = json!("a".repeat(2000));
+            }),
+        );
+    }
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_PROPOSED, 0, run, |p| {
+            p["by"] = json!("claude#1");
+            p["proposal_id"] = json!("p-late");
+        }),
+    );
+    publish(
+        &rig,
+        &fixture_with(tev::PLAN_REFUSED, 0, run, |p| {
+            p["proposal_id"] = json!("p-late");
+            p["reason"] = json!("no repo bound");
+        }),
+    );
+    let c2 = claim(2);
+    let claimed = Claimed {
+        runner: runner(&rig),
+        run_id: run.into(),
+        ord: 2,
+        attempt: 0,
+        by: "claude#1".into(),
+        step_id: "answer-2".into(),
+        stream_floor: floor,
+        claimed_id: c2,
+        reviewing: None,
+        criterion: String::new(),
+    };
+    let text = boundary(&claimed).block.expect("a block").output;
+    assert!(text.len() <= crate::team::ADVICE_TEXT_CAP, "{}", text.len());
+    assert!(
+        text.contains("your plan proposal p-late was refused"),
+        "the refusal outranks the help answers"
+    );
+    assert!(
+        text.contains("more answers did not fit; see the stream"),
+        "the omitted answers are counted"
+    );
+    let f = Finding {
+        finding_id: String::new(),
+        monitor_id: "m1".into(),
+        seat: "claude#2".into(),
+        severity: Severity::High,
+        path: "src/x.rs".into(),
+        line: 1,
+        evidence: "x".into(),
+        claim: "c".repeat(400),
+        suggestion: None,
+        tree: "t".into(),
+        in_diff: true,
+        checkpoint_seq: 0,
+        anchor: String::new(),
+        carried_from_attempt: None,
+        target: Default::default(),
+    };
+    let (block, sent, rest) =
+        crate::team::advice_block_within(vec![crate::team::Advice { finding: f }], 100);
+    assert!(block.is_empty() && sent.is_empty() && rest.len() == 1);
+}

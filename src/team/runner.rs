@@ -502,7 +502,7 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
         .into_iter()
         .filter(|(k, f)| !injected.contains(&(*k, f.finding_id.clone())))
         .collect();
-    let answers = team_answers(&stream.rows, claimed);
+    let answers = team_answers(&stream.rows, claimed, super::ADVICE_TEXT_CAP);
     if pending.is_empty() && answers.is_empty() {
         return Boundary::default();
     }
@@ -512,7 +512,7 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
         .collect();
     // (ASK-K3c) The team's answers first: a help outcome or the PA's own refusal has no
     // `advice.delivered` row to bring it back if the cap cuts it, a finding does.
-    let mut text = cap_utf8(&answers, super::ADVICE_TEXT_CAP);
+    let mut text = answers;
     let (block, sent, _rest) = if advice.is_empty() {
         (String::new(), Vec::new(), Vec::new())
     } else {
@@ -574,7 +574,7 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
 /// The team's answers the PA has not been shown yet (§8.9): `help.answered`, `council.ruled` and
 /// `change.requested` rows of the run with no later `step.claimed` by this attempt's seat (other
 /// than its own claim) — a claim after the row means that step's boundary read it.
-fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
+fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // (ASK-K3c, codex review of #740) The window this boundary owns: the rows between this seat's
     // PREVIOUS claim and its own. A row before the window was this seat's earlier boundary's to
     // render; one after it (landed between this claim and this read) is the next boundary's. So
@@ -609,7 +609,10 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
             _ => None,
         })
         .collect();
-    let mut out = String::new();
+    // Rows are rendered by priority within `cap` — the PA's own refusals first (small and
+    // decisive), then help, councils, change requests — each whole or not at all, and what did
+    // not fit is counted in a closing line, never silently cut (codex review of #740 round 2).
+    let mut entries: Vec<(u8, String)> = Vec::new();
     for r in rows {
         if later_claim(r.event_id) {
             continue;
@@ -647,33 +650,41 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
                             .unwrap_or_default()
                     ),
                 };
-                out.push_str(&format!(
-                    "- help {} — you asked: {}\n  {}\n",
-                    b.help_id, asked, reply
+                entries.push((
+                    1,
+                    format!("- help {} — you asked: {}\n  {}\n", b.help_id, asked, reply),
                 ));
             }
-            TeamBody::PlanRefused(b) if own_proposals.contains(b.proposal_id.as_str()) => out
-                .push_str(&format!(
-                    "- your plan proposal {} was refused: {}\n",
-                    b.proposal_id,
-                    cap_utf8(&b.reason, 512)
+            TeamBody::PlanRefused(b) if own_proposals.contains(b.proposal_id.as_str()) => entries
+                .push((
+                    0,
+                    format!(
+                        "- your plan proposal {} was refused: {}\n",
+                        b.proposal_id,
+                        cap_utf8(&b.reason, 512)
+                    ),
                 )),
-            TeamBody::CouncilRuled(b) => out.push_str(&format!(
-                "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
-                b.subject,
-                r.event.env.ord.unwrap_or_default(),
-                r.event.env.attempt.unwrap_or_default(),
-                token(&b.verdict).to_ascii_uppercase(),
-                b.reason
-                    .map(|x| format!(" ({})", token(&x)))
-                    .unwrap_or_default(),
-                if b.dissent.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — dissent: {}", cap_utf8(&b.dissent.join(" | "), 512))
-                }
+            TeamBody::CouncilRuled(b) => entries.push((
+                2,
+                format!(
+                    "- council ruling on {} (unit {}, attempt {}): {}{}{}\n",
+                    b.subject,
+                    r.event.env.ord.unwrap_or_default(),
+                    r.event.env.attempt.unwrap_or_default(),
+                    token(&b.verdict).to_ascii_uppercase(),
+                    b.reason
+                        .map(|x| format!(" ({})", token(&x)))
+                        .unwrap_or_default(),
+                    if b.dissent.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — dissent: {}", cap_utf8(&b.dissent.join(" | "), 512))
+                    }
+                ),
             )),
-            TeamBody::ChangeRequested(b) => out.push_str(&format!(
+            TeamBody::ChangeRequested(b) => entries.push((
+                3,
+                format!(
                 "- change requested {} by {}: steps [{}] — {}. Answer `PLAN {}: ACCEPT` and on the \
                  next line the steps you accept as `PLAN+ {{\"steps\":[{{\"catalog\":\"…\"}}]}}`, \
                  or `PLAN {}: DECLINE — <why>`.\n",
@@ -687,14 +698,41 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed) -> String {
                 cap_utf8(&b.reason, 512),
                 b.change_id,
                 b.change_id
+            ),
             )),
             _ => {}
         }
     }
-    if out.is_empty() {
-        return out;
+    if entries.is_empty() {
+        return String::new();
     }
-    format!("\n[team answers · ADVISORY: the team's replies since your last step]\n{out}")
+    const HEADER: &str = "\n[team answers · ADVISORY: the team's replies since your last step]\n";
+    let total = entries.len();
+    let mut ordered: Vec<(usize, u8, String)> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (p, l))| (i, p, l))
+        .collect();
+    ordered.sort_by_key(|(i, p, _)| (*p, *i));
+    // Room for the closing count line on every path.
+    let reserve = "- (+NNNN more answers did not fit; see the stream)\n".len();
+    let budget = cap.saturating_sub(HEADER.len() + reserve);
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (_, _, line) in ordered {
+        if out.len() + line.len() > budget {
+            continue;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < total {
+        out.push_str(&format!(
+            "- (+{} more answers did not fit; see the stream)\n",
+            total - shown
+        ));
+    }
+    format!("{HEADER}{out}")
 }
 
 fn completion(status: StepStatus) -> StepCompletion {
