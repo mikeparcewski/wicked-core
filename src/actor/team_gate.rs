@@ -3455,6 +3455,12 @@ pub(super) fn revise_units(
                 k.denial_reason = o.denial_reason.clone();
                 k.denial = o.denial.clone();
                 k.phase_status = o.phase_status.clone();
+                // Execution provenance the pipeline writes after a unit ran (its phase, claim
+                // and collection links; the seats it excluded) — codex review of #738 round 6.
+                k.phase_ref = o.phase_ref.clone();
+                k.conformance_ref = o.conformance_ref.clone();
+                k.collection_scope = o.collection_scope.clone();
+                k.exclude_seats = o.exclude_seats.clone();
                 k.capture_report = o.capture_report;
                 k.worker_failed_clis = o.worker_failed_clis.clone();
                 k.team_run = o.team_run;
