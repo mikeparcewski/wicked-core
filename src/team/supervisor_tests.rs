@@ -2189,8 +2189,11 @@ fn a_bound_unit_without_a_baseline_keeps_the_no_baseline_refusal() {
         p["at"] = json!(crate::interaction::now_millis());
         p["step_id"] = json!("answer-1");
         p["criterion"] = json!("the handler cancels stale fetches");
+        // The producer's shape when the dispatch snapshot failed: the workdir is named and the
+        // `git_dir` (which comes from the baseline) is EMPTY (runner.rs `claim`).
         p["baseline_tree"] = Value::Null;
-        p["repo"] = json!({"workdir": wd, "git_dir": gd});
+        p["repo"] = json!({"workdir": wd, "git_dir": ""});
+        let _ = &gd;
     }));
     h.complete_with_output(3, 1, "claude#1", "answer-1", ANSWER);
     h.pump();
@@ -2241,9 +2244,21 @@ fn a_capped_answer_discloses_its_truncation() {
     h.pump();
     let prompts = h.host.prompts_matching("review the worker's ANSWER");
     assert_eq!(prompts.len(), 1);
+    // Cut at the last line boundary within 64 bytes: the first line only, so no fragment of the
+    // second line is confirmable.
+    let first_line = ANSWER.split_inclusive('\n').next().unwrap();
     assert!(
-        prompts[0].contains(&format!("shown truncated at 64 of {} bytes", ANSWER.len())),
+        prompts[0].contains(&format!(
+            "shown truncated at {} of {} bytes",
+            first_line.len(),
+            ANSWER.len()
+        )),
         "{}",
+        prompts[0]
+    );
+    assert!(
+        !prompts[0].contains("It never cancels a stale"),
+        "no partial second line is shown: {}",
         prompts[0]
     );
     assert!(
@@ -2251,4 +2266,47 @@ fn a_capped_answer_discloses_its_truncation() {
         "a line past the cap is unconfirmed"
     );
     assert_eq!(h.folded(3, 1).rejected.unconfirmed, 1);
+}
+
+/// (codex review of #739 round 2) An output finding and a tree finding with the same `path`
+/// text, anchor and evidence are two findings: the output id lives in its own namespace, so a
+/// carried output MEDIUM can never swallow a confirmed tree HIGH as a corroboration.
+#[test]
+fn an_output_finding_never_shares_an_identity_with_a_tree_finding() {
+    let mut book = super::super::FindingBook::default();
+    let base = Finding {
+        finding_id: String::new(),
+        monitor_id: "m1".into(),
+        seat: "claude#2".into(),
+        severity: Severity::Medium,
+        path: "answer".into(),
+        line: 1,
+        evidence: "42".into(),
+        claim: "on the answer".into(),
+        suggestion: None,
+        tree: String::new(),
+        in_diff: false,
+        checkpoint_seq: 0,
+        anchor: String::new(),
+        carried_from_attempt: None,
+        target: tev::FindingTarget::Output,
+    };
+    let tree = Finding {
+        severity: Severity::High,
+        in_diff: true,
+        target: tev::FindingTarget::Tree,
+        monitor_id: "m2".into(),
+        seat: "codex#1".into(),
+        ..base.clone()
+    };
+    assert!(matches!(book.admit(base), super::super::Admit::New(..)));
+    assert!(
+        matches!(book.admit(tree), super::super::Admit::New(..)),
+        "a tree finding on a file named like the step is its own finding"
+    );
+    assert_eq!(book.findings.len(), 2);
+    assert_ne!(
+        book.findings[0].finding.finding_id,
+        book.findings[1].finding.finding_id
+    );
 }
