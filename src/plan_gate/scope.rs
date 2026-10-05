@@ -282,8 +282,9 @@ pub(crate) fn parse_answer(lines: &str, unbound: bool) -> Result<Declared, Strin
     })
 }
 
-/// The fail-closed score of a missing or malformed answer.
-fn no_scope(detail: &str) -> Scored {
+/// The fail-closed score of a missing or malformed answer (and, ASK-K2b, of a first-creator
+/// `PLAN+` that declared no touch).
+pub(super) fn no_scope(detail: &str) -> Scored {
     let t = &THRESHOLDS;
     Scored {
         assessment: Assessment {

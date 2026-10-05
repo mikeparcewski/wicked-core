@@ -765,3 +765,216 @@ fn a_creator_less_accepted_plan_has_an_empty_floor_at_any_recorded_band() {
         assert!(!filled.high_risk, "never high risk without a creator step");
     }
 }
+
+// ── codex review of #738: the gate's answers over a held first-creator proposal ────────────────
+
+/// The held first-creator proposal of `accepted(answer-1)`: `build` with a declared touch, scored
+/// 100 (no graph), pending with reason `first_creator`.
+fn held_first_creator(hc: &HumanConfirm) -> TeamPlanState {
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, hc);
+    let change = pa_block(
+        r#"[{"catalog":"build","id":"build"}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope {
+            repo_root: Some(std::env::temp_dir()),
+            base_commit: None,
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Held { .. }));
+    assert_eq!(r.state.pending.as_ref().unwrap().reason, "first_creator");
+    r.state
+}
+
+/// `Outcome` carries a composed def (no `Debug`): name it for an assertion message.
+fn describe(o: &Outcome) -> String {
+    match o {
+        Outcome::Accepted { .. } => "accepted".into(),
+        Outcome::Held { .. } => "held".into(),
+        Outcome::Refused { reason } => format!("refused: {reason}"),
+    }
+}
+
+fn gate_edit(steps: Value) -> Change {
+    Change::Steps {
+        by: "human".into(),
+        source: ProposalSource::Gate {
+            gate_id: "g-1".into(),
+        },
+        kind: ProposalKind::Edit,
+        reason: None,
+        steps: plan(json!({ "steps": steps })).steps,
+        touch: None,
+        scoring: None,
+    }
+}
+
+/// (§4.7 "Not now" = approve-with-amend whose steps are the ACCEPTED rev's; codex #738 finding 1)
+/// At the first-creator gate a human edit naming only the accepted steps declines the proposal's
+/// additions: the next rev is accepted by the human with the same steps, no creator, an empty
+/// floor, the launch's touch and source — the proposal's touch never lands — and nothing is
+/// re-scored; the pending plan is gone. It is not refused as "adds no step".
+#[test]
+fn a_not_now_edit_at_the_first_creator_gate_keeps_the_accepted_rev() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([{"catalog":"understand","id":"answer-1"}])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let a = r.state.accepted.as_ref().unwrap();
+    assert_eq!(a.by, "human");
+    assert_eq!(
+        a.steps
+            .steps
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        ["answer-1"],
+        "the accepted rev's steps alone: no creator, so no floor phase"
+    );
+    assert!(!a.steps.has_creator());
+    assert_eq!(
+        a.touch,
+        ["src/x.rs"],
+        "the launch's touch; the proposal's never landed"
+    );
+    assert_eq!(a.touch_source, Some(TouchSource::User));
+    assert!(
+        r.state.pending.is_none(),
+        "the proposal is declined, not held"
+    );
+    assert_eq!(
+        r.state.max_score, 100,
+        "the ratchet keeps the record (§8.5)"
+    );
+    assert!(body(&r, |b| matches!(b, TeamBody::PathScored(_)).then_some(())).is_empty());
+    assert!(body(&r, |b| matches!(b, TeamBody::PlanRefused(_)).then_some(())).is_empty());
+}
+
+/// (T2 §8.6 approve-with-amend) A human edit at the same gate that keeps the proposal's creator
+/// step (and adds a step of its own) accepts the work: the creator survives, the floor fills at
+/// the recorded band, and the touch the PA declared rides the accepted rev as `pa_scope`.
+#[test]
+fn an_amended_approval_at_the_first_creator_gate_keeps_the_creator_and_its_touch() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build","id":"build"},
+            {"catalog":"produce","id":"docs"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let a = r.state.accepted.as_ref().unwrap();
+    assert!(a.steps.has_creator());
+    let ids: Vec<&str> = a.steps.steps.iter().map(|s| s.id.as_str()).collect();
+    assert!(ids.contains(&"build") && ids.contains(&"docs"), "{ids:?}");
+    assert!(ids.contains(&"review"), "the band's floor fills: {ids:?}");
+    assert_eq!(a.touch_source, Some(TouchSource::PaScope));
+    assert_eq!(a.touch, ["src/x.rs", "src/retire.ts"]);
+    assert!(r.state.pending.is_none());
+}
+
+/// (codex #738 finding 3) A creator step that restates an ACCEPTED step's id adds nothing, so
+/// it does not cross into work: the change is a read-only addition — no touch on the proposal,
+/// no score, no gate, the ratchet untouched.
+#[test]
+fn a_creator_step_restating_an_accepted_id_does_not_cross_into_work() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let change = pa_block(
+        r#"[{"catalog":"build","id":"answer-1"},{"catalog":"understand","id":"answer-2"}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope::default()),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Accepted { .. }));
+    let proposed = body(&r, |b| match b {
+        TeamBody::PlanProposed(p) => Some(p.clone()),
+        _ => None,
+    });
+    assert!(proposed[0].touch.is_empty(), "nothing crossed into work");
+    assert!(body(&r, |b| matches!(b, TeamBody::PathScored(_)).then_some(())).is_empty());
+    assert_eq!(r.state.max_score, 0);
+    let a = r.state.accepted.as_ref().unwrap();
+    assert!(
+        !a.steps.has_creator(),
+        "the restated id stays the understand step"
+    );
+    assert_eq!(a.touch_source, Some(TouchSource::User));
+}
+
+/// (codex #738 finding 4) A first-creator change that declares no touch fails closed with X1's
+/// own words: score 100, reasons led by "the PA declared no scope".
+#[test]
+fn a_first_creator_change_with_no_touch_fails_closed_with_the_pa_declared_no_scope_reason() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let change = pa_block(
+        r#"[{"catalog":"build","id":"build"}]"#,
+        None,
+        Some(ScoreScope {
+            repo_root: Some(std::env::temp_dir()),
+            base_commit: Some("abc".into()),
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(matches!(r.outcome, Outcome::Held { .. }));
+    let scored = body(&r, |b| match b {
+        TeamBody::PathScored(p) => Some(p.clone()),
+        _ => None,
+    });
+    assert_eq!(scored.len(), 1);
+    assert_eq!(scored[0].score, 100);
+    assert_eq!(
+        scored[0].reasons.first().map(String::as_str),
+        Some(crate::plan_gate::scope::PA_DECLARED_NO_SCOPE)
+    );
+}
+
+/// (codex #738 finding 2) The first-creator row fires under its OWN reason in every mode: manual
+/// mode does not relabel it `manual_mode`.
+#[test]
+fn the_first_creator_row_keeps_its_reason_in_manual_mode() {
+    use crate::plan_gate::{approval, ApprovalReason, PlanEvent};
+    let into_work = PlanEvent::Revision {
+        previous_high_risk: false,
+        approved_high_risk: false,
+        first_creator: true,
+    };
+    assert_eq!(
+        approval(false, false, false, into_work),
+        Ok(Some(ApprovalReason::FirstCreator))
+    );
+    assert_eq!(
+        approval(true, true, false, into_work),
+        Ok(Some(ApprovalReason::FirstCreator))
+    );
+    let hc = HumanConfirm::Before(99);
+    let held = held_first_creator(&hc);
+    assert_eq!(held.pending.as_ref().unwrap().reason, "first_creator");
+}

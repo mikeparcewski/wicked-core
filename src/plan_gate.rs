@@ -626,19 +626,23 @@ pub(crate) fn approval(
             Ok(Some(ApprovalReason::Override))
         };
     }
+    // (rev 15) Crossing into work is the row symmetric to crossing into high risk: approval in
+    // EVERY mode under its own reason (manual mode included — the row, not the mode, is why the
+    // gate opened; codex review of #738), and the more specific reason when the high-risk row
+    // fires too — the gate payload still says `high_risk: true`. "Chat first": work never starts
+    // from a conversation on the engine's say-so.
+    if let PlanEvent::Revision {
+        first_creator: true,
+        ..
+    } = event
+    {
+        return Ok(Some(ApprovalReason::FirstCreator));
+    }
     if !auto {
         return Ok(Some(ApprovalReason::ManualMode));
     }
     Ok(match event {
         PlanEvent::Initial => high_risk.then_some(ApprovalReason::HighRisk),
-        // (rev 15) Crossing into work is the row symmetric to crossing into high risk: approval
-        // in every mode, and the more specific reason when both rows fire — the gate payload
-        // still says `high_risk: true`. "Chat first": work never starts from a conversation on
-        // the engine's say-so.
-        PlanEvent::Revision {
-            first_creator: true,
-            ..
-        } => Some(ApprovalReason::FirstCreator),
         PlanEvent::Revision {
             previous_high_risk,
             approved_high_risk,

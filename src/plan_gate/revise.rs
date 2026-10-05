@@ -287,19 +287,74 @@ pub(crate) fn revise(
 ) -> anyhow::Result<Revised> {
     let auto = is_auto(human_confirm);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
-    let base = match (&prior.pending, &prior.accepted) {
-        (Some(p), _) => p.steps.clone(),
-        (None, Some(a)) => a.steps.clone(),
-        (None, None) => anyhow::bail!("run {run_id} has no accepted plan to revise"),
-    };
+    let catalog = crate::catalog::catalog();
+    // (rev 15, ASK-K2b; codex review of #738) A human's answer at a gate over a HELD proposal is
+    // the human's whole plan: it starts from the ACCEPTED rev, keeps the proposal's additions it
+    // names and adds what it adds — an addition it leaves out is declined. "The plan only grows"
+    // protects accepted steps; a held proposal was never accepted. So "Not now" (the accepted
+    // steps alone) re-accepts the creator-less rev with its empty floor, and "approve with an
+    // amendment" keeps the proposal's creator step and, with it, the touch the PA declared.
+    let human_gate_edit = matches!(
+        &change,
+        Change::Steps {
+            reason: None,
+            source: ProposalSource::Gate { .. },
+            ..
+        }
+    );
     // (TR-W1a) A revision's plan keeps its base's declared touch (a change adds steps only), so
-    // its touch source is the base's.
-    let base_touch_source = match (&prior.pending, &prior.accepted) {
-        (Some(p), _) => p.touch_source.unwrap_or(TouchSource::User),
-        // A pre-W1a accepted row recorded no source: its declared touch reads as `user`, the
-        // same fallback `with_touch` and gate approval use (Copilot review on #693).
-        (None, Some(a)) => a.touch_source.unwrap_or(TouchSource::User),
-        (None, None) => TouchSource::None,
+    // its touch source is the base's. A pre-W1a accepted row recorded no source: its declared
+    // touch reads as `user`, the same fallback `with_touch` and gate approval use (Copilot review
+    // on #693).
+    let (base, base_touch_source, dropped) = match (&prior.pending, &prior.accepted) {
+        (Some(p), Some(a)) if human_gate_edit => {
+            let named: Vec<&str> = match &change {
+                Change::Steps { steps, .. } => steps.iter().map(|s| s.id.as_str()).collect(),
+                Change::Floor(_) => Vec::new(),
+            };
+            let kept: Vec<PlanStep> = p
+                .steps
+                .steps
+                .iter()
+                .filter(|s| {
+                    a.steps.steps.iter().any(|b| b.id == s.id) || named.contains(&s.id.as_str())
+                })
+                .cloned()
+                .collect();
+            let dropped = p.steps.steps.len() - kept.len();
+            let kept = PlanSteps {
+                steps: kept,
+                touch: None,
+                floor_override: a.steps.floor_override.clone(),
+                monitors: a.steps.monitors.clone(),
+            };
+            // The proposal's declared touch rides only with the creator step it scoped.
+            let keeps_first_creator =
+                !a.steps.has_creator_in(catalog) && kept.has_creator_in(catalog);
+            let (touch, source) = if keeps_first_creator {
+                (
+                    p.steps.touch.clone(),
+                    p.touch_source.unwrap_or(TouchSource::User),
+                )
+            } else {
+                (
+                    a.steps.touch.clone(),
+                    a.touch_source.unwrap_or(TouchSource::User),
+                )
+            };
+            (PlanSteps { touch, ..kept }, source, dropped)
+        }
+        (Some(p), _) => (
+            p.steps.clone(),
+            p.touch_source.unwrap_or(TouchSource::User),
+            0,
+        ),
+        (None, Some(a)) => (
+            a.steps.clone(),
+            a.touch_source.unwrap_or(TouchSource::User),
+            0,
+        ),
+        (None, None) => anyhow::bail!("run {run_id} has no accepted plan to revise"),
     };
     let mut events = Vec::new();
     let mut obligations = prior.obligations.clone();
@@ -335,7 +390,19 @@ pub(crate) fn revise(
             } => {
                 let pid = ev::mint_proposal_id(run_id, &by, &source);
                 let human = reason.is_none();
-                let catalog = crate::catalog::catalog();
+                // The steps that will actually be added: a step already in the plan — by its id,
+                // or, for a step that names no id, by its catalog entry — adds nothing (the merge
+                // below skips it), so it is classified and scored as nothing (codex review of
+                // #738: a creator step restating an accepted id must not cross into work).
+                let present = |s: &PlanStep| {
+                    if s.id.is_empty() {
+                        base.steps.iter().any(|b| b.catalog == s.catalog)
+                    } else {
+                        base.steps.iter().any(|b| b.id == s.id)
+                    }
+                };
+                let surviving: Vec<PlanStep> =
+                    steps.iter().filter(|s| !present(s)).cloned().collect();
                 // (rev 15, ASK-K2b) A PA change that adds the path's FIRST creator step crosses into
                 // work: it may declare what the work touches, and that touch is scored as an intent
                 // score (X1's scorer and fail-closed rule: no touch, no repo or no graph ⇒ 100, "the
@@ -343,7 +410,7 @@ pub(crate) fn revise(
                 let crosses_into_work = !human
                     && kind == ProposalKind::Change
                     && !base.has_creator_in(catalog)
-                    && steps
+                    && surviving
                         .iter()
                         .any(|s| crate::plan::is_creator_step(catalog, s));
                 let pa_touch = if crosses_into_work {
@@ -364,18 +431,23 @@ pub(crate) fn revise(
                 let (score, destructive) = if crosses_into_work {
                     let scope = scoring.unwrap_or_default();
                     let mut for_score = base.clone();
-                    for_score.steps.extend(steps.iter().cloned());
+                    for_score.steps.extend(surviving.iter().cloned());
                     for_score.touch = pa_touch.clone();
-                    let scored = super::intent_score_for_run(
-                        &for_score,
-                        scope.repo_root.as_deref(),
-                        scope.base_commit.as_deref(),
-                    );
+                    // X1's fail-closed rule, with X1's reason (codex review of #738).
+                    let scored = if pa_touch.is_none() {
+                        super::scope::no_scope("the PLAN+ block declared no touch")
+                    } else {
+                        super::intent_score_for_run(
+                            &for_score,
+                            scope.repo_root.as_deref(),
+                            scope.base_commit.as_deref(),
+                        )
+                    };
                     events.push(super::path_scored(run_id, &pid, &scored.assessment, now)?);
                     // (§4.7 F11) A step that executes code needs a worktree: refused on a repo-less
                     // path, on the record, before anything is planned.
                     if scope.repo_root.is_none()
-                        && steps.iter().any(|s| {
+                        && surviving.iter().any(|s| {
                             catalog
                                 .iter()
                                 .find(|e| e.id == s.catalog)
@@ -478,7 +550,9 @@ pub(crate) fn revise(
         floor_override: base.floor_override.clone(),
         monitors: base.monitors.clone(),
     });
-    if proposal_id.is_some() && merged.steps.len() == base.steps.len() {
+    // A human's answer that declines a held proposal's additions changes the plan by dropping
+    // them: that is not "adds no step".
+    if proposal_id.is_some() && merged.steps.len() == base.steps.len() && dropped == 0 {
         return refuse(events, "the proposal adds no step".to_string());
     }
     let deliver = deliver_cmd(prior.deliver_step.as_ref());
