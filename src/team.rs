@@ -900,7 +900,20 @@ impl FindingBook {
     /// `anchor` and `evidence` (whatever the caller put there is replaced), so dedup and the id
     /// agree by construction.
     pub fn admit(&mut self, mut finding: Finding) -> Admit {
-        let id = finding_id_anchored(&finding.path, &finding.anchor, &finding.evidence);
+        // (ASK-K3b) An output finding's `path` is a step id: it is minted in its own namespace so
+        // it can never share an identity with a tree finding on a file of that name (codex review
+        // of #739 round 2: a collision would fold a confirmed tree HIGH into a carried output
+        // MEDIUM and let the answer's re-confirmation supersede it).
+        let id = match finding.target {
+            events::FindingTarget::Output => finding_id_anchored(
+                &format!("output:{}", finding.path),
+                &finding.anchor,
+                &finding.evidence,
+            ),
+            events::FindingTarget::Tree => {
+                finding_id_anchored(&finding.path, &finding.anchor, &finding.evidence)
+            }
+        };
         if let Some(&i) = self.index.get(&id) {
             let f = &mut self.findings[i];
             // The same monitor raising it again — as its author or as a corroborator — is a

@@ -1139,9 +1139,19 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
     )
 }
 
-/// The answer text as the member sees it (and is confirmed against): capped at `cap` bytes.
+/// The answer text as the member sees it (and is confirmed against): capped at `cap` bytes, cut
+/// at the last LINE boundary within the cap — a partial trailing line is not shown, so no
+/// fragment that equals no complete line of the answer can ever be confirmed as evidence (codex
+/// review of #739 round 2). A single over-long line shows nothing confirmable.
 fn shown_output(text: &str, cap: usize) -> String {
-    cap_utf8(text, cap)
+    let capped = cap_utf8(text, cap);
+    if capped.len() == text.len() {
+        return capped;
+    }
+    match capped.rfind('\n') {
+        Some(i) => capped[..=i].to_string(),
+        None => String::new(),
+    }
 }
 
 // ── The run's stream, as the supervisor keeps it ────────────────────────────────────────────────
@@ -1570,7 +1580,10 @@ impl SupervisorCore {
             creator: env.by.clone(),
             plan: st.plan(),
             repo,
-            bound: b.repo.as_ref().is_some_and(|r| !r.git_dir.is_empty()),
+            // A `repo` record of any shape means a worktree: when the dispatch snapshot failed
+            // the runner still names the workdir, with an EMPTY `git_dir` (codex review of #739
+            // round 2) — bound, baseline missing, refused below as today.
+            bound: b.repo.is_some(),
             baseline_tree: b.baseline_tree.clone(),
             criterion: b.criterion.clone(),
             phase: b.phase.clone(),
