@@ -3404,6 +3404,17 @@ pub(super) fn revise_units(
             .find(|o| o.ord == ord)
             .and_then(|o| o.last_attempt)
     };
+    // (ASK-K2b; codex review of #738) A revision accepted at a gate may DROP steps a held
+    // proposal had added — never one that ran: their units leave the store, as the launch-gate
+    // edit's do (`replan_for_accepted_edit`). A "Not now" over a first-creator proposal
+    // otherwise left the creator and its floor units stored and dispatchable.
+    let in_plan: std::collections::HashSet<&str> = planned.iter().map(|u| u.id.as_str()).collect();
+    for u in old[cursor..]
+        .iter()
+        .filter(|u| !in_plan.contains(u.id.as_str()))
+    {
+        store.remove_file(&u.to_node().location.file)?;
+    }
     let mut kept = Vec::new();
     let mut fresh = Vec::new();
     let mut fresh_dists = Vec::new();

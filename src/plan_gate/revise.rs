@@ -271,6 +271,28 @@ pub(crate) fn running_order(logical: &PlanSteps, done: &[String]) -> Result<Plan
     })
 }
 
+/// The steps of `steps` the merge will actually add to `base`: a step already in the plan — by
+/// its id, or, for a step that names no id, by its catalog entry — adds nothing, and a later step
+/// of the same block that restates an earlier one adds nothing twice. Classification, scoring and
+/// the merge all read this one list (codex review of #738, rounds 1–2).
+fn additions_of(base: &PlanSteps, steps: &[PlanStep]) -> Vec<PlanStep> {
+    let mut out: Vec<PlanStep> = Vec::new();
+    for s in steps {
+        let same = |b: &PlanStep| {
+            if s.id.is_empty() {
+                b.catalog == s.catalog
+            } else {
+                b.id == s.id
+            }
+        };
+        if base.steps.iter().any(same) || out.iter().any(same) {
+            continue;
+        }
+        out.push(s.clone());
+    }
+    out
+}
+
 /// Revise the run's plan (§8.7): merge the change's steps into the working plan (a plan already
 /// held at this boundary, else the accepted one), floor-fill at the ratcheted score, compose it in
 /// running order, and run the approval matrix (§8.6) as a revision. Pure: the caller persists the
@@ -288,10 +310,12 @@ pub(crate) fn revise(
     let auto = is_auto(human_confirm);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
     let catalog = crate::catalog::catalog();
-    // (rev 15, ASK-K2b; codex review of #738) A human's answer at a gate over a HELD proposal is
-    // the human's whole plan: it starts from the ACCEPTED rev, keeps the proposal's additions it
-    // names and adds what it adds — an addition it leaves out is declined. "The plan only grows"
-    // protects accepted steps; a held proposal was never accepted. So "Not now" (the accepted
+    // (rev 15, ASK-K2b; codex review of #738) A human's answer at a gate over a HELD proposal
+    // comes in two spellings (T2 §8.6 approve-with-amend): steps to ADD (T4 (d): the human's own
+    // step lands beside the proposal's), or the human's WHOLE plan — an edit that restates every
+    // accepted step. A whole plan starts from the ACCEPTED rev, keeps the proposal's additions it
+    // names and adds what it adds; an addition it leaves out is declined ("the plan only grows"
+    // protects accepted steps; a held proposal was never accepted). So "Not now" (the accepted
     // steps alone) re-accepts the creator-less rev with its empty floor, and "approve with an
     // amendment" keeps the proposal's creator step and, with it, the touch the PA declared.
     let human_gate_edit = matches!(
@@ -308,16 +332,28 @@ pub(crate) fn revise(
     // on #693).
     let (base, base_touch_source, dropped) = match (&prior.pending, &prior.accepted) {
         (Some(p), Some(a)) if human_gate_edit => {
-            let named: Vec<&str> = match &change {
-                Change::Steps { steps, .. } => steps.iter().map(|s| s.id.as_str()).collect(),
-                Change::Floor(_) => Vec::new(),
+            let amendment: &[PlanStep] = match &change {
+                Change::Steps { steps, .. } => steps,
+                Change::Floor(_) => &[],
             };
+            // The amendment names a held step by its id, or — a step that names no id, the
+            // supported spelling — by its catalog entry (codex #738 round 2).
+            let names = |s: &PlanStep| {
+                amendment.iter().any(|n| {
+                    if n.id.is_empty() {
+                        n.catalog == s.catalog
+                    } else {
+                        n.id == s.id
+                    }
+                })
+            };
+            let restates_accepted = a.steps.steps.iter().all(names);
             let kept: Vec<PlanStep> = p
                 .steps
                 .steps
                 .iter()
                 .filter(|s| {
-                    a.steps.steps.iter().any(|b| b.id == s.id) || named.contains(&s.id.as_str())
+                    a.steps.steps.iter().any(|b| b.id == s.id) || !restates_accepted || names(s)
                 })
                 .cloned()
                 .collect();
@@ -390,19 +426,10 @@ pub(crate) fn revise(
             } => {
                 let pid = ev::mint_proposal_id(run_id, &by, &source);
                 let human = reason.is_none();
-                // The steps that will actually be added: a step already in the plan — by its id,
-                // or, for a step that names no id, by its catalog entry — adds nothing (the merge
-                // below skips it), so it is classified and scored as nothing (codex review of
-                // #738: a creator step restating an accepted id must not cross into work).
-                let present = |s: &PlanStep| {
-                    if s.id.is_empty() {
-                        base.steps.iter().any(|b| b.catalog == s.catalog)
-                    } else {
-                        base.steps.iter().any(|b| b.id == s.id)
-                    }
-                };
-                let surviving: Vec<PlanStep> =
-                    steps.iter().filter(|s| !present(s)).cloned().collect();
+                // The steps that will actually be added (the one predicate the merge below uses,
+                // codex review of #738): a creator step restating an accepted id, or a later step
+                // of the block restating an earlier one, adds nothing and must not cross into work.
+                let surviving = additions_of(&base, &steps);
                 // (rev 15, ASK-K2b) A PA change that adds the path's FIRST creator step crosses into
                 // work: it may declare what the work touches, and that touch is scored as an intent
                 // score (X1's scorer and fail-closed rule: no touch, no repo or no graph ⇒ 100, "the
@@ -523,18 +550,10 @@ pub(crate) fn revise(
             s
         })
         .collect();
-    for s in additions {
-        // The plan only grows: a step already in the plan is already there — by its id, or, for
-        // a step that names no id, by its catalog entry (a restated or retried proposal adds
-        // nothing twice; a deliberate second `review` names its own id).
-        let present = if s.id.is_empty() {
-            steps.iter().any(|b| b.catalog == s.catalog)
-        } else {
-            provenance.contains_key(&s.id)
-        };
-        if present {
-            continue;
-        }
+    // The plan only grows: a step already in the plan is already there — by its id, or, for a
+    // step that names no id, by its catalog entry (a restated or retried proposal adds nothing
+    // twice; a deliberate second `review` names its own id).
+    for s in additions_of(&base, &additions) {
         insert_by_catalog(&mut steps, s);
     }
     // (rev 15) The rev's own declared touch is the PA's when it scoped the first creator step;

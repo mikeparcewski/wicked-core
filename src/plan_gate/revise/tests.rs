@@ -978,3 +978,103 @@ fn the_first_creator_row_keeps_its_reason_in_manual_mode() {
     let held = held_first_creator(&hc);
     assert_eq!(held.pending.as_ref().unwrap().reason, "first_creator");
 }
+
+/// (codex #738 round 2, finding 2) The amendment may name the held creator step WITHOUT an id (the
+/// supported spelling): it is still the kept first creator, so the PA's touch rides the accepted
+/// rev as `pa_scope`.
+#[test]
+fn an_amendment_naming_the_creator_without_an_id_keeps_the_pas_touch() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([
+            {"catalog":"understand","id":"answer-1"},
+            {"catalog":"build"},
+            {"catalog":"produce","id":"docs"}
+        ])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let a = r.state.accepted.as_ref().unwrap();
+    let ids: Vec<&str> = a.steps.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids.iter().filter(|i| **i == "build").count(), 1, "{ids:?}");
+    assert_eq!(a.touch_source, Some(TouchSource::PaScope));
+    assert_eq!(a.touch, ["src/x.rs", "src/retire.ts"]);
+}
+
+/// (codex #738 round 2, finding 3) A later step of the same `PLAN+` block that restates an earlier
+/// one (no id, same catalog) adds nothing, so it does not cross into work either: an all
+/// read-only block stays read-only — no score, no gate, no refusal on a repo-less path.
+#[test]
+fn a_same_block_restatement_does_not_cross_into_work() {
+    let hc = HumanConfirm::None;
+    let s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    let change = pa_block(
+        r#"[{"catalog":"review","id":"check"},{"catalog":"review","executes_code":true}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope {
+            repo_root: None,
+            base_commit: None,
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    assert!(body(&r, |b| matches!(b, TeamBody::PathScored(_)).then_some(())).is_empty());
+    assert_eq!(r.state.max_score, 0);
+    let a = r.state.accepted.as_ref().unwrap();
+    assert_eq!(
+        a.steps
+            .steps
+            .iter()
+            .filter(|s| s.catalog == "review")
+            .count(),
+        1,
+        "the restatement is not added twice"
+    );
+    assert!(!a.steps.has_creator());
+}
+
+/// (T4 (d), kept) A human edit at a held gate that names NONE of the accepted steps is "steps to
+/// add": the proposal's held additions stay, and the human's step lands beside them.
+#[test]
+fn an_additive_gate_edit_keeps_the_held_proposal_and_adds_its_own_step() {
+    let hc = HumanConfirm::None;
+    let held = held_first_creator(&hc);
+    let r = revise(
+        "r",
+        &held,
+        gate_edit(json!([{"catalog":"produce","id":"docs"}])),
+        &["answer-1".into()],
+        &hc,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "{}",
+        describe(&r.outcome)
+    );
+    let a = r.state.accepted.as_ref().unwrap();
+    let ids: Vec<&str> = a.steps.steps.iter().map(|s| s.id.as_str()).collect();
+    assert!(ids.contains(&"build") && ids.contains(&"docs"), "{ids:?}");
+    assert_eq!(
+        a.touch_source,
+        Some(TouchSource::PaScope),
+        "the kept creator keeps its touch"
+    );
+}
