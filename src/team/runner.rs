@@ -591,21 +591,25 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
     // what it packed. A claim with no `step.completed` of its own (the process died between the
     // claim and the boundary, or the attempt was redriven) presented nothing, so its rows stay
     // in the next window (codex review of #740 round 4). The current claim always cuts.
-    let completed = |ord: Option<u32>, attempt: Option<u32>| {
-        rows.iter().any(|r| {
-            matches!(r.event.body, TeamBody::StepCompleted(_))
-                && r.event.env.by == claimed.by
-                && r.event.env.ord == ord
-                && r.event.env.attempt == attempt
+    // Known limit (round 5, disclosed, not fixed): completion is the only stateless evidence of
+    // presentation the stream carries — the design publishes no delivery row for answers (N2) —
+    // so an attempt whose boundary could not read the stream (it was told "advice unavailable")
+    // or a repo-checks rerun that skipped the seat turn counts as presented. Both are the
+    // channel's existing disclosure modes; a delivery row for answers would be a new fact.
+    let completed: BTreeSet<(Option<u32>, Option<u32>)> = rows
+        .iter()
+        .filter(|r| {
+            matches!(r.event.body, TeamBody::StepCompleted(_)) && r.event.env.by == claimed.by
         })
-    };
+        .map(|r| (r.event.env.ord, r.event.env.attempt))
+        .collect();
     let mut seat_claims: Vec<i64> = rows
         .iter()
         .filter(|r| {
             r.event_id < claimed.claimed_id
                 && r.event.env.by == claimed.by
                 && matches!(r.event.body, TeamBody::StepClaimed(_))
-                && completed(r.event.env.ord, r.event.env.attempt)
+                && completed.contains(&(r.event.env.ord, r.event.env.attempt))
         })
         .map(|r| r.event_id)
         .collect();
@@ -742,8 +746,9 @@ fn team_answers(rows: &[TeamRow], claimed: &Claimed, cap: usize) -> String {
             if line.len() <= ANSWER_ENTRY_CAP {
                 (at, p, line)
             } else {
-                let mut cut = cap_utf8(&line, ANSWER_ENTRY_CAP - 24);
-                cut.push_str(" … (cut; see the stream)\n");
+                const SUFFIX: &str = " … (cut; see the stream)\n";
+                let mut cut = cap_utf8(&line, ANSWER_ENTRY_CAP - SUFFIX.len());
+                cut.push_str(SUFFIX);
                 (at, p, cut)
             }
         })
