@@ -563,6 +563,24 @@ fn repo_relative(path: &str) -> Option<String> {
 /// A file-level finding (`anchor == ""`) keeps the pre-anchor spelling, sha256(`path` ‖ `\n` ‖
 /// normalized `evidence`), so every id minted before T6 stays the same id: two findings in one
 /// file with different anchors still differ from each other and from the file-level one.
+/// (ASK-K3b) The one id rule for every target: a tree finding hashes its repo path; an output
+/// finding (DES-ASK-TEAM-CHAT-001 §4.6; `path` is a step id) hashes `output:<step id>`, so it can
+/// never share an identity with a tree finding on a file of that name. Every minting site — the
+/// book, the wire readers — goes through here (codex review of #739, rounds 2–3).
+pub fn finding_id_for(
+    target: events::FindingTarget,
+    path: &str,
+    anchor: &str,
+    evidence: &str,
+) -> String {
+    match target {
+        events::FindingTarget::Output => {
+            finding_id_anchored(&format!("output:{path}"), anchor, evidence)
+        }
+        events::FindingTarget::Tree => finding_id_anchored(path, anchor, evidence),
+    }
+}
+
 pub fn finding_id_anchored(path: &str, anchor: &str, evidence: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -904,16 +922,12 @@ impl FindingBook {
         // it can never share an identity with a tree finding on a file of that name (codex review
         // of #739 round 2: a collision would fold a confirmed tree HIGH into a carried output
         // MEDIUM and let the answer's re-confirmation supersede it).
-        let id = match finding.target {
-            events::FindingTarget::Output => finding_id_anchored(
-                &format!("output:{}", finding.path),
-                &finding.anchor,
-                &finding.evidence,
-            ),
-            events::FindingTarget::Tree => {
-                finding_id_anchored(&finding.path, &finding.anchor, &finding.evidence)
-            }
-        };
+        let id = finding_id_for(
+            finding.target,
+            &finding.path,
+            &finding.anchor,
+            &finding.evidence,
+        );
         if let Some(&i) = self.index.get(&id) {
             let f = &mut self.findings[i];
             // The same monitor raising it again — as its author or as a corroborator — is a
@@ -1201,7 +1215,7 @@ pub struct FindingWire {
 impl From<FindingWire> for Finding {
     fn from(w: FindingWire) -> Self {
         Finding {
-            finding_id: finding_id_anchored(&w.path, &w.anchor, &w.evidence),
+            finding_id: finding_id_for(w.target, &w.path, &w.anchor, &w.evidence),
             monitor_id: w.monitor_id,
             seat: w.seat,
             severity: w.severity,

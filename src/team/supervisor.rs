@@ -2204,7 +2204,10 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     tev::FindingTarget::Output => answer.clone(),
                     tev::FindingTarget::Tree => match (&repo, &t_final) {
                         (Some(r), Some(t)) => r.file(t, &f.finding.path),
-                        _ => None,
+                        // No settled tree to read (a bound unit whose baseline was not taken):
+                        // a carried tree finding is neither confirmed nor superseded — it stands,
+                        // unresolved, for the gate (codex review of #739 round 3).
+                        _ => continue,
                     },
                 };
                 let seq = u.book.raises[i];

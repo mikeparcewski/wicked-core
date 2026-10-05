@@ -2310,3 +2310,70 @@ fn an_output_finding_never_shares_an_identity_with_a_tree_finding() {
         book.findings[1].finding.finding_id
     );
 }
+
+/// (codex review of #739 round 3) A redrive on a BOUND unit whose baseline was not taken carries
+/// the dead attempt's unresolved tree HIGH; with an output on record the final pass still runs,
+/// but with no settled tree to read the carried tree finding is neither confirmed nor superseded —
+/// it stands for the gate (the ledger still pauses on it).
+#[test]
+fn a_carried_tree_high_is_not_superseded_when_the_settled_tree_is_unavailable() {
+    let mut h = Harness::new("carrynobase");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            Ok("DONE".into())
+        } else {
+            Ok(format!("{hit}\nDONE"))
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    // Attempt 1 raises a tree HIGH and dies unanswered.
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1, "{raised:#?}");
+    // Attempt 2: bound, baseline missing (the producer's empty git_dir shape), an answer on record.
+    let wd = h.fx.dir.to_string_lossy().into_owned();
+    h.publish(&fixture_with(tev::STEP_CLAIMED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(2);
+        p["by"] = json!("claude#1");
+        p["at"] = json!(crate::interaction::now_millis());
+        p["step_id"] = json!("build");
+        p["criterion"] = json!("the handler cancels stale fetches");
+        p["baseline_tree"] = Value::Null;
+        p["repo"] = json!({"workdir": wd, "git_dir": ""});
+    }));
+    h.pump();
+    h.complete_with_output(3, 2, "claude#1", "build", ANSWER);
+    h.pump();
+    let carried: Vec<&Value> = h
+        .rows(tev::FINDING_RAISED)
+        .iter()
+        .filter(|r| r["attempt"] == 2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .iter()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|v| Box::leak(Box::new(v.clone())) as &Value)
+        .collect();
+    assert_eq!(carried.len(), 1, "the HIGH is carried into attempt 2");
+    assert_eq!(carried[0]["carried_from_attempt"], 1);
+    let settled: Vec<Value> = h
+        .rows(tev::FINDING_SETTLED)
+        .into_iter()
+        .filter(|r| r["attempt"] == 2 && r["status"] == "superseded")
+        .collect();
+    assert!(
+        settled.is_empty(),
+        "no settled tree, so nothing is superseded: {settled:#?}"
+    );
+    let ledger = h.folded(3, 2);
+    assert!(
+        ledger.team_pause,
+        "the unresolved carried HIGH still pauses: {ledger:?}"
+    );
+}

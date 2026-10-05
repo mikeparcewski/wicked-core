@@ -1206,7 +1206,8 @@ impl From<FindingRaisedWire> for FindingRaised {
     fn from(w: FindingRaisedWire) -> Self {
         FindingRaised {
             raise_seq: w.raise_seq,
-            finding_id: super::finding_id_anchored(
+            finding_id: super::finding_id_for(
+                w.target,
                 &w.path,
                 w.anchor.as_deref().unwrap_or(""),
                 &w.evidence,
