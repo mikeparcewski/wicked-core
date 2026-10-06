@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core#743 — a rework attempt's governance record reaches the wire.** Dogfood run ada5b0aa
+  (crew 0.8.1 / core-ts 0.7.38): the creator's rework attempt — re-dispatched after a send-back
+  on the cached ACP session — showed 0 `governanceHookFired` against 115 on attempt 0 and no
+  `skillsSnapshotHanded`, while it edited 78 files. The hook HAD fired on every call (the gate is
+  rebuilt per turn against `decisions_path_for(run, attempt)`); the record never reached the wire
+  because (a) `governanceHookFired` is replayed from the decisions log at the FOLD, and an attempt
+  captured `timed_out`/`cancelled` takes the terminal backstop before any fold, and (b) the
+  handoff event was emitted once per ACP SPAWN, so a reused session reported nothing for its later
+  turns. Fixed: `pipeline::disclose_hook_record` (the fold's replay, factored) runs for a governed
+  attempt at the backstop too, before the terminal frame; the ACP carrier emits
+  `skillsSnapshotHanded` for every REUSED turn as well (same `gen`, the turn's own `ord`/`attempt`
+  — one record per dispatch, the contract crew's live-generation pins already tolerate). Wire:
+  no new types or fields; more `skillsSnapshotHanded` rows per ACP session. Tests: an actor fold
+  of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
+  cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
+  answer in their own decisions log behind the ACP armed marker and each report the handoff.
 - **core-ts 0.7.38** — 2026-10-05 — npm release carrying the **ASK-K core slices** (DES-ASK-TEAM-CHAT-001:
   an ask starts a path — DES-TEAMING-002 applied to studio's Ask entry point) since 0.7.37, on main
   tip 02b08c3. Wire changes are additive (`serde(default)`; old rows read as before); one new event

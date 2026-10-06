@@ -851,10 +851,13 @@ impl SkillsSnapshot {
         eprintln!("{}", self.launch_line(context));
     }
 
-    /// The [`CoreEvent::SkillsSnapshotHanded`] record for one launch — the machine-readable half
+    /// The [`CoreEvent::SkillsSnapshotHanded`] record for one dispatch — the machine-readable half
     /// of [`report`](Self::report), on the same event stream crew already consumes, so it can tell
     /// which generations live sessions still reference. `path` is the carrier (`"wrapped_cli"` /
-    /// `"acp"`, the `GovernanceContextArmed` vocabulary) and `cli` the seat it was handed to.
+    /// `"acp"`, the `GovernanceContextArmed` vocabulary) and `cli` the seat it was handed to. On
+    /// the ACP path it is emitted for the spawning turn AND for every reused turn of the cached
+    /// session (core#743), each under its own `ord`/`attempt`, with the generation the session
+    /// was opened with.
     pub(crate) fn handed_event(
         &self,
         session: &str,

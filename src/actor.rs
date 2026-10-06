@@ -5307,6 +5307,17 @@ fn apply_step_result(
         crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
     ) && !pa_timed_out
     {
+        // (core#743) An attempt that ends here never reaches the fold, so its gate-hook record —
+        // the ONLY wire-visible proof the hook ran (the fold replays it as `governanceHookFired`)
+        // — would otherwise never be told. Run ada5b0aa: the creator's rework attempt (2 h 49 min,
+        // 78 files edited) was captured `timed_out` and showed 0 hook events against 115 on
+        // attempt 0; the hook had fired on every call, the record just stayed on disk. Replay it
+        // BEFORE the terminal frame, exactly as the fold would have.
+        if output.governed {
+            crate::pipeline::disclose_hook_record(&run_id, output.attempt, unit, &mut |e| {
+                emit(subscribers, e)
+            });
+        }
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
@@ -19033,6 +19044,18 @@ mod turn_timeout_vs_cancel_tests {
         status: StepStatus,
         attempt: u32,
     ) -> (StepApplied, AgentSession, Vec<CoreEvent>) {
+        fold_with(store, run_id, status, attempt, false)
+    }
+
+    /// [`fold`] with the runner's `governed` flag chosen by the test (core#743: a governed
+    /// attempt's hook record is replayed even when the attempt never folds).
+    fn fold_with(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        status: StepStatus,
+        attempt: u32,
+        governed: bool,
+    ) -> (StepApplied, AgentSession, Vec<CoreEvent>) {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let mut subs = crate::event_log::EventSink::default();
@@ -19047,7 +19070,7 @@ mod turn_timeout_vs_cancel_tests {
             usage: None,
             files: Vec::new(),
             tools: Vec::new(),
-            governed: false,
+            governed,
         };
         let applied = apply_step_result(
             store,
@@ -19074,6 +19097,83 @@ mod turn_timeout_vs_cancel_tests {
             CoreEvent::UnitOutputCaptured { step_status, .. } => Some(step_status.clone()),
             _ => None,
         })
+    }
+
+    /// (core#743) A GOVERNED attempt that ends at the terminal backstop — the turn ceiling fired
+    /// (`timed_out`) or the worker was cancelled — never reaches the fold, which is the only place
+    /// the attempt's gate-hook record was replayed onto the wire. Run ada5b0aa's rework attempt
+    /// (attempt 1 of the creator) edited 78 files under a live hook and showed 0
+    /// `governanceHookFired` against 115 on attempt 0: the record existed on disk and nothing read
+    /// it. The backstop must replay the attempt's record — under THAT attempt — before the
+    /// terminal frame, exactly as the fold does.
+    #[test]
+    fn a_governed_attempt_that_never_folds_still_replays_its_hook_record() {
+        let run_id = format!("timeout-hook-replay-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // Attempt 1: the rework dispatch after a send-back (`session.attempt` was bumped).
+        seed_run(&mut store, &run_id, 1);
+        let phase = crate::scope::unit_phase(1);
+        let decisions = crate::gate_hook::decisions_path_for(&run_id, 1);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        crate::gate_hook::write_armed_marker_for(
+            &decisions,
+            &phase,
+            Some(crate::gate_hook::CARRIER_ACP),
+        )
+        .unwrap();
+        // One allowed `Edit` the hook recorded for attempt 1, the way every production recorder
+        // writes it (annotated with the tool and the phase).
+        let claim = wicked_apps_core::ConformanceClaim {
+            claim_id: format!("hook-fired:{phase}:1"),
+            scope: format!("wicked-agent/{run_id}/unit/{run_id}:u1"),
+            phase: phase.clone(),
+            policy_ids: vec![],
+            decision: wicked_apps_core::Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:test".to_string(),
+            criteria: "test".to_string(),
+            evaluator_identity: "wicked-core-test".to_string(),
+            evaluated_at: crate::clock::eval_now(),
+        };
+        crate::gate_hook::append_annotated_claim_checked(
+            &decisions.to_string_lossy(),
+            &phase,
+            "Edit",
+            &claim,
+        )
+        .unwrap();
+
+        let (applied, _session, events) =
+            fold_with(&mut store, &run_id, StepStatus::TimedOut, 1, true);
+        assert!(matches!(applied, StepApplied::Finished));
+        let fired: Vec<(u32, String, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::GovernanceHookFired {
+                    attempt,
+                    tool_name,
+                    decision,
+                    ..
+                } => Some((*attempt, tool_name.clone(), decision.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fired,
+            vec![(1, "Edit".to_string(), "allow".to_string())],
+            "the timed-out attempt's hook record is replayed under its own attempt: {events:?}"
+        );
+        // Ordered: the record precedes the terminal frame, as it does for a folded unit.
+        let hook_ix = events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::GovernanceHookFired { .. }))
+            .unwrap();
+        let terminal_ix = events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::RunCancelled { .. }))
+            .expect("the backstop still ends the run");
+        assert!(hook_ix < terminal_ix, "{events:?}");
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
     }
 
     /// (1) The engine's turn ceiling folds terminal — same backstop as a cancel — but the wire
