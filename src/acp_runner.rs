@@ -8045,6 +8045,30 @@ impl AcpStepRunner {
                 ),
             }
         }
+        // (core#743) The handoff is reported PER DISPATCH, not per spawn: a REUSED turn — a later
+        // unit, or a rework / retry attempt of the same unit — runs against the generation the
+        // cached session was opened with, and the record of which generation attempt N was handed
+        // must exist for attempt N (run ada5b0aa: the creator's rework attempt showed no
+        // `skillsSnapshotHanded` at all, and nothing on the wire said the seat still had its
+        // skills). Same event, same `gen`, the turn's own `ord` / `attempt`. Emitted HERE, past
+        // every early return above that can hand the unit to the wrapped carrier instead (the
+        // read-only reroute on an unproven pin): the record says the turn RAN on ACP against this
+        // generation, so it fires only when the turn is about to (codex review on #746). The
+        // spawning turn reported at `session/new`, where the bridge was actually handed the root.
+        if reused {
+            if let Some(s) = bound
+                .as_ref()
+                .filter(|s| s.delivery(&worker_cli).delivers_skills())
+            {
+                self.emit_event(s.handed_event(
+                    &run_id,
+                    input.unit.ord,
+                    input.attempt,
+                    "acp",
+                    &cli_key,
+                ));
+            }
+        }
         // DES-TEAMING-002 §4.2: the turn's team context (a claimed attempt publishes its checkpoints).
         let team_turn = self.team_attach(input);
         // The process's MCP token resolves to THIS unit for exactly this turn (DES-MCP-TOOLS-001
@@ -13733,22 +13757,28 @@ transport = "stdio"
             "the shared worker-home file is launch-independent: {shared}"
         );
 
-        // Generation reporting: one handoff per session, each naming its own generation; nothing
-        // ever reports (A, gen 2).
-        let handed: Vec<(String, Option<String>)> = rx
+        // Generation reporting (core#743: one handoff per DISPATCH — the spawning turn and every
+        // reused turn, each under its own ord): run A's turns 1, 2 and 4 all report gen 1 (turn 3
+        // was refused before any frame reached the bridge and reports nothing); run B's one turn
+        // reports gen 2; nothing ever reports (A, gen 2). A's turn 4 and B's turn ran
+        // concurrently, so the order between them is not pinned — compare as a sorted multiset.
+        let mut handed: Vec<(String, u32, Option<String>)> = rx
             .try_iter()
             .filter_map(|c| match c {
-                Command::EmitEvent(CoreEvent::SkillsSnapshotHanded { session, gen, .. }) => {
-                    Some((session, gen))
-                }
+                Command::EmitEvent(CoreEvent::SkillsSnapshotHanded {
+                    session, ord, gen, ..
+                }) => Some((session, ord, gen)),
                 _ => None,
             })
             .collect();
+        handed.sort();
         assert_eq!(
             handed,
             vec![
-                ("run-A".to_string(), Some("1".to_string())),
-                ("run-B".to_string(), Some("2".to_string())),
+                ("run-A".to_string(), 1, Some("1".to_string())),
+                ("run-A".to_string(), 2, Some("1".to_string())),
+                ("run-A".to_string(), 4, Some("1".to_string())),
+                ("run-B".to_string(), 1, Some("2".to_string())),
             ]
         );
         runner.drop_session("run-A");
@@ -22288,6 +22318,265 @@ transport = "stdio"
         // compare-and-remove, now against the set).
         maps.deregister_tool_child("run-c", 999);
         assert_eq!(maps.take_tool_child_pgroups("run-c"), vec![333, 444]);
+    }
+
+    /// A bridge that, on EVERY `session/prompt`, asks `session/request_permission` for one `Write`
+    /// inside the session's cwd (read off `session/new`), waits for the client's answer, records
+    /// it (`{"perm": <result>}`) beside the `new`/`prompt` entries, then ends the turn. Its ask ids
+    /// start at 1001 so they never walk into the client's prompt-id space (core#293).
+    #[cfg(unix)]
+    fn write_permission_asking_bridge(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("permission-asking-bridge");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json
+ledger = sys.argv[1]
+
+def w(obj):
+    print(json.dumps(obj), flush=True)
+
+def record(entry):
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def r():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)
+        except Exception:
+            continue
+
+cwd = "/tmp"
+ask_id = 1000
+while True:
+    req = r()
+    if req is None:
+        break
+    method = req.get("method")
+    if method == "initialize":
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "serverInfo": {"name": "permission-asking", "version": "0"}}})
+    elif method == "session/new":
+        params = req.get("params") or {}
+        cwd = params.get("cwd") or cwd
+        record({"new": params})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "sessionId": "perm-session", "protocolVersion": "2025-03-26"}})
+    elif method == "session/prompt":
+        blocks = (req.get("params") or {}).get("prompt") or []
+        text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+        record({"prompt": text})
+        ask_id += 1
+        w({"jsonrpc": "2.0", "id": ask_id, "method": "session/request_permission", "params": {
+            "sessionId": "perm-session",
+            "toolCall": {"toolCallId": "call-%d" % ask_id, "title": "Write", "kind": "edit",
+                         "rawInput": {"file_path": cwd + "/notes.md", "content": "y"}},
+            "options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+            ],
+        }})
+        while True:
+            resp = r()
+            if resp is None:
+                sys.exit(3)
+            if resp.get("id") == ask_id and "result" in resp:
+                break
+            if resp.get("method") and "id" in resp:
+                w({"jsonrpc": "2.0", "id": resp["id"], "result": {}})
+        record({"perm": resp["result"]})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}}})
+    elif "id" in req and method:
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {}})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// (core#743) A REWORK dispatch on a cached ACP session — attempt N+1 of the same unit after
+    /// a send-back — takes exactly the governance path attempt 0 took, and SAYS so on the wire.
+    /// Through the real `AcpStepRunner`: a governed claude seat (admitted to input governance)
+    /// over a bridge that asks `session/request_permission` for one `Write` inside the worktree
+    /// on every turn, with a published snapshot generation handed.
+    ///
+    /// - turn 1 (attempt 0) spawns the session: the gate answers the ask and records it under
+    ///   `decisions_path_for(run, 0)`, and `skillsSnapshotHanded{attempt: 0}` names generation 1;
+    /// - turn 2 (attempt 1, `rework_of` set — the dispatch after `request_changes`) REUSES the
+    ///   session (one `session/new` in the ledger): the gate answers the ask and records it under
+    ///   `decisions_path_for(run, 1)` behind the ACP armed marker — the hook fired on the rework
+    ///   attempt, under its own attempt — and `skillsSnapshotHanded{attempt: 1}` names the same
+    ///   generation. Run ada5b0aa's attempt 1 had neither record on the wire.
+    #[test]
+    #[cfg(unix)]
+    fn a_rework_turn_on_a_cached_acp_session_is_governed_and_reports_its_handoff() {
+        use crate::skills_snapshot::test_support::{scratch as canonical_scratch, snapshot_root};
+        use crate::workflow::{StepInput, StepRunner};
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-rework-gov");
+        let _home = EnvPin::set("HOME", &home);
+        let worker = home.join("worker");
+        std::fs::create_dir_all(&worker).unwrap();
+        let _worker = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker);
+        let skills = home.join(".wicked-crew").join("skills");
+        let gen1 = snapshot_root(
+            &skills.join("snapshots").join("1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen1);
+        let ledger = home.join("ledger.ndjson");
+        let bridge = write_permission_asking_bridge(&home);
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "claude"
+display_name = "claude"
+binary = "claude"
+headless_invocation = "claude -p {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+acp_input_governance = true
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let db = home.join("estate.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+        let run_id = format!("run-743-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let input = |attempt: u32| -> StepInput {
+            let mut u =
+                crate::domain::WorkUnit::pending(format!("{run_id}:u6"), &run_id, 6, "build");
+            u.assigned_cli = Some("claude".to_string());
+            u.executes_code = true;
+            if attempt > 0 {
+                u.rework_of = Some(7);
+                u.rework_amendment =
+                    Some("[review — unit 7 — requested changes] move the journeys".to_string());
+            }
+            StepInput {
+                run_id: run_id.clone(),
+                unit_ix: 5,
+                attempt,
+                unit: u,
+                workflow_id: "wf-743".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: Some(crate::workflow::GovernanceContext {
+                    human_confirm: Default::default(),
+                    db_path: db.to_string_lossy().to_string(),
+                    code_graph_db: None,
+                    extra_write_roots: Vec::new(),
+                    extra_read_roots: Vec::new(),
+                    project_id: None,
+                }),
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+
+        // Attempt 0: the first dispatch spawns the session.
+        let out0 = runner.run_unit(&input(0));
+        assert_eq!(out0.status, StepStatus::Ok, "{}", out0.output);
+        assert!(out0.governed, "attempt 0 is governed: {}", out0.output);
+        // Attempt 1: the rework dispatch after a send-back reuses the session.
+        let out1 = runner.run_unit(&input(1));
+        assert_eq!(out1.status, StepStatus::Ok, "{}", out1.output);
+        assert!(out1.governed, "attempt 1 is governed: {}", out1.output);
+
+        let entries = ledger_entries(&ledger);
+        let news = entries.iter().filter(|e| e.get("new").is_some()).count();
+        let prompts = entries.iter().filter(|e| e.get("prompt").is_some()).count();
+        let perms: Vec<&Value> = entries.iter().filter_map(|e| e.get("perm")).collect();
+        assert_eq!(
+            (news, prompts, perms.len()),
+            (1, 2, 2),
+            "one spawn, two turns, one ask answered per turn: {entries:?}"
+        );
+        for p in &perms {
+            assert_eq!(
+                p["outcome"]["outcome"], "selected",
+                "the gate answered the ask, not the bridge's default: {p}"
+            );
+        }
+        // The hook's durable record exists for BOTH attempts, each armed on the ACP carrier and
+        // each holding the `Write` the gate judged on that turn.
+        for attempt in [0u32, 1] {
+            let log =
+                std::fs::read_to_string(crate::gate_hook::decisions_path_for(&run_id, attempt))
+                    .unwrap_or_default();
+            assert!(
+                log.contains(&format!("\"{}\"", crate::gate_hook::CARRIER_ACP)),
+                "attempt {attempt} armed on the ACP carrier: {log}"
+            );
+            let recs = crate::gate_hook::collect_hook_decisions(
+                &run_id,
+                attempt,
+                &crate::scope::unit_phase(6),
+            );
+            assert!(
+                recs.iter().any(|r| r.tool_name.contains("Write")),
+                "attempt {attempt}'s hook fired on the Write: {recs:?}"
+            );
+        }
+        // And the wire says which generation EACH attempt was handed — the reused turn included.
+        let handed: Vec<(u32, u32, Option<String>, String)> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(CoreEvent::SkillsSnapshotHanded {
+                    session,
+                    ord,
+                    attempt,
+                    path,
+                    gen,
+                    ..
+                }) if session == run_id => Some((ord, attempt, gen, path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            handed,
+            vec![
+                (6, 0, Some("1".to_string()), "acp".to_string()),
+                (6, 1, Some("1".to_string()), "acp".to_string()),
+            ],
+            "a handoff record per dispatch, the rework attempt's under attempt 1"
+        );
+        runner.drop_session(&run_id);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

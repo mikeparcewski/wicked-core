@@ -1380,36 +1380,10 @@ pub(crate) fn apply_and_finish_unit(
     // escalate to human review).
     let hook_denied = hook_denial.is_some();
 
-    // (EVT-008) GovernanceHookFired — replay per-tool-call decisions from the NDJSON log as events.
-    // Only runs for governed units (ungoverned units have no log). Reads the log once more (cheap;
-    // tiny NDJSON files) so fold_input_denial's signature is unchanged. Emits one event per claim
-    // entry for this unit's phase, in log order.
-    // (DES-MCP-TOOLS-001 §4.4) A brokered MCP call the gate refused: blocked, the seat continued.
-    // Disclosed for EVERY unit, governed by its runner or not — the broker, not the carrier, is
-    // what governs an MCP call, so a codex or pi unit's refusals are as real as a claude one's.
-    for rec in crate::gate_hook::collect_hook_decisions(
-        session_id,
-        attempt,
-        &crate::scope::unit_phase(unit.ord),
-    ) {
-        if let Some((reason, subject, remedy)) = rec.mcp_refusal() {
-            emit(CoreEvent::WorkerToolCallDenied {
-                session: session_id.to_string(),
-                ord: unit.ord,
-                attempt,
-                cli: unit
-                    .assigned_cli
-                    .clone()
-                    .unwrap_or_else(|| "claude".to_string()),
-                carrier: crate::mcp_gate::CARRIER_SHIM.to_string(),
-                role: crate::write_posture::role_wire(unit.role).to_string(),
-                tool: rec.tool_name.clone(),
-                command: subject,
-                reason,
-                remedy,
-            });
-        }
-    }
+    // (EVT-008 / DES-MCP-TOOLS-001 §4.4) The attempt's decisions-log disclosures — the brokered
+    // MCP refusals for EVERY unit and, for a governed one, the hook's refusals and one
+    // `governanceHookFired` per recorded call — ride `disclose_hook_record` below (core#743: the
+    // same helper the terminal backstop calls for an attempt that never folds).
     // (core#716) A blocked filesystem-boundary WRITE the fold did NOT deny on, because the unit's
     // floor passed (`fold_input_denial_after_floor`): disclosed here with the tool named, exactly
     // as an advisory refusal is — never silently dropped. Read off the same log the fold read, for
@@ -1442,130 +1416,7 @@ pub(crate) fn apply_and_finish_unit(
             }
         }
     }
-    if governed {
-        let phase = crate::scope::unit_phase(unit.ord);
-        for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
-            // (F-7R2-012) The wrapped carrier's gate hook refused a `git push` / `gh pr create`:
-            // the hook is a subprocess with no emit seam, so the fold discloses the refusal here
-            // from its durable record — the ACP carrier emits the same event live.
-            if let Some((reason, command)) = rec.remote_write_refusal() {
-                // The install fence (F-E2E-029) records under the same claim shape; its remedy
-                // differs, and the reason's prefix says which fence spoke.
-                let remedy = if reason.starts_with(crate::install_fence::REASON_PREFIX) {
-                    crate::install_fence::REMEDY
-                } else {
-                    // Which remote-write remedy the recorded reason embeds: the deliver-phase one
-                    // for a write, the no-credentials one for a fenced provider command (core#569
-                    // — a read refusal answered with "commit and let the deliver phase push" is
-                    // the wrong instruction, and the event is what a reviewer reads).
-                    crate::remote_write_fence::remedy_for_reason(&reason)
-                };
-                eprintln!(
-                    "wicked-core: unit {} ({}) on '{}' asked to run a fenced command and was \
-                     refused by the gate hook: `{command}` — {remedy} (F-7R2-012 / F-E2E-029)",
-                    unit.ord,
-                    crate::write_posture::role_wire(unit.role),
-                    unit.assigned_cli.as_deref().unwrap_or("claude"),
-                );
-                emit(CoreEvent::WorkerToolCallDenied {
-                    session: session_id.to_string(),
-                    ord: unit.ord,
-                    attempt,
-                    cli: unit
-                        .assigned_cli
-                        .clone()
-                        .unwrap_or_else(|| "claude".to_string()),
-                    // (issue #463) The carrier that armed the unit, read back off the armed
-                    // marker — this fold replays records BOTH carriers write; the wrapped label
-                    // stays the default for a log an older launcher wrote.
-                    carrier: rec
-                        .carrier
-                        .clone()
-                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
-                    role: crate::write_posture::role_wire(unit.role).to_string(),
-                    tool: rec.tool_name.clone(),
-                    command,
-                    reason,
-                    remedy: remedy.to_string(),
-                });
-            }
-            // (issue #463) The ADVISORY arm of the estate-command fence — a recon / pre-build unit
-            // asked for a write-path estate command (a `wicked-estate` write subcommand, or the
-            // shim / MCP without `--readonly` or a pinned store): the call was blocked, the graph
-            // is untouched, the seat was handed the remedy and continued. Disclosed here with the
-            // tool and the command named (the record carries both; `(unknown)` never). The FATAL
-            // arm (a code-executing unit) rides `boundary-deny:` into `fold_input_denial` above
-            // and denies the unit — it is not a refusal the seat survived, so it is not echoed
-            // here.
-            if let Some((reason, command)) = rec.estate_refusal() {
-                eprintln!(
-                    "wicked-core: unit {} ({}) on '{}' asked to run a write-path estate command \
-                     and was refused by the gate hook: `{command}` — {} (issue #463)",
-                    unit.ord,
-                    crate::write_posture::role_wire(unit.role),
-                    unit.assigned_cli.as_deref().unwrap_or("claude"),
-                    crate::gate_hook::ESTATE_DENY_REMEDY,
-                );
-                emit(CoreEvent::WorkerToolCallDenied {
-                    session: session_id.to_string(),
-                    ord: unit.ord,
-                    attempt,
-                    cli: unit
-                        .assigned_cli
-                        .clone()
-                        .unwrap_or_else(|| "claude".to_string()),
-                    // (issue #463) The carrier that armed the unit, read back off the armed
-                    // marker — this fold replays records BOTH carriers write; the wrapped label
-                    // stays the default for a log an older launcher wrote.
-                    carrier: rec
-                        .carrier
-                        .clone()
-                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
-                    role: crate::write_posture::role_wire(unit.role).to_string(),
-                    tool: rec.tool_name.clone(),
-                    command,
-                    reason,
-                    remedy: crate::gate_hook::ESTATE_DENY_REMEDY.to_string(),
-                });
-            }
-            // (DES-L4 PR-②, R7 — GRANTED to L4 by des-adjudicated §4.2) A PHASE-SCOPE refusal the
-            // seat survived — a read-only / pre-build / deliverable-roots unit asked to write
-            // outside its admitted roots (a path-bearing tool, or a `Bash` redirect / heredoc /
-            // tee / cp / mkdir): blocked, advisory, the unit continued. Disclosed with the tool
-            // and, for the `Bash` arm, the command (the record carries both; `(unknown)` never),
-            // so the wrapped carrier's Bash denies surface as `workerToolCallDenied` exactly as
-            // the ACP bridge's do — not on `governanceHookFired{deny}` alone.
-            if let Some((reason, command)) = rec.phase_scope_refusal() {
-                emit(CoreEvent::WorkerToolCallDenied {
-                    session: session_id.to_string(),
-                    ord: unit.ord,
-                    attempt,
-                    cli: unit
-                        .assigned_cli
-                        .clone()
-                        .unwrap_or_else(|| "claude".to_string()),
-                    carrier: rec
-                        .carrier
-                        .clone()
-                        .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
-                    role: crate::write_posture::role_wire(unit.role).to_string(),
-                    tool: rec.tool_name.clone(),
-                    command,
-                    reason,
-                    remedy: crate::gate_hook::PHASE_SCOPE_BASH_REMEDY.to_string(),
-                });
-            }
-            emit(CoreEvent::GovernanceHookFired {
-                session: session_id.to_string(),
-                ord: unit.ord,
-                attempt,
-                tool_name: rec.tool_name,
-                decision: rec.decision,
-                denying_policy: rec.denying_policy,
-                fired_policies: rec.fired_policies,
-            });
-        }
-    }
+    disclose_hook_record(session_id, attempt, unit, governed, emit);
 
     // DENY-DOMINATES ordering: deterministic re-verify, the evaluator's own verdict, agent judge,
     // evaluator pass, input governance. Each layer is wrapped as a STRUCTURED denial naming its
@@ -1856,6 +1707,178 @@ pub(crate) fn apply_and_finish_unit(
         }
     });
     Ok(outcome)
+}
+
+/// (core#743) Replay an attempt's durable decisions-log record onto the event stream: the
+/// brokered MCP refusals (every unit), then — for a GOVERNED attempt — one `governanceHookFired`
+/// per recorded tool call (in log order), each preceded by the `workerToolCallDenied` disclosures
+/// for the refusals the seat survived (a fenced remote write, a write-path estate command, a
+/// phase-scope write). The hook — the wrapped carrier's PreToolUse
+/// subprocess, or the ACP carrier's `session/request_permission` answer — has no emit seam of its
+/// own: the decisions log at `decisions_path_for(session, attempt)` IS its record, and this replay
+/// is the only way it reaches the wire.
+///
+/// Called by the fold for every governed unit that folds, AND by the actor for a governed attempt
+/// that never folds — a turn captured `timed_out` or `cancelled` (run ada5b0aa: the creator's
+/// rework attempt ran 2 h 49 min with 0 `governanceHookFired` on the wire against 115 on attempt
+/// 0, not because the hook was silent but because the attempt's record was never replayed). An
+/// attempt's governance is a fact about what the seat did, not about how the attempt ended.
+pub(crate) fn disclose_hook_record(
+    session_id: &str,
+    attempt: u32,
+    unit: &crate::domain::WorkUnit,
+    governed: bool,
+    emit: &mut dyn FnMut(CoreEvent),
+) {
+    let phase = crate::scope::unit_phase(unit.ord);
+    // (DES-MCP-TOOLS-001 §4.4) A brokered MCP call the gate refused: blocked, the seat continued.
+    // Disclosed for EVERY unit, governed by its runner or not — the broker, not the carrier, is
+    // what governs an MCP call, so a codex or pi unit's refusals are as real as a claude one's.
+    for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+        if let Some((reason, subject, remedy)) = rec.mcp_refusal() {
+            emit(CoreEvent::WorkerToolCallDenied {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+                carrier: crate::mcp_gate::CARRIER_SHIM.to_string(),
+                role: crate::write_posture::role_wire(unit.role).to_string(),
+                tool: rec.tool_name.clone(),
+                command: subject,
+                reason,
+                remedy,
+            });
+        }
+    }
+    // (EVT-008) GovernanceHookFired — the hook's per-tool-call decisions, one event per claim entry
+    // for this unit's phase, in log order; a governed unit only (an ungoverned one armed no hook).
+    if !governed {
+        return;
+    }
+    for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+        // (F-7R2-012) The wrapped carrier's gate hook refused a `git push` / `gh pr create`:
+        // the hook is a subprocess with no emit seam, so the fold discloses the refusal here
+        // from its durable record — the ACP carrier emits the same event live.
+        if let Some((reason, command)) = rec.remote_write_refusal() {
+            // The install fence (F-E2E-029) records under the same claim shape; its remedy
+            // differs, and the reason's prefix says which fence spoke.
+            let remedy = if reason.starts_with(crate::install_fence::REASON_PREFIX) {
+                crate::install_fence::REMEDY
+            } else {
+                // Which remote-write remedy the recorded reason embeds: the deliver-phase one
+                // for a write, the no-credentials one for a fenced provider command (core#569
+                // — a read refusal answered with "commit and let the deliver phase push" is
+                // the wrong instruction, and the event is what a reviewer reads).
+                crate::remote_write_fence::remedy_for_reason(&reason)
+            };
+            eprintln!(
+                "wicked-core: unit {} ({}) on '{}' asked to run a fenced command and was \
+                 refused by the gate hook: `{command}` — {remedy} (F-7R2-012 / F-E2E-029)",
+                unit.ord,
+                crate::write_posture::role_wire(unit.role),
+                unit.assigned_cli.as_deref().unwrap_or("claude"),
+            );
+            emit(CoreEvent::WorkerToolCallDenied {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+                // (issue #463) The carrier that armed the unit, read back off the armed
+                // marker — this fold replays records BOTH carriers write; the wrapped label
+                // stays the default for a log an older launcher wrote.
+                carrier: rec
+                    .carrier
+                    .clone()
+                    .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                role: crate::write_posture::role_wire(unit.role).to_string(),
+                tool: rec.tool_name.clone(),
+                command,
+                reason,
+                remedy: remedy.to_string(),
+            });
+        }
+        // (issue #463) The ADVISORY arm of the estate-command fence — a recon / pre-build unit
+        // asked for a write-path estate command (a `wicked-estate` write subcommand, or the
+        // shim / MCP without `--readonly` or a pinned store): the call was blocked, the graph
+        // is untouched, the seat was handed the remedy and continued. Disclosed here with the
+        // tool and the command named (the record carries both; `(unknown)` never). The FATAL
+        // arm (a code-executing unit) rides `boundary-deny:` into `fold_input_denial` above
+        // and denies the unit — it is not a refusal the seat survived, so it is not echoed
+        // here.
+        if let Some((reason, command)) = rec.estate_refusal() {
+            eprintln!(
+                "wicked-core: unit {} ({}) on '{}' asked to run a write-path estate command \
+                 and was refused by the gate hook: `{command}` — {} (issue #463)",
+                unit.ord,
+                crate::write_posture::role_wire(unit.role),
+                unit.assigned_cli.as_deref().unwrap_or("claude"),
+                crate::gate_hook::ESTATE_DENY_REMEDY,
+            );
+            emit(CoreEvent::WorkerToolCallDenied {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+                // (issue #463) The carrier that armed the unit, read back off the armed
+                // marker — this fold replays records BOTH carriers write; the wrapped label
+                // stays the default for a log an older launcher wrote.
+                carrier: rec
+                    .carrier
+                    .clone()
+                    .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                role: crate::write_posture::role_wire(unit.role).to_string(),
+                tool: rec.tool_name.clone(),
+                command,
+                reason,
+                remedy: crate::gate_hook::ESTATE_DENY_REMEDY.to_string(),
+            });
+        }
+        // (DES-L4 PR-②, R7 — GRANTED to L4 by des-adjudicated §4.2) A PHASE-SCOPE refusal the
+        // seat survived — a read-only / pre-build / deliverable-roots unit asked to write
+        // outside its admitted roots (a path-bearing tool, or a `Bash` redirect / heredoc /
+        // tee / cp / mkdir): blocked, advisory, the unit continued. Disclosed with the tool
+        // and, for the `Bash` arm, the command (the record carries both; `(unknown)` never),
+        // so the wrapped carrier's Bash denies surface as `workerToolCallDenied` exactly as
+        // the ACP bridge's do — not on `governanceHookFired{deny}` alone.
+        if let Some((reason, command)) = rec.phase_scope_refusal() {
+            emit(CoreEvent::WorkerToolCallDenied {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+                carrier: rec
+                    .carrier
+                    .clone()
+                    .unwrap_or_else(|| crate::gate_hook::CARRIER_WRAPPED_CLI.to_string()),
+                role: crate::write_posture::role_wire(unit.role).to_string(),
+                tool: rec.tool_name.clone(),
+                command,
+                reason,
+                remedy: crate::gate_hook::PHASE_SCOPE_BASH_REMEDY.to_string(),
+            });
+        }
+        emit(CoreEvent::GovernanceHookFired {
+            session: session_id.to_string(),
+            ord: unit.ord,
+            attempt,
+            tool_name: rec.tool_name,
+            decision: rec.decision,
+            denying_policy: rec.denying_policy,
+            fired_policies: rec.fired_policies,
+        });
+    }
 }
 
 /// (TR-W1b, DES-trigger-registry §4.4 row 4) The paths a creator unit changed, for its floor's
