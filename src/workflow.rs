@@ -249,9 +249,14 @@ pub enum StepStatus {
     /// consumer arming automatic stall recovery can key on the platform's own timeout WITHOUT
     /// ever treating an operator's cancel as failover-eligible (run 616c8661: making the ceiling
     /// actionable under the shared `Cancelled` status would let auto-recovery un-cancel a Ctrl-C).
-    /// The fold treats it exactly like `Cancelled` (terminal backstop — the silence watchdog is
-    /// the primary recovery lever and fires far earlier); the distinction rides the wire as
-    /// `UnitOutputCaptured.step_status == "timed_out"`.
+    /// (core#744) The fold does NOT treat it like `Cancelled`: a timed-out unit is Rejected under a
+    /// `turn_timeout` denial that names the bound which fired, `stepFailed{failureKind:
+    /// "timedOut"}` is emitted, and the run PAUSES at a `failure` gate (approve = re-dispatch as
+    /// the next attempt on the same tree, reassign, or reject with the worktree kept) — or, with
+    /// no operator in the loop (`HumanConfirm::None`), FAILS (`sessionFailed`). Only `Cancelled`
+    /// takes the cancel terminal (`runCancelled`); a team PA step's timeout with another eligible
+    /// seat takes the seat failover instead. The silence watchdog remains the earlier lever. The
+    /// distinction also rides the wire as `UnitOutputCaptured.step_status == "timed_out"`.
     TimedOut,
 }
 
