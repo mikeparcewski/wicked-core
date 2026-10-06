@@ -5302,18 +5302,17 @@ fn apply_step_result(
                 .iter()
                 .any(|k| k != seat && !unit.worker_failed_clis.contains(k))
         };
-    // (core#743) A cancelled or timed-out attempt never reaches the fold, so its decisions-log
-    // record — the ONLY wire-visible proof the hook ran (the fold replays it as
-    // `governanceHookFired`, and discloses the brokered MCP refusals for every unit) — would
-    // otherwise never be told. Run ada5b0aa: the creator's rework attempt (2 h 49 min, 78 files
-    // edited) was captured `timed_out` and showed 0 hook events against 115 on attempt 0; the hook
-    // had fired on every call, the record just stayed on disk. Replay it FIRST — before the
-    // terminal frame below, and before the team PA's seat failover (`pa_timed_out`) re-dispatches
-    // the step as attempt+1 — exactly as the fold would have (codex review on #746).
-    if matches!(
-        output.status,
-        crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
-    ) {
+    // (core#743) Only an `Ok` attempt reaches the fold (`apply_and_finish_unit`), and the fold is
+    // where an attempt's decisions-log record — the ONLY wire-visible proof the hook ran
+    // (`governanceHookFired`), plus the brokered MCP refusals for every unit — is replayed. Every
+    // other status leaves by a path that never folds: the cancel/timeout backstop, the team PA's
+    // seat failover, the elicitation terminal, the failure ladder (triage, gates, `fail_run`).
+    // Run ada5b0aa: the creator's rework attempt (2 h 49 min, 78 files edited) was captured
+    // `timed_out` and showed 0 hook events against 115 on attempt 0; the hook had fired on every
+    // call, the record just stayed on disk. Replay it FIRST for every non-`Ok` attempt — before any
+    // terminal frame, gate or re-dispatch below — exactly as the fold would have (codex rounds 1
+    // and 2 on #746: the PA failover and the plain `Failed` path lose the record the same way).
+    if output.status != crate::workflow::StepStatus::Ok {
         crate::pipeline::disclose_hook_record(
             &run_id,
             output.attempt,
@@ -19237,6 +19236,75 @@ mod turn_timeout_vs_cancel_tests {
             .position(|e| matches!(e, CoreEvent::RunCancelled { .. }))
             .expect("the backstop still ends the run");
         assert!(hook_ix < terminal_ix, "{events:?}");
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+    }
+
+    /// (codex round 2 on #746, HIGH) A plain `Failed` attempt — the bridge died without an
+    /// end-turn frame after answering permission asks — leaves by the failure ladder and never
+    /// folds either. Its record is replayed the same way, before the ladder decides anything.
+    #[test]
+    fn a_failed_governed_attempt_replays_its_hook_record_before_the_ladder() {
+        let run_id = format!("failed-hook-replay-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 1);
+        let phase = crate::scope::unit_phase(1);
+        let decisions = crate::gate_hook::decisions_path_for(&run_id, 1);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        crate::gate_hook::write_armed_marker_for(
+            &decisions,
+            &phase,
+            Some(crate::gate_hook::CARRIER_ACP),
+        )
+        .unwrap();
+        let claim = wicked_apps_core::ConformanceClaim {
+            claim_id: format!("hook-fired:{phase}:1"),
+            scope: format!("wicked-agent/{run_id}/unit/{run_id}:u1"),
+            phase: phase.clone(),
+            policy_ids: vec![],
+            decision: wicked_apps_core::Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:test".to_string(),
+            criteria: "test".to_string(),
+            evaluator_identity: "wicked-core-test".to_string(),
+            evaluated_at: crate::clock::eval_now(),
+        };
+        crate::gate_hook::append_annotated_claim_checked(
+            &decisions.to_string_lossy(),
+            &phase,
+            "Write",
+            &claim,
+        )
+        .unwrap();
+        let (_applied, _session, events) =
+            fold_with(&mut store, &run_id, StepStatus::Failed, 1, true);
+        let fired: Vec<(u32, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::GovernanceHookFired {
+                    attempt, tool_name, ..
+                } => Some((*attempt, tool_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fired,
+            vec![(1, "Write".to_string())],
+            "a failed attempt's record is replayed under its own attempt: {events:?}"
+        );
+        let hook_ix = events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::GovernanceHookFired { .. }))
+            .unwrap();
+        let ladder_ix = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    CoreEvent::StepFailed { .. } | CoreEvent::SessionFailed { .. }
+                )
+            })
+            .expect("the failure ladder spoke");
+        assert!(hook_ix < ladder_ix, "{events:?}");
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
     }
 
