@@ -490,10 +490,12 @@ fn a_pa_timeout_repicks_when_another_seat_is_eligible() {
     );
 }
 
-/// One seat: a PA timeout has nobody to re-pick, so the engine's terminal backstop runs exactly
-/// as before (the run is cancelled, `timed_out` on the wire) and no `path.repicked` is published.
+/// One seat: a PA timeout has nobody to re-pick, so it is an ordinary timeout (core#744) — with
+/// no operator in the loop the run FAILS (`sessionFailed`, `stepFailed{failureKind: timedOut}`,
+/// `timed_out` on the wire), it is never cancelled by its own ceiling, and no `path.repicked` is
+/// published.
 #[test]
-fn a_pa_timeout_on_a_one_seat_roster_keeps_the_backstop() {
+fn a_pa_timeout_on_a_one_seat_roster_fails_the_run_and_never_cancels_it() {
     let dir = tmp_dir("oneseat");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db, First::TimedOut);
@@ -501,16 +503,34 @@ fn a_pa_timeout_on_a_one_seat_roster_keeps_the_backstop() {
     rig.core
         .launch_run(spec("r1s", vec![cli("a")], None))
         .unwrap();
-    rig.tap.until("the cancel backstop", |seen| {
+    rig.tap.until("the failed terminal", |seen| {
         seen.iter()
-            .any(|e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r1s"))
+            .any(|e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "r1s"))
     });
     rig.tap.settle();
     assert_eq!(calls_of(&calls, "r1s").len(), 1, "no redispatch");
     assert!(of_type(&rig.bus, "r1s", REPICKED).is_empty());
+    assert!(
+        rig.tap.seen.iter().any(|e| matches!(
+            e,
+            CoreEvent::StepFailed {
+                session,
+                failure_kind: wicked_core::StepFailureKind::TimedOut,
+                ..
+            } if session == "r1s"
+        )),
+        "the cause is named on the wire"
+    );
+    assert!(
+        !rig.tap
+            .seen
+            .iter()
+            .any(|e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r1s")),
+        "a timeout never ends the run as cancelled"
+    );
     assert_eq!(
         view(&rig.core, "r1s").session.status,
-        wicked_core::SessionStatus::Cancelled
+        wicked_core::SessionStatus::Failed
     );
 }
 

@@ -5294,7 +5294,8 @@ fn apply_step_result(
     // branch: a PA step of a team run that hit the ceiling is a SEAT failure the path survives
     // when another eligible seat can take the PA's place — it takes the failover ladder below,
     // which re-picks the PA (`path.repicked`) and redispatches the step as attempt+1. With no
-    // other seat it takes this backstop exactly as before.
+    // other seat it is an ordinary timeout (core#744): the `failure` gate with an operator,
+    // `sessionFailed` without one — never the cancel backstop.
     let pa_timed_out =
         output.status == crate::workflow::StepStatus::TimedOut && team_gate::is_pa_step(unit) && {
             let seat = unit.assigned_cli.as_deref().unwrap_or("claude");
@@ -5321,11 +5322,145 @@ fn apply_step_result(
             &mut |e| emit(subscribers, e),
         );
     }
-    if matches!(
-        output.status,
-        crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
-    ) && !pa_timed_out
-    {
+    // (core#744) The engine's own turn ceiling is NOT an operator's cancel and must never end the
+    // run as one. Run ada5b0aa: the creator's rework attempt ran the repo's full journey suite
+    // under host load 90-220, hit the 2 h ceiling with 78 files of finished work uncommitted in the
+    // worktree, and the engine answered `runCancelled` — no gate, the tree orphaned, `Retry` a
+    // brand-new run, and the skin read the cancel as the operator's own send-back. A timeout is
+    // the one outcome the operator could not answer, and the one most likely to be a host-load
+    // artefact (the same tree had passed the floor 2 h 50 min earlier on attempt 0). So it takes
+    // the failure ladder's HUMAN decision point, like a refusal does: the unit is Rejected with a
+    // `turn_timeout` denial naming the ceiling in plain words, the transcript is kept, `stepFailed
+    // {failureKind: "timedOut"}` says what happened, and the run PAUSES at a `failure` gate —
+    // approve re-dispatches the unit (attempt+1, optionally amended; a step budget that was the
+    // binding bound is lifted first so the retry gets the daemon's full ceiling), the reassign
+    // surface moves it to another seat, reject stops the run and keeps the worktree. With no
+    // operator in the loop (`HumanConfirm::None` — the campaign/fail-fast contract) the run FAILS
+    // (`sessionFailed`, the clean-only reap keeps a dirty tree) rather than reading as cancelled.
+    // `runCancelled` is reserved for a cancel somebody asked for. The team PA case above
+    // (`pa_timed_out`) keeps its own seat-failover path.
+    if output.status == crate::workflow::StepStatus::TimedOut && !pa_timed_out {
+        let cli = unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
+        let ceiling = crate::workflow::unit_timeout_ceiling();
+        let (bound_secs, budget_bound) =
+            crate::workflow::binding_timeout(ceiling, unit.budget_secs);
+        let bound = crate::workflow::spell_secs(bound_secs);
+        let source = if budget_bound {
+            format!(
+                "the plan step's own budget of {bound} — lifted now, so a retry runs under the \
+                 daemon's full ceiling of {} ({})",
+                crate::workflow::spell_secs(ceiling.as_secs()),
+                crate::workflow::UNIT_TIMEOUT_ENV
+            )
+        } else {
+            format!(
+                "the daemon's turn ceiling of {bound} ({}; raise it on the daemon for longer \
+                 turns)",
+                crate::workflow::UNIT_TIMEOUT_ENV
+            )
+        };
+        if budget_bound {
+            unit.budget_secs = None;
+        }
+        let tree = match session.workdir.as_deref() {
+            Some(w) => format!(
+                "Whatever it wrote is still in the worktree at {w} — uncommitted, unjudged, not \
+                 discarded"
+            ),
+            None => "Whatever it wrote is still on disk — unjudged, not discarded".to_string(),
+        };
+        let mut why = format!(
+            "Unit {ord} ({cli}) ran out of time on attempt {}: {source} elapsed before the seat \
+             finished its turn. {tree}.",
+            output.attempt + 1
+        );
+        // (codex round 2 on #748) The SAME fail-closed input-governance fold every other non-Ok
+        // governed path runs: a governed attempt with no decisions log, or a wrapped one that made
+        // tool calls under a suppressed hook, is denied `input_governance` — that denial DOMINATES
+        // the timeout's (the gate still opens, but it says the attempt's calls were unchecked, and
+        // the record on the unit is the governance one). Deny claims are conformed as a side effect.
+        let governance = if output.governed {
+            crate::gate_hook::fold_input_denial_with_activity(
+                store,
+                &run_id,
+                output.attempt,
+                &crate::scope::unit_phase(ord),
+                true,
+                tool_activity,
+            )?
+        } else {
+            None
+        };
+        unit.status = crate::domain::UnitStatus::Rejected;
+        match governance {
+            Some(denial) => {
+                why = format!(
+                    "{why} — and the attempt's input governance could not be proven: {}",
+                    denial.reason
+                );
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(denial);
+            }
+            None => {
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(crate::domain::UnitDenial::new("turn_timeout", why.clone()));
+            }
+        }
+        put_node(store, unit.to_node())?;
+        // The partial transcript survives the rejection (usability review #1) — it is what the
+        // operator reads to decide between retry, reassign and stop.
+        persist_rejected_transcript(store, &session, unit, &output.output);
+        emit(
+            subscribers,
+            CoreEvent::StepFailed {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                detail: if human_present {
+                    format!("{why} Pausing for the operator's decision.")
+                } else {
+                    format!("{why} No operator in the loop; the run fails.")
+                },
+                failure_kind: crate::event::StepFailureKind::TimedOut,
+            },
+        );
+        if !human_present {
+            return Ok(fail_run(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                &mut session,
+                ord,
+            ));
+        }
+        let prompt = format!(
+            "{why} Approve to re-dispatch the unit as attempt {} on the same tree (optionally \
+             amend with a narrower instruction, e.g. which checks to skip); reassign it to \
+             another seat first if this one was the slow part; or reject to stop the run — the \
+             worktree is kept either way.",
+            output.attempt + 2
+        );
+        pause_for_human(
+            store,
+            subscribers,
+            self_tx,
+            &mut session,
+            ord,
+            Some(ord),
+            "failure",
+            prompt,
+        )?;
+        return Ok(StepApplied::Paused);
+    }
+    // A worker that CANCELLED the live unit (an external stop: operator Ctrl-C, run-terminal kill,
+    // a reassign's tear-down) terminates the run as Cancelled — and clears in_flight via
+    // `Finished` (NOT `Stale`, which would wedge the run). Its record was replayed above.
+    if output.status == crate::workflow::StepStatus::Cancelled {
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
@@ -19233,10 +19368,231 @@ mod turn_timeout_vs_cancel_tests {
             .unwrap();
         let terminal_ix = events
             .iter()
-            .position(|e| matches!(e, CoreEvent::RunCancelled { .. }))
-            .expect("the backstop still ends the run");
+            .position(|e| matches!(e, CoreEvent::SessionFailed { .. }))
+            .expect("with no operator the timeout fails the run (core#744)");
         assert!(hook_ix < terminal_ix, "{events:?}");
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+    }
+
+    fn with_operator(store: &mut dyn GraphStore, run_id: &str) {
+        let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        s.human_confirm = HumanConfirm::Before(1);
+        s.workdir = Some("/tmp/wt-of-the-run".to_string());
+        put_node(store, s.to_node()).unwrap();
+    }
+
+    fn gate_of(events: &[CoreEvent]) -> Option<(String, String)> {
+        events.iter().find_map(|e| match e {
+            CoreEvent::AwaitingHuman {
+                gate_kind, prompt, ..
+            } => Some((gate_kind.clone(), prompt.clone())),
+            _ => None,
+        })
+    }
+
+    /// (core#744) A creator that hits the ceiling with an operator in the loop PAUSES the run at a
+    /// `failure` gate instead of cancelling it: the unit is Rejected under a `turn_timeout` denial,
+    /// `stepFailed{failureKind: "timedOut"}` names the cause, the prompt names the ceiling that
+    /// fired (the daemon's `WICKED_UNIT_TIMEOUT_SECS`), says the worktree is kept, and offers
+    /// retry / reassign / stop. No `runCancelled` anywhere. Run ada5b0aa: the engine answered a
+    /// 2 h 49 min rework attempt with `runCancelled` and 78 files of finished work were orphaned.
+    #[test]
+    fn a_turn_timeout_with_an_operator_opens_a_failure_gate_and_keeps_the_run() {
+        let run_id = format!("timeout-gate-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 1);
+        with_operator(&mut store, &run_id);
+
+        let (applied, session, events) = fold(&mut store, &run_id, StepStatus::TimedOut, 1);
+        assert!(matches!(applied, StepApplied::Paused), "{events:?}");
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(step_status_of(&events).as_deref(), Some("timed_out"));
+        let (kind, prompt) = gate_of(&events).expect("a gate opened");
+        assert_eq!(kind, "failure");
+        assert!(
+            prompt.contains("ran out of time")
+                && prompt.contains(crate::workflow::UNIT_TIMEOUT_ENV)
+                && prompt.contains("/tmp/wt-of-the-run")
+                && prompt.contains("reassign")
+                && prompt.contains("reject to stop the run"),
+            "the ceiling, the kept tree and the three moves, in plain words: {prompt}"
+        );
+        let failed: Vec<(u32, crate::event::StepFailureKind, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::StepFailed {
+                    attempt,
+                    failure_kind,
+                    detail,
+                    ..
+                } => Some((*attempt, failure_kind.clone(), detail.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "{events:?}");
+        assert_eq!(failed[0].0, 1);
+        assert_eq!(failed[0].1, crate::event::StepFailureKind::TimedOut);
+        assert!(
+            failed[0].2.contains("Pausing for the operator"),
+            "{}",
+            failed[0].2
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::RunCancelled { .. })),
+            "never cancelled: {events:?}"
+        );
+        let unit = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("turn_timeout")
+        );
+        assert_eq!(unit.budget_secs, None, "no step budget to lift");
+        // The durable prompt exists, so a skin that was not connected still finds the gate.
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(&run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].gate_kind.as_deref(), Some("failure"));
+    }
+
+    /// (codex round 2 on #748) A GOVERNED attempt that times out with NO decisions log (the hook
+    /// never fired, or the evidence was erased) is denied `input_governance` — fail closed, exactly
+    /// as an `Ok` attempt would be — and the gate says so; the timeout is still named.
+    #[test]
+    fn a_governed_timeout_without_a_hook_record_is_denied_input_governance_at_the_gate() {
+        let run_id = format!("timeout-ungoverned-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+        with_operator(&mut store, &run_id);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+
+        let (applied, _session, events) =
+            fold_with(&mut store, &run_id, StepStatus::TimedOut, 0, true);
+        assert!(matches!(applied, StepApplied::Paused), "{events:?}");
+        let (kind, prompt) = gate_of(&events).expect("a gate opened");
+        assert_eq!(kind, "failure");
+        assert!(
+            prompt.contains("ran out of time")
+                && prompt.contains("input governance could not be proven")
+                && prompt.contains("NO decisions log"),
+            "{prompt}"
+        );
+        let unit = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("input_governance"),
+            "the fail-closed governance denial dominates the timeout's: {:?}",
+            unit.denial
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::RunCancelled { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// (core#744) When the plan step's own `budget_secs` was the binding bound, the gate says so
+    /// and LIFTS it, so an approve retries under the daemon's full ceiling — "retry with more
+    /// time" where more time exists.
+    #[test]
+    fn a_step_budget_that_bound_the_ceiling_is_named_and_lifted_for_the_retry() {
+        let run_id = format!("timeout-budget-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+        with_operator(&mut store, &run_id);
+        let mut u = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        u.budget_secs = Some(90);
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let (applied, _session, events) = fold(&mut store, &run_id, StepStatus::TimedOut, 0);
+        assert!(matches!(applied, StepApplied::Paused), "{events:?}");
+        let (_, prompt) = gate_of(&events).expect("a gate opened");
+        assert!(
+            prompt.contains("the plan step's own budget of 1 min 30 s")
+                && prompt.contains("lifted now")
+                && prompt.contains("full ceiling"),
+            "{prompt}"
+        );
+        let unit = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            unit.budget_secs, None,
+            "the binding budget is lifted for the retry"
+        );
+    }
+
+    /// (core#744) Approving the timeout gate re-dispatches the SAME unit as the next attempt on
+    /// the same tree — the run resumes, nothing is relaunched.
+    #[test]
+    fn approving_the_timeout_gate_redispatches_the_unit_as_the_next_attempt() {
+        let run_id = format!("timeout-approve-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+        with_operator(&mut store, &run_id);
+        let (applied, _session, _events) = fold(&mut store, &run_id, StepStatus::TimedOut, 0);
+        assert!(matches!(applied, StepApplied::Paused));
+
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        subs.push(ev_tx);
+        let mut in_flight = HashSet::new();
+        let status = confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            crate::workflow::HumanDecision::Approve {
+                amend: Some("skip the journey suite this time".to_string()),
+                amend_scope: Default::default(),
+            },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+        let events: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::Resumed { ord: 1, .. })),
+            "{events:?}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.attempt, 1,
+            "the retry is attempt 1 of the same unit"
+        );
+        let unit = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        assert!(
+            unit.description.contains("skip the journey suite"),
+            "the operator's amendment rides the retry: {}",
+            unit.description
+        );
     }
 
     /// (codex round 2 on #746, HIGH) A plain `Failed` attempt — the bridge died without an
@@ -19411,9 +19767,10 @@ mod turn_timeout_vs_cancel_tests {
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
     }
 
-    /// (1) The engine's turn ceiling folds terminal — same backstop as a cancel — but the wire
-    /// says `"timed_out"`, and the terminal frame is still `RunCancelled` (shape-compatible for
-    /// every existing consumer).
+    /// (1) The engine's turn ceiling with NO operator in the loop (`HumanConfirm::None`) folds
+    /// terminal — the wire says `"timed_out"`, `stepFailed{failureKind: "timedOut"}` names the
+    /// cause, and the terminal frame is `SessionFailed`, never `RunCancelled` (core#744:
+    /// `runCancelled` is reserved for a cancel somebody asked for).
     #[test]
     fn turn_timeout_folds_terminal_with_a_distinguishing_step_status() {
         let run_id = format!("timeout-fold-{}", std::process::id());
@@ -19422,17 +19779,33 @@ mod turn_timeout_vs_cancel_tests {
 
         let (applied, session, events) = fold(&mut store, &run_id, StepStatus::TimedOut, 0);
         assert!(matches!(applied, StepApplied::Finished));
-        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert_eq!(session.status, SessionStatus::Failed);
         assert_eq!(
             step_status_of(&events).as_deref(),
             Some("timed_out"),
             "the turn-timeout must be wire-distinguishable from an operator cancel"
         );
         assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoreEvent::StepFailed {
+                    failure_kind: crate::event::StepFailureKind::TimedOut,
+                    ..
+                }
+            )),
+            "the cause is named on the wire: {events:?}"
+        );
+        assert!(
             events.iter().any(
-                |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == &run_id)
+                |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == &run_id)
             ),
-            "the terminal frame stays RunCancelled — additive distinction, no wire break"
+            "the terminal frame is SessionFailed: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::RunCancelled { .. })),
+            "a timeout never ends the run as cancelled (core#744): {events:?}"
         );
     }
 

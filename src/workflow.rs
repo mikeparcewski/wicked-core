@@ -57,6 +57,46 @@ pub fn effective_timeout(
     }
 }
 
+/// The environment variable naming the engine's per-turn wall ceiling, in seconds.
+pub const UNIT_TIMEOUT_ENV: &str = "WICKED_UNIT_TIMEOUT_SECS";
+
+/// The default per-turn ceiling when [`UNIT_TIMEOUT_ENV`] is unset or unparsable: two hours.
+/// Real governed turns (a repo's full test suite under load) commonly exceed 15 minutes.
+pub const UNIT_TIMEOUT_DEFAULT_SECS: u64 = 7200;
+
+/// The engine's per-turn wall ceiling as the daemon's environment sets it — the ONE reading every
+/// carrier (wrapped CLI, persistent PTY, ACP) constructs with, and the one the actor names when a
+/// turn hits it (core#744: the ceiling that fired must be spelled out to the operator, so it is
+/// read in one place and spelled one way).
+pub fn unit_timeout_ceiling() -> std::time::Duration {
+    let secs = std::env::var(UNIT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(UNIT_TIMEOUT_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// (core#744) Which bound a unit's turn actually ran under, in the operator's words: the plan
+/// step's `budget_secs` when it was the tighter of the two, else the daemon's ceiling — with the
+/// seconds it amounted to. `(seconds, budget_bound)`.
+pub fn binding_timeout(ceiling: std::time::Duration, budget_secs: Option<u64>) -> (u64, bool) {
+    let effective = effective_timeout(ceiling, budget_secs);
+    let budget_bound = budget_secs.is_some_and(|b| std::time::Duration::from_secs(b) < ceiling);
+    (effective.as_secs(), budget_bound)
+}
+
+/// Spell a wall ceiling for a human: `2 h`, `1 h 30 min`, `45 min`, `90 s`.
+pub fn spell_secs(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    match (h, m, s) {
+        (0, 0, s) => format!("{s} s"),
+        (0, m, 0) => format!("{m} min"),
+        (0, m, s) => format!("{m} min {s} s"),
+        (h, 0, 0) => format!("{h} h"),
+        (h, m, _) => format!("{h} h {m} min"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StepInput {
     pub run_id: String,
@@ -209,9 +249,14 @@ pub enum StepStatus {
     /// consumer arming automatic stall recovery can key on the platform's own timeout WITHOUT
     /// ever treating an operator's cancel as failover-eligible (run 616c8661: making the ceiling
     /// actionable under the shared `Cancelled` status would let auto-recovery un-cancel a Ctrl-C).
-    /// The fold treats it exactly like `Cancelled` (terminal backstop — the silence watchdog is
-    /// the primary recovery lever and fires far earlier); the distinction rides the wire as
-    /// `UnitOutputCaptured.step_status == "timed_out"`.
+    /// (core#744) The fold does NOT treat it like `Cancelled`: a timed-out unit is Rejected under a
+    /// `turn_timeout` denial that names the bound which fired, `stepFailed{failureKind:
+    /// "timedOut"}` is emitted, and the run PAUSES at a `failure` gate (approve = re-dispatch as
+    /// the next attempt on the same tree, reassign, or reject with the worktree kept) — or, with
+    /// no operator in the loop (`HumanConfirm::None`), FAILS (`sessionFailed`). Only `Cancelled`
+    /// takes the cancel terminal (`runCancelled`); a team PA step's timeout with another eligible
+    /// seat takes the seat failover instead. The silence watchdog remains the earlier lever. The
+    /// distinction also rides the wire as `UnitOutputCaptured.step_status == "timed_out"`.
     TimedOut,
 }
 
