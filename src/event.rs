@@ -20,6 +20,15 @@ pub enum StepFailureKind {
     /// "the CLI worker process failed" (e.g. seat-health failover) never punish a healthy seat
     /// for a governance rejection.
     SubstanceRejected,
+    /// (core#744) The engine's own turn ceiling fired — `WICKED_UNIT_TIMEOUT_SECS`, lowered to
+    /// the plan step's `budget_secs` when it set one — before the seat finished its turn. The
+    /// work is in the worktree, unjudged; the seat is not dead (the same tree may have passed the
+    /// floor on an earlier attempt) and the ceiling is most often a host-load artefact, so this is
+    /// kept apart from [`Self::WorkerError`]: seat-health must not bench the seat, and a skin must
+    /// not read it as a refusal or as the operator's cancel. Pairs with
+    /// `unitOutputCaptured.stepStatus: "timed_out"` on the same attempt and the `failure` gate
+    /// that follows (`awaitingHuman.gateKind: "failure"`).
+    TimedOut,
 }
 
 /// One prior unit whose output was injected into a receiving unit's ACP context (EVT-007).
@@ -1782,6 +1791,7 @@ impl CoreEvent {
                     StepFailureKind::WorkerError => "workerError",
                     StepFailureKind::EnvironmentRefused => "environmentRefused",
                     StepFailureKind::SubstanceRejected => "substanceRejected",
+                    StepFailureKind::TimedOut => "timedOut",
                 },
             }),
             CoreEvent::WorkerStalled {

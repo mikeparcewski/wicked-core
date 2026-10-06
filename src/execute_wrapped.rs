@@ -1312,11 +1312,7 @@ struct WrappedCancelRegistry {
 /// commonly exceed 15 min. Override with `WICKED_UNIT_TIMEOUT_SECS` (e.g. 900 for conservative
 /// environments). Extracted into a helper so both `Default` and `with_tx` stay DRY (Gemini).
 fn unit_timeout() -> Duration {
-    let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(7200);
-    Duration::from_secs(secs)
+    crate::workflow::unit_timeout_ceiling()
 }
 
 impl Default for WrappedCliStepRunner {

@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core#744 — a creator that hits the turn ceiling opens a gate; the run is never "cancelled"
+  by its own timeout.** Dogfood run ada5b0aa: the creator's rework attempt ran the repo's full
+  journey suite under host load 90-220, hit the 2 h ceiling with 78 files of finished work
+  uncommitted, and the engine emitted `runCancelled` — no gate, the worktree orphaned, "Retry" a
+  brand-new run, and the skin showed the operator's own send-back note as the reason
+  (studio#537). Now a `timed_out` capture takes the failure ladder's human decision point: the
+  unit is Rejected under a `turn_timeout` denial whose text names the bound that fired in plain
+  words (the daemon's `WICKED_UNIT_TIMEOUT_SECS` ceiling, or the plan step's `budget_secs` — which
+  is LIFTED on the spot so an approve retries under the full ceiling), the partial transcript is
+  kept, `stepFailed{failureKind: "timedOut"}` (new variant, additive) names the cause, and the run
+  pauses at a `failure` gate: approve re-dispatches the unit as the next attempt on the same tree
+  (an amendment rides it), the reassign surface moves it to another seat, reject stops the run
+  and keeps the worktree. With no operator in the loop (`HumanConfirm::None`) the run FAILS
+  (`sessionFailed`; the clean-only reap keeps a dirty tree) — `runCancelled` is reserved for a
+  cancel somebody asked for. The team PA's seat-failover timeout is unchanged. The three carriers
+  now read the ceiling through one helper (`workflow::unit_timeout_ceiling`). Tests: operator
+  gate (prompt names the env var, the kept tree, retry/reassign/stop; durable `failure` row; no
+  `runCancelled`), budget lift ("1 min 30 s … lifted now"), no-operator → `sessionFailed`,
+  approve → `Resumed` at attempt 1 with the amendment on the unit.
 - **core#743 — a rework attempt's governance record reaches the wire.** Dogfood run ada5b0aa
   (crew 0.8.1 / core-ts 0.7.38): the creator's rework attempt — re-dispatched after a send-back
   on the cached ACP session — showed 0 `governanceHookFired` against 115 on attempt 0 and no

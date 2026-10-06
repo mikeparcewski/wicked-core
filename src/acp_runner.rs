@@ -6088,10 +6088,6 @@ impl AcpStepRunner {
         elicitation_maps: Arc<Mutex<ElicitationMaps>>,
         write_reg: WriteReg,
     ) -> Self {
-        let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(7200);
         Self {
             // Give the fallback runner the same tx so it can relay GovernanceContextArmed
             // events (EVT-016 "wrapped_cli" path) when ACP falls back to the wrapped-CLI runner.
@@ -6104,7 +6100,7 @@ impl AcpStepRunner {
             chat_scopes: Arc::new(Mutex::new(HashMap::new())),
             chat_holds: Arc::new(Mutex::new(HashMap::new())),
             chat_open_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            timeout: Duration::from_secs(secs),
+            timeout: crate::workflow::unit_timeout_ceiling(),
             operational_home: None,
             elicitation_maps,
             write_reg,

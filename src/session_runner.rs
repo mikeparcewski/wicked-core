@@ -73,15 +73,11 @@ const PTY_CARRIER: &str = "persistent PTY";
 
 impl PersistentStepRunner {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<Command>, pty: terminal::PtyMap) -> Self {
-        let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(7200);
         Self {
             tx,
             pty,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            timeout: Duration::from_secs(secs),
+            timeout: crate::workflow::unit_timeout_ceiling(),
         }
     }
 
