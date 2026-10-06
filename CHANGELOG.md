@@ -57,6 +57,16 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.39** — 2026-10-06 — npm release carrying the **two** engine fixes since 0.7.38, on
+  main tip c594c24; both from dogfood run ada5b0aa (crew 0.8.1 / core-ts 0.7.38). Wire changes are
+  additive (`stepFailed.failureKind: "timedOut"` is a new variant; old rows read as before).
+  **core#744 (#748)** — a creator that hits the turn ceiling opens a `failure` gate (approve = retry
+  on the same tree, reassign, reject keeps the worktree); the run is never `runCancelled` by its own
+  timeout, a no-operator run FAILS, the plan step's `budget_secs` is lifted on approve, and the
+  fail-closed input-governance fold runs on the timed-out attempt too.
+  **core#743 (#746)** — a rework attempt's governance record reaches the wire: the decisions-log
+  replay (`governanceHookFired`, refusals) runs at the `timed_out`/`cancelled` backstop, and the ACP
+  carrier emits `skillsSnapshotHanded` for every reused turn.
 - **core-ts 0.7.38** — 2026-10-05 — npm release carrying the **ASK-K core slices** (DES-ASK-TEAM-CHAT-001:
   an ask starts a path — DES-TEAMING-002 applied to studio's Ask entry point) since 0.7.37, on main
   tip 02b08c3. Wire changes are additive (`serde(default)`; old rows read as before); one new event
