@@ -5294,7 +5294,8 @@ fn apply_step_result(
     // branch: a PA step of a team run that hit the ceiling is a SEAT failure the path survives
     // when another eligible seat can take the PA's place — it takes the failover ladder below,
     // which re-picks the PA (`path.repicked`) and redispatches the step as attempt+1. With no
-    // other seat it takes this backstop exactly as before.
+    // other seat it is an ordinary timeout (core#744): the `failure` gate with an operator,
+    // `sessionFailed` without one — never the cancel backstop.
     let pa_timed_out =
         output.status == crate::workflow::StepStatus::TimedOut && team_gate::is_pa_step(unit) && {
             let seat = unit.assigned_cli.as_deref().unwrap_or("claude");
@@ -5372,14 +5373,43 @@ fn apply_step_result(
             ),
             None => "Whatever it wrote is still on disk — unjudged, not discarded".to_string(),
         };
-        let why = format!(
+        let mut why = format!(
             "Unit {ord} ({cli}) ran out of time on attempt {}: {source} elapsed before the seat \
              finished its turn. {tree}.",
             output.attempt + 1
         );
+        // (codex round 2 on #748) The SAME fail-closed input-governance fold every other non-Ok
+        // governed path runs: a governed attempt with no decisions log, or a wrapped one that made
+        // tool calls under a suppressed hook, is denied `input_governance` — that denial DOMINATES
+        // the timeout's (the gate still opens, but it says the attempt's calls were unchecked, and
+        // the record on the unit is the governance one). Deny claims are conformed as a side effect.
+        let governance = if output.governed {
+            crate::gate_hook::fold_input_denial_with_activity(
+                store,
+                &run_id,
+                output.attempt,
+                &crate::scope::unit_phase(ord),
+                true,
+                tool_activity,
+            )?
+        } else {
+            None
+        };
         unit.status = crate::domain::UnitStatus::Rejected;
-        unit.denial_reason = Some(why.clone());
-        unit.denial = Some(crate::domain::UnitDenial::new("turn_timeout", why.clone()));
+        match governance {
+            Some(denial) => {
+                why = format!(
+                    "{why} — and the attempt's input governance could not be proven: {}",
+                    denial.reason
+                );
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(denial);
+            }
+            None => {
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(crate::domain::UnitDenial::new("turn_timeout", why.clone()));
+            }
+        }
         put_node(store, unit.to_node())?;
         // The partial transcript survives the rejection (usability review #1) — it is what the
         // operator reads to decide between retry, reassign and stop.
@@ -19431,6 +19461,46 @@ mod turn_timeout_vs_cancel_tests {
         .unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].gate_kind.as_deref(), Some("failure"));
+    }
+
+    /// (codex round 2 on #748) A GOVERNED attempt that times out with NO decisions log (the hook
+    /// never fired, or the evidence was erased) is denied `input_governance` — fail closed, exactly
+    /// as an `Ok` attempt would be — and the gate says so; the timeout is still named.
+    #[test]
+    fn a_governed_timeout_without_a_hook_record_is_denied_input_governance_at_the_gate() {
+        let run_id = format!("timeout-ungoverned-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+        with_operator(&mut store, &run_id);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+
+        let (applied, _session, events) =
+            fold_with(&mut store, &run_id, StepStatus::TimedOut, 0, true);
+        assert!(matches!(applied, StepApplied::Paused), "{events:?}");
+        let (kind, prompt) = gate_of(&events).expect("a gate opened");
+        assert_eq!(kind, "failure");
+        assert!(
+            prompt.contains("ran out of time")
+                && prompt.contains("input governance could not be proven")
+                && prompt.contains("NO decisions log"),
+            "{prompt}"
+        );
+        let unit = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(
+            unit.denial.as_ref().map(|d| d.source.as_str()),
+            Some("input_governance"),
+            "the fail-closed governance denial dominates the timeout's: {:?}",
+            unit.denial
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::RunCancelled { .. })),
+            "{events:?}"
+        );
     }
 
     /// (core#744) When the plan step's own `budget_secs` was the binding bound, the gate says so

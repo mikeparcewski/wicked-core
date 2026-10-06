@@ -28,7 +28,11 @@ Two release tracks share this file, newest entry first regardless of track:
   (an amendment rides it), the reassign surface moves it to another seat, reject stops the run
   and keeps the worktree. With no operator in the loop (`HumanConfirm::None`) the run FAILS
   (`sessionFailed`; the clean-only reap keeps a dirty tree) — `runCancelled` is reserved for a
-  cancel somebody asked for. The team PA's seat-failover timeout is unchanged. The three carriers
+  cancel somebody asked for; a one-seat team PA timeout (nobody to re-pick) follows the same rule
+  (was: the cancel backstop). The fail-closed input-governance fold runs on the timed-out attempt
+  too: a governed attempt with no hook record is denied `input_governance`, which dominates the
+  `turn_timeout` denial on the unit and in the prompt. The two-seat PA seat-failover is unchanged.
+  The three carriers
   now read the ceiling through one helper (`workflow::unit_timeout_ceiling`). Tests: operator
   gate (prompt names the env var, the kept tree, retry/reassign/stop; durable `failure` row; no
   `runCancelled`), budget lift ("1 min 30 s … lifted now"), no-operator → `sessionFailed`,
