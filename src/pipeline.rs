@@ -1380,36 +1380,10 @@ pub(crate) fn apply_and_finish_unit(
     // escalate to human review).
     let hook_denied = hook_denial.is_some();
 
-    // (EVT-008) GovernanceHookFired — replay per-tool-call decisions from the NDJSON log as events.
-    // Only runs for governed units (ungoverned units have no log). Reads the log once more (cheap;
-    // tiny NDJSON files) so fold_input_denial's signature is unchanged. Emits one event per claim
-    // entry for this unit's phase, in log order.
-    // (DES-MCP-TOOLS-001 §4.4) A brokered MCP call the gate refused: blocked, the seat continued.
-    // Disclosed for EVERY unit, governed by its runner or not — the broker, not the carrier, is
-    // what governs an MCP call, so a codex or pi unit's refusals are as real as a claude one's.
-    for rec in crate::gate_hook::collect_hook_decisions(
-        session_id,
-        attempt,
-        &crate::scope::unit_phase(unit.ord),
-    ) {
-        if let Some((reason, subject, remedy)) = rec.mcp_refusal() {
-            emit(CoreEvent::WorkerToolCallDenied {
-                session: session_id.to_string(),
-                ord: unit.ord,
-                attempt,
-                cli: unit
-                    .assigned_cli
-                    .clone()
-                    .unwrap_or_else(|| "claude".to_string()),
-                carrier: crate::mcp_gate::CARRIER_SHIM.to_string(),
-                role: crate::write_posture::role_wire(unit.role).to_string(),
-                tool: rec.tool_name.clone(),
-                command: subject,
-                reason,
-                remedy,
-            });
-        }
-    }
+    // (EVT-008 / DES-MCP-TOOLS-001 §4.4) The attempt's decisions-log disclosures — the brokered
+    // MCP refusals for EVERY unit and, for a governed one, the hook's refusals and one
+    // `governanceHookFired` per recorded call — ride `disclose_hook_record` below (core#743: the
+    // same helper the terminal backstop calls for an attempt that never folds).
     // (core#716) A blocked filesystem-boundary WRITE the fold did NOT deny on, because the unit's
     // floor passed (`fold_input_denial_after_floor`): disclosed here with the tool named, exactly
     // as an advisory refusal is — never silently dropped. Read off the same log the fold read, for
@@ -1442,9 +1416,7 @@ pub(crate) fn apply_and_finish_unit(
             }
         }
     }
-    if governed {
-        disclose_hook_record(session_id, attempt, unit, emit);
-    }
+    disclose_hook_record(session_id, attempt, unit, governed, emit);
 
     // DENY-DOMINATES ordering: deterministic re-verify, the evaluator's own verdict, agent judge,
     // evaluator pass, input governance. Each layer is wrapped as a STRUCTURED denial naming its
@@ -1737,10 +1709,11 @@ pub(crate) fn apply_and_finish_unit(
     Ok(outcome)
 }
 
-/// (core#743) Replay a GOVERNED attempt's durable gate-hook record onto the event stream: one
-/// `governanceHookFired` per recorded tool call (in log order), preceded by the
-/// `workerToolCallDenied` disclosures for the refusals the seat survived (a fenced remote write,
-/// a write-path estate command, a phase-scope write). The hook — the wrapped carrier's PreToolUse
+/// (core#743) Replay an attempt's durable decisions-log record onto the event stream: the
+/// brokered MCP refusals (every unit), then — for a GOVERNED attempt — one `governanceHookFired`
+/// per recorded tool call (in log order), each preceded by the `workerToolCallDenied` disclosures
+/// for the refusals the seat survived (a fenced remote write, a write-path estate command, a
+/// phase-scope write). The hook — the wrapped carrier's PreToolUse
 /// subprocess, or the ACP carrier's `session/request_permission` answer — has no emit seam of its
 /// own: the decisions log at `decisions_path_for(session, attempt)` IS its record, and this replay
 /// is the only way it reaches the wire.
@@ -1754,9 +1727,37 @@ pub(crate) fn disclose_hook_record(
     session_id: &str,
     attempt: u32,
     unit: &crate::domain::WorkUnit,
+    governed: bool,
     emit: &mut dyn FnMut(CoreEvent),
 ) {
     let phase = crate::scope::unit_phase(unit.ord);
+    // (DES-MCP-TOOLS-001 §4.4) A brokered MCP call the gate refused: blocked, the seat continued.
+    // Disclosed for EVERY unit, governed by its runner or not — the broker, not the carrier, is
+    // what governs an MCP call, so a codex or pi unit's refusals are as real as a claude one's.
+    for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+        if let Some((reason, subject, remedy)) = rec.mcp_refusal() {
+            emit(CoreEvent::WorkerToolCallDenied {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+                carrier: crate::mcp_gate::CARRIER_SHIM.to_string(),
+                role: crate::write_posture::role_wire(unit.role).to_string(),
+                tool: rec.tool_name.clone(),
+                command: subject,
+                reason,
+                remedy,
+            });
+        }
+    }
+    // (EVT-008) GovernanceHookFired — the hook's per-tool-call decisions, one event per claim entry
+    // for this unit's phase, in log order; a governed unit only (an ungoverned one armed no hook).
+    if !governed {
+        return;
+    }
     for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
         // (F-7R2-012) The wrapped carrier's gate hook refused a `git push` / `gh pr create`:
         // the hook is a subprocess with no emit seam, so the fold discloses the refusal here

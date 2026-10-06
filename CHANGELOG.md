@@ -22,10 +22,14 @@ Two release tracks share this file, newest entry first regardless of track:
   because (a) `governanceHookFired` is replayed from the decisions log at the FOLD, and an attempt
   captured `timed_out`/`cancelled` takes the terminal backstop before any fold, and (b) the
   handoff event was emitted once per ACP SPAWN, so a reused session reported nothing for its later
-  turns. Fixed: `pipeline::disclose_hook_record` (the fold's replay, factored) runs for a governed
-  attempt at the backstop too, before the terminal frame; the ACP carrier emits
+  turns. Fixed: `pipeline::disclose_hook_record` (the fold's decisions-log replay, factored: the
+  brokered-MCP refusals for every unit, the hook's refusals and `governanceHookFired` for a governed
+  one) runs at the backstop for every `timed_out`/`cancelled` attempt — the team PA's seat-failover
+  timeout included — before the terminal frame or the re-dispatch; the ACP carrier emits
   `skillsSnapshotHanded` for every REUSED turn as well (same `gen`, the turn's own `ord`/`attempt`
-  — one record per dispatch, the contract crew's live-generation pins already tolerate). Wire:
+  — one record per dispatch, the contract crew's live-generation pins already tolerate), emitted
+  only once the turn is about to run on ACP (never for a reused turn rerouted to the wrapped
+  carrier). Wire:
   no new types or fields; more `skillsSnapshotHanded` rows per ACP session. Tests: an actor fold
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`

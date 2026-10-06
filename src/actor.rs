@@ -5302,22 +5302,31 @@ fn apply_step_result(
                 .iter()
                 .any(|k| k != seat && !unit.worker_failed_clis.contains(k))
         };
+    // (core#743) A cancelled or timed-out attempt never reaches the fold, so its decisions-log
+    // record — the ONLY wire-visible proof the hook ran (the fold replays it as
+    // `governanceHookFired`, and discloses the brokered MCP refusals for every unit) — would
+    // otherwise never be told. Run ada5b0aa: the creator's rework attempt (2 h 49 min, 78 files
+    // edited) was captured `timed_out` and showed 0 hook events against 115 on attempt 0; the hook
+    // had fired on every call, the record just stayed on disk. Replay it FIRST — before the
+    // terminal frame below, and before the team PA's seat failover (`pa_timed_out`) re-dispatches
+    // the step as attempt+1 — exactly as the fold would have (codex review on #746).
+    if matches!(
+        output.status,
+        crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
+    ) {
+        crate::pipeline::disclose_hook_record(
+            &run_id,
+            output.attempt,
+            unit,
+            output.governed,
+            &mut |e| emit(subscribers, e),
+        );
+    }
     if matches!(
         output.status,
         crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
     ) && !pa_timed_out
     {
-        // (core#743) An attempt that ends here never reaches the fold, so its gate-hook record —
-        // the ONLY wire-visible proof the hook ran (the fold replays it as `governanceHookFired`)
-        // — would otherwise never be told. Run ada5b0aa: the creator's rework attempt (2 h 49 min,
-        // 78 files edited) was captured `timed_out` and showed 0 hook events against 115 on
-        // attempt 0; the hook had fired on every call, the record just stayed on disk. Replay it
-        // BEFORE the terminal frame, exactly as the fold would have.
-        if output.governed {
-            crate::pipeline::disclose_hook_record(&run_id, output.attempt, unit, &mut |e| {
-                emit(subscribers, e)
-            });
-        }
         session.status = SessionStatus::Cancelled;
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
@@ -19142,10 +19151,57 @@ mod turn_timeout_vs_cancel_tests {
             &claim,
         )
         .unwrap();
+        // …and one brokered MCP call the gate REFUSED (DES-MCP-TOOLS-001 §4.4) — recorded by the
+        // broker, disclosed by the fold as `workerToolCallDenied{carrier: "shim"}` for every unit
+        // (codex review on #746: the terminal replay must carry it too).
+        let mcp_deny = wicked_apps_core::ConformanceClaim {
+            claim_id: format!("{}{phase}:1", crate::gate_hook::MCP_DENY_PREFIX),
+            scope: format!("wicked-agent/{run_id}/unit/{run_id}:u1"),
+            phase: phase.clone(),
+            policy_ids: vec!["engine:mcp-fence".to_string()],
+            decision: wicked_apps_core::Decision::Deny,
+            obligations: vec![
+                "no MCP server is registered for workers".to_string(),
+                "estate.memory_store".to_string(),
+                "use the shim".to_string(),
+            ],
+            evaluated_context_ref: "sha256:test".to_string(),
+            criteria: "test".to_string(),
+            evaluator_identity: crate::mcp_gate::MCP_EVALUATOR.to_string(),
+            evaluated_at: crate::clock::eval_now(),
+        };
+        crate::gate_hook::append_annotated_claim_checked(
+            &decisions.to_string_lossy(),
+            &phase,
+            "mcp__estate__memory_store",
+            &mcp_deny,
+        )
+        .unwrap();
 
         let (applied, _session, events) =
             fold_with(&mut store, &run_id, StepStatus::TimedOut, 1, true);
         assert!(matches!(applied, StepApplied::Finished));
+        let shim_denies: Vec<(u32, String, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::WorkerToolCallDenied {
+                    attempt,
+                    carrier,
+                    command,
+                    ..
+                } => Some((*attempt, carrier.clone(), command.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shim_denies,
+            vec![(
+                1,
+                crate::mcp_gate::CARRIER_SHIM.to_string(),
+                "estate.memory_store".to_string()
+            )],
+            "the refused MCP call is disclosed at the backstop as the fold would: {events:?}"
+        );
         let fired: Vec<(u32, String, String)> = events
             .iter()
             .filter_map(|e| match e {
@@ -19160,7 +19216,15 @@ mod turn_timeout_vs_cancel_tests {
             .collect();
         assert_eq!(
             fired,
-            vec![(1, "Edit".to_string(), "allow".to_string())],
+            vec![
+                (1, "Edit".to_string(), "allow".to_string()),
+                // The broker's deny is a hook record too — the fold replays it the same way.
+                (
+                    1,
+                    "mcp__estate__memory_store".to_string(),
+                    "deny".to_string()
+                ),
+            ],
             "the timed-out attempt's hook record is replayed under its own attempt: {events:?}"
         );
         // Ordered: the record precedes the terminal frame, as it does for a folded unit.
@@ -19173,6 +19237,109 @@ mod turn_timeout_vs_cancel_tests {
             .position(|e| matches!(e, CoreEvent::RunCancelled { .. }))
             .expect("the backstop still ends the run");
         assert!(hook_ix < terminal_ix, "{events:?}");
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+    }
+
+    /// (codex review on #746, HIGH) A TEAM PA step that hits the ceiling with another eligible
+    /// seat takes the seat-failover ladder (`pa_timed_out`), not the terminal backstop — and that
+    /// attempt never folds either. Its record is replayed all the same, before anything re-picks
+    /// the PA or re-dispatches the step.
+    #[test]
+    fn a_pa_steps_timed_out_attempt_replays_its_hook_record_before_the_failover() {
+        let run_id = format!("timeout-pa-replay-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+        // Make the unit a PA step: a teamed run's seat turn, owned by the PA, not a tool command.
+        let mut u = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        u.team_run = true;
+        u.tool_cmd = None;
+        u.owner = crate::workflow::StepOwner::Pa;
+        put_node(&mut store, u.to_node()).unwrap();
+        let phase = crate::scope::unit_phase(1);
+        let decisions = crate::gate_hook::decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        crate::gate_hook::write_armed_marker_for(
+            &decisions,
+            &phase,
+            Some(crate::gate_hook::CARRIER_ACP),
+        )
+        .unwrap();
+        let claim = wicked_apps_core::ConformanceClaim {
+            claim_id: format!("hook-fired:{phase}:0"),
+            scope: format!("wicked-agent/{run_id}/unit/{run_id}:u1"),
+            phase: phase.clone(),
+            policy_ids: vec![],
+            decision: wicked_apps_core::Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:test".to_string(),
+            criteria: "test".to_string(),
+            evaluator_identity: "wicked-core-test".to_string(),
+            evaluated_at: crate::clock::eval_now(),
+        };
+        crate::gate_hook::append_annotated_claim_checked(
+            &decisions.to_string_lossy(),
+            &phase,
+            "Bash",
+            &claim,
+        )
+        .unwrap();
+
+        // The ladder past the replay needs a real team record to re-pick the PA; this test owns
+        // only the replay, so the fold's outcome is not unwrapped — the events are the evidence.
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        subs.push(ev_tx);
+        let out = StepOutput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: "(cli `claude` exceeded the timeout and was killed)".into(),
+            status: StepStatus::TimedOut,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: true,
+        };
+        let _ = apply_step_result(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            crate::workflow::UnitEvidence::default(),
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        let events: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        let fired: Vec<(u32, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::GovernanceHookFired {
+                    attempt, tool_name, ..
+                } => Some((*attempt, tool_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fired,
+            vec![(0, "Bash".to_string())],
+            "the PA step's timed-out attempt replays its record: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::RunCancelled { .. })),
+            "a PA timeout with another eligible seat is a failover, never the cancel backstop: \
+             {events:?}"
+        );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
     }
 

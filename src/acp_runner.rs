@@ -7860,20 +7860,6 @@ impl AcpStepRunner {
                     "path=acp run={run_id} cli={cli_key} unit={} reused=true",
                     input.unit.ord
                 ));
-                // (core#743) The handoff is reported PER DISPATCH, not per spawn: this turn —
-                // a later unit, or a rework / retry attempt of the same unit — runs against the
-                // generation the cached session was opened with, and the record of which
-                // generation attempt N was handed must exist for attempt N (run ada5b0aa: the
-                // creator's rework attempt showed no `skillsSnapshotHanded` at all, and nothing
-                // on the wire said the seat still had its skills). Same event, same `gen`, the
-                // turn's own `ord` / `attempt`; the stderr line above already marks it reused.
-                self.emit_event(s.handed_event(
-                    &run_id,
-                    input.unit.ord,
-                    input.attempt,
-                    "acp",
-                    &cli_key,
-                ));
             }
         }
         let mut prompt = unit_prompt(input, skill_form, bound.as_ref());
@@ -8057,6 +8043,30 @@ impl AcpStepRunner {
                     input.unit.phase_id().unwrap_or("?"),
                     crate::write_posture::role_noun(f.role),
                 ),
+            }
+        }
+        // (core#743) The handoff is reported PER DISPATCH, not per spawn: a REUSED turn — a later
+        // unit, or a rework / retry attempt of the same unit — runs against the generation the
+        // cached session was opened with, and the record of which generation attempt N was handed
+        // must exist for attempt N (run ada5b0aa: the creator's rework attempt showed no
+        // `skillsSnapshotHanded` at all, and nothing on the wire said the seat still had its
+        // skills). Same event, same `gen`, the turn's own `ord` / `attempt`. Emitted HERE, past
+        // every early return above that can hand the unit to the wrapped carrier instead (the
+        // read-only reroute on an unproven pin): the record says the turn RAN on ACP against this
+        // generation, so it fires only when the turn is about to (codex review on #746). The
+        // spawning turn reported at `session/new`, where the bridge was actually handed the root.
+        if reused {
+            if let Some(s) = bound
+                .as_ref()
+                .filter(|s| s.delivery(&worker_cli).delivers_skills())
+            {
+                self.emit_event(s.handed_event(
+                    &run_id,
+                    input.unit.ord,
+                    input.attempt,
+                    "acp",
+                    &cli_key,
+                ));
             }
         }
         // DES-TEAMING-002 §4.2: the turn's team context (a claimed attempt publishes its checkpoints).
