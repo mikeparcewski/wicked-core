@@ -19,9 +19,13 @@
 //! `find_symbols(kind = EVENT)` and ordered by the timestamp-prefixed node id (a `changes_since`-
 //! style cursor drain can layer on later).
 //!
-//! ## Cross-platform
-//! The spool root resolves via `std::env::var_os("HOME")` / `USERPROFILE` joined with
-//! `std::path::Path` segments (never a hardcoded `~`), overridable via [`DEADLETTER_ENV`].
+//! ## Where the spool lives (core#749)
+//! Never under HOME. [`DEADLETTER_ENV`] when set (the launcher's choice: wicked-crew points its
+//! workers at its own state home); else beside the store this process was configured with (the
+//! directory of a file-path [`ESTATE_DB_ENV`] — the daemon's state home is the directory of its
+//! `--db`); else a PROCESS-SCOPED file under `std::env::temp_dir()` named with the pid. A
+//! store-less CLI or test process used to append to one host-shared file under HOME that every
+//! daemon on the host then reported as foreign dead letters it could not replay (crew#829).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -36,9 +40,13 @@ use crate::{
     ESTATE_DB_ENV, EVENT, SYMBOL_SCHEME,
 };
 
-/// Overrides the outbox / dead-letter spool file path. When unset, the spool defaults to
-/// `<home>/.something-wicked/wicked-apps/emit-outbox.ndjson`.
+/// Overrides the outbox / dead-letter spool file path. When unset, the spool resolves as
+/// [`deadletter_path`] says: beside this process's configured store, else a per-process temp file
+/// — never under HOME (core#749).
 pub const DEADLETTER_ENV: &str = "WICKED_APPS_EMIT_DEADLETTER";
+
+/// The spool file's name under a state home: `<state home>/wicked-apps/emit-outbox.ndjson`.
+pub const OUTBOX_FILE: &str = "emit-outbox.ndjson";
 
 /// Optional origin stamp for spooled records (wicked-crew#495): the launcher that owns this
 /// process sets it to a human-readable "who am I" (wicked-crew `serve` writes
@@ -396,27 +404,44 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Resolve the outbox spool path: the [`DEADLETTER_ENV`] override if set, else
-/// `<home>/.something-wicked/wicked-apps/emit-outbox.ndjson`.
-///
-/// Returns `None` only when no override is set AND the home directory cannot be resolved.
-pub fn deadletter_path() -> Option<PathBuf> {
+/// Resolve the outbox spool path (core#749): the [`DEADLETTER_ENV`] override if set; else
+/// `<state home>/wicked-apps/emit-outbox.ndjson` where the state home is the directory of the
+/// file-path store [`ESTATE_DB_ENV`] names (the daemon's state home is the directory of its
+/// `--db`; a URL spec or `:memory:` names none); else a process-scoped
+/// `<temp dir>/wicked-apps-emit-outbox-<pid>.ndjson`. Never a path under HOME: a store-less
+/// process's dead letters belong to that process, not to every daemon on the host.
+pub fn deadletter_path() -> PathBuf {
     if let Some(p) = std::env::var_os(DEADLETTER_ENV) {
-        return Some(PathBuf::from(p));
+        return PathBuf::from(p);
     }
-    let home = home_dir()?;
-    Some(
-        home.join(".something-wicked")
-            .join("wicked-apps")
-            .join("emit-outbox.ndjson"),
-    )
+    if let Some(home) = state_home() {
+        return home.join("wicked-apps").join(OUTBOX_FILE);
+    }
+    std::env::temp_dir().join(format!(
+        "wicked-apps-emit-outbox-{}.ndjson",
+        std::process::id()
+    ))
+}
+
+/// The state home this process has, when it has one: the directory of the FILE the store spec
+/// in [`ESTATE_DB_ENV`] names. A URL spec (`postgres://…`), `:memory:`, an empty value or a bare
+/// file name (no directory) is none.
+fn state_home() -> Option<PathBuf> {
+    let spec = std::env::var(ESTATE_DB_ENV).ok()?;
+    if spec.is_empty() || spec == ":memory:" || spec.contains("://") {
+        return None;
+    }
+    Path::new(&spec)
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(Path::to_path_buf)
 }
 
 /// TEST-SUPPORT — never call from runtime code. Redirects the outbox spool to one per-process
 /// temp file for the REST of the process, so a test suite that trips a fire-and-forget emission
 /// (a gate transition, conformance recording, a rule-lifecycle event) can never append junk to
-/// the operator's real `<home>/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue
-/// (core#311).
+/// a real spool — historically the operator's `<home>/.something-wicked/wicked-apps/emit-outbox.ndjson`
+/// replay queue (core#311), since core#749 the daemon's own state-home outbox.
 ///
 /// One shared helper instead of a copy per test binary. Idempotent (`Once`) and deliberately
 /// NEVER unset: an unset window would leak a parallel test's emission to the real spool (the
@@ -426,8 +451,8 @@ pub fn deadletter_path() -> Option<PathBuf> {
 /// covers its children. Tests that assert spool CONTENTS under their own path must live in a
 /// binary that manages [`DEADLETTER_ENV`] itself and must not call this.
 ///
-/// The DEFAULT runtime resolution ([`deadletter_path`]) is unchanged: this only sets the
-/// already-honored [`DEADLETTER_ENV`] override, and only in processes that opt in.
+/// This only sets the already-honored [`DEADLETTER_ENV`] override, and only in processes that
+/// opt in; the DEFAULT runtime resolution ([`deadletter_path`]) is untouched.
 ///
 /// Also arms [`crate::spawn::hermetic_test_worker_home`] — the worker-config-home override is the
 /// same test-hygiene guarantee for the engine's ACP spawn path (a real start re-sanitizes the
@@ -453,22 +478,7 @@ pub fn hermetic_test_spool() -> PathBuf {
 /// Append one NDJSON line for `event` to the outbox spool, writing the loud [`DEADLETTER_MARKER`]
 /// lines to stderr. Used whenever the event could not be written to the shared store.
 fn spool(event: &EmitEvent, reason: &str) {
-    match deadletter_path() {
-        Some(path) => {
-            let _ = spool_to(&path, event, reason, serde_json::Map::new());
-        }
-        None => {
-            eprintln!(
-                "{DEADLETTER_MARKER} event `{}` not stored ({reason}); spooling to outbox",
-                event.event_type
-            );
-            eprintln!(
-                "{DEADLETTER_MARKER} FAILED to spool `{}` to outbox: cannot resolve outbox spool \
-                 path (no HOME/USERPROFILE and no WICKED_APPS_EMIT_DEADLETTER)",
-                event.event_type
-            );
-        }
-    }
+    let _ = spool_to(&deadletter_path(), event, reason, serde_json::Map::new());
 }
 
 /// THE spool writer (one mechanism): announce `event` on stderr with the loud
@@ -822,18 +832,64 @@ mod tests {
     /// Default outbox path is derived from home (cross-platform) and ends with the documented
     /// suffix — never a hardcoded `~`.
     #[test]
-    fn default_outbox_path_is_under_home() {
+    fn default_outbox_path_is_never_under_home() {
         let _guard = lock_env();
+        let prior_db = std::env::var_os(ESTATE_DB_ENV);
         unsafe {
             std::env::remove_var(DEADLETTER_ENV);
+            std::env::remove_var(ESTATE_DB_ENV);
         }
-        if let Some(p) = deadletter_path() {
-            let s = p.to_string_lossy().replace('\\', "/");
-            assert!(
-                s.ends_with(".something-wicked/wicked-apps/emit-outbox.ndjson"),
-                "unexpected default spool path: {s}"
-            );
-            assert!(!s.contains('~'), "path must be expanded, not literal ~");
+        let legacy = super::home_dir()
+            .expect("HOME or USERPROFILE")
+            .join(".something-wicked")
+            .join("wicked-apps")
+            .join("emit-outbox.ndjson");
+        // No store, no override: a PROCESS-SCOPED temp file (the pid in its name), never the
+        // host-shared file under HOME (core#749). (On Windows the temp dir itself sits under the
+        // profile, so the pin is "not the legacy file" + "under the temp dir", not "not under
+        // home".)
+        let p = deadletter_path();
+        assert_ne!(p, legacy, "the legacy HOME-shared spool is gone");
+        assert!(p.starts_with(std::env::temp_dir()), "{}", p.display());
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            name,
+            format!("wicked-apps-emit-outbox-{}.ndjson", std::process::id()),
+            "{name}"
+        );
+        assert!(
+            !p.to_string_lossy().contains('~'),
+            "expanded, not literal ~"
+        );
+        // A file-path store: the spool lives in that store's state home.
+        let state = std::env::temp_dir().join("wicked-apps-state-home-749");
+        unsafe {
+            std::env::set_var(ESTATE_DB_ENV, state.join("core.db"));
+        }
+        assert_eq!(
+            deadletter_path(),
+            state.join("wicked-apps").join(super::OUTBOX_FILE)
+        );
+        // A URL store names no directory: back to the process-scoped temp file.
+        unsafe {
+            std::env::set_var(ESTATE_DB_ENV, "postgres://u:p@h/db");
+        }
+        assert!(deadletter_path().starts_with(std::env::temp_dir()));
+        unsafe {
+            std::env::set_var(ESTATE_DB_ENV, ":memory:");
+        }
+        assert!(deadletter_path().starts_with(std::env::temp_dir()));
+        // The override still wins over everything.
+        unsafe {
+            std::env::set_var(DEADLETTER_ENV, state.join("override.ndjson"));
+        }
+        assert_eq!(deadletter_path(), state.join("override.ndjson"));
+        unsafe {
+            std::env::remove_var(DEADLETTER_ENV);
+            match prior_db {
+                Some(v) => std::env::set_var(ESTATE_DB_ENV, v),
+                None => std::env::remove_var(ESTATE_DB_ENV),
+            }
         }
     }
 
