@@ -38,6 +38,16 @@ Two release tracks share this file, newest entry first regardless of track:
   through the generic bound and `&dyn GraphStore` on SQLite (and Postgres under the parity job).
   Unblocks core#692 (truncation cause on `review_scale`). core-ts ships a new `.node`; no wire
   change. Also lands estate 0.21.0's lineage/traverse/rules CLI for the gate hook (core#729).
+- **core#515 — agent-socket dirs are masked in the validator jail on both OSes.** Since C8 was
+  revised (#505) the Linux validator jail binds the host temp dir read-only, and `--ro-bind` does
+  not block `connect()` on a unix-socket inode — `/tmp`-resident agent sockets (`ssh-*/agent.N`
+  and friends) were connect-able from a validator script; the socket-dir masks existed but only
+  the recorder's loopback jail applied them. Every network-restricting jail (the validator's
+  `Deny` too) now masks `/run`, `/var/run`, the `.X11-unix`/`.ICE-unix`/`ssh-*`/`tmux-*` dirs
+  under `/tmp` and the system temp dir, and `SSH_AUTH_SOCK`'s own directory when it lies strictly
+  below a temp dir — bwrap with an empty `--tmpfs`, macOS with `(deny file-read* (subpath …))`
+  beside its `(deny network*)`. Never the temp dir itself (C8) and never a dir holding a write
+  root. The worker sandbox (network open) is unchanged — its agent access needs its own DES line.
 - **core#744 — a creator that hits the turn ceiling opens a gate; the run is never "cancelled"
   by its own timeout.** Dogfood run ada5b0aa: the creator's rework attempt ran the repo's full
   journey suite under host load 90-220, hit the 2 h ceiling with 78 files of finished work

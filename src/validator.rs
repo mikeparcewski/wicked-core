@@ -551,6 +551,24 @@ fn macos_sandbox_profile_for_roots(
             sbpl_quote(&dir)
         ));
     }
+    // (core#515) The agent-socket dirs under the temp dirs are unreadable in a network-restricting
+    // jail: `(deny network*)` already refuses the unix-socket connect, and this hides the socket
+    // inode itself (the same denylist entry the bwrap leg applies with a `--tmpfs`). SBPL
+    // `subpath` matches the REAL path, so each mask is canonicalized (`/tmp` → `/private/tmp`).
+    if network.restricts() {
+        let roots: Vec<std::path::PathBuf> = write_roots.iter().map(|r| r.to_path_buf()).collect();
+        let tmp = std::env::temp_dir();
+        for dir in loopback_socket_masks(
+            &roots,
+            &[Path::new("/tmp"), Path::new("/private/tmp"), tmp.as_path()],
+        ) {
+            let dir = dir.canonicalize().unwrap_or(dir);
+            p.push_str(&format!(
+                "(deny file-read* (subpath {}))\n",
+                sbpl_quote(&dir)
+            ));
+        }
+    }
     p.push_str("(deny file-write*)\n");
     p.push_str(&format!(
         "(allow file-write* (subpath {}))\n",
@@ -606,15 +624,29 @@ fn detect_sandbox_launcher_for_roots(
     launcher_for_roots_masking(write_roots, network, secret_read_block_dirs())
 }
 
-/// (WT-C2) The directories a loopback-only bwrap jail masks with an empty tmpfs so the recorder
-/// cannot reach host services over PATHNAME unix sockets: `/run` and `/var/run` (when real
-/// directories), and under each of `temp_dirs` the socket directories tools create there
-/// (`.X11-unix`, `.ICE-unix`, `ssh-*`, `tmux-*`). A directory holding one of `write_roots` is never
-/// masked — the jail's own roots stay reachable. macOS needs none of this: its profile's
-/// `(deny network*)` already refuses a unix-socket connect.
+/// (WT-C2, core#515) The directories a network-restricting jail masks so a validator or the
+/// recorder cannot reach host services over PATHNAME unix sockets (`--unshare-net` isolates only
+/// abstract ones; `--ro-bind / /` does not block `connect()` on a socket inode): `/run` and
+/// `/var/run` (when real directories), under each of `temp_dirs` the socket directories tools
+/// create there (`.X11-unix`, `.ICE-unix`, `ssh-*`, `tmux-*`), and the directory holding the
+/// process's `SSH_AUTH_SOCK` when it lies STRICTLY below one of `temp_dirs` (an agent with its own
+/// naming; never the temp dir itself — C8 forbids hiding the whole temp dir). A directory holding
+/// one of `write_roots` is never masked — the jail's own roots stay reachable. Linux applies these
+/// as empty `--tmpfs` mounts; macOS as `(deny file-read*)` beside its `(deny network*)`.
 fn loopback_socket_masks(
     write_roots: &[std::path::PathBuf],
     temp_dirs: &[&Path],
+) -> Vec<std::path::PathBuf> {
+    let agent = std::env::var_os("SSH_AUTH_SOCK").map(std::path::PathBuf::from);
+    socket_dir_masks(write_roots, temp_dirs, agent.as_deref())
+}
+
+/// [`loopback_socket_masks`] with the agent socket handed in — the seam the tests use so they
+/// never touch the process-global `SSH_AUTH_SOCK`.
+fn socket_dir_masks(
+    write_roots: &[std::path::PathBuf],
+    temp_dirs: &[&Path],
+    ssh_auth_sock: Option<&Path>,
 ) -> Vec<std::path::PathBuf> {
     let real_dir = |p: &Path| {
         std::fs::symlink_metadata(p)
@@ -636,9 +668,19 @@ fn loopback_socket_masks(
                 || name == ".ICE-unix"
                 || name.starts_with("ssh-")
                 || name.starts_with("tmux-");
-            if socketish && real_dir(&e.path()) {
+            if socketish && real_dir(&e.path()) && !out.contains(&e.path()) {
                 out.push(e.path());
             }
+        }
+    }
+    // (core#515) `SSH_AUTH_SOCK`'s own directory, when it is strictly below a temp dir: an agent
+    // that does not use the `ssh-*` naming (or a forwarded one) is as connect-able as any other.
+    if let Some(parent) = ssh_auth_sock.and_then(Path::parent) {
+        let below_a_temp_dir = temp_dirs
+            .iter()
+            .any(|t| parent != *t && parent.starts_with(t));
+        if below_a_temp_dir && real_dir(parent) && !out.iter().any(|m| m == parent) {
+            out.push(parent.to_path_buf());
         }
     }
     out.retain(|m| !write_roots.iter().any(|r| r.starts_with(m)));
@@ -728,12 +770,16 @@ fn launcher_for_roots_masking(
                 w.push("--tmpfs".to_string());
                 w.push(dir.to_string_lossy().to_string());
             }
-            // (WT-C2, Copilot on #697) `--unshare-net` isolates abstract unix sockets but not
-            // PATHNAME ones, which the read-only `/` still exposes (`/run/docker.sock`, the user's
-            // `/run/user/<uid>` bus, an ssh agent under `/tmp`). Loopback-only hides the usual
-            // socket directories behind an empty tmpfs; the write roots, bound below, still win.
-            if matches!(network, NetworkPolicy::LoopbackOnly) {
-                for dir in loopback_socket_masks(&roots, &[Path::new("/tmp")]) {
+            // (WT-C2, Copilot on #697; core#515) `--unshare-net` isolates abstract unix sockets
+            // but not PATHNAME ones, which the read-only `/` still exposes (`/run/docker.sock`,
+            // the user's `/run/user/<uid>` bus, an ssh agent under `/tmp`). EVERY
+            // network-restricting jail — the validator's `Deny` as much as the recorder's
+            // loopback-only — hides the usual socket directories and `SSH_AUTH_SOCK`'s own dir
+            // behind an empty tmpfs; the write roots, bound below, still win. Both `/tmp` and
+            // the system temp dir are scanned (one when `TMPDIR` is unset).
+            if network.restricts() {
+                let tmp = std::env::temp_dir();
+                for dir in loopback_socket_masks(&roots, &[Path::new("/tmp"), tmp.as_path()]) {
                     w.push("--tmpfs".to_string());
                     w.push(dir.to_string_lossy().to_string());
                 }
@@ -3555,6 +3601,139 @@ mod tests {
             "a dir holding a write root stays reachable"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#515: `SSH_AUTH_SOCK`'s own directory is masked when it lies strictly below a temp dir
+    /// — whatever its name — and never when it IS the temp dir (C8), lies outside every temp dir,
+    /// or holds a write root.
+    #[test]
+    fn the_ssh_auth_sock_dir_is_masked_only_strictly_below_a_temp_dir_515() {
+        let base = std::env::temp_dir().join(format!("wt-515-masks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["agent-dir", "root-dir/proof", "ssh-abc"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let root = base.join("root-dir").join("proof");
+        let roots = std::slice::from_ref(&root);
+        let temps = [base.as_path()];
+        // An agent dir with its own naming, strictly below the temp dir ⇒ masked (beside ssh-abc).
+        let masks = socket_dir_masks(roots, &temps, Some(&base.join("agent-dir").join("agent.7")));
+        assert!(masks.contains(&base.join("agent-dir")), "{masks:?}");
+        assert!(masks.contains(&base.join("ssh-abc")), "{masks:?}");
+        // A socket directly under the temp dir ⇒ the temp dir itself is NEVER masked (C8).
+        let masks = socket_dir_masks(roots, &temps, Some(&base.join("agent.7")));
+        assert!(
+            !masks.contains(&base),
+            "the temp dir is never a mask: {masks:?}"
+        );
+        // A socket outside every temp dir ⇒ nothing added for it.
+        let outside = std::env::temp_dir().join(format!("wt-515-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let masks = socket_dir_masks(roots, &temps, Some(&outside.join("agent.7")));
+        assert!(!masks.contains(&outside), "{masks:?}");
+        // A socket in the dir holding a write root ⇒ that dir stays reachable.
+        let masks = socket_dir_masks(roots, &temps, Some(&base.join("root-dir").join("agent.7")));
+        assert!(!masks.contains(&base.join("root-dir")), "{masks:?}");
+        // No agent ⇒ the named socket dirs only.
+        let masks = socket_dir_masks(roots, &temps, None);
+        assert_eq!(
+            masks
+                .iter()
+                .filter(|m| m.starts_with(&base))
+                .collect::<Vec<_>>(),
+            vec![&base.join("ssh-abc")]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// core#515: a stub ssh-agent socket in an `ssh-*` dir under the system temp dir is unreachable
+    /// from the VALIDATOR jail (network `Deny`, not only the recorder's loopback jail). Structurally
+    /// the launcher carries the mask (bwrap `--tmpfs <dir>`; macOS `(deny file-read* (subpath
+    /// <dir>))`), and at runtime — when a real jail arms — `test -S <socket>` succeeds outside and
+    /// fails inside (the inode is hidden; on macOS `(deny network*)` refuses the connect besides).
+    #[cfg(unix)]
+    #[test]
+    fn a_stub_ssh_agent_socket_under_the_temp_dir_is_unreachable_from_the_jail_515() {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let agent_dir = tmp.join(format!("ssh-wicked515-{pid}"));
+        let dir = tmp.join(format!("wicked-val-515-{pid}"));
+        for d in [&agent_dir, &dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sock = agent_dir.join(format!("agent.{pid}"));
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the stub agent");
+        {
+            use std::os::unix::fs::FileTypeExt;
+            assert!(
+                std::fs::symlink_metadata(&sock)
+                    .map(|m| m.file_type().is_socket())
+                    .unwrap_or(false),
+                "the stub is a socket outside the jail"
+            );
+        }
+        let launcher = detect_sandbox_launcher(&dir, None);
+        let canonical = agent_dir.canonicalize().unwrap_or(agent_dir.clone());
+        match sandbox_availability() {
+            (SandboxLevel::Sandboxed, Some("sandbox-exec")) => {
+                let profile = launcher.wrapper.get(2).cloned().unwrap_or_default();
+                let rule = format!("(deny file-read* (subpath {}))", sbpl_quote(&canonical));
+                assert!(
+                    profile.contains(&rule),
+                    "the validator profile must hide the agent dir: {profile}"
+                );
+            }
+            (SandboxLevel::Sandboxed, Some("bwrap")) => {
+                assert!(
+                    launcher
+                        .wrapper
+                        .windows(2)
+                        .any(|w| w[0] == "--tmpfs" && Path::new(&w[1]) == agent_dir),
+                    "the validator argv must mask the agent dir: {:?}",
+                    launcher.wrapper
+                );
+                assert!(
+                    !launcher
+                        .wrapper
+                        .windows(2)
+                        .any(|w| w[0] == "--tmpfs" && Path::new(&w[1]) == tmp),
+                    "the temp dir itself is never masked (C8): {:?}",
+                    launcher.wrapper
+                );
+            }
+            _ => {}
+        }
+        if launcher.level == SandboxLevel::Sandboxed {
+            if let Some(sh) = find_on_path("sh") {
+                let probe = format!("test -S '{}'", sock.display());
+                let mut argv = launcher.wrapper.clone();
+                argv.push(sh.to_string_lossy().to_string());
+                argv.push("-c".to_string());
+                argv.push(probe.clone());
+                // spawn-audit: test-only — sandbox socket-reach probe. Same `apply_minimal_env` floor as the path it is testing.
+                let mut cmd = Command::new(&argv[0]);
+                cmd.args(&argv[1..]).current_dir(&dir);
+                apply_minimal_env(&mut cmd);
+                let status = run_bounded_status(cmd, Duration::from_secs(20)).expect("spawn");
+                let reachable = matches!(status, Some(s) if s.success());
+                assert!(
+                    !reachable,
+                    "the stub agent socket must be unreachable inside the validator jail ({probe})"
+                );
+                // The same probe outside the jail sees it — the denial is the jail's, not a typo.
+                let mut outside = Command::new(&sh);
+                outside.arg("-c").arg(&probe).current_dir(&dir);
+                assert!(
+                    outside.status().map(|s| s.success()).unwrap_or(false),
+                    "the probe must see the socket outside the jail"
+                );
+            }
+        }
+        drop(_listener);
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
