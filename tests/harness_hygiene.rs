@@ -91,9 +91,12 @@ fn temp_fixtures_are_scoped_to_the_process() {
 ///
 /// Engine paths under test — gate transitions, conformance recording, rule lifecycle — fire
 /// coarse fire-and-forget `wicked.*` emissions as a side effect. With no shared store configured
-/// (the normal test condition) those spool to the outbox, and the default outbox is the
-/// operator's REAL `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue. Before the
-/// fix, one full `cargo test` run appended ~300KB of junk events there — on pristine main.
+/// (the normal test condition) those spool to the outbox. Before core#311 the default outbox was
+/// the operator's REAL `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue and one
+/// full `cargo test` run appended ~300KB of junk events there — on pristine main. Since core#749
+/// the un-armed default is a pid-named temp file (or a configured store's state home), but
+/// arming stays mandatory: a test that sets `WICKED_ESTATE_DB` to a real daemon db would
+/// otherwise spool into that daemon's outbox, and the suite's contents assertions pin the armed path.
 ///
 /// Arming must be PRE-MAIN (`#[ctor::ctor(unsafe)]`): a per-test call cannot guarantee order —
 /// tests run on parallel threads, so one unarmed test can spool before an armed one sets the
@@ -132,7 +135,7 @@ fn every_test_binary_arms_the_hermetic_emit_spool() {
     assert!(
         missing.is_empty(),
         "these test binaries never arm the hermetic emit spool, so any emission they trigger \
-         spools to the operator's real ~/.something-wicked replay queue (core#311). Add the \
+         spools outside the per-process test outbox (core#311, core#749). Add the \
          `#[ctor::ctor(unsafe)] fn arm_hermetic_emit_spool()` block: {missing:?}"
     );
 }
@@ -149,7 +152,7 @@ fn a_forced_spool_lands_in_the_armed_temp_outbox_never_in_the_real_home() {
     let armed = std::path::PathBuf::from(
         std::env::var_os(DEADLETTER_ENV).expect("the pre-main ctor armed the spool override"),
     );
-    let resolved = deadletter_path().expect("the spool path resolves");
+    let resolved = deadletter_path();
     assert_eq!(
         resolved, armed,
         "the seam must resolve the spool to the armed override"
