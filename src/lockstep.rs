@@ -167,8 +167,24 @@ mod tests {
         let mut pins: BTreeSet<(String, String)> = BTreeSet::new();
         for m in &manifests {
             let text = std::fs::read_to_string(m).unwrap();
+            // Only the dependency tables are pins: `[dependencies]`, `[dev-dependencies]`,
+            // `[build-dependencies]`, `[workspace.dependencies]`, `[target.'cfg(..)'.dependencies]`.
+            // A `wicked-estate-*` key under `[features]` (`wicked-estate-store = []`) or a
+            // comment is not one.
+            let mut in_deps = false;
             for line in text.lines() {
                 let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                if let Some(section) = line.strip_prefix('[') {
+                    let section = section.trim_end_matches(']').trim_start_matches('[');
+                    in_deps = section.ends_with("dependencies");
+                    continue;
+                }
+                if !in_deps {
+                    continue;
+                }
                 let Some((dep, spec)) = line.split_once('=') else {
                     continue;
                 };

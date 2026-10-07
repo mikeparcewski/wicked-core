@@ -368,8 +368,16 @@ mod tests {
             reads_back_via_dyn(&store, &tag),
             "node written via generic S bound must read back via &dyn GraphStore on Postgres backend"
         );
-        // core#742: the support plane forwards through the Postgres arm too.
-        support_plane_round_trip(&mut store, &format!("s2a-pid{}", std::process::id()));
+        // core#742: the support plane forwards through the Postgres arm too. The owner must be
+        // new to the shared database, so the tag carries the clock beside the pid (pids recycle).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        support_plane_round_trip(
+            &mut store,
+            &format!("s2a-pid{}-{nanos}", std::process::id()),
+        );
     }
 
     // §5 backend-parity note: the DEFAULT build (no `postgres` feature) must REJECT a postgres spec
