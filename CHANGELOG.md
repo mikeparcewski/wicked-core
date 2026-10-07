@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core#766 — the verify floor re-runs a vitest head-only failure as its file alone before
+  calling it a regression.** Dogfood run 049f77d8: a 5 s filesystem-walk `it` hit vitest's default
+  timeout (`Test timed out in 5000ms`) under host load 45-80, the floor classed it a
+  `regression` against a passing base and denied the test phase twice (~25 min each). The
+  core#553 load-flake re-run existed but knew only `cargo test`: `isolated_rerun_argv` returned
+  `None` for every other runner. A vitest id (`FAIL <file> > suite > name`) now re-runs as
+  `<the check's vitest> run <file>` (`--config`/`--root` kept, `--changed`/`related`/the file
+  list dropped; `--config`/`--root`/`--dir`/`--project`/`--workspace` kept so the file re-runs
+  under the same project), witnessed by the file's ` ✓ <file> (N tests)` line with no skipped
+  sub-count or the verbose line for exactly that id; two ids in one file share one re-run.
+  Same gate as before: only on an oversubscribed host (1-min load above the CPU count), at most
+  `MAX_FLAKE_RERUN` ids, a pass is `flaky_under_load` on the record, anything else stays a
+  `regression`. `npm run test` (runner hidden behind a script), jest and go ids are not re-run.
 - **core#744 — a creator that hits the turn ceiling opens a gate; the run is never "cancelled"
   by its own timeout.** Dogfood run ada5b0aa: the creator's rework attempt ran the repo's full
   journey suite under host load 90-220, hit the 2 h ceiling with 78 files of finished work
