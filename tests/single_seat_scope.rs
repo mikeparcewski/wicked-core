@@ -19,6 +19,17 @@ use wicked_council::{AgenticCli, CouncilTask};
 /// Generous: a loaded CI host (and Windows) must never flake on a slow actor.
 const DEADLINE: Duration = Duration::from_secs(90);
 
+/// Pre-main: arm the hermetic emit spool (core#311), so nothing this binary trips — the run's
+/// gate transitions, its failure — spools to the operator's real replay queue. Required of every
+/// test binary by `tests/harness_hygiene.rs`.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
+
 struct StubDispatcher;
 impl Dispatcher for StubDispatcher {
     fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
