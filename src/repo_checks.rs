@@ -73,10 +73,13 @@
 //! nested-sandbox launcher signature on both trees are `env_cannot_run` (never deny; the count is
 //! on the gate's `floorNote` — external CI is the test gate for them), and a head-only failure
 //! with the signature still denies with an advisory naming the likely cause. A head-only set of
-//! at most [`MAX_FLAKE_RERUN`] libtest ids, read on an oversubscribed host (1-min load above the
-//! CPU count — the evidence it was load), is re-run ONCE, each alone (core#553): if every one
-//! passes it is `flaky_under_load` (never denies; both attempts and the load at each are on the
-//! record), else a `regression`. A base that cannot be run or compared leaves the
+//! at most [`MAX_FLAKE_RERUN`] libtest or vitest ids, read on an oversubscribed host (1-min load
+//! above the CPU count — the evidence it was load), is re-run ONCE, each alone (core#553): a
+//! libtest id by its `--exact` name, a vitest id as its test FILE alone (core#766 — a 5 s
+//! filesystem-walk `it` that hit vitest's default timeout under load 45-80 was denied twice as a
+//! regression; vitest was not re-run because only `cargo test` was). If every one passes it is
+//! `flaky_under_load` (never denies; both attempts and the load at each are on the record), else
+//! a `regression`. A base that cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
 //! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
 //! ([`ClaimCheck`]: `claim_rejected` when the base is green).
@@ -2665,9 +2668,16 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
 
 /// (core#553) The argv that re-runs ONE libtest id alone: the check's own `cargo test` with the
 /// workspace/target selection replaced by the id's binary (`-p b --test common`, when the id is
-/// qualified) and `-- --exact <name>`. `None` for any other runner or id shape — the floor then
-/// does not re-run and the classification stands.
+/// qualified) and `-- --exact <name>`. (core#766) A vitest id (`FAIL <file> > suite > name`)
+/// re-runs as its FILE alone — the check's own `vitest` invocation (through `npx`, `pnpm exec`,
+/// `yarn`, or the binary) cut back to `vitest run <file>` plus any `--config`/`--root` it carried;
+/// a vitest test name is not addressable by exact match, the file is, and the issue asks for
+/// "that file only". `None` for any other runner or id shape — the floor then does not re-run and
+/// the classification stands.
 fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String)> {
+    if let Some(file) = vitest_file_of(id) {
+        return vitest_file_rerun_argv(argv, file).map(|a| (a, id.to_string()));
+    }
     let (name, target) = libtest_parts(id)?;
     let bin = argv.first()?;
     let is_cargo = Path::new(bin)
@@ -2732,6 +2742,62 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
     Some((out, name.to_string()))
 }
 
+/// (core#766) The test file a vitest failure id names: `FAIL tests/x.test.ts > suite > name` →
+/// `tests/x.test.ts`. The ` > ` separator is what makes it vitest's (go's `FAIL TestX` and a
+/// file-level `FAIL tests/x.test.ts [ tests/x.test.ts ]` import failure have none and are not
+/// re-run). The caller checks the runner.
+fn vitest_file_of(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("FAIL ")?;
+    let (file, _) = rest.split_once(" > ")?;
+    let file = file.trim();
+    (!file.is_empty() && !file.contains(char::is_whitespace) && file.contains('.')).then_some(file)
+}
+
+/// (core#766) The check's own `vitest` invocation cut back to one file: everything up to and
+/// including the `vitest` token (`npx --no-install vitest`, `pnpm exec vitest`, `yarn vitest`,
+/// `node_modules/.bin/vitest`), then `run <file>`, then the original's `--config` / `--root`
+/// selection (both spellings). `--changed <base>`, `related`, its file list and every other flag
+/// are dropped: the re-run is the one file, not the one selection. `None` when the argv has no
+/// `vitest` token (`npm run test` hides the runner behind a script).
+fn vitest_file_rerun_argv(argv: &[String], file: &str) -> Option<Vec<String>> {
+    let at = argv.iter().position(|a| {
+        Path::new(a)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "vitest" || n == "vitest.mjs" || n == "vitest.js")
+    })?;
+    let mut out: Vec<String> = argv[..=at].to_vec();
+    out.push("run".into());
+    out.push(file.to_string());
+    let mut rest = argv[at + 1..].iter();
+    while let Some(a) = rest.next() {
+        if matches!(a.as_str(), "--config" | "-c" | "--root" | "-r") {
+            if let Some(v) = rest.next() {
+                out.push(a.clone());
+                out.push(v.clone());
+            }
+        } else if a.starts_with("--config=") || a.starts_with("--root=") {
+            out.push(a.clone());
+        }
+    }
+    Some(out)
+}
+
+/// (core#766) Does a vitest output line witness `file` passing? The default reporter's per-file
+/// line (` ✓ tests/x.test.ts (2 tests) 1234ms`) or the verbose reporter's per-test line
+/// (` ✓ tests/x.test.ts > suite > name 12ms`): a check mark, then the file, then end / a space /
+/// `(`. A line for another file is not it.
+fn vitest_pass_line_witnesses(s: &str, file: &str) -> bool {
+    let Some(rest) = s.strip_prefix('✓') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    match rest.strip_prefix(file) {
+        Some(after) => after.is_empty() || after.starts_with(' ') || after.starts_with('('),
+        None => false,
+    }
+}
+
 /// (core#553) Is the host oversubscribed — its 1-min load above its logical CPU count? The one
 /// condition under which a head-only failure that passes alone is read as a load flake.
 pub(crate) fn oversubscribed(load1: Option<f64>, cpus: usize) -> bool {
@@ -2771,25 +2837,28 @@ fn rerun_flakes(
     let Some(plans) = plans else {
         return;
     };
-    let mut all_passed = true;
+    // (core#766) Two vitest ids in one file share one re-run argv — run the file once, witness
+    // both; libtest ids each carry their own `--exact` name and never group.
+    let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
     for (argv, name) in plans {
+        match groups.iter_mut().find(|(a, _)| *a == argv) {
+            Some((_, names)) => names.push(name),
+            None => groups.push((argv, vec![name])),
+        }
+    }
+    let mut all_passed = true;
+    for (argv, names) in groups {
+        let label = names.join("`, `");
         let one = RepoCheck {
             name: check.name.clone(),
             argv,
-            source: format!("isolated re-run of `{name}` (core#553)"),
+            source: format!("isolated re-run of `{label}` (core#553)"),
             timeout_s: check.timeout_s,
         };
-        let (r, passed) = run_one_watching(
-            worktree,
-            &one,
-            sandbox,
-            scratch,
-            Tree::Head,
-            std::slice::from_ref(&name),
-        );
-        let ok = r.passed() && passed.iter().any(|p| p == &name);
+        let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &names);
+        let ok = r.passed() && names.iter().all(|n| passed.iter().any(|p| p == n));
         eprintln!(
-            "wicked-core: repo checks floor — isolated re-run of `{name}` {} ({:.1}s{})",
+            "wicked-core: repo checks floor — isolated re-run of `{label}` {} ({:.1}s{})",
             if ok { "passed" } else { "did not pass" },
             r.duration_ms as f64 / 1000.0,
             r.bound_note
@@ -3093,6 +3162,17 @@ impl LineScan {
                 let name = name.trim();
                 if self.watch.iter().any(|w| w == name) && !self.passed.iter().any(|p| p == name) {
                     self.passed.push(name.to_string());
+                }
+                return;
+            }
+            // (core#766) A watched vitest id passes when its FILE's check-mark line is printed.
+            if s.starts_with('✓') {
+                for w in &self.watch {
+                    if vitest_file_of(w).is_some_and(|f| vitest_pass_line_witnesses(s, f))
+                        && !self.passed.iter().any(|p| p == w)
+                    {
+                        self.passed.push(w.clone());
+                    }
                 }
                 return;
             }
@@ -5961,7 +6041,10 @@ mod tests {
             "an unqualified id keeps the command's own selection"
         );
         assert!(isolated_rerun_argv(&s(&["npm", "run", "test"]), "test t::y").is_none());
-        assert!(isolated_rerun_argv(&argv, "FAIL tests/x.test.ts > a").is_none());
+        assert!(
+            isolated_rerun_argv(&argv, "FAIL tests/x.test.ts > a").is_none(),
+            "a vitest id under a cargo check has no runner to re-run with"
+        );
         assert!(isolated_rerun_argv(&s(&["cargo", "nextest", "run"]), "test t::y").is_none());
         // Only an oversubscribed host earns the re-run: load above the CPU count.
         assert!(oversubscribed(Some(15.0), 14));
@@ -5969,6 +6052,102 @@ mod tests {
         assert!(!oversubscribed(Some(3.0), 14));
         assert!(!oversubscribed(None, 14), "an unknown load is no evidence");
         assert!(!oversubscribed(Some(f64::NAN), 14));
+    }
+
+    /// core#766: a vitest head-only failure (`Test timed out in 5000ms` on a 5 s filesystem walk
+    /// under load 45-80) is re-run as its FILE alone through the check's own `vitest` — the
+    /// `--changed`/`related` selection, its file list and the other flags give way to `run <file>`
+    /// (`--config`/`--root` ride along); `npm run test` hides the runner and is not re-run; go's
+    /// `FAIL TestX` and a file-level import failure are not vitest ids. The witness is the file's
+    /// check-mark line (default or verbose reporter), never another file's.
+    #[test]
+    fn a_vitest_head_only_failure_is_rerun_as_its_file_alone_766() {
+        let id = "FAIL tests/fonts.selfhosted.test.ts > fonts are self-hosted > index.html and \
+                  every source file name no font CDN";
+        assert_eq!(
+            isolated_rerun_argv(&s(&["npx", "vitest", "run"]), id),
+            Some((
+                s(&["npx", "vitest", "run", "tests/fonts.selfhosted.test.ts"]),
+                id.to_string()
+            ))
+        );
+        assert_eq!(
+            isolated_rerun_argv(
+                &s(&[
+                    "npx",
+                    "--no-install",
+                    "vitest",
+                    "related",
+                    "--run",
+                    "src/a.ts",
+                    "src/b.ts",
+                    "--config",
+                    "vitest.ci.ts",
+                    "--coverage",
+                    "--changed",
+                    "abc123"
+                ]),
+                "FAIL tests/x.test.ts > a"
+            )
+            .map(|p| p.0),
+            Some(s(&[
+                "npx",
+                "--no-install",
+                "vitest",
+                "run",
+                "tests/x.test.ts",
+                "--config",
+                "vitest.ci.ts"
+            ]))
+        );
+        assert_eq!(
+            isolated_rerun_argv(
+                &s(&["node_modules/.bin/vitest", "run", "--root=packages/a"]),
+                "FAIL tests/x.test.ts > a"
+            )
+            .map(|p| p.0),
+            Some(s(&[
+                "node_modules/.bin/vitest",
+                "run",
+                "tests/x.test.ts",
+                "--root=packages/a"
+            ]))
+        );
+        assert!(
+            isolated_rerun_argv(&s(&["npm", "run", "test"]), "FAIL tests/x.test.ts > a").is_none()
+        );
+        assert!(isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "FAIL TestX").is_none());
+        assert!(isolated_rerun_argv(
+            &s(&["npx", "vitest", "run"]),
+            "FAIL tests/x.test.ts [ tests/x.test.ts ]"
+        )
+        .is_none());
+        assert!(isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "● suite › name").is_none());
+
+        // The witness: the re-run file's check-mark line, in either reporter's shape.
+        let watch = vec![id.to_string(), "FAIL tests/x.test.ts > a".to_string()];
+        let mut scan = LineScan::watching(&watch);
+        scan.line(" ✓ tests/other.test.ts (3 tests) 12ms");
+        scan.line(" ✓ tests/fonts.selfhosted.test.tsx (1 test) 1ms");
+        assert!(
+            scan.passed.is_empty(),
+            "another file is not the witness: {:?}",
+            scan.passed
+        );
+        scan.line(" ✓ tests/fonts.selfhosted.test.ts (2 tests) 1234ms");
+        assert_eq!(scan.passed, vec![id.to_string()]);
+        scan.line(" ✓ tests/x.test.ts > a 5ms");
+        assert_eq!(
+            scan.passed, watch,
+            "the verbose per-test line witnesses too"
+        );
+        scan.line(" ✓ tests/x.test.ts (1 test) 5ms");
+        assert_eq!(scan.passed, watch, "a file is witnessed once");
+        let mut none = LineScan::watching(&watch);
+        none.line(" ❯ tests/fonts.selfhosted.test.ts (2 tests | 1 failed) 5001ms");
+        none.line("   × fonts are self-hosted > index.html and every source file name no font CDN");
+        none.line("     → Test timed out in 5000ms.");
+        assert!(none.passed.is_empty(), "{:?}", none.passed);
     }
 
     /// core#553, end to end on a real cargo crate: a test that fails once and passes alone is
