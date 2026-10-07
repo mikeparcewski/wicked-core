@@ -18,9 +18,10 @@ use wicked_estate_store::PostgresStore;
 use wicked_estate_store::{SqliteStore, WalCheckpointStats};
 
 use wicked_estate_core::{
-    Annotation, Change, ChangeOp, Direction, Edge, GraphRead, GraphStats, GraphWrite,
-    HistoricalEdge, Node, NodeSemantics, RepoInfo, Result, StoreCapabilities, Subgraph, SymbolId,
-    SymbolQuery, TraversalSpec, UnresolvedRef,
+    Annotation, Change, ChangeOp, Direction, Edge, EdgeKind, EdgeSupport, GraphRead, GraphStats,
+    GraphWrite, HistoricalEdge, Node, NodeSemantics, RepoInfo, Result, StoreCapabilities, Subgraph,
+    SupportFact, SupportOwner, SupportOwnerState, SupportReplacement, SymbolId, SymbolQuery,
+    TraversalSpec, UnresolvedRef,
 };
 
 /// The estate graph backend chosen at runtime, as one concrete type. See the module docs.
@@ -140,6 +141,21 @@ impl GraphRead for AnyStore {
     fn symbol_epoch(&self, id: &SymbolId) -> Result<Option<u64>> {
         on_backend!(self, s => s.symbol_epoch(id))
     }
+    // TS-S2A support plane (estate 0.21.0, ENGINE-CONTRACT §3.4) — forwarded, never interpreted.
+    fn edge_supports(
+        &self,
+        source: &SymbolId,
+        target: &SymbolId,
+        kind: &EdgeKind,
+    ) -> Result<Vec<EdgeSupport>> {
+        on_backend!(self, s => s.edge_supports(source, target, kind))
+    }
+    fn support_generation(&self, owner: &SupportOwner) -> Result<Option<u64>> {
+        on_backend!(self, s => s.support_generation(owner))
+    }
+    fn support_owners(&self) -> Result<Vec<SupportOwnerState>> {
+        on_backend!(self, s => s.support_owners())
+    }
     fn stats(&self) -> Result<GraphStats> {
         on_backend!(self, s => s.stats())
     }
@@ -199,6 +215,14 @@ impl GraphWrite for AnyStore {
     ) -> Result<usize> {
         on_backend!(self, s => s.delete_annotations(symbol, ty, key))
     }
+    fn replace_edge_supports(
+        &mut self,
+        owner: &SupportOwner,
+        generation: u64,
+        facts: &[SupportFact],
+    ) -> Result<SupportReplacement> {
+        on_backend!(self, s => s.replace_edge_supports(owner, generation, facts))
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +253,75 @@ mod tests {
             .is_some()
     }
 
+    /// The TS-S2A support plane through the SAME two call styles (core#742): one owner replaces
+    /// its support set through an `S: GraphRead + GraphWrite` bound, and every one of the four
+    /// forwarded methods answers through `&dyn GraphStore` — `edge_supports` (the rows behind the
+    /// public edge), `support_generation` (the owner's last generation), `support_owners` (the
+    /// owner listed with it), and a same-generation `replace_edge_supports` replay (idempotent,
+    /// nothing written). Endpoints are two `tag`-unique nodes; the owner's snapshot is `tag` too,
+    /// so re-runs on a shared backend never read another run's rows.
+    fn support_plane_round_trip<S: GraphRead + GraphWrite>(store: &mut S, tag: &str) {
+        use wicked_estate_core::{Edge, EdgeKind, ResolutionTier, SupportFact, SupportOwner};
+        let (from, to) = (format!("{tag}-from"), format!("{tag}-to"));
+        seed_via_generic(store, &from);
+        seed_via_generic(store, &to);
+        let (source, target) = (
+            synthetic_symbol("anystore_test", &from),
+            synthetic_symbol("anystore_test", &to),
+        );
+        let owner = SupportOwner::new("anystore_test", tag).unwrap();
+        assert_eq!(store.support_generation(&owner).unwrap(), None);
+        assert!(store
+            .support_owners()
+            .unwrap()
+            .iter()
+            .all(|o| o.owner != owner));
+        let fact = SupportFact::new(
+            format!("{tag} fact 1"),
+            Edge::new(
+                source.clone(),
+                target.clone(),
+                EdgeKind::Calls,
+                ResolutionTier::Scip,
+                "anystore_test",
+            ),
+        )
+        .unwrap();
+        let applied = store
+            .replace_edge_supports(&owner, 1, std::slice::from_ref(&fact))
+            .unwrap();
+        assert!(
+            !applied.replayed && applied.asserted == 1 && applied.generation == 1,
+            "{applied:?}"
+        );
+        let replay = store
+            .replace_edge_supports(&owner, 1, std::slice::from_ref(&fact))
+            .unwrap();
+        assert!(replay.replayed && replay.asserted == 0, "{replay:?}");
+
+        let read: &dyn GraphStore = &*store;
+        let rows = read
+            .edge_supports(&source, &target, &EdgeKind::Calls)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].owner, owner);
+        assert_eq!(rows[0].generation, 1);
+        assert_eq!(rows[0].fact_id, format!("{tag} fact 1"));
+        assert_eq!(read.support_generation(&owner).unwrap(), Some(1));
+        let owners = read.support_owners().unwrap();
+        assert!(
+            owners.iter().any(|o| o.owner == owner && o.generation == 1),
+            "{owners:?}"
+        );
+        assert!(
+            read.neighbors(&source, crate::Direction::Outgoing)
+                .unwrap()
+                .iter()
+                .any(|e| e.target == target && e.kind == EdgeKind::Calls),
+            "the replaced support projects a public edge"
+        );
+    }
+
     #[test]
     fn any_store_sqlite_bridges_generic_bound_and_dyn_object() {
         // The whole point: ONE concrete `AnyStore` value written through an `S: GraphRead +
@@ -240,6 +333,14 @@ mod tests {
             reads_back_via_dyn(&store, "n1"),
             "node written via a generic S bound must read back via &dyn GraphStore"
         );
+    }
+
+    /// core#742: the four TS-S2A methods estate 0.21.0 added are forwarded, not stubbed — a
+    /// support set replaced through the generic bound is what `&dyn GraphStore` reads back.
+    #[test]
+    fn any_store_sqlite_forwards_the_support_plane_742() {
+        let mut store = open_store_any(Some(":memory:")).expect("open in-memory AnyStore");
+        support_plane_round_trip(&mut store, "s2a");
     }
 
     // §5 backend-parity: AnyStore must bridge the SAME generic→dyn call styles through Postgres.
@@ -267,6 +368,8 @@ mod tests {
             reads_back_via_dyn(&store, &tag),
             "node written via generic S bound must read back via &dyn GraphStore on Postgres backend"
         );
+        // core#742: the support plane forwards through the Postgres arm too.
+        support_plane_round_trip(&mut store, &format!("s2a-pid{}", std::process::id()));
     }
 
     // §5 backend-parity note: the DEFAULT build (no `postgres` feature) must REJECT a postgres spec
