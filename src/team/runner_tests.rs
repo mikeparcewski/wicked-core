@@ -31,6 +31,15 @@ fn runner(rig: &Rig) -> TeamRunner {
     TeamRunner::from_config(&cfg(rig)).expect("bus and outbox")
 }
 
+/// core#730: a runner whose final-pass budget outlasts a slow CI host. The fold wait returns the
+/// moment S's `ledger.folded` lands, so on a fast machine this costs nothing; `cfg`'s 400 ms is
+/// for the tests that assert the TIMEOUT path (`Synthesized`). A test that asserts `Folded`
+/// must give the fold the time it asserts.
+fn patient_runner(rig: &Rig) -> TeamRunner {
+    TeamRunner::from_config(&cfg(rig).with_final_pass_budget(Duration::from_secs(30)))
+        .expect("bus and outbox")
+}
+
 /// Publish `path.started` for `run` and return its event id (the stream floor).
 fn start(rig: &Rig, run: &str) -> i64 {
     let ev = crate::team::publish::tests::fixture(tev::PATH_STARTED, 0, run);
@@ -406,7 +415,7 @@ fn t5_a_step_claimed_precedes_every_checkpoint_in_process() {
         }
     });
     let r: Arc<dyn StepRunner> = worker.clone();
-    let tr = runner(&rig);
+    let tr = patient_runner(&rig); // the test asserts the fold, so it waits for it (core#730)
     let (out, _, evidence) = run_unit_and_judge_with_team(
         &r,
         &input(run, 1, 0, Some(bus_stamp(floor))),

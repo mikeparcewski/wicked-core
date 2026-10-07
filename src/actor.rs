@@ -17004,6 +17004,32 @@ mod terminal_worktree_reap_tests {
         }
     }
 
+    /// core#589: [`wait_gone`] and then wait for git to DEREGISTER the worktree too. The reap is
+    /// one `git worktree remove` on a background thread; git deletes the checkout first and its
+    /// admin entry (`.git/worktrees/<name>`) after, so a wait that only watches the path returns
+    /// in the gap between the two. A resume that walks in there runs `worktree add` against a
+    /// path git still considers registered — the Windows flake's second line, "missing but
+    /// already registered worktree", with the first ("a branch named 'wicked/r-reresume' already
+    /// exists") being `create_worktree`'s expected `-b` attempt that it retries without `-b`.
+    /// Same generous bound as [`wait_gone`]; returns the moment the entry is gone.
+    fn wait_reaped(root: &Path, wt: &Path) {
+        wait_gone(wt);
+        let admin = root.join(".git").join("worktrees").join(
+            wt.file_name()
+                .expect("a worktree path has a final component"),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while admin.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree admin entry still registered after 60s — the terminal reap never \
+                 deregistered {}",
+                admin.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
     fn branch_exists(root: &Path, branch: &str) -> bool {
         let out = std::process::Command::new("git")
             .hardened()
@@ -17144,7 +17170,7 @@ mod terminal_worktree_reap_tests {
             .unwrap()
             .unwrap();
         fail_run(&mut store, &mut subs, &runner, &tx, &mut session, 1);
-        wait_gone(&wt); // the reap really happened — this is the state a resume walks into
+        wait_reaped(&root, &wt); // the reap really happened — this is the state a resume walks into
 
         let mut in_flight = HashSet::new();
         let status = resume_run_inner(
