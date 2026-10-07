@@ -683,7 +683,20 @@ fn socket_dir_masks(
             out.push(parent.to_path_buf());
         }
     }
-    out.retain(|m| !write_roots.iter().any(|r| r.starts_with(m)));
+    // Compare REAL paths on both sides and dedupe: on macOS `/tmp` is a symlink to the real temp
+    // root, so a write root spelled through one and a mask found through the other must still
+    // meet — a mask is never allowed to cover a write root (Codex on #771).
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let roots: Vec<std::path::PathBuf> = write_roots.iter().map(|r| real(r)).collect();
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    out.retain(|m| {
+        let rm = real(m);
+        let keep = !roots.iter().any(|r| r.starts_with(&rm)) && !seen.contains(&rm);
+        if keep {
+            seen.push(rm);
+        }
+        keep
+    });
     out
 }
 
@@ -3631,9 +3644,27 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let masks = socket_dir_masks(roots, &temps, Some(&outside.join("agent.7")));
         assert!(!masks.contains(&outside), "{masks:?}");
-        // A socket in the dir holding a write root ⇒ that dir stays reachable.
+        // A socket in the dir holding a write root ⇒ that dir stays reachable — also when the
+        // write root is spelled through a symlink to the temp dir (macOS `/tmp` → the real root).
         let masks = socket_dir_masks(roots, &temps, Some(&base.join("root-dir").join("agent.7")));
         assert!(!masks.contains(&base.join("root-dir")), "{masks:?}");
+        #[cfg(unix)]
+        {
+            let link = std::env::temp_dir().join(format!("wt-515-link-{}", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&base, &link).unwrap();
+            let via_link = link.join("root-dir").join("proof");
+            let masks = socket_dir_masks(
+                std::slice::from_ref(&via_link),
+                &temps,
+                Some(&base.join("root-dir").join("agent.7")),
+            );
+            assert!(
+                !masks.contains(&base.join("root-dir")),
+                "a write root spelled through a symlink still protects its dir: {masks:?}"
+            );
+            let _ = std::fs::remove_file(&link);
+        }
         // No agent ⇒ the named socket dirs only.
         let masks = socket_dir_masks(roots, &temps, None);
         assert_eq!(
