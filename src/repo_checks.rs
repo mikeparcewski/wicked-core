@@ -2813,8 +2813,12 @@ fn vitest_pass_line_witnesses(s: &str, id: &str) -> bool {
     };
     let rest = rest.trim();
     if let Some(after) = rest.strip_prefix(body) {
-        let after = after.trim_start();
-        if after.is_empty() || after.starts_with(|c: char| c.is_ascii_digit()) {
+        // The id ends here: nothing after it, or a SPACE then the duration — `> a1 5ms` is
+        // another test, not `> a` with a timing suffix.
+        if after.is_empty()
+            || (after.starts_with(' ')
+                && after.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        {
             return true;
         }
     }
@@ -6190,6 +6194,7 @@ mod tests {
         scan.line(" ✓ tests/fonts.selfhosted.test.ts (3 tests | 1 skipped) 9ms");
         scan.line(" ✓ tests/x.test.ts > other test 5ms");
         scan.line(" ✓ tests/x.test.ts > a > nested 5ms");
+        scan.line(" ✓ tests/x.test.ts > a1 5ms");
         assert!(
             scan.passed.is_empty(),
             "a file with a skipped test, another test of the file, or a longer id is no witness: {:?}",
