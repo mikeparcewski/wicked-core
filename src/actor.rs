@@ -7535,8 +7535,15 @@ fn advance_or_pause(
     // as the initial plan (accepted, or held for its plan_approval gate) before any creator step
     // dispatches. A plan that cannot be decided or planned fails the run: it never runs on with
     // only its scope step.
-    team_gate::apply_scope(store, subscribers, run_id)
-        .map_err(|e| e.context("the PA-scoped plan could not be decided"))?;
+    // (core#747) `emit_run_error` shows `Display`, which on a context chain is the OUTERMOST
+    // message alone: a one-seat launch burned its scope unit and died with "could not be
+    // decided" and nothing else, while the cause (distribution: no seat distinct from the
+    // creator for the review/test steps) was one layer down. Carry the cause in the context
+    // text; `.context` keeps the typed `NoEligibleSeat` reachable by `downcast_ref` (D-10).
+    team_gate::apply_scope(store, subscribers, run_id).map_err(|e| {
+        let cause = format!("{e:#}");
+        e.context(format!("the PA-scoped plan could not be decided: {cause}"))
+    })?;
     // (DES-TEAMING-002 T4, §8.7) THE revision hook: every advance goes through here, so a held
     // diff re-score or the PA's held `PLAN` lines are applied before anything is dispatched —
     // after a fold, a dispute answer, a member step's acceptance or a gate alike.

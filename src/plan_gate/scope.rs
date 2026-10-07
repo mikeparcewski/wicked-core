@@ -392,6 +392,16 @@ pub(crate) fn pending_scored(unbound: bool) -> Scored {
     }
 }
 
+/// (core#747) The reason a one-seat roster's decided plan carries: its evaluator≠creator
+/// separation is degraded, and what would restore it.
+pub(crate) fn single_seat_reason(pa_seat: &str) -> String {
+    format!(
+        "single-seat roster ({pa_seat}): evaluator\u{2260}creator separation is degraded — every \
+         step runs on the one seat; a review or test step needs a second signed-in seat on the \
+         roster"
+    )
+}
+
 /// The scoped plan (the scope rev's steps, then the launch plan's) decided as the run's INITIAL
 /// plan at the scope step's boundary, through [`super::decide`]: proposed by the PA seat that
 /// answered (source: its understand turn), scored from its answer. `prior` is the run's state
@@ -418,7 +428,15 @@ pub(crate) fn decide_scoped(
         .accepted
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no scope rev"))?;
-    let (scored, touch) = scope_score(&hold, repo_root, base_commit, diff_rescored);
+    let (mut scored, touch) = scope_score(&hold, repo_root, base_commit, diff_rescored);
+    // (core#747) A one-seat roster has nothing to separate: the plan still decides here, and
+    // the score's reasons say what that costs — every step lands on the one seat, and a review
+    // or test step, which distribution never leaves on its creator's seat in a team run, needs
+    // a second signed-in seat. Said at the decision, so the gate and the facts carry it, instead
+    // of a bare refusal one layer down.
+    if prior.roster.len() == 1 {
+        scored.assessment.reasons.push(single_seat_reason(pa_seat));
+    }
     let (by, ord, attempt) = match &hold.answer {
         Some(a) => (a.by.clone(), a.ord, a.attempt),
         None => (pa_seat.to_string(), scope_ord, scope_attempt),
@@ -553,6 +571,107 @@ mod tests {
 
     /// A missing or malformed answer fails closed at 100 with the reason; a repo-less rating
     /// raises the lowest-band baseline through the model part and can never lower it.
+    /// (core#747) A one-seat roster DECIDES its PA-scoped plan — the refusal a single-seat
+    /// `feature` run met lives in distribution, one layer down — and the decision names the
+    /// degraded separation, so the gate and the facts say what a second seat would restore. A
+    /// two-seat roster says nothing.
+    #[test]
+    fn a_one_seat_roster_decides_and_names_the_degraded_separation() {
+        use crate::team::events::PATH_SCORED;
+        let state = |roster: Vec<serde_json::Value>| TeamPlanState {
+            rev: 1,
+            accepted_rev: 1,
+            roster,
+            accepted: Some(super::super::AcceptedPlan {
+                rev: 1,
+                by: "engine".into(),
+                band: "0-19".into(),
+                high_risk: false,
+                auto: true,
+                steps: plan(json!({"steps": [{"catalog": "understand", "id": SCOPE_STEP_ID}]})),
+                floor_override: None,
+                proposal_id: "p-scope".into(),
+                touch: Vec::new(),
+                touch_truncated: false,
+                touch_source: None,
+                rules: Vec::new(),
+            }),
+            scope: Some(ScopeHold {
+                plan: plan(json!({"steps": [{"catalog": "produce"}]})),
+                unbound: true,
+                answer: Some(ScopeAnswer {
+                    ord: 1,
+                    attempt: 0,
+                    by: "a".into(),
+                    lines: "RISK {\"score\":30,\"reasons\":[\"internal note\"]}".into(),
+                }),
+            }),
+            ..TeamPlanState::default()
+        };
+        let scored_reasons = |d: &Decided| -> Vec<String> {
+            d.events
+                .iter()
+                .filter(|e| e.event_type() == PATH_SCORED)
+                .flat_map(|e| {
+                    e.to_payload().unwrap()["reasons"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let one = decide_scoped(
+            "r1",
+            &state(vec![json!({"key": "a"})]),
+            "a",
+            1,
+            0,
+            None,
+            None,
+            true,
+            &HumanConfirm::None,
+            &super::super::NoRules,
+            0,
+        )
+        .expect("a one-seat roster decides its plan");
+        assert!(
+            !matches!(one.verdict, super::super::Verdict::Refused { .. }),
+            "decided, not refused"
+        );
+        let reasons = scored_reasons(&one);
+        assert!(
+            reasons.iter().any(|r| r == &single_seat_reason("a")),
+            "{reasons:?}"
+        );
+        assert!(
+            single_seat_reason("a").contains("second signed-in seat"),
+            "the reason names the remedy"
+        );
+
+        let two = decide_scoped(
+            "r2",
+            &state(vec![json!({"key": "a"}), json!({"key": "b"})]),
+            "a",
+            1,
+            0,
+            None,
+            None,
+            true,
+            &HumanConfirm::None,
+            &super::super::NoRules,
+            0,
+        )
+        .unwrap();
+        assert!(
+            !scored_reasons(&two)
+                .iter()
+                .any(|r| r.starts_with("single-seat roster")),
+            "two seats have something to separate"
+        );
+    }
+
     #[test]
     fn a_missing_answer_fails_closed_and_a_rating_only_raises() {
         let hold = |lines: Option<&str>, unbound: bool| ScopeHold {
