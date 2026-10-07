@@ -21,7 +21,9 @@ Two release tracks share this file, newest entry first regardless of track:
   core#553 load-flake re-run existed but knew only `cargo test`: `isolated_rerun_argv` returned
   `None` for every other runner. A vitest id (`FAIL <file> > suite > name`) now re-runs as
   `<the check's vitest> run <file>` (`--config`/`--root` kept, `--changed`/`related`/the file
-  list dropped), witnessed by the file's ` ✓ <file>` line; two ids in one file share one re-run.
+  list dropped; `--config`/`--root`/`--dir`/`--project`/`--workspace` kept so the file re-runs
+  under the same project), witnessed by the file's ` ✓ <file> (N tests)` line with no skipped
+  sub-count or the verbose line for exactly that id; two ids in one file share one re-run.
   Same gate as before: only on an oversubscribed host (1-min load above the CPU count), at most
   `MAX_FLAKE_RERUN` ids, a pass is `flaky_under_load` on the record, anything else stays a
   `regression`. `npm run test` (runner hidden behind a script), jest and go ids are not re-run.

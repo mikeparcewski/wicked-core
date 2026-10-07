@@ -2755,10 +2755,12 @@ fn vitest_file_of(id: &str) -> Option<&str> {
 
 /// (core#766) The check's own `vitest` invocation cut back to one file: everything up to and
 /// including the `vitest` token (`npx --no-install vitest`, `pnpm exec vitest`, `yarn vitest`,
-/// `node_modules/.bin/vitest`), then `run <file>`, then the original's `--config` / `--root`
-/// selection (both spellings). `--changed <base>`, `related`, its file list and every other flag
-/// are dropped: the re-run is the one file, not the one selection. `None` when the argv has no
-/// `vitest` token (`npm run test` hides the runner behind a script).
+/// `node_modules/.bin/vitest`), then `run <file>`, then the original's environment selection —
+/// `--config` / `--root` / `--dir` / `--project` / `--workspace` (both spellings; `--project`
+/// may repeat) — so the file re-runs under the SAME config and project, not a different one.
+/// `--changed <base>`, `related`, its file list and every other flag are dropped: the re-run is
+/// the one file, not the one selection. `None` when the argv has no `vitest` token (`npm run
+/// test` hides the runner behind a script).
 fn vitest_file_rerun_argv(argv: &[String], file: &str) -> Option<Vec<String>> {
     let at = argv.iter().position(|a| {
         Path::new(a)
@@ -2771,30 +2773,57 @@ fn vitest_file_rerun_argv(argv: &[String], file: &str) -> Option<Vec<String>> {
     out.push(file.to_string());
     let mut rest = argv[at + 1..].iter();
     while let Some(a) = rest.next() {
-        if matches!(a.as_str(), "--config" | "-c" | "--root" | "-r") {
+        if matches!(
+            a.as_str(),
+            "--config" | "-c" | "--root" | "-r" | "--dir" | "--project" | "--workspace" | "-w"
+        ) {
             if let Some(v) = rest.next() {
                 out.push(a.clone());
                 out.push(v.clone());
             }
-        } else if a.starts_with("--config=") || a.starts_with("--root=") {
+        } else if [
+            "--config=",
+            "--root=",
+            "--dir=",
+            "--project=",
+            "--workspace=",
+        ]
+        .iter()
+        .any(|k| a.starts_with(k))
+        {
             out.push(a.clone());
         }
     }
     Some(out)
 }
 
-/// (core#766) Does a vitest output line witness `file` passing? The default reporter's per-file
-/// line (` ✓ tests/x.test.ts (2 tests) 1234ms`) or the verbose reporter's per-test line
-/// (` ✓ tests/x.test.ts > suite > name 12ms`): a check mark, then the file, then end / a space /
-/// `(`. A line for another file is not it.
-fn vitest_pass_line_witnesses(s: &str, file: &str) -> bool {
-    let Some(rest) = s.strip_prefix('✓') else {
+/// (core#766) Does a vitest output line witness the id `FAIL <file> > suite > name` passing?
+/// Either the default reporter's per-file line with EVERY test passed — ` ✓ <file> (N tests)
+/// Nms`, a parenthetical with no `|` sub-count (`(3 tests | 1 skipped)` may have skipped the
+/// very test and is not a witness) — or the verbose reporter's per-test line for THIS id —
+/// ` ✓ <file> > suite > name[ Nms]`, the whole id, not a prefix of it (`> a > b` is not `> a`)
+/// and not another test of the same file. Another file's line is never it.
+fn vitest_pass_line_witnesses(s: &str, id: &str) -> bool {
+    let (Some(rest), Some(body), Some(file)) = (
+        s.strip_prefix('✓'),
+        id.strip_prefix("FAIL "),
+        vitest_file_of(id),
+    ) else {
         return false;
     };
-    let rest = rest.trim_start();
-    match rest.strip_prefix(file) {
-        Some(after) => after.is_empty() || after.starts_with(' ') || after.starts_with('('),
-        None => false,
+    let rest = rest.trim();
+    if let Some(after) = rest.strip_prefix(body) {
+        let after = after.trim_start();
+        if after.is_empty() || after.starts_with(|c: char| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    match rest.strip_prefix(file).map(str::trim_start) {
+        Some(after) if after.starts_with('(') => {
+            let inner = &after[1..after.find(')').unwrap_or(after.len())];
+            !inner.contains('|') && inner.contains("test")
+        }
+        _ => false,
     }
 }
 
@@ -3168,9 +3197,7 @@ impl LineScan {
             // (core#766) A watched vitest id passes when its FILE's check-mark line is printed.
             if s.starts_with('✓') {
                 for w in &self.watch {
-                    if vitest_file_of(w).is_some_and(|f| vitest_pass_line_witnesses(s, f))
-                        && !self.passed.iter().any(|p| p == w)
-                    {
+                    if vitest_pass_line_witnesses(s, w) && !self.passed.iter().any(|p| p == w) {
                         self.passed.push(w.clone());
                     }
                 }
@@ -6113,6 +6140,32 @@ mod tests {
                 "--root=packages/a"
             ]))
         );
+        // The project/workspace selection rides along: the file re-runs under the SAME project.
+        assert_eq!(
+            isolated_rerun_argv(
+                &s(&[
+                    "pnpm",
+                    "exec",
+                    "vitest",
+                    "--project",
+                    "unit",
+                    "run",
+                    "--workspace=ws.ts"
+                ]),
+                "FAIL tests/x.test.ts > a"
+            )
+            .map(|p| p.0),
+            Some(s(&[
+                "pnpm",
+                "exec",
+                "vitest",
+                "run",
+                "tests/x.test.ts",
+                "--project",
+                "unit",
+                "--workspace=ws.ts"
+            ]))
+        );
         assert!(
             isolated_rerun_argv(&s(&["npm", "run", "test"]), "FAIL tests/x.test.ts > a").is_none()
         );
@@ -6134,12 +6187,20 @@ mod tests {
             "another file is not the witness: {:?}",
             scan.passed
         );
+        scan.line(" ✓ tests/fonts.selfhosted.test.ts (3 tests | 1 skipped) 9ms");
+        scan.line(" ✓ tests/x.test.ts > other test 5ms");
+        scan.line(" ✓ tests/x.test.ts > a > nested 5ms");
+        assert!(
+            scan.passed.is_empty(),
+            "a file with a skipped test, another test of the file, or a longer id is no witness: {:?}",
+            scan.passed
+        );
         scan.line(" ✓ tests/fonts.selfhosted.test.ts (2 tests) 1234ms");
         assert_eq!(scan.passed, vec![id.to_string()]);
         scan.line(" ✓ tests/x.test.ts > a 5ms");
         assert_eq!(
             scan.passed, watch,
-            "the verbose per-test line witnesses too"
+            "the verbose per-test line for THIS id witnesses too"
         );
         scan.line(" ✓ tests/x.test.ts (1 test) 5ms");
         assert_eq!(scan.passed, watch, "a file is witnessed once");
@@ -6147,6 +6208,7 @@ mod tests {
         none.line(" ❯ tests/fonts.selfhosted.test.ts (2 tests | 1 failed) 5001ms");
         none.line("   × fonts are self-hosted > index.html and every source file name no font CDN");
         none.line("     → Test timed out in 5000ms.");
+        none.line(" ↓ tests/x.test.ts (1 test | 1 skipped)");
         assert!(none.passed.is_empty(), "{:?}", none.passed);
     }
 
