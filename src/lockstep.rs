@@ -146,6 +146,113 @@ mod tests {
         }
     }
 
+    /// wicked-estate is pinned in SIX manifests (the root, apps-core, governance, council, the
+    /// napi crate outside the workspace) and resolved in TWO lockfiles (the workspace's and the
+    /// napi crate's). One pin left behind on a bump resolves a second estate release beside the
+    /// first: either a type mismatch at the AnyStore seam, or — for the napi crate, which the
+    /// workspace build never compiles — a `.node` bundling an estate no test in this repo
+    /// exercised (core#742 moved 0.16.7 → 0.21.0 across all of them). Every `wicked-estate-*`
+    /// requirement in every manifest, and every `wicked-estate-*` package in both lockfiles, names
+    /// the same version; the test never says which.
+    #[test]
+    fn every_manifest_and_lockfile_names_one_estate_release() {
+        let root = repo_root();
+        let mut manifests = vec![root.join("Cargo.toml")];
+        for entry in std::fs::read_dir(root.join("crates")).expect("crates/ is readable") {
+            let m = entry.unwrap().path().join("Cargo.toml");
+            if m.is_file() {
+                manifests.push(m);
+            }
+        }
+        let mut pins: BTreeSet<(String, String)> = BTreeSet::new();
+        for m in &manifests {
+            let text = std::fs::read_to_string(m).unwrap();
+            // Only the dependency tables are pins: `[dependencies]`, `[dev-dependencies]`,
+            // `[build-dependencies]`, `[workspace.dependencies]`, `[target.'cfg(..)'.dependencies]`.
+            // A `wicked-estate-*` key under `[features]` (`wicked-estate-store = []`) or a
+            // comment is not one.
+            let mut in_deps = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    continue;
+                }
+                if let Some(section) = line.strip_prefix('[') {
+                    let section = section.trim_end_matches(']').trim_start_matches('[');
+                    in_deps = section.ends_with("dependencies");
+                    continue;
+                }
+                if !in_deps {
+                    continue;
+                }
+                let Some((dep, spec)) = line.split_once('=') else {
+                    continue;
+                };
+                let dep = dep.trim();
+                if !dep.starts_with("wicked-estate-") {
+                    continue;
+                }
+                let spec = spec.trim();
+                let version = if let Some(inner) = spec.strip_prefix('{') {
+                    inner
+                        .split(',')
+                        .map(str::trim)
+                        .find_map(|kv| kv.strip_prefix("version"))
+                        .and_then(|v| v.trim().strip_prefix('='))
+                        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '}').to_string())
+                } else {
+                    Some(spec.trim_matches('"').to_string())
+                };
+                let version = version.unwrap_or_else(|| {
+                    panic!(
+                        "{}: `{line}` pins no version",
+                        m.strip_prefix(&root).unwrap().display()
+                    )
+                });
+                pins.insert((
+                    format!("{}: {dep}", m.strip_prefix(&root).unwrap().display()),
+                    version,
+                ));
+            }
+        }
+        assert!(
+            pins.len() >= 6,
+            "expected the estate pins across the manifests, found {pins:?}"
+        );
+        let versions: BTreeSet<&str> = pins.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "the manifests pin more than one wicked-estate release — a bump left one behind:\n{}",
+            pins.iter()
+                .map(|(k, v)| format!("  {k} = {v}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let pinned = versions.into_iter().next().unwrap();
+        for lock in ["Cargo.lock", "crates/wicked-core-ts/Cargo.lock"] {
+            let text = read(lock);
+            let mut name: Option<&str> = None;
+            let mut seen = 0;
+            for line in text.lines() {
+                if let Some(n) = line.strip_prefix("name = ") {
+                    let n = n.trim_matches('"');
+                    name = n.starts_with("wicked-estate-").then_some(n);
+                } else if let (Some(n), Some(v)) = (name, line.strip_prefix("version = ")) {
+                    let v = v.trim_matches('"');
+                    assert_eq!(
+                        v, pinned,
+                        "{lock} resolves {n} {v} while the manifests pin {pinned} — run `cargo \
+                         update -p {n}` in that lockfile's directory"
+                    );
+                    seen += 1;
+                    name = None;
+                }
+            }
+            assert!(seen >= 6, "{lock} lists no wicked-estate packages ({seen})");
+        }
+    }
+
     /// The addon's version is written in three places: the crate manifest napi compiles, the
     /// package.json npm publishes, and one entry per platform in `optionalDependencies` — the
     /// per-target packages that carry the actual `.node`.

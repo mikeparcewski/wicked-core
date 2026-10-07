@@ -27,6 +27,17 @@ Two release tracks share this file, newest entry first regardless of track:
   Same gate as before: only on an oversubscribed host (1-min load above the CPU count), at most
   `MAX_FLAKE_RERUN` ids, a pass is `flaky_under_load` on the record, anything else stays a
   `regression`. `npm run test` (runner hidden behind a script), jest and go ids are not re-run.
+- **core#742 — wicked-estate 0.16.7 → 0.21.0; `AnyStore` forwards the TS-S2A support plane.**
+  Estate 0.21.0 added four required store-trait methods (`GraphRead::edge_supports`,
+  `support_generation`, `support_owners`; `GraphWrite::replace_edge_supports` — ENGINE-CONTRACT
+  §3.4) with no default body, and `crates/wicked-apps-core/src/store_any.rs` is the one
+  out-of-tree implementor: the pin could not move until the four `on_backend!` arms existed.
+  They do now (forwarded, never interpreted), the six manifests (root, apps-core, governance,
+  council, core-ts) and both lockfiles name 0.21.0, a `lockstep` test asserts every manifest and
+  lockfile names ONE estate release, and the AnyStore round-trip exercises the support plane
+  through the generic bound and `&dyn GraphStore` on SQLite (and Postgres under the parity job).
+  Unblocks core#692 (truncation cause on `review_scale`). core-ts ships a new `.node`; no wire
+  change. Also lands estate 0.21.0's lineage/traverse/rules CLI for the gate hook (core#729).
 - **core#744 — a creator that hits the turn ceiling opens a gate; the run is never "cancelled"
   by its own timeout.** Dogfood run ada5b0aa: the creator's rework attempt ran the repo's full
   journey suite under host load 90-220, hit the 2 h ceiling with 78 files of finished work
