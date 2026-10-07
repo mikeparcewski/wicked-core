@@ -295,6 +295,41 @@ impl PersistentStepRunner {
         // different binaries even if the registry is reloaded between the two uses.
         let invocation = Self::session_invocation(input);
 
+        // core#656: this carrier arms NO input governance — it opens the raw CLI with no gate-hook
+        // injection, no settings file, no permission tool — and every turn it returns reports
+        // `governed: false`, which alone cannot be told apart from a unit that never asked
+        // (FINDING-063). A governed unit therefore never runs quietly here: claude — the one
+        // binary the engine CAN govern — is REFUSED before any session opens (the core#653
+        // invariant: a governed claude unit runs on the ACP carrier, or wrapped with proven
+        // hooks); any other binary runs and is DISCLOSED with `GovernanceUnenforced`, exactly the
+        // wrapped carrier's non-claude arm (`execute_wrapped`). Only when there is a binary to
+        // name: an empty invocation fails below with exactly that message, and "governed but
+        // unenforced" for it would be a false disclosure.
+        if input.governance.is_some() {
+            let binary = build_argv(&invocation, "", &input.unit.allowed_skills)
+                .into_iter()
+                .next()
+                .filter(|b| !b.is_empty());
+            if let Some(bin) = binary {
+                if binary_is_claude(&bin) {
+                    return governance_refusal(input, &bin);
+                }
+                let _ = self
+                    .tx
+                    .send(Command::EmitEvent(CoreEvent::GovernanceUnenforced {
+                        session: run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        cli: bin.clone(),
+                        reason: format!(
+                            "unit is governed but the {PTY_CARRIER} carrier arms no input \
+                             governance for '{bin}' (gate-hook injection is claude-only and this \
+                             carrier opens the raw CLI); its tool calls are unchecked"
+                        ),
+                    }));
+            }
+        }
+
         // Lazily open a session for this run_id. The lock covers only the map read/write — not
         // the blocking open_terminal / wait_for_opened calls — so unrelated runs are never
         // serialised by one run's slow PTY startup.
@@ -596,6 +631,28 @@ fn collect_turn(
         usage,
         files,
         tools,
+        governed: false,
+    }
+}
+
+/// core#656: the failed launch a GOVERNED claude unit meets on this carrier (`exec_turn`), before
+/// any session is opened or written to. Shaped like `execute_wrapped::skills_refusal` so the
+/// actor's failed-launch handling applies unchanged; `governed: false` stays truthful.
+fn governance_refusal(input: &StepInput, bin: &str) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!(
+            "(governance refused the launch: unit is governed but {PTY_CARRIER} sessions arm no \
+             input governance for '{bin}' — no gate-hook is injected, so its tool calls would run \
+             unchecked; a governed claude unit runs on the ACP carrier or on the wrapped carrier \
+             with proven hooks (core#653, core#656))"
+        ),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
         governed: false,
     }
 }
@@ -1250,6 +1307,115 @@ mod tests {
         );
         runner.drop_session("run-pty-skills");
         wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+    }
+
+    /// core#656: this carrier arms no input governance, so a GOVERNED unit never runs quietly.
+    /// claude — the one governable binary — is REFUSED by name before any session opens (the
+    /// core#653 invariant: a governed claude unit runs on ACP or wrapped with proven hooks); any
+    /// other binary runs and the engine discloses it with `GovernanceUnenforced` (unit-shaped:
+    /// run, ord, attempt, argv[0]), exactly like the wrapped carrier's non-claude arm. Control:
+    /// the same unit without governance runs with no disclosure at all.
+    #[test]
+    fn a_governed_unit_on_the_pty_carrier_is_refused_for_claude_and_disclosed_for_other_binaries() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let governed = || {
+            Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: "/never/opened/estate.db".to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            })
+        };
+
+        // claude, governed: refused before any PTY opens, naming the carrier, the binary and
+        // where such a unit belongs. A refusal is not a disclosure: no `GovernanceUnenforced`.
+        let mut claude = make_unit("judge the work", "claude --output-format stream-json");
+        claude.ord = 1;
+        let mut input = make_input("run-pty-gov", 0, claude);
+        input.governance = governed();
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(!out.governed, "a refused launch never claims governance");
+        assert!(
+            out.output.contains("governance refused the launch")
+                && out
+                    .output
+                    .contains("persistent PTY sessions arm no input governance")
+                && out.output.contains("'claude'")
+                && out.output.contains("ACP carrier"),
+            "refused by name, naming the carrier and the binary: {}",
+            out.output
+        );
+        let (mut opened, mut disclosed) = (0usize, 0usize);
+        while let Ok(ev) = events.try_recv() {
+            match ev {
+                CoreEvent::TerminalOpened { .. } => opened += 1,
+                CoreEvent::GovernanceUnenforced { .. } => disclosed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(opened, 0, "a refused unit opens no session");
+        assert_eq!(disclosed, 0, "a refusal is not a disclosure");
+
+        // Any other binary, governed: runs, reports `governed: false`, and the engine says so.
+        let invocation = fake_cli_invocation();
+        let mut other = make_unit("second work", &invocation);
+        other.ord = 2;
+        let mut input = make_input("run-pty-gov", 1, other);
+        input.attempt = 3;
+        input.governance = governed();
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(!out.governed, "this carrier never claims governance");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut disclosure = None;
+        while Instant::now() < deadline && disclosure.is_none() {
+            if let Ok(CoreEvent::GovernanceUnenforced {
+                session,
+                ord,
+                attempt,
+                cli,
+                reason,
+            }) = events.recv_timeout(Duration::from_millis(50))
+            {
+                disclosure = Some((session, ord, attempt, cli, reason));
+            }
+        }
+        let (session, ord, attempt, cli, reason) =
+            disclosure.expect("a governed non-claude unit on the PTY carrier is disclosed");
+        assert_eq!((session.as_str(), ord, attempt), ("run-pty-gov", 2, 3));
+        assert_eq!(cli, "sh", "the disclosure names argv[0]");
+        assert!(
+            reason.contains("persistent PTY") && reason.contains("'sh'"),
+            "the reason names the carrier and the binary: {reason}"
+        );
+
+        // Control: the same unit, ungoverned, runs with no disclosure — drained up to the
+        // session's own exit so an in-flight event cannot be missed.
+        let mut plain = make_unit("third work", &invocation);
+        plain.ord = 3;
+        let out = runner.run_unit(&make_input("run-pty-gov", 2, plain));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        runner.drop_session("run-pty-gov");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < deadline && !exited {
+            match events.recv_timeout(Duration::from_millis(50)) {
+                Ok(CoreEvent::GovernanceUnenforced { ord, .. }) => {
+                    assert_ne!(ord, 3, "an ungoverned unit is never reported as unenforced")
+                }
+                Ok(CoreEvent::TerminalExited { .. }) => exited = true,
+                _ => {}
+            }
+        }
+        assert!(exited, "the dropped session exits");
     }
 
     /// codex round 9 (H3): the refusal is PLAN-WIDE. The actor hands every unit the run's whole
