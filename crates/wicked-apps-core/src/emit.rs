@@ -20,11 +20,13 @@
 //! style cursor drain can layer on later).
 //!
 //! ## Where the spool lives (core#749)
-//! Never under HOME. [`DEADLETTER_ENV`] when set (the launcher's choice: wicked-crew points its
-//! workers at its own state home); else beside the store this process was configured with (the
-//! directory of a file-path [`ESTATE_DB_ENV`] — the daemon's state home is the directory of its
-//! `--db`); else a PROCESS-SCOPED file under `std::env::temp_dir()` named with the pid. A
-//! store-less CLI or test process used to append to one host-shared file under HOME that every
+//! Never the host-shared file under HOME. [`DEADLETTER_ENV`] when set (the launcher's choice:
+//! wicked-crew points its workers at its own state home); else beside the store this process was
+//! configured with (the directory of a file-path [`ESTATE_DB_ENV`] — the daemon's state home is
+//! the directory of its `--db`, the current directory for a bare file name); else a
+//! PROCESS-SCOPED file under `std::env::temp_dir()` named with the pid (on Windows the temp dir
+//! itself sits under the profile — the guarantee is process-scoped, not "outside the profile").
+//! A store-less CLI or test process used to append to one host-shared file under HOME that every
 //! daemon on the host then reported as foreign dead letters it could not replay (crew#829).
 
 use std::io::{BufRead, BufReader, Write};
@@ -42,7 +44,7 @@ use crate::{
 
 /// Overrides the outbox / dead-letter spool file path. When unset, the spool resolves as
 /// [`deadletter_path`] says: beside this process's configured store, else a per-process temp file
-/// — never under HOME (core#749).
+/// — never the host-shared file under HOME (core#749).
 pub const DEADLETTER_ENV: &str = "WICKED_APPS_EMIT_DEADLETTER";
 
 /// The spool file's name under a state home: `<state home>/wicked-apps/emit-outbox.ndjson`.
@@ -407,9 +409,10 @@ fn home_dir() -> Option<PathBuf> {
 /// Resolve the outbox spool path (core#749): the [`DEADLETTER_ENV`] override if set; else
 /// `<state home>/wicked-apps/emit-outbox.ndjson` where the state home is the directory of the
 /// file-path store [`ESTATE_DB_ENV`] names (the daemon's state home is the directory of its
-/// `--db`; a URL spec or `:memory:` names none); else a process-scoped
-/// `<temp dir>/wicked-apps-emit-outbox-<pid>.ndjson`. Never a path under HOME: a store-less
-/// process's dead letters belong to that process, not to every daemon on the host.
+/// `--db`, the current directory for a bare file name — the same reading as the engine's
+/// `operational_home_of_db`; a URL spec or `:memory:` names none); else a process-scoped
+/// `<temp dir>/wicked-apps-emit-outbox-<pid>.ndjson`. Never the host-shared file under HOME: a
+/// store-less process's dead letters belong to that process, not to every daemon on the host.
 pub fn deadletter_path() -> PathBuf {
     if let Some(p) = std::env::var_os(DEADLETTER_ENV) {
         return PathBuf::from(p);
@@ -424,17 +427,22 @@ pub fn deadletter_path() -> PathBuf {
 }
 
 /// The state home this process has, when it has one: the directory of the FILE the store spec
-/// in [`ESTATE_DB_ENV`] names. A URL spec (`postgres://…`), `:memory:`, an empty value or a bare
-/// file name (no directory) is none.
+/// in [`ESTATE_DB_ENV`] names, spelled absolute (a bare file name or a relative parent resolves
+/// against the current directory — the engine's `operational_home_of_db` reads `--db` the same
+/// way). A URL spec (`postgres://…`), `:memory:` or an empty value is none.
 fn state_home() -> Option<PathBuf> {
     let spec = std::env::var(ESTATE_DB_ENV).ok()?;
     if spec.is_empty() || spec == ":memory:" || spec.contains("://") {
         return None;
     }
-    Path::new(&spec)
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .map(Path::to_path_buf)
+    let parent = Path::new(&spec).parent()?;
+    if parent.as_os_str().is_empty() {
+        std::env::current_dir().ok()
+    } else if parent.is_absolute() {
+        Some(parent.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(parent))
+    }
 }
 
 /// TEST-SUPPORT — never call from runtime code. Redirects the outbox spool to one per-process
@@ -829,8 +837,10 @@ mod tests {
         );
     }
 
-    /// Default outbox path is derived from home (cross-platform) and ends with the documented
-    /// suffix — never a hardcoded `~`.
+    /// The default outbox path (core#749): no store and no override -> a pid-named file under
+    /// the temp dir, never the legacy host-shared file under HOME; a file-path store -> that
+    /// store's state home; a URL / `:memory:` store -> the temp file again; the override wins.
+    /// Never a hardcoded `~`.
     #[test]
     fn default_outbox_path_is_never_under_home() {
         let _guard = lock_env();
@@ -869,6 +879,17 @@ mod tests {
         assert_eq!(
             deadletter_path(),
             state.join("wicked-apps").join(super::OUTBOX_FILE)
+        );
+        // A bare file name is a store in the current directory: its state home is the cwd.
+        unsafe {
+            std::env::set_var(ESTATE_DB_ENV, "core.db");
+        }
+        assert_eq!(
+            deadletter_path(),
+            std::env::current_dir()
+                .unwrap()
+                .join("wicked-apps")
+                .join(super::OUTBOX_FILE)
         );
         // A URL store names no directory: back to the process-scoped temp file.
         unsafe {

@@ -149,7 +149,7 @@ fn a_forced_spool_lands_in_the_armed_temp_outbox_never_in_the_real_home() {
     let armed = std::path::PathBuf::from(
         std::env::var_os(DEADLETTER_ENV).expect("the pre-main ctor armed the spool override"),
     );
-    let resolved = deadletter_path().expect("the spool path resolves");
+    let resolved = deadletter_path();
     assert_eq!(
         resolved, armed,
         "the seam must resolve the spool to the armed override"
