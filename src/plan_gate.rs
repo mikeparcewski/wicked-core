@@ -586,6 +586,11 @@ pub struct PendingPlan {
     /// (WT-C3) The testing rules the held plan was composed under, carried to its acceptance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<crate::team::events::RuleOutcome>,
+    /// (core#711) The step ids already dispatched or done when the plan was held, in the order
+    /// they ran. `steps` stays the LOGICAL plan (catalog order, what is accepted); the gate's
+    /// prompt shows the running order, as the def runs it. Empty on an initial plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done: Vec<String>,
 }
 
 /// Which row of the approval matrix a plan event is (§8.6).
@@ -1029,6 +1034,7 @@ pub(crate) fn decide(
                 refusal: None,
                 touch_source: Some(touch_source_of(&proposal.source)),
                 rules,
+                done: Vec::new(),
             });
             Ok(Decided {
                 state,
@@ -1201,10 +1207,13 @@ pub(crate) fn approve_pending(
     Ok((next, decided))
 }
 
-/// The prompt a `plan_approval` gate shows (§8.5: the override is shown at the gate).
+/// The prompt a `plan_approval` gate shows (§8.5: the override is shown at the gate). The steps
+/// are listed in RUNNING order (core#711): the done prefix as it ran, then the rest of the
+/// logical plan — a floor step added after `build` finished shows after `build`, where it runs,
+/// as the studio stepper shows it. A done step the plan dropped falls back to the logical order.
 pub(crate) fn gate_prompt(p: &PendingPlan, ord: u32, auto: bool) -> String {
-    let steps: Vec<String> = p
-        .steps
+    let running = revise::running_order(&p.steps, &p.done).unwrap_or_else(|_| p.steps.clone());
+    let steps: Vec<String> = running
         .steps
         .iter()
         .map(|s| match s.added_by {
@@ -1542,6 +1551,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ev.to_payload().unwrap()["monitors"], json!({"asked": 0}));
+    }
+
+    /// (core#711) The gate prompt lists the steps as they RUN, not as the logical plan orders
+    /// them: a floor step added after `build` finished shows after `build`. An initial plan (no
+    /// done prefix) and a plan whose done step is missing fall back to the logical order.
+    #[test]
+    fn the_gate_prompt_lists_steps_in_running_order() {
+        let steps = plan(json!({"steps": [
+            {"catalog": "understand", "id": "pa-scope", "added_by": "plan"},
+            {"catalog": "test_plan", "id": "test_plan", "added_by": "floor"},
+            {"catalog": "design", "id": "design", "added_by": "floor"},
+            {"catalog": "build", "id": "build", "added_by": "plan"},
+            {"catalog": "test", "id": "test", "added_by": "plan"},
+            {"catalog": "review", "id": "review", "added_by": "plan"},
+            {"catalog": "deliver", "id": "deliver", "added_by": "plan"}
+        ]}));
+        let mut p = PendingPlan {
+            rev: 3,
+            proposal_id: "p-rescore".into(),
+            reviewing_ord: Some(2),
+            steps,
+            band: "40-69".into(),
+            high_risk: false,
+            floor_override: None,
+            reason: "manual_mode".into(),
+            floor_added: vec!["test_plan".into(), "design".into()],
+            gate_id: None,
+            refusal: None,
+            touch_source: None,
+            rules: Vec::new(),
+            done: vec!["pa-scope".into(), "build".into()],
+        };
+        let prompt = gate_prompt(&p, 3, false);
+        assert!(
+            prompt.contains(
+                "pa-scope → build → test_plan (floor) → design (floor) → test → review → deliver"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Floor added: test_plan, design"),
+            "{prompt}"
+        );
+
+        let logical =
+            "pa-scope → test_plan (floor) → design (floor) → build → test → review → deliver";
+        p.done = Vec::new();
+        assert!(gate_prompt(&p, 1, false).contains(logical));
+        p.done = vec!["gone".into()];
+        assert!(gate_prompt(&p, 1, false).contains(logical));
     }
 
     /// DES-TEAMING-002 §8.6's approval matrix, row by row (fixed expectations from the table).

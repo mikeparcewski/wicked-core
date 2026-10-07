@@ -738,6 +738,7 @@ pub(crate) fn revise(
                 refusal: None,
                 touch_source: Some(touch_source),
                 rules,
+                done: done.to_vec(),
             });
             Ok(Revised {
                 state,

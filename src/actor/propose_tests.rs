@@ -306,6 +306,7 @@ fn an_edit_while_a_plan_awaits_approval_is_refused() {
             refusal: None,
             touch_source: None,
             rules: Vec::new(),
+            done: Vec::new(),
         });
     });
     let e = propose_plan(

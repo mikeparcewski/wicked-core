@@ -21045,6 +21045,7 @@ mod plan_gate_confirm_tests {
             refusal: None,
             touch_source: None,
             rules: Vec::new(),
+            done: Vec::new(),
         }
     }
 
