@@ -3775,6 +3775,7 @@ mod tests {
                     "the stub agent socket must be unreachable inside the validator jail ({probe})"
                 );
                 // The same probe outside the jail sees it — the denial is the jail's, not a typo.
+                // spawn-audit: test-only — the unjailed control for the socket-reach probe above; nothing of the daemon's runs here.
                 let mut outside = Command::new(&sh);
                 outside.arg("-c").arg(&probe).current_dir(&dir);
                 assert!(
