@@ -673,12 +673,18 @@ fn socket_dir_masks(
             }
         }
     }
-    // (core#515) `SSH_AUTH_SOCK`'s own directory, when it is strictly below a temp dir: an agent
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // (core#515) `SSH_AUTH_SOCK`'s own directory, when it is STRICTLY below a temp dir: an agent
     // that does not use the `ssh-*` naming (or a forwarded one) is as connect-able as any other.
+    // "Strictly below" is decided on REAL paths — a temp dir spelled through a symlink (`/tmp`
+    // on macOS) or any other equivalent spelling must never make the temp dir itself look like
+    // a child of itself (C8: the temp dir is never a mask).
     if let Some(parent) = ssh_auth_sock.and_then(Path::parent) {
-        let below_a_temp_dir = temp_dirs
-            .iter()
-            .any(|t| parent != *t && parent.starts_with(t));
+        let rp = real(parent);
+        let below_a_temp_dir = temp_dirs.iter().any(|t| {
+            let rt = real(t);
+            rp != rt && rp.starts_with(&rt)
+        });
         if below_a_temp_dir && real_dir(parent) && !out.iter().any(|m| m == parent) {
             out.push(parent.to_path_buf());
         }
@@ -686,7 +692,6 @@ fn socket_dir_masks(
     // Compare REAL paths on both sides and dedupe: on macOS `/tmp` is a symlink to the real temp
     // root, so a write root spelled through one and a mask found through the other must still
     // meet — a mask is never allowed to cover a write root (Codex on #771).
-    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let roots: Vec<std::path::PathBuf> = write_roots.iter().map(|r| real(r)).collect();
     let mut seen: Vec<std::path::PathBuf> = Vec::new();
     out.retain(|m| {
@@ -3633,12 +3638,28 @@ mod tests {
         let masks = socket_dir_masks(roots, &temps, Some(&base.join("agent-dir").join("agent.7")));
         assert!(masks.contains(&base.join("agent-dir")), "{masks:?}");
         assert!(masks.contains(&base.join("ssh-abc")), "{masks:?}");
-        // A socket directly under the temp dir ⇒ the temp dir itself is NEVER masked (C8).
+        // A socket directly under the temp dir ⇒ the temp dir itself is NEVER masked (C8) — not
+        // when spelled plainly, with a trailing slash, nor through a symlink to the temp dir.
         let masks = socket_dir_masks(roots, &temps, Some(&base.join("agent.7")));
         assert!(
             !masks.contains(&base),
             "the temp dir is never a mask: {masks:?}"
         );
+        let slashed = std::path::PathBuf::from(format!("{}/", base.display()));
+        let masks = socket_dir_masks(roots, &[slashed.as_path()], Some(&base.join("agent.7")));
+        assert!(!masks.contains(&base), "{masks:?}");
+        #[cfg(unix)]
+        {
+            let link = std::env::temp_dir().join(format!("wt-515-tlink-{}", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&base, &link).unwrap();
+            let masks = socket_dir_masks(roots, &temps, Some(&link.join("agent.7")));
+            assert!(
+                !masks.iter().any(|m| m == &link || m == &base),
+                "the temp dir through a symlink is still the temp dir: {masks:?}"
+            );
+            let _ = std::fs::remove_file(&link);
+        }
         // A socket outside every temp dir ⇒ nothing added for it.
         let outside = std::env::temp_dir().join(format!("wt-515-outside-{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();
