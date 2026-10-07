@@ -52,6 +52,10 @@ struct PtySession {
     /// an `executes_code: false` phase — it could background a write past the guard's final
     /// snapshot — and a read-only session is never handed to a code phase that must write.
     no_code: bool,
+    /// argv[0] of the command this session was opened with (core#656). A reused session's
+    /// governance decision reads THIS, not the current unit's invocation: the PTY that will run
+    /// the turn is the one already open, whatever the unit's template says.
+    binary: String,
 }
 
 // ── PersistentStepRunner ──────────────────────────────────────────────────────
@@ -299,34 +303,22 @@ impl PersistentStepRunner {
         // injection, no settings file, no permission tool — and every turn it returns reports
         // `governed: false`, which alone cannot be told apart from a unit that never asked
         // (FINDING-063). A governed unit therefore never runs quietly here: claude — the one
-        // binary the engine CAN govern — is REFUSED before any session opens (the core#653
-        // invariant: a governed claude unit runs on the ACP carrier, or wrapped with proven
-        // hooks); any other binary runs and is DISCLOSED with `GovernanceUnenforced`, exactly the
-        // wrapped carrier's non-claude arm (`execute_wrapped`). Only when there is a binary to
-        // name: an empty invocation fails below with exactly that message, and "governed but
-        // unenforced" for it would be a false disclosure.
-        if input.governance.is_some() {
-            let binary = build_argv(&invocation, "", &input.unit.allowed_skills)
+        // binary the engine CAN govern — is REFUSED (the core#653 invariant: a governed claude
+        // unit runs on the ACP carrier, or wrapped with proven hooks); any other binary runs and
+        // is DISCLOSED with `GovernanceUnenforced`, exactly the wrapped carrier's non-claude arm
+        // (`execute_wrapped`). Two sites: here, the unit's OWN template names claude ⇒ refused
+        // before any session opens; and below, once the session this turn will actually run in
+        // is known (`session_binary`) — a reused PTY may run a different binary than the unit's
+        // template names, and a launch the posture guard refuses must not be disclosed as having
+        // run unchecked (codex round 1 on #763).
+        let governed = input.governance.is_some();
+        if governed {
+            let own = build_argv(&invocation, "", &input.unit.allowed_skills)
                 .into_iter()
                 .next()
                 .filter(|b| !b.is_empty());
-            if let Some(bin) = binary {
-                if binary_is_claude(&bin) {
-                    return governance_refusal(input, &bin);
-                }
-                let _ = self
-                    .tx
-                    .send(Command::EmitEvent(CoreEvent::GovernanceUnenforced {
-                        session: run_id.clone(),
-                        ord: input.unit.ord,
-                        attempt: input.attempt,
-                        cli: bin.clone(),
-                        reason: format!(
-                            "unit is governed but the {PTY_CARRIER} carrier arms no input \
-                             governance for '{bin}' (gate-hook injection is claude-only and this \
-                             carrier opens the raw CLI); its tool calls are unchecked"
-                        ),
-                    }));
+            if let Some(bin) = own.filter(|b| binary_is_claude(b)) {
+                return governance_refusal(input, &bin);
             }
         }
 
@@ -345,11 +337,18 @@ impl PersistentStepRunner {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard
                 .get(&run_id)
-                .map(|s| (s.terminal_id.clone(), s.no_code))
+                .map(|s| (s.terminal_id.clone(), s.no_code, s.binary.clone()))
         };
         let existing_id = match existing_id {
-            Some((tid, no_code)) if no_code == wants_no_code => Some(tid),
-            Some((tid, _)) => {
+            Some((tid, no_code, binary)) if no_code == wants_no_code => {
+                // core#656: the open PTY runs `binary`, whatever this unit's template names. A
+                // governed unit never writes into a claude PTY on this carrier.
+                if governed && binary_is_claude(&binary) {
+                    return governance_refusal(input, &binary);
+                }
+                Some((tid, binary))
+            }
+            Some((tid, _, _)) => {
                 eprintln!(
                     "wicked-core: run {run_id} unit {} needs a {} session but the open PTY session \
                      {tid} was opened {} — closing it and opening a fresh one (F-036)",
@@ -363,8 +362,8 @@ impl PersistentStepRunner {
             None => None,
         };
 
-        let terminal_id = match existing_id {
-            Some(tid) => {
+        let (terminal_id, session_binary) = match existing_id {
+            Some((tid, binary)) => {
                 // (EVT-003) Session already open — reusing it for this unit. Fires before the
                 // prompt write so callers can observe the reuse before any output arrives.
                 let _ = self
@@ -374,7 +373,7 @@ impl PersistentStepRunner {
                         terminal_id: tid.clone(),
                         ord: input.unit.ord,
                     }));
-                tid
+                (tid, binary)
             }
             None => {
                 let cwd = input
@@ -390,6 +389,7 @@ impl PersistentStepRunner {
                         )
                     }
                 };
+                let binary = cmd.first().cloned().unwrap_or_default();
                 // Subscribe BEFORE open so we catch the TerminalOpened event.
                 let pre = self.subscribe();
                 let tid = match self.open_terminal(cwd, cmd) {
@@ -399,13 +399,14 @@ impl PersistentStepRunner {
                 wait_for_opened(&pre, &tid);
                 // Re-acquire to insert. Use entry to handle a concurrent opener for the same
                 // run_id: the first inserter wins; if we lose the race, close our duplicate.
-                let final_tid = {
+                let (final_tid, final_binary) = {
                     let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                     let entry = guard.entry(run_id.clone()).or_insert(PtySession {
                         terminal_id: tid.clone(),
                         no_code: wants_no_code,
+                        binary,
                     });
-                    entry.terminal_id.clone()
+                    (entry.terminal_id.clone(), entry.binary.clone())
                 };
                 if final_tid != tid {
                     // Lost the race — another thread already inserted for this run_id.
@@ -426,9 +427,32 @@ impl PersistentStepRunner {
                             cli_key,
                         }));
                 }
-                final_tid
+                (final_tid, final_binary)
             }
         };
+
+        // core#656, second site: the session this turn runs in is known and open. A governed unit
+        // on a claude PTY is refused (a concurrent opener may have won the race with claude); on
+        // any other binary it is disclosed NOW — after the posture guard and the open succeeded,
+        // so the event never claims a launch that was refused ran unchecked — and then runs.
+        if governed {
+            if binary_is_claude(&session_binary) {
+                return governance_refusal(input, &session_binary);
+            }
+            let _ = self
+                .tx
+                .send(Command::EmitEvent(CoreEvent::GovernanceUnenforced {
+                    session: run_id.clone(),
+                    ord: input.unit.ord,
+                    attempt: input.attempt,
+                    cli: session_binary.clone(),
+                    reason: format!(
+                        "unit is governed but the {PTY_CARRIER} carrier arms no input governance \
+                         for '{session_binary}' (gate-hook injection is claude-only and this \
+                         carrier opens the raw CLI); its tool calls are unchecked"
+                    ),
+                }));
+        }
 
         // Subscribe BEFORE writing so no output bytes are lost between write and drain.
         let events = self.subscribe();
@@ -863,6 +887,26 @@ mod tests {
             path.to_string_lossy().into_owned()
         });
         format!("sh {p}")
+    }
+
+    /// The same fake interactive CLI as [`fake_cli_invocation`], installed under a file NAMED
+    /// `claude` and run directly (shebang), so `binary_is_claude(argv[0])` is true for the session
+    /// it opens — the shape core#656's reuse case needs. Nothing real is launched.
+    fn fake_claude_invocation() -> String {
+        use std::os::unix::fs::PermissionsExt;
+        static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let sh = fake_cli_invocation();
+            let script = sh.strip_prefix("sh ").expect("`sh <path>`");
+            let dir = std::env::temp_dir()
+                .join(format!("wicked-core-fake-claude-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("claude");
+            std::fs::copy(script, &path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        })
+        .clone()
     }
 
     /// RAII pin of `WICKED_MEMORY_EMBEDDER` (codex round 9, L2): hold `test_env::ENV_LOCK` (write)
@@ -1416,6 +1460,83 @@ mod tests {
             }
         }
         assert!(exited, "the dropped session exits");
+    }
+
+    /// core#656 (codex round 1 on #763): the disclosure follows the LAUNCH, and the decision
+    /// reads the PTY the turn actually runs in. (1) A governed non-claude unit the read-only
+    /// posture guard refuses (an unknown binary whose template grants writes) opens nothing and
+    /// is NOT disclosed — `GovernanceUnenforced` would claim a launch that never happened ran
+    /// unchecked. (2) An ungoverned unit opens a claude-named PTY; a governed unit on the same
+    /// run whose own template names another binary would REUSE it — refused naming claude,
+    /// nothing written. Drained up to the session's exit: one session opened, zero disclosures.
+    #[test]
+    fn a_refused_launch_is_not_disclosed_and_a_reused_claude_pty_refuses_a_governed_unit() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let governed = || {
+            Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: "/never/opened/estate.db".to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            })
+        };
+        // (1) Governed, non-claude, refused by the posture guard: no session, no disclosure.
+        let mut fenced = make_unit(
+            "verify the fix",
+            "/opt/other/tool --sandbox workspace-write",
+        );
+        fenced.worktree_guarded = true;
+        fenced.ord = 1;
+        let mut input = make_input("run-pty-gov2", 0, fenced);
+        input.governance = governed();
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("read-only posture refused the launch"),
+            "the posture guard refused it: {}",
+            out.output
+        );
+        // (2) An ungoverned unit opens a claude-named PTY …
+        let mut first = make_unit("first work", &fake_claude_invocation());
+        first.ord = 2;
+        let out = runner.run_unit(&make_input("run-pty-gov2", 1, first));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(out.output.contains("WKRTURN:"), "{}", out.output);
+        // … and a governed unit whose OWN template is `sh` would reuse it: refused naming claude.
+        let mut second = make_unit("judge the work", &fake_cli_invocation());
+        second.ord = 3;
+        let mut input = make_input("run-pty-gov2", 2, second);
+        input.governance = governed();
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("governance refused the launch")
+                && out.output.contains("claude")
+                && !out.output.contains("'sh'"),
+            "refused on the PTY's binary, not the unit's template: {}",
+            out.output
+        );
+        runner.drop_session("run-pty-gov2");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut opened, mut disclosed, mut exited) = (0usize, 0usize, false);
+        while Instant::now() < deadline && !exited {
+            match events.recv_timeout(Duration::from_millis(50)) {
+                Ok(CoreEvent::TerminalOpened { .. }) => opened += 1,
+                Ok(CoreEvent::GovernanceUnenforced { .. }) => disclosed += 1,
+                Ok(CoreEvent::TerminalExited { .. }) => exited = true,
+                _ => {}
+            }
+        }
+        assert!(exited, "the dropped session exits");
+        assert_eq!(opened, 1, "only the ungoverned unit opened a session");
+        assert_eq!(disclosed, 0, "a refusal is never a disclosure");
     }
 
     /// codex round 9 (H3): the refusal is PLAN-WIDE. The actor hands every unit the run's whole
