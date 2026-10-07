@@ -314,7 +314,7 @@ mod tests {
             "{owners:?}"
         );
         assert!(
-            read.neighbors(&source, crate::Direction::Outgoing)
+            read.neighbors(&source, super::Direction::Dependencies)
                 .unwrap()
                 .iter()
                 .any(|e| e.target == target && e.kind == EdgeKind::Calls),
