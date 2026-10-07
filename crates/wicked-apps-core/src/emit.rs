@@ -867,10 +867,9 @@ mod tests {
             format!("wicked-apps-emit-outbox-{}.ndjson", std::process::id()),
             "{name}"
         );
-        assert!(
-            !p.to_string_lossy().contains('~'),
-            "expanded, not literal ~"
-        );
+        // Expanded, not a literal `~` shorthand. (`is_absolute`, not "no `~` anywhere": a
+        // Windows temp dir carries 8.3 short names like `RUNNER~1`.)
+        assert!(p.is_absolute(), "expanded, not literal ~: {}", p.display());
         // A file-path store: the spool lives in that store's state home.
         let state = std::env::temp_dir().join("wicked-apps-state-home-749");
         unsafe {
