@@ -595,6 +595,132 @@ rename to src/runtime/core.rs
     );
 }
 
+/// core#611: a copy's `a/` side is the SOURCE, which did not change. Scoring it as a rename
+/// counted every importer of `src/core.rs` for a diff that never touched `src/core.rs`. The copy
+/// is a new, unindexed leaf (20); the source still classifies the block and carries its path
+/// markers.
+#[test]
+fn copy_twin_of_a_heavily_imported_module_scores_as_a_new_leaf() {
+    let store = imported_file_graph("src/core.rs");
+    let d = "\
+diff --git a/src/core.rs b/src/runtime/core.rs
+similarity index 100%
+copy from src/core.rs
+copy to src/runtime/core.rs
+";
+    let diff = signals_from_diff(d);
+    assert_eq!((diff.code_files, diff.lines_added), (1, 0), "{diff:?}");
+    assert_eq!(
+        diff.touched[0].path, "src/runtime/core.rs",
+        "{:?}",
+        diff.touched
+    );
+    assert_eq!(
+        diff.touched[0].old_path, "",
+        "a copy's source is not the changed path"
+    );
+    let a = assess(&diff, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(
+        (s.changed_symbols, s.unindexed, s.dependents, a.score),
+        (1, 1, 0, 20),
+        "{a:?}"
+    );
+    assert_eq!(a.plan, PLAN_STANDARD);
+
+    // A copy with hunks (similarity < 100%): its line offsets are into the unchanged source, so
+    // none are looked up; the copy stays a leaf. The source path still carries its markers.
+    let edited = "\
+diff --git a/src/memory.rs b/src/runtime/memory.rs
+similarity index 90%
+copy from src/memory.rs
+copy to src/runtime/memory.rs
+--- a/src/memory.rs
++++ b/src/runtime/memory.rs
+@@ -10,3 +10,3 @@
+ fn keep() {
+-    let x = 1;
++    let x = 2;
+ }
+";
+    let diff = signals_from_diff(edited);
+    assert_eq!(diff.touched[0].old_path, "", "{:?}", diff.touched);
+    assert!(diff.touched[0].old_lines.is_empty(), "{:?}", diff.touched);
+    assert!(
+        diff.critical,
+        "the source path's marker still applies: {diff:?}"
+    );
+    assert_eq!((diff.lines_added, diff.lines_removed), (1, 1));
+
+    // The same block as a RENAME still counts the importers (review on #600 holds).
+    let renamed = d
+        .replace("copy from", "rename from")
+        .replace("copy to", "rename to");
+    let a = assess(&signals_from_diff(&renamed), ready(&store), None);
+    assert_eq!((a.score, a.plan), (80, PLAN_MOST), "{a:?}");
+}
+
+/// core#711: a changed path the graph never indexed (a new file) is UNKNOWN to the test gap,
+/// not untested — the graph has no edge to read. It still counts as one changed symbol with no
+/// dependents (reach), and the reasons name it as unindexed. A hot, tested symbol beside a new
+/// file scores its reach alone (60), not reach plus half a test gap (70).
+#[test]
+fn an_unindexed_changed_path_reads_unindexed_not_untested() {
+    let new_file = "diff --git a/scripts/walk.mjs b/scripts/walk.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/scripts/walk.mjs\n@@ -0,0 +1 @@\n+export const walk = 1;\n";
+    let diff = signals_from_diff(&format!("{}{new_file}", hot_diff()));
+    assert_eq!(diff.code_files, 2, "{diff:?}");
+
+    let tested = hot_graph(true);
+    let a = assess(&diff, ready(&tested), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    // 40 callers + the test that reaches `hot`.
+    assert_eq!(
+        (s.changed_symbols, s.unindexed, s.dependents),
+        (2, 1, 41),
+        "{s:?}"
+    );
+    assert_eq!(
+        s.test_gap, 0.0,
+        "the indexed symbol is tested; the new file is unknown"
+    );
+    assert_eq!(a.score, 60, "{a:?}");
+    assert!(
+        a.reasons
+            .iter()
+            .any(|r| r.contains("1 unindexed path(s) with unknown test reach")),
+        "{:?}",
+        a.reasons
+    );
+    assert!(
+        a.reasons
+            .iter()
+            .any(|r| r.contains("2 changed symbol(s) (1 unindexed)")),
+        "{:?}",
+        a.reasons
+    );
+    assert!(
+        !a.reasons.iter().any(|r| r.contains("untested")),
+        "{:?}",
+        a.reasons
+    );
+
+    // With the hot symbol untested, the gap is 100% OF THE INDEXED part (+20), and the note still
+    // separates the unindexed path from it.
+    let untested = hot_graph(false);
+    let a = assess(&diff, ready(&untested), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(s.test_gap, 1.0, "{s:?}");
+    assert_eq!(a.score, 80, "{a:?}");
+    assert!(
+        a.reasons.iter().any(
+            |r| r.starts_with("test gap +20: 100% of indexed changed symbols")
+                && r.contains("1 unindexed path(s) with unknown test reach")
+        ),
+        "{:?}",
+        a.reasons
+    );
+}
+
 // Review on #600: the `diff --git a/X b/Y` line was split on the first " b/", so an old path
 // containing " b/" (`src/a b/core.rs`) recorded `src/a`, the graph lookup missed, and a hot module
 // scored as an unindexed leaf. Paths come from the `---`/`+++` headers (git-unquoted, `/dev/null`

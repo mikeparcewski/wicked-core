@@ -40,7 +40,8 @@ use wicked_estate_core::{SymbolId, TraversalSpec};
 pub(crate) struct TouchedFile {
     /// The behavioural side of the header (the `b/` side unless it is docs).
     pub path: String,
-    /// The `a/` side, the path the graph indexed.
+    /// The `a/` side, the path the graph indexed. Empty for a new file AND for a copy (its `a/`
+    /// side is the unchanged source).
     pub old_path: String,
     pub old_lines: BTreeSet<u32>,
 }
@@ -106,8 +107,13 @@ pub(crate) struct ImpactSignals {
     pub products: u32,
     /// The diff touches a published surface (a path or a wire-type symbol marker).
     pub contract_change: bool,
-    /// G: the share of C that no test symbol reaches, 0..=1.
+    /// G: the share of the INDEXED part of C that no test symbol reaches, 0..=1. An unindexed
+    /// path is not in it (core#711: unindexed is not untested — the graph cannot see what reaches
+    /// a file it never indexed, so it is unknown, and unknown earns no points).
     pub test_gap: f32,
+    /// Touched paths the graph does not know (new files, copies): each is one changed symbol
+    /// with no dependents and an unknown test reach.
+    pub unindexed: u32,
     pub critical: bool,
     pub destructive: bool,
     /// A traversal hit a cap, so `dependents` is a lower bound.
@@ -525,10 +531,12 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
         }
     }
     s.changed_symbols = seeds.len() as u32 + unindexed;
-    // Per seed, so the test gap is attributable. R is the union outside C.
+    s.unindexed = unindexed;
+    // Per seed, so the test gap is attributable. R is the union outside C. An unindexed path is
+    // not untested, it is unknown: it has no seed, so no traversal and no share of the gap.
     let spec = TraversalSpec::blast_radius(t.hops);
     let mut reached: BTreeSet<String> = BTreeSet::new();
-    let mut untested = unindexed;
+    let mut untested = 0u32;
     for seed in &seeds {
         let sub = store.traverse(seed, &spec)?;
         s.truncated |= sub.truncated;
@@ -545,12 +553,18 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
     }
     s.dependents = reached.len() as u32;
     s.products = products.len() as u32;
-    s.test_gap = if s.changed_symbols == 0 {
+    s.test_gap = if seeds.is_empty() {
         0.0
     } else {
-        untested as f32 / s.changed_symbols as f32
+        untested as f32 / seeds.len() as f32
     };
     Ok(s)
+}
+
+/// The test-gap reason's note on unindexed paths: the graph has no edge to read for them, so
+/// their test reach is unknown — never "untested".
+fn unindexed_note(unindexed: u32) -> String {
+    format!("{unindexed} unindexed path(s) with unknown test reach")
 }
 
 /// The deterministic score from the table.
@@ -573,8 +587,13 @@ pub(crate) fn impact_score_in(t: &Thresholds, s: &ImpactSignals) -> Score {
             .map_or(0, |(_, p)| *p);
         score += reach;
         reasons.push(format!(
-            "reach {reach}: {} changed symbol(s), {} dependent(s) within {} hops{}",
+            "reach {reach}: {} changed symbol(s){}, {} dependent(s) within {} hops{}",
             s.changed_symbols,
+            if s.unindexed > 0 {
+                format!(" ({} unindexed)", s.unindexed)
+            } else {
+                String::new()
+            },
             s.dependents,
             t.hops,
             if s.truncated { " (capped)" } else { "" }
@@ -596,9 +615,18 @@ pub(crate) fn impact_score_in(t: &Thresholds, s: &ImpactSignals) -> Score {
         let gap = (t.test_gap_points as f32 * s.test_gap.clamp(0.0, 1.0)).round() as u32;
         score += gap;
         reasons.push(format!(
-            "test gap +{gap}: {:.0}% of changed symbols reached by no test",
-            s.test_gap * 100.0
+            "test gap +{gap}: {:.0}% of indexed changed symbols reached by no test{}",
+            s.test_gap * 100.0,
+            if s.unindexed > 0 {
+                format!("; {}", unindexed_note(s.unindexed))
+            } else {
+                String::new()
+            }
         ));
+    } else if s.unindexed > 0 {
+        // No gap scored, but say why the unindexed part is not in it (core#711: the operator
+        // read "100% untested" where the graph only had no edge to read).
+        reasons.push(format!("test gap +0: {}", unindexed_note(s.unindexed)));
     }
     if s.critical {
         score += t.critical_points;
@@ -756,7 +784,10 @@ enum Kind {
 /// A `diff --git` line only DELIMITS a file (review on #600: splitting it on the first ` b/`
 /// misread `src/a b/core.rs`). A file's paths come from its `---`/`+++` headers (git-unquoted;
 /// `/dev/null` is an absent side: new or deleted) and, for a hunk-less rename or copy, from the
-/// `rename from`/`rename to` (`copy from`/`copy to`) lines.
+/// `rename from`/`rename to` (`copy from`/`copy to`) lines. A rename's old path is the path the
+/// graph indexed, so its importers count; a copy's source did not change, so the copy is scored
+/// as a new leaf (`old_path` empty) while the source still classifies it and carries its path
+/// markers (core#611).
 ///
 /// Fails closed: a file is behavioural if EITHER side is (a rename from `src/memory.rs` to
 /// `docs/memory.md` moves code out of a critical subsystem), a block that names no path counts
@@ -818,6 +849,10 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         .unwrap_or(lines.len());
     let (mut old, mut new) = (None::<String>, None::<String>);
     let mut deleted = false;
+    // A copy's `a/` side is the SOURCE, which did not change (core#611): the source path still
+    // classifies the block and carries its critical/destructive markers, but it is not the path
+    // the graph is asked about — the copy is a new, unindexed leaf.
+    let mut copied = false;
     for l in &lines[..hunks] {
         if let Some(p) = l.strip_prefix("--- ") {
             old = Some(header_path(p, "a/"));
@@ -829,11 +864,13 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
             .strip_prefix("rename from ")
             .or_else(|| l.strip_prefix("copy from "))
         {
+            copied |= l.starts_with("copy from ");
             old.get_or_insert_with(|| git_unquote(p));
         } else if let Some(p) = l
             .strip_prefix("rename to ")
             .or_else(|| l.strip_prefix("copy to "))
         {
+            copied |= l.starts_with("copy to ");
             new.get_or_insert_with(|| git_unquote(p));
         } else if l.starts_with("deleted file mode") {
             deleted = true;
@@ -870,7 +907,7 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         s.destructive |= deleted;
         s.touched.push(TouchedFile {
             path: code.last().copied().unwrap_or("").to_string(),
-            old_path: old.clone(),
+            old_path: if copied { String::new() } else { old.clone() },
             old_lines: BTreeSet::new(),
         });
     }
@@ -897,7 +934,8 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         if behavioural && (added || removed || context) {
             let text = line.get(1..).unwrap_or("").to_ascii_lowercase();
             s.destructive |= t.destructive_line_markers.iter().any(|m| text.contains(m));
-            if let Some(f) = s.touched.last_mut() {
+            // A copy's hunk lines are offsets into the unchanged source: nothing to look up.
+            if let Some(f) = s.touched.last_mut().filter(|_| !copied) {
                 if removed {
                     f.old_lines.insert(old_next);
                 } else if added {
