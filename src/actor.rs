@@ -8012,10 +8012,7 @@ fn advance_or_pause(
                     .repo_ref
                     .as_deref()
                     .map_or_else(|| "the run's repository".to_string(), |r| format!("`{r}`"));
-                (
-                    reviewing_ord,
-                    deliver_gate_prompt(unit.ord, &unit.description, &branch, &repo),
-                )
+                (reviewing_ord, deliver_gate_prompt_for(unit, &branch, &repo))
             }
         };
         let ord = unit.ord;
@@ -8186,6 +8183,61 @@ fn filter_triage_decision(
 ///  - the engine's own sentence states only what the engine knows — it commits and pushes the
 ///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
 ///  - no separator is ever rendered: the intent follows as plain prose.
+/// (core#686) The deliver gate's consent prompt read from the unit's FIELDS: the card is
+/// [`WorkUnit::instructions`](crate::domain::WorkUnit::instructions), the amendments
+/// [`WorkUnit::amendments`](crate::domain::WorkUnit::amendments), and the intent head is the
+/// description with exactly those known suffixes removed — nothing is split on ` ||| `, so an
+/// intent that contains the separator or the engine's own amendment sentence reads whole. A unit
+/// planned before the fields (or whose description no longer ends in them) takes the legacy
+/// re-parse, flagged on stderr.
+fn deliver_gate_prompt_for(unit: &crate::domain::WorkUnit, branch: &str, repo: &str) -> String {
+    match structured_deliver_parts(unit) {
+        Some((head, card, amendments)) => {
+            deliver_gate_prompt_parts(unit.ord, &head, card, &amendments, branch, repo)
+        }
+        None => {
+            eprintln!(
+                "[wicked-core] deliver unit {} carries no structured card/amendments (a record \
+                 planned before core#686): its gate card is re-parsed from the description \
+                 (legacy)",
+                unit.ord
+            );
+            deliver_gate_prompt(unit.ord, &unit.description, branch, repo)
+        }
+    }
+}
+
+/// (core#686) `(head, card, amendments)` of a structured unit: the description minus each
+/// amendment segment (from the end, newest first) and then minus ` ||| <card>`. `None` for a
+/// legacy record, or when the description does not end in the fields it claims.
+fn structured_deliver_parts(
+    unit: &crate::domain::WorkUnit,
+) -> Option<(String, Option<String>, Vec<String>)> {
+    if !unit.structured_description {
+        return None;
+    }
+    let mut rest = unit.description.as_str();
+    for a in unit.amendments.iter().rev() {
+        let segment = format!("{}{a}", crate::workflow::INTENT_AMENDMENT_PREFIX);
+        rest = rest.strip_suffix(segment.as_str())?;
+    }
+    let card = unit
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    if let Some(c) = card {
+        rest = rest.strip_suffix(format!("{}{c}", crate::plan::INSTRUCTION_SEP).as_str())?;
+    }
+    Some((
+        rest.trim().to_string(),
+        card.map(str::to_string),
+        unit.amendments.clone(),
+    ))
+}
+
+/// The legacy reader: the deliver card and amendments RE-PARSED from a flat description (records
+/// planned before core#686). See [`deliver_gate_prompt_for`].
 fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) -> String {
     // The description is `deliver — <intent>`, then ` ||| <card>` (the phase's instructions, authored
     // with the workflow), then one `INTENT_AMENDMENT_PREFIX + <text>` per approved amendment
@@ -8207,28 +8259,45 @@ fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) ->
         ),
         None => (pre.trim(), None),
     };
-    // The amendments ride with the work as prose, each keeping its own prefix sentence; only the
-    // separators that introduce them are dropped.
-    let head = match amendments {
-        Some(a) => {
-            let prose = a
-                .split(crate::workflow::INTENT_AMENDMENT_PREFIX)
+    let amendments: Vec<String> = amendments
+        .map(|a| {
+            a.split(crate::workflow::INTENT_AMENDMENT_PREFIX)
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
-                .map(|t| {
-                    format!(
-                        "{} {t}",
-                        crate::workflow::INTENT_AMENDMENT_PREFIX
-                            .trim_start()
-                            .trim_start_matches("|||")
-                            .trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" — ");
-            format!("{head} — {prose}")
-        }
-        None => head.to_string(),
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    deliver_gate_prompt_parts(ord, head, card, &amendments, branch, repo)
+}
+
+/// The deliver gate's prose from its parts — the intent `head`, the author's `card`, and the
+/// approved amendment texts — shared by the structured reader and the legacy re-parse.
+fn deliver_gate_prompt_parts(
+    ord: u32,
+    head: &str,
+    card: Option<String>,
+    amendments: &[String],
+    branch: &str,
+    repo: &str,
+) -> String {
+    // The amendments ride with the work as prose, each keeping its own prefix sentence; only the
+    // separators that introduce them are dropped.
+    let head = if amendments.is_empty() {
+        head.to_string()
+    } else {
+        let sentence = crate::workflow::INTENT_AMENDMENT_PREFIX
+            .trim_start()
+            .trim_start_matches("|||")
+            .trim();
+        let prose = amendments
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("{sentence} {t}"))
+            .collect::<Vec<_>>()
+            .join(" — ");
+        format!("{head} — {prose}")
     };
     let what = match &card {
         // The card owns the push target AND the identity (crew states the configured login and
@@ -11262,6 +11331,8 @@ pub(crate) fn confirm_gate(
                 for u in units.iter_mut().skip(session.unit_ix) {
                     if !u.description.contains(&segment) {
                         u.description.push_str(&segment);
+                        // (core#686) …and as a field, read by the deliver card without a split.
+                        u.amendments.push(text.to_string());
                         put_node(store, u.to_node())?;
                     }
                 }
@@ -13288,6 +13359,91 @@ retry the deliver phase";
         assert!(bare.contains(
             "only if gh resolves that remote to a GitHub repository, opens a pull request"
         ));
+    }
+
+    /// core#686: the card and the amendments are read from the unit's FIELDS. The two known
+    /// mis-parses of the flat description now read correctly: (1) an intent that contains the
+    /// engine's full amendment sentence verbatim; (2) a no-card phase whose intent contains
+    /// ` ||| ` (its tail was read as the card). A legacy record (no fields) keeps the re-parse.
+    #[test]
+    fn the_deliver_card_and_amendments_are_read_from_fields_not_split_686() {
+        let card = "Pushes the run branch to origin; opens a pull request as @bot.";
+        let structured = |intent: &str, card: Option<&str>, amendments: &[&str]| {
+            let mut d = format!("deliver — {intent}");
+            if let Some(c) = card {
+                d.push_str(crate::plan::INSTRUCTION_SEP);
+                d.push_str(c);
+            }
+            for a in amendments {
+                d.push_str(&format!("{}{a}", crate::workflow::INTENT_AMENDMENT_PREFIX));
+            }
+            let mut u = WorkUnit::pending("r:deliver", "r", 8, d);
+            u.instructions = card.map(str::to_string);
+            u.amendments = amendments.iter().map(|a| a.to_string()).collect();
+            u.structured_description = true;
+            u
+        };
+        // (1) The intent quotes the engine's amendment sentence; there is a card.
+        let quoting = format!(
+            "document why{}is used",
+            crate::workflow::INTENT_AMENDMENT_PREFIX
+        );
+        let u = structured(&quoting, Some(card), &[]);
+        let p = deliver_gate_prompt_for(&u, "wicked/abc", "`r`");
+        assert!(
+            p.starts_with(&format!("Approve delivery before unit 8 runs. {card}")),
+            "the card leads: {p}"
+        );
+        assert!(
+            p.contains(&format!("The work: deliver — {}.", quoting.trim())),
+            "the intent reads whole: {p}"
+        );
+        // The legacy re-parse of the SAME text loses the card (the mis-parse being fixed).
+        let legacy = deliver_gate_prompt(8, &u.description, "wicked/abc", "`r`");
+        assert!(!legacy.starts_with(&format!("Approve delivery before unit 8 runs. {card}")));
+
+        // (2) No card, and the intent contains ` ||| `: the no-card disclosure, intent verbatim.
+        let u = structured("keep a ||| b as is", None, &[]);
+        let p = deliver_gate_prompt_for(&u, "wicked/abc", "`r`");
+        assert!(
+            p.contains("only if gh resolves that remote to a GitHub repository"),
+            "{p}"
+        );
+        assert!(p.contains("The work: deliver — keep a ||| b as is."), "{p}");
+        let legacy = deliver_gate_prompt(8, &u.description, "wicked/abc", "`r`");
+        assert!(
+            legacy.contains("b as is This step"),
+            "the legacy mis-parse: {legacy}"
+        );
+
+        // A card and two amendments: the card leads, both amendments ride with the work.
+        let u = structured(
+            "add a widget",
+            Some(card),
+            &["clamp at 10", "keep ||| as is"],
+        );
+        let p = deliver_gate_prompt_for(&u, "wicked/abc", "`r`");
+        assert!(p.starts_with(&format!("Approve delivery before unit 8 runs. {card}")));
+        assert!(
+            p.contains("clamp at 10") && p.contains("keep ||| as is"),
+            "{p}"
+        );
+        assert!(p.contains("The work: deliver — add a widget — "), "{p}");
+
+        // A legacy record (no fields) is the old reader, byte-identical.
+        let mut old = WorkUnit::pending("r:deliver", "r", 8, format!("deliver — x ||| {card}"));
+        old.structured_description = false;
+        assert_eq!(
+            deliver_gate_prompt_for(&old, "wicked/abc", "`r`"),
+            deliver_gate_prompt(8, &old.description, "wicked/abc", "`r`")
+        );
+        // A structured unit whose description no longer ends in its fields falls back too.
+        let mut drifted = structured("x", Some(card), &[]);
+        drifted.description.push_str(" (edited)");
+        assert_eq!(
+            deliver_gate_prompt_for(&drifted, "wicked/abc", "`r`"),
+            deliver_gate_prompt(8, &drifted.description, "wicked/abc", "`r`")
+        );
     }
 
     /// A `LIFT-CONFLICT` strand keeps today's terminal path exactly: crew derives `completed` +

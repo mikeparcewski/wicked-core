@@ -109,6 +109,9 @@ mod tests {
             operator_rulings: Vec::new(),
             carried_items: Vec::new(),
             floor_auto_retries: 0,
+            instructions: None,
+            amendments: Vec::new(),
+            structured_description: false,
             catalog: None,
             exclude_seats: Vec::new(),
         }

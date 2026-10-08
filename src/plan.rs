@@ -157,12 +157,12 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Joined with a SINGLE-LINE separator (`INSTRUCTION_SEP`): a `\n` here would be submitted
             // by the line-based PTY runner as an early turn end, sending only the head and stranding
             // the instructions — the very failure this fold exists to remove, reintroduced.
-            if let Some(instr) = phase
+            let instructions = phase
                 .instructions
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
+                .filter(|s| !s.is_empty());
+            if let Some(instr) = instructions {
                 description.push_str(INSTRUCTION_SEP);
                 description.push_str(instr);
             }
@@ -206,6 +206,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // lives in the unit id (`<session>:<phase_id>`) — we do NOT touch `phase_ref`, which the
             // execute path owns (it records the orchestration phase, set at execute time).
             unit.stage = phase.kind;
+            // (core#686) The card rides as a field too, so no reader re-finds it in the prompt.
+            unit.instructions = instructions.map(str::to_string);
+            unit.structured_description = true;
             // Carry the phase's skill + runtime allowlist (DES-EXEC-001 §4.1/§4.2) onto the unit so the
             // step runner invokes the right skill under least-privilege — pure data from the def.
             unit.skill_ref = phase.skill_ref.clone();
@@ -2311,6 +2314,10 @@ mod tests {
             units[1].description, "b",
             "blank instructions must not append"
         );
+        // core#686: the card also rides as a field (never re-found in the prompt).
+        assert_eq!(units[0].instructions.as_deref(), Some("do the one thing"));
+        assert_eq!(units[1].instructions, None);
+        assert!(units.iter().all(|u| u.structured_description));
     }
 
     /// FINDING-011 (remediation): the instruction fold MUST stay single-line, because the
