@@ -6741,6 +6741,9 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // no eligible seat left — a decision about SEATS, not a verdict on the work
         // (`domain::DENIAL_SOURCE_DEAD_SEAT`).
         Some("dead_seat") => "dead_seat",
+        // (core#772/#774) The judge never ran: every eligible judge seat failed (quota, sign-in,
+        // an empty answer). A decision about SEATS, never a verdict on the work.
+        Some(crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE) => "judge_unavailable",
         _ if hook_denied => "boundary_deny",
         // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
         // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
@@ -6800,11 +6803,30 @@ fn escalate_denied_unit(
         .unwrap_or_else(|| "verdict not pass".to_string());
     // (core#760) An evaluator's NOT-PASS verdict is kept on the unit for its later rounds
     // (`[prior verdicts — unit N]`), whatever the operator answers here.
+    // (core#761) THE REWORK CAP: once this review has been sent back
+    // `MAX_REVIEW_SENDBACKS` times, its next NOT-PASS opens `review_adjudication` — land with
+    // carried items / one more round / stop — instead of offering another send-back.
+    let mut adjudication: Option<String> = None;
     if class == "verdict_not_pass"
         && unit.role == crate::workflow::PhaseRole::Evaluator
         && unit.tool_cmd.is_none()
     {
-        record_review_round(store, &session.id, &unit.id, attempt, &reason)?;
+        let rounds = record_review_round(store, &session.id, &unit.id, attempt, &reason)?;
+        if crate::review_context::sent_back_count(&rounds)
+            >= crate::review_context::MAX_REVIEW_SENDBACKS
+        {
+            let units = crate::domain::session_units(store, &session.id)?;
+            if let Some(creator) = pipeline::most_recent_prior_creator(&units, unit.ord) {
+                adjudication = Some(crate::review_context::adjudication_prompt(
+                    unit.ord,
+                    creator.ord,
+                    &rounds,
+                    attempt,
+                    &reason,
+                    note,
+                ));
+            }
+        }
     }
     // The guard's restore outcome rides the gate only when the guard is what denied — a later
     // layer's denial on a unit whose tree happened to be clean carries none.
@@ -6830,7 +6852,13 @@ fn escalate_denied_unit(
             suggestion_ref: mutation.and_then(|m| m.suggestion_ref.clone()),
         },
     );
-    let prompt = denial_gate_prompt(unit, class, &reason, mutation, note);
+    let (gate_kind, prompt) = match adjudication {
+        Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
+        None => (
+            "escalation",
+            denial_gate_prompt(unit, class, &reason, mutation, note),
+        ),
+    };
     pause_for_human(
         store,
         subscribers,
@@ -6840,7 +6868,7 @@ fn escalate_denied_unit(
         // The gate reviews the unit that just ran — the gating unit and the reviewed unit
         // coincide, exactly as for the `HumanConfirmIf` escalation this generalises.
         Some(ord),
-        "escalation",
+        gate_kind,
         prompt,
     )
 }
@@ -6848,27 +6876,28 @@ fn escalate_denied_unit(
 /// (core#760) Append the NOT-PASS verdict an evaluator unit returned at `attempt` to its
 /// [`review_rounds`](crate::domain::WorkUnit::review_rounds) — once per attempt (a re-opened gate
 /// over the same denial does not book it twice). Read from the store, so the write never clobbers
-/// a field the caller's copy predates.
+/// a field the caller's copy predates. Returns the unit's rounds after the write.
 fn record_review_round(
     store: &mut dyn GraphStore,
     run_id: &str,
     unit_id: &str,
     attempt: u32,
     findings: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<crate::domain::ReviewRound>> {
     let units = crate::domain::session_units(store, run_id)?;
     let Some(mut u) = units.into_iter().find(|u| u.id == unit_id) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if u.review_rounds.iter().any(|r| r.attempt == attempt) {
-        return Ok(());
+        return Ok(u.review_rounds);
     }
     u.review_rounds.push(crate::domain::ReviewRound {
         attempt,
         findings: findings.to_string(),
         outcome: None,
     });
-    put_node(store, u.to_node())
+    put_node(store, u.to_node())?;
+    Ok(u.review_rounds)
 }
 
 /// (core#464) The operator-facing prompt of a denial gate, per class. Approve always means "retry
@@ -6992,6 +7021,14 @@ fn denial_gate_prompt(
                 )
             }
         }
+        // (core#774 follow-up) The judge could not run; the prompt names the failed seats (the
+        // reason's head line) and never reads "verdict is NOT PASS".
+        "judge_unavailable" => format!(
+            "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
+             not rejected. Sign a judge seat in (or reassign), then approve to re-run the phase, \
+             or reject to cancel the run{note}",
+            reason_head(reason)
+        ),
         // (DES-L1 PR-1A) The generic verdict gate names its THREE arms — retry, request changes
         // (PR-1B: the review goes back to the creator phase with these findings in context), reject
         // — and, when the evaluator's OWN verdict denied (`evaluator_verdict`), leads with what it
@@ -10578,6 +10615,17 @@ pub(crate) fn confirm_gate(
         );
     }
 
+    // (core#761) The capped review's gate: approve = LAND WITH CARRIED ITEMS (the unit counts
+    // over its FAIL, the items recorded as carried), request changes = ONE MORE ROUND (the
+    // ordinary rewind), reject = STOP. Read from the OPEN row's `gate_kind`, before it resolves.
+    let adjudication_open = crate::interaction::list_interactions(
+        &*store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .iter()
+    .any(|r| r.gate_kind.as_deref() == Some(crate::review_context::REVIEW_ADJUDICATION_GATE));
+
     // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
     // are checked here, before the durable prompt below is marked `answered` — a refused answer
     // must leave the gate row OPEN (the run stays paused and re-answerable, and the prompts surface
@@ -10613,6 +10661,16 @@ pub(crate) fn confirm_gate(
             }
         }
         match &decision {
+            crate::workflow::HumanDecision::FloorRerun(_)
+            | crate::workflow::HumanDecision::AcceptSuggestion
+            | crate::workflow::HumanDecision::AmendIntent { .. }
+                if adjudication_open =>
+            {
+                anyhow::bail!(
+                    "a review_adjudication gate takes approve (land with carried items), request \
+                     changes (one more round) or reject (stop)"
+                );
+            }
             crate::workflow::HumanDecision::RequestChanges { .. } => {
                 let has_creator = cursor
                     .is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
@@ -10693,7 +10751,9 @@ pub(crate) fn confirm_gate(
     {
         let answer = match &decision {
             crate::workflow::HumanDecision::Approve { amend, amend_scope } => serde_json::json!({
-                "approve": true, "action": "approve", "amend": amend,
+                "approve": true,
+                "action": if adjudication_open { "land_with_carried_items" } else { "approve" },
+                "amend": amend,
                 "amend_scope": amend_scope.as_wire(),
             })
             .to_string(),
@@ -10776,6 +10836,26 @@ pub(crate) fn confirm_gate(
             is_acp,
         };
         return team_gate::answer_dispute_gate(&mut cx, session, decision);
+    }
+
+    // (core#761) LAND WITH CARRIED ITEMS — the capped review's approve.
+    if adjudication_open {
+        if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
+            return land_with_carried_items(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                in_flight,
+                session,
+                run_id,
+                amend.clone(),
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            );
+        }
     }
 
     // (DES-L1 PR-1B) Three arms. Reject = cancel, unchanged (D-2). `RequestChanges` and `Approve`
@@ -11263,6 +11343,116 @@ fn apply_suggestion(
         },
         m.suggestion_ref.as_deref().unwrap_or("the suggestion ref")
     ))
+}
+
+/// (core#761) LAND WITH CARRIED ITEMS — approve at a `review_adjudication` gate. The layer-3
+/// boundary check runs first (deny-dominates: a policy veto cancels, as on every approve). Then
+/// ONE write for the cursor (Evaluator) unit: it counts (`Done`), its denial is cleared, its FAIL
+/// items are recorded as [`carried_items`](crate::domain::WorkUnit::carried_items), the round is
+/// booked `landed` and an operator note rides `operator_rulings`; the cursor moves past it
+/// (`gateDecided{allow}` + `unitDone`, as a team dispute's approve counts a unit) and the run
+/// advances. Evaluator ≠ creator is untouched: the human decides, no seat re-grades.
+#[allow(clippy::too_many_arguments)]
+fn land_with_carried_items(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    session: crate::domain::AgentSession,
+    run_id: &str,
+    amend: Option<String>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
+    if phase_boundary_denied(store, &session, run_id)? {
+        let result = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps);
+        if result.is_ok() {
+            in_flight.remove(run_id);
+        }
+        return result;
+    }
+    let units = crate::domain::session_units(store, run_id)?;
+    let ix = session.unit_ix;
+    let mut u = units
+        .get(ix)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor to land"))?;
+    let attempt = u.last_attempt.unwrap_or(0);
+    let verdict = u.denial_reason.clone().unwrap_or_default();
+    u.carried_items = crate::review_context::carried_items(&verdict);
+    if let Some(r) = u.review_rounds.iter_mut().find(|r| r.attempt == attempt) {
+        r.outcome = Some(crate::review_context::REVIEW_LANDED.to_string());
+    }
+    if let Some(a) = amend.filter(|a| !a.trim().is_empty()) {
+        u.operator_rulings.push(crate::domain::OperatorRuling {
+            action: "land".to_string(),
+            text: a,
+            attempt,
+            at: crate::interaction::now_millis(),
+        });
+    }
+    u.status = crate::domain::UnitStatus::Done;
+    u.denial = None;
+    u.denial_reason = None;
+    let ord = u.ord;
+    let mut s = session;
+    s.unit_ix = ix + 1;
+    s.attempt = units.get(ix + 1).map(next_attempt).unwrap_or(0);
+    s.status = SessionStatus::Executing;
+    crate::domain::put_nodes(store, &[u.to_node(), s.to_node()])?;
+    emit(
+        subscribers,
+        CoreEvent::Resumed {
+            session: run_id.to_string(),
+            ord,
+        },
+    );
+    emit(
+        subscribers,
+        CoreEvent::GateDecided {
+            session: run_id.to_string(),
+            ord,
+            allow: true,
+        },
+    );
+    emit(
+        subscribers,
+        CoreEvent::UnitDone {
+            session: run_id.to_string(),
+            ord,
+        },
+    );
+    in_flight.insert(run_id.to_string());
+    match advance_or_pause(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        ix + 1,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    ) {
+        Ok(Progress::Dispatched) | Ok(Progress::Deferred) => Ok(SessionStatus::Executing),
+        Ok(Progress::Paused) => {
+            in_flight.remove(run_id);
+            Ok(SessionStatus::AwaitingHuman)
+        }
+        Ok(Progress::Done) => {
+            in_flight.remove(run_id);
+            finalize_run(store, subscribers, runner, self_tx, run_id)?;
+            Ok(SessionStatus::Completed)
+        }
+        Err(e) => {
+            in_flight.remove(run_id);
+            Err(e)
+        }
+    }
 }
 
 /// (DES-L1 PR-1B, core#459) REQUEST CHANGES: send a NOT-PASS review back to the creator. The
@@ -14507,6 +14697,285 @@ mod request_changes_tests {
                 "{want} missing: {labels:?}"
             );
         }
+    }
+
+    /// (core#761) Seed the bug run with its verify unit DISTRIBUTED at attempt `attempt` after
+    /// `sent_back` send-backs (each an earlier FAIL on item 1), then fold its new verdict.
+    fn fold_verify_after_send_backs(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        sent_back: u32,
+        verdict: &str,
+    ) -> StepApplied {
+        seed_bug(store, run_id, true);
+        let attempt = sent_back;
+        let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        s.status = SessionStatus::Executing;
+        s.attempt = attempt;
+        put_node(store, s.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let v = &mut units[3];
+        v.status = UnitStatus::Distributed;
+        v.denial = None;
+        v.denial_reason = None;
+        v.worktree_baseline = None;
+        v.last_attempt = Some(attempt);
+        v.review_rounds = (0..sent_back)
+            .map(|a| crate::domain::ReviewRound {
+                attempt: a,
+                findings: "ITEM 1: FAIL — no regression test\nVERDICT: FAIL".into(),
+                outcome: Some(crate::domain::REVIEW_SENT_BACK.into()),
+            })
+            .collect();
+        put_node(store, v.to_node()).unwrap();
+        // The orchestration workflow the fold ticks (as `pre_distribute` registers it).
+        let phases: Vec<(String, &str)> = ["triage", "reproduce", "fix", "verify"]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("wf-{run_id}:unit-{}", i + 1), *p))
+            .collect();
+        wicked_orchestration::register_workflow(store, format!("wf-{run_id}"), "p", &phases)
+            .unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            StepOutput {
+                run_id: run_id.into(),
+                unit_ix: 3,
+                attempt,
+                output: verdict.into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            },
+            None,
+            crate::workflow::UnitEvidence::default(),
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap()
+    }
+
+    fn open_gate_kind(store: &dyn GraphStore, run_id: &str) -> Option<String> {
+        crate::interaction::list_interactions(
+            store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap()
+        .into_iter()
+        .find_map(|r| r.gate_kind)
+    }
+
+    const THIRD_FAIL: &str = "Reviewed.\nITEM 1: FAIL — still no regression test\nITEM 2: FAIL \
+                              — the prompt drops a verb\nITEM 3: RULED — step card kept (gate \
+                              6)\nVERDICT: FAIL";
+
+    /// (core#761) Under the cap a FAIL opens the plain `escalation` gate (retry / send back /
+    /// reject); the third FAIL — after `MAX_REVIEW_SENDBACKS` send-backs — opens
+    /// `review_adjudication` instead, its prompt splitting the items re-raised / new / ruled and
+    /// naming the three arms.
+    #[test]
+    fn the_third_fail_after_two_send_backs_opens_review_adjudication() {
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let under = format!("adj-under-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let applied = fold_verify_after_send_backs(&mut store, &mut subs, &under, 1, THIRD_FAIL);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(
+            open_gate_kind(&store, &under).as_deref(),
+            Some("escalation")
+        );
+        let _ = drain(&erx);
+
+        let run_id = format!("adj-cap-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let applied = fold_verify_after_send_backs(&mut store, &mut subs, &run_id, 2, THIRD_FAIL);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(
+            open_gate_kind(&store, &run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
+        let prompt = drain(&erx)
+            .into_iter()
+            .find_map(|e| match e {
+                CoreEvent::AwaitingHuman {
+                    ord: 4,
+                    prompt,
+                    gate_kind,
+                    ..
+                } if gate_kind == "review_adjudication" => Some(prompt),
+                _ => None,
+            })
+            .expect("awaitingHuman{review_adjudication}");
+        for want in [
+            "round 3, after 2 send-backs to unit 3",
+            "re-raised (1): ITEM 1: FAIL — still no regression test",
+            "new (1): ITEM 2: FAIL — the prompt drops a verb",
+            "ruled (1): ITEM 3: RULED",
+            "Approve = LAND WITH CARRIED ITEMS",
+        ] {
+            assert!(prompt.contains(want), "{want}: {prompt}");
+        }
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[3].review_rounds.len(),
+            3,
+            "the third verdict is booked"
+        );
+    }
+
+    /// (core#761) LAND WITH CARRIED ITEMS: approve at the adjudication gate counts the evaluator
+    /// unit over its FAIL — `Done`, denial cleared, the FAIL items carried, the round `landed` —
+    /// emits `gateDecided{allow}` + `unitDone` and advances (here: past the last unit, so the run
+    /// completes). The durable prompt's answer names the arm. A floor re-run, an adopted
+    /// suggestion or an intent amendment is refused before the row resolves.
+    #[test]
+    fn approving_review_adjudication_lands_with_carried_items_and_advances() {
+        let run_id = format!("adj-land-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        fold_verify_after_send_backs(&mut store, &mut subs, &run_id, 2, THIRD_FAIL);
+        let _ = drain(&erx);
+
+        let refused = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::AmendIntent {
+                text: "drop item 2".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("review_adjudication"),
+            "{refused}"
+        );
+        assert_eq!(
+            open_gate_kind(&store, &run_id).as_deref(),
+            Some("review_adjudication"),
+            "a refused answer leaves the gate open"
+        );
+
+        let status = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("land it; file item 2 as a follow-up".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Completed);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let v = &units[3];
+        assert_eq!(v.status, UnitStatus::Done);
+        assert!(v.denial.is_none() && v.denial_reason.is_none());
+        assert_eq!(
+            v.carried_items,
+            vec![
+                "ITEM 1: FAIL — still no regression test".to_string(),
+                "ITEM 2: FAIL — the prompt drops a verb".to_string()
+            ]
+        );
+        assert_eq!(
+            v.review_rounds.last().and_then(|r| r.outcome.as_deref()),
+            Some(crate::review_context::REVIEW_LANDED)
+        );
+        assert_eq!(
+            v.operator_rulings.last().map(|r| r.action.as_str()),
+            Some("land")
+        );
+        let evs = drain(&erx);
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            CoreEvent::GateDecided {
+                ord: 4,
+                allow: true,
+                ..
+            }
+        )));
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, CoreEvent::UnitDone { ord: 4, .. })));
+        let answered = crate::interaction::list_interactions(
+            &store,
+            Some(&run_id),
+            Some(crate::interaction::InteractionStatus::Answered),
+        )
+        .unwrap();
+        assert!(
+            answered.iter().any(|r| r
+                .answer
+                .as_deref()
+                .is_some_and(|a| a.contains("land_with_carried_items"))),
+            "{answered:?}"
+        );
+    }
+
+    /// (core#761) ONE MORE ROUND: request changes at the adjudication gate is the ordinary
+    /// rewind — the creator re-runs, the round is booked `sent_back` (three now), and the next
+    /// NOT PASS will come back to this gate.
+    #[test]
+    fn request_changes_at_review_adjudication_is_one_more_round() {
+        let run_id = format!("adj-more-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        fold_verify_after_send_backs(&mut store, &mut subs, &run_id, 2, THIRD_FAIL);
+        let status = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("one more: add the test".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 2, "the creator re-runs");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            crate::review_context::sent_back_count(&units[3].review_rounds),
+            3
+        );
+    }
+
+    /// (core#774 follow-up) A judge that could not run is its own denial class, and its gate
+    /// names the failed seats — never "verdict is NOT PASS".
+    #[test]
+    fn a_judge_unavailable_denial_has_its_own_class_and_names_the_seats() {
+        let denial = UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "agent validator could not run — copilot (exhausted its quota)",
+        );
+        assert_eq!(denial_class(Some(&denial), false), "judge_unavailable");
+        let mut u = WorkUnit::pending("r:u1", "r", 1, "verify");
+        u.denial = Some(denial.clone());
+        let p = denial_gate_prompt(&u, "judge_unavailable", &denial.reason, None, "");
+        assert!(
+            p.contains("could not be judged") && p.contains("copilot (exhausted its quota)"),
+            "{p}"
+        );
+        assert!(!p.contains("NOT PASS"), "{p}");
     }
 
     /// (core#549, acceptance 1) `request_changes` at a **deliver** gate injects the operator note
