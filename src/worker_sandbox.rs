@@ -273,37 +273,96 @@ fn launcher_argv(tool: &Path, b: &RepoBoundary) -> Vec<String> {
     }
 }
 
+/// (IG1-core-1) Why the default repository boundary did not arm for a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloorUnarmed {
+    /// The spawn's cwd is not a linked run worktree (a chat's scratch root, a clone root, a
+    /// repo-less directory): there is no clone or sibling to protect.
+    NotAWorktree,
+    /// The seat's CLI arms its own OS sandbox (codex), so the engine must not wrap it.
+    SeatArmsItsOwn,
+    /// No launcher (`sandbox-exec`, `bwrap`) is on this host's `PATH` (all of Windows).
+    NoLauncher,
+    /// A launcher is present but its probe failed here (a kernel refusing unprivileged user
+    /// namespaces, a daemon already running inside a sandbox).
+    CannotArm,
+}
+
+impl FloorUnarmed {
+    /// The reason's wire spelling, for a disclosure.
+    #[cfg_attr(not(test), allow(dead_code))] // read by IG1-core-2's arm sites
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FloorUnarmed::NotAWorktree => "not_a_worktree",
+            FloorUnarmed::SeatArmsItsOwn => "seat_arms_its_own",
+            FloorUnarmed::NoLauncher => "no_launcher",
+            FloorUnarmed::CannotArm => "cannot_arm",
+        }
+    }
+}
+
+/// (IG1-core-1) The repository boundary as armed for one spawn: the wrapper, and the launcher that
+/// armed it (`"sandbox-exec"` | `"bwrap"`) — the `_wicked_gov_boundary` an `os_sandbox` marker names.
+#[derive(Debug)]
+pub(crate) struct ArmedFloor {
+    pub(crate) sandbox: crate::validator::WorkerSandbox,
+    #[cfg_attr(not(test), allow(dead_code))] // read by IG1-core-2's arm sites
+    pub(crate) tool: &'static str,
+}
+
 /// The launcher this host arms the repository boundary with (`sandbox-exec`, then `bwrap`),
 /// resolved AND probed once per process — the cached value is the tool that armed, so a later
-/// call can never reuse one launcher's probe for another.
-fn boundary_tool() -> Option<&'static PathBuf> {
-    static TOOL: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// call can never reuse one launcher's probe for another. `Err` names why none armed: no launcher
+/// on `PATH`, or every one present failed its probe.
+fn boundary_launcher() -> Result<&'static PathBuf, FloorUnarmed> {
+    static TOOL: OnceLock<Result<PathBuf, FloorUnarmed>> = OnceLock::new();
     TOOL.get_or_init(|| {
-        ["sandbox-exec", "bwrap"]
+        let found: Vec<PathBuf> = ["sandbox-exec", "bwrap"]
             .iter()
-            .find_map(|t| crate::validator::find_on_path(t))
-            .filter(|tool| launcher_arms(tool))
+            .filter_map(|t| crate::validator::find_on_path(t))
+            .collect();
+        if found.is_empty() {
+            return Err(FloorUnarmed::NoLauncher);
+        }
+        found
+            .into_iter()
+            .find(|tool| launcher_arms(tool))
+            .ok_or(FloorUnarmed::CannotArm)
     })
     .as_ref()
+    .map_err(|e| *e)
+}
+
+/// The short name of a launcher path: `"sandbox-exec"` or `"bwrap"`.
+fn launcher_name(tool: &Path) -> &'static str {
+    if tool.file_name().is_some_and(|n| n == "sandbox-exec") {
+        "sandbox-exec"
+    } else {
+        "bwrap"
+    }
 }
 
 /// The default worker wrapper for a spawn in `cwd` for seat/CLI `seat`: the repository boundary
-/// rendered for this host's launcher, or `None` (not a run worktree, a self-sandboxing seat, no
-/// launcher, or a launcher that cannot arm here) — the worker then spawns as before.
+/// rendered for this host's launcher with the launcher's name, or why it did not arm (not a run
+/// worktree, a self-sandboxing seat, no launcher, a launcher that cannot arm here) — the worker
+/// then spawns as before.
 pub(crate) fn default_worker_sandbox(
     cwd: &Path,
     write_roots: &[PathBuf],
     seat: &str,
-) -> Option<crate::validator::WorkerSandbox> {
+) -> Result<ArmedFloor, FloorUnarmed> {
     if seat_arms_its_own_os_sandbox(seat) {
-        return None;
+        return Err(FloorUnarmed::SeatArmsItsOwn);
     }
-    let boundary = repo_boundary(cwd, write_roots)?;
-    let tool = boundary_tool()?;
-    Some(crate::validator::WorkerSandbox {
-        wrapper: launcher_argv(tool, &boundary),
-        level: crate::validator::SandboxLevel::Sandboxed,
-        downgrade_reason: None,
+    let boundary = repo_boundary(cwd, write_roots).ok_or(FloorUnarmed::NotAWorktree)?;
+    let tool = boundary_launcher()?;
+    Ok(ArmedFloor {
+        sandbox: crate::validator::WorkerSandbox {
+            wrapper: launcher_argv(tool, &boundary),
+            level: crate::validator::SandboxLevel::Sandboxed,
+            downgrade_reason: None,
+        },
+        tool: launcher_name(tool),
     })
 }
 
@@ -419,9 +478,41 @@ mod tests {
         }
         let (base, _clone, own, _sibling) = clone_with_two_runs("arms");
         assert!(
-            default_worker_sandbox(&own, &[], "claude").is_some(),
+            default_worker_sandbox(&own, &[], "claude").is_ok(),
             "{tool} runs on this host, so the repository boundary must arm"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn default_worker_sandbox_names_why_it_did_not_arm() {
+        // IG1-core-1: a scratch dir is not a worktree; a codex seat arms its own sandbox (checked
+        // first, so it holds even inside a run worktree).
+        let dir = std::env::temp_dir().join(format!("wicked-wsb-reason-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            default_worker_sandbox(&dir, &[], "claude").err(),
+            Some(FloorUnarmed::NotAWorktree)
+        );
+        let (base, _clone, own, _sibling) = clone_with_two_runs("reason");
+        for seat in ["codex", "codex-acp", "/usr/local/bin/codex"] {
+            assert_eq!(
+                default_worker_sandbox(&own, &[], seat).err(),
+                Some(FloorUnarmed::SeatArmsItsOwn),
+                "{seat}"
+            );
+        }
+        // In a worktree a non-codex seat either arms (naming its launcher) or names the launcher
+        // gap — never NotAWorktree.
+        match default_worker_sandbox(&own, &[], "claude") {
+            Ok(armed) => assert!(["sandbox-exec", "bwrap"].contains(&armed.tool)),
+            Err(e) => assert!(
+                matches!(e, FloorUnarmed::NoLauncher | FloorUnarmed::CannotArm),
+                "{e:?}"
+            ),
+        }
+        assert_eq!(FloorUnarmed::NotAWorktree.as_str(), "not_a_worktree");
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -468,7 +559,7 @@ mod tests {
     #[test]
     fn a_creator_cannot_write_a_sibling_worktree_or_the_clone_root_548() {
         let (base, clone, own, sibling) = clone_with_two_runs("escape");
-        let Some(sandbox) = default_worker_sandbox(&own, &[], "claude") else {
+        let Ok(sandbox) = default_worker_sandbox(&own, &[], "claude").map(|a| a.sandbox) else {
             eprintln!("worker_sandbox: no launcher can arm on this host — the #548 proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;

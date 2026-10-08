@@ -3430,6 +3430,16 @@ const ARMED_CARRIER_KEY: &str = "_wicked_gov_carrier";
 pub(crate) const CARRIER_WRAPPED_CLI: &str = "wrapped_cli";
 /// The carrier label of the ACP permission-bridge path.
 pub(crate) const CARRIER_ACP: &str = "acp";
+/// (IG1-core-1) The carrier label of the OS-sandbox governance floor: a seat with no per-call
+/// permission adapter, governed by the OS write boundary armed around its process tree. Its marker
+/// also names the write roots the boundary admitted ([`ARMED_ROOTS_KEY`]) and the launcher that
+/// armed it ([`ARMED_BOUNDARY_KEY`]).
+pub(crate) const CARRIER_OS_SANDBOX: &str = "os_sandbox";
+/// (IG1-core-1) Companion key on an `os_sandbox` marker: the write roots the boundary admitted.
+const ARMED_ROOTS_KEY: &str = "_wicked_gov_roots";
+/// (IG1-core-1) Companion key on an `os_sandbox` marker: what armed the boundary —
+/// `"sandbox-exec"` | `"bwrap"` | `"seat:codex"` (the seat's own `--sandbox` mode).
+const ARMED_BOUNDARY_KEY: &str = "_wicked_gov_boundary";
 
 /// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as claims).
 /// The carrier-less spelling, kept for the tests that drive the fold directly (a log an older
@@ -3448,12 +3458,42 @@ pub fn write_armed_marker_for(
     phase: &str,
     carrier: Option<&str>,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = decisions_path.parent() {
-        create_dir_all_private(parent)?;
-    }
     let mut marker = serde_json::json!({ ARMED_MARKER_KEY: phase });
     if let Some(c) = carrier {
         marker[ARMED_CARRIER_KEY] = serde_json::Value::String(c.to_string());
+    }
+    append_armed_marker(decisions_path, &marker)
+}
+
+/// (IG1-core-1) Append the ARMED sentinel for `phase` naming the [`CARRIER_OS_SANDBOX`] carrier,
+/// the write roots the boundary admitted (verbatim, in order) and the launcher that armed it
+/// (`"sandbox-exec"` | `"bwrap"` | `"seat:codex"`), under the same advisory lock as claims:
+///
+/// `{"_wicked_gov_armed":<phase>,"_wicked_gov_carrier":"os_sandbox","_wicked_gov_roots":[..],"_wicked_gov_boundary":<tool>}`
+#[cfg_attr(not(test), allow(dead_code))] // IG1-core-2 wires the arm sites with the fold rule
+pub(crate) fn write_os_sandbox_marker(
+    decisions_path: &Path,
+    phase: &str,
+    roots: &[std::path::PathBuf],
+    boundary: &str,
+) -> anyhow::Result<()> {
+    let roots: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+    let marker = serde_json::json!({
+        ARMED_MARKER_KEY: phase,
+        ARMED_CARRIER_KEY: CARRIER_OS_SANDBOX,
+        ARMED_ROOTS_KEY: roots,
+        ARMED_BOUNDARY_KEY: boundary,
+    });
+    append_armed_marker(decisions_path, &marker)
+}
+
+/// Append one ARMED marker line under the decisions log's append lock.
+fn append_armed_marker(decisions_path: &Path, marker: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = decisions_path.parent() {
+        create_dir_all_private(parent)?;
     }
     let mut line = marker.to_string();
     line.push('\n');
@@ -7577,6 +7617,41 @@ mod tests {
     /// core#653 (red on main): a governed unit armed on the WRAPPED carrier under an org
     /// `allowManagedHooksOnly` — the stubbed hook NEVER fires, so the log holds the armed marker
     /// only — while the agent made tool calls (`ToolInvoked` non-empty). It must fail its gate
+    /// IG1-core-1: the `os_sandbox` marker is one ARMED line naming its carrier, roots and
+    /// launcher; `marker_phase` / `marker_carrier` read it back like the other two carriers'.
+    #[test]
+    fn the_os_sandbox_marker_round_trips_through_marker_carrier() {
+        let run_id = format!("ig1-core-1-marker-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        let roots = vec![
+            std::path::PathBuf::from("/w/run1"),
+            std::path::PathBuf::from("/w/graph"),
+        ];
+        write_os_sandbox_marker(&p, "unit-1", &roots, "sandbox-exec").unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(marker_phase(&v), Some("unit-1"));
+        assert_eq!(marker_carrier(&v), Some(CARRIER_OS_SANDBOX));
+        assert_eq!(
+            v[ARMED_ROOTS_KEY],
+            serde_json::json!(["/w/run1", "/w/graph"])
+        );
+        assert_eq!(v[ARMED_BOUNDARY_KEY], "sandbox-exec");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "_wicked_gov_armed": "unit-1",
+                "_wicked_gov_carrier": "os_sandbox",
+                "_wicked_gov_roots": ["/w/run1", "/w/graph"],
+                "_wicked_gov_boundary": "sandbox-exec",
+            })
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
     /// `governance_unproven`; before #653 the fold read "marker only" as "no tool calls" and passed.
     #[test]
     fn a_wrapped_unit_with_tool_calls_and_no_hook_proof_is_governance_unproven() {

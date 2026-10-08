@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **IG1-core-1 — a seat's governance CLASS, the `os_sandbox` marker carrier, and why the floor did
+  not arm.** (1) `wicked_council::governance_class(&AgenticCli) -> GovernanceClass`
+  (`AcpInputGovernance | OsSandboxFloor | None`, wire `acp_input_governance | os_sandbox | none`):
+  admitted ACP adapters (claude, opencode) are `AcpInputGovernance`; a seat with no per-call
+  permission adapter (codex, pi, copilot, agy) is `OsSandboxFloor` — codex only while its trust
+  flags keep `--sandbox workspace-write|read-only` and carry no bypass flag, else `None`. The floor
+  is repository containment (clone, `.git`, sibling worktrees), not a per-call gate. (2) The opt-out:
+  `[cli.acp] governance_floor = false` (`AcpConfig.governance_floor: Option<bool>`, absent = floor,
+  absent on the wire unless set; a same-binary override inherits it like `os_sandbox`) puts the seat
+  in `None`. (3) `gate_hook::CARRIER_OS_SANDBOX = "os_sandbox"` and `write_os_sandbox_marker` — one
+  ARMED line `{"_wicked_gov_armed":<phase>,"_wicked_gov_carrier":"os_sandbox","_wicked_gov_roots":[..],"_wicked_gov_boundary":"sandbox-exec"|"bwrap"|"seat:codex"}`
+  under the decisions log's append lock; no arm site writes it yet (IG1-core-2 lands the arm sites
+  with the fold rule). (4) `worker_sandbox::default_worker_sandbox` returns the launcher it armed
+  with or why it did not arm — `NotAWorktree | SeatArmsItsOwn | NoLauncher | CannotArm`; both
+  callers keep today's behaviour.
 - **#708 — the `OPS-WATCH-*` warn rules see the spellings they missed.** (1) `pretool_context`
   (wicked-governance, the one projection the input hook and `rules eval` share) normalises the
   evaluated `command` once: a string `command` as before (byte-identical), else the first of `cmd`,

@@ -56,9 +56,9 @@ pub(crate) mod test_env {
 pub use bus::EmitSink;
 pub use store::{EstateHandle, EstateRankStore, Ledger, TaskRecord};
 pub use types::{
-    AgenticCli, Category, Confidence, CouncilTask, Dispatcher, EventSink, InputMode, NoopEventSink,
-    ProbeOutcome, Prober, RankSignal, RankStore, Ranking, TaskState, UnusableReason, Verdict, Vote,
-    COUNCIL_EVENTS,
+    governance_class, AgenticCli, Category, Confidence, CouncilTask, Dispatcher, EventSink,
+    GovernanceClass, InputMode, NoopEventSink, ProbeOutcome, Prober, RankSignal, RankStore,
+    Ranking, TaskState, UnusableReason, Verdict, Vote, COUNCIL_EVENTS,
 };
 pub use worker::{PollStatus, Worker};
 

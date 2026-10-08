@@ -1917,6 +1917,8 @@ impl WrappedCliStepRunner {
                 // sibling worktrees read-only at the OS (`worker_sandbox`). `None` (not a run
                 // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
                 crate::worker_sandbox::default_worker_sandbox(&cwd, &worker_write_roots, &cli_key)
+                    .ok()
+                    .map(|armed| armed.sandbox)
             };
             // `build_worker_command` HARDENS at construction (FINDING-067): no estate tool the worker
             // spawns may inherit a store from the environment. Stripped UNCONDITIONALLY — governed or
