@@ -589,3 +589,73 @@ fn a_tool_only_plan_on_a_dead_roster_is_still_accepted() {
         "no ballot dispatched"
     );
 }
+
+/// core#776: a generic Tool phase is handed the run variables — `WICKED_RUN_ID`,
+/// `WICKED_RUN_UNIT`, `WICKED_TREE` (the worktree's tree id) and `WICKED_EVIDENCE_ROOT` (the run's
+/// evidence root) — not only the walkthrough recorder.
+#[cfg(unix)]
+#[test]
+fn a_generic_tool_phase_is_handed_the_run_variables() {
+    let repo = make_git_repo("run-vars");
+    let out = std::env::temp_dir().join(format!("wicked-core-776-env-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let evidence =
+        std::env::temp_dir().join(format!("wicked-core-776-evidence-{}", std::process::id()));
+    std::fs::create_dir_all(&evidence).unwrap();
+    let core = Core::spawn_with_engine(
+        db_path("run-vars"),
+        Arc::new(CountingDispatcher(AtomicUsize::new(0))),
+        Arc::new(CountingRunner(AtomicUsize::new(0))),
+    );
+    core.register_workflow(
+        serde_json::json!({
+            "id": "core776-run-vars",
+            "phases": [
+                {"id": "dump", "kind": "recon",
+                 "executor": {"type": "tool", "cmd": [
+                     "sh", "-c", format!("env | grep '^WICKED_' > '{}'", out.display())
+                 ]}}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("register the tool workflow");
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "core776".into(),
+            root_path: repo.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .expect("register the repo");
+    let ev = core.subscribe();
+    let sid = "core776-run-vars";
+    let mut launch = spec(sid, "core776-run-vars", Some(entry.id.clone()));
+    launch.evidence_root = Some(evidence.to_string_lossy().into_owned());
+    core.launch_run(launch).expect("a tool-only plan launches");
+    let events = drain_until_terminal(&ev, sid);
+    let env = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_dir_all(&evidence);
+    let _ = std::fs::remove_dir_all(&repo);
+    let var = |k: &str| {
+        env.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .map(str::to_string)
+    };
+    assert_eq!(
+        var("WICKED_RUN_ID").as_deref(),
+        Some(sid),
+        "{env}\n{events:?}"
+    );
+    assert_eq!(var("WICKED_RUN_UNIT").as_deref(), Some("1"), "{env}");
+    assert_eq!(
+        var("WICKED_EVIDENCE_ROOT").as_deref(),
+        Some(evidence.to_string_lossy().as_ref()),
+        "{env}"
+    );
+    let tree = var("WICKED_TREE").unwrap_or_default();
+    assert!(
+        tree.len() >= 40 && tree.chars().all(|c| c.is_ascii_hexdigit()),
+        "a tree id: {env}"
+    );
+}

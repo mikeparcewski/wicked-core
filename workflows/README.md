@@ -99,10 +99,10 @@ run's worktree — no council, no seat. Notes:
 - A Tool phase satisfies the registration rule that an `executes_code` phase with an `auto` gate
   must carry a pin; it may still carry a human gate (`mcp-server`'s `install` does).
 - A Tool phase runs with the run's worktree as its working directory and inherits the daemon's
-  environment as it is. It is NOT handed the run variables (`WICKED_RUN_ID`, `WICKED_RUN_UNIT`,
-  `WICKED_TREE`, `WICKED_EVIDENCE_ROOT`): today only the engine's own walkthrough recorder gets
-  those (`src/walkthrough.rs`). A Tool command that needs the run's tree reads its working
-  directory.
+  environment, plus the run variables (core#776): `WICKED_RUN_ID`, `WICKED_RUN_UNIT` (the
+  unit's ordinal), `WICKED_TREE` (the worktree's tree id, snapshotted when the unit starts; unset
+  for a repo-less run) and `WICKED_EVIDENCE_ROOT` (the run's evidence root, when the launcher
+  minted one). The walkthrough recorder declares its own set (`src/walkthrough.rs`).
 
 ## Gating a phase (validator_pin)
 
