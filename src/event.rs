@@ -736,7 +736,10 @@ pub enum CoreEvent {
     /// is not write-containment for a WORKER whose network is deliberately open anyway). This is the
     /// WRITE-containment sibling of `GovernanceUnenforced` — a unit running without the deny floor is
     /// never silent. It is NOT an exfiltration or audit claim. It does NOT fire when `os_sandbox` is
-    /// OFF (the feature was not requested) or when the floor armed (`Sandboxed`).
+    /// OFF (the feature was not requested) or when the floor armed (`Sandboxed`). (IG1-core-2) It
+    /// also fires, `level: "best-effort"`, for a GOVERNED unit on a seat of governance class
+    /// `os_sandbox` whose default repository boundary did not arm (`reason` names why:
+    /// `not_a_worktree`, `no_launcher`, `cannot_arm`, …), beside its `GovernanceUnenforced`.
     SandboxUnenforced {
         session: String,
         ord: u32,

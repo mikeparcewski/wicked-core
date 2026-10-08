@@ -766,7 +766,10 @@ fn unit_distributed_teamed_routing_carries_no_council_fields() {
             None,
             None,
             None,
-            Some(ungoverned_build("a"))
+            // IG1-core-2: a stub seat (no ACP adapter, floor left on) is of class `os_sandbox`,
+            // so its build unit is not degraded; the negative case is pinned on a seat that
+            // refuses the floor (`unit_distributed_names_the_bench_on_the_teamed_arm`).
+            None
         )]
     );
 }
@@ -853,13 +856,13 @@ fn unit_distributed_names_the_bench_on_the_teamed_arm() {
         Arc::new(OkRunner),
     );
     let ev = core.subscribe();
-    let mut a = cli("a");
+    let mut a = floorless("a");
     a.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
     core.launch_run(LaunchSpec {
         base_ref: None,
         project_id: None,
         problem: "Do step one.".into(),
-        clis: vec![a, cli("b")],
+        clis: vec![a, floorless("b")],
         entity_mode: EntityMode::Shared,
         session_id: "degraded-sess".into(),
         human_confirm: HumanConfirm::None,
@@ -898,8 +901,8 @@ fn unit_distributed_names_the_bench_on_the_teamed_arm() {
         vec![(
             "b".to_string(),
             "teamed".to_string(),
-            // (crew#477) The stub seats enforce no input governance, so the build unit's
-            // degrade names that too, after the bench.
+            // (crew#477) The seats refuse the OS-sandbox floor (class `none`), so the build
+            // unit's degrade names that too, after the bench.
             Some(format!(
                 "1 of 2 seats benched: a (signed out — launcher); {}",
                 ungoverned_build("b")
@@ -908,14 +911,33 @@ fn unit_distributed_names_the_bench_on_the_teamed_arm() {
     );
 }
 
-/// (crew#477) The degrade a build unit on a stub seat carries: `cli()` records have no ACP
-/// adapter and no claude template, so they enforce no input governance.
+/// (crew#477) The degrade a build unit on a [`floorless`] seat carries: its record refuses the
+/// OS-sandbox floor and has no admitted ACP adapter, so it enforces no input governance.
 fn ungoverned_build(seat: &str) -> String {
     format!(
         "unit 1 (build) runs on '{seat}', which does not enforce input governance \
-         (acp_input_governance=false or no gate-hook adapter): no eligible seat that enforces it \
-         admits this unit, so its tool calls run unchecked"
+         (governance class none: no admitted ACP adapter and the OS-sandbox floor is refused or \
+         switched off): no eligible seat that enforces it admits this unit, so its tool calls run \
+         unchecked"
     )
+}
+
+/// (IG1-core-2) A stub seat whose record REFUSES the OS-sandbox floor (`[cli.acp]
+/// governance_floor = false`, no admitted adapter): governance class `none`.
+fn floorless(key: &str) -> AgenticCli {
+    let mut c = cli(key);
+    c.acp = Some(wicked_council::types::AcpConfig {
+        binary: format!("{key}-acp"),
+        start_args: vec![],
+        transport: Default::default(),
+        auth_method: None,
+        acp_input_governance: false,
+        os_sandbox: false,
+        acp_governance_env: None,
+        verified_version: None,
+        governance_floor: Some(false),
+    });
+    c
 }
 
 // ── StepFailed tests ─────────────────────────────────────────────────────────────────────────────

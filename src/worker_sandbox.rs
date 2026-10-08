@@ -289,8 +289,28 @@ pub(crate) enum FloorUnarmed {
 }
 
 impl FloorUnarmed {
+    /// The reason in words, for a `governanceUnenforced` / `sandboxUnenforced` disclosure.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            FloorUnarmed::NotAWorktree => {
+                "not_a_worktree: the unit does not run in a linked run worktree, so there is no \
+                 repository boundary to arm"
+            }
+            FloorUnarmed::SeatArmsItsOwn => {
+                "seat_arms_its_own: the seat's CLI arms its own OS sandbox, which the engine does \
+                 not wrap"
+            }
+            FloorUnarmed::NoLauncher => {
+                "no_launcher: neither sandbox-exec nor bwrap is on this host's PATH"
+            }
+            FloorUnarmed::CannotArm => {
+                "cannot_arm: the host's sandbox launcher is present but its probe failed here"
+            }
+        }
+    }
+
     /// The reason's wire spelling, for a disclosure.
-    #[cfg_attr(not(test), allow(dead_code))] // read by IG1-core-2's arm sites
+    #[cfg_attr(not(test), allow(dead_code))] // IG1-core-3 states it on the wire
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             FloorUnarmed::NotAWorktree => "not_a_worktree",
@@ -306,8 +326,25 @@ impl FloorUnarmed {
 #[derive(Debug)]
 pub(crate) struct ArmedFloor {
     pub(crate) sandbox: crate::validator::WorkerSandbox,
-    #[cfg_attr(not(test), allow(dead_code))] // read by IG1-core-2's arm sites
     pub(crate) tool: &'static str,
+}
+
+/// (IG1-core-2) The `_wicked_gov_boundary` an `os_sandbox` marker names when the boundary is the
+/// seat's OWN sandbox (codex `--sandbox workspace-write|read-only`), not an engine launcher.
+pub(crate) const SEAT_CODEX_BOUNDARY: &str = "seat:codex";
+
+/// (IG1-core-2) The launcher an ARMED sandbox wrapper argv starts with: `"sandbox-exec"` or
+/// `"bwrap"` — the `_wicked_gov_boundary` for a strict-profile (`os_sandbox = true`) spawn
+/// (firejail never arms: it is network-only and always downgrades).
+pub(crate) fn launcher_name_of(wrapper: &[String]) -> &'static str {
+    match wrapper
+        .first()
+        .and_then(|w| Path::new(w).file_name())
+        .and_then(|n| n.to_str())
+    {
+        Some("sandbox-exec") => "sandbox-exec",
+        _ => "bwrap",
+    }
 }
 
 /// The launcher this host arms the repository boundary with (`sandbox-exec`, then `bwrap`),
@@ -367,7 +404,7 @@ pub(crate) fn default_worker_sandbox(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
@@ -390,7 +427,7 @@ mod tests {
     }
 
     /// A clone with two run worktrees under `wicked-worktrees/` — the layout `repo.rs` creates.
-    fn clone_with_two_runs(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    pub(crate) fn clone_with_two_runs(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!("wicked-wsb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let clone = base.join("clone");

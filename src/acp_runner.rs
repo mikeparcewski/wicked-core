@@ -947,6 +947,14 @@ struct AcpProcess {
     /// session is cached and reused across turns — and read by the caller to emit exactly one
     /// `SandboxUnenforced` disclosure per spawn. `None` when the floor armed OR the flag was OFF.
     sandbox_downgrade: Option<(String, String)>,
+    /// (IG1-core-2) The OS write boundary this process spawned under, computed ONCE at spawn:
+    /// `Ok(launcher)` (`"sandbox-exec"` | `"bwrap"`) when the default repository boundary or the
+    /// strict `os_sandbox` profile armed, `Err(why)` when neither did. A governed unit on an
+    /// `os_sandbox`-class seat is governed on this carrier only when this is `Ok`.
+    floor: Result<&'static str, String>,
+    /// (IG1-core-2) The write roots the boundary admitted at spawn — `armed_write_root_paths`
+    /// verbatim — named by the `os_sandbox` ARMED marker.
+    floor_roots: Vec<std::path::PathBuf>,
     /// (core#581) `Some(..)` when this seat claims ACP input governance and its `verified_version`
     /// pin did NOT match the resolved binary — the disclosure detail behind
     /// `governance_verified == false`. Computed ONCE at spawn.
@@ -2450,22 +2458,33 @@ fn start_acp_process_with_write_roots(
     // failure. We wrap ONLY when the floor actually armed, and surface the gap on the `AcpProcess`
     // so the caller emits exactly ONE `SandboxUnenforced` per spawn (the session is cached and
     // reused across turns, so the disclosure belongs to the spawn, not each turn).
-    let (worker_sandbox, sandbox_downgrade) = if config.os_sandbox {
+    let (worker_sandbox, sandbox_downgrade, floor) = if config.os_sandbox {
         let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
         match ws.downgrade_reason {
-            Some(reason) => (None, Some((ws.level.as_wire().to_string(), reason))),
-            None => (Some(ws), None),
+            Some(reason) => (
+                None,
+                Some((ws.level.as_wire().to_string(), reason.clone())),
+                Err(reason),
+            ),
+            None => {
+                let tool = crate::worker_sandbox::launcher_name_of(&ws.wrapper);
+                (Some(ws), None, Ok(tool))
+            }
         }
     } else {
         // core#548: the default repository boundary — the unit's own tree writable, the clone
-        // and its sibling worktrees read-only at the OS (`worker_sandbox`). `None` (a chat's
+        // and its sibling worktrees read-only at the OS (`worker_sandbox`). Not armed (a chat's
         // scratch root, a self-sandboxing seat such as codex-acp, no launcher) spawns as before.
-        (
-            crate::worker_sandbox::default_worker_sandbox(cwd, &worker_write_roots, &config.binary)
-                .ok()
-                .map(|armed| armed.sandbox),
-            None,
-        )
+        // On this carrier codex-acp's own sandbox mode is the bridge's, not the trust flags the
+        // seat's class reads, so `SeatArmsItsOwn` is not counted as an armed floor here.
+        match crate::worker_sandbox::default_worker_sandbox(
+            cwd,
+            &worker_write_roots,
+            &config.binary,
+        ) {
+            Ok(armed) => (Some(armed.sandbox), None, Ok(armed.tool)),
+            Err(why) => (None, None, Err(why.describe().to_string())),
+        }
     };
     let worker_write_roots_env = std::env::join_paths(&worker_write_roots)
         .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
@@ -2510,7 +2529,9 @@ fn start_acp_process_with_write_roots(
         // wrapped path, FINDING-060), but an ungoverned worker in a repo runs the same
         // `wicked-estate index .`. Harden FIRST — anything set below is set deliberately.
         cmd.hardened();
-        if config.os_sandbox {
+        // (IG1-core-2) …and for a seat of governance class `os_sandbox` (no admitted adapter, the
+        // floor not refused): its write roots are the boundary its governance rests on.
+        if config.os_sandbox || acp_config_on_the_floor(config) {
             cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, &worker_write_roots_env);
         }
         // Run markers on the worker's OWN environment (R12 — DES-L4 PR-③): the same pairs the
@@ -2873,6 +2894,8 @@ fn start_acp_process_with_write_roots(
         steering_supported: steering_advertised(&init),
         governance_verified,
         sandbox_downgrade,
+        floor,
+        floor_roots: worker_write_roots.clone(),
         version_pin_drift,
         // Bound by the unit runner right after the spawn (it holds the admitted snapshot; this
         // chokepoint only knows the delivery it put in the handshake).
@@ -7323,6 +7346,9 @@ impl AcpStepRunner {
         // principle race a concurrent clis.toml edit and diverge from the config that actually
         // gets spawned a few lines below. Binding both to one resolution closes that — the same
         // `seat` record whose binary decided the skill form above.
+        // (IG1-core-2) The seat's governance class, off the SAME record: an `os_sandbox`-class
+        // seat's governed unit is governed by the floor its process spawned under (decided below).
+        let seat_class = seat.as_ref().map(wicked_council::governance_class);
         let acp_cfg_probe = seat.and_then(|c| c.acp);
         let acp_admitted = acp_cfg_probe
             .as_ref()
@@ -7360,6 +7386,8 @@ impl AcpStepRunner {
             return fallback_with_warning(reason, input, emit, &self.fallback);
         }
 
+        let mut floor_pending = false;
+        let mut floor_governed = false;
         let mut gate_ctx = match (&input.governance, acp_admitted) {
             (Some(g), true) => {
                 let scope =
@@ -7480,6 +7508,15 @@ impl AcpStepRunner {
             // `allow_result` at all (it falls straight to `self.fallback` below), so disclosing
             // "answered by allow_result, unchecked" here would be a false claim about a unit the
             // wrapped path may be governing correctly via its own, independent gate-hook check.
+            // (IG1-core-2) An `os_sandbox`-class seat: its disclosure — or its ARMED marker — waits
+            // for the process, whose spawn decided the floor.
+            (Some(_), false)
+                if seat_class == Some(wicked_council::GovernanceClass::OsSandboxFloor)
+                    && acp_cfg_probe.is_some() =>
+            {
+                floor_pending = true;
+                None
+            }
             (Some(_), false) => {
                 if acp_unadmitted_but_configured(acp_cfg_probe.as_ref()) {
                     if let Some(event) = acp_ungoverned_event(input, &cli_key) {
@@ -7942,6 +7979,52 @@ impl AcpStepRunner {
                 reason,
             });
         }
+        // (IG1-core-2) A governed unit on an `os_sandbox`-class seat: the floor this process
+        // spawned under armed ⇒ the ARMED marker names the `os_sandbox` carrier, the spawn's write
+        // roots verbatim and the launcher, BEFORE the turn's prompt is sent, and the unit is
+        // governed; not armed ⇒ today's disclosure (`governanceUnenforced` naming the real cause)
+        // plus `sandboxUnenforced` (the strict profile's downgrade already disclosed its own at
+        // spawn).
+        if floor_pending {
+            let marker = proc.floor.clone().and_then(|tool| {
+                crate::gate_hook::write_os_sandbox_marker(
+                    &crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+                    &crate::scope::unit_phase(input.unit.ord),
+                    &proc.floor_roots,
+                    tool,
+                )
+                .map_err(|e| format!("its ARMED marker could not be written: {e}"))
+            });
+            match marker {
+                Ok(()) => floor_governed = true,
+                Err(why) => {
+                    if proc.sandbox_downgrade.is_none() {
+                        self.emit_event(CoreEvent::SandboxUnenforced {
+                            session: run_id.clone(),
+                            ord: input.unit.ord,
+                            attempt: input.attempt,
+                            cli: cli_key.clone(),
+                            level: crate::validator::SandboxLevel::BestEffort
+                                .as_wire()
+                                .to_string(),
+                            reason: why.clone(),
+                        });
+                    }
+                    self.emit_event(CoreEvent::GovernanceUnenforced {
+                        session: run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        cli: cli_key.clone(),
+                        reason: format!(
+                            "unit is governed but the ACP adapter for '{cli_key}' is not admitted \
+                             to input governance (acp_input_governance=false) and its OS-sandbox \
+                             governance floor did not arm ({why}); its tool calls are answered by \
+                             allow_result, unchecked"
+                        ),
+                    });
+                }
+            }
+        }
         // (#627) The unit's own aliases — the phase id and the catalog id — as data, exactly the
         // pair the wrapped path arms for its hook: the ACP carrier selects on all three tokens.
         let (unit_phase_alias, unit_catalog_alias) =
@@ -8127,7 +8210,7 @@ impl AcpStepRunner {
                 usage,
                 files,
                 tools: Vec::new(),
-                governed: gate.is_some(),
+                governed: gate.is_some() || floor_governed,
             };
         }
 
@@ -8152,7 +8235,7 @@ impl AcpStepRunner {
                     usage: result.usage,
                     files: result.files,
                     tools: result.tools,
-                    governed: gate.is_some(),
+                    governed: gate.is_some() || floor_governed,
                 }
             }
             Ok(result) if matches!(result.status, StepStatus::Cancelled | StepStatus::TimedOut) => {
@@ -8171,7 +8254,7 @@ impl AcpStepRunner {
                     usage: result.usage,
                     files: result.files,
                     tools: result.tools,
-                    governed: gate.is_some(),
+                    governed: gate.is_some() || floor_governed,
                 }
             }
             Ok(result) if result.status == StepStatus::ElicitationFailed => {
@@ -8189,7 +8272,7 @@ impl AcpStepRunner {
                     usage: result.usage,
                     files: result.files,
                     tools: result.tools,
-                    governed: gate.is_some(),
+                    governed: gate.is_some() || floor_governed,
                 }
             }
             Ok(_) => {
@@ -8295,9 +8378,14 @@ impl AcpStepRunner {
 // `monitor_turn`: warm, READ-ONLY ACP sessions beside the chat machinery, judged by the chat
 // boundary, emitting no chat events.
 
-/// Why `seat` cannot be a monitor, or its launch facts (DES §4.1 (b)): the seat must have an ACP
-/// adapter on stdio that is ADMITTED to input governance — the read-only boundary is enforced by
-/// answering `session/request_permission`, which an unadmitted adapter never sends.
+/// Why `seat` cannot be a monitor, or its launch facts (DES §4.1 (b); IG1-core-2). A member is
+/// an ACP session, so the seat needs an ACP adapter on stdio; its read-only boundary then holds
+/// through its governance class — an adapter admitted to input governance answers every
+/// `session/request_permission` against the chat boundary, and a seat of class `os_sandbox` is
+/// spawned under the strict kernel write floor over its scratch root (the returned config has
+/// `os_sandbox` set, so the spawn arms [`crate::validator::detect_worker_sandbox`] and a downgrade
+/// is refused by [`scoped_seat_runtime_admission`]). Exactly three refusals: no `[cli.acp]`, an
+/// HTTP transport, governance class `none`.
 fn monitor_admission(
     seat: &str,
 ) -> Result<
@@ -8308,20 +8396,49 @@ fn monitor_admission(
     ),
     String,
 > {
-    let (config, seat_cli, worker_cli) = acp_launch_facts(seat)
-        .ok_or_else(|| format!("seat '{seat}' has no ACP adapter configured"))?;
+    let class = registry_record(seat)
+        .as_ref()
+        .map(wicked_council::governance_class);
+    let (mut config, seat_cli, worker_cli) = acp_launch_facts(seat).ok_or_else(|| {
+        let class = class.unwrap_or(wicked_council::GovernanceClass::OsSandboxFloor);
+        if class == wicked_council::GovernanceClass::None {
+            format!(
+                "seat '{seat}' has no ACP adapter, so the engine has no member session to open \
+                 for it — its governance class is none"
+            )
+        } else {
+            format!(
+                "seat '{seat}' has no ACP adapter, so the engine has no member session to open \
+                 for it — its governance class is {} and is not the blocker",
+                class.as_wire()
+            )
+        }
+    })?;
     if config.transport == AcpTransport::Http {
         return Err(format!(
             "seat '{seat}' runs its ACP adapter over HTTP, which a monitor does not support"
         ));
     }
-    if !config.acp_input_governance {
-        return Err(format!(
-            "seat '{seat}' runs an ACP adapter that is not admitted to input governance \
-             (acp_input_governance=false): its tool calls are never put to \
-             session/request_permission, so the read-only boundary cannot hold \
-             (DES-TEAMING-001 §4.1)"
-        ));
+    match class {
+        Some(wicked_council::GovernanceClass::AcpInputGovernance) => {}
+        // A seat whose CLI arms its own OS sandbox (codex) is not wrapped again — a nested
+        // `sandbox_apply` fails on macOS — and its own bounded mode confines its writes to the
+        // member's scratch cwd; every other floor-class member gets the strict profile.
+        Some(wicked_council::GovernanceClass::OsSandboxFloor) => {
+            if !crate::worker_sandbox::seat_arms_its_own_os_sandbox(&config.binary)
+                && !crate::worker_sandbox::seat_arms_its_own_os_sandbox(seat)
+            {
+                config.os_sandbox = true;
+            }
+        }
+        _ => {
+            return Err(format!(
+                "seat '{seat}' has governance class none: its ACP adapter is not admitted to \
+                 input governance and its record refuses the OS-sandbox floor \
+                 (governance_floor = false), so nothing holds the read-only boundary \
+                 (DES-TEAMING-001 §4.1)"
+            ))
+        }
     }
     Ok((config, seat_cli, worker_cli))
 }
@@ -8788,6 +8905,13 @@ fn acp_ungoverned_event(input: &StepInput, cli_key: &str) -> Option<CoreEvent> {
 /// that reason describes. Takes the already-resolved config rather than re-reading the (disk-
 /// backed) merged registry, which also keeps this predicate pure and independent of ambient
 /// registry state for testing.
+/// (IG1-core-2) Whether an ACP record puts its seat on the OS-sandbox floor: no admitted adapter
+/// and the floor not refused (`governance_floor = false`). The record-only half of
+/// [`wicked_council::governance_class`] — the spawn has the bridge record, not the seat's.
+fn acp_config_on_the_floor(config: &AcpConfig) -> bool {
+    !config.acp_input_governance && config.governance_floor != Some(false)
+}
+
 fn acp_unadmitted_but_configured(acp_cfg: Option<&AcpConfig>) -> bool {
     matches!(acp_cfg, Some(cfg) if !cfg.acp_input_governance)
 }
@@ -16446,7 +16570,8 @@ No further next steps — both questions fully answered.";
         // searches for, and a source audit that matches itself is the fifth such self-match I have
         // written in this campaign.
         let bad = format!("governed:{}false,", " ");
-        let good = format!("governed:{}gate.is_some(),", " ");
+        // IG1-core-2: …or whether the OS-sandbox floor armed for an `os_sandbox`-class seat.
+        let good = format!("governed:{}gate.is_some() || floor_governed,", " ");
         assert!(
             !src.contains(&bad),
             "an ACP StepOutput still hardcodes `governed: false`. If the unit was gated, the fold \
@@ -22896,10 +23021,12 @@ while True:
         assert_eq!(control_text, "pwned\n", "control: and its write lands");
     }
 
-    /// DES §4.1 (b): a seat whose ACP adapter is not admitted to input governance cannot be a
-    /// monitor, and says why; neither can a seat with no ACP adapter at all.
+    /// DES §4.1 (b), IG1-core-2: a member is admitted by its governance CLASS. An admitted
+    /// adapter and a floor-class adapter (pi-acp, `acp_input_governance = false`) are admitted —
+    /// the floor-class member's config arms the strict kernel profile — and exactly three refusals
+    /// remain, each with its wording: no `[cli.acp]`, an HTTP transport, class `none`.
     #[test]
-    fn an_unadmitted_or_unconfigured_seat_is_refused_as_a_monitor() {
+    fn a_member_is_admitted_by_its_governance_class_with_three_refusals() {
         let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let home = scratch("admission-home");
         let council = home.join(".config").join("wicked-council");
@@ -22919,35 +23046,91 @@ transport = "stdio"
 acp_input_governance = true
 
 [[cli]]
-key = "codex"
-display_name = "Codex"
-binary = "codex"
-headless_invocation = "codex exec \"{PROMPT}\""
+key = "pi"
+display_name = "pi"
+binary = "pi"
+headless_invocation = "pi -p \"{PROMPT}\""
 
 [cli.acp]
-binary = "/opt/team-test/codex-bridge"
+binary = "/opt/team-test/pi-bridge"
 transport = "stdio"
 acp_input_governance = false
+
+[[cli]]
+key = "refuser"
+display_name = "Refuser"
+binary = "refuser"
+headless_invocation = "refuser \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/team-test/refuser-bridge"
+transport = "stdio"
+governance_floor = false
+
+[[cli]]
+key = "httpseat"
+display_name = "HTTP"
+binary = "httpseat"
+headless_invocation = "httpseat \"{PROMPT}\""
+
+[cli.acp]
+binary = "httpseat"
+transport = "http"
+
+[[cli]]
+key = "copilot"
+display_name = "Copilot"
+binary = "copilot"
+headless_invocation = "copilot -p \"{PROMPT}\""
 "#,
         )
         .unwrap();
         let prior = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
-        let claude2 = monitor_admission("claude#2").map(|(c, _, _)| c.binary);
-        let codex2 = monitor_admission("codex#2").map(|(c, _, _)| c.binary);
+        let claude2 = monitor_admission("claude#2").map(|(c, _, _)| (c.binary, c.os_sandbox));
+        let pi = monitor_admission("pi").map(|(c, _, _)| (c.binary, c.os_sandbox));
+        let refuser = monitor_admission("refuser").map(|(c, _, _)| c.binary);
+        let http = monitor_admission("httpseat").map(|(c, _, _)| c.binary);
+        let copilot = monitor_admission("copilot").map(|(c, _, _)| c.binary);
         let none = monitor_admission("no-such-cli#2").map(|(c, _, _)| c.binary);
         match prior {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
         let _ = std::fs::remove_dir_all(&home);
-        assert_eq!(claude2, Ok("/opt/team-test/claude-bridge".to_string()));
+        assert_eq!(
+            claude2,
+            Ok(("/opt/team-test/claude-bridge".to_string(), false)),
+            "an admitted adapter holds the boundary through its permission channel"
+        );
+        assert_eq!(
+            pi,
+            Ok(("/opt/team-test/pi-bridge".to_string(), true)),
+            "a floor-class member is spawned under the strict kernel profile"
+        );
         assert!(
-            codex2
-                .as_ref()
-                .is_err_and(|e| e.contains("acp_input_governance=false")),
-            "{codex2:?}"
+            refuser.as_ref().is_err_and(|e| e.contains(
+                "has governance class none: its ACP adapter is not admitted to input governance \
+                 and its record refuses the OS-sandbox floor (governance_floor = false)"
+            )),
+            "{refuser:?}"
+        );
+        assert!(
+            http.as_ref()
+                .is_err_and(|e| e.contains("runs its ACP adapter over HTTP")),
+            "{http:?}"
+        );
+        assert!(
+            copilot.as_ref().is_err_and(|e| e.contains(
+                "seat 'copilot' has no ACP adapter, so the engine has no member session to open \
+                 for it — its governance class is os_sandbox and is not the blocker"
+            )),
+            "{copilot:?}"
         );
         assert!(none.is_err(), "{none:?}");
+        assert!(
+            !format!("{refuser:?}{http:?}{copilot:?}").contains("acp_input_governance=false"),
+            "the unadmitted-adapter refusal is gone"
+        );
     }
 }

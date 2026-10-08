@@ -1774,6 +1774,10 @@ impl WrappedCliStepRunner {
         // insert `--settings <file>`, and return the child env (decisions log + absolute store path).
         // `--settings` MERGES (the user's own settings stay intact) and lives OUTSIDE the worktree.
         // Non-claude CLIs + ungoverned internal calls (`governance: None`) are untouched.
+        // (IG1-core-2) Set when a governed unit runs on an `os_sandbox`-class seat: the floor's
+        // outcome at spawn decides `governed`; `floor_governed` is that outcome.
+        let mut floor_pending = false;
+        let mut floor_governed = false;
         let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
             (Some(gov), true) => {
                 // #653: an org `allowManagedHooksOnly` setting drops every `--settings` hook, so
@@ -1833,6 +1837,16 @@ impl WrappedCliStepRunner {
             // configured at all: the unit fails hard below with exactly that message, and
             // reporting "governed but unenforced" for it would be a false disclosure — nothing
             // ran, so nothing ran unchecked. An event whose `cli` is `""` also can't be acted on.
+            // (IG1-core-2) A seat of governance class `os_sandbox` is governed by the OS write
+            // boundary instead: whether that floor arms is only known at spawn (below), so its
+            // disclosure — or its ARMED marker — is decided there.
+            (Some(_), false)
+                if seat_governance_class(&cli_key)
+                    == wicked_council::GovernanceClass::OsSandboxFloor =>
+            {
+                floor_pending = true;
+                None
+            }
             (Some(_), false) => {
                 if let Some(cli) = argv.first() {
                     self.emit_event(crate::event::CoreEvent::GovernanceUnenforced {
@@ -1894,6 +1908,9 @@ impl WrappedCliStepRunner {
             // WRITE-containment sibling of `GovernanceUnenforced`) before proceeding unsandboxed.
             // This covers the no-launcher hosts (all of Windows), firejail-only Linux, and a
             // canonicalize failure. It NEVER fires when `os_sandbox` is OFF or the floor armed.
+            // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
+            // whether that was already disclosed — read by the `os_sandbox`-class arm below.
+            let floor: Result<&'static str, (String, bool)>;
             let sandbox = if os_sandbox {
                 let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
                 if let Some(reason) = &ws.downgrade_reason {
@@ -1907,19 +1924,87 @@ impl WrappedCliStepRunner {
                             reason: reason.clone(),
                         });
                     }
+                    floor = Err((reason.clone(), true));
                     None
                 } else {
+                    floor = Ok(crate::worker_sandbox::launcher_name_of(&ws.wrapper));
                     Some(ws)
                 }
             } else {
                 // core#548: with no strict per-seat profile, every worker in a run worktree
                 // still gets the repository boundary — its own tree writable, the clone and its
-                // sibling worktrees read-only at the OS (`worker_sandbox`). `None` (not a run
+                // sibling worktrees read-only at the OS (`worker_sandbox`). Not armed (not a run
                 // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
-                crate::worker_sandbox::default_worker_sandbox(&cwd, &worker_write_roots, &cli_key)
-                    .ok()
-                    .map(|armed| armed.sandbox)
+                match crate::worker_sandbox::default_worker_sandbox(
+                    &cwd,
+                    &worker_write_roots,
+                    &cli_key,
+                ) {
+                    Ok(armed) => {
+                        floor = Ok(armed.tool);
+                        Some(armed.sandbox)
+                    }
+                    // codex's own `--sandbox workspace-write|read-only` is its boundary; its class
+                    // is `os_sandbox` only while its trust flags carry that mode (IG1-core-1).
+                    Err(crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn) => {
+                        floor = Ok(crate::worker_sandbox::SEAT_CODEX_BOUNDARY);
+                        None
+                    }
+                    Err(why) => {
+                        floor = Err((why.describe().to_string(), false));
+                        None
+                    }
+                }
             };
+            // (IG1-core-2) A governed unit on an `os_sandbox`-class seat: the floor armed ⇒ the
+            // ARMED marker names the `os_sandbox` carrier, the write roots verbatim and the
+            // launcher, BEFORE the CLI runs, and the unit is governed; not armed ⇒ today's
+            // `governanceUnenforced` naming the real cause, plus `sandboxUnenforced`.
+            if floor_pending {
+                if let Some(cli) = argv.first() {
+                    let marker = floor.as_ref().map_err(|e| e.clone()).and_then(|tool| {
+                        crate::gate_hook::write_os_sandbox_marker(
+                            &crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+                            &crate::scope::unit_phase(input.unit.ord),
+                            &worker_write_roots,
+                            tool,
+                        )
+                        .map_err(|e| (format!("its ARMED marker could not be written: {e}"), true))
+                    });
+                    match marker {
+                        Ok(()) => floor_governed = true,
+                        Err((why, disclosed)) => {
+                            if !disclosed {
+                                self.emit_event(crate::event::CoreEvent::SandboxUnenforced {
+                                    session: input.run_id.clone(),
+                                    ord: input.unit.ord,
+                                    attempt: input.attempt,
+                                    cli: cli.clone(),
+                                    level: crate::validator::SandboxLevel::BestEffort
+                                        .as_wire()
+                                        .to_string(),
+                                    reason: why.clone(),
+                                });
+                            }
+                            let lever = no_lever_note
+                                .as_ref()
+                                .map(|n| format!("; {n}"))
+                                .unwrap_or_default();
+                            self.emit_event(crate::event::CoreEvent::GovernanceUnenforced {
+                                session: input.run_id.clone(),
+                                ord: input.unit.ord,
+                                attempt: input.attempt,
+                                cli: cli.clone(),
+                                reason: format!(
+                                    "unit is governed but '{cli}' has no input-governance adapter \
+                                     and its OS-sandbox governance floor did not arm ({why}); its \
+                                     tool calls are unchecked{lever}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
             // `build_worker_command` HARDENS at construction (FINDING-067): no estate tool the worker
             // spawns may inherit a store from the environment. Stripped UNCONDITIONALLY — governed or
             // not, set by us or exported by whoever started the daemon. `wicked-estate`,
@@ -2298,7 +2383,9 @@ impl WrappedCliStepRunner {
             // The wrapped-CLI runner is the ONLY authority on whether input governance was armed (it wrote
             // the armed marker). The fold trusts this, not unit properties, so a stub/test runner never
             // false-denies a claude-assigned unit for a marker it never wrote.
-            governed: gov_env.is_some(),
+            // (IG1-core-2) …or it armed the OS-sandbox floor for an `os_sandbox`-class seat and
+            // wrote that carrier's marker.
+            governed: gov_env.is_some() || floor_governed,
         }
     }
 }
@@ -2388,6 +2475,38 @@ pub(crate) fn build_worker_command(
 /// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
 /// Mirrors `resolve_invocation`'s two-step key lookup: exact key first, then the CLI key
 /// behind it (core#595), so `claude#2` inherits the `claude` registry record's flag.
+/// (IG1-core-2) The governance class of seat `cli_key`, off the merged registry record (the same
+/// two-step key lookup as [`worker_os_sandbox_enabled`]). A seat with no record runs its key as
+/// its binary with no trust flags, so it is classed from exactly that.
+pub(crate) fn seat_governance_class(cli_key: &str) -> wicked_council::GovernanceClass {
+    let user = wicked_council::registry::default_user_path();
+    let clis = wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin());
+    for key in [cli_key, wicked_apps_core::spawn::seat_cli_key(cli_key)] {
+        if let Some(cli) = clis.iter().find(|c| c.key == key) {
+            return wicked_council::governance_class(cli);
+        }
+    }
+    let unregistered = wicked_council::AgenticCli {
+        key: cli_key.to_string(),
+        display_name: cli_key.to_string(),
+        binary: cli_key.to_string(),
+        headless_invocation: String::new(),
+        category: Default::default(),
+        input_mode: Default::default(),
+        version_probe: Vec::new(),
+        trust_flags: Vec::new(),
+        alt_binaries: Vec::new(),
+        confidence: Default::default(),
+        enabled_for_council: true,
+        acp: None,
+        capabilities: None,
+        login_invocation: None,
+        health: None,
+    };
+    wicked_council::governance_class(&unregistered)
+}
+
 pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
     let user = wicked_council::registry::default_user_path();
     let clis = wicked_council::registry::load(user.as_deref())
@@ -5278,15 +5397,108 @@ mod tests {
             "names the binary, not the seat key"
         );
         assert_eq!(unenforced.2, 4);
+        // IG1-core-2: agy is of class `os_sandbox`; a scratch dir is not a run worktree, so the
+        // floor did not arm — the disclosure names that cause, and `sandboxUnenforced` rides it.
         assert!(
-            unenforced.1.contains("claude-only"),
+            unenforced
+                .1
+                .contains("its OS-sandbox governance floor did not arm (not_a_worktree"),
             "the reason must say WHY it could not be armed: {}",
             unenforced.1
         );
         // The unit still runs — this is a disclosure, not a fallback or a failure.
         assert_eq!(out.status, StepStatus::Ok);
         assert!(!out.governed, "and it is honestly reported as ungoverned");
+        assert!(
+            !crate::gate_hook::decisions_path_for("run-unenf", 0).exists(),
+            "no marker is written when the floor did not arm"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IG1-core-2: a governed unit on an `os_sandbox`-class seat in a linked run worktree arms the
+    /// repository boundary, writes the `os_sandbox` ARMED marker (roots verbatim, launcher named)
+    /// before the CLI runs, reports `governed: true`, and the fold passes it — no
+    /// `governanceUnenforced`. Skips (printed) where no launcher can arm.
+    #[cfg(unix)]
+    #[test]
+    fn a_governed_unit_on_a_floor_class_seat_in_a_worktree_is_governed_by_the_floor() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let (base, _clone, own, _sibling) =
+            crate::worker_sandbox::tests::clone_with_two_runs("ig1c2-wrapped");
+        if crate::worker_sandbox::default_worker_sandbox(&own, &[], "agy").is_err() {
+            eprintln!("execute_wrapped: no launcher can arm here — the IG1-core-2 proof skips");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let mut u = WorkUnit::pending("s:u2", "s", 2, "build the work");
+        u.assigned_cli = Some("agy".to_string());
+        u.assigned_invocation = Some("/bin/echo {PROMPT}".to_string());
+        let run_id = format!("run-ig1c2-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let input = StepInput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(own.clone()),
+            governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: base.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(out.governed, "the armed floor governs the unit");
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            !events.iter().any(|c| matches!(
+                c,
+                crate::command::Command::EmitEvent(
+                    crate::event::CoreEvent::GovernanceUnenforced { .. }
+                        | crate::event::CoreEvent::SandboxUnenforced { .. }
+                )
+            )),
+            "an armed floor discloses nothing"
+        );
+        let log = std::fs::read_to_string(crate::gate_hook::decisions_path_for(&run_id, 0))
+            .expect("the os_sandbox marker is written");
+        let marker: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(marker["_wicked_gov_armed"], "unit-2");
+        assert_eq!(marker["_wicked_gov_carrier"], "os_sandbox");
+        assert_eq!(
+            marker["_wicked_gov_roots"],
+            serde_json::json!([own.to_string_lossy()])
+        );
+        assert!(
+            ["sandbox-exec", "bwrap"].contains(&marker["_wicked_gov_boundary"].as_str().unwrap()),
+            "{marker}"
+        );
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        assert_eq!(
+            crate::gate_hook::fold_input_denial_with_activity(
+                &mut store, &run_id, 0, "unit-2", true, true
+            )
+            .unwrap(),
+            None,
+            "the fold accepts a governed, contained floor attempt"
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The converse, so the event cannot degrade into noise on every ungoverned internal call:
