@@ -4582,6 +4582,8 @@ mod tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         }
     }
@@ -5630,6 +5632,8 @@ mod triage_parse_tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         };
         let roster = vec![
