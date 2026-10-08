@@ -5165,6 +5165,22 @@ fn apply_step_result(
             output.status = crate::workflow::StepStatus::Failed;
         }
     }
+    // (core#769) IN-TOOL APPROVAL REFUSAL TRIPWIRE: an Ok agent step whose every command was
+    // refused by a host-forced approval policy (codex on a signed requirements bundle — the seat
+    // kept going and wrote prose saying so) did no work it could verify. It takes the failure
+    // path, where the appended line — the launcher's own frame, last — classifies as
+    // `approval_unavailable`: the seat is benched for the run and the unit fails over.
+    if unit.tool_cmd.is_none() && matches!(output.status, crate::workflow::StepStatus::Ok) {
+        if let Some(n) =
+            wicked_council::types::SeatFailureReason::in_tool_approval_refusals(&output.output)
+        {
+            output.status = crate::workflow::StepStatus::Failed;
+            output.output.push_str(&format!(
+                "\n(wicked-core: the seat ran no command — {n} exec_command failed: \
+                 approval request failed; core#769)"
+            ));
+        }
+    }
     if unit.status == crate::domain::UnitStatus::Done {
         return Ok(StepApplied::Stale);
     }
@@ -16542,6 +16558,95 @@ mod seat_failover_tests {
         let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
         let units = crate::domain::session_units(store, run_id).unwrap();
         (applied, session, units)
+    }
+
+    /// (core#769) A seat that "completes" a unit with every command refused by a host-forced
+    /// approval policy (codex's in-tool `Rejected("approval request failed")`, wicked-crew#856)
+    /// did no work: the Ok fold takes the failure path, the seat is BENCHED for the run
+    /// (`approval_unavailable`) and the unit fails over to the next seat — never Done on codex.
+    #[test]
+    fn an_ok_unit_whose_every_command_was_refused_benches_the_seat_and_fails_over() {
+        let run_id = format!("in-tool-refusal-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["codex", "claude"],
+            SessionStatus::Executing,
+            0,
+        );
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "build",
+            "codex",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+        let refused = "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"approval request failed\\\")\" }\n";
+        let transcript = format!(
+            "{}Every command was refused; I wrote the files with the patch tool instead.",
+            refused.repeat(5)
+        );
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        apply_step_result(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            StepOutput {
+                run_id: run_id.clone(),
+                unit_ix: 0,
+                attempt: 0,
+                output: transcript,
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: true,
+            },
+            None,
+            crate::workflow::UnitEvidence::default(),
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            session
+                .benched_seats
+                .iter()
+                .any(|b| b.cli == "codex" && b.source == "worker"),
+            "{:?}",
+            session.benched_seats
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_ne!(
+            units[0].status,
+            UnitStatus::Done,
+            "never Done on the refusing seat"
+        );
+        assert!(
+            units[0].worker_failed_clis.iter().any(|c| c == "codex"),
+            "{:?}",
+            units[0].worker_failed_clis
+        );
+        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            CoreEvent::SeatBenched { cli, .. } if cli == "codex"
+        )));
     }
 
     /// THE required behavior: failover walks the roster IN ORDER, never repeats a seat that
