@@ -395,6 +395,16 @@ pub enum CoreEvent {
         cache_creation_tokens: u64,
         cost_usd: Option<f64>,
     },
+    /// (core#412) An agent unit's seat reported NO usage for this attempt (its adapter carries no
+    /// token counts — today every seat but claude on the wrapped carrier, and any ACP adapter that
+    /// sends none). Emitted where [`CoreEvent::CliUsage`] would be, so a run's burn says which units
+    /// are UNREPORTED instead of reading them as $0. Additive.
+    CliUsageUnreported {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli: String,
+    },
     /// (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched (from `tool_use` file paths),
     /// emitted after the unit completes when ≥1 file was seen. Absent for seats that report no file access.
     DataUsed {
@@ -1611,6 +1621,18 @@ impl CoreEvent {
                 "cacheReadTokens": cache_read_tokens,
                 "cacheCreationTokens": cache_creation_tokens,
                 "costUsd": cost_usd,
+            }),
+            CoreEvent::CliUsageUnreported {
+                session,
+                ord,
+                attempt,
+                cli,
+            } => json!({
+                "type": "cliUsageUnreported",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched.
             CoreEvent::DataUsed {

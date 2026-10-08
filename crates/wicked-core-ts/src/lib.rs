@@ -3267,6 +3267,16 @@ mod tests {
             ],
         );
         check(
+            CoreEvent::CliUsageUnreported {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                cli: s(),
+            },
+            "cliUsageUnreported",
+            &["type", "session", "ord", "attempt", "cli"],
+        );
+        check(
             CoreEvent::DataUsed {
                 session: s(),
                 ord: 1,

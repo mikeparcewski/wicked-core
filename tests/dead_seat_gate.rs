@@ -363,6 +363,19 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
             .any(|e| matches!(e, CoreEvent::SessionCompleted { session } if session == sid)),
         "the stub runner answers on the provisional seat and the run completes: {post:?}"
     );
+    // core#412: the stub seat reports no usage, so its burn is disclosed UNREPORTED, not $0.
+    assert!(
+        post.iter().any(|e| matches!(e,
+            CoreEvent::CliUsageUnreported { session, ord: 1, attempt: 0, cli }
+                if session == sid && cli == "codex")),
+        "{post:?}"
+    );
+    assert!(
+        !post
+            .iter()
+            .any(|e| matches!(e, CoreEvent::CliUsage { session, .. } if session == sid)),
+        "no usage frame for a seat that reported none"
+    );
     let store = wicked_apps_core::open_store_ro(Some(&db)).expect("read-only store");
     let units = session_units(&store, sid).unwrap();
     assert_eq!(units[0].assigned_cli.as_deref(), Some("codex"));

@@ -5231,6 +5231,21 @@ fn apply_step_result(
             },
         );
     }
+    // (core#412) …and an agent unit whose seat reported nothing says so, rather than reading as $0.
+    if output.usage.is_none() && unit.tool_cmd.is_none() {
+        emit(
+            subscribers,
+            CoreEvent::CliUsageUnreported {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
+            },
+        );
+    }
     if !output.files.is_empty() {
         emit(
             subscribers,
