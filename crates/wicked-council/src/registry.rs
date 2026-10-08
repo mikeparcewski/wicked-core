@@ -73,6 +73,9 @@ struct TomlAcpConfig {
     acp_input_governance: Option<bool>,
     #[serde(default)]
     os_sandbox: Option<bool>,
+    /// (IG1-core-1) `false` refuses the OS-sandbox governance floor; absent = floor.
+    #[serde(default)]
+    governance_floor: Option<bool>,
 }
 
 impl From<TomlAcpConfig> for AcpConfig {
@@ -90,6 +93,8 @@ impl From<TomlAcpConfig> for AcpConfig {
             // same as it already loses `acp_input_governance: true` unless restated.
             acp_governance_env: None,
             verified_version: None,
+            // Already optional on the resolved record: `None` (omitted) is the floor.
+            governance_floor: t.governance_floor,
         }
     }
 }
@@ -155,6 +160,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
+                governance_floor: None,
             }),
             capabilities: Some(
                 "broad reasoning, architecture design, TypeScript/React/web, \
@@ -210,6 +216,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
+                governance_floor: None,
             }),
             capabilities: Some(
                 "fast iteration, multi-language code generation, open-source models, \
@@ -307,6 +314,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
+                governance_floor: None,
             }),
             capabilities: Some(
                 "algorithm implementation, Python/JavaScript code generation, \
@@ -381,6 +389,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
+                governance_floor: None,
             }),
             capabilities: Some(
                 "conversational reasoning, nuanced analysis, cross-language tasks, \
@@ -431,6 +440,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
+                governance_floor: None,
             }),
             capabilities: Some(
                 "GitHub context, pull request review, commit-level changes, \
@@ -494,6 +504,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask","task":"deny"}}"#.into(),
                 )),
                 verified_version: Some("1.17.18".into()),
+                governance_floor: None,
             }),
             capabilities: Some(
                 "open-source models, local/private code, broad language support, \
@@ -561,6 +572,12 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                     .acp
                     .as_ref()
                     .is_some_and(|acp| acp.os_sandbox.is_none());
+                // (IG1-core-1) The floor opt-out inherits like the two flags above: a same-binary
+                // override that omits it keeps the built-in's setting; a binary swap does not.
+                let omitted_governance_floor = tcli
+                    .acp
+                    .as_ref()
+                    .is_some_and(|acp| acp.governance_floor.is_none());
                 // (core#379) The override omits the WHOLE `[cli.acp]` block: the wholesale-replace
                 // rule (module doc) drops the built-in's ACP config, so the seat runs wrapped and
                 // ungoverned — silently, until now. Warn only; the rule itself is unchanged.
@@ -632,6 +649,17 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                             }
                         }
                     }
+                    if omitted_governance_floor {
+                        if let (Some(new_acp), Some(builtin_acp)) =
+                            (cli.acp.as_mut(), slot.acp.as_ref())
+                        {
+                            if builtin_acp.governance_floor.is_some()
+                                && new_acp.binary == builtin_acp.binary
+                            {
+                                new_acp.governance_floor = builtin_acp.governance_floor;
+                            }
+                        }
+                    }
                     *slot = cli;
                 } else {
                     merged.push(cli);
@@ -690,6 +718,148 @@ mod tests {
                 "only claude and opencode's pinned adapters have passed ACP input-governance proof"
             );
         }
+    }
+
+    #[test]
+    fn every_builtin_seat_has_its_governance_class() {
+        // IG1-core-1: the class table. claude/opencode are admitted to ACP input governance; every
+        // other built-in has no per-call permission adapter and sits on the OS-sandbox floor
+        // (codex through its own `--sandbox workspace-write`).
+        use crate::types::{governance_class, GovernanceClass};
+        let want = [
+            ("claude", GovernanceClass::AcpInputGovernance),
+            ("opencode", GovernanceClass::AcpInputGovernance),
+            ("codex", GovernanceClass::OsSandboxFloor),
+            ("pi", GovernanceClass::OsSandboxFloor),
+            ("copilot", GovernanceClass::OsSandboxFloor),
+            ("agy", GovernanceClass::OsSandboxFloor),
+        ];
+        let clis = builtin();
+        for (key, class) in want {
+            let cli = clis.iter().find(|c| c.key == key).expect(key);
+            assert_eq!(governance_class(cli), class, "{key}");
+        }
+        assert_eq!(GovernanceClass::OsSandboxFloor.as_wire(), "os_sandbox");
+        assert_eq!(
+            GovernanceClass::AcpInputGovernance.as_wire(),
+            "acp_input_governance"
+        );
+        assert_eq!(GovernanceClass::None.as_wire(), "none");
+    }
+
+    #[test]
+    fn codex_is_on_the_floor_only_while_its_own_sandbox_is_bounded() {
+        use crate::types::{governance_class, GovernanceClass};
+        let base = builtin().into_iter().find(|c| c.key == "codex").unwrap();
+        let with = |flags: &[&str]| {
+            let mut c = base.clone();
+            c.trust_flags = flags.iter().map(|f| f.to_string()).collect();
+            governance_class(&c)
+        };
+        assert_eq!(
+            with(&["--sandbox", "workspace-write"]),
+            GovernanceClass::OsSandboxFloor
+        );
+        assert_eq!(
+            with(&["--sandbox", "read-only"]),
+            GovernanceClass::OsSandboxFloor
+        );
+        assert_eq!(
+            with(&["--sandbox=workspace-write"]),
+            GovernanceClass::OsSandboxFloor
+        );
+        assert_eq!(with(&[]), GovernanceClass::None, "no recorded sandbox mode");
+        assert_eq!(
+            with(&["--dangerously-bypass-approvals-and-sandbox"]),
+            GovernanceClass::None
+        );
+        assert_eq!(
+            with(&[
+                "--sandbox",
+                "workspace-write",
+                "--dangerously-bypass-approvals-and-sandbox"
+            ]),
+            GovernanceClass::None,
+            "the bypass flag wins over a bounded mode"
+        );
+        assert_eq!(
+            with(&["--sandbox", "danger-full-access"]),
+            GovernanceClass::None
+        );
+    }
+
+    #[test]
+    fn a_toml_seat_with_governance_floor_false_has_no_class_and_omission_is_the_floor() {
+        use crate::types::{governance_class, GovernanceClass};
+        let dir = std::env::temp_dir().join(format!(
+            "wc-gov-floor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[cli]]
+key = "refuser"
+display_name = "Refuser"
+binary = "refuser"
+headless_invocation = "refuser {PROMPT}"
+
+[cli.acp]
+binary = "refuser-acp"
+governance_floor = false
+
+[[cli]]
+key = "floor"
+display_name = "Floor"
+binary = "floor"
+headless_invocation = "floor {PROMPT}"
+
+[cli.acp]
+binary = "floor-acp"
+
+[[cli]]
+key = "bare"
+display_name = "Bare"
+binary = "bare"
+headless_invocation = "bare {PROMPT}"
+
+[[cli]]
+key = "pi"
+display_name = "pi (override)"
+binary = "pi"
+headless_invocation = "pi -p {PROMPT}"
+
+[cli.acp]
+binary = "pi-acp"
+governance_floor = false
+"#,
+        )
+        .unwrap();
+        let clis = load(Some(&path)).unwrap();
+        let class = |k: &str| governance_class(clis.iter().find(|c| c.key == k).unwrap());
+        assert_eq!(class("refuser"), GovernanceClass::None);
+        assert_eq!(
+            clis.iter()
+                .find(|c| c.key == "refuser")
+                .and_then(|c| c.acp.as_ref())
+                .and_then(|a| a.governance_floor),
+            Some(false)
+        );
+        assert_eq!(class("floor"), GovernanceClass::OsSandboxFloor);
+        assert_eq!(class("bare"), GovernanceClass::OsSandboxFloor);
+        assert_eq!(
+            class("pi"),
+            GovernanceClass::None,
+            "an override opts pi out"
+        );
+        // The opt-out rides the wire only when set.
+        let floor = clis.iter().find(|c| c.key == "floor").unwrap();
+        let v = serde_json::to_value(floor).unwrap();
+        assert!(v["acp"].get("governance_floor").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

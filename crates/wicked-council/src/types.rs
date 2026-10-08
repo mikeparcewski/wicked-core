@@ -121,6 +121,97 @@ pub struct AcpConfig {
     /// gap this admission closed against one specific build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_version: Option<String>,
+    /// (IG1-core-1) The operator's explicit opt-out of the OS-sandbox governance floor for a seat
+    /// with no per-call permission adapter. `None` (the default, absent on the wire) and
+    /// `Some(true)` leave the seat in [`GovernanceClass::OsSandboxFloor`]; `Some(false)` refuses
+    /// the floor and the seat's class is [`GovernanceClass::None`]. Ignored for a seat admitted to
+    /// ACP input governance — its class is decided by `acp_input_governance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_floor: Option<bool>,
+}
+
+/// (IG1-core-1) How a seat's tool calls are governed — the admission class the engine records.
+///
+/// - `AcpInputGovernance`: the seat's ACP adapter routes every tool action through
+///   `session/request_permission`, so wicked-core's own gate answers each call
+///   ([`AcpConfig::acp_input_governance`]).
+/// - `OsSandboxFloor`: no per-call permission adapter, so the seat is governed by the OS write
+///   boundary the engine (or, for codex, the seat's own `--sandbox` mode) arms around the worker
+///   process tree. This is REPOSITORY containment — the clone, its `.git` and sibling worktrees —
+///   not a per-call gate and not a read or network jail.
+/// - `None`: the operator refused the floor (`governance_floor = false`), or the seat runs with its
+///   own sandbox switched off (codex without `--sandbox workspace-write|read-only`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceClass {
+    AcpInputGovernance,
+    OsSandboxFloor,
+    None,
+}
+
+impl GovernanceClass {
+    /// The wire spelling: `acp_input_governance` | `os_sandbox` | `none`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            GovernanceClass::AcpInputGovernance => "acp_input_governance",
+            GovernanceClass::OsSandboxFloor => "os_sandbox",
+            GovernanceClass::None => "none",
+        }
+    }
+}
+
+/// Whether `seat` is codex (by key, CLI binary, or a `codex:<n>` / `codex#<n>` instance key).
+fn is_codex_seat(seat: &AgenticCli) -> bool {
+    let base = |s: &str| -> bool {
+        let stem = std::path::Path::new(s)
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or(s)
+            .to_string();
+        stem == "codex" || stem.starts_with("codex:") || stem.starts_with("codex#")
+    };
+    base(&seat.key) || base(&seat.binary)
+}
+
+/// Whether codex's trust flags keep its OWN OS sandbox on in a bounded mode
+/// (`--sandbox workspace-write` | `--sandbox read-only`, or the `--sandbox=<mode>` spelling) and
+/// carry no bypass flag. `trust_flags = []` leaves codex on its default read-only sandbox but that
+/// is not the engine-recorded posture, so it is not accepted as the floor (IG1 Risk 3).
+fn codex_sandbox_is_bounded(trust_flags: &[String]) -> bool {
+    const BOUNDED: [&str; 2] = ["workspace-write", "read-only"];
+    if trust_flags
+        .iter()
+        .any(|f| f == "--dangerously-bypass-approvals-and-sandbox" || f == "--yolo")
+    {
+        return false;
+    }
+    trust_flags.iter().enumerate().any(|(i, f)| {
+        if let Some(mode) = f.strip_prefix("--sandbox=") {
+            return BOUNDED.contains(&mode);
+        }
+        (f == "--sandbox" || f == "-s")
+            && trust_flags
+                .get(i + 1)
+                .is_some_and(|m| BOUNDED.contains(&m.as_str()))
+    })
+}
+
+/// (IG1-core-1) The governance class of `seat` — derived from the seat record, never read from
+/// input. `AcpInputGovernance` when its ACP adapter is admitted; otherwise `OsSandboxFloor` unless
+/// the operator refused the floor (`[cli.acp] governance_floor = false`). Codex is on the floor only
+/// while its own sandbox is on in a bounded mode: its trust flags must carry
+/// `--sandbox workspace-write|read-only` and no bypass flag, else `None`.
+pub fn governance_class(seat: &AgenticCli) -> GovernanceClass {
+    if seat.acp.as_ref().is_some_and(|a| a.acp_input_governance) {
+        return GovernanceClass::AcpInputGovernance;
+    }
+    if seat.acp.as_ref().and_then(|a| a.governance_floor) == Some(false) {
+        return GovernanceClass::None;
+    }
+    if is_codex_seat(seat) && !codex_sandbox_is_bounded(&seat.trust_flags) {
+        return GovernanceClass::None;
+    }
+    GovernanceClass::OsSandboxFloor
 }
 
 /// How the scaffold prompt is delivered to the CLI process.

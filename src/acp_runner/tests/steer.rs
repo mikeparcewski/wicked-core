@@ -312,6 +312,7 @@ fn run_turn_waiting(
         os_sandbox: false,
         acp_governance_env: None,
         verified_version: None,
+        governance_floor: None,
     };
     let mut proc = {
         let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());

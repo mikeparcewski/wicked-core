@@ -2461,7 +2461,9 @@ fn start_acp_process_with_write_roots(
         // and its sibling worktrees read-only at the OS (`worker_sandbox`). `None` (a chat's
         // scratch root, a self-sandboxing seat such as codex-acp, no launcher) spawns as before.
         (
-            crate::worker_sandbox::default_worker_sandbox(cwd, &worker_write_roots, &config.binary),
+            crate::worker_sandbox::default_worker_sandbox(cwd, &worker_write_roots, &config.binary)
+                .ok()
+                .map(|armed| armed.sandbox),
             None,
         )
     };
@@ -9799,7 +9801,7 @@ sleep 30
         ]);
         let cwd = clone.join("wicked-worktrees").join("r1");
         let sibling_file = clone.join("wicked-worktrees").join("r2").join("pwned");
-        if crate::worker_sandbox::default_worker_sandbox(&cwd, &[], "claude-agent-acp").is_none() {
+        if crate::worker_sandbox::default_worker_sandbox(&cwd, &[], "claude-agent-acp").is_err() {
             eprintln!("acp_runner: no launcher can arm here — the #548 carrier proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;
@@ -9832,6 +9834,7 @@ sleep 30
                 sibling_file.to_string_lossy().into_owned(),
             )),
             verified_version: None,
+            governance_floor: None,
         };
         let proc = start_acp_process(&config, &cwd, None, Some(&cwd.join("tmp")))
             .expect("the boundary-wrapped ACP bridge completes its handshake");
@@ -9893,6 +9896,7 @@ sleep 30
                 outside_file.to_string_lossy().into_owned(),
             )),
             verified_version: None,
+            governance_floor: None,
         };
         let proc = match start_acp_process(&config, &cwd, None, Some(&cwd.join("tmp"))) {
             Ok(proc) => proc,
@@ -9966,6 +9970,7 @@ sleep 30
                 "governance-forcing-value".into(),
             )),
             verified_version: None,
+            governance_floor: None,
         };
 
         let proc =
@@ -10063,6 +10068,7 @@ sleep 30
                 "governance-forcing-value".into(),
             )),
             verified_version: None,
+            governance_floor: None,
         };
 
         let proc =
@@ -10326,6 +10332,7 @@ sleep 30
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
 
         // No pin at all: always verified, and nothing to disclose.
@@ -10340,6 +10347,7 @@ sleep 30
         // Matching pin: verified, and nothing to disclose.
         let matching = AcpConfig {
             verified_version: Some("1.17.18".into()),
+            governance_floor: None,
             ..base_config.clone()
         };
         let proc = start_acp_process(&matching, &dir, None, None).unwrap();
@@ -10353,6 +10361,7 @@ sleep 30
         // Mismatched pin: the spawn still succeeds, but governance is downgraded for this process.
         let mismatched = AcpConfig {
             verified_version: Some("1.18.21".into()),
+            governance_floor: None,
             ..base_config.clone()
         };
         let proc = start_acp_process(&mismatched, &dir, None, None).unwrap();
@@ -10379,6 +10388,7 @@ sleep 30
         // mismatch there is not an operator-facing drift — no noise.
         let ungoverned = AcpConfig {
             verified_version: Some("1.18.21".into()),
+            governance_floor: None,
             acp_input_governance: false,
             ..base_config
         };
@@ -10425,6 +10435,7 @@ sleep 30
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
 
         let handles: Vec<_> = (0..8)
@@ -10594,6 +10605,7 @@ sleep 30
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         }
     }
 
@@ -14399,6 +14411,7 @@ transport = "stdio"
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
         let err = scoped_seat_admission("pi", &scoped, &cfg).expect_err("refused");
         assert!(
@@ -14751,6 +14764,7 @@ transport = "stdio"
             os_sandbox: true,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
         let governed = AcpConfig {
             binary: "claude-agent-acp".into(),
@@ -16558,6 +16572,7 @@ No further next steps — both questions fully answered.";
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
         let admitted = AcpConfig {
             acp_input_governance: true,
@@ -17082,6 +17097,7 @@ No further next steps — both questions fully answered.";
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
         let mut evaluator = crate::domain::WorkUnit::pending("r:verify", "r", 4, "verify");
         evaluator.worktree_guarded = true;
@@ -18960,6 +18976,7 @@ else:
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         };
         // The spawn resolves WICKED_WORKER_HOME mid-call (`ensure_worker_config_home`), so hold
         // the env read-lock across the start (core#285): without it, a start landing inside a
@@ -22668,6 +22685,7 @@ while True:
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         }
     }
 

@@ -952,6 +952,7 @@ mod tests {
                 os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
+                governance_floor: None,
             }),
             capabilities: Some(format!("{key} capabilities")),
             login_invocation: None,
@@ -2613,6 +2614,7 @@ mod tests {
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
+            governance_floor: None,
         });
         c
     }
