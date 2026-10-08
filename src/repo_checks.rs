@@ -3177,12 +3177,22 @@ fn worker_start_files(signal: &str, worktree: &Path) -> Result<Vec<String>, ()> 
         } else {
             f
         };
-        if rel.split('/').any(|c| c == "..") || rel.contains(char::is_whitespace) {
+        if !rerun_file_ok(rel) {
             return Err(());
         }
         out.push(rel.to_string());
     }
     Ok(out)
+}
+
+/// (core#790) May a file name ride a load-class re-run's argv? Relative, inside the tree (no
+/// `..`), no whitespace, not option-shaped (a leading `-`), non-empty.
+fn rerun_file_ok(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.starts_with('-')
+        && !Path::new(rel).is_absolute()
+        && !rel.split('/').any(|c| c == "..")
+        && !rel.contains(char::is_whitespace)
 }
 
 /// The test file a vitest id names: `FAIL <file> > suite > name` or a file-level failure
@@ -3271,7 +3281,7 @@ fn rerun_load_class(
     };
     let mut files: Vec<String> = Vec::new();
     for id in &head_only {
-        let Some(f) = vitest_any_file_of(id) else {
+        let Some(f) = vitest_any_file_of(id).filter(|f| rerun_file_ok(f)) else {
             return false;
         };
         if !files.iter().any(|x| x == f) {
@@ -3339,9 +3349,11 @@ fn rerun_load_class(
 /// (core#789) ENVIRONMENT CRASH. Head and base both failed with no failure ids
 /// (`unclassified_red_base`) and BOTH outputs carry a `crash:` signal — the tool died opening a
 /// dependency file (`EPERM`/`EACCES` under `node_modules`; an endpoint scanner denying opens under
-/// load). The head check is re-run ONCE: a pass makes it `flaky_under_load` (the crash is named);
-/// the same crash again makes it `env_cannot_run` with the crash line on `env_cannot_run` — never
-/// denying, so the floor goes on to the remaining checks; any other outcome leaves it denying.
+/// load). Head and base must share the crash CLASS (the same errno — the file a scanner denies
+/// differs run to run). The head check is re-run ONCE: a pass makes it `flaky_under_load` (the
+/// crash is named); the same class again makes it `env_cannot_run` with the crash line on
+/// `env_cannot_run` — never denying, so the floor goes on to the remaining checks; any other
+/// outcome leaves it denying.
 /// Returns whether the re-run ran.
 fn rerun_env_crash(
     worktree: &Path,
@@ -3364,13 +3376,18 @@ fn rerun_env_crash(
         .as_deref()
         .and_then(|b| b.run.as_ref())
         .and_then(crash_of);
-    let (Some(head_crash), Some(_)) = (crash_of(run), base_crash) else {
+    let (Some(head_crash), Some(base_crash)) = (crash_of(run), base_crash) else {
         return false;
     };
+    let class = crash_class(&head_crash);
+    if class != crash_class(&base_crash) {
+        return false;
+    }
     let r = run_one(worktree, check, sandbox, scratch, Tree::Head);
     let again = (!r.passed() && r.failure_ids.is_empty() && !r.timed_out)
         .then(|| crash_of(&r))
-        .flatten();
+        .flatten()
+        .filter(|c| crash_class(c) == class);
     eprintln!(
         "wicked-core: repo checks floor — `{}` crashed on head and base ({head_crash}); re-run {}",
         check.name,
@@ -3391,6 +3408,15 @@ fn rerun_env_crash(
     }
     run.reruns.push(r);
     true
+}
+
+/// (core#789) The errno class of a `crash:` signal (`EPERM` / `EACCES`).
+fn crash_class(signal: &str) -> &'static str {
+    if signal.contains("EPERM: operation not permitted") {
+        "EPERM"
+    } else {
+        "EACCES"
+    }
 }
 
 /// Phrases a creator uses to wave a failure away, and the check-shaped words one of them must
@@ -7160,6 +7186,24 @@ mod tests {
         );
         assert_eq!(vitest_any_file_of("FAIL a.test.ts [ b.test.ts ]"), None);
         assert_eq!(vitest_any_file_of("FAIL TestX"), None);
+        assert!(rerun_file_ok("src/a.test.ts"));
+        for bad in [
+            "/abs/a.test.ts",
+            "../a.test.ts",
+            "--config=a.test.ts",
+            "a b.ts",
+            "",
+        ] {
+            assert!(!rerun_file_ok(bad), "{bad}");
+        }
+        assert_eq!(
+            crash_class("crash: Error: EPERM: operation not permitted, open 'x'"),
+            "EPERM"
+        );
+        assert_eq!(
+            crash_class("crash: Error: EACCES: permission denied, open 'x'"),
+            "EACCES"
+        );
 
         assert!(vitest_file_pass_line(
             "✓ a.test.ts (3 tests) 12ms",
