@@ -1361,7 +1361,12 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
             sq = true;
         } else if c == b'"' {
             dq = true;
-        } else if c == b'<' && b.get(i + 1) == Some(&b'<') && b.get(i + 2) != Some(&b'<') {
+        } else if c == b'<' && b.get(i + 1) == Some(&b'<') && b.get(i + 2) == Some(&b'<') {
+            // `<<<` is a here-string, not a heredoc: step over ALL of it, or its second and third
+            // `<` would read as a heredoc operator (codex round 2 on batch 3).
+            i += 3;
+            continue;
+        } else if c == b'<' && b.get(i + 1) == Some(&b'<') {
             operators += 1;
             let mut j = i + 2;
             let dash = b.get(j) == Some(&b'-');
@@ -5801,6 +5806,8 @@ mod tests {
             // (codex on batch 3) Two heredocs on one line: the first, unquoted, body is expanded
             // by the shell, so nothing up to the quoted one's delimiter may be blanked.
             "cat <<EOF <<'DATA'\n$(echo x > /etc/y)\nEOF\nliteral\nDATA",
+            // A here-string has no body: the next line is a command.
+            "cat <<<'EOF'\necho x > /etc/y\nEOF",
         ] {
             assert_eq!(strip_quoted_heredoc_bodies(kept), kept, "{kept}");
             assert!(
