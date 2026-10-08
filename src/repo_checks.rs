@@ -2745,7 +2745,7 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
 /// (core#781) The runner behind a package-manager script check — `npm test`, `npm run <s>`,
 /// `pnpm [run] <s>`, `yarn [run] <s>` — read from the worktree's `package.json`: the script as
 /// `npx --no-install <tokens…>` when it is ONE plain `vitest` command (its first token `vitest`,
-/// no shell operator, quote, substitution or variable), else `None` (a script the floor cannot
+/// no shell operator, quote, comment, glob, substitution or variable), else `None` (a script the floor cannot
 /// see through is not re-run, as before).
 fn script_runner_argv(worktree: &Path, argv: &[String]) -> Option<Vec<String>> {
     let pm = Path::new(argv.first()?).file_stem()?.to_str()?;
@@ -2761,7 +2761,7 @@ fn script_runner_argv(worktree: &Path, argv: &[String]) -> Option<Vec<String>> {
     let pkg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(worktree.join("package.json")).ok()?).ok()?;
     let body = pkg.get("scripts")?.get(script)?.as_str()?.trim();
-    if body.chars().any(|c| "&|;<>`$\"'(){}*?\\\n".contains(c)) {
+    if body.chars().any(|c| "&|;<>`$\"'(){}*?#~!\\\n".contains(c)) {
         return None;
     }
     let tokens: Vec<String> = body.split_whitespace().map(String::from).collect();
@@ -6137,7 +6137,7 @@ mod tests {
         assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "test"])), None);
         std::fs::write(
             dir.join("package.json"),
-            r#"{"scripts":{"test":"vitest run","ci":"vitest run --config vitest.ci.ts","both":"tsc && vitest run","lint":"eslint ."}}"#,
+            r#"{"scripts":{"test":"vitest run","ci":"vitest run --config vitest.ci.ts","both":"tsc && vitest run","commented":"vitest run # --config alt.ts","lint":"eslint ."}}"#,
         )
         .unwrap();
         let id = "FAIL tests/chordModifiers.test.ts > chords > a modifier";
@@ -6172,6 +6172,11 @@ mod tests {
             ]))
         );
         assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "both"])), None);
+        assert_eq!(
+            script_runner_argv(&dir, &s(&["npm", "run", "commented"])),
+            None,
+            "a comment must not turn into live flags on the re-run"
+        );
         assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "lint"])), None);
         assert_eq!(script_runner_argv(&dir, &s(&["cargo", "test"])), None);
         let _ = std::fs::remove_dir_all(&dir);

@@ -7325,6 +7325,8 @@ impl AcpStepRunner {
                         fallback_kind: fallback_kind::PROMPT_TOO_LONG.to_string(),
                     });
                     emit(&format!("{reason}\n"));
+                    // Nothing ran: the turn was refused before any tool call (as `auth_refusal`).
+                    let governed = false;
                     return StepOutput {
                         run_id: input.run_id.clone(),
                         unit_ix: input.unit_ix,
@@ -7338,7 +7340,7 @@ impl AcpStepRunner {
                         usage: None,
                         files: Vec::new(),
                         tools: Vec::new(),
-                        governed: false,
+                        governed,
                     };
                 }
                 let (reason, kind) = {
@@ -8147,7 +8149,8 @@ mod tests {
         assert!(!turn_prompt_too_long(&anyhow::anyhow!(
             "the bridge exited (code 1)"
         )));
-        // Both carriers clip each prior output within ONE shared budget: six 100 KiB outputs fit.
+        // Both carriers clip each prior output within ONE shared budget: six 100 KiB outputs fit,
+        // and so do twenty (no per-output floor lets the shares sum past it).
         let six: Vec<PriorUnitOutput> = (0..6)
             .map(|i| PriorUnitOutput {
                 label: format!("[unit {i}]"),
@@ -8161,6 +8164,13 @@ mod tests {
         assert!(
             total <= crate::execute_wrapped::PRIOR_CONTEXT_BUDGET + 6 * 200,
             "the prior context exceeds its budget: {total} bytes"
+        );
+        let twenty: usize = (0..20)
+            .map(|_| crate::execute_wrapped::clip_prior_output(&"z".repeat(64 * 1024), 20).len())
+            .sum();
+        assert!(
+            twenty <= crate::execute_wrapped::PRIOR_CONTEXT_BUDGET + 20 * 200,
+            "{twenty} bytes"
         );
         assert_eq!(
             crate::execute_wrapped::clip_prior_output("short", 6),

@@ -4391,17 +4391,16 @@ pub(crate) fn prior_context_prefix(prior_outputs: &[crate::workflow::PriorUnitOu
 /// (core#754) One prior output as BOTH carriers hand it: ONE budget for the whole context block,
 /// shared evenly, so a unit that depends on many long outputs (a demo's review after five phases)
 /// is not handed a first prompt over the model's context. Each output keeps its head and tail
-/// within its share — never more than the single-output review-target cap, never less than a
-/// floor that still shows a conclusion — with the elision marked.
+/// within its share — never more than the single-output review-target cap — with the elision
+/// marked. No per-output floor: the shares never sum past the budget (the wrapped carrier's prompt
+/// is ONE argv argument, `MAX_ARG_STRLEN` 128 KiB on Linux).
 pub(crate) fn clip_prior_output(output: &str, count: usize) -> String {
-    let share = (PRIOR_CONTEXT_BUDGET / count.max(1)).clamp(PRIOR_OUTPUT_FLOOR, 48 * 1024);
+    let share = (PRIOR_CONTEXT_BUDGET / count.max(1)).min(48 * 1024);
     crate::cli_runner::clip_head_tail(output.to_string(), share / 2, share - share / 2)
 }
 
 /// (core#754) The total bytes of prior unit output one prompt carries (~24k tokens).
 pub(crate) const PRIOR_CONTEXT_BUDGET: usize = 96 * 1024;
-/// (core#754) The least of each prior output a prompt keeps, however many there are.
-const PRIOR_OUTPUT_FLOOR: usize = 8 * 1024;
 
 pub(crate) fn unit_prompt(
     input: &StepInput,
