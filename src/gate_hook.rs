@@ -6283,6 +6283,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// core#552 item 2: the collector-mismatch guard pinned through the PRODUCTION fold
+    /// ([`fold_input_denial`]), not a re-implementation of it — a `git ls-files` witness re-checked
+    /// with `.git` unavailable (a raw walk) re-snapshots and admits; removing the fold-site guard
+    /// fails this test (the raw walk sees `.git-bak/**`, a "change"). A real write after the
+    /// re-snapshot still denies, so the fold does read the witness.
+    #[test]
+    fn the_fold_resnapshots_on_a_collector_mismatch_and_still_catches_a_write_552() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-collf-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if !git(&["init", "-q"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: git init failed");
+            return;
+        }
+        std::fs::write(base.join("tracked.rs"), "fn main() {}").unwrap();
+        let _ = git(&["add", "."]);
+        let _ = git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "i",
+        ]);
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("collfold-{}-{tid}", std::process::id());
+        let path = decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_file(&path);
+        append_decision(&path, &allow_claim("a1", "unit-1")).unwrap();
+        let sidecar = write_root_witness_path(&path.to_string_lossy(), "unit-1");
+        let mut entries = Vec::new();
+        assert_eq!(
+            collect_dir_entries_for_witness(&base, &mut entries),
+            CollectorKind::GitLsFiles
+        );
+        entries.sort_unstable();
+        write_write_root_witness(
+            &sidecar,
+            &WitnessSnapshot {
+                roots: vec![base.clone()],
+                collector: CollectorKind::GitLsFiles,
+                entries,
+            },
+        );
+        std::fs::rename(base.join(".git"), base.join(".git-bak")).unwrap();
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap(),
+            None,
+            "a collector change with no file changed is no denial"
+        );
+        assert_eq!(
+            read_write_root_witness(&sidecar).map(|w| w.collector),
+            Some(CollectorKind::RawWalk),
+            "the fold re-snapshotted under the raw walk"
+        );
+        std::fs::write(base.join("escaped.txt"), "x").unwrap();
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap();
+        assert!(
+            denial
+                .as_ref()
+                .is_some_and(|d| d.reason.contains("escaped.txt")),
+            "{denial:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// item 4 — `bash_cd_escape_targets` fires when the command contains a write-CAPABLE
     /// program even if `bash_write_targets` finds no resolvable target. Interpreter-literal
     /// code-string scanning is retired; a Creator-posture unit writing outside its tree through
