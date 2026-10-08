@@ -2052,7 +2052,8 @@ fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
 /// Replaces the old deny-all rule with a per-command ALLOWLIST:
 ///
 /// * **`wicked-estate` CLI** — the read-only subcommands [`ESTATE_READ_VERBS`] (`query`,
-///   `blast-radius`, `rank`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`) and
+///   `blast-radius`, `rank`/`hotspots`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`,
+///   `lineage`, `traverse`) and
 ///   `clusters` WITHOUT `--annotate` are ALLOWED; the write subcommands (`index`, `scip`,
 ///   `tfstate`, `import-telemetry`, `compact`, `watch`, `clusters --annotate`) and any
 ///   unrecognised subcommand are DENIED (fail-closed: a future read verb must be added here).
@@ -2314,16 +2315,21 @@ fn graph_store_cwd_bases(
 }
 
 /// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
-/// `clusters` joins them only WITHOUT `--annotate` (judged at the call site).
-const ESTATE_READ_VERBS: [&str; 8] = [
+/// `clusters` joins them only WITHOUT `--annotate` (judged at the call site). (core#729) `lineage`,
+/// `traverse` and the `rank` alias `hotspots` (estate#241/#242) are read-only too. THE list:
+/// garden's shim mirrors it (`wicked_core::ESTATE_READ_VERBS`), so a new read verb lands here first.
+pub const ESTATE_READ_VERBS: [&str; 11] = [
     "query",
     "blast-radius",
     "rank",
+    "hotspots",
     "stats",
     "source",
     "semantic",
     "cross-graph",
     "subscribe",
+    "lineage",
+    "traverse",
 ];
 /// The `wicked-estate` subcommands that WRITE the graph — named so the reason can say "write
 /// subcommand" rather than "unknown"; anything else unrecognised is denied fail-closed anyway.
@@ -8132,6 +8138,10 @@ mod boundary_tests {
             format!("wicked-estate semantic 'design pattern' --db {shared}"),
             format!("wicked-estate cross-graph --db {shared}"),
             format!("wicked-estate subscribe --db {shared}"),
+            // core#729: estate#241/#242's read verbs
+            format!("wicked-estate lineage src/lib.rs --db {shared}"),
+            format!("wicked-estate traverse 'fn:main' --depth 2 --db {shared}"),
+            format!("wicked-estate hotspots --db {shared}"),
             // clusters WITHOUT --annotate is read-only
             format!("wicked-estate clusters --json --db {shared}"),
             "wicked-estate.exe stats".to_string(),
