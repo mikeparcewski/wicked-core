@@ -712,4 +712,53 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// (IG1-core-3) The `sandboxPosture` prediction and each of its three failures: a seat off the
+    /// floor (class `none`), a run not bound to a linked worktree, and (host-dependent) a launcher
+    /// that does not arm; a bounded codex seat brings its own boundary.
+    #[test]
+    fn the_predicted_posture_names_which_of_the_three_failed() {
+        let seat = |key: &str, floor: Option<bool>, flags: &[&str]| {
+            let mut c = wicked_council::registry::builtin()
+                .into_iter()
+                .find(|c| c.key == key)
+                .expect("a built-in seat");
+            if let Some(acp) = c.acp.as_mut() {
+                acp.governance_floor = floor;
+                acp.os_sandbox = false;
+            }
+            c.trust_flags = flags.iter().map(|f| f.to_string()).collect();
+            c
+        };
+        let (base, _clone, own, _sibling) = clone_with_two_runs("posture");
+        let pi = seat("pi", None, &[]);
+        // 1. Off the floor.
+        assert_eq!(
+            predicted_posture(&seat("pi", Some(false), &[]), Some(&own)),
+            Err(PostureGap::NotOnTheFloor)
+        );
+        // 2. On the floor, not bound to a worktree (none, or a plain directory).
+        assert_eq!(
+            predicted_posture(&pi, None),
+            Err(PostureGap::Unarmed(FloorUnarmed::NotAWorktree))
+        );
+        assert_eq!(
+            predicted_posture(&pi, Some(&base)),
+            Err(PostureGap::Unarmed(FloorUnarmed::NotAWorktree))
+        );
+        // 3. Bound: the host's launcher decides.
+        assert_eq!(
+            predicted_posture(&pi, Some(&own)),
+            boundary_tool().map_err(PostureGap::Unarmed)
+        );
+        // A bounded codex seat brings its own sandbox.
+        assert_eq!(
+            predicted_posture(
+                &seat("codex", None, &["--sandbox", "workspace-write"]),
+                Some(&own)
+            ),
+            Ok(SEAT_CODEX_BOUNDARY)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

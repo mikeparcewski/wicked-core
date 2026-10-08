@@ -2061,3 +2061,52 @@ fn an_output_target_survives_the_fold_finding_of_and_the_finding_serde() {
     assert_eq!(ledger.findings.len(), 1);
     assert_eq!(ledger.findings[0].finding.target, FindingTarget::Output);
 }
+
+/// (IG1-core-3) `path.started.governance` and `member.joined.governance_class` are additive: an
+/// old row without them deserialises (empty / `None`) and re-serialises byte-identical; a new row
+/// carries and round-trips them.
+#[test]
+fn the_governance_wire_fields_round_trip_absent_and_present() {
+    let old = fixture(PATH_STARTED);
+    assert!(old.get("governance").is_none());
+    let ev = TeamEvent::from_payload(PATH_STARTED, &old).unwrap();
+    let TeamBody::PathStarted(b) = &ev.body else {
+        panic!()
+    };
+    assert!(b.governance.is_empty());
+    assert_eq!(ev.to_payload().unwrap(), old);
+    let mut new = old.clone();
+    new["governance"] = json!([
+        {"seat": "claude#1", "class": "acp_input_governance"},
+        {"seat": "pi", "class": "os_sandbox"}
+    ]);
+    let ev = TeamEvent::from_payload(PATH_STARTED, &new).unwrap();
+    let TeamBody::PathStarted(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!(
+        b.governance[1],
+        SeatGovernance {
+            seat: "pi".into(),
+            class: "os_sandbox".into()
+        }
+    );
+    assert_eq!(ev.to_payload().unwrap(), new);
+
+    let old = fixture(MEMBER_JOINED);
+    assert!(old.get("governance_class").is_none());
+    let ev = TeamEvent::from_payload(MEMBER_JOINED, &old).unwrap();
+    let TeamBody::MemberJoined(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!(b.governance_class, None);
+    assert_eq!(ev.to_payload().unwrap(), old);
+    let mut new = old.clone();
+    new["governance_class"] = json!("os_sandbox");
+    let ev = TeamEvent::from_payload(MEMBER_JOINED, &new).unwrap();
+    let TeamBody::MemberJoined(b) = &ev.body else {
+        panic!()
+    };
+    assert_eq!(b.governance_class.as_deref(), Some("os_sandbox"));
+    assert_eq!(ev.to_payload().unwrap(), new);
+}

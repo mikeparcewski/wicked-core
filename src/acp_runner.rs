@@ -23105,6 +23105,15 @@ headless_invocation = "copilot -p \"{PROMPT}\""
         let http = monitor_admission("httpseat").map(|(c, _, _)| c.binary);
         let copilot = monitor_admission("copilot").map(|(c, _, _)| c.binary);
         let none = monitor_admission("no-such-cli#2").map(|(c, _, _)| c.binary);
+        // (IG1-core-3) The class the wire states is the class admission acted on.
+        let classes: Vec<&str> = ["claude#2", "pi", "refuser", "copilot"]
+            .iter()
+            .map(|s| seat_governance_class(s).as_wire())
+            .collect();
+        let roster: Vec<(String, Option<String>)> = crate::registry_roster()
+            .into_iter()
+            .map(|c| (c.key, c.governance_class))
+            .collect();
         match prior {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
@@ -23140,6 +23149,23 @@ headless_invocation = "copilot -p \"{PROMPT}\""
             "{copilot:?}"
         );
         assert!(none.is_err(), "{none:?}");
+        assert_eq!(
+            classes,
+            ["acp_input_governance", "os_sandbox", "none", "os_sandbox"]
+        );
+        let class_of = |k: &str| {
+            roster
+                .iter()
+                .find(|(key, _)| key == k)
+                .and_then(|(_, c)| c.clone())
+        };
+        assert_eq!(class_of("pi").as_deref(), Some("os_sandbox"));
+        assert_eq!(class_of("refuser").as_deref(), Some("none"));
+        assert_eq!(class_of("claude").as_deref(), Some("acp_input_governance"));
+        assert!(
+            roster.iter().all(|(_, c)| c.is_some()),
+            "registry_roster derives a class for every seat: {roster:?}"
+        );
         assert!(
             !format!("{refuser:?}{http:?}{copilot:?}").contains("acp_input_governance=false"),
             "the unadmitted-adapter refusal is gone"
