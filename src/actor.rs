@@ -8560,11 +8560,7 @@ fn dispatch_unit(
                     label: label.clone(),
                     output,
                 },
-                crate::event::InjectedContext {
-                    ord: u.ord,
-                    label,
-                    output_bytes,
-                },
+                crate::event::InjectedContext::new(u.ord, label, output_bytes),
             ))
         })
         .unzip();
@@ -8589,11 +8585,11 @@ fn dispatch_unit(
         };
         if !output.is_empty() {
             let label = format!("[review — unit {e} — requested changes]");
-            context_items.push(crate::event::InjectedContext {
-                ord: e,
-                label: label.clone(),
+            context_items.push(crate::event::InjectedContext::new(
+                e,
+                label.clone(),
                 output_bytes,
-            });
+            ));
             prior_outputs.push(PriorUnitOutput { label, output });
         }
     }
@@ -8608,11 +8604,11 @@ fn dispatch_unit(
                 .and_then(crate::team::runner::render_for_gate)
             {
                 let label = format!("[team findings — unit {}]", creator.ord);
-                context_items.push(crate::event::InjectedContext {
-                    ord: creator.ord,
-                    label: label.clone(),
-                    output_bytes: text.len(),
-                });
+                context_items.push(crate::event::InjectedContext::new(
+                    creator.ord,
+                    label.clone(),
+                    text.len(),
+                ));
                 prior_outputs.push(PriorUnitOutput {
                     label,
                     output: text,
@@ -8630,11 +8626,11 @@ fn dispatch_unit(
                 &units,
                 unit,
             ) {
-                context_items.push(crate::event::InjectedContext {
+                context_items.push(crate::event::InjectedContext::new(
                     ord,
-                    label: label.clone(),
-                    output_bytes: output.len(),
-                });
+                    label.clone(),
+                    output.len(),
+                ));
                 prior_outputs.push(PriorUnitOutput { label, output });
             }
         }
@@ -8653,11 +8649,11 @@ fn dispatch_unit(
             .unwrap_or_else(|| format!("unit-{}", unit.ord));
         let label = format!("[team step — {step_id} by {member}]");
         let output = crate::domain::get_work_output(store, &unit.id).unwrap_or_default();
-        context_items.push(crate::event::InjectedContext {
-            ord: unit.ord,
-            label: label.clone(),
-            output_bytes: output.len(),
-        });
+        context_items.push(crate::event::InjectedContext::new(
+            unit.ord,
+            label.clone(),
+            output.len(),
+        ));
         prior_outputs.push(PriorUnitOutput {
             label,
             output: format!(
@@ -8674,6 +8670,14 @@ fn dispatch_unit(
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
     if !context_items.is_empty() {
+        // (core#554) Each item reports what the worker RECEIVES, after the carriers' shared clip
+        // (`clip_prior_output`, sized by the block count) — the items and the outputs are pushed
+        // in lockstep above, so they pair by index.
+        debug_assert_eq!(context_items.len(), prior_outputs.len());
+        let count = prior_outputs.len();
+        for (item, p) in context_items.iter_mut().zip(&prior_outputs) {
+            item.deliver(&p.output, count);
+        }
         emit(
             subscribers,
             CoreEvent::UnitContextInjected {
@@ -15228,6 +15232,119 @@ mod request_changes_tests {
             Some(expected_amendment.as_str()),
             "rework_amendment on the creator unit must be the full amendment"
         );
+    }
+
+    /// A [`StepRunner`] that records every dispatched input — the string handed to the seat is
+    /// read off it, not off the event (core#554 item 3).
+    struct CaptureRunner(Arc<std::sync::Mutex<Vec<StepInput>>>);
+    impl StepRunner for CaptureRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            self.0.lock().unwrap().push(i.clone());
+            NoopRunner.run_unit(i)
+        }
+    }
+
+    /// Request changes at the deliver gate of a seeded run with `note`, through the real
+    /// `confirm_gate`, returning the events and the input the creator's re-dispatch received.
+    fn rework_through_capture(run_id: &str, note: &str) -> (Vec<CoreEvent>, StepInput) {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, run_id);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner: Arc<dyn StepRunner> = Arc::new(CaptureRunner(seen.clone()));
+        let (tx, _rx) = channel::<Command>();
+        let mut in_flight = HashSet::new();
+        confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::RequestChanges {
+                note: Some(note.to_string()),
+            },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let input = loop {
+            if let Some(i) = seen.lock().unwrap().first().cloned() {
+                break i;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the creator was never re-dispatched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        (drain(&erx), input)
+    }
+
+    fn rework_item(evs: &[CoreEvent]) -> crate::event::InjectedContext {
+        evs.iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitContextInjected { prior_units, .. } => prior_units
+                    .iter()
+                    .find(|u| u.label.contains("requested changes"))
+                    .cloned(),
+                _ => None,
+            })
+            .expect("a requested-changes context item")
+    }
+
+    /// (core#554 items 2 + 3) The operator's note as the WORKER receives it: under the shared
+    /// prior-context budget it arrives verbatim in the wrapped carrier's prompt block and the
+    /// event says `deliveredBytes == outputBytes`, `clipped: false`; a note above the budget is
+    /// clipped by the carrier — and the event now SAYS so (`clipped: true`, `deliveredBytes` the
+    /// size the seat received) instead of reporting the pre-clip length alone.
+    #[test]
+    fn the_rework_note_is_pinned_as_delivered_and_a_clip_is_named_554() {
+        let note = "n".repeat(2400);
+        let (evs, input) =
+            rework_through_capture(&format!("rc-554a-{}", std::process::id()), &note);
+        let item = rework_item(&evs);
+        assert_eq!(
+            item.output_bytes,
+            note.len() + 1,
+            "amendment = \"\\n\" + note"
+        );
+        assert_eq!(item.delivered_bytes, item.output_bytes);
+        assert!(!item.clipped);
+        let block = crate::execute_wrapped::prior_context_prefix(&input.prior_outputs);
+        assert!(
+            block.contains(&format!("requested changes]\n\n{note}\n\n")),
+            "the note reaches the seat verbatim, whole, in its labelled block"
+        );
+
+        let big = "b".repeat(200 * 1024);
+        let (evs, input) = rework_through_capture(&format!("rc-554b-{}", std::process::id()), &big);
+        let item = rework_item(&evs);
+        assert_eq!(item.output_bytes, big.len() + 1);
+        assert!(
+            item.clipped,
+            "a note over the budget is clipped — and named"
+        );
+        assert!(item.delivered_bytes < item.output_bytes);
+        let delivered = input
+            .prior_outputs
+            .iter()
+            .find(|p| p.label.contains("requested changes"))
+            .map(|p| {
+                crate::execute_wrapped::clip_prior_output(&p.output, input.prior_outputs.len())
+            })
+            .expect("the note block was dispatched");
+        assert_eq!(
+            delivered.len(),
+            item.delivered_bytes,
+            "deliveredBytes is what the carrier hands the seat"
+        );
+        assert!(!crate::execute_wrapped::prior_context_prefix(&input.prior_outputs).contains(&big));
     }
 
     /// (core#549, acceptance 2) A 12 KB operator note arrives whole at the creator (no cap on the

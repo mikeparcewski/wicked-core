@@ -41,6 +41,35 @@ pub struct InjectedContext {
     pub label: String,
     /// Byte length of the injected output (for size debugging; not the content itself).
     pub output_bytes: usize,
+    /// (core#554) Byte length of the block AS THE WORKER RECEIVED IT — after the carriers' shared
+    /// prior-context clip ([`crate::execute_wrapped::clip_prior_output`]). Equal to
+    /// `output_bytes` unless [`clipped`](Self::clipped).
+    pub delivered_bytes: usize,
+    /// (core#554) The block was clipped (head + tail kept, elision marked) before the worker saw
+    /// it — an operator note on a rework can be one of them, so a client comparing the amend
+    /// length against `outputBytes` alone would miss the truncation.
+    pub clipped: bool,
+}
+
+impl InjectedContext {
+    /// An item whose delivered size is not yet known — [`Self::deliver`] sets it once the whole
+    /// block's count (which sizes each share) is.
+    pub fn new(ord: u32, label: String, output_bytes: usize) -> Self {
+        Self {
+            ord,
+            label,
+            output_bytes,
+            delivered_bytes: output_bytes,
+            clipped: false,
+        }
+    }
+
+    /// (core#554) Record what the worker receives of `output`, one of `count` prior blocks.
+    pub fn deliver(&mut self, output: &str, count: usize) {
+        let delivered = crate::execute_wrapped::clip_prior_output(output, count);
+        self.clipped = delivered != output;
+        self.delivered_bytes = delivered.len();
+    }
 }
 
 /// (core#468) The BASE skill directive a dispatch carries — the run's role-keyed discipline
@@ -1953,6 +1982,8 @@ impl CoreEvent {
                     "ord": c.ord,
                     "label": c.label,
                     "outputBytes": c.output_bytes,
+                    "deliveredBytes": c.delivered_bytes,
+                    "clipped": c.clipped,
                 })).collect::<Vec<_>>(),
             }),
             // ── P2 governance-deep wave (EVT-008, EVT-009, EVT-010, EVT-011, EVT-016) ──────────

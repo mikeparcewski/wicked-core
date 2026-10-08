@@ -3623,11 +3623,7 @@ mod tests {
                 session: s(),
                 ord: 2,
                 recipient_cli: s(),
-                prior_units: vec![wicked_core::InjectedContext {
-                    ord: 1,
-                    label: s(),
-                    output_bytes: 42,
-                }],
+                prior_units: vec![wicked_core::InjectedContext::new(1, s(), 42)],
             },
             "unitContextInjected",
             &["type", "session", "ord", "recipientCli", "priorUnits"],
