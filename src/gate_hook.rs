@@ -1336,12 +1336,15 @@ fn strip_quoted_heredoc_bodies(command: &str) -> String {
     out.join("\n")
 }
 
-/// The delimiter (and `<<-` flag) of the LAST quoted-delimiter heredoc operator on `line` that
-/// sits outside quotes, or `None`.
+/// The delimiter (and `<<-` flag) of the quoted-delimiter heredoc operator on `line` that sits
+/// outside quotes, or `None`. FAIL-CLOSED on a line with more than one heredoc operator: the
+/// bodies follow one another (`cat <<EOF <<'DATA'` — the first, unquoted, body is EXPANDED by the
+/// shell), and blanking up to the last delimiter would hide the expanded one, so none is stripped.
 fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
     let b = line.as_bytes();
     let (mut i, mut sq, mut dq) = (0usize, false, false);
     let mut found = None;
+    let mut operators = 0usize;
     while i < b.len() {
         let c = b[i];
         if sq {
@@ -1359,6 +1362,7 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
         } else if c == b'"' {
             dq = true;
         } else if c == b'<' && b.get(i + 1) == Some(&b'<') && b.get(i + 2) != Some(&b'<') {
+            operators += 1;
             let mut j = i + 2;
             let dash = b.get(j) == Some(&b'-');
             if dash {
@@ -1394,7 +1398,7 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
         }
         i += 1;
     }
-    found
+    found.filter(|_| operators == 1)
 }
 
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
@@ -5794,6 +5798,9 @@ mod tests {
             "cat <<'EOF' | sh\necho x > /etc/y\nEOF",
             "cat > f <<EOF\n$(echo x > /etc/y)\nEOF",
             "echo \"<<'EOF'\"\necho x > /etc/y\nEOF",
+            // (codex on batch 3) Two heredocs on one line: the first, unquoted, body is expanded
+            // by the shell, so nothing up to the quoted one's delimiter may be blanked.
+            "cat <<EOF <<'DATA'\n$(echo x > /etc/y)\nEOF\nliteral\nDATA",
         ] {
             assert_eq!(strip_quoted_heredoc_bodies(kept), kept, "{kept}");
             assert!(
