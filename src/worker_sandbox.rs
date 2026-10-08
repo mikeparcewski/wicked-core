@@ -310,7 +310,7 @@ impl FloorUnarmed {
     }
 
     /// The reason's wire spelling, for a disclosure.
-    #[cfg_attr(not(test), allow(dead_code))] // IG1-core-3 states it on the wire
+    #[cfg_attr(not(test), allow(dead_code))] // `describe` leads with it on every disclosure
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             FloorUnarmed::NotAWorktree => "not_a_worktree",
@@ -368,6 +368,47 @@ fn boundary_launcher() -> Result<&'static PathBuf, FloorUnarmed> {
     })
     .as_ref()
     .map_err(|e| *e)
+}
+
+/// (IG1-core-3) The launcher this host arms the repository boundary with, by name, or why none
+/// arms (`no_launcher` | `cannot_arm`) — the probe [`default_worker_sandbox`] uses, cached.
+pub(crate) fn boundary_tool() -> Result<&'static str, FloorUnarmed> {
+    boundary_launcher().map(|t| launcher_name(t))
+}
+
+/// (IG1-core-3) The write containment a seat is PREDICTED to run under at distribution — the
+/// `sandboxPosture` decision. `Ok(boundary)` (`"sandbox-exec"` | `"bwrap"` | `"seat:codex"`) when
+/// the seat sits on the OS-sandbox floor (governance class `os_sandbox`, or `acp.os_sandbox: true`)
+/// AND the run is bound to a linked run worktree AND this host's launcher arms (a self-sandboxing
+/// codex seat brings its own); else which of the three failed. The arm site's marker is the fact;
+/// this predicts it.
+pub(crate) fn predicted_posture(
+    seat: &wicked_council::AgenticCli,
+    workdir: Option<&Path>,
+) -> Result<&'static str, PostureGap> {
+    let floor = wicked_council::governance_class(seat)
+        == wicked_council::GovernanceClass::OsSandboxFloor
+        || seat.acp.as_ref().is_some_and(|a| a.os_sandbox);
+    if !floor {
+        return Err(PostureGap::NotOnTheFloor);
+    }
+    if workdir.and_then(|w| repo_boundary(w, &[])).is_none() {
+        return Err(PostureGap::Unarmed(FloorUnarmed::NotAWorktree));
+    }
+    if seat_arms_its_own_os_sandbox(&seat.key) || seat_arms_its_own_os_sandbox(&seat.binary) {
+        return Ok(SEAT_CODEX_BOUNDARY);
+    }
+    boundary_tool().map_err(PostureGap::Unarmed)
+}
+
+/// (IG1-core-3) Why [`predicted_posture`] is `advisory`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostureGap {
+    /// The seat's governance class is not `os_sandbox` and its record sets no `os_sandbox`.
+    NotOnTheFloor,
+    /// On the floor, but it will not arm: no run worktree, no launcher, or a launcher that
+    /// cannot arm here.
+    Unarmed(FloorUnarmed),
 }
 
 /// The short name of a launcher path: `"sandbox-exec"` or `"bwrap"`.

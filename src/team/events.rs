@@ -636,6 +636,19 @@ pub struct PathStarted {
     pub workflow: Option<String>,
     /// The launch carried a user-composed plan.
     pub plan: bool,
+    /// (IG1-core-3) Each roster seat's governance class, in roster order — how the engine holds
+    /// that seat's writes (`acp_input_governance` | `os_sandbox` | `none`). Derived at emit from the
+    /// seat records; an older row without it deserialises as empty.
+    #[serde(default)]
+    pub governance: Vec<SeatGovernance>,
+}
+
+/// (IG1-core-3) One roster seat's governance class on `path.started.governance`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeatGovernance {
+    pub seat: String,
+    /// `acp_input_governance` | `os_sandbox` | `none`.
+    pub class: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -802,6 +815,11 @@ pub struct MemberJoined {
     pub status: AttachStatus,
     pub reason: String,
     pub error: Option<String>,
+    /// (IG1-core-3) The seat's governance class (`acp_input_governance` | `os_sandbox` | `none`),
+    /// how its read-only boundary holds; `null` when no seat was named. Older rows deserialise
+    /// without it.
+    #[serde(default)]
+    pub governance_class: Option<String>,
 }
 
 /// 8 — `member.left` (S).

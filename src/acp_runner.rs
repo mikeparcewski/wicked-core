@@ -8788,6 +8788,18 @@ impl StepRunner for AcpStepRunner {
 /// NOT `registry_roster()`: that filters to `enabled_for_council` seats (a seat disabled
 /// for voting can still execute units over ACP) and swallows load errors. A malformed
 /// overlay falls back to built-ins instead of stripping every ACP config.
+/// (IG1-core-3) The governance class of seat instance `seat` as the engine judges it — the merged
+/// registry record's ([`registry_record`], an instance reading its cli's record), the class
+/// `monitor_admission` and the arm sites act on. An unregistered key is judged as a bare record
+/// (no ACP adapter, not codex): `os_sandbox`, the same default `monitor_admission` names. Stated on
+/// `path.started.governance` and `member.joined.governance_class`; never read back from input.
+pub(crate) fn seat_governance_class(seat: &str) -> wicked_council::GovernanceClass {
+    registry_record(seat)
+        .as_ref()
+        .map(wicked_council::governance_class)
+        .unwrap_or(wicked_council::GovernanceClass::OsSandboxFloor)
+}
+
 fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
     let user = wicked_council::registry::default_user_path();
     let clis = wicked_council::registry::load(user.as_deref())

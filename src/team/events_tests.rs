@@ -790,6 +790,7 @@ impl Stream {
                 status: tok("attached"),
                 reason: "team plan monitors=1".into(),
                 error: None,
+                governance_class: None,
             }),
         )
     }

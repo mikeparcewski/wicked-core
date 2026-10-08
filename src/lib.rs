@@ -364,6 +364,8 @@ pub fn registry_roster() -> Vec<AgenticCli> {
             if c.login_invocation.is_none() {
                 c.login_invocation = wicked_council::types::default_login_invocation(&c.key);
             }
+            // (IG1-core-3) The seat's governance class, derived per call from its record.
+            c.governance_class = Some(wicked_council::governance_class(&c).as_wire().to_string());
             c
         })
         .collect()
@@ -2013,6 +2015,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         };
         let dir =
@@ -2124,6 +2127,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         };
 
@@ -2254,6 +2258,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         };
         struct NoRun;

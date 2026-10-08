@@ -113,6 +113,7 @@ fn cli(key: &str) -> AgenticCli {
         acp: None,
         capabilities: None,
         login_invocation: None,
+        governance_class: None,
         health: None,
     }
 }

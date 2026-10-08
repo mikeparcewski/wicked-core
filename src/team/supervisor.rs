@@ -508,6 +508,12 @@ impl UnitTeam {
                 },
                 reason,
                 error,
+                // (IG1-core-3) How the member's read-only boundary holds, from its record.
+                governance_class: seat.map(|s| {
+                    crate::acp_runner::seat_governance_class(s)
+                        .as_wire()
+                        .to_string()
+                }),
             }),
         };
         self.publish(&ev);

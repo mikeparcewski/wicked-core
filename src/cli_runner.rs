@@ -2954,6 +2954,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         }
     }
@@ -4639,6 +4640,7 @@ mod judge_routing_tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         }
     }
