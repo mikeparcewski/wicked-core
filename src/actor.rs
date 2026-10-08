@@ -8259,20 +8259,6 @@ fn filter_triage_decision(
     }
 }
 
-/// The deliver gate's consent prompt (N3, ship re-proof). The deliver unit's description is
-/// `deliver — <intent>` plus, after [`crate::plan::INSTRUCTION_SEP`], the gate-card text the
-/// workflow's author wrote for the phase (crew's `deliverGateInstructions`: what the push will do
-/// on THIS origin, and under which identity).
-///
-/// It used to print the description verbatim — the raw ` ||| ` separator included — and then
-/// promise "pushes branch … and opens a pull request on <repo>" unconditionally, so on a non-GitHub
-/// origin the one prompt said both "no pull request can be opened" and "opens a pull request", with
-/// the true sentence buried behind the intent. Now:
-///  - the author's card LEADS, right after the ask, so the first visible line states what will
-///    actually happen;
-///  - the engine's own sentence states only what the engine knows — it commits and pushes the
-///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
-///  - no separator is ever rendered: the intent follows as plain prose.
 /// (core#686) The deliver gate's consent prompt read from the unit's FIELDS: the card is
 /// [`WorkUnit::instructions`](crate::domain::WorkUnit::instructions), the amendments
 /// [`WorkUnit::amendments`](crate::domain::WorkUnit::amendments), and the intent head is the
@@ -8326,6 +8312,21 @@ fn structured_deliver_parts(
     ))
 }
 
+/// The deliver gate's consent prompt (N3, ship re-proof). The deliver unit's description is
+/// `deliver — <intent>` plus, after [`crate::plan::INSTRUCTION_SEP`], the gate-card text the
+/// workflow's author wrote for the phase (crew's `deliverGateInstructions`: what the push will do
+/// on THIS origin, and under which identity).
+///
+/// It used to print the description verbatim — the raw ` ||| ` separator included — and then
+/// promise "pushes branch … and opens a pull request on <repo>" unconditionally, so on a non-GitHub
+/// origin the one prompt said both "no pull request can be opened" and "opens a pull request", with
+/// the true sentence buried behind the intent. Now:
+///  - the author's card LEADS, right after the ask, so the first visible line states what will
+///    actually happen;
+///  - the engine's own sentence states only what the engine knows — it commits and pushes the
+///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
+///  - no separator is ever rendered: the intent follows as plain prose.
+///
 /// The legacy reader: the deliver card and amendments RE-PARSED from a flat description (records
 /// planned before core#686). See [`deliver_gate_prompt_for`].
 fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) -> String {
