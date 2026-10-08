@@ -2792,6 +2792,9 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
 /// the classification stands.
 fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String)> {
     if let Some(file) = vitest_file_of(id) {
+        if !rerun_file_ok(file) {
+            return None;
+        }
         return vitest_file_rerun_argv(argv, file).map(|a| (a, id.to_string()));
     }
     let (name, target) = libtest_parts(id)?;
@@ -6775,6 +6778,11 @@ mod tests {
             isolated_rerun_argv(&s(&["npm", "run", "test"]), "FAIL tests/x.test.ts > a").is_none()
         );
         assert!(isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "FAIL TestX").is_none());
+        assert!(
+            isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "FAIL --config=x.test.ts > a")
+                .is_none(),
+            "an option-shaped file never rides the re-run"
+        );
         assert!(isolated_rerun_argv(
             &s(&["npx", "vitest", "run"]),
             "FAIL tests/x.test.ts [ tests/x.test.ts ]"
