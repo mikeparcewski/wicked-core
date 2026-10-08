@@ -122,7 +122,17 @@ pub fn pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::Valu
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
-    let command = get("command");
+    // #708: the command a shell tool runs, normalised ONCE so every trigger reads one string. A
+    // string `command` (claude's `Bash`, pi's `bash`) is taken as before, byte-identical; otherwise
+    // the same keys and the same ARGV-ARRAY spelling `acp_permission::execute_command` reads
+    // (codex's `shell` sends `command: ["bash", "-lc", "git push"]`) — an argv element holding
+    // whitespace or a quote is re-quoted, so the `-c` script stays the one token the shell got.
+    // The fallback reads only a SHELL tool's input: every other tool's context is unchanged.
+    let command = get("command").or_else(|| {
+        is_shell_tool(&tool)
+            .then(|| normalized_command(&input))
+            .flatten()
+    });
     let path = get("file_path")
         .or_else(|| get("path"))
         .or_else(|| get("notebook_path"));
@@ -145,6 +155,78 @@ pub fn pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::Valu
         "work": work,
     });
     (context, tool)
+}
+
+/// The keys a seat's shell tool spells its command under, in the order they are read (#708; the
+/// same list `wicked-core`'s `acp_permission::execute_command` reads, minus the ambiguous `args`).
+const COMMAND_KEYS: [&str; 6] = [
+    "command",
+    "cmd",
+    "commandLine",
+    "command_line",
+    "script",
+    "argv",
+];
+
+/// The shell tools whose input carries a command (#708; `acp_permission::EXECUTE_TOOL_NAMES` plus
+/// an MCP `*__bash`), compared case-insensitively.
+const SHELL_TOOL_NAMES: [&str; 14] = [
+    "bash",
+    "shell",
+    "sh",
+    "execute",
+    "exec",
+    "exec_command",
+    "execute_command",
+    "run_command",
+    "run_shell_command",
+    "run_terminal_cmd",
+    "shell_command",
+    "terminal",
+    "command",
+    "powershell",
+];
+
+fn is_shell_tool(tool: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    SHELL_TOOL_NAMES.contains(&t.as_str()) || t.ends_with("__bash")
+}
+
+/// A tool input's command when it is not a plain `command` string: the first of
+/// [`COMMAND_KEYS`] holding a non-blank string, or an argv array joined with shell quoting.
+fn normalized_command(input: &serde_json::Value) -> Option<String> {
+    let shell_quote = |s: &str| -> String {
+        if s.is_empty()
+            || s.chars()
+                .any(|c| c.is_whitespace() || c == '\'' || c == '"')
+        {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        } else {
+            s.to_string()
+        }
+    };
+    let text_of = |v: &serde_json::Value| -> Option<String> {
+        match v {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Array(a) => {
+                // A non-string element is kept as its JSON text, never dropped: a silently shorter
+                // argv would misstate what runs.
+                let joined = a
+                    .iter()
+                    .map(|e| match e {
+                        serde_json::Value::String(s) => shell_quote(s),
+                        other => shell_quote(&other.to_string()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!joined.trim().is_empty()).then_some(joined)
+            }
+            _ => None,
+        }
+    };
+    COMMAND_KEYS
+        .iter()
+        .find_map(|k| input.get(*k).and_then(text_of))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1110,6 +1192,68 @@ mod tests {
     use crate::engine::register_policy;
     use crate::fanout::rationale_chunk;
     use wicked_apps_core::open_store;
+
+    /// #708: a string `command` is taken as before (byte-identical context); otherwise the
+    /// command is read once from the other keys or an argv array, shell-quoted.
+    #[test]
+    fn pretool_context_normalises_the_command_once() {
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"Bash","tool_input":{"command":"git push -f"}}"#,
+            "s",
+            "build",
+        );
+        assert_eq!(ctx["command"], "git push -f");
+        assert_eq!(ctx["work"], "git push -f");
+        // A string command is taken verbatim: no trimming, no quoting, escapes as parsed.
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"Bash","tool_input":{"command":"  printf 'x y'\ngit status  "}}"#,
+            "s",
+            "build",
+        );
+        assert_eq!(ctx["command"], "  printf 'x y'\ngit status  ");
+        // A non-string argv element is kept, never dropped.
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"exec","tool_input":{"argv":["sleep",5]}}"#,
+            "s",
+            "build",
+        );
+        assert_eq!(ctx["command"], "sleep 5");
+        // A NON-shell tool's other keys are not read: its context is unchanged.
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","new_string":"y","cmd":"x"}}"#,
+            "s",
+            "build",
+        );
+        assert!(ctx["command"].is_null());
+        assert_eq!(ctx["work"], "y");
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"shell","tool_input":{"command":["bash","-lc","git push --force"]}}"#,
+            "s",
+            "build",
+        );
+        assert_eq!(ctx["command"], "bash -lc 'git push --force'");
+        assert_eq!(ctx["work"], "bash -lc 'git push --force'");
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"run_command","tool_input":{"cmd":"sudo ls"}}"#,
+            "s",
+            "build",
+        );
+        assert_eq!(ctx["command"], "sudo ls");
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"exec","tool_input":{"argv":["rm","it's here"]}}"#,
+            "s",
+            "build",
+        );
+        assert_eq!(ctx["command"], r#"rm 'it'\''s here'"#);
+        // A tool with none of the keys keeps a null command and its old `work`.
+        let (ctx, _) = pretool_context(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.md","content":"x"}}"#,
+            "s",
+            "build",
+        );
+        assert!(ctx["command"].is_null());
+        assert_eq!(ctx["work"], "x");
+    }
 
     fn deny_policy(id: &str, applies: &[&str], contains: Option<&str>) -> Policy {
         Policy {

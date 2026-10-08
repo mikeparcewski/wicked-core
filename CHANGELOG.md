@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **#708 — the `OPS-WATCH-*` warn rules see the spellings they missed.** (1) `pretool_context`
+  (wicked-governance, the one projection the input hook and `rules eval` share) normalises the
+  evaluated `command` once: a string `command` as before (byte-identical), else the first of `cmd`,
+  `commandLine`, `command_line`, `script`, `argv`, with an ARGV ARRAY (codex's `shell`:
+  `["bash","-lc","git push --force"]`) joined with shell quoting, the same reading
+  `acp_permission::execute_command` already does, read only for a shell tool (every other tool's context is unchanged; a non-string argv element is kept as its JSON text). The rules' shell-tool anchor gains `sh`,
+  `command`, `execute_command`, `run_command`, `shell_command`, `powershell` and MCP `*__bash`.
+  (2) `OPS-WATCH-001` matches `rm -r -f`, `-f -r`, `--recursive --force`, `-rfv`, `-Rf`, interleaved
+  flags and `--`. (3) Every rule's command word also matches after an encoded newline
+  (`printf x\ngit push --force`), not just 001/004. Still `effect: warn`, never blocking; a
+  non-shell tool fires nothing. The tool-name selection token (#707) and the labelled-set re-measure
+  are not in this change (the set's lane directory is gone).
+
 - **core#753 (engine half) — a `walkthrough_plan` unit is told where its storyline goes.** The
   unit was handed only `walkthrough_plan — <problem>` and the evaluator's no-worktree-writes
   discipline, wrote no storyline, and its pinned lint denied on every live run. `unit_prompt`
