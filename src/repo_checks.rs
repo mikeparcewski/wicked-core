@@ -258,6 +258,14 @@ pub const MAX_FLAKE_RERUN: usize = 2;
 /// e.g. node:test without a TAP-aware parser). Cannot determine if pre-existing or a regression —
 /// fail-closed: always denies (#538).
 pub const UNCLASSIFIED_RED_BASE: &str = "unclassified_red_base";
+/// (core#789/#790) The most environment signals ([`CheckRun::env_signals`]) one check records;
+/// a scan that hit the cap is marked [`SIGNALS_TRUNCATED`] and the re-run rules that COUNT
+/// signals do not apply (fail-closed).
+pub const MAX_ENV_SIGNALS: usize = 200;
+/// The marker a capped signal list ends with.
+pub const SIGNALS_TRUNCATED: &str = "truncated";
+/// (core#790) The most test files a load-class re-run runs (in one serial invocation).
+pub const MAX_LOAD_RERUN_FILES: usize = 100;
 
 /// Claim verdicts on the wire (`ClaimCheck::verdict`).
 pub const CLAIM_REJECTED: &str = "claim_rejected";
@@ -424,6 +432,14 @@ pub struct CheckRun {
     /// (core#553) The isolated re-runs of a small head-only failure set, one per id, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reruns: Vec<CheckRun>,
+    /// (core#789/#790) Environment signals the scan read off the check's own output, at most
+    /// [`MAX_ENV_SIGNALS`], each prefixed by its class: `load: <line>` (a vitest pool worker that
+    /// never started — `Failed to start forks worker` / `Timeout waiting for worker to respond` —
+    /// or a per-test `Test timed out in Nms`), `errors: <N>` (vitest's own error count —
+    /// `Errors  N errors` / `Vitest caught N unhandled errors`) and `crash: <line>` (the tool itself died opening a dependency file —
+    /// `EPERM`/`EACCES` under `node_modules`). Evidence for the re-run rules, never a verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_signals: Vec<String>,
 }
 
 impl CheckRun {
@@ -460,6 +476,18 @@ impl CheckRun {
             )
     }
 
+    /// (core#789) Is this check's environment class a tool CRASH (`crash: …` entries) rather than
+    /// a nested-sandbox launcher signature?
+    pub fn env_crash(&self) -> bool {
+        self.env_cannot_run
+            .first()
+            .is_some_and(|e| e.starts_with("crash: "))
+            || self
+                .regressions
+                .first()
+                .is_some_and(|e| e.starts_with("crash: "))
+    }
+
     /// One line an operator can read: `test: exit 1 (154.9s)`.
     pub fn summary(&self) -> String {
         let secs = self.duration_ms as f64 / 1000.0;
@@ -478,6 +506,10 @@ impl CheckRun {
             );
         }
         let cls = match self.classification.as_deref() {
+            Some(ENV_CANNOT_RUN) if !self.passed() && self.env_crash() => format!(
+                " [env_cannot_run: the tool crashed on head, base and a re-run — {}]",
+                self.env_cannot_run.join(", ")
+            ),
             Some(ENV_CANNOT_RUN) if !self.passed() => format!(
                 " [env_cannot_run: {} tests cannot run under the floor's nested sandbox on this \
                  host]",
@@ -665,6 +697,18 @@ impl RepoChecksReport {
             if c.env_cannot_run.is_empty() {
                 continue;
             }
+            // (core#789) A tool that crashed opening a dependency file on both trees and again on
+            // its re-run: the check did not run here; external CI is its gate.
+            if c.env_crash() {
+                notes.push(format!(
+                    "`{}`: the tool crashed with an environment error on the head, the base and a \
+                     re-run ({}) — env_cannot_run, not denied and not skipping the remaining \
+                     checks; external CI is the gate for it",
+                    c.name,
+                    c.env_cannot_run.join(", ")
+                ));
+                continue;
+            }
             let head_only: Vec<&String> = c
                 .env_cannot_run
                 .iter()
@@ -700,7 +744,14 @@ impl RepoChecksReport {
         // (core#553) A failure that passed alone is not a denial, but it is not silent either: an
         // order-dependent failure the change introduced reads the same way.
         for c in &self.checks {
-            if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) {
+            if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) && c.env_crash() {
+                notes.push(format!(
+                    "`{}`: crashed with an environment error on head and base ({}) and passed \
+                     its re-run — classed flaky_under_load, not denied",
+                    c.name,
+                    c.regressions.join(", ")
+                ));
+            } else if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) {
                 notes.push(format!(
                     "`{}`: {} failed in the full run on an oversubscribed host and passed \
                      re-run alone — classed flaky_under_load (host load), not denied; an \
@@ -2323,7 +2374,13 @@ pub(crate) fn run_with_sandbox_ctx(
                         }
                     };
                     classify(&mut run, base_run);
-                    rerun_flakes(worktree, check, &mut run, &sandbox, &scratch);
+                    // (core#789) an identical environment crash, then (core#790) a load-class
+                    // failure whatever the base did, then (core#553) a small head-only set.
+                    if !rerun_env_crash(worktree, check, &mut run, &sandbox, &scratch)
+                        && !rerun_load_class(worktree, check, &mut run, &sandbox, &scratch)
+                    {
+                        rerun_flakes(worktree, check, &mut run, &sandbox, &scratch);
+                    }
                 }
                 _ => {}
             }
@@ -2793,6 +2850,12 @@ fn vitest_file_of(id: &str) -> Option<&str> {
 /// the one file, not the one selection. `None` when the argv has no `vitest` token (`npm run
 /// test` hides the runner behind a script).
 fn vitest_file_rerun_argv(argv: &[String], file: &str) -> Option<Vec<String>> {
+    vitest_files_rerun_argv(argv, &[file])
+}
+
+/// [`vitest_file_rerun_argv`] for a SET of files (core#790): `vitest run <f1> <f2> …` plus the
+/// original's environment selection.
+fn vitest_files_rerun_argv(argv: &[String], files: &[&str]) -> Option<Vec<String>> {
     let at = argv.iter().position(|a| {
         Path::new(a)
             .file_name()
@@ -2801,7 +2864,7 @@ fn vitest_file_rerun_argv(argv: &[String], file: &str) -> Option<Vec<String>> {
     })?;
     let mut out: Vec<String> = argv[..=at].to_vec();
     out.push("run".into());
-    out.push(file.to_string());
+    out.extend(files.iter().map(|f| f.to_string()));
     let mut rest = argv[at + 1..].iter();
     while let Some(a) = rest.next() {
         if matches!(
@@ -2948,6 +3011,327 @@ fn rerun_flakes(
     if all_passed {
         run.classification = Some(FLAKY_UNDER_LOAD.to_string());
     }
+}
+
+/// (core#790) The watch prefix that asks [`LineScan`] for a whole FILE's check-mark line.
+const FILE_WATCH: &str = "file:";
+
+/// (core#790) Does a vitest output line witness `file` passing as a whole — ` ✓ <file> (N
+/// tests[ | M skipped]) Nms`, optionally behind a `|project|` label? A parenthetical that names a
+/// failure is never a witness, nor is another file's line.
+fn vitest_file_pass_line(s: &str, file: &str) -> bool {
+    let Some(rest) = s.strip_prefix('✓') else {
+        return false;
+    };
+    let mut rest = rest.trim_start();
+    if let Some(after) = rest.strip_prefix('|') {
+        match after.split_once('|') {
+            Some((_, r)) => rest = r.trim_start(),
+            None => return false,
+        }
+    }
+    match rest.strip_prefix(file).map(str::trim_start) {
+        Some(after) if after.starts_with('(') => {
+            let inner = &after[1..after.find(')').unwrap_or(after.len())];
+            inner.contains("test") && !inner.contains("fail")
+        }
+        _ => false,
+    }
+}
+
+/// (core#789/#790) The environment-signal class one output line carries, as recorded on
+/// [`CheckRun::env_signals`]: `load: …` for a vitest pool worker that could not start
+/// ([`LOAD_SIGNATURES`]) or a per-test/hook timeout (`Test timed out in Nms`), `errors: N` for
+/// vitest's own error count (`Errors  N errors`, `Vitest caught N unhandled errors`), `crash: …`
+/// for a tool that died opening a dependency file (`EPERM`/`EACCES` naming `node_modules`).
+fn env_signal_of_line(s: &str) -> Option<String> {
+    let clip = |line: &str| -> String { line.chars().take(300).collect() };
+    if LOAD_SIGNATURES.iter().any(|sig| s.contains(sig)) || per_test_timeout(s) {
+        return Some(format!("load: {}", clip(s)));
+    }
+    if let Some(n) = vitest_error_count(s) {
+        return Some(format!("errors: {n}"));
+    }
+    if (s.contains("EPERM: operation not permitted") || s.contains("EACCES: permission denied"))
+        && s.contains("node_modules")
+    {
+        return Some(format!("crash: {}", clip(s)));
+    }
+    None
+}
+
+/// The vitest pool's worker-start failure (core#790): `[vitest-pool]: Failed to start <pool>
+/// worker for test files <abs>, <abs>.` with its cause `Timeout waiting for worker to respond`.
+const LOAD_SIGNATURES: &[&str] = &[
+    "[vitest-pool]: Failed to start ",
+    "Timeout waiting for worker to respond",
+];
+
+/// The prefix of the worker-start line that names its files.
+const WORKER_START_FILES: &str = " worker for test files ";
+
+/// `Test timed out in 30000ms` / `Hook timed out in 10000ms` — vitest's per-test bound.
+fn per_test_timeout(s: &str) -> bool {
+    ["Test timed out in ", "Hook timed out in "]
+        .iter()
+        .any(|k| {
+            s.split_once(k).is_some_and(|(_, rest)| {
+                let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+                n > 0 && rest[n..].starts_with("ms")
+            })
+        })
+}
+
+/// vitest's error count: the summary row `Errors  N error(s)` or the banner `Vitest caught N
+/// unhandled error(s)`.
+fn vitest_error_count(s: &str) -> Option<usize> {
+    let rest = if let Some(r) = s.strip_prefix("Errors ") {
+        r.trim_start()
+    } else {
+        s.split_once("Vitest caught ")?.1
+    };
+    let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let count = rest[..n].parse().ok()?;
+    let tail = rest[n..].trim_start();
+    (tail.starts_with("error") || tail.starts_with("unhandled error")).then_some(count)
+}
+
+/// (core#790) The files a worker-start signal names, relative to `worktree` (absolute on vitest's
+/// line; a path outside the worktree is `Err` — the floor never re-runs a file it does not own).
+fn worker_start_files(signal: &str, worktree: &Path) -> Result<Vec<String>, ()> {
+    let Some((_, list)) = signal.split_once(WORKER_START_FILES) else {
+        return Ok(Vec::new());
+    };
+    let roots: Vec<String> = [Some(worktree.to_path_buf()), worktree.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+        .map(|p| format!("{}/", p.to_string_lossy().trim_end_matches('/')))
+        .collect();
+    let list = list.trim_end().trim_end_matches('.');
+    let mut out = Vec::new();
+    for f in list.split(", ").map(str::trim).filter(|f| !f.is_empty()) {
+        let rel = if Path::new(f).is_absolute() {
+            match roots.iter().find_map(|r| f.strip_prefix(r.as_str())) {
+                Some(rel) => rel,
+                None => return Err(()),
+            }
+        } else {
+            f
+        };
+        if rel.split('/').any(|c| c == "..") || rel.contains(char::is_whitespace) {
+            return Err(());
+        }
+        out.push(rel.to_string());
+    }
+    Ok(out)
+}
+
+/// The test file a vitest id names: `FAIL <file> > suite > name` or a file-level failure
+/// `FAIL <file> [ <file> ]` (an import error, a worker that never started).
+fn vitest_any_file_of(id: &str) -> Option<&str> {
+    if let Some(f) = vitest_file_of(id) {
+        return Some(f);
+    }
+    let rest = id.strip_prefix("FAIL ")?;
+    let (file, bracket) = rest.split_once(" [ ")?;
+    let file = file.trim();
+    (bracket.trim_end().strip_suffix(']').map(str::trim) == Some(file)
+        && !file.contains(char::is_whitespace)
+        && file.contains('.'))
+    .then_some(file)
+}
+
+/// (core#790) LOAD-CLASS RE-RUN. A vitest check whose output carries a load-class signal — a pool
+/// worker that could not start, or a per-test timeout on an oversubscribed host — re-runs the
+/// files its head-only failures name, plus every file a worker never started for, ONCE, in one
+/// serial invocation (`--no-file-parallelism`), WHATEVER the base did: a red base is not evidence
+/// of a regression when the head's red is load. Every file must print its own passing line and
+/// the re-run must exit 0, then the check is `flaky_under_load`; anything else leaves the
+/// classification as it was. Not applied when a head-only id is not a vitest id (a tsc or lint id
+/// is never load), when the error count vitest printed exceeds the worker-start errors (an
+/// unhandled error that is not a worker-start one is unexplained), or when the signal list was
+/// truncated. Returns whether the re-run ran.
+fn rerun_load_class(
+    worktree: &Path,
+    check: &RepoCheck,
+    run: &mut CheckRun,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> bool {
+    use std::collections::BTreeSet;
+    if !matches!(
+        run.classification.as_deref(),
+        Some(REGRESSION) | Some(UNCLASSIFIED_RED_BASE)
+    ) || run.env_signals.iter().any(|s| s == SIGNALS_TRUNCATED)
+    {
+        return false;
+    }
+    let loads: Vec<&str> = run
+        .env_signals
+        .iter()
+        .filter_map(|s| s.strip_prefix("load: "))
+        .collect();
+    if loads.is_empty() {
+        return false;
+    }
+    let worker_start = loads
+        .iter()
+        .filter(|l| l.contains(LOAD_SIGNATURES[0]))
+        .count();
+    // A per-test timeout alone is load only on an oversubscribed host (core#553's rule); a worker
+    // that could not START in vitest's fixed window is load whatever the snapshot reads.
+    let (load1, cpus) = host_load();
+    if worker_start == 0 && !oversubscribed(load1, cpus) {
+        return false;
+    }
+    let errors = run
+        .env_signals
+        .iter()
+        .filter_map(|s| s.strip_prefix("errors: ")?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    if errors > worker_start {
+        return false;
+    }
+    // The head-only failures: the regressions, or — one side without ids, or no ids at all —
+    // every head id the base does not share.
+    let base_ids: BTreeSet<&str> = run
+        .base
+        .as_deref()
+        .and_then(|b| b.run.as_ref())
+        .map(|b| b.failure_ids.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let head_only: Vec<String> = if run.regressions.is_empty() {
+        run.failure_ids
+            .iter()
+            .filter(|id| !base_ids.contains(id.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        run.regressions.clone()
+    };
+    let mut files: Vec<String> = Vec::new();
+    for id in &head_only {
+        let Some(f) = vitest_any_file_of(id) else {
+            return false;
+        };
+        if !files.iter().any(|x| x == f) {
+            files.push(f.to_string());
+        }
+    }
+    for l in &loads {
+        match worker_start_files(l, worktree) {
+            Ok(fs) => {
+                for f in fs {
+                    if !files.contains(&f) {
+                        files.push(f);
+                    }
+                }
+            }
+            Err(()) => return false,
+        }
+    }
+    if files.is_empty() || files.len() > MAX_LOAD_RERUN_FILES {
+        return false;
+    }
+    let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    let argv = vitest_files_rerun_argv(&check.argv, &refs).or_else(|| {
+        script_runner_argv(worktree, &check.argv).and_then(|a| vitest_files_rerun_argv(&a, &refs))
+    });
+    let Some(mut argv) = argv else {
+        return false;
+    };
+    if files.len() > 1 {
+        argv.push("--no-file-parallelism".into());
+    }
+    let watch: Vec<String> = files.iter().map(|f| format!("{FILE_WATCH}{f}")).collect();
+    let one = RepoCheck {
+        name: check.name.clone(),
+        argv,
+        source: format!(
+            "load-class re-run of {} file{} (core#790)",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ),
+        timeout_s: check.timeout_s,
+    };
+    let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &watch);
+    let ok = r.passed() && watch.iter().all(|w| passed.contains(w));
+    eprintln!(
+        "wicked-core: repo checks floor — load-class re-run of {} file(s) {} ({:.1}s)",
+        files.len(),
+        if ok { "passed" } else { "did not pass" },
+        r.duration_ms as f64 / 1000.0
+    );
+    run.reruns.push(r);
+    if ok {
+        if run.regressions.is_empty() {
+            run.regressions = if head_only.is_empty() {
+                files.iter().map(|f| format!("FAIL {f} [ {f} ]")).collect()
+            } else {
+                head_only
+            };
+        }
+        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
+    }
+    true
+}
+
+/// (core#789) ENVIRONMENT CRASH. Head and base both failed with no failure ids
+/// (`unclassified_red_base`) and BOTH outputs carry a `crash:` signal — the tool died opening a
+/// dependency file (`EPERM`/`EACCES` under `node_modules`; an endpoint scanner denying opens under
+/// load). The head check is re-run ONCE: a pass makes it `flaky_under_load` (the crash is named);
+/// the same crash again makes it `env_cannot_run` with the crash line on `env_cannot_run` — never
+/// denying, so the floor goes on to the remaining checks; any other outcome leaves it denying.
+/// Returns whether the re-run ran.
+fn rerun_env_crash(
+    worktree: &Path,
+    check: &RepoCheck,
+    run: &mut CheckRun,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> bool {
+    let crash_of = |r: &CheckRun| -> Option<String> {
+        r.env_signals
+            .iter()
+            .find(|s| s.starts_with("crash: "))
+            .cloned()
+    };
+    if run.classification.as_deref() != Some(UNCLASSIFIED_RED_BASE) {
+        return false;
+    }
+    let base_crash = run
+        .base
+        .as_deref()
+        .and_then(|b| b.run.as_ref())
+        .and_then(crash_of);
+    let (Some(head_crash), Some(_)) = (crash_of(run), base_crash) else {
+        return false;
+    };
+    let r = run_one(worktree, check, sandbox, scratch, Tree::Head);
+    let again = (!r.passed() && r.failure_ids.is_empty() && !r.timed_out)
+        .then(|| crash_of(&r))
+        .flatten();
+    eprintln!(
+        "wicked-core: repo checks floor — `{}` crashed on head and base ({head_crash}); re-run {}",
+        check.name,
+        if r.passed() {
+            "passed"
+        } else if again.is_some() {
+            "crashed again"
+        } else {
+            "failed otherwise"
+        }
+    );
+    if r.passed() {
+        run.regressions = vec![head_crash];
+        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
+    } else if let Some(c) = again {
+        run.env_cannot_run = vec![c];
+        run.classification = Some(ENV_CANNOT_RUN.to_string());
+    }
+    run.reruns.push(r);
+    true
 }
 
 /// Phrases a creator uses to wave a failure away, and the check-shaped words one of them must
@@ -3182,6 +3566,8 @@ struct LineScan {
     /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
     passed: Vec<String>,
     watch: Vec<String>,
+    /// (core#789/#790) Environment signals in order of sight ([`env_signal_of_line`]).
+    signals: Vec<String>,
 }
 
 impl LineScan {
@@ -3194,6 +3580,16 @@ impl LineScan {
 
     fn line(&mut self, line: &str) {
         let s = line.trim();
+        if let Some(sig) = env_signal_of_line(s) {
+            let repeat = sig.starts_with("crash: ") && self.signals.contains(&sig);
+            if !repeat {
+                if self.signals.len() < MAX_ENV_SIGNALS {
+                    self.signals.push(sig);
+                } else if self.signals.last().map(String::as_str) != Some(SIGNALS_TRUNCATED) {
+                    *self.signals.last_mut().expect("cap > 0") = SIGNALS_TRUNCATED.to_string();
+                }
+            }
+        }
         if s.starts_with("test result: FAILED") {
             self.failed_blocks += 1;
             self.section = None;
@@ -3239,9 +3635,14 @@ impl LineScan {
                 return;
             }
             // (core#766) A watched vitest id passes when its FILE's check-mark line is printed.
+            // (core#790) A watched `file:<path>` passes on that file's own check-mark line.
             if s.starts_with('✓') {
                 for w in &self.watch {
-                    if vitest_pass_line_witnesses(s, w) && !self.passed.iter().any(|p| p == w) {
+                    let hit = match w.strip_prefix(FILE_WATCH) {
+                        Some(file) => vitest_file_pass_line(s, file),
+                        None => vitest_pass_line_witnesses(s, w),
+                    };
+                    if hit && !self.passed.iter().any(|p| p == w) {
                         self.passed.push(w.clone());
                     }
                 }
@@ -3289,7 +3690,7 @@ fn libtest_parts(id: &str) -> Option<(&str, Option<&str>)> {
 
 /// The scanned ids of one check run, qualified: the failure ids (stdout first, then stderr), the
 /// ids whose captured output carries a launcher signature, and the watched names seen passing.
-fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     // cargo prints the per-binary selector on stderr, libtest its results on stdout.
     let targets: Vec<String> = out
         .targets
@@ -3330,7 +3731,19 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
             passed.push(p);
         }
     }
-    (ids, env, passed)
+    let mut signals = out.signals;
+    for sig in err.signals {
+        if signals.len() >= MAX_ENV_SIGNALS {
+            if signals.last().map(String::as_str) != Some(SIGNALS_TRUNCATED) {
+                *signals.last_mut().expect("cap > 0") = SIGNALS_TRUNCATED.to_string();
+            }
+            break;
+        }
+        if !(sig.starts_with("crash: ") && signals.contains(&sig)) {
+            signals.push(sig);
+        }
+    }
+    (ids, env, passed, signals)
 }
 
 /// The failure identifier one complete output line carries, for the runners the floor knows —
@@ -3534,6 +3947,7 @@ fn run_one_watching(
         base: None,
         env_cannot_run: Vec::new(),
         reruns: Vec::new(),
+        env_signals: Vec::new(),
     };
     // LOAD-AWARE BOUND (core#469): base × clamp(load1/ncpu, 1, 3), recorded on the run and
     // logged before the check starts so the observed duration can be read against it.
@@ -3643,9 +4057,10 @@ fn run_one_watching(
     }
     // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
     // stderr), de-duplicated, in order of first sight; libtest ids qualified by their binary.
-    let (ids, env, passed) = qualify(out_scan, err_scan);
+    let (ids, env, passed, signals) = qualify(out_scan, err_scan);
     result.failure_ids = ids;
     result.env_cannot_run = env;
+    result.env_signals = signals;
     result.duration_ms = started.elapsed().as_millis() as u64;
     (result, passed)
 }
@@ -3835,6 +4250,7 @@ mod tests {
                 base: None,
                 env_cannot_run: Vec::new(),
                 reruns: Vec::new(),
+                env_signals: Vec::new(),
             }],
             skipped: vec!["typecheck".into(), "test".into()],
             passed: false,
@@ -5250,6 +5666,7 @@ mod tests {
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
+            env_signals: Vec::new(),
         };
         let make_base = |exit: i32| BaseRun {
             head: "abc1234567".to_string(),
@@ -5752,6 +6169,7 @@ mod tests {
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
+            env_signals: Vec::new(),
         }
     }
 
@@ -5909,7 +6327,7 @@ mod tests {
     /// (core#546). With cargo's selectors missing, the ids stay bare (the historical form).
     #[test]
     fn libtest_ids_are_qualified_by_their_binary_481() {
-        let (ids, env, _) = qualify(scan_of(WS_STDOUT), scan_of(WS_STDERR));
+        let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), scan_of(WS_STDERR));
         assert_eq!(
             ids,
             vec![
@@ -5922,7 +6340,7 @@ mod tests {
         // The summary block's trailing "`-p a --lib`" list line is not a second selector.
         assert_eq!(scan_of(WS_STDERR).targets.len(), 3);
         // No selectors (another runner wrapped cargo, or the stderr was lost): bare, de-duplicated.
-        let (ids, env, _) = qualify(scan_of(WS_STDOUT), LineScan::default());
+        let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), LineScan::default());
         assert_eq!(
             ids,
             vec!["test t::shared".to_string(), "test shared".to_string()]
@@ -5955,6 +6373,7 @@ mod tests {
             base: None,
             env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
             reruns: Vec::new(),
+            env_signals: Vec::new(),
         }
     }
 
@@ -6611,5 +7030,232 @@ mod tests {
         );
         drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+    /// core#789/#790: the environment signals one output line carries, and the helpers the
+    /// load-class re-run reads them with.
+    #[test]
+    fn env_signals_are_read_off_the_output_789_790() {
+        assert_eq!(
+            env_signal_of_line(
+                "[vitest-pool]: Failed to start forks worker for test files /w/a.test.ts, /w/b.test.ts."
+            )
+            .as_deref()
+            .map(|s| s.starts_with("load: ")),
+            Some(true)
+        );
+        assert!(env_signal_of_line("→ Test timed out in 30000ms.").is_some());
+        assert!(env_signal_of_line("Hook timed out in 10000ms").is_some());
+        assert!(env_signal_of_line("Test timed out in soon").is_none());
+        assert_eq!(
+            env_signal_of_line("Errors  44 errors").as_deref(),
+            Some("errors: 44")
+        );
+        assert_eq!(
+            env_signal_of_line("⎯⎯ Vitest caught 3 unhandled errors during the test run ⎯⎯")
+                .as_deref(),
+            Some("errors: 3")
+        );
+        assert_eq!(
+            env_signal_of_line(
+                "Error: EPERM: operation not permitted, open '/w/node_modules/eslint/lib/x.js'"
+            )
+            .as_deref()
+            .map(|s| s.starts_with("crash: ")),
+            Some(true)
+        );
+        assert!(
+            env_signal_of_line("Error: EPERM: operation not permitted, open '/w/src/a.ts'")
+                .is_none(),
+            "a denied open outside node_modules is not a dependency crash"
+        );
+        assert!(env_signal_of_line("ok 1 - a test").is_none());
+
+        let wt = Path::new("/w");
+        assert_eq!(
+            worker_start_files(
+                "[vitest-pool]: Failed to start forks worker for test files /w/a.test.ts, /w/src/b.test.ts.",
+                wt
+            ),
+            Ok(s(&["a.test.ts", "src/b.test.ts"]))
+        );
+        assert_eq!(
+            worker_start_files(
+                "[vitest-pool]: Failed to start forks worker for test files /elsewhere/a.test.ts.",
+                wt
+            ),
+            Err(()),
+            "a file outside the worktree is never re-run"
+        );
+        assert_eq!(
+            worker_start_files("Timeout waiting for worker to respond", wt),
+            Ok(vec![])
+        );
+
+        assert_eq!(
+            vitest_any_file_of("FAIL a.test.ts > s > n"),
+            Some("a.test.ts")
+        );
+        assert_eq!(
+            vitest_any_file_of("FAIL a.test.ts [ a.test.ts ]"),
+            Some("a.test.ts")
+        );
+        assert_eq!(vitest_any_file_of("FAIL a.test.ts [ b.test.ts ]"), None);
+        assert_eq!(vitest_any_file_of("FAIL TestX"), None);
+
+        assert!(vitest_file_pass_line(
+            "✓ a.test.ts (3 tests) 12ms",
+            "a.test.ts"
+        ));
+        assert!(vitest_file_pass_line(
+            "✓ |unit| a.test.ts (3 tests | 1 skipped) 12ms",
+            "a.test.ts"
+        ));
+        assert!(!vitest_file_pass_line(
+            "✓ a.test.tsx (3 tests) 12ms",
+            "a.test.ts"
+        ));
+        assert!(!vitest_file_pass_line(
+            "✓ a.test.ts (3 tests | 1 failed) 12ms",
+            "a.test.ts"
+        ));
+        assert!(!vitest_file_pass_line(
+            "✓ a.test.ts > one 12ms",
+            "a.test.ts"
+        ));
+
+        // The signal list is capped and marks the cut.
+        let mut scan = LineScan::watching(&[]);
+        for _ in 0..(MAX_ENV_SIGNALS + 5) {
+            scan.line("Test timed out in 5000ms");
+        }
+        assert_eq!(scan.signals.len(), MAX_ENV_SIGNALS);
+        assert_eq!(
+            scan.signals.last().map(String::as_str),
+            Some(SIGNALS_TRUNCATED)
+        );
+        // An identical crash line is recorded once.
+        let mut scan = LineScan::watching(&[]);
+        for _ in 0..3 {
+            scan.line("Error: EACCES: permission denied, open '/w/node_modules/x.js'");
+        }
+        assert_eq!(scan.signals.len(), 1);
+    }
+
+    /// core#789, end to end: a check that crashes with the SAME dependency-file EPERM on head and
+    /// base and again on its re-run is `env_cannot_run` — it does not deny and the floor goes on
+    /// to the next check (which used to be skipped).
+    #[cfg(unix)]
+    #[test]
+    fn an_identical_env_crash_on_head_and_base_is_env_cannot_run_and_skips_nothing_789() {
+        let repo = scratch("crash789");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"lint":["sh","-c","echo \"Error: EPERM: operation not permitted, open '$PWD/node_modules/eslint/lib/x.js'\" >&2; exit 2"],"test":["true"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the crash floor cannot run");
+            return;
+        }
+        assert_eq!(names_run(&report), vec!["lint", "test"], "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let lint = &report.checks[0];
+        assert_eq!(
+            lint.classification.as_deref(),
+            Some(ENV_CANNOT_RUN),
+            "{lint:?}"
+        );
+        assert!(lint.env_crash());
+        assert!(!lint.denies());
+        assert_eq!(lint.reruns.len(), 1);
+        assert!(report.passed, "{report:?}");
+        assert!(report
+            .classification_note()
+            .is_some_and(|n| n.contains("crashed with an environment error")));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// core#790, end to end: head and base BOTH red from load (different files never started),
+    /// so the id diff calls the head's failures regressions; the load-class re-run runs the
+    /// failing file plus the never-started file once, serially, and a pass is `flaky_under_load`.
+    /// An error count above the worker-start errors (an unexplained unhandled error) is not load.
+    #[cfg(unix)]
+    #[test]
+    fn a_load_class_failure_reruns_whatever_the_base_did_790() {
+        let repo = scratch("load790");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::create_dir_all(repo.join("vt")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["sh","vt/vitest","run"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let script = |fail_id: &str, never: &str, errors: usize| {
+            format!(
+                "if [ \"$1\" = run ] && [ -n \"$2\" ]; then shift; for f in \"$@\"; do case \"$f\" in \
+                 *.ts) echo \" ✓ $f (1 test) 1ms\";; esac; done; exit 0; fi\n\
+                 echo ' FAIL  {fail_id} > s > n'\n\
+                 echo \"[vitest-pool]: Failed to start forks worker for test files $PWD/{never}.\"\n\
+                 echo ' Errors  {errors} error'\n\
+                 exit 1\n"
+            )
+        };
+        std::fs::write(repo.join("vt/vitest"), script("c.test.ts", "d.test.ts", 1)).unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(repo.join("vt/vitest"), script("a.test.ts", "b.test.ts", 1)).unwrap();
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the load floor cannot run");
+            return;
+        }
+        let test = &report.checks[0];
+        assert_eq!(
+            test.classification.as_deref(),
+            Some(FLAKY_UNDER_LOAD),
+            "{test:?}"
+        );
+        assert_eq!(test.reruns.len(), 1, "{test:?}");
+        assert_eq!(
+            test.reruns[0].argv,
+            s(&[
+                "sh",
+                "vt/vitest",
+                "run",
+                "a.test.ts",
+                "b.test.ts",
+                "--no-file-parallelism"
+            ])
+        );
+        assert!(report.passed, "{report:?}");
+
+        // More errors than worker-start failures: not explained by load — no load-class re-run
+        // (the never-started file is not re-run; core#553/#766's own one-file rule may still).
+        std::fs::write(repo.join("vt/vitest"), script("a.test.ts", "b.test.ts", 5)).unwrap();
+        let report = run_floor(&repo, &ctx);
+        let test = &report.checks[0];
+        assert!(
+            test.reruns
+                .iter()
+                .all(|r| !r.argv.iter().any(|a| a == "b.test.ts")),
+            "{test:?}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
