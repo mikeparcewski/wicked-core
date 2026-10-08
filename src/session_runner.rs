@@ -844,6 +844,7 @@ mod tests {
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
             carried_items: Vec::new(),
+            floor_auto_retries: 0,
             status: UnitStatus::Pending,
             catalog: None,
             exclude_seats: Vec::new(),

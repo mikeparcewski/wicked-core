@@ -6602,6 +6602,35 @@ fn apply_step_result(
         } else {
             denial_gate_note(session.human_confirm)
         };
+        // (core#651) A creator whose OWN repo-checks floor ran and failed gets ONE automatic
+        // round with the failing checks' tails before any gate opens — a lint or a spawn-audit
+        // failure the seat can fix itself is not worth an operator round-trip. Never a timed-out
+        // floor (it did not finish: nothing for the creator to fix) nor a floor that did not run.
+        if floor_auto_retry_applies(unit, outcome.hook_denied, &evidence) {
+            let mut u = unit.clone();
+            u.floor_auto_retries = u.floor_auto_retries.saturating_add(1);
+            put_node(store, u.to_node())?;
+            let mut scratch_in_flight = HashSet::new();
+            return match rewind_to_creator_scoped(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                &mut scratch_in_flight,
+                session.clone(),
+                &run_id,
+                Some(FLOOR_AUTO_RETRY_NOTE.to_string()),
+                FLOOR_AUTO_RETRY_SCOPE,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            )? {
+                SessionStatus::Executing => Ok(StepApplied::Continuing),
+                SessionStatus::AwaitingHuman => Ok(StepApplied::Paused),
+                _ => Ok(StepApplied::Finished),
+            };
+        }
         escalate_denied_unit(
             store,
             subscribers,
@@ -6770,6 +6799,39 @@ fn tail_chars(s: &str, cap: usize) -> String {
     } else {
         format!("…{}", s.chars().skip(n - cap).collect::<String>())
     }
+}
+
+/// (core#651) The `unitReworkAmended.scope` token of the automatic creator-floor round.
+pub(crate) const FLOOR_AUTO_RETRY_SCOPE: &str = "floor_auto_retry";
+
+/// (core#651) The marker the automatic round's amendment carries after the floor's own denial
+/// (which already names each failing check with its stdout/stderr tails).
+const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (core#651)] Your own \
+     repo-checks floor ran on the tree you left and FAILED (the checks and their tails are above). \
+     Fix those failures in this round; a second red floor opens the escalation gate for a human.";
+
+/// (core#651) Whether a denied unit takes the one automatic creator-floor round instead of the
+/// escalation gate: an agent CREATOR unit, not hook-denied, whose denial is the repo-checks floor
+/// (`repo_checks`, never `repo_checks_timeout`), on a floor report of this attempt that RAN and
+/// failed (`outcome() == "failed"` — not a refused sandbox, a detect error, or a carried result),
+/// and that has not had its round yet.
+fn floor_auto_retry_applies(
+    unit: &crate::domain::WorkUnit,
+    hook_denied: bool,
+    evidence: &crate::workflow::UnitEvidence,
+) -> bool {
+    unit.role == crate::workflow::PhaseRole::Creator
+        && unit.tool_cmd.is_none()
+        && !hook_denied
+        && unit.floor_auto_retries == 0
+        && unit
+            .denial
+            .as_ref()
+            .is_some_and(|d| d.source == crate::repo_checks::DENIAL_SOURCE)
+        && evidence
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.outcome() == "failed")
 }
 
 /// (core#464) The DENIAL CLASS a denied unit opens the escalation gate under — the token
@@ -13550,6 +13612,153 @@ mod substance_gate_tests {
             "no denial reaches sessionFailed without a decided gate (core#464)"
         );
         (escalated, paused)
+    }
+
+    /// A creator floor report that RAN: `test` exited `exit` (or hit its bound, `timed_out`).
+    fn creator_floor(exit: i32, timed_out: bool) -> crate::workflow::UnitEvidence {
+        let report: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [],
+                "checks": [{
+                    "name": "lint", "argv": ["npm", "run", "lint"], "source": "package.json",
+                    "exit_code": exit, "timed_out": timed_out, "duration_ms": 900,
+                    "stdout_tail": "", "stderr_tail": "src/a.ts:3:1 error no-unused-vars"
+                }],
+                "skipped": [],
+                "passed": exit == 0 && !timed_out,
+                "sandbox_level": "none"
+            }))
+            .unwrap();
+        crate::workflow::UnitEvidence {
+            repo_checks: Some(report),
+            ..Default::default()
+        }
+    }
+
+    /// Fold an Ok creator result at `attempt` (the cursor's) with `evidence`.
+    fn fold_at(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        attempt: u32,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (StepApplied, AgentSession, WorkUnit) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt,
+            output: "Implemented the feature in src/a.ts and wired it into the router.".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        let applied = apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            evidence,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .remove(0);
+        (applied, session, unit)
+    }
+
+    /// core#651: a creator whose own floor ran and FAILED is re-dispatched ONCE with the failing
+    /// checks' tails — no gate — and the round is on the unit; the second red floor opens the
+    /// `floor_failed` escalation gate as before, with no third automatic attempt.
+    #[test]
+    fn a_red_creator_floor_retries_once_automatically_then_escalates_651() {
+        let run_id = format!("floor-auto-retry-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (applied, session, unit) =
+            fold_at(&mut store, &mut subs, &run_id, 0, creator_floor(1, false));
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!((session.unit_ix, session.attempt), (0, 1));
+        assert_eq!(unit.status, UnitStatus::Distributed);
+        assert_eq!(
+            unit.floor_auto_retries, 1,
+            "the round is on the unit (restart-durable)"
+        );
+        let evs = drain_events(&erx);
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::GateEscalated { .. } | CoreEvent::AwaitingHuman { .. }
+            )),
+            "no gate opens on the automatic round: {evs:?}"
+        );
+        let amendment = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitReworkAmended {
+                    amendment, scope, ..
+                } if scope == FLOOR_AUTO_RETRY_SCOPE => Some(amendment.clone()),
+                _ => None,
+            })
+            .expect("unitReworkAmended{floor_auto_retry}");
+        assert!(
+            amendment.contains("no-unused-vars") && amendment.contains("core#651"),
+            "the failing check's tail and the round marker ride the amendment: {amendment}"
+        );
+        assert_eq!(unit.rework_amendment.as_deref(), Some(amendment.as_str()));
+
+        // The second red floor: the escalation gate, as today.
+        let (applied, session, unit) =
+            fold_at(&mut store, &mut subs, &run_id, 1, creator_floor(1, false));
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.floor_auto_retries, 1, "no third automatic attempt");
+        let (escalated, _) = gate_shape(&drain_events(&erx));
+        assert_eq!(
+            (escalated.0.as_str(), escalated.1.as_str()),
+            ("floor_failed", "repo_checks")
+        );
+    }
+
+    /// core#651: a floor that did not FINISH is not something the creator can fix — a timed-out
+    /// creator floor opens the gate at once; and an evaluator's red floor never auto-retries.
+    #[test]
+    fn a_timed_out_or_evaluator_floor_never_auto_retries_651() {
+        for (role, ev, source) in [
+            (
+                PhaseRole::Creator,
+                creator_floor(1, true),
+                "repo_checks_timeout",
+            ),
+            (PhaseRole::Evaluator, creator_floor(1, false), "repo_checks"),
+        ] {
+            let run_id = format!("floor-no-retry-{role:?}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(&mut store, &run_id, role);
+            let mut subs = crate::event_log::EventSink::default();
+            let (esub, erx) = channel();
+            subs.push(esub);
+            let (applied, _session, unit) = fold_at(&mut store, &mut subs, &run_id, 0, ev);
+            assert!(matches!(applied, StepApplied::Paused), "{role:?}");
+            assert_eq!(unit.floor_auto_retries, 0);
+            let (escalated, _) = gate_shape(&drain_events(&erx));
+            assert_eq!(escalated.1, source, "{role:?}");
+        }
     }
 
     /// core#464: a FLOOR denial (the substance floor here — the class every deterministic floor

@@ -737,6 +737,11 @@ pub struct OperatorRuling {
     pub at: i64,
 }
 
+/// serde `skip_serializing_if` for a counter that is absent while zero.
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 /// A unit of distributed work, persisted as `Node(Other(WORK_UNIT))`. Plan creates it `Pending`;
 /// distribute records the assignment; execute records the outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1054,6 +1059,12 @@ pub struct WorkUnit {
     /// the run record and the PR body. Skipped on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_items: Vec<String>,
+    /// (core#651) How many AUTOMATIC creator-floor retries this unit has taken: a creator whose own
+    /// repo-checks floor ran and FAILED is re-dispatched once with the failing checks' tails before
+    /// any gate opens; the second red floor opens the escalation gate. Persisted, so a restart
+    /// never grants a second automatic round. Skipped on the wire while zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub floor_auto_retries: u32,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -1246,6 +1257,7 @@ impl WorkUnit {
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
             carried_items: Vec::new(),
+            floor_auto_retries: 0,
             status: UnitStatus::Pending,
             exclude_seats: Vec::new(),
         }
