@@ -2111,6 +2111,142 @@ mod workflow_def_tests {
         );
     }
 
+    /// The `mcp-server` drop-in is governed exactly as designed (DES-mcp-server-workflow): eight
+    /// phases in order, one creator (`build`, evidence-floor pin), one verify-floor phase (`test`),
+    /// two cold evaluators after `test`, and an operator-gated Tool phase `install` that carries no
+    /// pin (it leaves the tree unchanged, so the evidence floor would deny it). No `deliver` phase —
+    /// wicked-crew composes it per run.
+    #[test]
+    fn mcp_server_drop_in_is_governed_as_designed() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/mcp-server.json");
+        let def =
+            WorkflowRegistry::def_from_file(&path).expect("mcp-server.json parses + validates");
+        assert_eq!(def.id, "mcp-server");
+        assert!(def.base_skill_ref.is_none(), "no base_skill_ref");
+        let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "scope",
+                "source-discovery",
+                "design",
+                "build",
+                "test",
+                "security-review",
+                "observability-review",
+                "install"
+            ]
+        );
+        let phase = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
+        const FLOOR: &str = "e2e7af1db9e48454";
+
+        let coders: Vec<&str> = def
+            .phases
+            .iter()
+            .filter(|p| p.executes_code)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(coders, ["build"], "build is the only executes_code phase");
+        let build = phase("build");
+        assert_eq!(build.role, PhaseRole::Creator);
+        assert_eq!(build.validator_pin.as_deref(), Some(FLOOR));
+        let creators: Vec<&str> = def
+            .phases
+            .iter()
+            .filter(|p| p.role == PhaseRole::Creator)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(creators, ["build"], "build is the one creator");
+
+        let verified: Vec<&str> = def
+            .phases
+            .iter()
+            .filter(|p| p.verified_evidence)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(
+            verified,
+            ["test"],
+            "test is the only verified_evidence phase"
+        );
+        assert_eq!(phase("test").validator_pin.as_deref(), Some(FLOOR));
+
+        for review in ["security-review", "observability-review"] {
+            let p = phase(review);
+            assert_eq!(p.role, PhaseRole::Evaluator, "{review} plays evaluator");
+            assert_eq!(
+                p.depends_on,
+                vec!["test".to_string()],
+                "{review} runs after test"
+            );
+        }
+
+        let install = phase("install");
+        match &install.executor {
+            PhaseExecutor::Tool { cmd } => assert!(
+                cmd.iter().any(|a| a.contains("scripts/mcp/install.py")),
+                "install's cmd names scripts/mcp/install.py: {cmd:?}"
+            ),
+            other => panic!("install must be a Tool executor, got {other:?}"),
+        }
+        assert_eq!(
+            install.gate,
+            GateSpec::HumanConfirm {
+                unconditional: true
+            },
+            "install pauses for the operator unconditionally"
+        );
+        assert!(install.validator_pin.is_none(), "install carries no pin");
+        assert!(install.skill_ref.is_none(), "install carries no skill_ref");
+        assert!(!install.executes_code && !install.verified_evidence);
+        assert_eq!(
+            install.depends_on,
+            vec![
+                "security-review".to_string(),
+                "observability-review".to_string()
+            ]
+        );
+
+        for p in &def.phases {
+            assert!(
+                p.instructions
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()),
+                "{} carries non-empty instructions (install's are its gate card)",
+                p.id
+            );
+            assert!(
+                p.required_deliverables.is_empty(),
+                "{} declares no deliverables",
+                p.id
+            );
+        }
+        let mut skills: Vec<&str> = def
+            .phases
+            .iter()
+            .filter_map(|p| p.skill_ref.as_deref())
+            .collect();
+        skills.sort_unstable();
+        skills.dedup();
+        assert_eq!(
+            skills,
+            [
+                "wicked-garden-mcp-scaffold",
+                "wicked-garden-platform-security-engineer",
+                "wicked-garden-qe-contract-testing-engineer",
+                "wicked-garden-qe-observability-test-engineer"
+            ]
+        );
+        assert!(
+            def.phases.iter().all(|p| p.id != "deliver"),
+            "deliver is composed by wicked-crew, never authored here"
+        );
+        // Registration accepts it: the F-039 / FINDING-055 rules hold as authored.
+        let mut reg = WorkflowRegistry::default();
+        reg.register(def).expect("mcp-server registers");
+    }
+
     /// F-039: an `executes_code` agent phase with an `auto` gate and no pin would fold `combined:
     /// true` over nothing evaluated — registration REFUSES it by name ("gate evaluates nothing:
     /// <phase>"), the pure lint names it, and a pin / a human gate / a Tool executor each satisfy
