@@ -4251,7 +4251,18 @@ pub(crate) fn unit_prompt(
         .workdir
         .as_deref()
         .and_then(crate::repo::worktree_layout);
-    skill_prompt(&input.unit, layout.as_deref(), form, skills)
+    let unit = author_directed(input);
+    skill_prompt(&unit, layout.as_deref(), form, skills)
+}
+
+/// The unit as its prompt reads it: a `walkthrough_plan` unit gains its author contract (core#753,
+/// [`crate::walkthrough::with_author_directive`]); every other unit is borrowed unchanged.
+fn author_directed(input: &StepInput) -> std::borrow::Cow<'_, WorkUnit> {
+    let roots = input
+        .governance
+        .as_ref()
+        .map_or(&[][..], |g| g.extra_write_roots.as_slice());
+    crate::walkthrough::with_author_directive(&input.unit, roots)
 }
 
 /// Ceiling on a prompt written to a pty as a single line, with headroom under `MAX_CANON`.
@@ -4282,7 +4293,8 @@ const MIN_USEFUL_LAYOUT: usize = 40;
 /// so the directive resolves by convention alone; `form` still spells it for the session's CLI.
 pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<String, String> {
     // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
-    let plain = skill_prompt(&input.unit, None, form, None);
+    let unit = author_directed(input);
+    let plain = skill_prompt(&unit, None, form, None);
     // FINDING-011: a pty turn is submitted line-based — the runner appends one `\n` to end the turn,
     // so ANY newline the prompt itself carries submits the turn EARLY. The worker then gets only the
     // text up to that byte and the remainder lands as a stray follow-up that desyncs the reused
@@ -4322,7 +4334,7 @@ pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<Stri
                 .as_deref()
                 .and_then(|d| crate::repo::worktree_layout_within(d, budget))
         });
-    Ok(skill_prompt(&input.unit, layout.as_deref(), form, None))
+    Ok(skill_prompt(&unit, layout.as_deref(), form, None))
 }
 
 /// Map a dash-form `skill_ref` onto the name the running CLI invokes it by (core#396).
@@ -7920,6 +7932,53 @@ mod tests {
     /// never on a Creator/Neutral unit, a `tool_cmd` unit or an engine-internal judge/triage
     /// prompt. An output that obeys the line parses PASS. The shipped `bug.verify` unit, planned
     /// as the planner plans it, still fits a pty turn with the line appended, newline-free.
+    /// core#753: the prompt a `walkthrough_plan` unit is actually sent on the wrapped/ACP path
+    /// names its storyline file under the declared author root; the pty path refuses it by name.
+    #[test]
+    fn the_walkthrough_author_prompt_names_its_storyline() {
+        let mut u = WorkUnit::pending("s:walkthrough_plan", "s", 4, "walkthrough_plan — pay once");
+        u.catalog = Some("walkthrough_plan".to_string());
+        u.role = crate::workflow::PhaseRole::Evaluator;
+        let author = std::env::temp_dir().join("ev-753").join("author");
+        let input = StepInput {
+            run_id: "s".to_string(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: "/x/estate.db".to_string(),
+                code_graph_db: None,
+                extra_write_roots: vec![author.to_string_lossy().into_owned()],
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let file = author
+            .join("walkthrough_plan")
+            .join("storyline.mjs")
+            .display()
+            .to_string();
+        let wrapped = unit_prompt(&input, SkillForm::ClaudePlugin, None);
+        assert!(wrapped.contains(&file), "{wrapped}");
+        // The pty composer: the contract plus the evaluator's verdict line outgrow one pty line, so
+        // the unit is refused fast and by name — never sent with the contract cut off, never
+        // discarded by the terminal. (The production binding runs wrapped/ACP seats.)
+        let err = pty_unit_prompt(&input, SkillForm::MirroredName)
+            .expect_err("the author contract does not fit one pty line");
+        assert!(err.contains("cannot exceed"), "{err}");
+        // The unit itself is untouched: the contract is folded into the prompt, not the record.
+        assert_eq!(input.unit.description, "walkthrough_plan — pay once");
+    }
+
     #[test]
     fn an_evaluator_prompt_ends_with_the_verdict_contract_on_every_form() {
         // The shipped evaluators whose authored instructions are longer than one pty turn (the

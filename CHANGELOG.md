@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core#753 (engine half) — a `walkthrough_plan` unit is told where its storyline goes.** The
+  unit was handed only `walkthrough_plan — <problem>` and the evaluator's no-worktree-writes
+  discipline, wrote no storyline, and its pinned lint denied on every live run. `unit_prompt`
+  (wrapped + ACP seats) now folds an author contract onto that unit's prompt: the exact
+  `<evidence root>/author/<step id>/storyline.mjs` file, derived from the ONE declared `…/author`
+  write root, that the directory is its write root, and that the pinned lint reads it. With no such
+  root (or two, or one carrying a control character) the prompt says the step cannot pass rather
+  than guessing a path. On a pty seat the longer prompt is refused fast and by name. The garden half
+  (no `walkthrough.mjs lint` action; `record` ignores `WICKED_WALKTHROUGH_AUTHOR`) is
+  wicked-garden#1231.
 - **The `mcp-server` workflow ships as a drop-in, with the `mcp-server` steering pack.**
   `workflows/mcp-server.json` (registered via `load_dir`, like `domain-extraction`) makes an MCP
   server from an OpenAPI document or hand-written integration code in eight phases: `scope`
