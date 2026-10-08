@@ -26,6 +26,25 @@ Two release tracks share this file, newest entry first regardless of track:
   (`printf x\ngit push --force`), not just 001/004. Still `effect: warn`, never blocking; a
   non-shell tool fires nothing. The tool-name selection token (#707) and the labelled-set re-measure
   are not in this change (the set's lane directory is gone).
+- **core#761 — the evaluator↔creator rework loop is capped: after 2 send-backs the next NOT
+  PASS opens a `review_adjudication` gate.** Run ad5a4ca7 ran 13 send-backs on one unit (~10 h of
+  creator time) because nothing bounded the loop; the team step has `MAX_STEP_REWORK = 2`
+  (DES-TEAMING-002 §8.8), the unit loop had no mirror. Now `review_context::MAX_REVIEW_SENDBACKS
+  = 2`: an evaluator verdict that is NOT PASS after two `sent_back` rounds opens
+  `awaitingHuman{gateKind: "review_adjudication"}` instead of the plain escalation. Its prompt
+  gives the round and send-back count and splits the verdict's `ITEM` lines into new /
+  re-raised (an earlier round failed the same item) / ruled. Arms: **approve = land with carried
+  items** (the evaluator unit counts — `Done`, `gateDecided{allow}` + `unitDone` — its FAIL
+  items recorded on the new `WorkUnit::carried_items`, the round booked `landed`, an operator
+  note kept as a ruling; the layer-3 boundary check still runs first and a policy veto still
+  cancels; the durable answer's action is `land_with_carried_items`), **request changes = one
+  more round** (the ordinary rewind; the next NOT PASS returns to this gate), **reject = stop**.
+  A floor re-run, an adopted suggestion or an intent amendment is refused at this gate before
+  the row resolves. Evaluator ≠ creator is unchanged — the human decides; no seat re-grades.
+- **A `judge_unavailable` denial is its own gate class** (core#774 follow-up): `denial_class`
+  mapped it to `verdict_not_pass`, so the gate read "verdict is NOT PASS" for a judge that never
+  ran. It now opens `gateEscalated{condition: "judge_unavailable"}` with a prompt naming the
+  failed seats (the reason's head line) and saying the work was not rejected.
 
 - **core#760 — the evaluator is handed its review history: a numbered done-when checklist, its
   own prior verdicts, the operator's rulings and the latest floor record.** Run ad5a4ca7 (S15e):

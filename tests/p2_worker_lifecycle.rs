@@ -121,6 +121,7 @@ mod tests {
             rework_amendment: None,
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
+            carried_items: Vec::new(),
             catalog: None,
             exclude_seats: Vec::new(),
         }

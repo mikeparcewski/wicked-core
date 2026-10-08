@@ -1049,6 +1049,11 @@ pub struct WorkUnit {
     /// evaluator that reviews it. Skipped on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_rulings: Vec<OperatorRuling>,
+    /// (core#761) The FAIL items an operator LANDED this (Evaluator) unit over at its
+    /// `review_adjudication` gate — the review's open items carried forward with the work, for
+    /// the run record and the PR body. Skipped on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_items: Vec<String>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -1240,6 +1245,7 @@ impl WorkUnit {
             rework_amendment: None,
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
+            carried_items: Vec::new(),
             status: UnitStatus::Pending,
             exclude_seats: Vec::new(),
         }

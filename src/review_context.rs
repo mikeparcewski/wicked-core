@@ -11,8 +11,9 @@
 //!
 //! The verdict contract this brief asks for — one `ITEM <n>: PASS | FAIL | RULED` line per
 //! checklist item above the `VERDICT:` line — gives a later round (and the operator) stable item
-//! numbers to hold a verdict to. The `VERDICT:` line is still the only thing the gate fold parses
-//! ([`crate::validator::parse_evaluator_verdict`]).
+//! numbers to hold a verdict to; [`parse_review_items`] reads them back when the rework cap
+//! (core#761, [`MAX_REVIEW_SENDBACKS`]) opens its `review_adjudication` gate. The `VERDICT:` line
+//! is still the only thing the gate fold parses ([`crate::validator::parse_evaluator_verdict`]).
 
 use crate::domain::{IntentAmendment, WorkUnit};
 
@@ -115,6 +116,185 @@ fn list_item(trimmed: &str) -> Option<&str> {
         .find_map(|b| rest.strip_prefix(b))
         .unwrap_or(rest);
     Some(rest.trim())
+}
+
+/// One `ITEM <n>: <STATUS> — …` line a verdict carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewItem {
+    pub n: u32,
+    /// `PASS` | `FAIL` | `RULED` (uppercased).
+    pub status: String,
+    /// The line as written (trimmed of decoration).
+    pub line: String,
+}
+
+/// The `ITEM <n>: PASS | FAIL | RULED` lines of a verdict, in order; the LAST line for an item
+/// number wins (a reviewer restating an item). Decoration (`-`, `*`, `#`, `>`, backticks) is
+/// tolerated; a line whose status is none of the three is not an item line.
+pub(crate) fn parse_review_items(text: &str) -> Vec<ReviewItem> {
+    let mut out: Vec<ReviewItem> = Vec::new();
+    for line in text.lines() {
+        let bare = line
+            .trim()
+            .trim_start_matches(['#', '*', '-', '>', '`', ' ', '\t'])
+            .trim_end();
+        let Some(head) = bare.get(..4) else { continue };
+        if !head.eq_ignore_ascii_case("item") {
+            continue;
+        }
+        let rest = bare[4..].trim_start();
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let Ok(n) = rest[..digits].parse::<u32>() else {
+            continue;
+        };
+        let Some((_, after)) = rest[digits..].split_once(':') else {
+            continue;
+        };
+        let status = after
+            .split_whitespace()
+            .next()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_uppercase()
+            })
+            .unwrap_or_default();
+        if !matches!(status.as_str(), "PASS" | "FAIL" | "RULED") {
+            continue;
+        }
+        let line = bare.trim_matches(['*', '`']).trim().to_string();
+        out.retain(|i| i.n != n);
+        out.push(ReviewItem { n, status, line });
+    }
+    out.sort_by_key(|i| i.n);
+    out
+}
+
+/// (core#761) THE REWORK CAP: after this many send-backs of one review, the next NOT-PASS verdict
+/// opens [`REVIEW_ADJUDICATION_GATE`] instead of the plain escalation (retry / send back /
+/// reject). Mirrors the team step's `MAX_STEP_REWORK` (DES-TEAMING-002 §8.8) and the program's
+/// two-round cap on PR adjudication. Before it nothing bounded the evaluator↔creator loop: run
+/// ad5a4ca7 ran 13 send-backs on one unit, ~10 h of creator time, before a human stopped it.
+pub(crate) const MAX_REVIEW_SENDBACKS: usize = 2;
+
+/// The gate kind ([`crate::event::CoreEvent::AwaitingHuman`]`.gate_kind`) of the capped review:
+/// approve = LAND WITH CARRIED ITEMS, request changes = ONE MORE ROUND, reject = STOP.
+pub(crate) const REVIEW_ADJUDICATION_GATE: &str = "review_adjudication";
+
+/// [`crate::domain::ReviewRound::outcome`] for a verdict the operator landed the work over.
+pub(crate) const REVIEW_LANDED: &str = "landed";
+
+/// How many of `rounds` were sent back to the creator.
+pub(crate) fn sent_back_count(rounds: &[crate::domain::ReviewRound]) -> usize {
+    rounds
+        .iter()
+        .filter(|r| r.outcome.as_deref() == Some(crate::domain::REVIEW_SENT_BACK))
+        .count()
+}
+
+/// The current verdict's items, split for the adjudication prompt: a FAIL item is NEW when no
+/// earlier round failed the same item number, RE-RAISED when one did; RULED items are listed as
+/// such. Each list holds the item lines as written.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ItemTally {
+    pub new: Vec<String>,
+    pub re_raised: Vec<String>,
+    pub ruled: Vec<String>,
+}
+
+pub(crate) fn tally_items(
+    rounds: &[crate::domain::ReviewRound],
+    attempt: u32,
+    verdict: &str,
+) -> ItemTally {
+    let prior_fail: std::collections::HashSet<u32> = rounds
+        .iter()
+        .filter(|r| r.attempt != attempt)
+        .flat_map(|r| parse_review_items(&r.findings))
+        .filter(|i| i.status == "FAIL")
+        .map(|i| i.n)
+        .collect();
+    let mut t = ItemTally::default();
+    for i in parse_review_items(verdict) {
+        match i.status.as_str() {
+            "FAIL" if prior_fail.contains(&i.n) => t.re_raised.push(i.line),
+            "FAIL" => t.new.push(i.line),
+            "RULED" => t.ruled.push(i.line),
+            _ => {}
+        }
+    }
+    t
+}
+
+/// What a LANDED review carries forward: its FAIL item lines, or — a verdict written without item
+/// lines — its own words (bounded tail) as one entry.
+pub(crate) fn carried_items(verdict: &str) -> Vec<String> {
+    let fails: Vec<String> = parse_review_items(verdict)
+        .into_iter()
+        .filter(|i| i.status == "FAIL")
+        .map(|i| i.line)
+        .collect();
+    if !fails.is_empty() || verdict.trim().is_empty() {
+        return fails;
+    }
+    vec![tail(verdict, ROUND_FINDINGS_CAP)]
+}
+
+/// One bounded list for the prompt: up to five lines, each ≤ 160 chars, then `(+N more)`.
+fn prompt_list(lines: &[String]) -> String {
+    let mut parts: Vec<String> = lines
+        .iter()
+        .take(5)
+        .map(|l| {
+            if l.chars().count() > 160 {
+                format!("{}…", l.chars().take(160).collect::<String>())
+            } else {
+                l.clone()
+            }
+        })
+        .collect();
+    if lines.len() > 5 {
+        parts.push(format!("(+{} more)", lines.len() - 5));
+    }
+    parts.join("; ")
+}
+
+/// The `review_adjudication` gate's prompt: the round, the send-backs so far against the cap, the
+/// items split new / re-raised / ruled, and the three arms in the operator's words.
+pub(crate) fn adjudication_prompt(
+    ord: u32,
+    creator_ord: u32,
+    rounds: &[crate::domain::ReviewRound],
+    attempt: u32,
+    verdict: &str,
+    note: &str,
+) -> String {
+    let t = tally_items(rounds, attempt, verdict);
+    let mut items = Vec::new();
+    for (name, list) in [
+        ("new", &t.new),
+        ("re-raised", &t.re_raised),
+        ("ruled", &t.ruled),
+    ] {
+        if !list.is_empty() {
+            items.push(format!("{name} ({}): {}", list.len(), prompt_list(list)));
+        }
+    }
+    let items = if items.is_empty() {
+        "The verdict carries no ITEM lines; its findings ride the gate's verdict summary."
+            .to_string()
+    } else {
+        format!("Items — {}.", items.join(" · "))
+    };
+    format!(
+        "Unit {ord} verdict is NOT PASS again — round {}, after {} send-backs to unit \
+         {creator_ord} (the rework cap is {MAX_REVIEW_SENDBACKS}), so this gate adjudicates \
+         instead of sending it back. {items} Approve = LAND WITH CARRIED ITEMS: the creator's \
+         tree is accepted as it stands, the FAIL items are recorded as carried on unit {ord} and \
+         the run moves on. Request changes = ONE MORE ROUND: the review goes back to unit \
+         {creator_ord} once more (the next NOT PASS returns here). Reject = STOP the run{note}",
+        rounds.len(),
+        sent_back_count(rounds),
+    )
 }
 
 fn tail(s: &str, cap: usize) -> String {
@@ -303,6 +483,73 @@ mod tests {
             vec!["The page loads in one pass.".to_string()]
         );
         assert!(done_when_items("just prose, nothing named done when here").is_empty());
+    }
+
+    #[test]
+    fn item_lines_parse_with_decoration_and_the_last_line_for_an_item_wins() {
+        let v = "Findings\n- ITEM 1: PASS — ok\n**ITEM 2: FAIL — GateRow.tsx:188 empty**\nItem \
+                 3: ruled — gate 6\nITEM 4: maybe\nITEM 2: FAIL — restated\nVERDICT: FAIL";
+        let items = parse_review_items(v);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.n, i.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "PASS"), (2, "FAIL"), (3, "RULED")]
+        );
+        assert!(items[1].line.ends_with("restated"));
+    }
+
+    fn round(attempt: u32, findings: &str, sent_back: bool) -> crate::domain::ReviewRound {
+        crate::domain::ReviewRound {
+            attempt,
+            findings: findings.into(),
+            outcome: sent_back.then(|| crate::domain::REVIEW_SENT_BACK.to_string()),
+        }
+    }
+
+    /// (core#761) The adjudication prompt splits the current verdict's items against the earlier
+    /// rounds — re-raised (an earlier round failed the same item), new, ruled — counts the
+    /// send-backs against the cap and names the three arms.
+    #[test]
+    fn the_adjudication_prompt_splits_new_re_raised_and_ruled_items_and_names_the_arms() {
+        let rounds = vec![
+            round(0, "ITEM 1: FAIL — a\nITEM 2: PASS\nVERDICT: FAIL", true),
+            round(1, "ITEM 2: FAIL — b\nVERDICT: FAIL", true),
+            round(2, "", false),
+        ];
+        let verdict =
+            "ITEM 1: FAIL — a again\nITEM 2: RULED — gate 6\nITEM 3: FAIL — c\nVERDICT: FAIL";
+        let t = tally_items(&rounds, 2, verdict);
+        assert_eq!(t.re_raised, vec!["ITEM 1: FAIL — a again".to_string()]);
+        assert_eq!(t.new, vec!["ITEM 3: FAIL — c".to_string()]);
+        assert_eq!(t.ruled, vec!["ITEM 2: RULED — gate 6".to_string()]);
+        assert_eq!(sent_back_count(&rounds), 2);
+        let p = adjudication_prompt(7, 6, &rounds, 2, verdict, "");
+        assert!(
+            p.starts_with(
+                "Unit 7 verdict is NOT PASS again — round 3, after 2 send-backs to unit 6"
+            ),
+            "{p}"
+        );
+        for want in [
+            "new (1): ITEM 3: FAIL — c",
+            "re-raised (1): ITEM 1: FAIL — a again",
+            "ruled (1): ITEM 2: RULED — gate 6",
+            "Approve = LAND WITH CARRIED ITEMS",
+            "Request changes = ONE MORE ROUND",
+            "Reject = STOP the run",
+        ] {
+            assert!(p.contains(want), "{want}: {p}");
+        }
+        assert_eq!(
+            carried_items(verdict),
+            vec![
+                "ITEM 1: FAIL — a again".to_string(),
+                "ITEM 3: FAIL — c".to_string()
+            ]
+        );
+        assert_eq!(carried_items("no items here\nVERDICT: FAIL").len(), 1);
     }
 
     fn unit(ord: u32, role: crate::workflow::PhaseRole) -> WorkUnit {
