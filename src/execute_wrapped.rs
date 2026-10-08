@@ -1945,9 +1945,20 @@ impl WrappedCliStepRunner {
                         Some(armed.sandbox)
                     }
                     // codex's own `--sandbox workspace-write|read-only` is its boundary; its class
-                    // is `os_sandbox` only while its trust flags carry that mode (IG1-core-1).
+                    // is `os_sandbox` only while its trust flags carry that mode (IG1-core-1). The
+                    // record is not the process: the boundary counts only when the LAUNCHED argv
+                    // runs codex itself with that bounded mode and no bypass flag.
                     Err(crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn) => {
-                        floor = Ok(crate::worker_sandbox::SEAT_CODEX_BOUNDARY);
+                        floor = if launches_bounded_codex(&argv) {
+                            Ok(crate::worker_sandbox::SEAT_CODEX_BOUNDARY)
+                        } else {
+                            Err((
+                                "the launched invocation does not run codex with its own bounded \
+                                 --sandbox mode"
+                                    .to_string(),
+                                false,
+                            ))
+                        };
                         None
                     }
                     Err(why) => {
@@ -2472,9 +2483,18 @@ pub(crate) fn build_worker_command(
     cmd
 }
 
-/// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
-/// Mirrors `resolve_invocation`'s two-step key lookup: exact key first, then the CLI key
-/// behind it (core#595), so `claude#2` inherits the `claude` registry record's flag.
+/// (IG1-core-2, review) Whether `argv` — the command a unit actually launches — runs codex itself
+/// (its program's stem is `codex`) with its own sandbox in a bounded mode and no bypass flag. The
+/// seat record's class is a prediction; a wrapper or an invocation that drops the mode is refused.
+fn launches_bounded_codex(argv: &[String]) -> bool {
+    argv.first().is_some_and(|bin| {
+        std::path::Path::new(bin)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == "codex")
+    }) && wicked_council::codex_sandbox_is_bounded(argv.get(1..).unwrap_or_default())
+}
+
 /// (IG1-core-2) The governance class of seat `cli_key`, off the merged registry record (the same
 /// two-step key lookup as [`worker_os_sandbox_enabled`]). A seat with no record runs its key as
 /// its binary with no trust flags, so it is classed from exactly that.
@@ -2508,6 +2528,9 @@ pub(crate) fn seat_governance_class(cli_key: &str) -> wicked_council::Governance
     wicked_council::governance_class(&unregistered)
 }
 
+/// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
+/// Mirrors `resolve_invocation`'s two-step key lookup: exact key first, then the CLI key
+/// behind it (core#595), so `claude#2` inherits the `claude` registry record's flag.
 pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
     let user = wicked_council::registry::default_user_path();
     let clis = wicked_council::registry::load(user.as_deref())
@@ -5500,6 +5523,107 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// IG1-core-2 (review): codex's own sandbox counts as the floor only when the LAUNCHED argv
+    /// runs codex with a bounded mode — the record's class is a prediction, not the process.
+    #[test]
+    fn the_seat_owned_codex_boundary_is_judged_on_the_launched_argv() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(launches_bounded_codex(&v(&[
+            "codex",
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "p"
+        ])));
+        assert!(launches_bounded_codex(&v(&[
+            "/usr/local/bin/codex",
+            "--sandbox=read-only",
+            "p"
+        ])));
+        assert!(!launches_bounded_codex(&v(&[
+            "/bin/echo",
+            "--sandbox",
+            "workspace-write"
+        ])));
+        assert!(!launches_bounded_codex(&v(&["codex", "exec", "p"])));
+        assert!(!launches_bounded_codex(&v(&[
+            "codex",
+            "--sandbox",
+            "workspace-write",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ])));
+        assert!(!launches_bounded_codex(&[]));
+    }
+
+    /// IG1-core-2 (review): a governed unit on the `codex` seat whose invocation does not launch
+    /// codex is NOT governed by codex's sandbox — no marker, `governed: false`, both disclosures.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_seat_launching_another_binary_is_not_governed_by_codex_sandbox() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        if seat_governance_class("codex") != wicked_council::GovernanceClass::OsSandboxFloor {
+            eprintln!("execute_wrapped: this host's codex record is not floor-class — skips");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let mut u = WorkUnit::pending("s:u2", "s", 2, "build the work");
+        u.assigned_cli = Some("codex".to_string());
+        u.assigned_invocation = Some("/bin/echo {PROMPT}".to_string());
+        let run_id = format!("run-ig1c2-cdx-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let dir = std::env::temp_dir().join(format!("wicked-ig1c2-cdx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = StepInput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = runner.run_unit(&input);
+        let events: Vec<_> = rx.try_iter().collect();
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.governed, "an echo is not codex's sandbox");
+        assert!(
+            events.iter().any(|c| matches!(
+                c,
+                crate::command::Command::EmitEvent(
+                    crate::event::CoreEvent::GovernanceUnenforced { reason, .. }
+                ) if reason.contains("does not run codex with its own bounded")
+            )),
+            "{} events, none matched",
+            events.len()
+        );
+        assert!(
+            events.iter().any(|c| matches!(
+                c,
+                crate::command::Command::EmitEvent(
+                    crate::event::CoreEvent::SandboxUnenforced { .. }
+                )
+            )),
+            "{} events, none matched",
+            events.len()
+        );
     }
 
     /// The converse, so the event cannot degrade into noise on every ungoverned internal call:

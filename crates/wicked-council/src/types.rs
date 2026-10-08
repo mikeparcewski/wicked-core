@@ -176,8 +176,9 @@ fn is_codex_seat(seat: &AgenticCli) -> bool {
 /// Whether codex's trust flags keep its OWN OS sandbox on in a bounded mode
 /// (`--sandbox workspace-write` | `--sandbox read-only`, or the `--sandbox=<mode>` spelling) and
 /// carry no bypass flag. `trust_flags = []` leaves codex on its default read-only sandbox but that
-/// is not the engine-recorded posture, so it is not accepted as the floor (IG1 Risk 3).
-fn codex_sandbox_is_bounded(trust_flags: &[String]) -> bool {
+/// is not the engine-recorded posture, so it is not accepted as the floor (IG1 Risk 3). The engine
+/// also applies it to the LAUNCHED argv, so a record whose invocation drops the mode is not trusted.
+pub fn codex_sandbox_is_bounded(trust_flags: &[String]) -> bool {
     const BOUNDED: [&str; 2] = ["workspace-write", "read-only"];
     if trust_flags
         .iter()

@@ -5701,38 +5701,8 @@ fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("refusing scratch root {} ({e})", cwd.display()))
 }
 
-/// May `cli_key` join a chat in `scope` (Copilot, #426)? An UNSCOPED chat (no roots, no graph)
-/// promises nothing beyond its scratch root and admits every seat. A SCOPED chat promises that
-/// its roots are read-only and that the seats see nothing else — a promise this engine can keep
-/// only through a channel the seat actually passes through: the chat boundary on
-/// `session/request_permission` (an adapter admitted to input governance asks for every tool
-/// call — claude and opencode, as registered; copilot's `--acp` is NOT admitted) or the kernel
-/// write floor (`os_sandbox` armed on the seat's record). An adapter that asks no permissions and
-/// runs under no floor (pi-acp, codex-acp, copilot --acp, agy-acp as registered) would run
-/// unbounded behind a read-only statement, so it is refused BY NAME for
-/// scoped chats — the open still succeeds for the seats that can be held, and the per-seat
-/// outcome says why this one cannot. Read containment for such adapters needs a read jail this
-/// platform does not have; the residual is stated rather than hidden.
-fn scoped_seat_admission(
-    cli_key: &str,
-    scope: &ChatScope,
-    config: &AcpConfig,
-) -> Result<(), String> {
-    let scoped = scope.code_graph_db.is_some() || !scope.read_roots.is_empty();
-    if !scoped || config.acp_input_governance || config.os_sandbox {
-        return Ok(());
-    }
-    Err(format!(
-        "seat '{cli_key}' cannot join a SCOPED chat: its ACP adapter '{}' asks no permissions (the \
-         chat's read-only boundary never sees its tool calls) and its record arms no OS sandbox, so \
-         the scoped repositories could not be held read-only; open the chat unscoped for this seat, \
-         or set `os_sandbox = true` on its [cli.acp] record",
-        config.binary
-    ))
-}
-
 /// The POST-SPAWN half of scoped-chat admission (core#410 hardening, deferred hunk #4):
-/// [`scoped_seat_admission`] judged the RECORD; this judges the PROCESS the spawn actually produced.
+/// The record was judged at admission; this judges the PROCESS the spawn actually produced.
 /// A seat that relies on the kernel write floor (no permission channel) is refused when the floor
 /// did not arm (`sandbox_downgrade` — no launcher on this host, a root that failed to canonicalize);
 /// a seat that relies on ACP governance is refused when the spawn-time version pin did not prove
@@ -7438,8 +7408,10 @@ impl AcpStepRunner {
             return Ok(Arc::clone(p));
         }
         let (config, seat_cli, worker_cli) = monitor_admission(seat)?;
+        // `monitor_admission` IS the record-level admission (three refusals, by class): a
+        // self-sandboxing codex member arms no engine floor and asks no permissions, yet its own
+        // bounded sandbox holds the read-only boundary, so no second record check refuses it.
         let scope = chat_scope_of(scope);
-        scoped_seat_admission(seat, &scope, &config)?;
         ensure_chat_scratch_root(&scope.cwd).map_err(|e| format!("monitor '{pool_key}': {e}"))?;
         // The same ladder a chat seat is handed from; unlike a chat, a monitor may run
         // skill-less (its work is the diff in its prompt), but a FAILED ladder refuses it.
@@ -13126,56 +13098,6 @@ transport = "stdio"
         );
         drop(dir);
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// Copilot, #426: a seat whose adapter asks no permissions and runs under no kernel floor
-    /// cannot be held to a scoped chat's read-only roots — refused by name for SCOPED chats,
-    /// admitted to unscoped ones; an admitted or sandboxed adapter joins either.
-    #[test]
-    fn a_permission_less_unsandboxed_seat_is_refused_for_a_scoped_chat_only() {
-        let scoped = ChatScope {
-            cwd: std::env::temp_dir().join("wicked-chat-adm"),
-            code_graph_db: None,
-            read_roots: vec![std::env::temp_dir()
-                .join("repo")
-                .to_string_lossy()
-                .into_owned()],
-        };
-        let unscoped = ChatScope {
-            read_roots: vec![],
-            ..scoped.clone()
-        };
-        let mut cfg = AcpConfig {
-            binary: "pi-acp".into(),
-            start_args: vec![],
-            transport: AcpTransport::default(),
-            auth_method: None,
-            acp_input_governance: false,
-            os_sandbox: false,
-            acp_governance_env: None,
-            verified_version: None,
-            governance_floor: None,
-        };
-        let err = scoped_seat_admission("pi", &scoped, &cfg).expect_err("refused");
-        assert!(
-            err.contains("pi") && err.contains("SCOPED") && err.contains("pi-acp"),
-            "{err}"
-        );
-        assert!(
-            scoped_seat_admission("pi", &unscoped, &cfg).is_ok(),
-            "unscoped admits everyone"
-        );
-        cfg.os_sandbox = true;
-        assert!(
-            scoped_seat_admission("pi", &scoped, &cfg).is_ok(),
-            "the kernel floor holds it"
-        );
-        cfg.os_sandbox = false;
-        cfg.acp_input_governance = true;
-        assert!(
-            scoped_seat_admission("claude", &scoped, &cfg).is_ok(),
-            "the boundary holds it"
-        );
     }
 
     /// core#410 hardening (deferred hunk #4): the post-spawn half of admission judges the PROCESS —
