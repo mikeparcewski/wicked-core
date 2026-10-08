@@ -116,7 +116,6 @@ pub(crate) mod test_env {
 }
 
 pub use acp_runner::AcpStepRunner;
-pub use acp_runner::{ChatInfo, ChatOpenOutcomes, ChatScope};
 pub use actor::{NoEligibleSeat, RunBusy, RunExists, CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
@@ -388,74 +387,6 @@ impl Drop for ShutdownGuard {
     }
 }
 
-/// Start the background thread that reclaims idle chats.
-///
-/// Every warm chat seat pins an ACP bridge plus an agent child process — ~520 MB resident apiece —
-/// and nothing else ever releases them: `chat_close` reaps correctly but is only called by a
-/// client that is still alive to call it. A closed laptop lid, a crashed tab, or a page navigated
-/// away leaves the seats warm for the daemon's whole lifetime (FINDING-027: 25 processes / 3.30 GB
-/// after 7h34m, still climbing during pure observation). This thread is the only reclamation path
-/// that does not depend on the client, which is exactly why it has to exist.
-///
-/// Holds a [`Weak`](std::sync::Weak), so it stops when the last `Core`/runner handle drops instead
-/// of pinning the runner alive forever and inverting the leak it was written to fix.
-///
-/// `WICKED_CHAT_IDLE_SECS=0` disables it entirely, for a host that would rather pay the memory
-/// than ever have a chat reclaimed underneath it.
-///
-/// A chat a run was launched from (crew#619, [`Core::chat_hold`]) is passed over while the STORE
-/// says that run is non-terminal: asked once per sweep over `tx`, and only when some chat is held.
-fn spawn_chat_reaper(runner: &std::sync::Arc<AcpStepRunner>, tx: Sender<Command>) {
-    let ttl = AcpStepRunner::chat_idle_ttl();
-    if ttl.is_zero() {
-        return;
-    }
-    let weak = std::sync::Arc::downgrade(runner);
-    // Sweep at a fraction of the TTL so a chat is reclaimed within ~10% of when it aged out rather
-    // than up to a full TTL late; floored at 1s so a tiny test TTL cannot spin the CPU.
-    let tick = std::cmp::max(ttl / 10, std::time::Duration::from_secs(1));
-    std::thread::spawn(move || loop {
-        std::thread::sleep(tick);
-        // Upgrade, act, and DROP the strong ref before sleeping again — holding it across the
-        // sleep would keep the runner (and its child processes) alive past the Core.
-        match weak.upgrade() {
-            Some(runner) => {
-                let live = live_runs(&tx, &runner.chat_held_runs());
-                runner.chat_reap_idle(ttl, &|run| live.contains(run));
-            }
-            None => break,
-        }
-    });
-}
-
-/// Which of `runs` the store reports non-terminal (crew#619's chat holds). No query when `runs` is
-/// empty, the common case. A store that cannot answer keeps every hold: a chat kept warm one sweep
-/// too long costs memory, while a chat reclaimed under a live run loses the operator's thread.
-fn live_runs(tx: &Sender<Command>, runs: &[String]) -> std::collections::HashSet<String> {
-    if runs.is_empty() {
-        return Default::default();
-    }
-    let keep_all = || runs.iter().cloned().collect();
-    let (reply, rx) = channel();
-    if tx.send(Command::Projects(reply)).is_err() {
-        return keep_all();
-    }
-    match rx.recv() {
-        Ok(Ok(views)) => views
-            .into_iter()
-            .filter(|v| {
-                runs.contains(&v.session.id)
-                    && !matches!(
-                        v.session.status,
-                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
-                    )
-            })
-            .map(|v| v.session.id)
-            .collect(),
-        _ => keep_all(),
-    }
-}
-
 /// A handle to the core runtime. Clone freely — every clone funnels into the single store-owning
 /// actor thread, so callers compose the core services without contending on the SQLite file. When
 /// the last clone drops, the actor shuts down (see [`ShutdownGuard`]).
@@ -466,11 +397,6 @@ pub struct Core {
     /// `resize_terminal` act on this DIRECTLY — no store round-trip — so keystroke I/O never queues
     /// behind the single store-writer actor. Shared (cloned) with the actor, which owns open/close.
     pty: terminal::PtyMap,
-    /// The concrete ACP runner handle for CHAT sessions (crew#165 / core#13). Chat acts on the
-    /// session pool DIRECTLY (off-actor — warm-ups and turns are slow I/O that must not queue
-    /// behind the single store-writer); its events still flow through the actor's emit point.
-    /// `None` when the engine was spawned with an injected non-ACP runner — chat unsupported.
-    chat: Option<std::sync::Arc<AcpStepRunner>>,
     /// Where this core's durable event logs live (`<store>.events`, see [`crate::event_log`]). Held on
     /// the handle rather than fetched from the actor because reading a run's history is a plain file
     /// read: routing it through the command channel would queue an evidence read behind whatever the
@@ -538,106 +464,6 @@ impl Core {
     pub fn spawn(path: impl Into<String>) -> Core {
         let (core, _runner) = Core::spawn_with_acp_sessions(path);
         core
-    }
-
-    // ── Chat sessions (crew#165 / core#13): warm ACP seats + group fan-out ─────────
-
-    fn chat_runner(&self) -> anyhow::Result<&std::sync::Arc<AcpStepRunner>> {
-        self.chat.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("chat unsupported: engine spawned without the ACP runner")
-        })
-    }
-
-    /// Eagerly warm one ACP session per seat for `chat_id`, in `scope` (core#410 / crew#502):
-    /// the seats run in `scope.cwd` — the chat's own scratch root, never this process's working
-    /// directory (F-067) — grounded on `scope.code_graph_db` through the READ-ONLY estate MCP,
-    /// with `scope.read_roots` advertised. Blocking (spawn + handshake per seat) — call off any
-    /// latency-sensitive thread. Per-seat outcomes returned; the same outcomes stream to
-    /// subscribers as `ChatSessionReady`/`ChatSessionFailed`.
-    pub fn chat_open(
-        &self,
-        chat_id: &str,
-        clis: &[String],
-        scope: ChatScope,
-    ) -> anyhow::Result<ChatOpenOutcomes> {
-        let runner = self.chat_runner()?;
-        runner
-            .chat_open(chat_id, clis, scope)
-            .map_err(|e| anyhow::anyhow!(e))
-    }
-
-    /// Fan `text` out to the chat's warm seats (all, or the named subset) — one thread per
-    /// seat so replies stream in parallel as `ChatDelta`/`ChatReply` events. Ack-fast:
-    /// returns the seats targeted, not their replies. Every turn runs in the scope recorded at
-    /// [`Core::chat_open`]; there is no per-message working directory.
-    pub fn chat_send(
-        &self,
-        chat_id: &str,
-        text: &str,
-        targets: Option<Vec<String>>,
-    ) -> anyhow::Result<Vec<String>> {
-        let runner = self.chat_runner()?;
-        let seats = match targets {
-            Some(t) if !t.is_empty() => t,
-            _ => runner.chat_seats(chat_id),
-        };
-        if seats.is_empty() {
-            anyhow::bail!("chat '{chat_id}' has no warm seats — open it first");
-        }
-        for cli in &seats {
-            let runner = runner.clone();
-            let tx = self.tx.clone();
-            let (chat_id, cli, text) = (chat_id.to_string(), cli.clone(), text.to_string());
-            std::thread::spawn(move || {
-                let outcome = runner.chat_turn(&chat_id, &cli, &text);
-                // DES-L5: the reply carries the turn's usage when the bridge reported one; a
-                // failed turn (evicted seat) carries the reason as its text and no usage.
-                let (ok, body, usage) = match outcome {
-                    Ok(reply) => (true, reply.text, reply.usage),
-                    Err(e) => (false, e, None),
-                };
-                let _ = tx.send(Command::EmitEvent(CoreEvent::ChatReply {
-                    chat: chat_id,
-                    cli_key: cli,
-                    text: body,
-                    ok,
-                    usage,
-                }));
-            });
-        }
-        Ok(seats)
-    }
-
-    /// The seats currently warm for `chat_id`.
-    pub fn chat_seats(&self, chat_id: &str) -> anyhow::Result<Vec<String>> {
-        Ok(self.chat_runner()?.chat_seats(chat_id))
-    }
-
-    /// Every chat currently holding warm seats, with how long each has been idle.
-    ///
-    /// Each warm seat pins a bridge plus an agent child process (~520 MB resident), and clients
-    /// mint chat ids freely — without an enumerate surface an accumulation is invisible until the
-    /// host runs out of memory (FINDING-027).
-    pub fn chat_list(&self) -> anyhow::Result<Vec<crate::acp_runner::ChatInfo>> {
-        Ok(self.chat_runner()?.chat_list())
-    }
-
-    /// Hold `chat_id` warm for `run_id`, a run launched from it (crew#619): the idle reaper passes
-    /// the chat over until the run is terminal, then its idle clock restarts. `Ok(false)` when the
-    /// chat is not open on this engine (nothing to hold). Call it right after the launch returns.
-    pub fn chat_hold(&self, chat_id: &str, run_id: &str) -> anyhow::Result<bool> {
-        Ok(self.chat_runner()?.chat_hold(chat_id, run_id))
-    }
-
-    /// Close a chat's warm sessions (idempotent); emits `ChatClosed { reason: "requested" }`.
-    ///
-    /// Always `Requested`: this entry point is only ever reached from an operator surface. The
-    /// daemon's own reclamations go through the runner directly with their own reason, so a client
-    /// can always tell "I closed this" from "the daemon took it back".
-    pub fn chat_close(&self, chat_id: &str) -> anyhow::Result<()> {
-        self.chat_runner()?
-            .chat_close(chat_id, crate::acp_runner::ChatCloseReason::Requested);
-        Ok(())
     }
 
     /// Spawn the store actor with INJECTED engine seams — the council `dispatcher` (vote collection)
@@ -773,7 +599,6 @@ impl Core {
         let core = Core {
             tx: tx.clone(),
             pty,
-            chat: None, // PTY runner — ACP chat sessions unavailable
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             team: team_cfg,
@@ -789,8 +614,6 @@ impl Core {
     /// caller can call [`AcpStepRunner::drop_session`] after each run completes to release the
     /// ACP child processes. See [`Core::spawn`] for the simpler version that manages the runner
     /// internally.
-    ///
-    /// Also starts the chat reaper — see [`spawn_chat_reaper`].
     pub fn spawn_with_acp_sessions(
         path: impl Into<String>,
     ) -> (Core, std::sync::Arc<AcpStepRunner>) {
@@ -840,7 +663,6 @@ impl Core {
                 team_link,
             )
         });
-        spawn_chat_reaper(&runner, tx.clone());
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
         // it polls strictly after the bus tail as of now, or has reported itself not armed.
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
@@ -872,7 +694,6 @@ impl Core {
         let core = Core {
             tx: tx.clone(),
             pty,
-            chat: Some(runner.clone()),
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             team: team_cfg,
@@ -932,7 +753,6 @@ impl Core {
         Core {
             tx: tx.clone(),
             pty,
-            chat: None, // injected runner (tests / bus seam) — ACP chat sessions unavailable
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             team: team_cfg,
@@ -1979,107 +1799,6 @@ impl Core {
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    /// crew#619: the reaper's liveness oracle reads the STORE. A run paused at a gate is live
-    /// (the operator is mid-run), a cancelled one is not, and an id the store has never heard of
-    /// is not live either, so a hold on it is released rather than kept forever.
-    #[test]
-    fn the_chat_reapers_liveness_oracle_reads_run_status_from_the_store() {
-        use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
-        struct Ballot;
-        impl Dispatcher for Ballot {
-            fn dispatch(&self, cli: &AgenticCli, _t: &wicked_council::CouncilTask) -> Option<Vote> {
-                Some(Vote {
-                    cli: cli.key.clone(),
-                    recommendation: "x".into(),
-                    top_risk: "none".into(),
-                    change_my_mind: "no".into(),
-                    disqualifier: None,
-                    confidence: Confidence::default(),
-                    provenance: "stub".into(),
-                })
-            }
-        }
-        let cli = |key: &str| AgenticCli {
-            key: key.into(),
-            display_name: key.into(),
-            binary: "unused".into(),
-            headless_invocation: "unused {PROMPT}".into(),
-            category: Category::default(),
-            input_mode: InputMode::default(),
-            version_probe: vec![],
-            trust_flags: vec![],
-            alt_binaries: vec![],
-            confidence: Confidence::default(),
-            enabled_for_council: true,
-            acp: None,
-            capabilities: None,
-            login_invocation: None,
-            governance_class: None,
-            health: None,
-        };
-        let dir =
-            std::env::temp_dir().join(format!("wicked-core-chat-hold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("estate.db").display().to_string();
-        let core = Core::spawn_with_engine(db, Arc::new(Ballot), Arc::new(StubStepRunner));
-        core.register_workflow(
-            r#"{"id":"hold-2","phases":[{"id":"one","kind":"build","gate":"auto"},{"id":"two","kind":"build","gate":"auto","depends_on":["one"]}]}"#,
-        )
-        .expect("register");
-        core.launch_run(LaunchSpec {
-            base_ref: None,
-            project_id: None,
-            problem: "Do step one. Do step two".into(),
-            clis: vec![cli("a"), cli("b")],
-            entity_mode: EntityMode::Shared,
-            session_id: "held".into(),
-            human_confirm: HumanConfirm::Before(1),
-            auto_deliver: false,
-            repo_ref: None,
-            workflow: Some("hold-2".into()),
-            extra_write_roots: Vec::new(),
-            extra_read_roots: Vec::new(),
-            project_graph: None,
-            plan: None,
-            deliver_step: None,
-            exclude_seats: Vec::new(),
-            evidence_root: None,
-            primary: None,
-        })
-        .expect("launch");
-        let runs = vec!["held".to_string(), "ghost".to_string()];
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let paused = || {
-            core.sessions_detail().is_ok_and(|views| {
-                views.iter().any(|v| {
-                    v.session.id == "held" && v.session.status == SessionStatus::AwaitingHuman
-                })
-            })
-        };
-        while !paused() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(paused(), "the run reaches its gate");
-        let live = live_runs(&core.tx, &runs);
-        assert!(
-            live.contains("held"),
-            "a run paused at its gate is live: {live:?}"
-        );
-        assert!(
-            !live.contains("ghost"),
-            "an unknown run is not live: {live:?}"
-        );
-
-        assert_eq!(core.cancel_run("held").unwrap(), SessionStatus::Cancelled);
-        assert!(
-            live_runs(&core.tx, &runs).is_empty(),
-            "a cancelled run is not live"
-        );
-        assert!(live_runs(&core.tx, &[]).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     // Proves the P1 pattern end to end: one actor owns the store, serves a read, and fans events
     // out to subscribers — all in-process, no file polling, no second writer.

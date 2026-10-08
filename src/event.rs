@@ -76,6 +76,10 @@ pub struct BaseSkill {
 pub enum CoreEvent {
     /// Liveness tick (also the P1 proof that subscribe→emit works end to end).
     Heartbeat,
+    /// (ASK-K4) The five `Chat*` variants below belonged to the warm chat pool, which is gone: no
+    /// engine path emits them any more. They stay on the wire type only until crew drops its
+    /// `chatClosed` consumers, so a consumer's type union does not break on the pin bump.
+    ///
     /// A chat seat's warm ACP session is ready to receive messages (crew#165 / core#13).
     ChatSessionReady { chat: String, cli_key: String },
     /// A chat seat's session could not start (or died); the seat is out of the group
@@ -104,8 +108,7 @@ pub enum CoreEvent {
     /// The chat's warm sessions were closed and their processes reaped.
     ChatClosed {
         chat: String,
-        /// Why — `"requested"`, `"idle"`, or `"pool_cap"`
-        /// (see [`crate::acp_runner::ChatCloseReason`]).
+        /// Why — `"requested"`, `"idle"`, or `"pool_cap"`.
         ///
         /// Required, not optional: the daemon now closes chats on its own, and a client that saw
         /// only `chat` could not tell a reclaim from an operator's own close — it would report the
