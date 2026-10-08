@@ -14,6 +14,32 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The `mcp-server` workflow ships as a drop-in, with the `mcp-server` steering pack.**
+  `workflows/mcp-server.json` (registered via `load_dir`, like `domain-extraction`) makes an MCP
+  server from an OpenAPI document or hand-written integration code in eight phases: `scope`
+  (value gate, human confirm) → `source-discovery` → `design` (strategy gate, human confirm) →
+  `build` (the one creator, `executes_code`, evidence-floor pin) → `test` (the one
+  `verified_evidence` phase, contract-testing seat, human confirm on a non-PASS) →
+  `security-review` and `observability-review` (evaluators in parallel, after `test`) →
+  `install`, a Tool phase (`scripts/mcp/install.py --from-run` through wicked-garden) behind an
+  unconditional human gate with no pin: approve installs or updates the built server for running,
+  reject is "not now". No `deliver` phase — wicked-crew composes it per run and places it before
+  `install`. Every phase carries `instructions`; the skill seats are
+  `wicked-garden-mcp-scaffold`, `wicked-garden-qe-contract-testing-engineer`,
+  `wicked-garden-platform-security-engineer` and `wicked-garden-qe-observability-test-engineer`.
+  The pack `governance/packs/mcp-server/` holds seven guidance rules (recall-only, no effect):
+  MCPS-1001 TypeScript + fastmcp (architecture), MCPS-1002 OpenTelemetry traces and metrics and
+  MCPS-1003 loglayer logging (operations), MCPS-1004 authentication with one secret (critical)
+  and MCPS-1005 input validation and egress pinning (security), MCPS-1006 contract tests and the
+  conformance smoke (testing), MCPS-1007 SPDX headers and no default egress (compliance, warn).
+  `workflows/README.md` gains the drop-in bullet, the `instructions` and `executor` rows of the
+  Phase fields table and a *Tool executor* section (a Tool phase runs in the run's worktree and
+  inherits the daemon environment; it is not handed the `WICKED_*` run variables, which only the
+  walkthrough recorder gets today); `governance/packs/README.md` lists the pack. Tests:
+  `mcp_server_drop_in_is_governed_as_designed` (src/workflow.rs) and
+  `mcp_server_pack_ingests_as_seven_guidance_rules` (crates/wicked-governance/tests). Engine
+  version unchanged.
+
 - **core#772 — a judge seat that answers with a provider refusal is a SEAT failure, not a
   REJECT; it is benched and the rotation moves on.** Dogfood run ab944664 (S17b): copilot's whole
   judge answer was `Error: You have exceeded your monthly quota`, exit 0. The rotation treated

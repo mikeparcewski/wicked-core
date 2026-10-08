@@ -39,6 +39,14 @@ registry.load_dir("~/.wicked/workflows")?;            // overlay: your drop-in f
     seed, a run of this drop-in fails **closed** at plan time ("validator pin not in
     the vault") — deny-dominates, never a silent pass. The seed is idempotent
     (content-addressed) and yields exactly the pin embedded in the JSON.
+- `mcp-server.json` is a **shipped drop-in** (not a seeded built-in) that makes an
+  MCP server from an OpenAPI document or hand-written integration code, driven by the
+  `wicked-garden-mcp-scaffold` skill, with the contract-testing, security and
+  observability specialists as its test and review seats and an operator-gated Tool
+  phase `install` that installs or updates the built server for running (wicked-crew
+  places its composed `deliver` before it). It carries only the evidence-floor pin
+  (`e2e7af1db9e48454`, seeded on the plan path), so it needs no one-time seed step. Its
+  doctrine is the `governance/packs/mcp-server/` steering pack (MCPS-1001..1007).
 
 ## The minimal workflow
 
@@ -68,6 +76,7 @@ Only `id` is required on a phase — everything else defaults:
 |---|---|---|
 | `id` | *(required)* | Unique within the workflow; referenced by `depends_on`. |
 | `kind` | `"build"` | Methodology badge: `recon` \| `build` \| `review` \| `test`. |
+| `instructions` | *(absent)* | Per-phase instructions folded into the phase's unit prompt (what THIS phase's slice of the work is) and printed on its gate card. Absent stays absent on the wire. |
 | `gate_type` | `null` | Where the gate sits in the ladder: `value` \| `strategy` \| `execution` (`null` = ungated). |
 | `gate` | `"auto"` | Confirm policy — see below. |
 | `executes_code` | `false` | Phase changes the tree under review (provisions a git worktree, enables code tools). `false` means the phase does NOT change that tree — it is worktree-guarded and, unless it plays `creator`, read-only at the tool boundary. A `creator` phase with `executes_code: false` (a document/proposal deliverable) still writes into the run's declared `extra_write_roots` (F-4R2-004); a phase that must leave a file IN the tree declares `true`. |
@@ -78,6 +87,22 @@ Only `id` is required on a phase — everything else defaults:
 | `skill_ref` | `null` | Skill that drives the phase, headless (e.g. `wicked-testing-semantic-reviewer`). |
 | `allowed_skills` | `[]` | Runtime skill allowlist for the phase's agent — the tool/skill scope it may load (least-privilege, like `--allowedTools`). |
 | `validator_pin` | `null` | Content-hash pin of an **approved** deterministic validator in the vault. When set, the run loads it at plan time and the dual-validator gate re-verifies the phase's work against the worktree (deny-dominates). See *Gating a phase* below. |
+| `executor` | `{"type":"agent"}` | How the phase runs: `agent` (a council-routed CLI seat) or `{"type":"tool","cmd":[...]}` (the `cmd` argv run directly, no seat). See *Tool executor* below. |
+
+## Tool executor
+
+A phase with `"executor": {"type": "tool", "cmd": [...]}` runs its `cmd` as written in the
+run's worktree — no council, no seat. Notes:
+
+- The launch preflight refuses a run whose Tool `cmd[0]` does not resolve (on `PATH` or at that
+  path), loudly, before any unit is planned.
+- A Tool phase satisfies the registration rule that an `executes_code` phase with an `auto` gate
+  must carry a pin; it may still carry a human gate (`mcp-server`'s `install` does).
+- A Tool phase runs with the run's worktree as its working directory and inherits the daemon's
+  environment as it is. It is NOT handed the run variables (`WICKED_RUN_ID`, `WICKED_RUN_UNIT`,
+  `WICKED_TREE`, `WICKED_EVIDENCE_ROOT`): today only the engine's own walkthrough recorder gets
+  those (`src/walkthrough.rs`). A Tool command that needs the run's tree reads its working
+  directory.
 
 ## Gating a phase (validator_pin)
 

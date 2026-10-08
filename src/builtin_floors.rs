@@ -550,7 +550,12 @@ mod tests {
         code_creators.sort();
         assert_eq!(
             code_creators,
-            vec!["bug/fix", "feature/build", "migration/execute"],
+            vec![
+                "bug/fix",
+                "feature/build",
+                "mcp-server/build",
+                "migration/execute"
+            ],
             "the shipped JSON copies of the code-writing workflows must pin their Creator phases"
         );
 
@@ -559,6 +564,8 @@ mod tests {
             vec![
                 "bug/verify",
                 "feature/adversarial-review",
+                "mcp-server/observability-review",
+                "mcp-server/security-review",
                 "migration/verify"
             ],
             "the shipped copies of the code-writing workflows must carry the DIFF floor, exactly as \

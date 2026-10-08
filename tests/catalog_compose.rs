@@ -72,9 +72,10 @@ fn today_defs() -> BTreeMap<String, WorkflowDef> {
     let loaded = reg
         .load_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workflows"))
         .expect("the shipped workflows/ overlay loads");
+    // bug, domain-extraction, feature, mcp-server, migration.
     assert_eq!(
         loaded.len(),
-        4,
+        5,
         "every shipped workflow file loads: {loaded:?}"
     );
     let mut out = BTreeMap::new();

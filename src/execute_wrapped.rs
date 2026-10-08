@@ -7922,6 +7922,12 @@ mod tests {
     /// as the planner plans it, still fits a pty turn with the line appended, newline-free.
     #[test]
     fn an_evaluator_prompt_ends_with_the_verdict_contract_on_every_form() {
+        // The shipped evaluators whose authored instructions are longer than one pty turn (the
+        // `mcp-server` reviews): the pty composer must refuse them by name.
+        const PTY_OVERSIZE_BY_DESIGN: [&str; 2] = [
+            "mcp-server/observability-review",
+            "mcp-server/security-review",
+        ];
         use crate::workflow::PhaseRole;
         let line = crate::assumptions::EVALUATOR_VERDICT_CONVENTION;
         let forms = [
@@ -8000,9 +8006,20 @@ mod tests {
                     launch_seq: 0,
                     required_skills: Vec::new(),
                 };
+                let name = format!("{}/{}", def.id, u.phase_id().unwrap_or("?"));
                 for form in forms {
                     let p = skill_prompt(u, None, form, None);
                     assert!(p.ends_with(line), "{}/{} {form:?}: {p}", def.id, u.ord);
+                    // A drop-in whose authored instructions outgrow one pty line is refused by the
+                    // pty composer FAST and by name — never discarded by the terminal. Pinned by name
+                    // so a new over-long evaluator is a decision, not an accident. (The production
+                    // binding runs wrapped/ACP seats, which carry no line limit.)
+                    if PTY_OVERSIZE_BY_DESIGN.contains(&name.as_str()) {
+                        let err = pty_unit_prompt(&input, form)
+                            .expect_err("an over-long evaluator prompt must not be sent to a pty");
+                        assert!(err.contains("cannot exceed"), "{name}: {err}");
+                        continue;
+                    }
                     let p = pty_unit_prompt(&input, form).unwrap_or_else(|e| {
                         panic!(
                             "{}/{} fits a pty turn with the verdict line: {e}",
@@ -8026,6 +8043,8 @@ mod tests {
                 "bug/verify",
                 "domain-extraction/coverage",
                 "feature/adversarial-review",
+                "mcp-server/observability-review",
+                "mcp-server/security-review",
                 "migration/verify",
             ],
             "the shipped Evaluator agent units the verdict contract reaches — pinned by name"

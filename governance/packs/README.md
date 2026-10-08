@@ -45,3 +45,4 @@ Every recalled rule cites its id (`PAT-`/`POL-`, INV-C1) and its provenance ref
 | Pack | Steering type | Doctrine | Enforcing gate |
 |---|---|---|---|
 | [`phase-scope/`](phase-scope/phase-scope.md) | `operations` | Pre-build phases write documentation only (phase-scope write-denies) | `engine:pre-build-scope` (`gate_hook::phase_scope_denial`, core#306) + completion-path `phase_scope_warning` backstop |
+| [`mcp-server/`](mcp-server/mcp-server-language.md) | `architecture` · `operations` · `security` · `testing` · `compliance` | Defaults for MCP servers the `mcp-server` workflow builds (MCPS-1001..1007: TypeScript + fastmcp, OpenTelemetry, loglayer, authentication with one secret, input validation and egress pinning, contract tests, license and default egress) | none (`guidance`; the workflow's design and review phases recall it) |
