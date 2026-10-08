@@ -1774,7 +1774,14 @@ impl Core {
     ///   the council vote returns (the method returns `Ok(())` before that happens — the result
     ///   appears as a [`CoreEvent::UnitReassigned`] followed by the normal unit-lifecycle events).
     ///
-    /// Returns an error if the run is not currently `Executing`, or if `ord` is not the cursor unit.
+    /// * (core#773) On a run PARKED at a gate (`AwaitingHuman`), `new_cli = Some(key)` re-seats the
+    ///   cursor unit in place: nothing is dispatched and the attempt does not move
+    ///   (`UnitReassigned{previousAttemptReaped: true}`); the gate's approve then dispatches the
+    ///   unit once, on the new seat. A re-route (`None`), a completed unit, or a held plan is
+    ///   refused there.
+    ///
+    /// Returns an error if the run is neither `Executing` nor parked at a gate, or if `ord` is not
+    /// the cursor unit.
     pub fn reassign_unit(
         &self,
         run_id: &str,

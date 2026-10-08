@@ -365,3 +365,105 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
     let units = session_units(&store, sid).unwrap();
     assert_eq!(units[0].assigned_cli.as_deref(), Some("codex"));
 }
+
+/// Records the seat of every unit it is handed, and completes it.
+struct SeatLog(std::sync::Mutex<Vec<(u32, u32, Option<String>)>>);
+impl StepRunner for SeatLog {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        self.0
+            .lock()
+            .unwrap()
+            .push((i.unit.ord, i.attempt, i.unit.assigned_cli.clone()));
+        OkRunner.run_unit(i)
+    }
+}
+
+/// core#773: reassign on a run PARKED at a gate re-seats the cursor unit in place — no dispatch,
+/// no attempt bump, `unitReassigned{previousAttemptReaped: true}` — and the gate's approve then
+/// dispatches it ONCE, on the new seat (approve-then-reassign used to dispatch a phantom attempt
+/// on the old seat first). A re-route (`None`) is refused while parked.
+#[test]
+fn a_reassign_at_a_gate_reseats_in_place_and_the_approve_dispatches_once_there() {
+    let sid = "deadseat-reassign";
+    let db = db_path("reassign");
+    let log = Arc::new(SeatLog(std::sync::Mutex::new(Vec::new())));
+    let core = engine(db.clone(), log.clone());
+    let ev = core.subscribe();
+    core.launch_run(spec(sid)).expect("launch");
+    let _ = collect_until(
+        &ev,
+        Duration::from_secs(15),
+        |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid),
+    );
+    assert!(
+        core.reassign_unit(sid, 1, None).is_err(),
+        "a re-route needs a running unit"
+    );
+    assert!(
+        core.reassign_unit(sid, 2, Some("claude".into())).is_err(),
+        "only the cursor unit"
+    );
+    core.reassign_unit(sid, 1, Some("claude".into()))
+        .expect("re-seat the parked cursor unit");
+    let parked = collect_until(
+        &ev,
+        Duration::from_secs(5),
+        |e| matches!(e, CoreEvent::UnitReassigned { session, .. } if session == sid),
+    );
+    assert!(
+        parked.iter().any(|e| matches!(e,
+            CoreEvent::UnitReassigned {
+                session, ord: 1, attempt: 0, previous_cli, new_cli, previous_attempt_reaped: true
+            } if session == sid && previous_cli == "codex" && new_cli.as_deref() == Some("claude"))),
+        "{parked:?}"
+    );
+    assert!(
+        !parked
+            .iter()
+            .any(|e| matches!(e, CoreEvent::UnitDispatched { session, .. } if session == sid)),
+        "nothing dispatched while parked: {parked:?}"
+    );
+    {
+        let store = wicked_apps_core::open_store_ro(Some(&db)).expect("read-only store");
+        assert_eq!(
+            get_session(&store, sid).unwrap().unwrap().status,
+            SessionStatus::AwaitingHuman
+        );
+    }
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve");
+    let post = collect_until(
+        &ev,
+        Duration::from_secs(15),
+        |e| matches!(e, CoreEvent::UnitDispatched { session, ord: 1, .. } if session == sid),
+    );
+    assert!(
+        post.iter().any(|e| matches!(e,
+            CoreEvent::UnitDispatched { session, ord: 1, attempt: 0, .. } if session == sid)),
+        "{post:?}"
+    );
+    let _ = collect_until(&ev, Duration::from_secs(10), |e| {
+        matches!(e, CoreEvent::UnitDispatched { session, ord: 2, .. } if session == sid)
+            || matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid)
+            || matches!(e, CoreEvent::SessionCompleted { session } if session == sid)
+    });
+    let ran: Vec<_> = log
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(o, _, _)| *o == 1)
+        .cloned()
+        .collect();
+    assert_eq!(
+        ran,
+        vec![(1, 0, Some("claude".to_string()))],
+        "unit 1 ran once, on the new seat"
+    );
+}

@@ -2994,6 +2994,21 @@ pub(crate) fn run(
                         continue;
                     }
                 };
+                // core#773: a run PARKED at a gate on its cursor unit is re-seated in place —
+                // nothing runs, so nothing is reaped, the attempt is not bumped and nothing is
+                // dispatched; the gate's own approve then dispatches the unit ONCE, on the new
+                // seat. (Approve-then-reassign dispatched a phantom attempt on the old seat first.)
+                if session.status == crate::domain::SessionStatus::AwaitingHuman {
+                    let res = reseat_parked_unit(
+                        &mut store,
+                        &mut subscribers,
+                        &session,
+                        ord,
+                        new_cli.as_deref(),
+                    );
+                    let _ = reply.send(res);
+                    continue;
+                }
                 if session.status != crate::domain::SessionStatus::Executing {
                     let _ = reply.send(Err(anyhow::anyhow!(
                         "run {run_id} is not Executing (status: {:?}); \
@@ -7475,6 +7490,71 @@ enum Reseat {
     Moved,
     /// Its seat is benched and no eligible seat may take it. Carries why, in the operator's words.
     NoSeat(String),
+}
+
+/// (core#773) Reassign on a run PARKED at a gate (`AwaitingHuman`): re-seat the cursor unit `ord`
+/// on `new_cli` without dispatching. No worker runs while the run is parked, so there is nothing
+/// to reap (`previousAttemptReaped: true`) and the attempt counter does not move; the gate's
+/// approve dispatches the unit once, on the new seat. Refused (the run untouched) while a plan
+/// is held for approval, for a unit that is not the cursor, for one that already completed (an
+/// approve advances past it), and for a re-route (`new_cli: None`), which needs a running unit.
+fn reseat_parked_unit(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    session: &crate::domain::AgentSession,
+    ord: u32,
+    new_cli: Option<&str>,
+) -> anyhow::Result<()> {
+    let run_id = &session.id;
+    if let Some(why) = team_gate::dispatch_blocked(session) {
+        anyhow::bail!("cannot reassign: {why}");
+    }
+    let Some(cli) = new_cli.filter(|c| !c.trim().is_empty()) else {
+        anyhow::bail!(
+            "run {run_id} is parked at a gate: name the seat to reassign unit {ord} to (a \
+             re-route needs a running unit)"
+        );
+    };
+    let units = crate::domain::session_units(store, run_id)?;
+    let Some(unit) = units.get(session.unit_ix) else {
+        anyhow::bail!(
+            "run {run_id} cursor unit_ix {} out of range",
+            session.unit_ix
+        );
+    };
+    if unit.ord != ord {
+        anyhow::bail!(
+            "run {run_id} cursor unit is ord={} not ord={ord}; can only reassign the unit the \
+             gate holds",
+            unit.ord
+        );
+    }
+    if matches!(unit.status, crate::domain::UnitStatus::Done) {
+        anyhow::bail!(
+            "unit {ord} of run {run_id} already completed; approving the gate advances past it, \
+             so there is nothing to reassign"
+        );
+    }
+    let previous_cli = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    let mut moved = unit.clone();
+    moved.assigned_cli = Some(cli.to_string());
+    moved.assigned_invocation = None;
+    put_node(store, moved.to_node())?;
+    emit(
+        subscribers,
+        CoreEvent::UnitReassigned {
+            session: run_id.clone(),
+            ord,
+            attempt: session.attempt,
+            previous_cli,
+            new_cli: Some(cli.to_string()),
+            previous_attempt_reaped: true,
+        },
+    );
+    Ok(())
 }
 
 /// Re-seat the cursor unit when the seat it was planned on has been BENCHED for this run since.

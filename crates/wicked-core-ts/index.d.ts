@@ -893,6 +893,9 @@ export declare class Core {
    * `newCli` is either a CLI key string (re-dispatch immediately to that CLI) or `null` (re-run
    * the council and let it pick). Returns `"ok"` when the command has been queued; the
    * [`CoreEvent::UnitReassigned`] event confirms the reassignment.
+   *
+   * (core#773) On a run parked at a gate, a named `newCli` re-seats the cursor unit without
+   * dispatching it (the attempt does not move); approving the gate then runs it once, there.
    */
   reassignUnit(runId: string, ord: number, newCli?: string | undefined | null): Promise<unknown>
 }
