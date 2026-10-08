@@ -3172,7 +3172,7 @@ fn worker_start_files(signal: &str, worktree: &Path) -> Result<Vec<String>, ()> 
     let list = list.trim_end().trim_end_matches('.');
     let mut out = Vec::new();
     for f in list.split(", ").map(str::trim).filter(|f| !f.is_empty()) {
-        let rel = if Path::new(f).is_absolute() {
+        let rel = if f.starts_with('/') || Path::new(f).is_absolute() {
             match roots.iter().find_map(|r| f.strip_prefix(r.as_str())) {
                 Some(rel) => rel,
                 None => return Err(()),
@@ -3193,6 +3193,8 @@ fn worker_start_files(signal: &str, worktree: &Path) -> Result<Vec<String>, ()> 
 fn rerun_file_ok(rel: &str) -> bool {
     !rel.is_empty()
         && !rel.starts_with('-')
+        && !rel.starts_with('/')
+        && !rel.contains('\\')
         && !Path::new(rel).is_absolute()
         && !rel.split('/').any(|c| c == "..")
         && !rel.contains(char::is_whitespace)
