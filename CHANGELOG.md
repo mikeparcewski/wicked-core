@@ -26,6 +26,30 @@ Two release tracks share this file, newest entry first regardless of track:
   (`printf x\ngit push --force`), not just 001/004. Still `effect: warn`, never blocking; a
   non-shell tool fires nothing. The tool-name selection token (#707) and the labelled-set re-measure
   are not in this change (the set's lane directory is gone).
+- **core#765 — the write-root witness (core#541's per-call and unit-end catch) judges a file by
+  its content and never watches the engine scratch or npm/node caches.** Two read-only evaluator
+  PASSes were denied as "write-root mutated": run 64bb6775 by npm's own
+  `tmp/wicked-checks/npm-cache/_logs/*-debug-0.log` (the harness points the checks' npm cache
+  there), run 049f77d8 by the repo's idempotent generator rewriting a tracked file with identical
+  bytes (the content-hash worktree guard was rightly silent). A witness entry's third element is
+  now a content digest for a regular file ≤ 1 MiB (its mtime otherwise, as before); a raw-walk
+  directory is watched by presence only. The git listing excludes the untracked engine scratch
+  `/tmp/` (the worker's `TMPDIR`, the repo checks' `HOME` and caches — what the worktree guard
+  and deliver already exclude; a committed `tmp/` file stays watched), and any `.npm`,
+  `npm-cache`, `.node-gyp` or `node-compile-cache` path component is skipped on both collectors.
+  A same-size content change is still a mutation.
+- **core#769 — a seat whose every command was refused IN-TOOL by a host-forced approval policy is
+  benched, not credited with the unit.** On wicked-crew#856 a `wrapped_cli` codex creator got
+  `exec_command failed: CreateProcess { message: "Rejected(\"approval request failed\")" }` as tool
+  output for every command, kept going, wrote files with its patch tool and "completed"; core#670
+  only classified the terminal (exit) shape. New
+  `SeatFailureReason::in_tool_approval_refusals` (wicked-council): ≥ 3 lines carrying the whole
+  frame (phrase + `exec_command failed` + `CreateProcess`) and no codex execution record
+  (`succeeded in …` / `exited N in …`). An Ok agent fold that matches takes the failure path with
+  the launcher's frame appended, so it classifies `approval_unavailable`: the seat is benched for
+  the run and the unit fails over. The codex registry comment now carries the signed-requirements
+  caveat (`--approve-for-me` noted as unproven).
+
 - **core#761 — the evaluator↔creator rework loop is capped: after 2 send-backs the next NOT
   PASS opens a `review_adjudication` gate.** Run ad5a4ca7 ran 13 send-backs on one unit (~10 h of
   creator time) because nothing bounded the loop; the team step has `MAX_STEP_REWORK = 2`

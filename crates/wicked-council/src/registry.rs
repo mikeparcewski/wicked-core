@@ -239,7 +239,13 @@ pub fn builtin() -> Vec<AgenticCli> {
             // codex worker with no sandbox AND no gate would be UNBOUNDED — free to write outside
             // its worktree. `--sandbox workspace-write` is codex's native bounded mode: writes are
             // confined to the workspace (the worktree + in-boundary scratch) and DENIED outside,
-            // and `codex exec` is already non-interactive so no approval flag is needed. codex's
+            // and `codex exec` is already non-interactive so no approval flag is needed — CAVEAT
+            // (core#769): an account whose signed requirements bundle forbids `never` turns exec
+            // into `on-request` with no approver, every command is `Rejected("approval request
+            // failed")`, and no flag passed here changes that (`--approve-for-me`, codex-cli
+            // 0.160, is the candidate where a policy allows the `auto_review` reviewer — unproven
+            // on such an account). The engine benches the seat instead
+            // (`SeatFailureReason::in_tool_approval_refusals`). codex's
             // own workspace-write sandbox is then the boundary — aligned with path_policy's intent
             // that the worktree is the write root — which is safe WITHOUT the claude-only gate.
             // Operators overriding codex in their wicked-council clis.toml (see `default_user_path`;

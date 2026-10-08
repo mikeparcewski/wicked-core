@@ -497,7 +497,8 @@ pub(crate) fn write_root_witness_path(decisions_path: &str, phase: &str) -> std:
     Path::new(decisions_path).with_file_name(format!("write-root-witness-{safe}"))
 }
 
-/// FNV-1a fingerprint of the admitted write-root trees: sorted (path, size, mtime-secs) tuples.
+/// FNV-1a fingerprint of the admitted write-root trees: sorted (path, size, stamp) tuples
+/// ([`entry_stamp`]).
 /// Detects any file creation, deletion, or content/metadata change a Bash call could cause.
 /// `DefaultHasher` is deliberately avoided (it is not stable across Rust versions).
 #[cfg(test)]
@@ -510,17 +511,63 @@ pub(crate) fn fingerprint_write_roots(roots: &[std::path::PathBuf]) -> u64 {
     }
     entries.sort_unstable();
     let mut hash = FNV_OFFSET;
-    for (path, size, mtime) in &entries {
+    for (path, size, stamp) in &entries {
         for b in path.bytes() {
             hash ^= b as u64;
             hash = hash.wrapping_mul(FNV_PRIME);
         }
         hash ^= size;
         hash = hash.wrapping_mul(FNV_PRIME);
-        hash ^= mtime;
+        hash ^= stamp;
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// (core#765) The largest file the witness judges by CONTENT; a larger one is judged by its
+/// modification time, as every file was before.
+const WITNESS_CONTENT_CAP: u64 = 1024 * 1024;
+
+/// (core#765) The third element of a witness entry: for a regular file of at most
+/// [`WITNESS_CONTENT_CAP`] bytes, an FNV-1a digest of its CONTENT, so a byte-identical rewrite (a
+/// read-only reviewer running the repo's own idempotent generator — `testid-inventory.json`, run
+/// 049f77d8) is not a mutation; for anything else (a larger file, a directory of the raw walk,
+/// an unreadable file) the modification time in seconds, as before. Deterministic per file, so
+/// two snapshots of the same unchanged tree always agree.
+fn entry_stamp(path: &std::path::Path, meta: &std::fs::Metadata) -> u64 {
+    let mtime = || {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    if !meta.is_file() || meta.len() > WITNESS_CONTENT_CAP {
+        return mtime();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut hash: u64 = 14695981039346656037;
+            for b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(1099511628211);
+            }
+            hash
+        }
+        Err(_) => mtime(),
+    }
+}
+
+/// (core#765) Paths the witness never watches, relative to a write root: the npm / node caches a
+/// repository's own commands write as a side effect (`.npm`, `npm-cache` — npm's `_logs/*-debug-0.log`
+/// —, `.node-gyp`, `node-compile-cache`), wherever they sit. A read-only reviewer running
+/// `npm test` cannot avoid them, and they are never the tree under review. (The engine scratch
+/// `tmp/` at a worktree root — the worker's `TMPDIR` and the repo checks' `HOME`/caches, where
+/// those logs landed on run 64bb6775 — is excluded at the git listing, as the worktree guard
+/// excludes it.)
+fn witness_ignores(rel: &str) -> bool {
+    const CACHES: [&str; 4] = [".npm", "npm-cache", ".node-gyp", "node-compile-cache"];
+    rel.split(['/', '\\']).any(|c| CACHES.contains(&c))
 }
 
 fn collect_dir_entries_for_witness(
@@ -534,6 +581,7 @@ fn collect_dir_entries_for_witness(
     // so that plain temp directories inside an outer git repo do not accidentally inherit the
     // outer repo's file list via git's upward root search.
     if dir.join(".git").exists() {
+        let scratch_exclude = format!("/{}/", crate::worktree_guard::ENGINE_SCRATCH_DIR);
         if let Ok(output) = std::process::Command::new("git")
             .hardened()
             .args([
@@ -541,6 +589,11 @@ fn collect_dir_entries_for_witness(
                 "--cached",
                 "--others",
                 "--exclude-standard",
+                // (core#765) The engine scratch (`TMPDIR`, the repo checks' caches) is never the
+                // tree under review — the worktree guard and deliver exclude it the same way. An
+                // `--exclude` reaches only UNTRACKED files, so a committed `tmp/` file stays watched.
+                "--exclude",
+                &scratch_exclude,
                 "-z",
             ])
             .current_dir(dir)
@@ -551,18 +604,16 @@ fn collect_dir_entries_for_witness(
                     let Ok(rel_str) = std::str::from_utf8(rel) else {
                         continue;
                     };
+                    if witness_ignores(rel_str) {
+                        continue;
+                    }
                     let abs = dir.join(rel_str);
                     let Ok(meta) = std::fs::metadata(&abs) else {
                         continue;
                     };
                     if meta.is_file() {
-                        let mtime = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        out.push((abs.to_string_lossy().into_owned(), meta.len(), mtime));
+                        let stamp = entry_stamp(&abs, &meta);
+                        out.push((abs.to_string_lossy().into_owned(), meta.len(), stamp));
                     }
                 }
                 return CollectorKind::GitLsFiles;
@@ -581,19 +632,23 @@ fn collect_dir_entries_raw(dir: &std::path::Path, out: &mut Vec<(String, u64, u6
     };
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.file_name().is_some_and(|n| n == ".git") {
+        let name = entry.file_name();
+        if name == ".git" || witness_ignores(&name.to_string_lossy()) {
             continue;
         }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        out.push((path.to_string_lossy().into_owned(), meta.len(), mtime));
+        // A directory is watched by its PRESENCE; what it holds is watched entry by entry. Its
+        // own size and mtime move whenever a child is renamed into place (an atomic rewrite of an
+        // unchanged file), which proves nothing (core#765). `u64::MAX` marks it a directory, so a
+        // directory replaced by an empty file at the same path still reads as a change.
+        let (size, stamp) = if meta.is_dir() {
+            (0, u64::MAX)
+        } else {
+            (meta.len(), entry_stamp(&path, &meta))
+        };
+        out.push((path.to_string_lossy().into_owned(), size, stamp));
         if meta.is_dir() {
             collect_dir_entries_raw(&path, out);
         }
@@ -624,7 +679,7 @@ pub(crate) struct WitnessSnapshot {
     /// Which strategy enumerated the entries. When the current collector differs from the stored
     /// one, re-snapshot instead of diffing to avoid false positives.
     pub collector: CollectorKind,
-    pub entries: Vec<(String, u64, u64)>, // (path, size_bytes, mtime_secs)
+    pub entries: Vec<(String, u64, u64)>, // (path, size_bytes, stamp — `entry_stamp`)
 }
 
 /// Read the stored write-root witness snapshot (`None` on first call or missing sidecar).
@@ -5183,6 +5238,94 @@ mod tests {
             "git -C inside the worktree is admitted even for write subcommands"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#765) A byte-identical rewrite is not a mutation — the witness judges a file by its
+    /// content, not its mtime (a reviewer's idempotent `npm run manifest:…` rewrote a tracked
+    /// file with the same bytes and the unit-end catch denied a PASS, run 049f77d8) — while a
+    /// same-size CONTENT change still is. And npm's own logs in a cache dir are never watched.
+    #[test]
+    fn the_witness_ignores_byte_identical_rewrites_and_npm_caches_but_not_content_changes() {
+        let base = std::env::temp_dir().join(format!("wicked-765-witness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("npm-cache").join("_logs")).unwrap();
+        let file = root.join("inventory.json");
+        std::fs::write(&file, "{\"a\":1}").unwrap();
+        let old_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        let snap = |root: &std::path::Path| {
+            let mut e = Vec::new();
+            collect_dir_entries_raw(root, &mut e);
+            e.sort_unstable();
+            e
+        };
+        let before = snap(&root);
+
+        // Same bytes rewritten (a fresh mtime) + npm writing its debug log: no change.
+        std::fs::write(&file, "{\"a\":1}").unwrap();
+        std::fs::write(
+            root.join("npm-cache").join("_logs").join("debug-0.log"),
+            "npm log",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".npm").join("_cacache")).unwrap();
+        std::fs::write(root.join(".npm").join("_cacache").join("x"), "c").unwrap();
+        assert!(
+            diff_witness_entries(&before, &snap(&root)).is_empty(),
+            "{:?}",
+            diff_witness_entries(&before, &snap(&root))
+        );
+
+        // Same size, different bytes: a real mutation.
+        std::fs::write(&file, "{\"a\":2}").unwrap();
+        assert_eq!(
+            diff_witness_entries(&before, &snap(&root)),
+            vec![file.to_string_lossy().into_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#765) In a git worktree the engine scratch `tmp/` — where the repo checks keep npm's
+    /// cache (`tmp/wicked-checks/npm-cache/_logs/*-debug-0.log`, run 64bb6775) — is not in the
+    /// witness listing, while an untracked file elsewhere still is.
+    #[test]
+    fn the_git_witness_listing_skips_the_engine_scratch() {
+        let base = std::env::temp_dir().join(format!("wicked-765-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if !git(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("skipping: git init failed");
+            return;
+        }
+        std::fs::write(base.join("src.rs"), "fn main() {}").unwrap();
+        let logs = base.join("tmp/wicked-checks/npm-cache/_logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("2026-10-07T12_49_51_412Z-debug-0.log"), "npm").unwrap();
+        std::fs::write(base.join("stray.txt"), "x").unwrap();
+        let mut entries = Vec::new();
+        assert_eq!(
+            collect_dir_entries_for_witness(&base, &mut entries),
+            CollectorKind::GitLsFiles
+        );
+        assert!(
+            !entries.iter().any(|(p, _, _)| p.contains("wicked-checks")),
+            "{entries:?}"
+        );
+        assert!(entries.iter().any(|(p, _, _)| p.ends_with("stray.txt")));
+        assert!(entries.iter().any(|(p, _, _)| p.ends_with("src.rs")));
         let _ = std::fs::remove_dir_all(&base);
     }
 

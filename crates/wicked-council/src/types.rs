@@ -818,6 +818,36 @@ impl SeatFailureReason {
         None
     }
 
+    /// (core#769) The IN-TOOL shape of [`Self::ApprovalUnavailable`]: a seat that did not exit on
+    /// the refusal but kept going, every command it issued answered by the tool router's own
+    /// `exec_command failed: CreateProcess { message: "Rejected(\"approval request failed\")" }`
+    /// line, and finished the unit with prose saying so (wicked-crew#856). `Some(n)` — the
+    /// refused-command count — when at least [`IN_TOOL_REFUSAL_MIN`] such FRAMED lines appear
+    /// (phrase + `exec_command failed` + `CreateProcess`, all on one line, so prose that merely
+    /// quotes the phrase stays innocent) AND not one command ran: no codex execution record
+    /// (`succeeded in …` / `exited N in …`). Judged over the whole transcript — unlike the
+    /// terminal refusal, this one is spread through the body by construction.
+    pub fn in_tool_approval_refusals(output: &str) -> Option<usize> {
+        let refused = output
+            .lines()
+            .filter(|l| {
+                [
+                    "approval request failed",
+                    "exec_command failed",
+                    "createprocess",
+                ]
+                .iter()
+                .all(|p| contains_ignore_ascii_case(l, p))
+            })
+            .count();
+        let ran = output.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("succeeded in ")
+                || (t.starts_with("exited ") && t.contains(" in ") && t.trim_end().ends_with(':'))
+        });
+        (refused >= IN_TOOL_REFUSAL_MIN && !ran).then_some(refused)
+    }
+
     /// The reason for a stable wire token ([`Self::as_str`]), `None` for anything else — the
     /// fold reads a judge refusal back off `UnitEvidence.judge_refusals` by its token.
     pub fn from_token(token: &str) -> Option<Self> {
@@ -858,6 +888,11 @@ impl SeatFailureReason {
         matches_any(detail, NOT_INSTALLED).then_some(SeatFailureReason::NotInstalled)
     }
 }
+
+/// (core#769) How many framed in-tool approval refusals, with no command run, make a seat
+/// [`SeatFailureReason::ApprovalUnavailable`] — one or two could be a single risky command the
+/// policy refused; a seat that cannot run three in a row and ran none cannot work here.
+pub const IN_TOOL_REFUSAL_MIN: usize = 3;
 
 /// The sign-in refusals the seats print — ASCII-case-insensitive substrings.
 const NOT_LOGGED_IN: &[&str] = &[
@@ -1775,6 +1810,57 @@ mod failure_reason_tests {
         assert_eq!(f.reason, None);
         assert!(!f.summary().contains('['), "{}", f.summary());
         assert_eq!(SeatFailureReason::classify("", "", true), None);
+    }
+
+    /// (core#769) The IN-TOOL shape (wicked-crew#856): the seat did not exit on the refusal —
+    /// every `exec_command` came back refused as TOOL OUTPUT, the model wrote files with its
+    /// patch tool and ended with prose. Three or more framed refusal lines and no command that
+    /// ran ⇒ `Some(count)`; one ran (`succeeded in` / `exited N in`) ⇒ `None`; fewer than the
+    /// minimum ⇒ `None`; the phrase in prose (no `exec_command failed` / `CreateProcess` frame on
+    /// the same line) ⇒ `None`.
+    #[test]
+    fn in_tool_approval_refusals_need_the_frame_a_count_and_no_command_that_ran() {
+        let refused = "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"approval request failed\\\")\" }";
+        let body = |n: usize, extra: &str| {
+            let mut t = String::from("codex\nI'll look at the skill first.\nexec\nrg --files\n");
+            for _ in 0..n {
+                t.push_str(refused);
+                t.push('\n');
+            }
+            t.push_str(extra);
+            t.push_str("\nAll commands were refused; I wrote the files with the patch tool.");
+            t
+        };
+        assert_eq!(
+            SeatFailureReason::in_tool_approval_refusals(&body(4, "")),
+            Some(4)
+        );
+        assert_eq!(
+            SeatFailureReason::in_tool_approval_refusals(&body(IN_TOOL_REFUSAL_MIN - 1, "")),
+            None,
+            "below the minimum"
+        );
+        assert_eq!(
+            SeatFailureReason::in_tool_approval_refusals(&body(4, " succeeded in 12ms:\nok")),
+            None,
+            "a command ran"
+        );
+        assert_eq!(
+            SeatFailureReason::in_tool_approval_refusals(&body(4, " exited 1 in 40ms:\nfail")),
+            None,
+            "a command ran (and failed on its own)"
+        );
+        let prose =
+            "core#769: every exec_command was refused with approval request failed.\n".repeat(5);
+        assert_eq!(SeatFailureReason::in_tool_approval_refusals(&prose), None);
+        // The engine's appended marker then classifies through the ordinary transcript path.
+        assert_eq!(
+            SeatFailureReason::classify_refusal(
+                "…\n(wicked-core: the seat ran no command — 4 exec_command failed: approval request failed; core#769)",
+                false
+            ),
+            Some(SeatFailureReason::ApprovalUnavailable)
+        );
     }
 
     /// (core#670) The MCP S8 dogfood's F-1, verbatim: on a host whose enterprise-managed codex
