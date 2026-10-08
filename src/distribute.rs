@@ -17,8 +17,8 @@
 //!
 //! * (crew#477) a BUILD unit — the unit that writes — prefers a seat that ENFORCES input
 //!   governance on its tool calls ([`seat_governs`]): with one available it is never routed to an
-//!   ungoverned seat (pi, codex, an unadmitted ACP adapter) just because that seat comes first in
-//!   the roster; with none, it is routed anyway and `degraded_reason` says so, by seat.
+//!   ungoverned seat (governance class `none`: the OS-sandbox floor refused or switched off) just
+//!   because that seat comes first in the roster; with none, it is routed anyway and `degraded_reason` says so, by seat.
 //!
 //! The ONE thing distribution refuses — at plan time, before any unit runs — is a roster with no
 //! eligible seat for a unit ([`crate::skills_snapshot::SkillsError::NoEligibleSeat`],
@@ -217,27 +217,14 @@ pub fn distribute_units_on_benched(
     distribute_units_against_benched(units, clis, session_id, snapshot.as_ref(), prior_benched)
 }
 
-/// (crew#477) Whether a seat ENFORCES input governance on a governed unit's tool calls: an ACP
-/// seat when its adapter is admitted (`acp_input_governance`, the flag `acp_runner` reads before
-/// it answers a tool call); a seat with no ACP adapter only when its wrapped template runs claude
-/// (the wrapped runner's PreToolUse gate-hook is claude-only and keys off the template's program —
-/// every other wrapped CLI runs with `governanceUnenforced`). Judged on the roster record the run
-/// was handed, so it is pure.
+/// (crew#477, IG1-core-2) Whether a seat GOVERNS a governed unit's tool calls: its governance
+/// class ([`wicked_council::governance_class`]) is `AcpInputGovernance` (an admitted ACP adapter
+/// answers every call through the engine's gate) or `OsSandboxFloor` (no per-call adapter; the OS
+/// write boundary is armed around the worker — repository containment, disclosed by the arm site
+/// when it cannot arm). A seat of class `None` — `governance_floor = false`, or codex with its own
+/// sandbox switched off — does not. Judged on the roster record the run was handed, so it is pure.
 pub(crate) fn seat_governs(seat: &AgenticCli) -> bool {
-    match &seat.acp {
-        Some(acp) => acp.acp_input_governance,
-        // The wrapped runner's own resolution, verbatim: the launch template (this record's, else
-        // the registry's) and its first token — never the record's `binary` field, which a
-        // template may contradict (codex review of #648).
-        None => {
-            let invocation =
-                Some(seat.headless_invocation.clone()).filter(|s| !s.trim().is_empty());
-            let template = crate::execute_wrapped::launch_invocation(&seat.key, invocation);
-            crate::execute_wrapped::binary_is_claude(&crate::execute_wrapped::template_binary(
-                &template,
-            ))
-        }
-    }
+    wicked_council::governance_class(seat) != wicked_council::GovernanceClass::None
 }
 
 /// (crew#477) Is `unit` one whose seat must enforce governance — a seated BUILD unit, the stage
@@ -639,8 +626,9 @@ pub(crate) fn distribute_units_against_benched(
             };
             format!(
                 "unit {} ({what}) runs on '{}', which does not enforce input governance \
-                 (acp_input_governance=false or no gate-hook adapter): no eligible seat that \
-                 enforces it admits this unit, so its tool calls run unchecked",
+                 (governance class none: no admitted ACP adapter and the OS-sandbox floor is \
+                 refused or switched off): no eligible seat that enforces it admits this unit, \
+                 so its tool calls run unchecked",
                 u.ord, d.assigned_cli
             )
         });
@@ -956,6 +944,7 @@ mod tests {
             }),
             capabilities: Some(format!("{key} capabilities")),
             login_invocation: None,
+            governance_class: None,
             health: None,
         }
     }
@@ -2614,7 +2603,9 @@ mod tests {
             os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
-            governance_floor: None,
+            // IG1-core-2: an unadmitted seat here REFUSES the OS-sandbox floor, so it is of class
+            // `none` and the governed-first / degrade tests keep their negative case.
+            governance_floor: (!admitted).then_some(false),
         });
         c
     }
@@ -2630,31 +2621,37 @@ mod tests {
     }
 
     #[test]
-    fn seat_governs_reads_the_acp_admission_or_the_claude_gate_hook() {
+    fn seat_governs_reads_the_seats_governance_class() {
+        // AcpInputGovernance.
         assert!(seat_governs(&acp_seat("claude", true)));
+        // None: an unadmitted adapter whose record refuses the floor (`governance_floor = false`).
         assert!(!seat_governs(&acp_seat("pi", false)));
+        // OsSandboxFloor: an unadmitted adapter with the floor left on, and a wrapped seat.
+        let mut floor_pi = acp_seat("pi", false);
+        floor_pi.acp.as_mut().unwrap().governance_floor = None;
+        assert!(
+            seat_governs(&floor_pi),
+            "pi-acp sits on the OS-sandbox floor"
+        );
         let wrapped = |key: &str| AgenticCli {
             acp: None,
             ..seat_running(key, key)
         };
+        assert!(seat_governs(&wrapped("claude")));
         assert!(
-            seat_governs(&wrapped("claude")),
-            "wrapped claude arms the gate-hook"
+            seat_governs(&wrapped("copilot")),
+            "copilot sits on the floor"
         );
+        // codex: on the floor only while its own sandbox is bounded.
         assert!(
             !seat_governs(&wrapped("codex")),
-            "wrapped codex has no gate-hook"
+            "codex with no --sandbox mode has no recorded boundary"
         );
-        // The template decides, as it does for the wrapped runner — not the record's `binary`.
-        let mislabelled = AgenticCli {
-            binary: "claude".into(),
-            headless_invocation: "codex exec {PROMPT}".into(),
-            ..wrapped("claude")
+        let bounded = AgenticCli {
+            trust_flags: vec!["--sandbox".into(), "workspace-write".into()],
+            ..wrapped("codex")
         };
-        assert!(
-            !seat_governs(&mislabelled),
-            "a codex template arms no gate-hook"
-        );
+        assert!(seat_governs(&bounded));
     }
 
     #[test]

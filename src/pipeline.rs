@@ -769,23 +769,41 @@ pub(crate) fn apply_distributions(
         // command-text fences only, which a shell can evade. A Tool unit has no seat to disclose.
         if !matches!(dist.routing, RoutingInfo::Tool) {
             if let Some(seat) = pre.clis.iter().find(|c| c.key == dist.assigned_cli) {
-                let (posture, reason) = if seat.acp.as_ref().is_some_and(|a| a.os_sandbox) {
-                    (
-                        "os",
-                        "the seat record arms the kernel write boundary (acp.os_sandbox: true): \
-                         writes outside the worktree are refused by the OS"
-                            .to_string(),
-                    )
-                } else {
-                    (
-                        "advisory",
-                        "the seat record arms no OS write boundary (acp.os_sandbox: false): \
-                         write containment is the worktree guard plus the command-text fences \
-                         (remote-write, install) — best-effort, a shell can evade a text scan; \
-                         set `os_sandbox = true` on the seat's [cli.acp] record for a kernel fence"
-                            .to_string(),
-                    )
-                };
+                // (IG1-core-3) `os` only when the seat sits on the OS-sandbox floor AND the run
+                // is bound to a linked worktree AND this host's launcher arms; else `advisory`,
+                // naming which of the three failed. A prediction: the arm site's marker is the fact.
+                let workdir = pre.session.workdir.as_deref().map(std::path::Path::new);
+                let (posture, reason) =
+                    match crate::worker_sandbox::predicted_posture(seat, workdir) {
+                        Ok(boundary) => (
+                            "os",
+                            format!(
+                                "the seat sits on the OS-sandbox floor and the run is bound to a \
+                                 worktree: the kernel write boundary arms ({boundary}), so writes \
+                                 outside the repository boundary are refused by the OS"
+                            ),
+                        ),
+                        Err(gap) => {
+                            let why = match gap {
+                                crate::worker_sandbox::PostureGap::NotOnTheFloor => format!(
+                                    "the seat is not on the OS-sandbox floor (governance class \
+                                     {}, acp.os_sandbox: false), so it arms no OS write boundary",
+                                    wicked_council::governance_class(seat).as_wire()
+                                ),
+                                crate::worker_sandbox::PostureGap::Unarmed(u) => {
+                                    format!("the OS write boundary will not arm — {}", u.describe())
+                                }
+                            };
+                            (
+                                "advisory",
+                                format!(
+                                    "{why}: write containment is the worktree guard plus the \
+                                     command-text fences (remote-write, install) — best-effort, \
+                                     a shell can evade a text scan"
+                                ),
+                            )
+                        }
+                    };
                 emit(CoreEvent::SandboxPosture {
                     session: pre.session_id.clone(),
                     ord: u.ord,
@@ -3202,6 +3220,7 @@ mod resolve_tests {
                 acp: None,
                 capabilities: None,
                 login_invocation: None,
+                governance_class: None,
                 health: None,
             }
         }
@@ -3276,7 +3295,9 @@ mod resolve_tests {
         );
         for (posture, reason) in &postures {
             assert_eq!(posture, "advisory");
-            assert!(reason.contains("no OS write boundary"), "{reason}");
+            // (IG1-core-3) The stub seats sit on the floor, but the run is not bound to a
+            // worktree: the reason names that failure.
+            assert!(reason.contains("not_a_worktree"), "{reason}");
             assert!(reason.contains("best-effort"), "{reason}");
         }
         let session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
@@ -3352,6 +3373,7 @@ mod judge_bench_tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         }
     }

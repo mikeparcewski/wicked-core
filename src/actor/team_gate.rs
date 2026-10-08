@@ -167,6 +167,17 @@ fn path_started(session: &AgentSession) -> TeamEvent {
                 .team_plan
                 .as_ref()
                 .is_some_and(|t| t.preset.is_none()),
+            // (IG1-core-3) Each roster seat's class, derived from its record at emit.
+            governance: session
+                .clis
+                .iter()
+                .map(|seat| tev::SeatGovernance {
+                    seat: seat.clone(),
+                    class: crate::acp_runner::seat_governance_class(seat)
+                        .as_wire()
+                        .to_string(),
+                })
+                .collect(),
         }),
     )
 }

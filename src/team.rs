@@ -1094,7 +1094,7 @@ pub struct MonitorScope {
 }
 
 /// The carrier a member session runs on. Production: `AcpStepRunner` (`monitor_ensure` /
-/// `monitor_turn` beside `chat_turn`, the chat boundary, no chat events). Tests: a fake.
+/// `monitor_turn`, judged by the chat boundary, no chat events). Tests: a fake.
 pub trait MonitorHost: Send + Sync {
     /// DES §4.1 (b): the seat's `[cli.acp]` is admitted to input governance — the read-only
     /// boundary is enforced by answering `session/request_permission`, which an unadmitted

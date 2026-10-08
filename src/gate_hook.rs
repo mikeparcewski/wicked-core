@@ -3470,7 +3470,6 @@ pub fn write_armed_marker_for(
 /// (`"sandbox-exec"` | `"bwrap"` | `"seat:codex"`), under the same advisory lock as claims:
 ///
 /// `{"_wicked_gov_armed":<phase>,"_wicked_gov_carrier":"os_sandbox","_wicked_gov_roots":[..],"_wicked_gov_boundary":<tool>}`
-#[cfg_attr(not(test), allow(dead_code))] // IG1-core-2 wires the arm sites with the fold rule
 pub(crate) fn write_os_sandbox_marker(
     decisions_path: &Path,
     phase: &str,
@@ -4034,6 +4033,37 @@ fn marker_carrier(v: &serde_json::Value) -> Option<&str> {
     v.get(ARMED_CARRIER_KEY).and_then(|x| x.as_str())
 }
 
+/// (IG1-core-2) The carrier an ARMED marker names, read ONCE by the fold. A marker with no carrier
+/// key was written by the wrapped launcher before the key existed (issue #463), so it is `Wrapped`;
+/// a carrier string this engine does not know is `Unknown` and is held to the wrapped carrier's
+/// hook-proof rule (fail closed: nothing proves a hook-free carrier armed it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmedCarrier {
+    Wrapped,
+    Acp,
+    OsSandbox,
+    Unknown,
+}
+
+impl ArmedCarrier {
+    fn of_marker(v: &serde_json::Value) -> Self {
+        match marker_carrier(v) {
+            None => ArmedCarrier::Wrapped,
+            Some(CARRIER_WRAPPED_CLI) => ArmedCarrier::Wrapped,
+            Some(CARRIER_ACP) => ArmedCarrier::Acp,
+            Some(CARRIER_OS_SANDBOX) => ArmedCarrier::OsSandbox,
+            Some(_) => ArmedCarrier::Unknown,
+        }
+    }
+
+    /// Whether this carrier runs a gate-hook whose sentinel must prove it ran when the unit made
+    /// tool calls (#653). The ACP carrier answers `session/request_permission` in-process and the
+    /// OS-sandbox floor has no per-call channel at all, so neither writes a hook sentinel.
+    fn needs_hook_proof(self) -> bool {
+        matches!(self, ArmedCarrier::Wrapped | ArmedCarrier::Unknown)
+    }
+}
+
 /// If `v` is a hook-fired sentinel, the phase it covers; else `None`. Root-key check for the same
 /// reason as `marker_phase` — substring matching would let a crafted claim sneak past the fold.
 fn fired_phase(v: &serde_json::Value) -> Option<&str> {
@@ -4367,9 +4397,10 @@ pub(crate) fn fold_input_denial_after_floor(
     };
     let mut denial: Option<crate::domain::UnitDenial> = None;
     let mut saw_marker = false;
-    // Whether THIS phase's armed marker names the ACP carrier (#653 scopes to wrapped only: the ACP
-    // carrier answers `session/request_permission` in-process and uses no hook).
-    let mut armed_on_acp = false;
+    // The carrier THIS phase's armed marker names, read once (IG1-core-2). #653's no-hook deny is
+    // scoped to the wrapped carrier: the ACP carrier answers `session/request_permission`
+    // in-process and the OS-sandbox floor has no per-call channel, so neither runs a hook.
+    let mut carrier = ArmedCarrier::Wrapped;
     let mut saw_hook_fired = false;
     let mut has_claim_lines = false; // any ConformanceClaim present for `phase`
     let mut pending_tool: Option<String> = None; // tool name from the last annotation (this phase)
@@ -4397,7 +4428,7 @@ pub(crate) fn fold_input_denial_after_floor(
         if let Some(mp) = marker_phase(&v) {
             if mp == phase {
                 saw_marker = true;
-                armed_on_acp = marker_carrier(&v) == Some(CARRIER_ACP);
+                carrier = ArmedCarrier::of_marker(&v);
             }
             continue;
         }
@@ -4521,7 +4552,7 @@ pub(crate) fn fold_input_denial_after_floor(
     // hook exactly this way, so "marker only" is not "a governed unit that made no tool calls".
     if governed
         && saw_marker
-        && !armed_on_acp
+        && carrier.needs_hook_proof()
         && tool_activity
         && !saw_hook_fired
         && denial.is_none()
@@ -7648,6 +7679,68 @@ mod tests {
                 "_wicked_gov_roots": ["/w/run1", "/w/graph"],
                 "_wicked_gov_boundary": "sandbox-exec",
             })
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// IG1-core-2: the fold rule per carrier. An `os_sandbox` marker with no claims and no
+    /// sentinel is a governed, contained attempt even with tool activity (the floor has no hook);
+    /// the same log on `wrapped_cli` is denied as today; no marker is marker-missing; an
+    /// `os_sandbox` marker with claims and no sentinel is still sentinel-missing; an unknown
+    /// carrier is held to the wrapped rule.
+    #[test]
+    fn the_fold_reads_the_os_sandbox_carrier_per_its_rule() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("ig1-core-2-fold-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let roots = [std::path::PathBuf::from("/w/run1")];
+
+        // (a) os_sandbox, no claims, no sentinel, tool activity ⇒ passes.
+        let p0 = decisions_path_for(&run_id, 0);
+        write_os_sandbox_marker(&p0, "unit-1", &roots, "sandbox-exec").unwrap();
+        assert_eq!(
+            fold_input_denial_with_activity(&mut store, &run_id, 0, "unit-1", true, true).unwrap(),
+            None,
+            "the OS-sandbox floor has no hook to prove"
+        );
+
+        // (b) the same log on wrapped_cli ⇒ governance_unproven, as today.
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker_for(&p1, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        assert!(
+            fold_input_denial_with_activity(&mut store, &run_id, 1, "unit-1", true, true)
+                .unwrap()
+                .is_some_and(|d| d.reason.starts_with(GOVERNANCE_UNPROVEN)),
+        );
+
+        // (c) no marker (another phase's only) ⇒ marker-missing.
+        let p2 = decisions_path_for(&run_id, 2);
+        write_os_sandbox_marker(&p2, "unit-9", &roots, "bwrap").unwrap();
+        let d = fold_input_denial_with_activity(&mut store, &run_id, 2, "unit-1", true, true)
+            .unwrap()
+            .expect("a governed unit with no marker of its own is denied");
+        assert!(d.reason.contains("armed marker missing"), "{}", d.reason);
+
+        // (d) os_sandbox marker WITH claims and no sentinel ⇒ sentinel-missing.
+        let p3 = decisions_path_for(&run_id, 3);
+        write_os_sandbox_marker(&p3, "unit-1", &roots, "sandbox-exec").unwrap();
+        append_decision(&p3, &allow_claim("ig1-c2", "unit-1")).unwrap();
+        let d = fold_input_denial_with_activity(&mut store, &run_id, 3, "unit-1", true, true)
+            .unwrap()
+            .expect("claims with no sentinel are a tamper signal on every carrier");
+        assert!(
+            d.reason.contains("hook-fired sentinel missing"),
+            "{}",
+            d.reason
+        );
+
+        // (e) an unknown carrier is held to the wrapped carrier's hook-proof rule.
+        let p4 = decisions_path_for(&run_id, 4);
+        write_armed_marker_for(&p4, "unit-1", Some("some_future_carrier")).unwrap();
+        assert!(
+            fold_input_denial_with_activity(&mut store, &run_id, 4, "unit-1", true, true)
+                .unwrap()
+                .is_some_and(|d| d.reason.starts_with(GOVERNANCE_UNPROVEN)),
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }

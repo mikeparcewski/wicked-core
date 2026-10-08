@@ -4581,6 +4581,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         }
     }
@@ -5628,6 +5629,7 @@ mod triage_parse_tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         };
         let roster = vec![

@@ -636,6 +636,20 @@ pub struct PathStarted {
     pub workflow: Option<String>,
     /// The launch carried a user-composed plan.
     pub plan: bool,
+    /// (IG1-core-3) Each roster seat's governance class, in roster order — how the engine holds
+    /// that seat's writes (`acp_input_governance` | `os_sandbox` | `none`). Derived at emit from the
+    /// seat records; an older row without it deserialises as empty (and an empty list is not
+    /// written, so an old row re-serialises byte-identical).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub governance: Vec<SeatGovernance>,
+}
+
+/// (IG1-core-3) One roster seat's governance class on `path.started.governance`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeatGovernance {
+    pub seat: String,
+    /// `acp_input_governance` | `os_sandbox` | `none`.
+    pub class: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -802,6 +816,11 @@ pub struct MemberJoined {
     pub status: AttachStatus,
     pub reason: String,
     pub error: Option<String>,
+    /// (IG1-core-3) The seat's governance class (`acp_input_governance` | `os_sandbox` | `none`),
+    /// how its read-only boundary holds; `null` when no seat was named. Older rows deserialise
+    /// without it (and re-serialise byte-identical: `None` is not written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_class: Option<String>,
 }
 
 /// 8 — `member.left` (S).

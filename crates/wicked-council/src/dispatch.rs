@@ -1442,6 +1442,7 @@ mod failure_diagnostics_tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            governance_class: None,
             health: None,
         }
     }

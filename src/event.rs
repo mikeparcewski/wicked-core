@@ -76,6 +76,10 @@ pub struct BaseSkill {
 pub enum CoreEvent {
     /// Liveness tick (also the P1 proof that subscribe→emit works end to end).
     Heartbeat,
+    /// (ASK-K4) The five `Chat*` variants below belonged to the warm chat pool, which is gone: no
+    /// engine path emits them any more. They stay on the wire type only until crew drops its
+    /// `chatClosed` consumers, so a consumer's type union does not break on the pin bump.
+    ///
     /// A chat seat's warm ACP session is ready to receive messages (crew#165 / core#13).
     ChatSessionReady { chat: String, cli_key: String },
     /// A chat seat's session could not start (or died); the seat is out of the group
@@ -104,8 +108,7 @@ pub enum CoreEvent {
     /// The chat's warm sessions were closed and their processes reaped.
     ChatClosed {
         chat: String,
-        /// Why — `"requested"`, `"idle"`, or `"pool_cap"`
-        /// (see [`crate::acp_runner::ChatCloseReason`]).
+        /// Why — `"requested"`, `"idle"`, or `"pool_cap"`.
         ///
         /// Required, not optional: the daemon now closes chats on its own, and a client that saw
         /// only `chat` could not tell a reclaim from an operator's own close — it would report the
@@ -736,7 +739,10 @@ pub enum CoreEvent {
     /// is not write-containment for a WORKER whose network is deliberately open anyway). This is the
     /// WRITE-containment sibling of `GovernanceUnenforced` — a unit running without the deny floor is
     /// never silent. It is NOT an exfiltration or audit claim. It does NOT fire when `os_sandbox` is
-    /// OFF (the feature was not requested) or when the floor armed (`Sandboxed`).
+    /// OFF (the feature was not requested) or when the floor armed (`Sandboxed`). (IG1-core-2) It
+    /// also fires, `level: "best-effort"`, for a GOVERNED unit on a seat of governance class
+    /// `os_sandbox` whose default repository boundary did not arm (`reason` names why:
+    /// `not_a_worktree`, `no_launcher`, `cannot_arm`, …), beside its `GovernanceUnenforced`.
     SandboxUnenforced {
         session: String,
         ord: u32,
@@ -923,10 +929,12 @@ pub enum CoreEvent {
     },
     /// (F-E2E-029 review F4; additive) The WRITE CONTAINMENT the seat assigned to an agent unit
     /// actually runs under, disclosed at distribution so an operator is never left believing a
-    /// fence is hermetic: `os` — the seat's record arms the kernel write boundary
-    /// (`acp.os_sandbox: true`; the wrapped carrier reads the same flag); `advisory` — the record
-    /// arms none, so containment is the worktree guard plus the command-text fences (remote-write,
-    /// install), which a shell can evade. Run `01234444`'s creator ran `advisory` and put 194 MB
+    /// fence is hermetic: `os` — (IG1-core-3) the seat sits on the OS-sandbox floor (governance
+    /// class `os_sandbox`, or `acp.os_sandbox: true`) AND the run is bound to a linked worktree AND
+    /// this host's launcher arms (codex: its own sandbox); `advisory` — any of the three failed, and
+    /// `reason` names which (not on the floor; `not_a_worktree`; `no_launcher` / `cannot_arm`), so
+    /// containment is the worktree guard plus the command-text fences (remote-write, install),
+    /// which a shell can evade. A prediction at distribution: the arm site's marker is the fact. Run `01234444`'s creator ran `advisory` and put 194 MB
     /// of `node_modules` into the customer's clone root; nothing had said so.
     SandboxPosture {
         session: String,

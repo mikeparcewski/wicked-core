@@ -176,8 +176,9 @@ fn is_codex_seat(seat: &AgenticCli) -> bool {
 /// Whether codex's trust flags keep its OWN OS sandbox on in a bounded mode
 /// (`--sandbox workspace-write` | `--sandbox read-only`, or the `--sandbox=<mode>` spelling) and
 /// carry no bypass flag. `trust_flags = []` leaves codex on its default read-only sandbox but that
-/// is not the engine-recorded posture, so it is not accepted as the floor (IG1 Risk 3).
-fn codex_sandbox_is_bounded(trust_flags: &[String]) -> bool {
+/// is not the engine-recorded posture, so it is not accepted as the floor (IG1 Risk 3). The engine
+/// also applies it to the LAUNCHED argv, so a record whose invocation drops the mode is not trusted.
+pub fn codex_sandbox_is_bounded(trust_flags: &[String]) -> bool {
     const BOUNDED: [&str; 2] = ["workspace-write", "read-only"];
     if trust_flags
         .iter()
@@ -362,6 +363,13 @@ pub struct AgenticCli {
     /// default for the seat key ([`default_login_invocation`]), else no sign-in surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_invocation: Option<String>,
+    /// (IG1-core-3) The seat's governance class (`acp_input_governance` | `os_sandbox` | `none`,
+    /// [`governance_class`]) — DERIVED by `wicked_core::registry_roster()` per call, as it fills
+    /// `login_invocation`, so a launcher can show how each seat's writes are held. Computed, so
+    /// never read from input (`skip_deserializing`): a roster handed back through `clisJson`
+    /// carries none, and no predicate reads it — the engine recomputes the class from `acp.*`.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub governance_class: Option<String>,
     /// (F-7R2-006, wave 6) The LAUNCHER's health verdict for this seat — the result of its
     /// sign-in / usability probe (wicked-crew's `GET /roster` `auth` + `council_eligible`), carried
     /// on the roster it hands the engine so routing can act on it. `Some(usable: false)` BENCHES

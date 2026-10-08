@@ -289,8 +289,28 @@ pub(crate) enum FloorUnarmed {
 }
 
 impl FloorUnarmed {
+    /// The reason in words, for a `governanceUnenforced` / `sandboxUnenforced` disclosure.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            FloorUnarmed::NotAWorktree => {
+                "not_a_worktree: the unit does not run in a linked run worktree, so there is no \
+                 repository boundary to arm"
+            }
+            FloorUnarmed::SeatArmsItsOwn => {
+                "seat_arms_its_own: the seat's CLI arms its own OS sandbox, which the engine does \
+                 not wrap"
+            }
+            FloorUnarmed::NoLauncher => {
+                "no_launcher: neither sandbox-exec nor bwrap is on this host's PATH"
+            }
+            FloorUnarmed::CannotArm => {
+                "cannot_arm: the host's sandbox launcher is present but its probe failed here"
+            }
+        }
+    }
+
     /// The reason's wire spelling, for a disclosure.
-    #[cfg_attr(not(test), allow(dead_code))] // read by IG1-core-2's arm sites
+    #[cfg_attr(not(test), allow(dead_code))] // `describe` leads with it on every disclosure
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             FloorUnarmed::NotAWorktree => "not_a_worktree",
@@ -306,8 +326,25 @@ impl FloorUnarmed {
 #[derive(Debug)]
 pub(crate) struct ArmedFloor {
     pub(crate) sandbox: crate::validator::WorkerSandbox,
-    #[cfg_attr(not(test), allow(dead_code))] // read by IG1-core-2's arm sites
     pub(crate) tool: &'static str,
+}
+
+/// (IG1-core-2) The `_wicked_gov_boundary` an `os_sandbox` marker names when the boundary is the
+/// seat's OWN sandbox (codex `--sandbox workspace-write|read-only`), not an engine launcher.
+pub(crate) const SEAT_CODEX_BOUNDARY: &str = "seat:codex";
+
+/// (IG1-core-2) The launcher an ARMED sandbox wrapper argv starts with: `"sandbox-exec"` or
+/// `"bwrap"` — the `_wicked_gov_boundary` for a strict-profile (`os_sandbox = true`) spawn
+/// (firejail never arms: it is network-only and always downgrades).
+pub(crate) fn launcher_name_of(wrapper: &[String]) -> &'static str {
+    match wrapper
+        .first()
+        .and_then(|w| Path::new(w).file_name())
+        .and_then(|n| n.to_str())
+    {
+        Some("sandbox-exec") => "sandbox-exec",
+        _ => "bwrap",
+    }
 }
 
 /// The launcher this host arms the repository boundary with (`sandbox-exec`, then `bwrap`),
@@ -331,6 +368,47 @@ fn boundary_launcher() -> Result<&'static PathBuf, FloorUnarmed> {
     })
     .as_ref()
     .map_err(|e| *e)
+}
+
+/// (IG1-core-3) The launcher this host arms the repository boundary with, by name, or why none
+/// arms (`no_launcher` | `cannot_arm`) — the probe [`default_worker_sandbox`] uses, cached.
+pub(crate) fn boundary_tool() -> Result<&'static str, FloorUnarmed> {
+    boundary_launcher().map(|t| launcher_name(t))
+}
+
+/// (IG1-core-3) The write containment a seat is PREDICTED to run under at distribution — the
+/// `sandboxPosture` decision. `Ok(boundary)` (`"sandbox-exec"` | `"bwrap"` | `"seat:codex"`) when
+/// the seat sits on the OS-sandbox floor (governance class `os_sandbox`, or `acp.os_sandbox: true`)
+/// AND the run is bound to a linked run worktree AND this host's launcher arms (a self-sandboxing
+/// codex seat brings its own); else which of the three failed. The arm site's marker is the fact;
+/// this predicts it.
+pub(crate) fn predicted_posture(
+    seat: &wicked_council::AgenticCli,
+    workdir: Option<&Path>,
+) -> Result<&'static str, PostureGap> {
+    let floor = wicked_council::governance_class(seat)
+        == wicked_council::GovernanceClass::OsSandboxFloor
+        || seat.acp.as_ref().is_some_and(|a| a.os_sandbox);
+    if !floor {
+        return Err(PostureGap::NotOnTheFloor);
+    }
+    if workdir.and_then(|w| repo_boundary(w, &[])).is_none() {
+        return Err(PostureGap::Unarmed(FloorUnarmed::NotAWorktree));
+    }
+    if seat_arms_its_own_os_sandbox(&seat.key) || seat_arms_its_own_os_sandbox(&seat.binary) {
+        return Ok(SEAT_CODEX_BOUNDARY);
+    }
+    boundary_tool().map_err(PostureGap::Unarmed)
+}
+
+/// (IG1-core-3) Why [`predicted_posture`] is `advisory`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostureGap {
+    /// The seat's governance class is not `os_sandbox` and its record sets no `os_sandbox`.
+    NotOnTheFloor,
+    /// On the floor, but it will not arm: no run worktree, no launcher, or a launcher that
+    /// cannot arm here.
+    Unarmed(FloorUnarmed),
 }
 
 /// The short name of a launcher path: `"sandbox-exec"` or `"bwrap"`.
@@ -367,7 +445,7 @@ pub(crate) fn default_worker_sandbox(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
@@ -390,7 +468,7 @@ mod tests {
     }
 
     /// A clone with two run worktrees under `wicked-worktrees/` — the layout `repo.rs` creates.
-    fn clone_with_two_runs(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    pub(crate) fn clone_with_two_runs(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!("wicked-wsb-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let clone = base.join("clone");
@@ -631,6 +709,55 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
         assert!(
             field("commit").starts_with("0"),
             "a commit on the run branch must succeed: {stdout} / {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (IG1-core-3) The `sandboxPosture` prediction and each of its three failures: a seat off the
+    /// floor (class `none`), a run not bound to a linked worktree, and (host-dependent) a launcher
+    /// that does not arm; a bounded codex seat brings its own boundary.
+    #[test]
+    fn the_predicted_posture_names_which_of_the_three_failed() {
+        let seat = |key: &str, floor: Option<bool>, flags: &[&str]| {
+            let mut c = wicked_council::registry::builtin()
+                .into_iter()
+                .find(|c| c.key == key)
+                .expect("a built-in seat");
+            if let Some(acp) = c.acp.as_mut() {
+                acp.governance_floor = floor;
+                acp.os_sandbox = false;
+            }
+            c.trust_flags = flags.iter().map(|f| f.to_string()).collect();
+            c
+        };
+        let (base, _clone, own, _sibling) = clone_with_two_runs("posture");
+        let pi = seat("pi", None, &[]);
+        // 1. Off the floor.
+        assert_eq!(
+            predicted_posture(&seat("pi", Some(false), &[]), Some(&own)),
+            Err(PostureGap::NotOnTheFloor)
+        );
+        // 2. On the floor, not bound to a worktree (none, or a plain directory).
+        assert_eq!(
+            predicted_posture(&pi, None),
+            Err(PostureGap::Unarmed(FloorUnarmed::NotAWorktree))
+        );
+        assert_eq!(
+            predicted_posture(&pi, Some(&base)),
+            Err(PostureGap::Unarmed(FloorUnarmed::NotAWorktree))
+        );
+        // 3. Bound: the host's launcher decides.
+        assert_eq!(
+            predicted_posture(&pi, Some(&own)),
+            boundary_tool().map_err(PostureGap::Unarmed)
+        );
+        // A bounded codex seat brings its own sandbox.
+        assert_eq!(
+            predicted_posture(
+                &seat("codex", None, &["--sandbox", "workspace-write"]),
+                Some(&own)
+            ),
+            Ok(SEAT_CODEX_BOUNDARY)
         );
         let _ = std::fs::remove_dir_all(&base);
     }

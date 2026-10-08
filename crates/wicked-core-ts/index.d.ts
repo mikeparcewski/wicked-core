@@ -256,59 +256,6 @@ export declare class Core {
   /** Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`). */
   ping(): Promise<string>
   /**
-   * Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13) in a SCOPE
-   * (wicked-core#410 / wicked-crew#502). `cwd` is the seats' working directory — the chat's
-   * scratch root; omitted, a private `<tmp>/wicked-core-chat-<id>` of the chat's own, NEVER this
-   * process's cwd. `scopeJson` is `{"codeGraphDb"?: string|null, "readRoots"?: string[]}`: the
-   * estate graph the seats' READ-ONLY estate MCP is bound to (omitted/null ⇒ no estate MCP) and
-   * the repository roots in scope (advertised to a claude seat as `additionalDirectories`,
-   * recorded for every seat). Resolves to a JSON array of per-seat outcomes
-   * `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed` also stream to
-   * subscribers. Blocking handshakes run on the task pool, not the JS thread.
-   */
-  chatOpen(chatId: string, clisJson: string, cwd?: string | undefined | null, scopeJson?: string | undefined | null): Promise<string>
-  /**
-   * Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
-   * resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
-   * `cwd` is accepted for wire compatibility and IGNORED (wicked-core#410): every turn runs in
-   * the scope recorded at `chatOpen` — a per-message working directory was the F-067 leak.
-   */
-  chatSend(chatId: string, text: string, targetsJson?: string | undefined | null, cwd?: string | undefined | null): Promise<string>
-  /** The seats currently warm for a chat — JSON array of cli keys. */
-  chatSeats(chatId: string): Promise<string>
-  /**
-   * Every chat currently holding pool state — JSON array of
-   * `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots, heldBy}]`, sorted by id. `cwd` /
-   * `codeGraphDb` / `readRoots` are the scope recorded at `chatOpen` (wicked-core#410): where the
-   * seats run, the estate graph their read-only estate MCP is bound to (`null` ⇒ none), and the
-   * repository roots in scope (`[]` when none); `cwd` is `null` only for a pool entry whose scope
-   * is gone (a chat mid-close). `heldBy` lists the runs launched from the chat that keep it
-   * warm (`chatHold`, crew#619).
-   *
-   * Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
-   * chat ids freely, so without this an accumulation is invisible until the host runs out of
-   * memory (FINDING-027). `idleSecs` is seconds since the chat's last open/ensure/turn, or
-   * `null` when no activity was ever recorded — which the reaper treats as idle-since-forever.
-   *
-   * `null` rather than the `u64::MAX` the Rust side uses for that case: a JS `number` is an
-   * f64, so `u64::MAX` arrives as `18446744073709552000` and no consumer can test for the
-   * sentinel by equality. `null` is checkable, and it stops a caller from doing arithmetic on a
-   * value that never meant a duration.
-   */
-  chatList(): Promise<string>
-  /**
-   * Hold a chat warm for a run launched from it (crew#619): the engine's idle reaper passes the
-   * chat over until that run is terminal, and its idle clock restarts then. Resolves `"true"`,
-   * or `"false"` when the chat is not open on this engine (nothing held). Call it right after
-   * `launchRun` resolves the run id.
-   */
-  chatHold(chatId: string, runId: string): Promise<string>
-  /**
-   * Close a chat's warm sessions (idempotent); emits
-   * `chatClosed` with `reason: "requested"`.
-   */
-  chatClose(chatId: string): Promise<string>
-  /**
    * Launch an interactive, resumable run: plans + distributes, then executes each unit off-thread
    * (or pauses at a human-confirm gate). Resolves to the run id. Progress arrives as `CoreEvent`s
    * — `subscribe()` first. Rejects with a busy error if a run with that id is already in flight.
@@ -340,10 +287,10 @@ export declare class Core {
    * amendment. The engine refuses each at any other gate.
    *
    * (core#555, additive.) `amend_intent` (`approve=true`, the text in `amend`, no `amendScope`)
-   * approves the gate AND AMENDS THE RUN'S INTENT: the text is appended to every unit at or after
-   * the cursor, so the acceptance list each LATER EVALUATOR is handed changes with the decision,
-   * and it is recorded on the run (`intent_amendments`) plus an `intentAmended` event. It is the
-   * only arm that can descope a run mid-flight; refused at a plan or team gate, and with no text.
+   * approves the gate AND AMENDS THE RUN'S INTENT: the text is appended to every unit at or
+   * after the cursor, so the acceptance list each LATER EVALUATOR is handed changes with the
+   * decision, and it is recorded on the run plus an `intentAmended` event. It is the only arm
+   * that can descope a run mid-flight; refused at a plan or team gate, and with empty text.
    *
    * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
    * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
@@ -1013,8 +960,9 @@ export declare class Subscription {
  * may start with 'install fence:' (a package-manager install outside the unit's worktree, judged
  * from the seat's shell cwd tracked across its tool calls — best-effort, never hermetic);
  * sandboxPosture {session, ord, cli, posture: 'os' | 'advisory', reason} (the write containment
- * the assigned seat runs under — 'advisory' = no OS write boundary on the seat record, command-text
- * fences + worktree guard only); worktreeRetained {session, path, reason} (a terminal run's worktree
+ * the assigned seat runs under — 'os' = the seat is on the OS-sandbox floor, the run is bound to a
+ * worktree and the host launcher arms; 'advisory' = one of the three failed, reason names which —
+ * command-text fences + worktree guard only); worktreeRetained {session, path, reason} (a terminal run's worktree
  * kept because it holds uncommitted work — cancel included).
  * core#468 (additive): unitDispatched carries `baseSkill: {name, role, handed} | null` — the run's
  * role-keyed BASE skill directive (`role` is 'creator' | 'evaluator' | 'neutral'), null when the
