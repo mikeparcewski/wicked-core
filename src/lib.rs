@@ -1634,6 +1634,43 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (core#677) Vault a deterministic validator the HOST authored — `criterion` (what it checks)
+    /// and `script` (a POSIX shell check that exits 0 iff it holds) — UNAPPROVED, returning its
+    /// content-addressed pin. The napi twin of `wicked-core provision-validator` without the live
+    /// writer: a host (crew) that owns its check can provision it on a machine nobody seeded by
+    /// hand. Approve it with [`Core::approve_validator`]; a def pins the APPROVED pin.
+    pub fn vault_validator(
+        &self,
+        criterion: impl Into<String>,
+        script: impl Into<String>,
+    ) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::VaultValidator {
+                criterion: criterion.into(),
+                script: script.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (core#677) Approve a vaulted validator (the audited step `approve-validator` takes) and
+    /// return the APPROVED pin a workflow def's `validator_pin` names. An unknown pin is an error
+    /// (`not_found: …`); a def pinning an unapproved or unvaulted pin still bails at plan time.
+    pub fn approve_validator(&self, pin: impl Into<String>) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ApproveValidator {
+                pin: pin.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     pub fn register_workflow(&self, json: impl Into<String>) -> anyhow::Result<String> {
         let (reply, rx) = channel();
         self.tx

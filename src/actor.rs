@@ -2857,6 +2857,22 @@ pub(crate) fn run(
             Command::ListPresets { project_id, reply } => {
                 let _ = reply.send(crate::preset::list_presets(&store, project_id.as_deref()));
             }
+            Command::VaultValidator {
+                criterion,
+                script,
+                reply,
+            } => {
+                let _ = reply.send(vault_host_validator(&mut store, criterion, script));
+            }
+            Command::ApproveValidator { pin, reply } => {
+                let res =
+                    crate::validator_vault::approve_and_store(&mut store, &pin).and_then(|p| {
+                        p.ok_or_else(|| {
+                            anyhow::anyhow!("not_found: no vaulted validator with pin {pin}")
+                        })
+                    });
+                let _ = reply.send(res);
+            }
             Command::RegisterWorkflow { json, reply } => {
                 let result = serde_json::from_str::<crate::workflow::WorkflowDef>(&json)
                     .map_err(|e| anyhow::anyhow!("invalid workflow JSON: {e}"))
@@ -6799,6 +6815,31 @@ fn tail_chars(s: &str, cap: usize) -> String {
     } else {
         format!("…{}", s.chars().skip(n - cap).collect::<String>())
     }
+}
+
+/// (core#677) Vault a validator a napi HOST authored (crew's draft self-check, …) — UNAPPROVED, at
+/// the engine's content address. Refused up front: an empty criterion or script, and a script the
+/// run-time backstop would refuse anyway ([`crate::validator::looks_dangerous`]) — so a host learns
+/// at provisioning, not at its first gate.
+fn vault_host_validator(
+    store: &mut dyn GraphStore,
+    criterion: String,
+    script: String,
+) -> anyhow::Result<String> {
+    if criterion.trim().is_empty() || script.trim().is_empty() {
+        anyhow::bail!("bad_request: a validator needs a non-empty criterion and script");
+    }
+    if let Some(why) = crate::validator::looks_dangerous(&script) {
+        anyhow::bail!("bad_request: the script would be refused at run time ({why})");
+    }
+    crate::validator_vault::store_validator(
+        store,
+        &crate::validator::DeterministicValidator {
+            criterion,
+            script,
+            approved: false,
+        },
+    )
 }
 
 /// (core#651) The `unitReworkAmended.scope` token of the automatic creator-floor round.

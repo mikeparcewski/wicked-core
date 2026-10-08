@@ -744,6 +744,19 @@ export declare class Core {
    */
   registerWorkflow(json: string): Promise<string>
   /**
+   * (core#677) Vault a deterministic validator the host authored — `criterion` and a POSIX
+   * shell `script` that exits 0 iff it holds — UNAPPROVED, resolving to its content-addressed
+   * pin. Rejects `bad_request: …` on an empty criterion/script or a script the run-time
+   * backstop refuses. Approve it with `approveValidator`; a def pins the APPROVED pin.
+   */
+  vaultValidator(criterion: string, script: string): Promise<string>
+  /**
+   * (core#677) Approve a vaulted validator (the audited step) and resolve to the APPROVED pin
+   * a workflow def's `validator_pin` names. Rejects `not_found: …` on an unknown pin. A def
+   * pinning an unapproved or unvaulted pin still fails its launch at plan time.
+   */
+  approveValidator(pin: string): Promise<string>
+  /**
    * Recall which conformance rules apply to the given `query_json` (a JSON-serialized
    * `RuleQuery` — fields: language, layer, framework, severity, rule_type, steering_type;
    * all optional).
@@ -1042,6 +1055,19 @@ export declare class Subscription {
  * the option the producer of the options recommends (the field's own JSON Schema `default`, when
  * it names a delivered option). ABSENT ⇒ nothing is preselected; `options`/`propType` stay
  * explicit nulls.
+ * core#412 (additive — a new `type` value): cliUsageUnreported {session, ord, attempt, cli} — an
+ * agent unit whose seat reported NO usage for that attempt; emitted where cliUsage would be, so a
+ * burn view shows the unit as UNREPORTED, never as $0.
+ * core#554 (additive): every unitContextInjected.priorUnits[] item carries `deliveredBytes`
+ * (the size the worker received, after the carriers' shared prior-context clip) and `clipped`
+ * (boolean). `outputBytes` stays the pre-clip size; a clipped operator note now says so.
+ * core#651 (a new VALUE): unitReworkAmended.scope can read `'floor_auto_retry'` — the one automatic
+ * round a creator gets when its own repo-checks floor ran and failed (the failing tails are the
+ * amendment); WorkUnit gains `floor_auto_retries` (number, absent while 0).
+ * core#686 (additive): WorkUnit gains `instructions` (the phase's authored card, absent when
+ * none), `amendments` (approved intent-amendment texts, absent when empty) and
+ * `structured_description` (true on units planned with those fields; absent on older records,
+ * which a reader re-parses from `description` as legacy).
  */
 export interface CoreEventJson {
   type: string

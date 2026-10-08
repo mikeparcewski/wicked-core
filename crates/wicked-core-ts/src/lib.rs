@@ -2213,6 +2213,25 @@ impl Core {
         task(move || core.register_workflow(json).map_err(err))
     }
 
+    /// (core#677) Vault a deterministic validator the host authored — `criterion` and a POSIX
+    /// shell `script` that exits 0 iff it holds — UNAPPROVED, resolving to its content-addressed
+    /// pin. Rejects `bad_request: …` on an empty criterion/script or a script the run-time
+    /// backstop refuses. Approve it with `approveValidator`; a def pins the APPROVED pin.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn vault_validator(&self, criterion: String, script: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.vault_validator(criterion, script).map_err(err))
+    }
+
+    /// (core#677) Approve a vaulted validator (the audited step) and resolve to the APPROVED pin
+    /// a workflow def's `validator_pin` names. Rejects `not_found: …` on an unknown pin. A def
+    /// pinning an unapproved or unvaulted pin still fails its launch at plan time.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn approve_validator(&self, pin: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.approve_validator(pin).map_err(err))
+    }
+
     /// Recall which conformance rules apply to the given `query_json` (a JSON-serialized
     /// `RuleQuery` — fields: language, layer, framework, severity, rule_type, steering_type;
     /// all optional).

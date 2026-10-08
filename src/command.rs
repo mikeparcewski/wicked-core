@@ -394,6 +394,19 @@ pub(crate) enum Command {
         json: String,
         reply: std::sync::mpsc::Sender<anyhow::Result<String>>, // returns the workflow id
     },
+    /// (core#677) Vault a HOST-authored deterministic validator UNAPPROVED (the content address is
+    /// the engine's own); replies its pin. Authoring never authorizes running.
+    VaultValidator {
+        criterion: String,
+        script: String,
+        reply: std::sync::mpsc::Sender<anyhow::Result<String>>,
+    },
+    /// (core#677) Approve a vaulted validator — the distinct, audited step; replies the APPROVED pin
+    /// a def's `validator_pin` names. Errors when no validator is vaulted under `pin`.
+    ApproveValidator {
+        pin: String,
+        reply: std::sync::mpsc::Sender<anyhow::Result<String>>,
+    },
     /// Distribution complete — the distribute worker thread finished `distribute_units_on`
     /// successfully. The actor arm calls `pipeline::apply_distributions` to write assignments to the
     /// store and dispatch unit 0. Sent by the off-actor distribute thread; processed on actor thread.
