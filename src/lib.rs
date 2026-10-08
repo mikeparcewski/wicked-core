@@ -226,7 +226,7 @@ pub use state_home::{
 pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
     run_validator_reporting, run_validator_reporting_with_env, sandbox_availability, AgentVerdict,
-    DeterministicValidator, GateVerdict, SandboxLevel, ValidatorOutcome,
+    DeterministicValidator, GateVerdict, JudgeUnavailable, SandboxLevel, ValidatorOutcome,
     DETERMINISTIC_VALIDATOR_SEAT,
 };
 pub use validator_vault::{

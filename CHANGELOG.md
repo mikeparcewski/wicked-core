@@ -14,6 +14,31 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core#772 — a judge seat that answers with a provider refusal is a SEAT failure, not a
+  REJECT; it is benched and the rotation moves on.** Dogfood run ab944664 (S17b): copilot's whole
+  judge answer was `Error: You have exceeded your monthly quota`, exit 0. The rotation treated
+  any `Ok` exit as "the seat answered", `parse_agent_verdict` failed the sentence closed to
+  REJECT (`denialSource: agent_validator`, `condition: verdict_not_pass`), the seat was never
+  benched (only `Failed` seats were reported), and the registry-order walk drew the same
+  exhausted seat on every retry — two full build-gate rounds until the operator reassigned the
+  creator. Now an `Ok` answer is first checked with the SAME recogniser the worker path benches on
+  (`SeatFailureReason::classify_refusal`: quota / sign-in / forced-approval sentences; plus the
+  wrapped runner's `(could not run …)` line and an EMPTY answer): a match is reported for the
+  run's bench (`judge_refusals`, `source: "judge"`, the seat's own words) and the rotation goes to
+  the next identity-distinct seat (evaluator ≠ creator kept; a seat that said anything of its own
+  still ends the rotation — no verdict-shopping). When NO eligible seat remains the judge call
+  returns the typed `JudgeUnavailable`; `AgentVerdict` gains `seat_failure: Option<String>`
+  (in-process and bus-path wire, additive) and the fold books the denial under the new
+  `UnitDenial.source = "judge_unavailable"` with a reason that names every seat failure —
+  still a deny (fail-closed), never "agent validator rejected". The single-runner fallback gets
+  the same check. A seat that wrote a PASS/REJECT word anywhere has answered (a REJECT about
+  "unauthenticated requests" is never a sign-in refusal), an empty answer is benched under its own
+  `empty_answer` token, only a SHORT answer (≤ 3 lines) can be a refusal and a sign-in refusal
+  needs the CLI's own frame (`Not logged in`, `run /login`, an `Error`-led line), and a RETRY whose only distinct judges were benched by such failures is
+  the same seat-failure denial — never a skipped (UNGATED) judge. Not in this change (actor.rs is IG1-core's): `denial_class` still folds the new
+  source to `condition: verdict_not_pass`, so the escalation PROMPT still reads "verdict is NOT
+  PASS" — the two match arms that give it its own class + prompt are listed on the PR.
+
 - **core#766 — the verify floor re-runs a vitest head-only failure as its file alone before
   calling it a regression.** Dogfood run 049f77d8: a 5 s filesystem-walk `it` hit vitest's default
   timeout (`Test timed out in 5000ms`) under host load 45-80, the floor classed it a
