@@ -637,6 +637,12 @@ impl FromNode for AgentSession {
 /// (core#461) — the payload the escalation gate's reassign arm keys on.
 pub const DENIAL_SOURCE_DEAD_SEAT: &str = "dead_seat";
 
+/// (core#772) [`UnitDenial::source`] when the agent JUDGE could not run: every eligible
+/// identity-distinct judge seat failed as a seat (quota, sign-in, not installed, an empty
+/// answer), so no verdict exists. Fail-closed — the unit is still denied into the escalation
+/// gate — but a decision about SEATS, not a verdict on the work: never `agent_validator`.
+pub const DENIAL_SOURCE_JUDGE_UNAVAILABLE: &str = "judge_unavailable";
+
 /// The MACHINE-READABLE twin of a unit's prose `denial_reason` (usability review #1): which layer
 /// denied, which rule/policy fired, which claim recorded it, and — for an input-governance deny —
 /// which tool-call was refused. Additive everywhere it appears (unit record, work-output record,
@@ -653,7 +659,10 @@ pub struct UnitDenial {
     /// F-036), `repo_checks` (the repository's own checks failed in the worktree, F-039),
     /// `dead_seat` (the worker exited on a classified seat refusal — signed out, out of quota, not
     /// installed — and no eligible seat remains; the run is PAUSED at core#464's escalation gate
-    /// (`gateEscalated.condition: "dead_seat"`), not failed, core#461 — [`DENIAL_SOURCE_DEAD_SEAT`]).
+    /// (`gateEscalated.condition: "dead_seat"`), not failed, core#461 — [`DENIAL_SOURCE_DEAD_SEAT`]),
+    /// `judge_unavailable` (the agent judge could not run: every eligible judge seat failed as a
+    /// seat — quota / sign-in / not installed / empty answer — so no verdict exists; core#772 —
+    /// [`DENIAL_SOURCE_JUDGE_UNAVAILABLE`]).
     pub source: String,
     /// The operator-facing prose — byte-identical to the `denial_reason` the record carries.
     pub reason: String,

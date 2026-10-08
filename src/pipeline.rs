@@ -1431,7 +1431,7 @@ pub(crate) fn apply_and_finish_unit(
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(capture_denial)
         .or(evaluator_verdict_denial)
-        .or(agent_denial.map(|r| crate::domain::UnitDenial::new("agent_validator", r)))
+        .or(agent_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(evaluator_denial)
         .or(hook_denial);
 
@@ -2051,13 +2051,30 @@ fn denial_for_outcome(
 /// structural phase) OR an agent PASS ⇒ `None` (no denial). PURE + actor-safe: the LLM already ran on
 /// the worker thread; this only interprets the `(pass, reasoning)` it produced. `combine_verdict`
 /// guarantees the agent can FAIL a gate but is never the sole approver.
-fn agent_verdict_denial(agent: Option<&crate::validator::AgentVerdict>) -> Option<String> {
+///
+/// (core#772) The denial names its SOURCE: `agent_validator` when a seat judged and rejected;
+/// [`crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE`] when NO seat judged because every eligible
+/// judge seat failed as a seat (`AgentVerdict::seat_failure`) — still a deny (fail-closed), but
+/// the record and the gate say the judge could not run, never that the work was rejected.
+fn agent_verdict_denial(
+    agent: Option<&crate::validator::AgentVerdict>,
+) -> Option<(&'static str, String)> {
     let verdict = agent?;
     match crate::validator::combine_verdict(true, Some(verdict)) {
         crate::validator::GateVerdict::Approve => None,
-        crate::validator::GateVerdict::Reject => {
-            Some(format!("agent validator rejected: {}", verdict.reasoning))
-        }
+        crate::validator::GateVerdict::Reject => Some(match &verdict.seat_failure {
+            Some(failures) => (
+                crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+                format!(
+                    "agent judge could not run — every eligible judge seat failed: {failures}. \
+                     The failed seat(s) are benched for this run; a retry draws another judge"
+                ),
+            ),
+            None => (
+                "agent_validator",
+                format!("agent validator rejected: {}", verdict.reasoning),
+            ),
+        }),
     }
 }
 
@@ -2522,6 +2539,7 @@ mod resolve_tests {
             reasoning: reasoning.to_string(),
             judge_cli: None,
             judge_distinct: None,
+            seat_failure: None,
         }
     }
 
@@ -2533,12 +2551,32 @@ mod resolve_tests {
         assert!(agent_verdict_denial(Some(&av(true, "looks good"))).is_none());
         // Agent REJECT ⇒ denial (deny-dominates); the reason is carried through for the UI.
         let denial = agent_verdict_denial(Some(&av(false, "diverged from criterion")));
+        let (source, reason) = denial.clone().unwrap();
+        assert_eq!(source, "agent_validator");
         assert!(
-            denial
-                .as_deref()
-                .unwrap()
-                .contains("diverged from criterion"),
+            reason.contains("diverged from criterion"),
             "agent reject must deny and surface the reason: {denial:?}"
+        );
+    }
+
+    /// (core#772) A judge that could not run — every eligible seat refused on quota / sign-in —
+    /// still DENIES (fail-closed), but under `judge_unavailable`, naming the seat failures: the
+    /// operator is told the judge never ran, not that the work was rejected.
+    #[test]
+    fn agent_verdict_denial_books_a_seat_failure_as_judge_unavailable_not_a_reject() {
+        let mut v = av(false, "agent validator could not run — …");
+        v.seat_failure = Some(
+            "copilot (exhausted its quota: Error: You have exceeded your monthly quota)".into(),
+        );
+        let (source, reason) = agent_verdict_denial(Some(&v)).expect("fail-closed: still a denial");
+        assert_eq!(source, crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE);
+        assert!(
+            reason.contains("could not run") && reason.contains("exhausted its quota"),
+            "the denial names the seat failure, not a verdict: {reason}"
+        );
+        assert!(
+            !reason.contains("rejected"),
+            "a seat failure must never read as a rejection: {reason}"
         );
     }
 
@@ -2551,7 +2589,7 @@ mod resolve_tests {
         let mut denial_reason: Option<String> = None;
         let agent = av(false, "output does not satisfy the acceptance criterion");
         if approved {
-            if let Some(reason) = agent_verdict_denial(Some(&agent)) {
+            if let Some((_, reason)) = agent_verdict_denial(Some(&agent)) {
                 approved = false;
                 denial_reason = Some(reason);
             }

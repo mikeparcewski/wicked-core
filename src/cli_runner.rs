@@ -305,6 +305,10 @@ struct AgentVerdictWire {
     judge_cli: Option<String>,
     #[serde(default)]
     judge_distinct: Option<bool>,
+    /// (core#772) The seat-failure marker, carried so the fold books a judge that could not
+    /// run as `judge_unavailable` on the bus path too. `default`: absent from an older runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seat_failure: Option<String>,
 }
 
 impl From<AgentVerdictWire> for crate::validator::AgentVerdict {
@@ -314,6 +318,7 @@ impl From<AgentVerdictWire> for crate::validator::AgentVerdict {
             reasoning: v.reasoning,
             judge_cli: v.judge_cli,
             judge_distinct: v.judge_distinct,
+            seat_failure: v.seat_failure,
         }
     }
 }
@@ -325,6 +330,7 @@ impl From<crate::validator::AgentVerdict> for AgentVerdictWire {
             reasoning: v.reasoning,
             judge_cli: v.judge_cli,
             judge_distinct: v.judge_distinct,
+            seat_failure: v.seat_failure,
         }
     }
 }
@@ -412,6 +418,7 @@ fn bus_request_agent_verdict(
             return crate::validator::AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
+                seat_failure: None,
                 pass: false,
                 reasoning: $reason,
             }
@@ -508,6 +515,7 @@ fn bus_request_agent_verdict(
                     return crate::validator::AgentVerdict {
                         judge_cli: resp.judge_cli,
                         judge_distinct: None,
+                        seat_failure: None,
                         pass: resp.pass,
                         reasoning: resp.reasoning,
                     };
@@ -529,6 +537,7 @@ fn bus_request_agent_verdict(
     crate::validator::AgentVerdict {
         judge_cli: None,
         judge_distinct: None,
+        seat_failure: None,
         pass: false,
         reasoning: format!(
             "gate eval bus-path DENY: evaluator daemon did not respond within {GATE_EVAL_TIMEOUT:?}. \
@@ -884,6 +893,37 @@ pub(crate) fn run_unit_and_judge_with_team(
     )
 }
 
+/// (core#772) When NO identity-distinct judge remains on the run's unbenched roster but one
+/// WOULD exist without the run's bench, the judge is unavailable because of SEAT FAILURES earlier
+/// in the run (a quota / sign-in / empty answer while judging) — not because the run never had
+/// a distinct seat. That is a fail-closed seat-failure verdict naming the benched seats (booked
+/// `judge_unavailable`, the human gate opens), never a skipped judge: skipping would let the
+/// retry after a judge's quota refusal pass on the deterministic floor alone. `None` when a
+/// distinct judge is still available, or when none ever was (the pre-existing UNGATED path).
+fn benched_judge_unavailable(
+    who: &str,
+    excluded: &[&str],
+    roster: &[crate::AgenticCli],
+    unbenched: &[crate::AgenticCli],
+    benched: &[String],
+) -> Option<crate::validator::AgentVerdict> {
+    if benched.is_empty() || crate::validator::distinct_judge_available(excluded, roster) {
+        return None;
+    }
+    let lost: Vec<String> = crate::validator::distinct_judge_keys(excluded, unbenched)
+        .into_iter()
+        .filter(|k| benched.iter().any(|b| b == k))
+        .map(|k| format!("{k} (benched for this run after a seat failure)"))
+        .collect();
+    if lost.is_empty() {
+        return None;
+    }
+    Some(crate::validator::AgentVerdict::from_judge_error(
+        who,
+        crate::validator::JudgeUnavailable { refusals: lost }.into(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_unit_and_judge_on(
     runner: &Arc<dyn StepRunner>,
@@ -1082,10 +1122,18 @@ fn run_unit_and_judge_on(
     } else {
         configured
     };
-    let eligible: Vec<crate::AgenticCli> = pool
-        .into_iter()
-        .filter(|c| !benched.iter().any(|b| b == &c.key))
+    // (core#772) The same pool BEFORE the run's bench: a judge seat benched earlier in this run
+    // (a quota / sign-in refusal while judging) must not turn "no distinct judge" into an
+    // UNGATED pass on the retry — when the only distinct judges left are benched ones, the gate
+    // is a seat failure ([`benched_judge_unavailable`]), never a skipped judge.
+    let unbenched: Vec<crate::AgenticCli> = pool
+        .iter()
         .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+        .map(|c| (*c).clone())
+        .collect();
+    let eligible: Vec<crate::AgenticCli> = unbenched
+        .iter()
+        .filter(|c| !benched.iter().any(|b| b == &c.key))
         .cloned()
         .collect();
     let roster = eligible.as_slice();
@@ -1104,23 +1152,31 @@ fn run_unit_and_judge_on(
             // (r2-N2) Exit evidence for the generic quota rule: the runner's own marker.
             let exited_nonzero =
                 crate::execute_wrapped::wrapped_exit_code(out).is_some_and(|c| c != 0);
-            let reason = SeatFailureReason::classify_refusal(out, exited_nonzero).or_else(|| {
-                crate::execute_wrapped::spawn_failure_detail(out)
-                    .and_then(SeatFailureReason::classify_spawn_detail)
-            });
-            if let Some(reason) = reason {
+            let reason = SeatFailureReason::classify_refusal(out, exited_nonzero)
+                .or_else(|| {
+                    crate::execute_wrapped::spawn_failure_detail(out)
+                        .and_then(SeatFailureReason::classify_spawn_detail)
+                })
+                .map(|r| (r.verb(), r.as_str()))
+                // (core#772) A judge that exited clean and printed nothing: benched under its
+                // own token (the fold benches a token it does not know as written).
+                .or_else(|| {
+                    (out == crate::validator::JUDGE_EMPTY_ANSWER).then_some((
+                        "answered nothing",
+                        crate::validator::JUDGE_EMPTY_ANSWER_REASON,
+                    ))
+                });
+            if let Some((verb, token)) = reason {
                 let mut v = judge_refusals.borrow_mut();
                 if !v.iter().any(|r| &r.seat == seat) {
                     eprintln!(
                         "wicked-core: judge seat '{seat}' {} on unit {} ({}); reported for the \
                          run's bench (F-7R2-006 / review RT-1 / F-7R3-001)",
-                        reason.verb(),
-                        input.unit.ord,
-                        reason.as_str()
+                        verb, input.unit.ord, token
                     );
                     v.push(crate::workflow::JudgeRefusal {
                         seat: seat.clone(),
-                        reason: reason.as_str().to_string(),
+                        reason: token.to_string(),
                     });
                 }
             }
@@ -1287,6 +1343,11 @@ fn run_unit_and_judge_on(
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
+            if let Some(v) =
+                benched_judge_unavailable("agent validator", &excluded, roster, &unbenched, benched)
+            {
+                break 'pinned Some(v);
+            }
             if !crate::validator::distinct_judge_available(&excluded, roster) {
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
                 let validator_id = crate::validator::excluded_identity(
@@ -1345,12 +1406,9 @@ fn run_unit_and_judge_on(
             Some(match verdict {
                 // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
                 Ok(av) => av,
-                Err(e) => crate::validator::AgentVerdict {
-                    pass: false,
-                    reasoning: format!("agent validator errored (fail-closed): {e}"),
-                    judge_cli: None,
-                    judge_distinct: None,
-                },
+                // (core#772) Every judge seat failed as a seat ⇒ a seat-failure denial, not a
+                // REJECT; any other error keeps the fail-closed REJECT shape.
+                Err(e) => crate::validator::AgentVerdict::from_judge_error("agent validator", e),
             })
         };
         if pinned.is_some() {
@@ -1368,7 +1426,11 @@ fn run_unit_and_judge_on(
                 .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
             let mut excluded: Vec<&str> = vec![work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
-            if crate::validator::distinct_judge_available(&excluded, roster) {
+            if let Some(v) =
+                benched_judge_unavailable("default judge", &excluded, roster, &unbenched, benched)
+            {
+                Some(v)
+            } else if crate::validator::distinct_judge_available(&excluded, roster) {
                 let criterion = crate::validator::default_judge_criterion(&input.unit);
                 eprintln!(
                     "wicked-core: unit {} changed the worktree tree with no pinned validator — \
@@ -1386,12 +1448,7 @@ fn run_unit_and_judge_on(
                 note_refusals(&refused);
                 Some(match verdict {
                     Ok(av) => av,
-                    Err(e) => crate::validator::AgentVerdict {
-                        pass: false,
-                        reasoning: format!("default judge errored (fail-closed): {e}"),
-                        judge_cli: None,
-                        judge_distinct: None,
-                    },
+                    Err(e) => crate::validator::AgentVerdict::from_judge_error("default judge", e),
                 })
             } else {
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
@@ -4184,6 +4241,14 @@ mod tests {
                         out.status = StepStatus::Failed;
                         out.output =
                             "(cli `dead` exited 1) Not logged in · Please run /login".into();
+                    } else if seat == "empty" {
+                        // (core#772) Exit 0, nothing printed.
+                        out.output = String::new();
+                    } else if seat == "quota" {
+                        // (core#772) Exit 0 + the provider's refusal: the captured copilot shape.
+                        out.output =
+                            "Error: You have exceeded your monthly quota (Request ID: D7DE:0)"
+                                .into();
                     } else {
                         out.output = "PASS\nfine\nPASS".into();
                     }
@@ -4250,6 +4315,8 @@ mod tests {
         let registry = [
             seat("creator", "creator -p {PROMPT}"),
             seat("dead", "dead -p {PROMPT}"),
+            seat("quota", "quota -p {PROMPT}"), // (core#772) runs, exits 0, prints a quota refusal
+            seat("empty", "empty -p {PROMPT}"), // (core#772) runs, exits 0, prints nothing
             seat("alive", "alive -p {PROMPT}"),
             seat("stranger", "stranger -p {PROMPT}"), // in the registry, NOT on this run's roster
         ];
@@ -4258,7 +4325,7 @@ mod tests {
         });
         let runner: Arc<dyn StepRunner> = seats.clone();
         let noop: &DeltaSink = &|_| {};
-        let run_roster: Vec<String> = ["creator", "dead", "alive"]
+        let run_roster: Vec<String> = ["creator", "dead", "quota", "alive"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -4283,7 +4350,11 @@ mod tests {
         assert_eq!(
             verdict.judge_cli.as_deref(),
             Some("alive"),
-            "the judge rotated past the dead seat onto the run's other seat"
+            "the judge rotated past the dead seat AND the quota-refusing seat onto the run's other seat"
+        );
+        assert!(
+            verdict.seat_failure.is_none(),
+            "a seat judged, so no seat-failure marker"
         );
         let judged_on = seats.judged_on.lock().unwrap().clone();
         assert!(
@@ -4299,13 +4370,21 @@ mod tests {
             vec!["dead".to_string()],
             "the signed-out judge seat is reported for the bench"
         );
-        // (F-7R3-001) …and, with its cause, on the carrier the fold benches from.
+        // (F-7R3-001) …and, with its cause, on the carrier the fold benches from — (core#772) the
+        // seat that answered with a quota refusal beside it, classified from the same text the
+        // worker path benches on, so the fold benches both and the next unit draws neither.
         assert_eq!(
             evidence.judge_refusals,
-            vec![crate::workflow::JudgeRefusal {
-                seat: "dead".to_string(),
-                reason: "not_logged_in".to_string(),
-            }]
+            vec![
+                crate::workflow::JudgeRefusal {
+                    seat: "dead".to_string(),
+                    reason: "not_logged_in".to_string(),
+                },
+                crate::workflow::JudgeRefusal {
+                    seat: "quota".to_string(),
+                    reason: "quota_exhausted".to_string(),
+                },
+            ]
         );
 
         // With `dead` benched, the next unit never dispatches to it.
@@ -4324,13 +4403,99 @@ mod tests {
             noop,
             &registry,
             &run_roster,
-            &["dead".to_string()],
+            &["dead".to_string(), "quota".to_string()],
         );
         assert_eq!(verdict2.unwrap().judge_cli.as_deref(), Some("alive"));
         assert!(
-            evidence2.judge_auth_refusals.is_empty()
-                && !seats.judged_on.lock().unwrap().iter().any(|s| s == "dead"),
+            evidence2.judge_refusals.is_empty()
+                && !seats
+                    .judged_on
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "dead" || s == "quota"),
             "a benched judge seat is never tried again"
+        );
+
+        // (core#772) EVERY eligible judge seat failing as a seat: the gate still denies
+        // (fail-closed) but as a SEAT FAILURE — no judge named, `seat_failure` set, the reasoning
+        // names the seats and never a verdict word — and every seat is reported for the bench.
+        seats.judged_on.lock().unwrap().clear();
+        let mut unit3 = input.unit.clone();
+        std::fs::remove_file(wt.join("note.txt")).unwrap();
+        unit3.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+        let input3 = StepInput {
+            unit: unit3,
+            ..input.clone()
+        };
+        let only_failing: Vec<String> = ["creator", "dead", "quota", "empty"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_, verdict3, evidence3) = run_unit_and_judge_with_roster(
+            &runner,
+            &input3,
+            None,
+            noop,
+            &registry,
+            &only_failing,
+            &[],
+        );
+        let v3 = verdict3.expect("the default judge was convened (distinct seats existed)");
+        assert!(
+            !v3.pass && v3.judge_cli.is_none(),
+            "fail-closed, nobody judged: {v3:?}"
+        );
+        let failures = v3
+            .seat_failure
+            .as_deref()
+            .expect("a seat failure, not a verdict");
+        assert!(
+            failures.contains("quota (exhausted its quota") && failures.contains("dead ("),
+            "{failures}"
+        );
+        assert!(!v3.reasoning.contains("REJECT"), "{}", v3.reasoning);
+        let benched3: Vec<&str> = evidence3
+            .judge_refusals
+            .iter()
+            .map(|r| r.seat.as_str())
+            .collect();
+        assert_eq!(
+            benched3,
+            vec!["dead", "quota", "empty"],
+            "every failed seat reported for the bench"
+        );
+        assert_eq!(
+            evidence3.judge_refusals[2].reason,
+            crate::validator::JUDGE_EMPTY_ANSWER_REASON,
+            "an empty answer is benched under its own token"
+        );
+
+        // (core#772, codex r1) The RETRY with those seats benched: no distinct judge remains on
+        // the unbenched roster, but one existed before the bench. That is still a SEAT FAILURE
+        // (the human gate opens) — never a skipped judge, which would pass the retry on the
+        // deterministic floor alone.
+        seats.judged_on.lock().unwrap().clear();
+        let benched_all = ["dead".to_string(), "quota".to_string(), "empty".to_string()];
+        let (_, verdict4, evidence4) = run_unit_and_judge_with_roster(
+            &runner,
+            &input3,
+            None,
+            noop,
+            &registry,
+            &only_failing,
+            &benched_all,
+        );
+        let v4 = verdict4.expect("a benched-out judge is a seat-failure verdict, not a skip");
+        assert!(!v4.pass && v4.judge_cli.is_none(), "{v4:?}");
+        let f4 = v4.seat_failure.as_deref().expect("seat failure");
+        assert!(
+            f4.contains("dead (benched") && f4.contains("quota (benched"),
+            "{f4}"
+        );
+        assert!(
+            seats.judged_on.lock().unwrap().is_empty() && evidence4.judge_refusals.is_empty(),
+            "no benched seat is re-drawn"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
