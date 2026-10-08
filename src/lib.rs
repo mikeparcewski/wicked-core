@@ -158,9 +158,9 @@ pub use gate_hook::{
 };
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, list_mcp_tools_json,
-    preview_mcp_calls_json, McpAnnotations, McpClass,
+    preview_mcp_calls_json, record_mcp_boundary_escape_json, McpAnnotations, McpClass,
     APPROVAL_OBLIGATION as MCP_APPROVAL_OBLIGATION, CREW_URL_ENV as MCP_CREW_URL_ENV,
-    TOKEN_ENV as MCP_TOKEN_ENV,
+    MCP_REST_BOUNDARY_RULE, TOKEN_ENV as MCP_TOKEN_ENV,
 };
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;
@@ -1854,6 +1854,8 @@ mod tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         };
 
@@ -1985,6 +1987,8 @@ mod tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         };
         struct NoRun;

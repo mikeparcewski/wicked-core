@@ -777,6 +777,15 @@ export declare class Core {
    */
   static evaluateMcpCall(requestJson: string): Promise<string>
   /**
+   * (core#669, DES-MCP-TOOLS-001 decision 2) Record that a brokered REST call left its pinned
+   * host (crew's broker calls this on `RestBoundaryError`, after `evaluateMcpCall` allowed it).
+   * `request_json` is `{ token, subject, reason }`; appends a unit-FATAL deny claim under rule
+   * `engine:mcp-rest-boundary` (not the advisory `mcp-deny:` class) and resolves to
+   * `{ claimId }`. Rejects with `invalid_token: …`, `bad_request: …` or `guard_error: …` — the
+   * broker then refuses the call with `guard_error` (D-3). Static, like `evaluateMcpCall`.
+   */
+  static recordMcpBoundaryEscape(requestJson: string): Promise<string>
+  /**
    * The unit's visible MCP tool list (DES-MCP-TOOLS-001 §8 `GET /mcp/tools?token=`; slice S4,
    * the garden shim's `list`). `request_json` is `{ token, calls: [{ server, tool, annotations?,
    * classOverride?, registered, kind? }] }` — the worker's `WICKED_MCP_TOKEN` and the registry's

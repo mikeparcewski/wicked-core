@@ -850,6 +850,66 @@ pub fn evaluate_mcp_call_json(request_json: &str) -> Result<String, String> {
     serde_json::to_string(&verdict).map_err(|e| format!("guard_error: {e}"))
 }
 
+/// (core#669, DES-MCP-TOOLS-001 operator decision 2) The rule id of a wrapped REST call that tried
+/// to leave its pinned host — one of the two MCP outcomes that FAIL the unit.
+pub const MCP_REST_BOUNDARY_RULE: &str = "engine:mcp-rest-boundary";
+
+/// Record that a brokered REST call for `token`'s unit tried to leave its pinned scheme, host, port
+/// or base path (crew's broker detects it AFTER the engine allowed the call, on `RestBoundaryError`).
+/// Appends a deny claim under [`MCP_REST_BOUNDARY_RULE`] — NOT the advisory `mcp-deny:` class — so
+/// the fold fails the unit. The broker refuses the call with `guard_error` when this fails (D-3).
+pub fn record_mcp_boundary_escape(
+    token: &str,
+    subject: &str,
+    reason: &str,
+) -> Result<String, McpCallError> {
+    let unit = resolve(token).ok_or(McpCallError::InvalidToken)?;
+    let (subject, reason) = (subject.trim(), reason.trim());
+    if subject.is_empty() || reason.is_empty() {
+        return Err(McpCallError::BadRequest(
+            "a boundary escape names its subject and its reason".to_string(),
+        ));
+    }
+    let claim = ConformanceClaim {
+        claim_id: format!("{MCP_REST_BOUNDARY_RULE}:{}", unit.phase),
+        scope: unit.scope.clone(),
+        phase: unit.phase.clone(),
+        policy_ids: vec![MCP_REST_BOUNDARY_RULE.to_string()],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string(), subject.to_string()],
+        evaluated_context_ref: "sha256:mcp".to_string(),
+        criteria: format!(
+            "mcp REST call left its pinned host (unit-fatal, DES-MCP-TOOLS-001 decision 2): {reason}"
+        ),
+        evaluator_identity: MCP_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    crate::gate_hook::append_annotated_claim_checked(
+        &unit.decisions_path.to_string_lossy(),
+        &unit.phase,
+        subject,
+        &claim,
+    )
+    .map_err(|e| McpCallError::GuardError(format!("could not record the escape: {e}")))?;
+    Ok(claim.claim_id)
+}
+
+/// The JSON face of [`record_mcp_boundary_escape`]: `{token, subject, reason}` in, `{claimId}` out.
+pub fn record_mcp_boundary_escape_json(request_json: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        token: String,
+        subject: String,
+        reason: String,
+    }
+    let req: Request = serde_json::from_str(request_json)
+        .map_err(|e| McpCallError::BadRequest(format!("request: {e}")).to_string())?;
+    let id = record_mcp_boundary_escape(&req.token, &req.subject, &req.reason)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "claimId": id }).to_string())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The unit's tool list (S4): what the garden shim's `list` shows, judged and never recorded
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1712,6 +1772,86 @@ mod tests {
     /// PROVING TEST (S1 row 4): the fold treats an `mcp-deny` as advisory — the unit is not
     /// denied, the refusal is disclosed with its subject and remedy — and an `ask` never resolves
     /// the phase gate (it is not the unit's verdict), while a co-occurring policy deny still does.
+    /// core#669 PROVING TEST: a REST call that left its pinned host (recorded by the broker after the
+    /// engine allowed it) FAILS the unit, while an ordinary MCP deny in the same unit stays advisory;
+    /// a request without a subject, or with a dead token, is refused.
+    #[test]
+    fn a_rest_boundary_escape_fails_the_unit_and_a_policy_deny_stays_advisory_669() {
+        use crate::gate_hook::{
+            decisions_path_for, fold_input_denial, gov_run_dir, write_armed_marker_for, CARRIER_ACP,
+        };
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let run_id = format!("mcp-escape-{}-{tid}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&dpath, "unit-2", Some(CARRIER_ACP)).unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&dpath)
+                .unwrap();
+            f.write_all(b"{\"_wicked_hook_fired\":\"unit-2\"}\n")
+                .unwrap();
+        }
+        let db = gov_run_dir(&run_id).join("policy.db");
+        {
+            let mut store = open_store(Some(&db.to_string_lossy())).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+        }
+        let mut u = unit(
+            WritePosture::ReadOnly,
+            PhaseRole::Evaluator,
+            "codex",
+            McpMode::Balanced,
+        );
+        u.run_id = run_id.clone();
+        u.db_path = db.to_string_lossy().into_owned();
+        u.decisions_path = dpath.clone();
+        let token = McpToken::mint();
+        let _b = token.bind(u);
+        assert_eq!(
+            evaluate_mcp_call(&token.value, &call("create_issue", None))
+                .unwrap()
+                .decision,
+            "deny"
+        );
+        let mut store = open_store(Some(":memory:")).unwrap();
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-2", true).unwrap(),
+            None,
+            "the policy deny alone is advisory"
+        );
+        assert!(matches!(
+            record_mcp_boundary_escape(&token.value, "", "left its host"),
+            Err(McpCallError::BadRequest(_))
+        ));
+        assert!(matches!(
+            record_mcp_boundary_escape("no-such-token", "mcp:jira/get_issue", "x"),
+            Err(McpCallError::InvalidToken)
+        ));
+        let out = record_mcp_boundary_escape_json(
+            &serde_json::json!({
+                "token": token.value,
+                "subject": "mcp:jira/get_issue",
+                "reason": "the path value `..` resolves off the pinned base path /rest/api/2",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(out.contains(MCP_REST_BOUNDARY_RULE), "{out}");
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-2", true).unwrap();
+        assert!(
+            denial.as_ref().is_some_and(|d| {
+                d.claim_id.as_deref() == Some("engine:mcp-rest-boundary:unit-2")
+                    && d.rule_ids == [MCP_REST_BOUNDARY_RULE]
+                    && d.denied_tool.as_deref() == Some("mcp:jira/get_issue")
+            }),
+            "the escape fails the unit: {denial:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
     #[test]
     fn the_fold_treats_an_mcp_deny_as_advisory_and_an_ask_never_gates_the_phase() {
         use crate::gate_hook::{
