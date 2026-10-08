@@ -287,10 +287,10 @@ export declare class Core {
    * amendment. The engine refuses each at any other gate.
    *
    * (core#555, additive.) `amend_intent` (`approve=true`, the text in `amend`, no `amendScope`)
-   * approves the gate AND AMENDS THE RUN'S INTENT: the text is appended to every unit at or after
-   * the cursor, so the acceptance list each LATER EVALUATOR is handed changes with the decision,
-   * and it is recorded on the run (`intent_amendments`) plus an `intentAmended` event. It is the
-   * only arm that can descope a run mid-flight; refused at a plan or team gate, and with no text.
+   * approves the gate AND AMENDS THE RUN'S INTENT: the text is appended to every unit at or
+   * after the cursor, so the acceptance list each LATER EVALUATOR is handed changes with the
+   * decision, and it is recorded on the run plus an `intentAmended` event. It is the only arm
+   * that can descope a run mid-flight; refused at a plan or team gate, and with empty text.
    *
    * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
    * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
