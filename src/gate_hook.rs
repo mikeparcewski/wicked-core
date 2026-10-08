@@ -3024,7 +3024,14 @@ pub(crate) fn evaluate_tool_call(
         }
     };
 
-    let phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias);
+    let mut phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias);
+    // (core#707) The tool itself is a selection token — `tool:<name>` beside the phase aliases —
+    // so a rule scoped to one tool writes `applies_to: [tool:Bash]` instead of matching JSON text
+    // a crafted `args` could carry. Only a tool-shaped name earns one (never a described call).
+    let tool_token = tool_selection_token(tool);
+    if let Some(t) = tool_token.as_deref() {
+        phases.push(t);
+    }
     let selected = match select_any(&store, scope, &phases, context) {
         Ok(s) => s,
         Err(e) => {
@@ -3389,6 +3396,17 @@ fn is_plain_tool_token(token: &str) -> bool {
 ///
 /// This lives at the ONE recording seam — the annotation the three appenders write — so it holds
 /// for every carrier (wrapped hook, ACP bridge, MCP broker) rather than per parse site.
+/// (core#707) The `tool:<name>` selection token for a tool-shaped `tool` (`tool:Bash`,
+/// `tool:mcp__estate__query`); `None` for an empty or described call, which selects nothing extra.
+pub(crate) fn tool_selection_token(tool: &str) -> Option<String> {
+    let t = tool.trim();
+    (!t.is_empty() && !TOOL_NAME_SENTINELS.contains(&t) && is_tool_shaped(t))
+        .then(|| format!("{TOOL_TOKEN_PREFIX}{t}"))
+}
+
+/// The prefix of a [`tool_selection_token`] (`applies_to: [tool:Bash]`).
+pub const TOOL_TOKEN_PREFIX: &str = "tool:";
+
 pub(crate) fn audit_tool_name(tool: &str) -> String {
     let t = tool.trim();
     if t.is_empty() {
@@ -6342,6 +6360,92 @@ mod tests {
             vec![app, outbox],
             "only the exact graph dir is dropped"
         );
+    }
+
+    /// core#707: the tool is a selection token — a rule with `applies_to: [tool:Bash]` fires on a
+    /// Bash call in any phase and on no other tool, however the other call's raw input is spelled.
+    #[test]
+    fn a_tool_token_selects_a_rule_for_that_tool_only_707() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        assert_eq!(tool_selection_token("Bash").as_deref(), Some("tool:Bash"));
+        assert_eq!(tool_selection_token("(unknown)"), None);
+        assert_eq!(tool_selection_token("run a shell command"), None);
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-tooltok-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let policy_db = base.join("policy.db").to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&policy_db)).unwrap();
+            wicked_governance::register_policy(
+                &mut store,
+                &wicked_governance::Policy {
+                    id: "pol-tool-bash".into(),
+                    kind: "ops".into(),
+                    applies_to: vec!["tool:Bash".into()],
+                    effect: wicked_governance::Effect::Deny,
+                    trigger: wicked_governance::Trigger { contains: None },
+                    obligations: vec![],
+                    criteria: "no shell in this test".into(),
+                    severity: wicked_governance::Severity::High,
+                    rule: "Deny every Bash call.".into(),
+                    retired: false,
+                },
+            )
+            .unwrap();
+        }
+        let run_id = format!("tooltok-{}-{tid}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0)
+            .to_string_lossy()
+            .into_owned();
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::Full,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        let call = |tool: &str, ctx: serde_json::Value| {
+            evaluate_tool_call(
+                "wicked-agent/tooltok/shared",
+                "unit-1",
+                Some("build"),
+                None,
+                Some(&policy_db),
+                &dpath,
+                &ctx,
+                tool,
+                Some(&boundary),
+            )
+        };
+        let read = wt.join("a.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            call(
+                "Read",
+                serde_json::json!({ "file_path": read, "args": {"tool": "Bash", "command": "rm -rf /"} })
+            ),
+            0,
+            "a Read whose raw input says Bash is not a Bash call"
+        );
+        assert_eq!(
+            call("Bash", serde_json::json!({ "command": "ls" })),
+            2,
+            "the tool:Bash rule fires on a Bash call"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A read-only unit that grounds on the code graph (run 1a22f803's `pa-scope`: the estate

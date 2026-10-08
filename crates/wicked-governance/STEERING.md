@@ -71,7 +71,7 @@ half of the retired standalone `Policy` (`src/domain.rs`):
 | `confidence` | f32 in `[0,1]` | rule authority (INV-C2); rides the `Governs` edge |
 | `steering_type` | string enum | one of the seven steering types below; default `architecture` |
 | `targets` | facets | `language`/`layer`/`framework` wildcards (absent = matches all) |
-| `applies_to` | string[] | **inclusion** — phases/tools this rule is selected for (exact match) |
+| `applies_to` | string[] | **inclusion** — phases/tools this rule is selected for (exact match); a tool is spelled `tool:<name>` (`tool:Bash`), the selection token the gate hook adds for each tool call (core#707) |
 | `excludes` | string[] | **exclusion** — phases/tools this rule is never selected for (the inclusion twin) |
 | `weight` | f32, default 1.0 | ordering within a severity band + gate priority |
 | `effect` | `deny` \| `allow_with_conditions` \| `allow` (optional) | **absent ⇒ recall-only** — the rule informs, never gates |
