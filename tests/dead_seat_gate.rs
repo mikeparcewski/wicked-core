@@ -428,7 +428,7 @@ fn a_reassign_at_a_gate_reseats_in_place_and_the_approve_dispatches_once_there()
     assert!(
         parked.iter().any(|e| matches!(e,
             CoreEvent::UnitReassigned {
-                session, ord: 1, attempt: 0, previous_cli, new_cli, previous_attempt_reaped: true
+                session, ord: 1, attempt: 0, previous_cli, new_cli, previous_attempt_reaped: true, ..
             } if session == sid && previous_cli == "codex" && new_cli.as_deref() == Some("claude"))),
         "{parked:?}"
     );

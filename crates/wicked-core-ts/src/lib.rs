@@ -3431,6 +3431,7 @@ mod tests {
                 previous_cli: s(),
                 new_cli: Some(s()),
                 previous_attempt_reaped: false,
+                distinctness_fallback: None,
             },
             "unitReassigned",
             &[
@@ -3441,6 +3442,7 @@ mod tests {
                 "previousCli",
                 "newCli",
                 "previousAttemptReaped",
+                "distinctnessFallback",
             ],
         );
         check(

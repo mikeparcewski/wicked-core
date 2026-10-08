@@ -1152,6 +1152,12 @@ pub enum CoreEvent {
         /// BEFORE this event was emitted (core#500 / AC2); `false` for non-tool units or when
         /// no child was registered (e.g. the previous attempt had not yet spawned its child).
         previous_attempt_reaped: bool,
+        /// (core#591) The evaluator ≠ creator fallback the NEW seat takes, as on
+        /// `unitDistributed`: `Some("same_cli_instance")` when it is another INSTANCE of the CLI
+        /// that created the work this unit depends on (context separated, model not),
+        /// `Some("creator_seat")` when it is that very seat, `None` otherwise (and for a re-route,
+        /// `new_cli: None`). Wire `distinctnessFallback`, `null` when none.
+        distinctness_fallback: Option<String>,
     },
     /// A seat was BENCHED for this run by what it said while doing the run's work: a worker or a
     /// judge refused on a classified dead-seat cause (`not_logged_in`, `quota_exhausted`,
@@ -1738,6 +1744,7 @@ impl CoreEvent {
                 previous_cli,
                 new_cli,
                 previous_attempt_reaped,
+                distinctness_fallback,
             } => json!({
                 "type": "unitReassigned",
                 "session": session,
@@ -1746,6 +1753,7 @@ impl CoreEvent {
                 "previousCli": previous_cli,
                 "newCli": new_cli,
                 "previousAttemptReaped": previous_attempt_reaped,
+                "distinctnessFallback": distinctness_fallback,
             }),
             CoreEvent::SeatBenched {
                 session,

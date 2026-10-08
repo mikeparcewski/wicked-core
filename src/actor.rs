@@ -3196,6 +3196,11 @@ pub(crate) fn run(
                                 previous_cli: previous_cli.clone(),
                                 new_cli: Some(cli.clone()),
                                 previous_attempt_reaped,
+                                distinctness_fallback: reassign_distinctness(
+                                    &units,
+                                    session.unit_ix,
+                                    &cli,
+                                ),
                             },
                         );
                         // Re-dispatch the cursor unit.
@@ -3255,6 +3260,7 @@ pub(crate) fn run(
                                 previous_cli: previous_cli.clone(),
                                 new_cli: None,
                                 previous_attempt_reaped,
+                                distinctness_fallback: None,
                             },
                         );
                         let _ = reply.send(Ok(()));
@@ -5039,6 +5045,40 @@ fn reassign_candidates(
         .collect()
 }
 
+/// (core#591) The evaluator ≠ creator fallback a reassignment of unit `unit_ix` onto `seat`
+/// takes, by the distribution rule's own vocabulary: `creator_seat` when `seat` IS the seat of a
+/// unit it depends on, `same_cli_instance` when it is another INSTANCE of that seat's CLI
+/// (`claude#2` checking `claude`'s work: context separated, model not), `None` otherwise.
+fn reassign_distinctness(
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+    seat: &str,
+) -> Option<String> {
+    let unit = units.get(unit_ix)?;
+    let creators: Vec<String> = units
+        .iter()
+        .filter(|u| {
+            u.phase_id()
+                .is_some_and(|p| unit.depends_on.iter().any(|d| d == p))
+        })
+        .map(|u| {
+            u.assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string())
+        })
+        .collect();
+    if creators.iter().any(|c| c == seat) {
+        Some(crate::distribute::DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string())
+    } else if creators
+        .iter()
+        .any(|c| crate::distribute::model_of(c) == crate::distribute::model_of(seat))
+    {
+        Some(crate::distribute::DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE.to_string())
+    } else {
+        None
+    }
+}
+
 /// (core#718) Whether a failed launch's output is the SEAT's own refusal rather than the run's
 /// environment: today, the wrapped carrier refusing to run a governed claude unit ungoverned
 /// because the host's org settings allow only managed hooks (core#653) — claude's carrier alone
@@ -6171,6 +6211,8 @@ fn apply_step_result(
                         &reason,
                     )?;
                 }
+                // (core#591) Another instance of the creator's CLI is a disclosed fallback.
+                let failover_distinctness = reassign_distinctness(&units, unit_ix, &next);
                 let invocation = crate::registry_roster()
                     .into_iter()
                     .find(|c| c.key == next)
@@ -6189,8 +6231,12 @@ fn apply_step_result(
                         attempt: output.attempt,
                         detail: format!(
                             "seat '{failed_cli}' failed (worker error); failing over to '{next}' \
-                             (seats worker-failed on this unit: {seats_tried}/{})",
-                            session.clis.len().max(seats_tried)
+                             (seats worker-failed on this unit: {seats_tried}/{}){}",
+                            session.clis.len().max(seats_tried),
+                            failover_distinctness
+                                .as_deref()
+                                .map(|f| format!(" [distinctness fallback: {f}]"))
+                                .unwrap_or_default()
                         ),
                         failure_kind: crate::event::StepFailureKind::WorkerError,
                     },
@@ -7657,6 +7703,7 @@ fn reseat_parked_unit(
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
+    let distinctness_fallback = reassign_distinctness(&units, session.unit_ix, cli);
     let mut moved = unit.clone();
     moved.assigned_cli = Some(cli.to_string());
     moved.assigned_invocation = None;
@@ -7670,6 +7717,7 @@ fn reseat_parked_unit(
             previous_cli,
             new_cli: Some(cli.to_string()),
             previous_attempt_reaped: true,
+            distinctness_fallback,
         },
     );
     Ok(())
@@ -7758,6 +7806,7 @@ fn reseat_off_benched_seat(
             ord: unit.ord,
             attempt: session.attempt,
             previous_cli: seat,
+            distinctness_fallback: reassign_distinctness(units, unit_ix, &next),
             new_cli: Some(next),
             previous_attempt_reaped: false,
         },
@@ -17638,6 +17687,49 @@ mod seat_failover_tests {
             next_failover_seat(&[lone], 0, &roster).as_deref(),
             Some("agy")
         );
+    }
+
+    /// core#591 residual: a failover / reseat onto ANOTHER INSTANCE of the creator's CLI
+    /// (`claude#2` taking over a review of `claude`'s work) is disclosed `same_cli_instance`, the
+    /// creator's own seat `creator_seat`, and a model-distinct seat nothing.
+    #[test]
+    fn a_reassignment_onto_the_creators_cli_instance_is_disclosed_591() {
+        let mut creator = WorkUnit::pending("s:build", "s", 1, "w");
+        creator.assigned_cli = None; // the default seat: claude
+        let mut eval = WorkUnit::pending("s:review", "s", 2, "w");
+        eval.assigned_cli = Some("agy".into());
+        eval.depends_on = vec!["build".into()];
+        eval.worker_failed_clis = vec!["agy".into()];
+        let units = vec![creator, eval];
+        let roster = vec![
+            "claude".to_string(),
+            "agy".to_string(),
+            "claude#2".to_string(),
+        ];
+        let next = next_failover_seat(&units, 1, &roster).expect("claude#2 is eligible");
+        assert_eq!(next, "claude#2");
+        assert_eq!(
+            reassign_distinctness(&units, 1, &next).as_deref(),
+            Some("same_cli_instance")
+        );
+        assert_eq!(
+            reassign_distinctness(&units, 1, "claude").as_deref(),
+            Some("creator_seat")
+        );
+        assert_eq!(reassign_distinctness(&units, 1, "codex"), None);
+        // A unit with no dependencies has no creator to be distinct from.
+        assert_eq!(reassign_distinctness(&units, 0, "claude#2"), None);
+        let j = CoreEvent::UnitReassigned {
+            session: "s".into(),
+            ord: 2,
+            attempt: 1,
+            previous_cli: "agy".into(),
+            new_cli: Some(next.clone()),
+            previous_attempt_reaped: false,
+            distinctness_fallback: reassign_distinctness(&units, 1, &next),
+        }
+        .to_json();
+        assert_eq!(j["distinctnessFallback"], "same_cli_instance");
     }
 }
 

@@ -101,7 +101,7 @@ pub(crate) const DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE: &str = "same_cli_insta
 /// INSTANCES of one CLI. Spelled once, over [`wicked_apps_core::spawn::seat_cli_key`] — the same
 /// split the configuration-home resolver keys a seat's root on — so routing and isolation cannot
 /// disagree about which seats share a model.
-fn model_of(key: &str) -> &str {
+pub(crate) fn model_of(key: &str) -> &str {
     wicked_apps_core::spawn::seat_cli_key(key)
 }
 

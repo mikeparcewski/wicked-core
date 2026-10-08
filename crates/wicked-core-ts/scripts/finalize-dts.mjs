@@ -152,6 +152,9 @@ const HAND_AUTHORED = `${BEGIN}
  * none), \`amendments\` (approved intent-amendment texts, absent when empty) and
  * \`structured_description\` (true on units planned with those fields; absent on older records,
  * which a reader re-parses from \`description\` as legacy).
+ * core#591 (additive): unitReassigned carries \`distinctnessFallback\` ('creator_seat' |
+ * 'same_cli_instance' | null), as unitDistributed does — the new seat is another INSTANCE of (or
+ * the very seat of) the CLI that created the work the unit depends on.
  */
 export interface CoreEventJson {
   type: string
