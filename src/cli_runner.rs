@@ -668,14 +668,20 @@ const REVIEW_TARGET_TAIL: usize = 24 * 1024;
 /// knows it is looking at an excerpt, not the whole artifact. Under the cap the input passes
 /// through untouched (no realloc).
 pub(crate) fn clip_review_target(s: String) -> String {
-    if s.len() <= REVIEW_TARGET_HEAD + REVIEW_TARGET_TAIL {
+    clip_head_tail(s, REVIEW_TARGET_HEAD, REVIEW_TARGET_TAIL)
+}
+
+/// [`clip_review_target`] with an explicit head and tail budget (core#754: the prior-context block
+/// shares one total budget across every prior output).
+pub(crate) fn clip_head_tail(s: String, head: usize, tail: usize) -> String {
+    if s.len() <= head + tail {
         return s;
     }
-    let mut head_end = REVIEW_TARGET_HEAD;
+    let mut head_end = head;
     while !s.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    let mut tail_start = s.len() - REVIEW_TARGET_TAIL;
+    let mut tail_start = s.len() - tail;
     while !s.is_char_boundary(tail_start) {
         tail_start += 1;
     }

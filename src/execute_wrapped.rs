@@ -4370,8 +4370,9 @@ prior output you are reviewing, testing, or revising.";
 /// at 128 KiB (`MAX_ARG_STRLEN`, E2BIG ⇒ the unit fails to spawn) and a cross-CLI unit receives
 /// EVERY earlier other-CLI output — so each block's output is clipped exactly like the evaluator's
 /// review target ([`crate::cli_runner::clip_review_target`], core#282: 24 KiB head + 24 KiB tail,
-/// elision marked, under the cap untouched). The ACP carrier ships the same blocks over JSON-RPC,
-/// which has no such limit, so it stays unclipped.
+/// elision marked, under the cap untouched), and (core#754) the whole block shares
+/// [`PRIOR_CONTEXT_BUDGET`] ([`clip_prior_output`]). The ACP carrier clips its blocks the same way:
+/// JSON-RPC has no argv limit, but the model's context does.
 pub(crate) fn prior_context_prefix(prior_outputs: &[crate::workflow::PriorUnitOutput]) -> String {
     if prior_outputs.is_empty() {
         return String::new();
@@ -4381,11 +4382,26 @@ pub(crate) fn prior_context_prefix(prior_outputs: &[crate::workflow::PriorUnitOu
     for p in prior_outputs {
         out.push_str(&p.label);
         out.push('\n');
-        out.push_str(&crate::cli_runner::clip_review_target(p.output.clone()));
+        out.push_str(&clip_prior_output(&p.output, prior_outputs.len()));
         out.push_str("\n\n");
     }
     out
 }
+
+/// (core#754) One prior output as BOTH carriers hand it: ONE budget for the whole context block,
+/// shared evenly, so a unit that depends on many long outputs (a demo's review after five phases)
+/// is not handed a first prompt over the model's context. Each output keeps its head and tail
+/// within its share — never more than the single-output review-target cap, never less than a
+/// floor that still shows a conclusion — with the elision marked.
+pub(crate) fn clip_prior_output(output: &str, count: usize) -> String {
+    let share = (PRIOR_CONTEXT_BUDGET / count.max(1)).clamp(PRIOR_OUTPUT_FLOOR, 48 * 1024);
+    crate::cli_runner::clip_head_tail(output.to_string(), share / 2, share - share / 2)
+}
+
+/// (core#754) The total bytes of prior unit output one prompt carries (~24k tokens).
+pub(crate) const PRIOR_CONTEXT_BUDGET: usize = 96 * 1024;
+/// (core#754) The least of each prior output a prompt keeps, however many there are.
+const PRIOR_OUTPUT_FLOOR: usize = 8 * 1024;
 
 pub(crate) fn unit_prompt(
     input: &StepInput,

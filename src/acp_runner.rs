@@ -3257,6 +3257,13 @@ const AUTH_FAILED_ERROR_KIND: &str = "authentication_failed";
 ///
 /// `Some((kind, message))` carries the bridge's own `error.message` (empty when it sent none), so
 /// the unit's refusal names the cause in the seat's words.
+/// (core#754) Whether a turn error is the model refusing the prompt as over its context window —
+/// Anthropic's `Prompt is too long`, OpenAI's `context_length_exceeded`.
+fn turn_prompt_too_long(e: &anyhow::Error) -> bool {
+    let t = format!("{e:#}").to_ascii_lowercase();
+    t.contains("prompt is too long") || t.contains("context_length_exceeded")
+}
+
 fn turn_auth_refusal(e: &anyhow::Error) -> Option<(&'static str, String)> {
     let se = e.downcast_ref::<RpcServerError>()?;
     let frame: Option<Value> = serde_json::from_str(&se.raw).ok();
@@ -4041,7 +4048,13 @@ fn exec_turn_acp_posture(
     blocks.extend(prior_outputs.iter().map(|p| {
         json!({
             "type": "text",
-            "text": format!("{}\n{}", p.label, p.output)
+            // (core#754) Clipped like the wrapped carrier's: the first turn of a session must fit
+            // the model's context, or it fails `Prompt is too long` before it says anything.
+            "text": format!(
+                "{}\n{}",
+                p.label,
+                crate::execute_wrapped::clip_prior_output(&p.output, prior_outputs.len())
+            )
         })
     }));
     blocks.push(json!({"type": "text", "text": prompt}));
@@ -5548,6 +5561,9 @@ enum SessionProbe {
 pub(crate) mod fallback_kind {
     pub const BINARY_UNAVAILABLE: &str = "binary_unavailable";
     pub const SESSION_DIED: &str = "session_died";
+    /// (core#754) The model refused the turn's prompt as over its context window (`Prompt is too
+    /// long`). No single-shot fallback: it would be handed the same prompt.
+    pub const PROMPT_TOO_LONG: &str = "prompt_too_long";
     /// The bridge answered the turn with `-32000 Authentication required` (crew#267): the
     /// engine-minted `CLAUDE_CONFIG_DIR` (FINDING-061) severs the CLI's logged-in state, so a
     /// governed ACP claude session fails its FIRST prompt by construction. Named so the seat
@@ -7290,6 +7306,41 @@ impl AcpStepRunner {
                         &format!("{cause}; sign it in with `{login}`"),
                     );
                 }
+                // (core#754) The model refused the PROMPT as over its context — not a session
+                // death: the single-shot fallback would be handed the same prompt (and, on a host
+                // where claude is governed only on ACP, is refused by governance besides). The unit
+                // fails with that cause as its own reason; the seat is not at fault.
+                if turn_prompt_too_long(&e) {
+                    let reason = format!(
+                        "[wicked-core] the prompt for unit {} is over '{cli_key}''s context window \
+                         ({e}); NOT falling back to the single-shot carrier — it would be handed the \
+                         same prompt (core#754)",
+                        input.unit.ord
+                    );
+                    eprintln!("{reason}");
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::PROMPT_TOO_LONG.to_string(),
+                    });
+                    emit(&format!("{reason}\n"));
+                    return StepOutput {
+                        run_id: input.run_id.clone(),
+                        unit_ix: input.unit_ix,
+                        attempt: input.attempt,
+                        output: format!(
+                            "(unit {} was not attempted: its prompt is over the model's context \
+                             window on seat '{cli_key}' — {e})",
+                            input.unit.ord
+                        ),
+                        status: StepStatus::Failed,
+                        usage: None,
+                        files: Vec::new(),
+                        tools: Vec::new(),
+                        governed: false,
+                    };
+                }
                 let (reason, kind) = {
                     (
                         format!(
@@ -8078,6 +8129,46 @@ mod tests {
     /// fact like -32000, not a grep — so it takes the auth path (no single-shot fallback; the
     /// actor benches the seat and the unit fails over). Every other `errorKind` (a rate limit, a
     /// server error) stays a session death, and the bridge's message rides the reason.
+    /// core#754: the bridge's `Prompt is too long` (a demo review's first turn) is its own class —
+    /// not an auth refusal, not a session death; `context_length_exceeded` reads the same.
+    #[test]
+    fn a_prompt_over_the_context_is_its_own_turn_failure_754() {
+        let too_long = anyhow::Error::new(RpcServerError {
+            code: Some(-32603),
+            raw: "{\"code\":-32603,\"data\":{\"errorKind\":\"invalid_request\"},\"message\":\
+                  \"Internal error: Prompt is too long\"}"
+                .into(),
+        });
+        assert!(turn_prompt_too_long(&too_long));
+        assert!(turn_auth_refusal(&too_long).is_none());
+        assert!(turn_prompt_too_long(&anyhow::anyhow!(
+            "error: context_length_exceeded: maximum context length is 200000 tokens"
+        )));
+        assert!(!turn_prompt_too_long(&anyhow::anyhow!(
+            "the bridge exited (code 1)"
+        )));
+        // Both carriers clip each prior output within ONE shared budget: six 100 KiB outputs fit.
+        let six: Vec<PriorUnitOutput> = (0..6)
+            .map(|i| PriorUnitOutput {
+                label: format!("[unit {i}]"),
+                output: "y".repeat(100 * 1024),
+            })
+            .collect();
+        let total: usize = six
+            .iter()
+            .map(|p| crate::execute_wrapped::clip_prior_output(&p.output, six.len()).len())
+            .sum();
+        assert!(
+            total <= crate::execute_wrapped::PRIOR_CONTEXT_BUDGET + 6 * 200,
+            "the prior context exceeds its budget: {total} bytes"
+        );
+        assert_eq!(
+            crate::execute_wrapped::clip_prior_output("short", 6),
+            "short",
+            "under its share an output is untouched"
+        );
+    }
+
     #[test]
     fn an_authentication_failed_error_kind_is_an_auth_refusal() {
         let expired = anyhow::Error::new(RpcServerError {
