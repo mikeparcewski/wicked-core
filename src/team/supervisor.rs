@@ -826,6 +826,18 @@ impl UnitTeam {
     }
 
     /// The members as the ledger reports them (DES §7 `teamLedger.monitors[]`).
+    /// [`Self::ledger_monitors`] for the fold: a slot admitted but never opened (an unbound
+    /// attempt that ended before its final pass, core#745) ran nothing, so it is not folded as a
+    /// `completed` member.
+    fn folded_monitors(&self) -> Vec<LedgerMonitor> {
+        self.monitors
+            .iter()
+            .zip(self.ledger_monitors())
+            .filter(|(m, _)| !(m.state == SlotState::Pending && m.open_seq == 0 && m.batches == 0))
+            .map(|(_, lm)| lm)
+            .collect()
+    }
+
     fn ledger_monitors(&self) -> Vec<LedgerMonitor> {
         self.monitors
             .iter()
@@ -1380,6 +1392,14 @@ impl SupervisorCore {
                 // for — the ratchet is the §8.5 rule ("it only goes up") applied to members.
                 st.asked = st.asked.max(b.monitors.asked);
             }
+            // core#745 (a): a re-pick moves the PA, so the member candidates follow it — the new
+            // PA is never offered as its own reviewer, the former PA becomes a candidate.
+            TeamBody::PathRepicked(b) => {
+                let st = self.runs.get_mut(&run_id).expect("armed");
+                if !b.to.is_empty() {
+                    st.pa = b.to.clone();
+                }
+            }
             TeamBody::PlanAccepted(b) => {
                 let st = self.runs.get_mut(&run_id).expect("armed");
                 st.band = (!b.band.trim().is_empty()).then(|| b.band.clone());
@@ -1609,6 +1629,12 @@ impl SupervisorCore {
         unit.engine = self.cfg.engine.clone();
         for (from, e, f) in carried {
             unit.carry(super::runner::finding_of(&e, &f), from);
+        }
+        // core#745 (b): an UNBOUND unit has no tree change to wait for, so its members are
+        // summoned at the claim — a refusal (or "no distinct seat") is on the record while the PA
+        // works, not after its step; an admitted member still opens with its final-pass batch.
+        if unit.ctx.repo.is_none() && !unit.ctx.bound {
+            unit.summon(&*self.host);
         }
         self.units
             .insert((run_id.to_string(), k.0, k.1), Arc::new(Mutex::new(unit)));
@@ -2463,7 +2489,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                 (
                     TeamLedger::new(
                         FinalPass::StreamGap,
-                        u.ledger_monitors(),
+                        u.folded_monitors(),
                         Vec::new(),
                         u.book.rejected,
                     ),

@@ -2087,6 +2087,49 @@ fn an_unbound_step_with_a_member_is_reviewed_on_its_output() {
     assert_eq!(h.folded(3, 1).final_pass, FinalPass::Completed);
 }
 
+/// core#745 (a): after `path.repicked` the member candidates follow the NEW PA — the new PA is
+/// never offered as its own reviewer and the former PA is the natural reviewer.
+#[test]
+fn a_repick_moves_the_pa_so_the_former_pa_reviews_the_new_one() {
+    let mut h = Harness::new("repick");
+    h.host.set_reply(output_reviewer("survey-repo"));
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.publish(&fixture_with(tev::PATH_REPICKED, 0, RUN, |p| {
+        p["from"] = json!("claude#1");
+        p["to"] = json!("claude#2");
+    }));
+    h.claim_step(3, 1, "claude#2", "survey-repo", false);
+    h.complete_with_output(3, 1, "claude#2", "survey-repo", ANSWER);
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    assert_eq!(
+        (joined[0]["status"].as_str(), joined[0]["seat"].as_str()),
+        (Some("attached"), Some("claude#1")),
+        "the former PA reviews; the new PA is not refused as its own member"
+    );
+}
+
+/// core#745 (b): an UNBOUND unit summons its members at the claim, so a refusal is on the record
+/// while the PA works — before (and whether or not) its step completes.
+#[test]
+fn an_unbound_step_discloses_its_member_refusal_at_the_claim() {
+    let mut h = Harness::new("unboundclaim");
+    h.start("claude#1", &["claude#1"], "20-39");
+    h.claim_step(3, 1, "claude#1", "survey-repo", false);
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    assert_eq!(joined[0]["status"], "failed", "{}", joined[0]);
+    h.complete_step(3, 1, "claude#1", "survey-repo", "timed_out");
+    h.pump();
+    assert_eq!(
+        h.rows(tev::MEMBER_JOINED).len(),
+        1,
+        "the final pass does not summon twice"
+    );
+}
+
 /// The other half of the rule: a step that CHANGED the tree is reviewed on its diff even when its
 /// output is on record — the member sees the diff, not the answer, and the finding is a tree
 /// finding (no `target` on the wire).
