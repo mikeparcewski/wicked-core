@@ -239,6 +239,22 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.41** — 2026-10-08 — npm release for IG1-crew, on main tip f6fc3d1 (#786).
+  **IG1-core-2**: the OS-sandbox floor is an admission class the engine honours. A governed unit on
+  an `os_sandbox`-class seat (pi, copilot, agy, and codex while its own `--sandbox` is bounded)
+  whose floor arms writes the `os_sandbox` ARMED marker before the CLI runs and reports
+  `governed: true`. The fold accepts that carrier without a hook sentinel; the #653 no-hook deny
+  still holds for the wrapped carrier. A floor that does not arm discloses `governanceUnenforced`
+  naming why (`not_a_worktree`, `no_launcher`, `cannot_arm`, …) plus `sandboxUnenforced`. Codex's
+  own sandbox counts only when the LAUNCHED argv runs codex with a bounded mode. The team gate
+  admits a stdio `[cli.acp]` member by class, with exactly three refusals: no `[cli.acp]`, HTTP
+  transport, class none. A codex monitor over a repository scope stays refused until its
+  adapter's own sandbox is proven. **IG1-core-3**: the seat roster carries `governance_class`
+  (computed, `null` with no record) and `sandboxPosture` carries a `reason`; both additive.
+  **ASK-K4 (napi surface removed)**: the warm chat pool is deleted — `chatOpen`, `chatSend`,
+  `chatSeats`, `chatList`, `chatHold`, `chatClose` and the idle reaper are gone from the engine and
+  the binding. `monitor_ensure` / `monitor_turn` stay. The five `Chat*` CoreEvent variants stay on
+  the wire type only until crew drops its `chatClosed` consumers.
 - **core-ts 0.7.40** — 2026-10-08 — npm release carrying the engine fixes since 0.7.39, on main tip
   400c897. Wire changes are additive (new optional `WorkUnit` fields `review_rounds`,
   `operator_rulings`, `carried_items` — skipped when empty; new gate kind `review_adjudication`; new
