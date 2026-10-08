@@ -2742,6 +2742,37 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
     Some((out, name.to_string()))
 }
 
+/// (core#781) The runner behind a package-manager script check — `npm test`, `npm run <s>`,
+/// `pnpm [run] <s>`, `yarn [run] <s>` — read from the worktree's `package.json`: the script as
+/// `npx --no-install <tokens…>` when it is ONE plain `vitest` command (its first token `vitest`,
+/// no shell operator, quote, comment, glob, substitution or variable), else `None` (a script the floor cannot
+/// see through is not re-run, as before).
+fn script_runner_argv(worktree: &Path, argv: &[String]) -> Option<Vec<String>> {
+    let pm = Path::new(argv.first()?).file_stem()?.to_str()?;
+    if !matches!(pm, "npm" | "pnpm" | "yarn") {
+        return None;
+    }
+    let script = match argv.get(1..)? {
+        [t] if t == "test" => "test",
+        [r, name] if r == "run" || r == "run-script" => name.as_str(),
+        [name] if pm != "npm" => name.as_str(),
+        _ => return None,
+    };
+    let pkg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(worktree.join("package.json")).ok()?).ok()?;
+    let body = pkg.get("scripts")?.get(script)?.as_str()?.trim();
+    if body.chars().any(|c| "&|;<>`$\"'(){}*?#~!\\\n".contains(c)) {
+        return None;
+    }
+    let tokens: Vec<String> = body.split_whitespace().map(String::from).collect();
+    if tokens.first().map(String::as_str) != Some("vitest") {
+        return None;
+    }
+    let mut out = vec!["npx".to_string(), "--no-install".to_string()];
+    out.extend(tokens);
+    Some(out)
+}
+
 /// (core#766) The test file a vitest failure id names: `FAIL tests/x.test.ts > suite > name` →
 /// `tests/x.test.ts`. The ` > ` separator is what makes it vitest's (go's `FAIL TestX` and a
 /// file-level `FAIL tests/x.test.ts [ tests/x.test.ts ]` import failure have none and are not
@@ -2862,10 +2893,19 @@ fn rerun_flakes(
     if !oversubscribed(load1, cpus) {
         return;
     }
+    // (core#781) `npm run test` hides its runner behind a script: when the script is a plain
+    // `vitest …` command the re-run goes through that runner (`npx --no-install vitest …`).
+    let runner_argv = script_runner_argv(worktree, &check.argv);
     let plans: Option<Vec<(Vec<String>, String)>> = run
         .regressions
         .iter()
-        .map(|id| isolated_rerun_argv(&check.argv, id))
+        .map(|id| {
+            isolated_rerun_argv(&check.argv, id).or_else(|| {
+                runner_argv
+                    .as_deref()
+                    .and_then(|a| isolated_rerun_argv(a, id))
+            })
+        })
         .collect();
     let Some(plans) = plans else {
         return;
@@ -6083,6 +6123,63 @@ mod tests {
         assert!(!oversubscribed(Some(3.0), 14));
         assert!(!oversubscribed(None, 14), "an unknown load is no evidence");
         assert!(!oversubscribed(Some(f64::NAN), 14));
+    }
+
+    /// core#781: `npm run test` / `npm test` hides vitest behind a script — the re-run reads the
+    /// script from the worktree's package.json and goes through `npx --no-install vitest`, cut to
+    /// the one file as for a direct vitest check; a compound script, a non-vitest script or a
+    /// missing package.json is not seen through.
+    #[test]
+    fn a_script_hidden_vitest_is_rerun_through_its_runner_781() {
+        let dir = std::env::temp_dir().join(format!("wicked-rc-781-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "test"])), None);
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"vitest run","ci":"vitest run --config vitest.ci.ts","both":"tsc && vitest run","commented":"vitest run # --config alt.ts","lint":"eslint ."}}"#,
+        )
+        .unwrap();
+        let id = "FAIL tests/chordModifiers.test.ts > chords > a modifier";
+        let runner = script_runner_argv(&dir, &s(&["npm", "run", "test"])).unwrap();
+        assert_eq!(runner, s(&["npx", "--no-install", "vitest", "run"]));
+        assert_eq!(
+            isolated_rerun_argv(&runner, id).map(|p| p.0),
+            Some(s(&[
+                "npx",
+                "--no-install",
+                "vitest",
+                "run",
+                "tests/chordModifiers.test.ts"
+            ]))
+        );
+        assert_eq!(
+            script_runner_argv(&dir, &s(&["npm", "test"])),
+            Some(runner.clone())
+        );
+        assert_eq!(
+            script_runner_argv(&dir, &s(&["pnpm", "ci"]))
+                .and_then(|a| isolated_rerun_argv(&a, id))
+                .map(|p| p.0),
+            Some(s(&[
+                "npx",
+                "--no-install",
+                "vitest",
+                "run",
+                "tests/chordModifiers.test.ts",
+                "--config",
+                "vitest.ci.ts"
+            ]))
+        );
+        assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "both"])), None);
+        assert_eq!(
+            script_runner_argv(&dir, &s(&["npm", "run", "commented"])),
+            None,
+            "a comment must not turn into live flags on the re-run"
+        );
+        assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "lint"])), None);
+        assert_eq!(script_runner_argv(&dir, &s(&["cargo", "test"])), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// core#766: a vitest head-only failure (`Test timed out in 5000ms` on a 5 s filesystem walk

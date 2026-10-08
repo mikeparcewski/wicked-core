@@ -2994,6 +2994,21 @@ pub(crate) fn run(
                         continue;
                     }
                 };
+                // core#773: a run PARKED at a gate on its cursor unit is re-seated in place —
+                // nothing runs, so nothing is reaped, the attempt is not bumped and nothing is
+                // dispatched; the gate's own approve then dispatches the unit ONCE, on the new
+                // seat. (Approve-then-reassign dispatched a phantom attempt on the old seat first.)
+                if session.status == crate::domain::SessionStatus::AwaitingHuman {
+                    let res = reseat_parked_unit(
+                        &mut store,
+                        &mut subscribers,
+                        &session,
+                        ord,
+                        new_cli.as_deref(),
+                    );
+                    let _ = reply.send(res);
+                    continue;
+                }
                 if session.status != crate::domain::SessionStatus::Executing {
                     let _ = reply.send(Err(anyhow::anyhow!(
                         "run {run_id} is not Executing (status: {:?}); \
@@ -7477,6 +7492,71 @@ enum Reseat {
     NoSeat(String),
 }
 
+/// (core#773) Reassign on a run PARKED at a gate (`AwaitingHuman`): re-seat the cursor unit `ord`
+/// on `new_cli` without dispatching. No worker runs while the run is parked, so there is nothing
+/// to reap (`previousAttemptReaped: true`) and the attempt counter does not move; the gate's
+/// approve dispatches the unit once, on the new seat. Refused (the run untouched) while a plan
+/// is held for approval, for a unit that is not the cursor, for one that already completed (an
+/// approve advances past it), and for a re-route (`new_cli: None`), which needs a running unit.
+fn reseat_parked_unit(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    session: &crate::domain::AgentSession,
+    ord: u32,
+    new_cli: Option<&str>,
+) -> anyhow::Result<()> {
+    let run_id = &session.id;
+    if let Some(why) = team_gate::dispatch_blocked(session) {
+        anyhow::bail!("cannot reassign: {why}");
+    }
+    let Some(cli) = new_cli.filter(|c| !c.trim().is_empty()) else {
+        anyhow::bail!(
+            "run {run_id} is parked at a gate: name the seat to reassign unit {ord} to (a \
+             re-route needs a running unit)"
+        );
+    };
+    let units = crate::domain::session_units(store, run_id)?;
+    let Some(unit) = units.get(session.unit_ix) else {
+        anyhow::bail!(
+            "run {run_id} cursor unit_ix {} out of range",
+            session.unit_ix
+        );
+    };
+    if unit.ord != ord {
+        anyhow::bail!(
+            "run {run_id} cursor unit is ord={} not ord={ord}; can only reassign the unit the \
+             gate holds",
+            unit.ord
+        );
+    }
+    if matches!(unit.status, crate::domain::UnitStatus::Done) {
+        anyhow::bail!(
+            "unit {ord} of run {run_id} already completed; approving the gate advances past it, \
+             so there is nothing to reassign"
+        );
+    }
+    let previous_cli = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    let mut moved = unit.clone();
+    moved.assigned_cli = Some(cli.to_string());
+    moved.assigned_invocation = None;
+    put_node(store, moved.to_node())?;
+    emit(
+        subscribers,
+        CoreEvent::UnitReassigned {
+            session: run_id.clone(),
+            ord,
+            attempt: session.attempt,
+            previous_cli,
+            new_cli: Some(cli.to_string()),
+            previous_attempt_reaped: true,
+        },
+    );
+    Ok(())
+}
+
 /// Re-seat the cursor unit when the seat it was planned on has been BENCHED for this run since.
 ///
 /// Distribution seats every unit at plan time (core#590 S5: no ballot finds a dead seat first). A
@@ -8721,6 +8801,21 @@ fn dispatch_unit(
                 )
             })
             .flatten();
+        // core#776: every OTHER Tool unit is handed the run variables too — the id and ordinal
+        // here, the run's evidence root when the launcher minted one, and the worktree's tree id,
+        // snapshotted off-thread below (the repository root is the only store read it needs).
+        let run_env = record.is_none().then(|| ToolRunEnv {
+            run_id: run_id.to_string(),
+            ord: unit.ord,
+            evidence_root: session.evidence_root.clone(),
+            tree_from: session.workdir.clone().zip(
+                session
+                    .repo_ref
+                    .as_deref()
+                    .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                    .map(|r| r.root_path),
+            ),
+        });
         // core#500 (F-BM-008): the child's STOP predicate — the run's launch identity, read the
         // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown flip it:
         // `tombstone_run` + `advance_launch_seq` inside `cancel_run` (covers all cancel callers),
@@ -8851,6 +8946,7 @@ fn dispatch_unit(
                         let emit_ev = |ev: CoreEvent| {
                             let _ = tx.send(crate::command::Command::EmitEvent(ev));
                         };
+                        let run_vars = run_env.as_ref().map(ToolRunEnv::vars).unwrap_or_default();
                         let lifted = lift_ctx.as_ref().map(|ctx| {
                             crate::deliver_lift::lift_and_reverify(
                                 ctx,
@@ -8868,15 +8964,13 @@ fn dispatch_unit(
                                 // The verified tip rides to the script (Copilot on #433): its own
                                 // fetch + rebase + push can still race a remote that advances in
                                 // the window; with this it can refuse or re-verify a moved base.
-                                let env: Vec<(String, String)> = clearance
-                                    .verified_base
-                                    .map(|b| {
-                                        vec![(
-                                            crate::deliver_lift::VERIFIED_BASE_ENV.to_string(),
-                                            b,
-                                        )]
-                                    })
-                                    .unwrap_or_default();
+                                let mut env = run_vars.clone();
+                                if let Some(b) = clearance.verified_base {
+                                    env.push((
+                                        crate::deliver_lift::VERIFIED_BASE_ENV.to_string(),
+                                        b,
+                                    ));
+                                }
                                 let (o, st, k) = run_tool_cmd(
                                     &cmd,
                                     workdir.as_deref(),
@@ -8892,7 +8986,7 @@ fn dispatch_unit(
                                 let (o, st, k) = run_tool_cmd(
                                     &cmd,
                                     workdir.as_deref(),
-                                    &[],
+                                    &run_vars,
                                     &stop,
                                     &on_spawn,
                                     &on_done,
@@ -9265,10 +9359,47 @@ fn walkthrough_tree(
         .map_err(|e| e.to_string())
 }
 
+/// (core#776) The run variables a generic Tool unit is handed, resolved on the actor thread:
+/// `WICKED_RUN_ID`, `WICKED_RUN_UNIT`, `WICKED_EVIDENCE_ROOT` when the run has one, and
+/// `WICKED_TREE` — the worktree's tree id, snapshotted off the actor thread by [`Self::vars`]
+/// (`tree_from` = the worktree and its registered repository root; absent or unsnapshottable ⇒
+/// the variable is not set, never set empty). The walkthrough recorder declares its own set.
+struct ToolRunEnv {
+    run_id: String,
+    ord: u32,
+    evidence_root: Option<String>,
+    tree_from: Option<(String, String)>,
+}
+
+impl ToolRunEnv {
+    fn vars(&self) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("WICKED_RUN_ID".to_string(), self.run_id.clone()),
+            ("WICKED_RUN_UNIT".to_string(), self.ord.to_string()),
+        ];
+        if let Some(root) = &self.evidence_root {
+            env.push((
+                crate::walkthrough::EVIDENCE_ROOT_ENV.to_string(),
+                root.clone(),
+            ));
+        }
+        if let Some((wd, repo)) = &self.tree_from {
+            if let Ok(s) = crate::worktree_guard::snapshot(
+                std::path::Path::new(wd),
+                std::path::Path::new(repo),
+            ) {
+                env.push((crate::walkthrough::TREE_ENV.to_string(), s.tree));
+            }
+        }
+        env
+    }
+}
+
 /// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
 /// `(output, StepStatus)`. Exit 0 → `StepStatus::Ok`; anything else → `StepStatus::Failed`.
 /// Called off the actor thread (blocking subprocess). `extra_env` rides on top of the hardened
-/// environment — the deliver lift's `WICKED_DELIVER_VERIFIED_BASE` (core#431), nothing else today.
+/// environment — the run variables (core#776) and the deliver lift's `WICKED_DELIVER_VERIFIED_BASE`
+/// (core#431).
 /// What stopped a Tool child before it exited on its own (core#500 / F-BM-008): the pid of the
 /// process-group leader the engine killed, the invalidation signal the child observed, and how
 /// long it had run.
