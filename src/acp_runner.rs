@@ -16391,6 +16391,8 @@ No further next steps — both questions fully answered.";
             last_attempt: None,
             rework_of: None,
             rework_amendment: None,
+            review_rounds: Vec::new(),
+            operator_rulings: Vec::new(),
             status: crate::domain::UnitStatus::Pending,
             catalog: None,
             exclude_seats: Vec::new(),

@@ -27,6 +27,22 @@ Two release tracks share this file, newest entry first regardless of track:
   non-shell tool fires nothing. The tool-name selection token (#707) and the labelled-set re-measure
   are not in this change (the set's lane directory is gone).
 
+- **core#760 — the evaluator is handed its review history: a numbered done-when checklist, its
+  own prior verdicts, the operator's rulings and the latest floor record.** Run ad5a4ca7 (S15e):
+  the evaluator FAILed one creator 13 times with the same six context labels every round — no
+  prior verdict, no operator note, no `repoChecksEvaluated` — so the bar moved each round,
+  rulings were re-raised and 9 of 13 verdicts said "floor results not available" over a passing
+  floor. `WorkUnit` gains `review_rounds` (each NOT-PASS verdict an evaluator returned, booked at
+  its escalation, marked `sent_back` by a request-changes rewind) and `operator_rulings` (every
+  request-changes note and approve amendment, verbatim, on the unit it amended); both are skipped
+  on the wire when empty. At dispatch an Evaluator unit is handed (new module `review_context`)
+  `[review checklist — unit N]` (the intent's `Done when` / `Acceptance criteria` list numbered,
+  approved intent amendments, and the contract: one `ITEM <n>: PASS | FAIL | RULED` line per item
+  above the `VERDICT:` line; a RULED item never fails the unit; FAIL only when an item FAILs; in
+  round ≥ 2 a new FAIL says why it was invisible before or is a follow-up), `[prior verdicts —
+  unit N]`, `[operator rulings — unit N]` (its own and its creator's, in time order) and
+  `[floor record — unit M]` (the latest repo-checks record before it). The `VERDICT:` line stays
+  the only thing the gate fold parses.
 - **core#753 (engine half) — a `walkthrough_plan` unit is told where its storyline goes.** The
   unit was handed only `walkthrough_plan — <problem>` and the evaluator's no-worktree-writes
   discipline, wrote no storyline, and its pinned lint denied on every live run. `unit_prompt`
