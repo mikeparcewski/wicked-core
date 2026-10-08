@@ -256,11 +256,27 @@ fn a_creator_scoped_steer_reaches_fix_only_and_no_prior_context_block() {
         "verify: {}",
         by_ord(4).1
     );
+    // (core#760) The ONE exception is the evaluator that reviews fix: the steer is an operator
+    // ruling on the creator it reviews, so `verify` is handed it — framed as a ruling, in the
+    // `[operator rulings]` block — and judges against it. No other unit's prior block carries it.
     for (ord, _, priors) in &handed {
-        assert!(
-            priors.iter().all(|p| !p.contains("Implement X")),
-            "unit {ord}'s prior-context block carries the steer: {priors:?}"
-        );
+        let carrying: Vec<&String> = priors
+            .iter()
+            .filter(|p| p.contains("Implement X"))
+            .collect();
+        if *ord == 4 {
+            assert!(
+                carrying.len() == 1
+                    && carrying[0].contains("The operator's rulings, verbatim")
+                    && carrying[0].contains(&format!("[amend on unit 3, attempt 0] {STEER}")),
+                "verify is handed the steer as a ruling, once: {priors:?}"
+            );
+        } else {
+            assert!(
+                carrying.is_empty(),
+                "unit {ord}'s prior-context block carries the steer: {priors:?}"
+            );
+        }
     }
     // The declared handoffs still flow (reproduce saw triage's output; verify saw fix's).
     assert!(

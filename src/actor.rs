@@ -6798,6 +6798,14 @@ fn escalate_denied_unit(
         .clone()
         .or_else(|| denial.map(|d| d.reason.clone()))
         .unwrap_or_else(|| "verdict not pass".to_string());
+    // (core#760) An evaluator's NOT-PASS verdict is kept on the unit for its later rounds
+    // (`[prior verdicts — unit N]`), whatever the operator answers here.
+    if class == "verdict_not_pass"
+        && unit.role == crate::workflow::PhaseRole::Evaluator
+        && unit.tool_cmd.is_none()
+    {
+        record_review_round(store, &session.id, &unit.id, attempt, &reason)?;
+    }
     // The guard's restore outcome rides the gate only when the guard is what denied — a later
     // layer's denial on a unit whose tree happened to be clean carries none.
     let mutation = unit
@@ -6835,6 +6843,32 @@ fn escalate_denied_unit(
         "escalation",
         prompt,
     )
+}
+
+/// (core#760) Append the NOT-PASS verdict an evaluator unit returned at `attempt` to its
+/// [`review_rounds`](crate::domain::WorkUnit::review_rounds) — once per attempt (a re-opened gate
+/// over the same denial does not book it twice). Read from the store, so the write never clobbers
+/// a field the caller's copy predates.
+fn record_review_round(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    unit_id: &str,
+    attempt: u32,
+    findings: &str,
+) -> anyhow::Result<()> {
+    let units = crate::domain::session_units(store, run_id)?;
+    let Some(mut u) = units.into_iter().find(|u| u.id == unit_id) else {
+        return Ok(());
+    };
+    if u.review_rounds.iter().any(|r| r.attempt == attempt) {
+        return Ok(());
+    }
+    u.review_rounds.push(crate::domain::ReviewRound {
+        attempt,
+        findings: findings.to_string(),
+        outcome: None,
+    });
+    put_node(store, u.to_node())
 }
 
 /// (core#464) The operator-facing prompt of a denial gate, per class. Approve always means "retry
@@ -8435,6 +8469,25 @@ fn dispatch_unit(
                     label,
                     output: text,
                 });
+            }
+        }
+        // (core#760) The reviewer's brief: the intent's done-when as a numbered checklist with
+        // the per-item PASS / FAIL / RULED contract, its own prior verdicts, the operator's
+        // rulings on it and on the creator it reviews, and the latest floor record — so a later
+        // round judges the same bar the earlier rounds did instead of re-deriving it.
+        if unit.tool_cmd.is_none() {
+            for (ord, label, output) in crate::review_context::evaluator_brief(
+                &session.problem,
+                &session.intent_amendments,
+                &units,
+                unit,
+            ) {
+                context_items.push(crate::event::InjectedContext {
+                    ord,
+                    label: label.clone(),
+                    output_bytes: output.len(),
+                });
+                prior_outputs.push(PriorUnitOutput { label, output });
             }
         }
     }
@@ -10859,6 +10912,13 @@ pub(crate) fn confirm_gate(
                         let segment = format!(" (operator amendment: {a})");
                         if !u.description.contains(&segment) {
                             u.description.push_str(&segment);
+                            // (core#760) The amendment is a ruling the unit's reviewer reads.
+                            u.operator_rulings.push(crate::domain::OperatorRuling {
+                                action: "amend".to_string(),
+                                text: a.clone(),
+                                attempt: u.last_attempt.unwrap_or(0),
+                                at: crate::interaction::now_millis(),
+                            });
                             put_node(store, u.to_node())?;
                             // (EVT-012) UnitReworkAmended — the authoritative amendment paper trail.
                             // Fires here (after persist, before Resumed) so the amendment text is
@@ -11299,8 +11359,39 @@ fn rewind_to_creator_scoped(
         None => findings.clone(),
     };
     let target_ord = units[target_ix].ord;
+    let review_attempt = cursor.last_attempt.unwrap_or(0);
+    let now = crate::interaction::now_millis();
     // ONE write batch over every unit from the target on.
     for (ix, u) in units.iter_mut().enumerate().skip(target_ix) {
+        if ix == cursor_ix {
+            // (core#760/#761) The reviewing unit keeps the verdict it sent back (booked at its
+            // escalation; a floor/other denial sent back is booked here) and the operator's note.
+            if ix != target_ix
+                && u.role == crate::workflow::PhaseRole::Evaluator
+                && u.tool_cmd.is_none()
+            {
+                match u
+                    .review_rounds
+                    .iter_mut()
+                    .find(|r| r.attempt == review_attempt)
+                {
+                    Some(r) => r.outcome = Some(crate::domain::REVIEW_SENT_BACK.to_string()),
+                    None => u.review_rounds.push(crate::domain::ReviewRound {
+                        attempt: review_attempt,
+                        findings: findings.clone(),
+                        outcome: Some(crate::domain::REVIEW_SENT_BACK.to_string()),
+                    }),
+                }
+            }
+            if let (Some(n), "request_changes") = (&note, scope) {
+                u.operator_rulings.push(crate::domain::OperatorRuling {
+                    action: scope.to_string(),
+                    text: n.clone(),
+                    attempt: review_attempt,
+                    at: now,
+                });
+            }
+        }
         u.worktree_baseline = None;
         u.worktree_mutation = None;
         u.denial = None;
@@ -13582,6 +13673,16 @@ mod substance_gate_tests {
                 && reason.contains("the regression test is missing"),
             "{reason}"
         );
+        // (core#760) The verdict is booked on the unit for its later rounds, undecided.
+        let booked = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(booked.review_rounds.len(), 1, "{:?}", booked.review_rounds);
+        assert_eq!(booked.review_rounds[0].attempt, 0);
+        assert!(booked.review_rounds[0]
+            .findings
+            .contains("the regression test is missing"));
+        assert_eq!(booked.review_rounds[0].outcome, None);
         let evs = drain_events(&erx);
         assert_eq!(evaluator_verdict_of(&evs), Some(Some("FAIL".to_string())));
         let (escalated, paused) = gate_shape(&evs);
@@ -14314,6 +14415,100 @@ mod request_changes_tests {
         );
     }
 
+    /// (core#760) The re-run EVALUATOR is handed the reviewer's brief: after a `request_changes`
+    /// with a note, the verify unit keeps its verdict (marked `sent_back`) and the note as a
+    /// ruling, and its next dispatch injects `[review checklist]`, `[prior verdicts]`,
+    /// `[operator rulings]` and the creator's `[floor record]` beside the creator's output.
+    #[test]
+    fn a_re_run_evaluator_is_handed_its_checklist_prior_verdicts_rulings_and_floor() {
+        let run_id = format!("rc-brief-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, true);
+        {
+            let mut s = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            s.problem =
+                "Fix the gate.\n\n## Done when\n1. the gate opens\n2. tests pin it\n".into();
+            put_node(&mut store, s.to_node()).unwrap();
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            units[2].repo_checks = Some(
+                serde_json::from_value(serde_json::json!({
+                    "detected": [], "checks": [], "skipped": [], "passed": true,
+                    "sandbox_level": "none", "tree": "tree-b"
+                }))
+                .unwrap(),
+            );
+            put_node(&mut store, units[2].to_node()).unwrap();
+            // As the verify unit's escalation booked it.
+            record_review_round(&mut store, &run_id, &units[3].id, 0, FINDINGS).unwrap();
+        }
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("the step card stays — ruled at this gate".into()),
+            },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let verify = &units[3];
+        assert_eq!(verify.review_rounds.len(), 1, "booked once, not twice");
+        assert_eq!(
+            verify.review_rounds[0].outcome.as_deref(),
+            Some(crate::domain::REVIEW_SENT_BACK)
+        );
+        assert_eq!(verify.operator_rulings.len(), 1);
+        assert_eq!(
+            verify.operator_rulings[0].text,
+            "the step card stays — ruled at this gate"
+        );
+        assert_eq!(verify.operator_rulings[0].action, "request_changes");
+
+        let _ = drain(&erx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        dispatch_unit(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &run_id,
+            3,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let labels: Vec<String> = drain(&erx)
+            .into_iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitContextInjected {
+                    ord: 4,
+                    prior_units,
+                    ..
+                } => Some(prior_units.into_iter().map(|p| p.label).collect()),
+                _ => None,
+            })
+            .expect("the evaluator's dispatch injects context");
+        for want in [
+            "[review checklist — unit 4]",
+            "[prior verdicts — unit 4]",
+            "[operator rulings — unit 4]",
+            "[floor record — unit 3]",
+        ] {
+            assert!(
+                labels.iter().any(|l| l == want),
+                "{want} missing: {labels:?}"
+            );
+        }
+    }
+
     /// (core#549, acceptance 1) `request_changes` at a **deliver** gate injects the operator note
     /// as a `[review — unit N — requested changes]` context item. The cursor is the deliver unit
     /// (no evaluator denial — `findings` is empty); the amendment is `"\n" + note`. Both the
@@ -14388,6 +14583,14 @@ mod request_changes_tests {
 
         // rework_amendment on the fix unit holds the full text byte-for-byte.
         let units = crate::domain::session_units(&store, &run_id).unwrap();
+        // (core#760) A send-back from a non-evaluator (the deliver tool unit) books no review
+        // round — only an evaluator's verdicts are review history — but its note is a ruling.
+        assert!(
+            units[4].review_rounds.is_empty(),
+            "{:?}",
+            units[4].review_rounds
+        );
+        assert_eq!(units[4].operator_rulings.len(), 1);
         let fix = &units[2];
         assert_eq!(
             fix.rework_amendment.as_deref(),

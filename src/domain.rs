@@ -703,6 +703,40 @@ impl UnitDenial {
     }
 }
 
+/// (core#760) One NOT-PASS verdict an Evaluator unit returned, kept on that unit for the rest of
+/// the run so every later round of the same review is handed it (`[prior verdicts — unit N]`).
+/// Without it the reviewer re-derived the bar from the intent each round: rulings were re-raised
+/// and items present since the first attempt surfaced ten rounds late (run ad5a4ca7, 13 FAILs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRound {
+    /// The evaluator unit's attempt that returned the verdict.
+    pub attempt: u32,
+    /// The verdict's own words (the bounded findings the gate carried — `denial_reason`).
+    pub findings: String,
+    /// What the gate did with it: `sent_back` (request changes — the creator reworked), or `None`
+    /// while undecided / when the phase was retried as is. Counted by the rework cap (core#761).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// [`ReviewRound::outcome`] for a verdict the operator sent back to the creator.
+pub const REVIEW_SENT_BACK: &str = "sent_back";
+
+/// (core#760) A human's note at a gate on a unit — a request-changes note or an approve amendment,
+/// verbatim. Kept on the unit the gate amended so the evaluator reviewing it reads the operator's
+/// rulings (`[operator rulings — unit N]`), not only the creator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorRuling {
+    /// The gate's arm: `request_changes` | `amend`.
+    pub action: String,
+    /// The operator's own words.
+    pub text: String,
+    /// The amended unit's attempt when the ruling was given.
+    pub attempt: u32,
+    /// When it was given (unix millis).
+    pub at: i64,
+}
+
 /// A unit of distributed work, persisted as `Node(Other(WORK_UNIT))`. Plan creates it `Pending`;
 /// distribute records the assignment; execute records the outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1007,6 +1041,14 @@ pub struct WorkUnit {
     /// re-reading the evaluator transcript. Absent until the unit is rewound; cleared on approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rework_amendment: Option<String>,
+    /// (core#760) Every NOT-PASS verdict this (Evaluator) unit returned, oldest first — handed back
+    /// to the unit on its next round. Never cleared by a rewind; skipped on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_rounds: Vec<ReviewRound>,
+    /// (core#760) Every human gate note that amended this unit, oldest first — read by the
+    /// evaluator that reviews it. Skipped on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_rulings: Vec<OperatorRuling>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -1196,6 +1238,8 @@ impl WorkUnit {
             last_attempt: None,
             rework_of: None,
             rework_amendment: None,
+            review_rounds: Vec::new(),
+            operator_rulings: Vec::new(),
             status: UnitStatus::Pending,
             exclude_seats: Vec::new(),
         }
