@@ -228,6 +228,8 @@ pub const MAX_FAILURE_IDS: usize = 1000;
 pub const SCRATCH_SUBDIR: &str = "wicked-checks";
 /// The optional per-repo check configuration, relative to the worktree root.
 pub const CONFIG_PATH: &str = ".wicked/checks.json";
+/// (core#767) The check-name prefix of a configured journey (`journey-<name>`).
+pub const JOURNEY_PREFIX: &str = "journey-";
 
 /// Check classifications on the wire (`CheckRun::classification`).
 /// The head failure is absent on the base: the change broke it — denies.
@@ -1173,6 +1175,14 @@ struct ChecksConfig {
     /// check; `false` is accepted and means the same. `timeout_s` and the baseline diff apply
     /// (a base lacking the key fails closed: "the change introduced it").
     e2e: Option<CheckCommand>,
+    /// (core#767) Named end-to-end JOURNEYS — `{"desk_projects": ["python3", "e2e/desk_projects_test.py"]}`
+    /// — each its own check `journey-<name>`, run at the VERIFY stage only, after `e2e`, in name
+    /// order, under the same bound, baseline diff and boundary as every other check. A name is
+    /// `[A-Za-z0-9_]{1,64}`; `false` drops one. The engine runs them itself, so a repository whose
+    /// proof is a set of scripts (Python journeys) is verified by the floor even when no seat may
+    /// run an interpreter.
+    #[serde(default)]
+    journeys: std::collections::BTreeMap<String, CheckCommand>,
     /// Override or disable the formatter check auto-detected from `Cargo.toml`. Default: when
     /// `Cargo.toml` is present, runs `cargo fmt --all --check`. Set to `false` to disable, or
     /// supply an explicit command. `timeout_s` applies; the baseline diff does not (a formatting
@@ -1355,6 +1365,30 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let r_targeted = resolve(&cfg.test_targeted, "test_targeted")?;
     let r_e2e = resolve(&cfg.e2e, "e2e")?;
     let r_formatter = resolve(&cfg.formatter, "formatter")?;
+    // (core#767) Journeys: validated always (a bad entry fails detection at every stage), run at
+    // VERIFY only.
+    let mut journeys: Vec<RepoCheck> = Vec::new();
+    for (name, cmd) in &cfg.journeys {
+        if name.is_empty()
+            || name.len() > 64
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!(
+                "`{CONFIG_PATH}` `journeys`: `{name}` is not a journey name ([A-Za-z0-9_]{{1,64}})"
+            ));
+        }
+        let key = format!("journeys.{name}");
+        if let Resolved::Command(argv) = resolve(&Some(cmd.clone()), &key)? {
+            if ctx.stage == FloorStage::Verify {
+                journeys.push(RepoCheck {
+                    name: format!("{JOURNEY_PREFIX}{name}"),
+                    argv,
+                    source: format!("{CONFIG_PATH} {key}"),
+                    timeout_s: None,
+                });
+            }
+        }
+    }
     // `e2e` is a VERIFY-stage check only (the base run copies the stage, so never at the creator).
     let e2e = match r_e2e {
         Resolved::Command(argv) if ctx.stage == FloorStage::Verify => Some(RepoCheck {
@@ -1371,7 +1405,8 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let configured_node = [&r_typecheck, &r_lint, &r_test, &r_targeted, &r_formatter]
         .iter()
         .any(|r| matches!(r, Resolved::Command(_)))
-        || e2e.is_some();
+        || e2e.is_some()
+        || !journeys.is_empty();
     let mut install: Option<RepoCheck> = None;
     let mut typecheck: Option<RepoCheck> = None;
     let mut lint: Option<RepoCheck> = None;
@@ -1562,6 +1597,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     let mut out: Vec<RepoCheck> = [install, cargo_fmt, typecheck, lint, test, cargo, e2e]
         .into_iter()
         .flatten()
+        .chain(journeys)
         .collect();
     if let Some(t) = cfg.timeout_s {
         for c in out.iter_mut().filter(|c| c.name != "install") {
@@ -2040,7 +2076,30 @@ impl CheckScratch {
             )
             .env("CI", "1")
             .env("NO_COLOR", "1")
-            .env("FORCE_COLOR", "0");
+            .env("FORCE_COLOR", "0")
+            // (core#767) A Python journey must not leave `__pycache__/` in the reviewed tree (the
+            // worktree guard would deny the engine's own side effect).
+            .env("PYTHONDONTWRITEBYTECODE", "1");
+        // (core#767) Playwright resolves its browsers under the user cache, which moved with
+        // HOME: pin the operator's installed browsers (read-only to the check — writes stay
+        // confined by the boundary) when the daemon set no location of its own.
+        match std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+            Some(v) => {
+                cmd.env("PLAYWRIGHT_BROWSERS_PATH", v);
+            }
+            None => {
+                if let Some(h) = real_home.as_deref() {
+                    let cache = if cfg!(target_os = "macos") {
+                        Path::new(h).join("Library/Caches/ms-playwright")
+                    } else {
+                        Path::new(h).join(".cache/ms-playwright")
+                    };
+                    if cache.is_dir() {
+                        cmd.env("PLAYWRIGHT_BROWSERS_PATH", cache);
+                    }
+                }
+            }
+        }
         // The toolchain proxies (`cargo`, `rustc` under rustup) resolve toolchains through
         // `RUSTUP_HOME`, which defaults to `$HOME/.rustup`. Moving HOME must not lose them: pin the
         // real location explicitly when the daemon did not (when it did, the allow-list passed it).
@@ -2432,7 +2491,7 @@ pub(crate) fn run_with_sandbox_ctx(
 
 /// Is `name` one of the floor's TEST-set checks (the ones a `targeted` re-run replaces)?
 fn is_test_set_check(name: &str) -> bool {
-    matches!(name, "test" | "cargo-test" | "e2e")
+    matches!(name, "test" | "cargo-test" | "e2e") || name.starts_with(JOURNEY_PREFIX)
 }
 
 /// (core#469) The check set an operator's re-run runs, and the detected checks it waives.
@@ -7256,6 +7315,44 @@ mod tests {
                 .all(|r| !r.argv.iter().any(|a| a == "b.test.ts")),
             "{test:?}"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// core#767: `journeys` are VERIFY-stage checks named `journey-<name>`, in name order after
+    /// `e2e`; a bad name fails detection; `false` drops one; a journey is a test-set check.
+    #[test]
+    fn journeys_are_verify_stage_checks_in_name_order_767() {
+        let repo = scratch("journeys767");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"e2e":["true"],"journeys":{"desk_projects":["python3","e2e/desk_projects_test.py"],"cmdk":["python3","e2e/cmdk.py"],"off":false},"timeout_s":60}"#,
+        )
+        .unwrap();
+        let verify = detect_with(&repo, &FloorContext::default()).unwrap();
+        assert_eq!(
+            names(&verify),
+            vec!["test", "e2e", "journey-cmdk", "journey-desk_projects"]
+        );
+        assert_eq!(verify[3].argv, s(&["python3", "e2e/desk_projects_test.py"]));
+        assert_eq!(verify[3].timeout_s, Some(60));
+        assert!(is_test_set_check("journey-cmdk"));
+        let creator = detect_with(
+            &repo,
+            &FloorContext {
+                stage: FloorStage::Creator,
+                ..FloorContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(names(&creator), vec!["test"]);
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"journeys":{"bad name":["true"]}}"#,
+        )
+        .unwrap();
+        let err = detect_with(&repo, &FloorContext::default()).unwrap_err();
+        assert!(err.contains("not a journey name"), "{err}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
