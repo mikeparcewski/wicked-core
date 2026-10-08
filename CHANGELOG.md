@@ -224,6 +224,22 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.40** — 2026-10-08 — npm release carrying the engine fixes since 0.7.39, on main tip
+  400c897. Wire changes are additive (new optional `WorkUnit` fields `review_rounds`,
+  `operator_rulings`, `carried_items` — skipped when empty; new gate kind `review_adjudication`; new
+  `gateEscalated.condition` `judge_unavailable`). **Review loop** — core#760 (#777) the evaluator
+  is handed a numbered done-when checklist, its prior verdicts, the operator's rulings and the
+  latest floor record; core#761 (#780) after 2 send-backs the next NOT PASS opens
+  `review_adjudication` (land with carried items / one more round / stop), and a
+  `judge_unavailable` denial is its own class; core#765 + core#769 (#783) the write-root witness
+  judges content and skips the engine scratch / npm caches, and an in-tool approval refusal
+  benches the seat. **Also** — #772 (#774) a judge seat's provider refusal is a seat failure, not a
+  REJECT; #515 (#771) agent-socket dirs masked in the jail; #742 (#770) wicked-estate 0.21.0;
+  #766 (#768) a vitest head-only failure re-runs as its file alone; #656 (#763) a governed PTY unit
+  is refused or disclosed; #749 (#758) a store-less emit never spools under HOME; #747 (#757) a
+  single-seat roster scopes its plan; #611/#711 (#756) review-scale fixes; core#753 (#778)
+  walkthrough_plan storyline prompt; #708 (#779) ops-watch spellings; #775 the mcp-server drop-in
+  and steering pack; rustls 0.23.45 (#751, #752).
 - **core-ts 0.7.39** — 2026-10-06 — npm release carrying the **two** engine fixes since 0.7.38, on
   main tip c594c24; both from dogfood run ada5b0aa (crew 0.8.1 / core-ts 0.7.38). Wire changes are
   additive (`stepFailed.failureKind: "timedOut"` is a new variant; old rows read as before).
