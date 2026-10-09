@@ -201,6 +201,245 @@ impl OutputAdapter for ClaudeStreamJson {
     }
 }
 
+/// (core#412) The `codex exec --json` JSONL adapter. Plain `codex exec` prints only the final agent
+/// message on stdout (everything else, `tokens used N` included, goes to stderr), so a wrapped codex
+/// unit reported no usage at all. `--json` puts the turn on stdout as events; this adapter keeps the
+/// unit's text EXACTLY what plain mode produced — the LAST `agent_message` item, emitted when stdout
+/// closes, so every verdict / refusal / floor reader sees the same text — and adds:
+/// * `turn.completed.usage` → [`Usage`]: `input_tokens` is codex's total (it includes
+///   `cached_input_tokens`, the cache-read split), `cache_write_input_tokens` is the creation split,
+///   `output_tokens` as reported; no cost (codex reports none). Summed over turns.
+/// * `error` / `turn.failed` messages → text at once, so a refusal (auth, quota) still reaches the
+///   classifiers on a failed exit, where plain mode printed it.
+///
+/// Every other event (`thread.started`, `item.started`, command executions, reasoning, …) yields
+/// nothing, as in plain mode. A line that is not JSON (version drift, a stub) passes through as one
+/// text delta — fail-safe, never a panic or a block.
+#[derive(Default)]
+pub(crate) struct CodexJsonl {
+    /// The newest `agent_message` text, held until stdout closes.
+    last_message: Option<String>,
+    /// Usage summed over every `turn.completed` seen so far.
+    usage: Option<Usage>,
+}
+
+impl OutputAdapter for CodexJsonl {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        if line.trim().is_empty() {
+            return AdapterOut::default();
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return AdapterOut {
+                text: vec![line.to_string()],
+                ..AdapterOut::default()
+            };
+        };
+        let mut out = AdapterOut::default();
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("item.completed") => {
+                let item = v.get("item");
+                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                    == Some("agent_message")
+                {
+                    if let Some(t) = item.and_then(|i| i.get("text")).and_then(|t| t.as_str()) {
+                        if !t.trim().is_empty() {
+                            self.last_message = Some(t.to_string());
+                        }
+                    }
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(u) = v.get("usage") {
+                    let field = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+                    let turn = Usage {
+                        input_tokens: field("input_tokens"),
+                        output_tokens: field("output_tokens"),
+                        cache_read_tokens: field("cached_input_tokens"),
+                        cache_creation_tokens: field("cache_write_input_tokens"),
+                        cost_usd: None,
+                    };
+                    let total = match self.usage.take() {
+                        None => turn,
+                        Some(t) => Usage {
+                            input_tokens: t.input_tokens.saturating_add(turn.input_tokens),
+                            output_tokens: t.output_tokens.saturating_add(turn.output_tokens),
+                            cache_read_tokens: t
+                                .cache_read_tokens
+                                .saturating_add(turn.cache_read_tokens),
+                            cache_creation_tokens: t
+                                .cache_creation_tokens
+                                .saturating_add(turn.cache_creation_tokens),
+                            cost_usd: None,
+                        },
+                    };
+                    self.usage = Some(total.clone());
+                    out.usage = Some(total);
+                }
+            }
+            Some("error") => {
+                if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
+                    out.text.push(m.to_string());
+                }
+            }
+            Some("turn.failed") => {
+                if let Some(m) = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    out.text.push(m.to_string());
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn finish(&mut self) -> AdapterOut {
+        AdapterOut {
+            text: self.last_message.take().into_iter().collect(),
+            ..AdapterOut::default()
+        }
+    }
+}
+
+/// (core#412) The `pi -p --mode json` event adapter — pi's twin of [`CodexJsonl`]. Each assistant
+/// `message_end` carries that message's `usage` (`input` fresh, `cacheRead`, `cacheWrite`, `output`,
+/// `cost.total`); they are summed, `input_tokens` being fresh + cache-read + cache-write as
+/// [`ClaudeStreamJson`] counts it. The unit's text is the LAST assistant message's text blocks,
+/// emitted when stdout closes (plain `pi -p` prints the final answer); an `errorMessage` on a
+/// message is text at once, so a refusal reaches the classifiers. Anything that is not JSON passes
+/// through as one text delta.
+#[derive(Default)]
+pub(crate) struct PiJson {
+    last_message: Option<String>,
+    usage: Option<Usage>,
+}
+
+impl OutputAdapter for PiJson {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        if line.trim().is_empty() {
+            return AdapterOut::default();
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return AdapterOut {
+                text: vec![line.to_string()],
+                ..AdapterOut::default()
+            };
+        };
+        let mut out = AdapterOut::default();
+        let msg = v.get("message");
+        let is_assistant_end = v.get("type").and_then(|t| t.as_str()) == Some("message_end")
+            && msg.and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant");
+        if !is_assistant_end {
+            return out;
+        }
+        let msg = msg.expect("checked above");
+        if let Some(e) = msg.get("errorMessage").and_then(|e| e.as_str()) {
+            if !e.trim().is_empty() {
+                out.text.push(e.to_string());
+            }
+        }
+        let text: Vec<&str> = msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = text.join("");
+        if !text.trim().is_empty() {
+            self.last_message = Some(text);
+        }
+        if let Some(u) = msg.get("usage") {
+            let field = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+            let cache_read = field("cacheRead");
+            let cache_write = field("cacheWrite");
+            let cost = u
+                .get("cost")
+                .and_then(|c| c.get("total"))
+                .and_then(|c| c.as_f64());
+            let prev = self.usage.take();
+            let total = Usage {
+                input_tokens: field("input")
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_write)
+                    .saturating_add(prev.as_ref().map_or(0, |p| p.input_tokens)),
+                output_tokens: field("output")
+                    .saturating_add(prev.as_ref().map_or(0, |p| p.output_tokens)),
+                cache_read_tokens: cache_read
+                    .saturating_add(prev.as_ref().map_or(0, |p| p.cache_read_tokens)),
+                cache_creation_tokens: cache_write
+                    .saturating_add(prev.as_ref().map_or(0, |p| p.cache_creation_tokens)),
+                cost_usd: match (prev.as_ref().and_then(|p| p.cost_usd), cost) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (a, b) => a.or(b),
+                },
+            };
+            self.usage = Some(total.clone());
+            out.usage = Some(total);
+        }
+        out
+    }
+
+    fn finish(&mut self) -> AdapterOut {
+        AdapterOut {
+            text: self.last_message.take().into_iter().collect(),
+            ..AdapterOut::default()
+        }
+    }
+}
+
+/// (core#412) Add `--mode json` to a WRAPPED `pi` print launch (`-p` / `--print`), before any `--`
+/// guard, unless the template already picked a `--mode`. Returns whether the argv now runs json
+/// mode, which decides the [`PiJson`] adapter.
+pub(crate) fn inject_pi_json_mode(argv: &mut Vec<String>) -> bool {
+    if !argv.iter().any(|a| a == "-p" || a == "--print") {
+        return false;
+    }
+    if let Some(i) = argv.iter().position(|a| a == "--mode") {
+        return argv.get(i + 1).is_some_and(|m| m == "json");
+    }
+    if argv.iter().any(|a| a.starts_with("--mode=")) {
+        return argv.iter().any(|a| a == "--mode=json");
+    }
+    let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv.insert(at, "json".to_string());
+    argv.insert(at, "--mode".to_string());
+    true
+}
+
+/// (core#412) Add `--json` to a WRAPPED `codex exec` launch (never the council ballot, which runs the
+/// registry template itself), before any `--` guard, like [`inject_claude_stream_flags`]. Only for
+/// the `exec` subcommand — the only one that takes it — and not when the template already chose
+/// (`--json` / `--experimental-json`). Returns whether the flag is on the argv, which decides the
+/// [`CodexJsonl`] adapter: a template without `exec` keeps the passthrough.
+pub(crate) fn inject_codex_json_flag(argv: &mut Vec<String>) -> bool {
+    let is_exec = argv
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|a| a == "exec");
+    if !is_exec {
+        return false;
+    }
+    if argv
+        .iter()
+        .any(|a| a == "--json" || a == "--experimental-json")
+    {
+        return true;
+    }
+    match argv.iter().position(|a| a == "--") {
+        Some(i) => argv.insert(i, "--json".to_string()),
+        None => argv.push("--json".to_string()),
+    }
+    true
+}
+
 /// Whether the resolved binary is `claude` (selects the stream-json adapter + flag injection). Matches on
 /// the file stem so `claude`, `/usr/local/bin/claude`, and `claude.exe` (Windows) all resolve.
 ///
@@ -1623,6 +1862,13 @@ impl WrappedCliStepRunner {
 
         // Per-binary output adapter (B-runner). claude → stream-json (+ the two flags, injected before the
         // `--` guard); every other binary → passthrough (byte-identical to the pre-adapter raw-line stream).
+        // (core#412) codex → `exec --json`, pi → `-p --mode json`, each with its JSON adapter, so
+        // the seat's usage is captured; the unit's text stays what plain mode printed.
+        let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
+        let codex_json = seat_cli == wicked_apps_core::spawn::SeatCli::Codex
+            && inject_codex_json_flag(&mut argv);
+        let pi_json =
+            seat_cli == wicked_apps_core::spawn::SeatCli::Pi && inject_pi_json_mode(&mut argv);
         if is_claude {
             inject_claude_stream_flags(&mut argv);
             // Before governance arms: isolation applies to EVERY claude unit, governed or not. An
@@ -1888,6 +2134,10 @@ impl WrappedCliStepRunner {
         } else {
             let adapter: Box<dyn OutputAdapter> = if is_claude {
                 Box::<ClaudeStreamJson>::default()
+            } else if codex_json {
+                Box::<CodexJsonl>::default()
+            } else if pi_json {
+                Box::<PiJson>::default()
             } else {
                 Box::new(Passthrough)
             };
@@ -9272,6 +9522,148 @@ mod tests {
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
         r#"{"type":"result","subtype":"success","is_error":false,"result":"hello","total_cost_usd":0.409099,"usage":{"input_tokens":25789,"cache_creation_input_tokens":26103,"cache_read_input_tokens":34098,"output_tokens":83}}"#,
     ];
+
+    /// core#412: a real `codex exec --json` turn (codex-cli 0.161.0), captured 2026-10-09.
+    const CODEX_FIXTURE: &[&str] = &[
+        r#"{"type":"thread.started","thread_id":"01a12288-2318-7160-b322-675d623b0b99"}"#,
+        r#"{"type":"turn.started"}"#,
+        r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll run the shell command now.\n"}}"#,
+        r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo probe'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
+        r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'echo probe'","aggregated_output":"probe\n","exit_code":0,"status":"completed"}}"#,
+        r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"done"}}"#,
+        r#"{"type":"turn.completed","usage":{"input_tokens":40507,"cached_input_tokens":15232,"cache_write_input_tokens":0,"output_tokens":54,"reasoning_output_tokens":0}}"#,
+    ];
+
+    /// core#412: the unit's text is what plain `codex exec` printed (the final agent message only —
+    /// no event JSON, no intermediate message, no command output) and the turn's usage is captured.
+    #[test]
+    fn the_codex_adapter_keeps_the_final_message_and_captures_usage() {
+        let out = drive(&mut CodexJsonl::default(), CODEX_FIXTURE);
+        assert_eq!(out.text, vec!["done".to_string()]);
+        assert_eq!(
+            out.usage,
+            Some(Usage {
+                input_tokens: 40_507,
+                output_tokens: 54,
+                cache_read_tokens: 15_232,
+                cache_creation_tokens: 0,
+                cost_usd: None,
+            })
+        );
+        assert!(
+            out.files.is_empty() && out.tools.is_empty(),
+            "parity with plain mode"
+        );
+
+        // A refusal still reaches the classifiers as text; no usage is invented for it.
+        let failed = drive(
+            &mut CodexJsonl::default(),
+            &[
+                r#"{"type":"error","message":"You've hit your usage limit."}"#,
+                r#"{"type":"turn.failed","error":{"message":"Not logged in"}}"#,
+            ],
+        );
+        assert_eq!(
+            failed.text,
+            vec![
+                "You've hit your usage limit.".to_string(),
+                "Not logged in".to_string()
+            ]
+        );
+        assert_eq!(failed.usage, None);
+
+        // Not JSON (drift, a stub) passes through unchanged.
+        let plain = drive(&mut CodexJsonl::default(), &["hi", ""]);
+        assert_eq!(plain.text, vec!["hi".to_string()]);
+    }
+
+    /// core#412: `--json` rides only a codex `exec` launch, before a `--` guard, once.
+    #[test]
+    fn the_codex_json_flag_rides_exec_only_and_once() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut argv = s(&["codex", "exec", "--skip-git-repo-check", "the prompt"]);
+        assert!(inject_codex_json_flag(&mut argv));
+        assert_eq!(
+            argv,
+            s(&[
+                "codex",
+                "exec",
+                "--skip-git-repo-check",
+                "the prompt",
+                "--json"
+            ])
+        );
+        assert!(inject_codex_json_flag(&mut argv), "already on");
+        assert_eq!(argv.iter().filter(|a| *a == "--json").count(), 1);
+        let mut guarded = s(&["codex", "exec", "--", "the prompt"]);
+        assert!(inject_codex_json_flag(&mut guarded));
+        assert_eq!(guarded, s(&["codex", "exec", "--json", "--", "the prompt"]));
+        let mut chat = s(&["codex", "the prompt"]);
+        assert!(!inject_codex_json_flag(&mut chat), "no exec: no --json");
+        assert_eq!(chat, s(&["codex", "the prompt"]));
+    }
+
+    /// core#412: pi's `--mode json` — usage summed over assistant messages (fresh + cache as
+    /// input, cost from `cost.total`), the text the LAST assistant message's, an error surfaced.
+    #[test]
+    fn the_pi_adapter_keeps_the_final_message_and_sums_usage() {
+        let msg = |text: &str, input: u64, read: u64, cost: f64| {
+            format!(
+                r#"{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}},{{"type":"toolCall","name":"bash"}}],"usage":{{"input":{input},"output":10,"cacheRead":{read},"cacheWrite":5,"totalTokens":0,"cost":{{"total":{cost}}}}}}}}}"#
+            )
+        };
+        let (a, b) = (msg("looking", 100, 1000, 0.5), msg("done", 20, 2000, 0.25));
+        let lines = [
+            r#"{"type":"session"}"#,
+            r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"the prompt"}]}}"#,
+            a.as_str(),
+            r#"{"type":"turn_end","message":{"role":"assistant","usage":{"input":999}}}"#,
+            b.as_str(),
+            r#"{"type":"agent_end","messages":[]}"#,
+        ];
+        let out = drive(&mut PiJson::default(), &lines);
+        assert_eq!(out.text, vec!["done".to_string()]);
+        assert_eq!(
+            out.usage,
+            Some(Usage {
+                input_tokens: 100 + 1000 + 5 + 20 + 2000 + 5,
+                output_tokens: 20,
+                cache_read_tokens: 3000,
+                cache_creation_tokens: 10,
+                cost_usd: Some(0.75),
+            })
+        );
+        let failed = drive(
+            &mut PiJson::default(),
+            &[
+                r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Not logged in"}}"#,
+            ],
+        );
+        assert_eq!(failed.text, vec!["Not logged in".to_string()]);
+        assert_eq!(failed.usage, None);
+    }
+
+    #[test]
+    fn the_pi_json_mode_rides_print_launches_only() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut argv = s(&["pi", "-p", "the prompt"]);
+        assert!(inject_pi_json_mode(&mut argv));
+        assert_eq!(argv, s(&["pi", "-p", "the prompt", "--mode", "json"]));
+        let mut guarded = s(&["pi", "-p", "--", "the prompt"]);
+        assert!(inject_pi_json_mode(&mut guarded));
+        assert_eq!(
+            guarded,
+            s(&["pi", "-p", "--mode", "json", "--", "the prompt"])
+        );
+        let mut text = s(&["pi", "-p", "--mode", "text", "x"]);
+        assert!(
+            !inject_pi_json_mode(&mut text),
+            "the template's own mode wins"
+        );
+        assert_eq!(text, s(&["pi", "-p", "--mode", "text", "x"]));
+        let mut interactive = s(&["pi", "x"]);
+        assert!(!inject_pi_json_mode(&mut interactive));
+    }
 
     #[test]
     fn t_d1_claude_adapter_extracts_text_usage_and_files() {
