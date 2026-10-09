@@ -596,6 +596,32 @@ pub enum CoreEvent {
         cli_key: String,
         acp_session_id: String,
     },
+    /// (core#418) The ACP session that just opened REPLACES a process the engine closed itself, so
+    /// the run paid a cold start: `reason` is `posture_switch` (a fenced unit reached a
+    /// write-posture process, or the reverse, F-036), `fenced_unit_quiesced` (the previous fenced
+    /// unit's process died with that unit) or `turn_settled` (core#762). `ms` is the cost — from
+    /// the close (posture switch) or the spawn (otherwise) to the opened session.
+    AcpProcessRestarted {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli_key: String,
+        reason: String,
+        ms: u64,
+    },
+    /// (core#762) The bridge sent no `stopReason` for `quiet_secs` after the worker's final
+    /// MESSAGE, with no tool call open, so the ENGINE ended the turn and kept its output
+    /// (`output_bytes`) as the attempt's result, which goes to the fold and the floor like any
+    /// completed turn. A stall after a complete final message is a transport fault, not a dead
+    /// worker: a watchdog seeing this does not reassign. The wedged process is never reused.
+    AcpTurnSettled {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli_key: String,
+        quiet_secs: u64,
+        output_bytes: usize,
+    },
     /// The ACP runner fell back to single-shot wrapped-CLI execution for this unit.
     /// `reason` is the human-readable warning already prepended to step output; `fallback_kind`
     /// is a stable slug for UI dispatch (see acp_runner constants).
@@ -1997,6 +2023,38 @@ impl CoreEvent {
                 "session": session,
                 "cliKey": cli_key,
                 "acpSessionId": acp_session_id,
+            }),
+            CoreEvent::AcpProcessRestarted {
+                session,
+                ord,
+                attempt,
+                cli_key,
+                reason,
+                ms,
+            } => json!({
+                "type": "acpProcessRestarted",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cliKey": cli_key,
+                "reason": reason,
+                "ms": ms,
+            }),
+            CoreEvent::AcpTurnSettled {
+                session,
+                ord,
+                attempt,
+                cli_key,
+                quiet_secs,
+                output_bytes,
+            } => json!({
+                "type": "acpTurnSettled",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cliKey": cli_key,
+                "quietSecs": quiet_secs,
+                "outputBytes": output_bytes,
             }),
             CoreEvent::AcpFallback {
                 session,

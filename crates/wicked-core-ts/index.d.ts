@@ -1091,6 +1091,13 @@ export declare class Subscription {
  * when the plan names any, `writeTargetsSkipped` (`{cli, why}[]`). With no plan it carries only
  * `writeTargetsMissing` (why nothing is listed). Answer with `action: 'consent:<id>'`, approve
  * (= the default) or reject.
+ * core#762 / core#418 (additive, new events): `acpTurnSettled` {session, ord, attempt, cliKey,
+ * quietSecs, outputBytes} — the bridge sent no stopReason for quietSecs after the worker's final
+ * message with no tool call open, so the ENGINE ended the turn and kept its output as the
+ * attempt's result (a watchdog seeing it does not reassign; WICKED_ACP_SETTLE_SECS, default 600,
+ * 0 = off). `acpProcessRestarted` {session, ord, attempt, cliKey, reason, ms} — the session that
+ * opened replaces one the engine closed itself (reason `posture_switch` |
+ * `fenced_unit_quiesced` | `turn_settled`); ms is the cold-start cost.
  */
 export interface CoreEventJson {
   type: string
