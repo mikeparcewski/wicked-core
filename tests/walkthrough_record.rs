@@ -266,6 +266,14 @@ fn a_passing_walkthrough_completes_and_the_recorder_got_exactly_the_declared_env
     );
     // No plan step precedes the review, so no author dir is named.
     assert_eq!(get("WICKED_WALKTHROUGH_AUTHOR"), None);
+    // core#798: the recorder is told it is jailed and by what — garden's recorder seals
+    // `unjailed_host` without it.
+    let kind = if cfg!(target_os = "macos") {
+        "sandbox-exec"
+    } else {
+        "bwrap"
+    };
+    assert_eq!(get("WICKED_WALKTHROUGH_JAIL").as_deref(), Some(kind));
     // The daemon's environment does not leak in: the test process's own engine variables (the
     // hermetic emit spool) are set in THIS process and must be absent in the recorder.
     for l in env.lines() {
@@ -278,6 +286,7 @@ fn a_passing_walkthrough_completes_and_the_recorder_got_exactly_the_declared_env
                     "WICKED_EVIDENCE_ROOT",
                     "WICKED_TREE",
                     "WICKED_WALKTHROUGH_AUTHOR",
+                    "WICKED_WALKTHROUGH_JAIL",
                     "WICKED_GARDEN_ROOT",
                 ]
                 .contains(&k),
