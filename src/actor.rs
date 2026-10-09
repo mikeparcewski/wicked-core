@@ -849,6 +849,12 @@ pub(crate) fn run(
     if let Err(e) = crate::editor_gate::seed_editor_defaults(&mut store) {
         eprintln!("wicked-core: could not seed the editor grant rules ({e})");
     }
+    // (core#804) The guidance packs the shipped workflows cite (MCPS-*, RVWL-*), seeded the same
+    // way — INSERT-ONLY, so a retired rule stays retired — so `rules.recall` finds them without
+    // an operator ingest.
+    if let Err(e) = crate::steering_packs::seed_shipped_packs(&mut store) {
+        eprintln!("wicked-core: could not seed the shipped steering packs ({e})");
+    }
 
     let sidecar_base: String = sidecar_base(&path);
 
@@ -7989,8 +7995,12 @@ fn advance_or_pause(
     // released deliver unit still stops for its engine-enforced deliver gate (unless the launch
     // set `auto_deliver`).
     let pause = if released {
-        should_pause(&session, &units, unit_ix)
-            .filter(|r| matches!(r, PauseReason::DeliverGate { .. }))
+        should_pause(&session, &units, unit_ix).filter(|r| {
+            matches!(
+                r,
+                PauseReason::DeliverGate { .. } | PauseReason::ConsentBefore { .. }
+            )
+        })
     } else {
         should_pause(&session, &units, unit_ix)
     };
@@ -8004,6 +8014,7 @@ fn advance_or_pause(
             PauseReason::RunLevel => "run_level",
             PauseReason::DeliverGate { .. } => "deliver",
             PauseReason::PlanApproval => crate::plan_gate::GATE_KIND,
+            PauseReason::ConsentBefore { .. } => CONSENT_GATE_KIND,
         };
         // (T3) A plan gate takes the next `gate_seq` in the SAME batch as the pause (§6.1): the
         // session write below carries it. A gate already opened (a resume re-pausing it) keeps
@@ -8103,6 +8114,9 @@ fn advance_or_pause(
                     .as_deref()
                     .map_or_else(|| "the run's repository".to_string(), |r| format!("`{r}`"));
                 (reviewing_ord, deliver_gate_prompt_for(unit, &branch, &repo))
+            }
+            PauseReason::ConsentBefore { reviewing_ord } => {
+                (reviewing_ord, consent_gate_prompt(unit, reviewing_ord))
             }
         };
         let ord = unit.ord;
@@ -8418,6 +8432,31 @@ fn deliver_gate_prompt_parts(
     )
 }
 
+/// (core#801) The `gateKind` of a [`PauseReason::ConsentBefore`] pause. Deliberately NOT `def`
+/// (a standing order may auto-approve `def` / `run_level` / `terminal` gates): consent is an
+/// operator's decision every time.
+pub(crate) const CONSENT_GATE_KIND: &str = "consent";
+
+/// The prompt of a `consent` pause: what is about to run, in the phase's own authored words (its
+/// card), before anything has run. Approve runs it; Reject cancels the run with nothing run.
+fn consent_gate_prompt(unit: &crate::domain::WorkUnit, reviewing_ord: Option<u32>) -> String {
+    let card = unit
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map_or_else(|| unit.description.clone(), str::to_string);
+    let also = reviewing_ord.map_or_else(String::new, |o| {
+        format!(" Approving also releases the output of unit {o}, whose gate fired here.")
+    });
+    format!(
+        "Consent needed before unit {} runs — nothing in it has run yet. {card}{also} Approve \
+         runs it; Reject cancels the run without running it. [consent gate: the phase's own \
+         consent_before, engine-enforced whatever the run-level policy]",
+        unit.ord
+    )
+}
+
 /// Why a run paused before dispatching a unit — not merely *that* it did.
 ///
 /// The distinction is the operator's entire context. A `DefGate` pause asks about work that has
@@ -8440,6 +8479,10 @@ enum PauseReason {
     /// (DES-TEAMING-002 §8.6, T3) The run holds a composed plan the approval matrix requires a
     /// human to release (`AgentSession.team_plan.pending`); token `plan_approval`.
     PlanApproval,
+    /// (core#801) The upcoming unit's OWN def declares `consent_before`: the operator decides
+    /// before it runs; token `consent`. `reviewing_ord` is the preceding unit when ITS def gate
+    /// fired at the same boundary — one pause answers both, and the prompt says so.
+    ConsentBefore { reviewing_ord: Option<u32> },
 }
 
 /// Why to pause for a human before dispatching `units[unit_ix]`, or `None` to dispatch. Two sources:
@@ -8503,25 +8546,33 @@ fn should_pause(
                 .map(|prev| prev.ord),
         });
     }
-    let run_level = match session.human_confirm {
-        crate::domain::HumanConfirm::None => false,
-        crate::domain::HumanConfirm::All => true,
-        crate::domain::HumanConfirm::Before(o) => o == ord,
-    };
     let def_gate = unit_ix
         .checked_sub(1)
         .and_then(|i| units.get(i))
         .filter(|prev| match prev.gate {
-            crate::workflow::GateSpec::Auto => false,
+            crate::workflow::GateSpec::Auto | crate::workflow::GateSpec::ConsentBefore => false,
             crate::workflow::GateSpec::HumanConfirm { .. } => true,
             crate::workflow::GateSpec::HumanConfirmIf(
                 crate::workflow::GateCond::VerdictNotPass,
             ) => prev.status != crate::domain::UnitStatus::Done,
         })
-        .map(|prev| PauseReason::DefGate {
-            reviewing_ord: prev.ord,
+        .map(|prev| prev.ord);
+    // CONSENT BEFORE (core#801): the unit's own def asks for a decision BEFORE it runs. Judged
+    // ahead of the run-level policy and the preceding phase's def gate, which it subsumes (one
+    // pause, and the prompt names the output it also releases); never by the run-level posture.
+    if units[unit_ix].gate == crate::workflow::GateSpec::ConsentBefore {
+        return Some(PauseReason::ConsentBefore {
+            reviewing_ord: def_gate,
         });
-    def_gate.or(run_level.then_some(PauseReason::RunLevel))
+    }
+    let run_level = match session.human_confirm {
+        crate::domain::HumanConfirm::None => false,
+        crate::domain::HumanConfirm::All => true,
+        crate::domain::HumanConfirm::Before(o) => o == ord,
+    };
+    def_gate
+        .map(|reviewing_ord| PauseReason::DefGate { reviewing_ord })
+        .or(run_level.then_some(PauseReason::RunLevel))
 }
 
 /// The disclosure appended to a DEF-declared gate's pause prompt when the run was launched with
@@ -9187,7 +9238,23 @@ fn dispatch_unit(
                         let emit_ev = |ev: CoreEvent| {
                             let _ = tx.send(crate::command::Command::EmitEvent(ev));
                         };
-                        let run_vars = run_env.as_ref().map(ToolRunEnv::vars).unwrap_or_default();
+                        let mut run_vars =
+                            run_env.as_ref().map(ToolRunEnv::vars).unwrap_or_default();
+                        // (core#802) The garden root the run was admitted against rides every
+                        // generic Tool unit as `WICKED_GARDEN_ROOT`, so a def runs
+                        // `"$WICKED_GARDEN_ROOT/scripts/wicked-garden" run <script>` from the
+                        // published snapshot — the generation the agent units were handed — and
+                        // never whichever `wicked-garden` the daemon's (or a login shell's) PATH
+                        // finds. No snapshot admitted ⇒ the ladder's root; no garden ⇒ unset
+                        // (a def that needs it refuses with `${WICKED_GARDEN_ROOT:?…}`).
+                        if run_env.is_some() {
+                            if let Some(root) = tool_garden_root(admitted.as_ref()) {
+                                run_vars.push((
+                                    crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
+                                    root.to_string_lossy().into_owned(),
+                                ));
+                            }
+                        }
                         let lifted = lift_ctx.as_ref().map(|ctx| {
                             crate::deliver_lift::lift_and_reverify(
                                 ctx,
@@ -9605,6 +9672,22 @@ fn walkthrough_tree(
     crate::worktree_guard::snapshot(std::path::Path::new(wd), std::path::Path::new(&root))
         .map(|s| s.tree)
         .map_err(|e| e.to_string())
+}
+
+/// (core#802) The garden root a generic Tool unit is handed as `WICKED_GARDEN_ROOT`: the snapshot
+/// the run was admitted against, else the skills ladder's root. `None` when there is no garden or
+/// the ladder could not be resolved — the variable is then left unset (never set empty), and a
+/// def that needs it refuses loudly rather than falling through to PATH.
+fn tool_garden_root(
+    admitted: Option<&crate::skills_snapshot::SkillsSnapshot>,
+) -> Option<std::path::PathBuf> {
+    match admitted {
+        Some(g) => Some(g.root.clone()),
+        None => match crate::skills_snapshot::resolve_ladder() {
+            Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
+            _ => None,
+        },
+    }
 }
 
 /// (core#776) The run variables a generic Tool unit is handed, resolved on the actor thread:
@@ -11919,7 +12002,16 @@ fn rewind_to_creator_scoped(
     let Some(cursor) = units.get(cursor_ix) else {
         anyhow::bail!("run {run_id} has no unit at its cursor ({cursor_ix}) to send back");
     };
-    let target_ix = if cursor.role == crate::workflow::PhaseRole::Creator {
+    // (core#803) A FAILED Tool unit is its own target: a send-back on it (the `mcp-server`
+    // install, a deliver that ran and failed) re-runs THAT command and nothing else. Routing it to
+    // the most recent creator handed the operator's "retry the install" note to the build seat as
+    // an instruction, and the seat ran the install itself — writes outside the worktree that the
+    // workflow reserves for its consent-gated Tool phase. A Tool unit that has NOT run (the
+    // deliver gate before the push) still sends its note back to the creator: there the operator
+    // is reviewing the creator's work.
+    let failed_tool_unit =
+        cursor.tool_cmd.is_some() && cursor.status == crate::domain::UnitStatus::Rejected;
+    let target_ix = if cursor.role == crate::workflow::PhaseRole::Creator || failed_tool_unit {
         cursor_ix
     } else {
         let creator_id = crate::pipeline::most_recent_prior_creator(&units, cursor.ord)
@@ -12770,6 +12862,72 @@ mod gate_pause_tests {
         agent.status = UnitStatus::Pending;
         let units = vec![unit(1, GateSpec::Auto, UnitStatus::Done), agent];
         assert_eq!(should_pause(&sess(HumanConfirm::None), &units, 1), None);
+    }
+
+    /// core#801 — the `mcp-server` install: a `consent_before` unit pauses BEFORE it runs, under
+    /// every run-level policy and `autoDeliver`, after a deliver unit that already ran; it
+    /// subsumes (and names) the preceding phase's def gate; and nothing pauses after it.
+    #[test]
+    fn a_consent_before_unit_pauses_before_it_runs_whatever_the_posture() {
+        let mut install = unit(3, GateSpec::ConsentBefore, UnitStatus::Pending);
+        install.tool_cmd = Some(vec!["bash".into(), "-c".into(), "install".into()]);
+        let units = vec![
+            unit(1, GateSpec::Auto, UnitStatus::Done),
+            deliver_unit(2, UnitStatus::Done),
+            install.clone(),
+        ];
+        for hc in [
+            HumanConfirm::None,
+            HumanConfirm::Before(1),
+            HumanConfirm::All,
+        ] {
+            for auto_deliver in [false, true] {
+                let mut s = sess(hc);
+                s.auto_deliver = auto_deliver;
+                assert_eq!(
+                    should_pause(&s, &units, 2),
+                    Some(PauseReason::ConsentBefore {
+                        reviewing_ord: None
+                    }),
+                    "{hc:?} autoDeliver={auto_deliver}"
+                );
+            }
+        }
+        // The preceding phase's own def gate fires at the same boundary: one pause, naming it.
+        let units = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirm {
+                    unconditional: true,
+                },
+                UnitStatus::Done,
+            ),
+            install.clone(),
+        ];
+        assert_eq!(
+            should_pause(&sess(HumanConfirm::None), &units, 1),
+            Some(PauseReason::ConsentBefore {
+                reviewing_ord: Some(1)
+            })
+        );
+        // Nothing pauses AFTER a consent_before unit: the next unit is not def-gated by it.
+        let mut done = install;
+        done.status = UnitStatus::Done;
+        let units = vec![done, unit(4, GateSpec::Auto, UnitStatus::Pending)];
+        assert_eq!(should_pause(&sess(HumanConfirm::None), &units, 1), None);
+        // The prompt is the phase's card, and says nothing has run.
+        let mut card = unit(9, GateSpec::ConsentBefore, UnitStatus::Pending);
+        card.instructions = Some("Install for running. Approve to: write the configs.".into());
+        let p = super::consent_gate_prompt(&card, Some(8));
+        assert!(
+            p.contains("before unit 9 runs") && p.contains("nothing in it has run yet"),
+            "{p}"
+        );
+        assert!(
+            p.contains("Approve to: write the configs.") && p.contains("unit 8"),
+            "{p}"
+        );
+        assert_eq!(super::CONSENT_GATE_KIND, "consent");
     }
 
     #[test]
@@ -15870,6 +16028,64 @@ mod request_changes_tests {
             "rework_amendment byte length matches the full 12 KB amendment"
         );
         let _ = escalated; // present in fold-level tests, absent here by design
+    }
+
+    /// core#803 — Send back on a Tool unit that RAN and FAILED (the `mcp-server` install's
+    /// escalation) re-runs that Tool unit only: the cursor stays on it, the creator (`fix`) and
+    /// the evaluator before it keep their results, and the rework is booked on the Tool unit.
+    /// The deliver gate (a Tool unit that has not run) still rewinds to the creator, pinned by
+    /// `request_changes_at_deliver_gate_injects_full_note_as_context_item`.
+    #[test]
+    fn request_changes_on_a_failed_tool_unit_re_runs_that_tool_unit_only() {
+        let run_id = format!("rc-tool-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let tool = units.iter_mut().find(|u| u.ord == 5).unwrap();
+        tool.tool_cmd = Some(vec!["false".to_string()]);
+        tool.status = UnitStatus::Rejected;
+        tool.last_attempt = Some(0);
+        tool.denial_reason = Some("install.py: not found under the plugin root".into());
+        put_node(&mut store, tool.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("retry the install once as is".into()),
+            },
+        )
+        .unwrap();
+        let evs = drain(&erx);
+        let amended: Vec<u32> = evs
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::UnitReworkAmended { ord, .. } => Some(*ord),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            amended,
+            vec![5],
+            "the rework is the Tool unit's, never the creator's"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 4, "the cursor stays on the Tool unit");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        for u in units.iter().filter(|u| u.ord < 5) {
+            assert_eq!(
+                u.status,
+                UnitStatus::Done,
+                "unit {} keeps its result",
+                u.ord
+            );
+            assert!(u.rework_of.is_none(), "unit {} is not reworked", u.ord);
+        }
     }
 
     /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused

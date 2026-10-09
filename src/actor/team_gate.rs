@@ -3514,6 +3514,7 @@ pub(super) fn revise_units(
                     crate::workflow::GateSpec::Auto => "auto",
                     crate::workflow::GateSpec::HumanConfirm { .. } => "human_confirm",
                     crate::workflow::GateSpec::HumanConfirmIf(_) => "human_confirm_if",
+                    crate::workflow::GateSpec::ConsentBefore => "consent_before",
                 }
                 .to_string(),
                 skill_ref: u.skill_ref.clone(),

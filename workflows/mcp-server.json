@@ -56,7 +56,7 @@
       "skill_ref": "wicked-garden-mcp-scaffold",
       "allowed_skills": [],
       "validator_pin": null,
-      "instructions": "Produce the design: the final tool table (name, description, input schema, annotations, class), the resources and prompts if any, the authentication plan (the one secret variable, the committed non-secret parameters, which header, what fails at startup), and the observability plan (span names and attributes, the three instruments, log fields, what leaves the process and only when). Check each against the MCP-server steering rules MCPS-1001 to MCPS-1007 (recall them with rules.recall, scope wiki:governance, when an estate store is present; otherwise use the checklist in the skill) and against MCP-D2 and MCP-D4. Name every deviation and why."
+      "instructions": "Produce the design: the final tool table (name, description, input schema, annotations, class), the resources and prompts if any, the authentication plan (the one secret variable, the committed non-secret parameters, which header, what fails at startup), and the observability plan (span names and attributes, the three instruments, log fields, what leaves the process and only when). Check each against the MCP-server steering rules MCPS-1001 to MCPS-1007 (recall them with rules.recall, scope wiki:governance, when an estate store is present; otherwise use the checklist in the skill) and against MCP-D2 and MCP-D4. If a rule cannot be recalled, say so, cite the skill's checklist instead, and never state what a rule id means when you could not read it. Name every deviation and why."
     },
     {
       "id": "build",
@@ -138,11 +138,7 @@
       "id": "install",
       "kind": "build",
       "gate_type": "execution",
-      "gate": {
-        "human_confirm": {
-          "unconditional": true
-        }
-      },
+      "gate": "consent_before",
       "executes_code": false,
       "verified_evidence": false,
       "required_deliverables": [],
@@ -158,11 +154,11 @@
         "type": "tool",
         "cmd": [
           "bash",
-          "-lc",
-          "if command -v wicked-garden >/dev/null 2>&1; then exec wicked-garden run scripts/mcp/install.py --from-run --json; else exec npx -y wicked-garden run scripts/mcp/install.py --from-run --json; fi"
+          "-c",
+          "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --json"
         ]
       },
-      "instructions": "Install for running — or update the installed copy when this server key is already installed. Approve to: build the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, register it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks), write it into your CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret), and probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Reject for not now — the pull request already delivered stays as it is."
+      "instructions": "Install for running — or update the installed copy when this server key is already installed. Nothing has been installed yet: this asks before the install runs. Approve to: build the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, register it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks), write it into your CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret), and probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Reject for not now — the pull request already delivered stays as it is."
     }
   ]
 }

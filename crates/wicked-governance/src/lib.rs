@@ -112,7 +112,7 @@ pub use edge_vocab::{assert_edge_vocabulary, edge_vocabulary_violation};
 
 // MarkdownAdapter — frontmattered docs as a rule source on the same SourceAdapter seam
 // (AW-3 / arch-R1); all output still materializes through `normalize_bundle`.
-pub use markdown::MarkdownAdapter;
+pub use markdown::{EmbeddedMarkdownAdapter, MarkdownAdapter};
 // RuleSet grouping (AW-13 / arch-R9): one NodeKind::RuleSet parent per doctrine domain, native
 // Contains membership; frontmatter `domain:` selects the parent.
 pub use ruleset::{register_rule_sets, rule_set_symbol, RuleSetGrouping, RULE_SET};

@@ -97,12 +97,18 @@ run's worktree — no council, no seat. Notes:
 - The launch preflight refuses a run whose Tool `cmd[0]` does not resolve (on `PATH` or at that
   path), loudly, before any unit is planned.
 - A Tool phase satisfies the registration rule that an `executes_code` phase with an `auto` gate
-  must carry a pin; it may still carry a human gate (`mcp-server`'s `install` does).
+  must carry a pin; it may still carry a human gate (`mcp-server`'s `install` carries
+  `consent_before`).
 - A Tool phase runs with the run's worktree as its working directory and inherits the daemon's
   environment, plus the run variables (core#776): `WICKED_RUN_ID`, `WICKED_RUN_UNIT` (the
   unit's ordinal), `WICKED_TREE` (the worktree's tree id, snapshotted when the unit starts; unset
   for a repo-less run) and `WICKED_EVIDENCE_ROOT` (the run's evidence root, when the launcher
-  minted one). The walkthrough recorder declares its own set (`src/walkthrough.rs`).
+  minted one), and `WICKED_GARDEN_ROOT` — the skills generation the run was admitted against
+  (core#802), so a command runs `"$WICKED_GARDEN_ROOT/scripts/wicked-garden" run <script>` from
+  the published snapshot instead of whatever `wicked-garden` a login shell's `PATH` finds (use
+  `bash -c`, never `bash -lc`). The walkthrough recorder declares its own set (`src/walkthrough.rs`).
+- **Send back** on a failed Tool phase re-runs that Tool phase only (core#803); it never
+  reworks an earlier creator.
 
 ## Gating a phase (validator_pin)
 
@@ -121,7 +127,14 @@ Put the **approved** pin on the phase (`"validator_pin": "<approved pin>"`). At 
 "auto"                                        // no human pause
 { "human_confirm": { "unconditional": true } } // always pause for a human
 { "human_confirm_if": "verdict_not_pass" }      // pause only when the verdict is not PASS
+"consent_before"                               // pause BEFORE the phase runs (core#801)
 ```
+
+Every gate except `consent_before` fires AFTER its phase's work: the pause before unit N asks
+about unit N-1's output. `consent_before` asks before the phase itself runs
+(`awaitingHuman{gateKind: "consent"}`, its prompt = the phase's `instructions`), for a phase with
+side effects outside the run such as `mcp-server`'s `install`. The run-level policy, `autoDeliver`,
+a released plan and standing orders never skip it, and nothing pauses after the phase.
 
 ## Validation
 

@@ -67,6 +67,7 @@ pub fn boot_seeded_rule_ids() -> anyhow::Result<std::collections::BTreeSet<Strin
 }
 mod mcp_isolation;
 mod memory;
+mod operator_config_fence;
 mod output_throttle;
 mod outstanding_work;
 pub mod path_policy;
@@ -89,6 +90,7 @@ mod skills_snapshot;
 mod sources;
 mod spawn_audit;
 mod state_home;
+mod steering_packs;
 mod team;
 mod terminal;
 mod validator;
