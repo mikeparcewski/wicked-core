@@ -1487,6 +1487,15 @@ pub struct UnitTranscript {
     /// The machine-readable WHY, when rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial: Option<UnitDenial>,
+    /// (core#791) The attempt this record belongs to. Absent on a resolution record written before
+    /// attempts were stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// (core#791) Every attempt of the unit that left a per-attempt output record, oldest first.
+    /// Filled by [`get_unit_transcript_at`] (the operator read); [`get_unit_transcript`], the
+    /// engine's own read of the resolution record, leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<u32>,
 }
 
 /// Read a unit's transcript record — resolved OR rejected — or `None` when the unit never ran far
@@ -1517,6 +1526,93 @@ pub fn get_unit_transcript(store: &dyn GraphRead, unit_id: &str) -> Option<UnitT
         output: meta_str("output"),
         denial_reason: meta_str("denial_reason"),
         denial,
+        attempt: meta_attempt(&node),
+        attempts: Vec::new(),
+    })
+}
+
+fn meta_attempt(node: &wicked_apps_core::Node) -> Option<u32> {
+    node.metadata
+        .get("attempt")
+        .and_then(|v| v.as_u64())
+        .and_then(|a| u32::try_from(a).ok())
+}
+
+/// (core#791) A unit's per-attempt output records, oldest attempt first.
+fn attempt_records(store: &dyn GraphRead, unit_id: &str) -> Vec<(u32, wicked_apps_core::Node)> {
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(
+            crate::execute::WORK_OUTPUT_ATTEMPT.to_string(),
+        )],
+        exact_name: Some(unit_id.to_string()),
+        ..Default::default()
+    };
+    let mut records: Vec<(u32, wicked_apps_core::Node)> = store
+        .find_symbols(&query)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.metadata.get("unit_id").and_then(|v| v.as_str()) == Some(unit_id))
+        .filter_map(|n| meta_attempt(&n).map(|a| (a, n)))
+        .collect();
+    records.sort_by_key(|(a, _)| *a);
+    records.dedup_by_key(|(a, _)| *a);
+    records
+}
+
+/// (core#791) The operator's transcript read, by attempt. `attempts` lists every attempt that left
+/// an output record.
+///
+/// * `attempt: None` — the unit's RESOLUTION record ([`get_unit_transcript`]) as before; when the
+///   unit has none (every attempt was cancelled, or failed into a retry), the NEWEST attempt's
+///   record instead.
+/// * `attempt: Some(n)` — that attempt's bytes: the resolution record when it was written for `n`,
+///   else attempt `n`'s own record, flagged `partial` with resolution `superseded` (a later
+///   attempt's record replaced it) or `unresolved` (it ended without one). `phase_status` is then
+///   the attempt's step status (`ok`, `timed_out`, `cancelled`, `failed`, `elicitation_failed`).
+///   `None` when attempt `n` left no record.
+pub fn get_unit_transcript_at(
+    store: &dyn GraphRead,
+    unit_id: &str,
+    attempt: Option<u32>,
+) -> Option<UnitTranscript> {
+    let records = attempt_records(store, unit_id);
+    let attempts: Vec<u32> = records.iter().map(|(a, _)| *a).collect();
+    let resolution = get_unit_transcript(store, unit_id);
+    let want = match (attempt, &resolution) {
+        (None, Some(_)) => None,
+        (None, None) => Some(*attempts.last()?),
+        (Some(n), Some(r)) if r.attempt == Some(n) => None,
+        (Some(n), _) => Some(n),
+    };
+    let Some(n) = want else {
+        return resolution.map(|t| UnitTranscript { attempts, ..t });
+    };
+    let (_, node) = records.iter().find(|(a, _)| *a == n)?;
+    let meta_str = |key: &str| {
+        node.metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let superseded = resolution
+        .as_ref()
+        .and_then(|r| r.attempt)
+        .is_some_and(|r| r > n);
+    Some(UnitTranscript {
+        unit_id: unit_id.to_string(),
+        resolution: if superseded {
+            crate::execute::RESOLUTION_SUPERSEDED
+        } else {
+            crate::execute::RESOLUTION_UNRESOLVED
+        }
+        .to_string(),
+        partial: true,
+        phase_status: meta_str("step_status"),
+        output: meta_str("output"),
+        denial_reason: None,
+        denial: None,
+        attempt: Some(n),
+        attempts,
     })
 }
 

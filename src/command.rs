@@ -24,8 +24,13 @@ pub(crate) enum Command {
     /// partial output (usability review #1); `None` only when no output was ever stored.
     WorkOutput(String, Sender<Option<String>>),
     /// A unit's full transcript RECORD — resolved or rejected, output + resolution flag +
-    /// structured denial (usability review #1).
-    UnitTranscript(String, Sender<Option<crate::domain::UnitTranscript>>),
+    /// structured denial (usability review #1) — or, with an attempt, that attempt's record
+    /// (core#791, [`crate::domain::get_unit_transcript_at`]).
+    UnitTranscript(
+        String,
+        Option<u32>,
+        Sender<Option<crate::domain::UnitTranscript>>,
+    ),
     /// Register a live event subscriber.
     Subscribe(Sender<CoreEvent>),
     /// Run a full governed session (fire-and-forget — progress + outcome arrive as `CoreEvent`s,

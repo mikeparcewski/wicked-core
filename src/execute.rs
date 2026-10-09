@@ -30,6 +30,17 @@ pub const RESOLUTION_KEY: &str = "resolution";
 pub const RESOLUTION_RESOLVED: &str = "resolved";
 /// The unit was denied/failed — `output` (when present) is PARTIAL, never an approved artifact.
 pub const RESOLUTION_REJECTED: &str = "rejected";
+/// (core#791) An EARLIER attempt's output, read by attempt: a later attempt's record replaced it as
+/// the unit's resolution record. Never approved work.
+pub const RESOLUTION_SUPERSEDED: &str = "superseded";
+/// (core#791) An attempt that ended without a resolution record of its own — cancelled, failed and
+/// sent to triage/retry, or the latest attempt while its decision is still open. Never approved work.
+pub const RESOLUTION_UNRESOLVED: &str = "unresolved";
+/// (core#791) Node kind of a PER-ATTEMPT output record: every attempt that returns a step result
+/// leaves one (keyed `(unit, attempt)`, written before the status branches), so a rework never
+/// hides an earlier attempt and a `timed_out` / `cancelled` / `failed` attempt keeps its bytes.
+/// The [`WORK_OUTPUT`] record stays the unit's ONE resolution record — what every engine read uses.
+pub const WORK_OUTPUT_ATTEMPT: &str = "work_output_attempt";
 
 /// The outcome of executing one unit — recorded back onto the unit node.
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +267,7 @@ pub(crate) fn apply_unit(
             RESOLUTION_REJECTED
         },
         denial.as_ref(),
+        attempt,
     );
     put_node(store, output_node)?;
     // Record the REAL governance claim (its actual decision) for provenance — the synthesized gate
@@ -375,6 +387,7 @@ fn decision_token(decision: &Decision) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn work_output_node(
     unit: &WorkUnit,
     assigned_cli: &str,
@@ -383,6 +396,7 @@ fn work_output_node(
     phase_status: &str,
     resolution: &str,
     denial: Option<&UnitDenial>,
+    attempt: u32,
 ) -> Node {
     let mut node = Node::new(
         synthetic_symbol(WORK_OUTPUT, &unit.id),
@@ -399,6 +413,8 @@ fn work_output_node(
     m.insert("collection_scope".into(), s(collection_scope));
     m.insert("phase_status".into(), s(phase_status));
     m.insert(RESOLUTION_KEY.into(), s(resolution));
+    // (core#791) Which attempt this resolution record belongs to.
+    m.insert("attempt".into(), serde_json::Value::from(attempt));
     if let Some(output) = output {
         m.insert("output".into(), s(output));
     }
@@ -423,6 +439,7 @@ pub(crate) fn record_rejected_output(
     collection_scope: &str,
     output: &str,
     denial: &UnitDenial,
+    attempt: u32,
 ) -> anyhow::Result<()> {
     let assigned_cli = unit
         .assigned_cli
@@ -436,7 +453,53 @@ pub(crate) fn record_rejected_output(
         "rejected",
         RESOLUTION_REJECTED,
         Some(denial),
+        attempt,
     );
+    put_node(store, node)
+}
+
+/// The symbol id of a unit's per-attempt output record ([`WORK_OUTPUT_ATTEMPT`], core#791).
+pub(crate) fn attempt_output_symbol(unit_id: &str, attempt: u32) -> wicked_apps_core::SymbolId {
+    synthetic_symbol(WORK_OUTPUT_ATTEMPT, &format!("{unit_id}#a{attempt}"))
+}
+
+/// (core#791) Persist ONE attempt's captured output, whatever the attempt's outcome — written by
+/// the actor where `unitOutputCaptured` fires, before the status branches, so an attempt that ends
+/// `timed_out` / `cancelled` / `failed` (and never folds) still leaves its bytes, and a later
+/// attempt never overwrites an earlier one. Named by the unit id (`exact_name`) so
+/// [`crate::domain::get_unit_transcript_at`] lists a unit's attempts with one indexed query. An
+/// empty output stores no `output` key. Not a resolution: [`crate::domain::get_work_output`] never
+/// reads it, so no attempt record can be handed on as approved work.
+pub(crate) fn record_attempt_output(
+    store: &mut dyn GraphStore,
+    unit: &WorkUnit,
+    attempt: u32,
+    step_status: &str,
+    output: &str,
+) -> anyhow::Result<()> {
+    let mut node = Node::new(
+        attempt_output_symbol(&unit.id, attempt),
+        NodeKind::Other(WORK_OUTPUT_ATTEMPT.to_string()),
+        unit.id.clone(),
+        Language::new(SYMBOL_SCHEME),
+        Location::new(
+            format!("{WORK_OUTPUT_ATTEMPT}/{}#a{attempt}", unit.id),
+            Span::ZERO,
+        ),
+    );
+    let m = &mut node.metadata;
+    let s = |v: &str| serde_json::Value::String(v.to_string());
+    m.insert("unit_id".into(), s(&unit.id));
+    m.insert("session_id".into(), s(&unit.session_id));
+    m.insert("attempt".into(), serde_json::Value::from(attempt));
+    m.insert("step_status".into(), s(step_status));
+    m.insert(
+        "assigned_cli".into(),
+        s(unit.assigned_cli.as_deref().unwrap_or("claude")),
+    );
+    if !output.trim().is_empty() {
+        m.insert("output".into(), s(output));
+    }
     put_node(store, node)
 }
 
@@ -540,6 +603,88 @@ mod tests {
             !unfiled.iter().any(|o| o.contains("proposal:p-1")),
             "{unfiled:?}"
         );
+    }
+
+    /// core#791: a rework whose attempt 1 hit the turn ceiling kept only attempt 0's record, and
+    /// attempt 1's bytes (5897 B on run ada5b0aa) were unreachable. Every attempt now leaves its own
+    /// record; the resolution record — the one every engine read uses — is unchanged, and an
+    /// attempt record is never approved work.
+    #[test]
+    fn every_attempt_keeps_its_own_output_beside_the_one_resolution_record() {
+        use crate::domain::get_unit_transcript_at;
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut unit = WorkUnit::pending("s:rw", "s", 1, "build it");
+        unit.assigned_cli = Some("claude".into());
+        let approve = |store: &mut dyn GraphStore, out: &str, attempt: u32| {
+            let o = apply_unit(
+                store,
+                &unit,
+                out,
+                "wf-s",
+                EntityMode::Shared,
+                "s",
+                None,
+                attempt,
+            )
+            .unwrap();
+            assert!(o.approved, "no policy on the store: the fold approves");
+        };
+
+        // Attempt 0 folds; the rework (attempt 1) times out and never folds.
+        record_attempt_output(&mut store, &unit, 0, "ok", "attempt zero").unwrap();
+        approve(&mut store, "attempt zero", 0);
+        record_attempt_output(&mut store, &unit, 1, "timed_out", "attempt one, cut off").unwrap();
+
+        assert_eq!(
+            get_work_output(&store, "s:rw").as_deref(),
+            Some("attempt zero"),
+            "the engine's approved read is untouched by an attempt record"
+        );
+        let head = get_unit_transcript_at(&store, "s:rw", None).unwrap();
+        assert_eq!(head.resolution, RESOLUTION_RESOLVED);
+        assert_eq!(head.attempt, Some(0));
+        assert_eq!(
+            head.attempts,
+            vec![0, 1],
+            "the attempts on record are listed"
+        );
+        let one = get_unit_transcript_at(&store, "s:rw", Some(1)).unwrap();
+        assert_eq!(one.output.as_deref(), Some("attempt one, cut off"));
+        assert_eq!(one.resolution, RESOLUTION_UNRESOLVED);
+        assert!(one.partial, "an attempt record is never approved work");
+        assert_eq!(one.phase_status.as_deref(), Some("timed_out"));
+        assert_eq!(
+            get_unit_transcript_at(&store, "s:rw", Some(0)),
+            Some(head.clone()),
+            "the attempt the resolution record was written for reads that record"
+        );
+
+        // Attempt 2 folds: attempt 0's bytes are still reachable, marked superseded.
+        record_attempt_output(&mut store, &unit, 2, "ok", "attempt two").unwrap();
+        approve(&mut store, "attempt two", 2);
+        let zero = get_unit_transcript_at(&store, "s:rw", Some(0)).unwrap();
+        assert_eq!(zero.output.as_deref(), Some("attempt zero"));
+        assert_eq!(zero.resolution, RESOLUTION_SUPERSEDED);
+        let head = get_unit_transcript_at(&store, "s:rw", None).unwrap();
+        assert_eq!(
+            (head.attempt, head.output.as_deref()),
+            (Some(2), Some("attempt two"))
+        );
+        assert_eq!(head.attempts, vec![0, 1, 2]);
+        assert_eq!(get_unit_transcript_at(&store, "s:rw", Some(7)), None);
+
+        // A unit whose only attempt was cancelled has no resolution record: the default read
+        // answers with that attempt rather than nothing.
+        let mut lone = WorkUnit::pending("s:lone", "s", 2, "build it");
+        lone.assigned_cli = Some("codex".into());
+        record_attempt_output(&mut store, &lone, 0, "cancelled", "half a thought").unwrap();
+        assert_eq!(get_unit_transcript(&store, "s:lone"), None);
+        let t = get_unit_transcript_at(&store, "s:lone", None).unwrap();
+        assert_eq!(
+            (t.attempt, t.phase_status.as_deref(), t.output.as_deref()),
+            (Some(0), Some("cancelled"), Some("half a thought"))
+        );
+        assert_eq!(t.resolution, RESOLUTION_UNRESOLVED);
     }
 
     #[test]

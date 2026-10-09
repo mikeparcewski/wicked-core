@@ -1224,8 +1224,10 @@ pub(crate) fn run(
                     crate::domain::get_unit_transcript(&store, &unit_id).and_then(|t| t.output),
                 );
             }
-            Command::UnitTranscript(unit_id, reply) => {
-                let _ = reply.send(crate::domain::get_unit_transcript(&store, &unit_id));
+            Command::UnitTranscript(unit_id, attempt, reply) => {
+                let _ = reply.send(crate::domain::get_unit_transcript_at(
+                    &store, &unit_id, attempt,
+                ));
             }
             Command::Subscribe(sub) => subscribers.push(sub),
             Command::Launch(spec) => {
@@ -5131,7 +5133,14 @@ fn persist_rejected_transcript(
                 .unwrap_or_else(|| format!("unit {} rejected", unit.ord)),
         )
     });
-    if let Err(e) = crate::execute::record_rejected_output(store, unit, &scope, output, &denial) {
+    if let Err(e) = crate::execute::record_rejected_output(
+        store,
+        unit,
+        &scope,
+        output,
+        &denial,
+        session.attempt,
+    ) {
         eprintln!(
             "wicked-core: could not persist rejected transcript for {}: {e}",
             unit.id
@@ -5344,6 +5353,19 @@ fn apply_step_result(
     // where the output is known to belong to the current live unit at the correct attempt.
     // `step_status` mirrors the observable outcomes so consumers can distinguish them without
     // pattern-matching the downstream events; `output_bytes` surfaces truncation at a glance.
+    let step_status = match output.status {
+        crate::workflow::StepStatus::Cancelled => "cancelled",
+        crate::workflow::StepStatus::Failed => "failed",
+        crate::workflow::StepStatus::Ok => "ok",
+        // ACP elicitation terminal — routes to run-terminal path, not triage (DES-002 I-7).
+        crate::workflow::StepStatus::ElicitationFailed => "elicitation_failed",
+        // The engine's own turn ceiling (WICKED_UNIT_TIMEOUT_SECS). This string is THE
+        // wire-visible distinction between a turn-timeout and an operator cancel — a
+        // consumer arming automatic stall recovery keys on it, and it precedes the
+        // RunCancelled terminal frame from this same fold (single actor thread, ordered
+        // per-subscriber channel).
+        crate::workflow::StepStatus::TimedOut => "timed_out",
+    };
     emit(
         subscribers,
         CoreEvent::UnitOutputCaptured {
@@ -5351,23 +5373,27 @@ fn apply_step_result(
             ord,
             attempt: output.attempt,
             output_bytes: output.output.len(),
-            step_status: match output.status {
-                crate::workflow::StepStatus::Cancelled => "cancelled",
-                crate::workflow::StepStatus::Failed => "failed",
-                crate::workflow::StepStatus::Ok => "ok",
-                // ACP elicitation terminal — routes to run-terminal path, not triage (DES-002 I-7).
-                crate::workflow::StepStatus::ElicitationFailed => "elicitation_failed",
-                // The engine's own turn ceiling (WICKED_UNIT_TIMEOUT_SECS). This string is THE
-                // wire-visible distinction between a turn-timeout and an operator cancel — a
-                // consumer arming automatic stall recovery keys on it, and it precedes the
-                // RunCancelled terminal frame from this same fold (single actor thread, ordered
-                // per-subscriber channel).
-                crate::workflow::StepStatus::TimedOut => "timed_out",
-            }
-            .to_string(),
+            step_status: step_status.to_string(),
             governed: output.governed,
         },
     );
+    // (core#791) …and the attempt's bytes are kept as ITS record, keyed `(unit, attempt)`, before
+    // any branch below can leave without folding: a `timed_out` / `cancelled` / `failed` attempt
+    // never reaches the resolution record, and a rework's fold would overwrite attempt 0's. Run
+    // ada5b0aa's attempt 1 (5897 B, `timed_out`) was unreachable for exactly that reason. Best
+    // effort, like `persist_rejected_transcript`: a store hiccup here must not fail the step.
+    if let Err(e) = crate::execute::record_attempt_output(
+        store,
+        unit,
+        output.attempt,
+        step_status,
+        &output.output,
+    ) {
+        eprintln!(
+            "wicked-core: could not persist attempt {} output for {}: {e}",
+            output.attempt, unit.id
+        );
+    }
 
     // Structured assumptions (external-transform convention): parse markers from OK
     // output and surface each as an event — needs-research entries are the human-review
@@ -21449,6 +21475,36 @@ mod turn_timeout_vs_cancel_tests {
             CoreEvent::UnitOutputCaptured { step_status, .. } => Some(step_status.clone()),
             _ => None,
         })
+    }
+
+    /// (core#791) An attempt that leaves by the cancel backstop never folds, so it wrote no
+    /// transcript at all. It now keeps its bytes as ITS attempt's record.
+    #[test]
+    fn a_cancelled_attempt_keeps_its_output_as_its_attempts_record() {
+        let run_id = format!("cancel-attempt-record-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 1);
+        let (_applied, _session, events) = fold(&mut store, &run_id, StepStatus::Cancelled, 1);
+        assert_eq!(step_status_of(&events).as_deref(), Some("cancelled"));
+        let unit_id = format!("{run_id}:u1");
+        let t = crate::domain::get_unit_transcript_at(&store, &unit_id, Some(1))
+            .expect("the cancelled attempt left a record");
+        assert_eq!(t.attempt, Some(1));
+        assert_eq!(t.attempts, vec![1]);
+        assert_eq!(t.phase_status.as_deref(), Some("cancelled"));
+        assert!(t.partial);
+        assert!(
+            t.output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exceeded the timeout"),
+            "{t:?}"
+        );
+        assert_eq!(
+            crate::domain::get_work_output(&store, &unit_id),
+            None,
+            "an attempt record is never approved work"
+        );
     }
 
     /// (core#743) A GOVERNED attempt that ends at the terminal backstop — the turn ceiling fired
