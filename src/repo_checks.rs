@@ -460,6 +460,11 @@ pub struct CheckRun {
     /// `EPERM`/`EACCES` under `node_modules`). Evidence for the re-run rules, never a verdict.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_signals: Vec<String>,
+    /// (core#781) The host's load band as the check started: `floor(1-min load / cpus)` — 0 has
+    /// headroom, N is N× oversubscribed. `None` where the load is unknown. A head failure compared
+    /// against a CACHED base from another band says so ([`cached_base_load_note`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_band: Option<u32>,
 }
 
 impl CheckRun {
@@ -653,6 +658,11 @@ pub struct RepoChecksReport {
     /// answers). Consumed there: the re-run's own report replaces this one on the unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_rerun: Option<FloorRerun>,
+    /// (core#432 F-3R2-023) A VERIFY floor whose change touches end-to-end files while no `e2e`
+    /// or journey check ran says so here — the gate's `floorNote` then states that the floor did
+    /// not run them, instead of a green floor implying it did ([`e2e_coverage_note`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_note: Option<String>,
 }
 
 impl RepoChecksReport {
@@ -781,6 +791,10 @@ impl RepoChecksReport {
                 ));
             }
         }
+        // (core#432 F-3R2-023) An end-to-end change the floor did not run, on a pass too.
+        if let Some(n) = &self.coverage_note {
+            notes.push(n.clone());
+        }
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
@@ -874,7 +888,7 @@ impl RepoChecksReport {
                     }
                     _ => String::new(),
                 };
-                let line = format!("{line}{base_note}");
+                let line = format!("{line}{base_note}{}", cached_base_load_note(c));
                 // A failed INSTALL is an environmental finding about provisioning the worktree,
                 // not a verdict on the work (F-E2E-029): say so, and say what was being provisioned
                 // (`source` = the lockfile and why the install ran), so the operator reads
@@ -1312,8 +1326,14 @@ fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
 /// Did the change delete a tracked file relative to the base — renames counted as a deletion of
 /// the old path (`--no-renames`)? A derived targeted set cannot see what a missing file broke.
 fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
+    Ok(!deleted_files(worktree, ctx)?.is_empty())
+}
+
+/// The tracked paths the change deleted relative to the base (a rename's old path included —
+/// `--no-renames`). Empty when the run knows no base.
+fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
     let deleted = crate::worktree_guard::git_string(
@@ -1328,7 +1348,12 @@ fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
         &env,
     )
     .map_err(|e| format!("the change's deleted files could not be listed: {e}"))?;
-    Ok(deleted.lines().any(|l| !l.trim().is_empty()))
+    Ok(deleted
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Substitute `{files}` / `{base}` into a targeted command: a standalone `{files}` element expands
@@ -2241,6 +2266,7 @@ fn scratch_refused(
         rerun: None,
         waived: Vec::new(),
         requested_rerun: None,
+        coverage_note: None,
     }
 }
 
@@ -2338,6 +2364,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     rerun: None,
                     waived: Vec::new(),
                     requested_rerun: None,
+                    coverage_note: None,
                 };
             }
         }
@@ -2361,6 +2388,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 rerun: None,
                 waived: Vec::new(),
                 requested_rerun: None,
+                coverage_note: None,
             }
         }
     };
@@ -2384,6 +2412,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     rerun: None,
                     waived: Vec::new(),
                     requested_rerun: None,
+                    coverage_note: None,
                 }
             }
         },
@@ -2488,6 +2517,9 @@ pub(crate) fn run_with_sandbox_ctx(
             }
         }
     }
+    let coverage_note = (ctx.stage == FloorStage::Verify)
+        .then(|| e2e_coverage_note(worktree, ctx, &detected, &checks, &waived))
+        .flatten();
     RepoChecksReport {
         passed: !failed,
         detected,
@@ -2504,7 +2536,75 @@ pub(crate) fn run_with_sandbox_ctx(
         rerun: None,
         waived,
         requested_rerun: None,
+        coverage_note,
     }
+}
+
+/// (core#432 F-3R2-023) Does `path` look like an end-to-end file: a path segment `e2e`,
+/// `playwright` or `cypress`, or a file name carrying `e2e` (`checkout.e2e.ts`, `test_e2e_x.py`)?
+fn is_e2e_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let mut segments = lower.split('/').peekable();
+    while let Some(seg) = segments.next() {
+        let last = segments.peek().is_none();
+        if matches!(seg, "e2e" | "playwright" | "cypress") || (last && seg.contains("e2e")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// (core#432 F-3R2-023) A fix that promotes an e2e scenario (an xfail flipped to expected-pass) was
+/// green at verify while the scenario never ran: the floor ran typecheck, lint and the unit tests
+/// only. When the change touches end-to-end files (added, modified or deleted relative to the
+/// base) and no `e2e` or journey check RAN, say which files and why nothing ran them — undeclared,
+/// waived, or skipped after an earlier failure. `None` when an end-to-end check ran, nothing e2e
+/// was touched, or the run knows no base.
+fn e2e_coverage_note(
+    worktree: &Path,
+    ctx: &FloorContext,
+    detected: &[RepoCheck],
+    checks: &[CheckRun],
+    waived: &[String],
+) -> Option<String> {
+    let is_e2e_check = |name: &str| name == "e2e" || name.starts_with(JOURNEY_PREFIX);
+    // A check that could not even start (`spawn_error`) did not run it.
+    if checks
+        .iter()
+        .any(|c| is_e2e_check(&c.name) && c.spawn_error.is_none())
+    {
+        return None;
+    }
+    let mut paths = touched_files(worktree, ctx).ok()?;
+    paths.extend(deleted_files(worktree, ctx).ok()?);
+    let mut e2e: Vec<String> = paths.into_iter().filter(|p| is_e2e_path(p)).collect();
+    e2e.sort();
+    e2e.dedup();
+    if e2e.is_empty() {
+        return None;
+    }
+    let why = if checks.iter().any(|c| is_e2e_check(&c.name)) {
+        "the declared end-to-end check could not start".to_string()
+    } else if waived.iter().any(|w| is_e2e_check(w)) {
+        "the operator waived the declared end-to-end check".to_string()
+    } else if detected.iter().any(|c| is_e2e_check(&c.name)) {
+        "the declared end-to-end check was skipped after an earlier check failed".to_string()
+    } else {
+        format!("no `e2e` or `journeys` check is declared in `{CONFIG_PATH}`")
+    };
+    let shown: Vec<&str> = e2e.iter().take(5).map(String::as_str).collect();
+    let more = e2e.len().saturating_sub(shown.len());
+    Some(format!(
+        "the change touches end-to-end file{} {}{} and the floor did NOT run them: {why} — the \
+         promoted scenario is unproven by this floor; external CI or the reviewer is its gate",
+        if e2e.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 /// Is `name` one of the floor's TEST-set checks (the ones a `targeted` re-run replaces)?
@@ -3574,6 +3674,40 @@ pub(crate) fn host_load() -> (Option<f64>, usize) {
     (load1, cpus)
 }
 
+/// (core#781) `floor(load1 / cpus)`: 0 = headroom, N = N× oversubscribed; `None` when unknown.
+pub(crate) fn load_band(load1: Option<f64>, cpus: usize) -> Option<u32> {
+    match load1 {
+        Some(l) if cpus > 0 && l.is_finite() && l >= 0.0 => {
+            Some((l / cpus as f64).floor().min(u32::MAX as f64) as u32)
+        }
+        _ => None,
+    }
+}
+
+/// (core#781) The base result was read from this run's cache — run by an earlier floor, under
+/// another host load — and its load band differs from the head's: head and base were not compared
+/// under like load, so the denial says so (a 5 s vitest timeout at 7× load against a base that ran
+/// at 4× read as a plain regression twice). Empty when the base ran fresh, the bands match, or a
+/// band is unknown.
+fn cached_base_load_note(head: &CheckRun) -> String {
+    let Some(base) = head.base.as_deref().filter(|b| b.cached) else {
+        return String::new();
+    };
+    let Some(b) = base.run.as_ref() else {
+        return String::new();
+    };
+    match (b.load_band, head.load_band) {
+        (Some(bb), Some(hb)) if bb != hb => format!(
+            " (the base result is CACHED from an earlier floor of this run, under {}; this check \
+             ran under {} — a different load band, so head and base were not compared under like \
+             load)",
+            b.bound_note.as_deref().unwrap_or("an unrecorded load"),
+            head.bound_note.as_deref().unwrap_or("an unrecorded load"),
+        ),
+        _ => String::new(),
+    }
+}
+
 /// The bound multiplier: `clamp(load1 / cpus, 1, LOAD_FACTOR_CAP)` — never below 1 (an idle host
 /// keeps the base bound), capped so a wedged host cannot hold a unit for hours; 1 when the load is
 /// unknown.
@@ -4058,7 +4192,10 @@ fn run_one_watching(
         env_cannot_run: Vec::new(),
         reruns: Vec::new(),
         env_signals: Vec::new(),
+        load_band: None,
     };
+    let (load1, cpus) = host_load();
+    result.load_band = load_band(load1, cpus);
     // LOAD-AWARE BOUND (core#469): base × clamp(load1/ncpu, 1, 3), recorded on the run and
     // logged before the check starts so the observed duration can be read against it.
     let (timeout, bound_note) = effective_bound(check);
@@ -4361,6 +4498,7 @@ mod tests {
                 env_cannot_run: Vec::new(),
                 reruns: Vec::new(),
                 env_signals: Vec::new(),
+                load_band: None,
             }],
             skipped: vec!["typecheck".into(), "test".into()],
             passed: false,
@@ -4375,6 +4513,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            coverage_note: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -5368,6 +5507,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            coverage_note: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -5480,6 +5620,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            coverage_note: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -5777,6 +5918,7 @@ mod tests {
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
             env_signals: Vec::new(),
+            load_band: None,
         };
         let make_base = |exit: i32| BaseRun {
             head: "abc1234567".to_string(),
@@ -6244,6 +6386,86 @@ mod tests {
         );
     }
 
+    /// core#432 F-3R2-023: a verify floor that ran no end-to-end check over a change touching e2e
+    /// files says so on the gate's note — a pass included — and stays silent once one ran.
+    #[cfg(unix)]
+    #[test]
+    fn an_e2e_change_the_floor_did_not_run_is_disclosed_432() {
+        let repo = scratch("e2e-cover");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::create_dir_all(repo.join("e2e")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.join("e2e/carve.py"), "XFAIL = True\n").unwrap();
+        std::fs::write(repo.join("e2e/old.py"), "pass\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::write(repo.join("e2e/carve.py"), "XFAIL = False\n").unwrap();
+        std::fs::remove_file(repo.join("e2e/old.py")).unwrap();
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+            return;
+        }
+        assert!(report.passed, "{report:?}");
+        let note = report
+            .classification_note()
+            .expect("the gap is on the note");
+        assert!(
+            note.contains("touches end-to-end files e2e/carve.py, e2e/old.py")
+                && note.contains("did NOT run them")
+                && note.contains("no `e2e` or `journeys` check is declared"),
+            "{note}"
+        );
+        // The creator floor never runs e2e, so it never says this.
+        let creator = run_floor(
+            &repo,
+            &FloorContext {
+                stage: FloorStage::Creator,
+                ..ctx.clone()
+            },
+        );
+        assert!(creator.coverage_note.is_none(), "{creator:?}");
+        // A declared e2e that runs answers it.
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"e2e":["true"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let report = run_floor(&repo, &ctx);
+        assert_eq!(names_run(&report), vec!["test", "e2e"]);
+        assert!(report.coverage_note.is_none(), "{report:?}");
+        // One that could not start did not run them.
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["true"],"e2e":["wicked-no-such-e2e-binary"],"timeout_s":45}"#,
+        )
+        .unwrap();
+        let report = run_floor(&repo, &ctx);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.name == "e2e" && c.spawn_error.is_some()));
+        assert!(
+            report
+                .coverage_note
+                .as_deref()
+                .is_some_and(|n| n.contains("the declared end-to-end check could not start")),
+            "{report:?}"
+        );
+        assert!(is_e2e_path("web/tests/checkout.e2e.ts") && is_e2e_path("Playwright/x.ts"));
+        assert!(!is_e2e_path("src/app.ts") && !is_e2e_path("src/e2e_helpers/x.rs"));
+    }
+
     #[cfg(unix)]
     fn detect_with_bad_key(repo: &Path) -> String {
         std::fs::write(
@@ -6280,6 +6502,7 @@ mod tests {
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
             env_signals: Vec::new(),
+            load_band: None,
         }
     }
 
@@ -6301,6 +6524,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            coverage_note: None,
         }
     }
 
@@ -6485,6 +6709,7 @@ mod tests {
             env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
             reruns: Vec::new(),
             env_signals: Vec::new(),
+            load_band: None,
         }
     }
 
@@ -6495,6 +6720,50 @@ mod tests {
             run: Some(run),
             error: None,
         }
+    }
+
+    /// core#781: a regression read against a base CACHED from another load band says so in the
+    /// denial; a fresh base, or a cached one from the same band, does not.
+    #[test]
+    fn a_cached_base_from_another_load_band_is_disclosed_781() {
+        let at = |band: u32, note: &str| CheckRun {
+            load_band: Some(band),
+            bound_note: Some(note.to_string()),
+            ..failed_run(&[], &[])
+        };
+        let passing_base = |band: u32, cached: bool| BaseRun {
+            cached,
+            ..base_of(CheckRun {
+                exit_code: Some(0),
+                ..at(band, "1200s × 3.00 (1-min load 63.1 / 14 cpus)")
+            })
+        };
+        let denial = |head_band: u32, base: BaseRun| {
+            let mut head = CheckRun {
+                failure_ids: vec!["FAIL tests/chord.test.ts > scans".to_string()],
+                ..at(head_band, "1200s × 3.00 (1-min load 100.9 / 14 cpus)")
+            };
+            classify(&mut head, base);
+            assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+            report_of(vec![head], &[]).denial_reason()
+        };
+        let r = denial(7, passing_base(4, true));
+        assert!(
+            r.contains(
+                "the base result is CACHED from an earlier floor of this run, under 1200s × \
+                 3.00 (1-min load 63.1 / 14 cpus); this check ran under 1200s × 3.00 (1-min load \
+                 100.9 / 14 cpus) — a different load band"
+            ),
+            "{r}"
+        );
+        for (head_band, base) in [(7, passing_base(4, false)), (4, passing_base(4, true))] {
+            let r = denial(head_band, base);
+            assert!(!r.contains("CACHED"), "{r}");
+        }
+        assert_eq!(load_band(Some(100.9), 14), Some(7));
+        assert_eq!(load_band(Some(13.9), 14), Some(0));
+        assert_eq!(load_band(None, 14), None);
+        assert_eq!(load_band(Some(f64::NAN), 14), None);
     }
 
     /// core#481: a regression in crate B is not masked by the same-named red test in crate A,

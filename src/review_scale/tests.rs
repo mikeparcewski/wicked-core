@@ -463,6 +463,63 @@ fn impact_score_table() {
     }
 }
 
+/// core#692: the reach reason names WHY a traversal is incomplete. A hop horizon is not a node
+/// cap: within the horizon the count is exact, so it must not read "(capped)".
+#[test]
+fn reach_reason_labels_truncation_by_cause() {
+    let reason = |node_cap_reached, depth_horizon_reached| {
+        impact_score(&ImpactSignals {
+            changed_symbols: 1,
+            dependents: 3,
+            products: 1,
+            node_cap_reached,
+            depth_horizon_reached,
+            ..Default::default()
+        })
+        .reasons[0]
+            .clone()
+    };
+    assert!(
+        reason(false, false).ends_with("within 3 hops"),
+        "{}",
+        reason(false, false)
+    );
+    assert!(reason(true, false).ends_with("within 3 hops (capped)"));
+    assert!(reason(false, true).ends_with("within 3 hops (depth-limited)"));
+    assert!(reason(true, true).ends_with("within 3 hops (capped, depth-limited)"));
+}
+
+/// core#692 through the real traversal: a five-deep caller chain under a 3-hop horizon counts
+/// the three callers in reach and reads "depth-limited", never "capped".
+#[test]
+fn a_chain_past_the_hop_horizon_reads_depth_limited_not_capped() {
+    let mut nodes = vec![node("hot", NodeKind::Function, "src/core.rs", (10, 30))];
+    let mut edges = Vec::new();
+    let mut prev = "hot".to_string();
+    for i in 0..5u32 {
+        let caller = format!("chain{i}");
+        nodes.push(node(
+            &caller,
+            NodeKind::Function,
+            "src/chain.rs",
+            (i * 5 + 1, i * 5 + 4),
+        ));
+        edges.push(edge(&caller, &prev, EdgeKind::Calls));
+        prev = caller;
+    }
+    let store = graph(&nodes, &edges);
+    let a = assess(&signals_from_diff(&hot_diff()), ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(s.dependents, 3, "{s:?}");
+    assert!(s.depth_horizon_reached && !s.node_cap_reached, "{s:?}");
+    let reach = a
+        .reasons
+        .iter()
+        .find(|r| r.starts_with("reach"))
+        .expect("a reach reason");
+    assert!(reach.ends_with("(depth-limited)"), "{reach}");
+}
+
 #[test]
 fn bands_table() {
     for (score, want) in [
