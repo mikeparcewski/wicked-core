@@ -205,7 +205,6 @@ fn a_host_provisioned_pin_plans_an_agent_phase_and_an_unresolvable_one_still_bai
 }
 
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
-// ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
 /// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
 /// no shared store configured those spool — which must land in a per-process temp file, never in
