@@ -8017,11 +8017,17 @@ fn advance_or_pause(
     // (T3 round 10) …but never the DELIVER gate: approving a plan is not approving a push. A
     // released deliver unit still stops for its engine-enforced deliver gate (unless the launch
     // set `auto_deliver`).
+    // (core#812) …and never a NEWER plan: a release answers the revision its gate showed, so a
+    // plan held for approval now (a later rev staged while that answer was in flight) re-opens
+    // the plan_approval gate on the CURRENT rev. Bypassing it dispatched into `dispatch_blocked`
+    // ("holds plan rev N+1 for approval") and the release FAILED the run.
     let pause = if released {
         should_pause(&session, &units, unit_ix).filter(|r| {
             matches!(
                 r,
-                PauseReason::DeliverGate { .. } | PauseReason::ConsentBefore { .. }
+                PauseReason::DeliverGate { .. }
+                    | PauseReason::ConsentBefore { .. }
+                    | PauseReason::PlanApproval
             )
         })
     } else {
@@ -23377,6 +23383,76 @@ mod plan_gate_confirm_tests {
         let a = t.accepted.expect("the accepted plan record");
         assert_eq!((a.rev, a.by.as_str(), a.high_risk), (1, "human", true));
         assert_eq!(t.released_ord, None, "the release is spent by the dispatch");
+    }
+
+    /// (core#812) An answer released rev 1's cursor unit while rev 2 was staged for approval (the
+    /// S19a dogfood: Go on "plan rev 2" while the engine held rev 3). The release must re-open the
+    /// plan_approval gate on the CURRENT rev — the run stays `awaiting_human`, nothing dispatches,
+    /// and no `sessionFailed` — instead of dispatching into `dispatch_blocked` and failing.
+    #[test]
+    fn a_release_over_a_superseded_plan_rev_reopens_the_gate_on_the_current_rev_812() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        fixture(&mut store, UnitStatus::Distributed);
+        // Rev 1 was answered and released (cursor unit 2); rev 2 is held, its gate not yet open.
+        let mut s = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        s.status = SessionStatus::Executing;
+        let tp = s.team_plan.as_mut().unwrap();
+        tp.accepted_rev = 1;
+        tp.released_ord = Some(2);
+        tp.pending = Some(crate::plan_gate::PendingPlan {
+            rev: 2,
+            gate_id: None,
+            ..pending()
+        });
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (etx, erx) = channel::<CoreEvent>();
+        subs.push(etx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .expect("a superseded release never fails the run");
+        assert!(matches!(progress, Progress::Paused));
+        let seen: Vec<CoreEvent> = erx.try_iter().collect();
+        assert!(
+            !seen.iter().any(|e| matches!(
+                e,
+                CoreEvent::SessionFailed { .. } | CoreEvent::UnitDispatched { .. }
+            )),
+            "{seen:?}"
+        );
+        let s = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::AwaitingHuman);
+        let t = s.team_plan.unwrap();
+        assert_eq!(
+            t.pending.as_ref().map(|p| p.rev),
+            Some(2),
+            "rev 2 is still held"
+        );
+        assert_eq!(t.released_ord, None, "the stale release is spent");
+        let open = crate::interaction::list_interactions(&store, Some("r"), None)
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.status == crate::interaction::InteractionStatus::Open
+                    && r.gate_kind.as_deref() == Some(crate::plan_gate::GATE_KIND)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            open.iter().any(|r| r.prompt.contains("rev 2")),
+            "the plan gate re-opens on the current rev: {open:#?}"
+        );
     }
 
     #[test]
