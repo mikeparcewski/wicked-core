@@ -14303,6 +14303,7 @@ No further next steps — both questions fully answered.";
             budget_secs: None,
             pool: None,
             pool_seating: None,
+            consent_choice: None,
             validator: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),

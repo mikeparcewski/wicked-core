@@ -559,6 +559,11 @@ pub enum CoreEvent {
         /// answers without reading the team stream. Empty for every other kind, and then ABSENT
         /// on the wire.
         finding_ids: Vec<String>,
+        /// (core#820) For a `consent` pause: what each answer would write, from the dry-run plan
+        /// the gated unit depends on — `choices` / `recommended` / `choiceLabels` / `writeTargets`
+        /// (per answer token) / `writePlanOrd` / `writeTargetsSkipped`, or `writeTargetsMissing`
+        /// when no plan ran. `None` for every other kind, and then ABSENT on the wire.
+        consent: Option<Box<crate::consent_plan::ConsentOffer>>,
     },
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
@@ -1729,8 +1734,14 @@ impl CoreEvent {
                 prompt,
                 gate_kind,
                 finding_ids,
+                consent,
             } => {
                 let mut j = json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind });
+                if let Some(offer) = consent {
+                    for (k, v) in crate::consent_plan::event_fields(offer) {
+                        j[k] = v;
+                    }
+                }
                 if !finding_ids.is_empty() {
                     j["findingIds"] = json!(finding_ids);
                 }
@@ -2563,6 +2574,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                consent: None,
             }
             .to_json()
         };

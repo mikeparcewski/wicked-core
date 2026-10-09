@@ -7655,6 +7655,18 @@ fn pause_for_human_keyed(
     gate_key: Option<&str>,
     prompt: String,
 ) -> anyhow::Result<()> {
+    // (core#820) A consent pause names what each answer would write, from the dry-run plan the
+    // gated unit depends on — in the durable prompt AND on the event — or says that no plan ran.
+    let consent = (gate_kind == CONSENT_GATE_KIND)
+        .then(|| consent_offer(&*store, &session.id, ord))
+        .transpose()?;
+    let prompt = match &consent {
+        Some(offer) => format!(
+            "{prompt}{}",
+            crate::consent_plan::offer_sentence(offer, std::env::var("HOME").ok().as_deref())
+        ),
+        None => prompt,
+    };
     session.status = SessionStatus::AwaitingHuman;
     // DES-PROJECT-001 §5.3: the prompt is DURABLE STATE, not just an event — the session's
     // AwaitingHuman write and the open interaction_request commit in ONE batch, so a skin that
@@ -7690,6 +7702,7 @@ fn pause_for_human_keyed(
             } else {
                 Vec::new()
             },
+            consent: consent.map(Box::new),
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
@@ -8492,6 +8505,104 @@ fn deliver_gate_prompt_parts(
 /// operator's decision every time.
 pub(crate) const CONSENT_GATE_KIND: &str = "consent";
 
+/// (core#820) The dry-run plan a consent gate on unit `ord` offers: the approved output of the
+/// newest unit before it whose phase it `depends_on` and which printed a plan
+/// ([`crate::consent_plan::parse_plan`]), or why there is none.
+fn consent_offer(
+    store: &dyn GraphStore,
+    session_id: &str,
+    ord: u32,
+) -> anyhow::Result<crate::consent_plan::ConsentOffer> {
+    let units = crate::domain::session_units(store, session_id)?;
+    let Some(unit) = units.iter().find(|u| u.ord == ord) else {
+        anyhow::bail!("run {session_id} has no unit {ord}");
+    };
+    let deps: Vec<&crate::domain::WorkUnit> = units
+        .iter()
+        .filter(|p| p.ord < ord)
+        .filter(|p| {
+            p.phase_id()
+                .is_some_and(|id| unit.depends_on.iter().any(|d| d == id))
+        })
+        .collect();
+    let found = deps.iter().rev().find_map(|p| {
+        crate::domain::get_work_output(store, &p.id)
+            .and_then(|o| crate::consent_plan::parse_plan(&o))
+            .map(|plan| (p.ord, plan))
+    });
+    Ok(match found {
+        Some((plan_ord, plan)) => crate::consent_plan::ConsentOffer {
+            plan_ord: Some(plan_ord),
+            plan: Some(plan),
+            missing: None,
+        },
+        None => crate::consent_plan::ConsentOffer {
+            plan_ord: None,
+            plan: None,
+            missing: Some(
+                if deps.is_empty() {
+                    "no dry-run plan ran before this gate"
+                } else {
+                    "the phase this gate depends on printed no dry-run plan"
+                }
+                .to_string(),
+            ),
+        },
+    })
+}
+
+/// (core#820) Resolve an answer at an open consent gate on unit `ord` into the ordinary approve /
+/// reject flow. With a plan, `consent:<id>` approves that choice and a plain approve takes the
+/// plan's default (program-owned) choice; the id is recorded on the unit, whose Tool command
+/// receives it as `WICKED_CONSENT_CHOICE`. A choice the plan does not offer is refused, and so is
+/// a choice at a gate with no plan. Reject is unchanged (decline: nothing runs).
+fn resolve_consent_answer(
+    store: &mut dyn GraphStore,
+    session_id: &str,
+    ord: u32,
+    decision: crate::workflow::HumanDecision,
+) -> anyhow::Result<crate::workflow::HumanDecision> {
+    use crate::workflow::HumanDecision;
+    let offer = consent_offer(&*store, session_id, ord)?;
+    let plan = offer.plan.as_ref().filter(|p| !p.choices.is_empty());
+    let (chosen, decision) = match decision {
+        HumanDecision::ConsentChoice { choice } => {
+            let Some(plan) = plan else {
+                anyhow::bail!(
+                    "the consent gate on unit {ord} offers no choices ({}) — answer approve or                      reject",
+                    offer.missing.as_deref().unwrap_or("no dry-run plan")
+                );
+            };
+            let Some(c) = plan.choice_for_token(&choice) else {
+                let offered: Vec<String> = plan
+                    .choices
+                    .iter()
+                    .map(|c| format!("{}{}", crate::consent_plan::CHOICE_PREFIX, c.id))
+                    .collect();
+                anyhow::bail!(
+                    "`{choice}` is not a choice of the consent gate on unit {ord} (offered: {},                      reject)",
+                    offered.join(", ")
+                );
+            };
+            (Some(c.id.clone()), HumanDecision::ConsentChoice { choice })
+        }
+        d @ HumanDecision::Approve { .. } => (
+            plan.and_then(|p| p.default_choice()).map(|c| c.id.clone()),
+            d,
+        ),
+        other => (None, other),
+    };
+    if let Some(id) = chosen {
+        let mut unit = crate::domain::session_units(&*store, session_id)?
+            .into_iter()
+            .find(|u| u.ord == ord)
+            .ok_or_else(|| anyhow::anyhow!("run {session_id} has no unit {ord}"))?;
+        unit.consent_choice = Some(id);
+        put_node(store, unit.to_node())?;
+    }
+    Ok(decision)
+}
+
 /// The prompt of a `consent` pause: what is about to run, in the phase's own authored words (its
 /// card), before anything has run. Approve runs it; Reject cancels the run with nothing run.
 fn consent_gate_prompt(unit: &crate::domain::WorkUnit, reviewing_ord: Option<u32>) -> String {
@@ -9173,6 +9284,7 @@ fn dispatch_unit(
         let run_env = record.is_none().then(|| ToolRunEnv {
             run_id: run_id.to_string(),
             ord: unit.ord,
+            consent_choice: unit.consent_choice.clone(),
             evidence_root: session.evidence_root.clone(),
             tree_from: session.workdir.clone().zip(
                 session
@@ -9777,6 +9889,9 @@ fn tool_garden_root(
 struct ToolRunEnv {
     run_id: String,
     ord: u32,
+    /// (core#820) The choice approved at this unit's consent gate, handed on as
+    /// `WICKED_CONSENT_CHOICE` (unset when the gate offered none).
+    consent_choice: Option<String>,
     evidence_root: Option<String>,
     tree_from: Option<(String, String)>,
 }
@@ -9787,6 +9902,12 @@ impl ToolRunEnv {
             ("WICKED_RUN_ID".to_string(), self.run_id.clone()),
             ("WICKED_RUN_UNIT".to_string(), self.ord.to_string()),
         ];
+        if let Some(choice) = &self.consent_choice {
+            env.push((
+                crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
+                choice.clone(),
+            ));
+        }
         if let Some(root) = &self.evidence_root {
             env.push((
                 crate::walkthrough::EVIDENCE_ROOT_ENV.to_string(),
@@ -10628,7 +10749,8 @@ fn confirm_plan_gate(
         // been judged against yet.
         HumanDecision::FloorRerun(_)
         | HumanDecision::AcceptSuggestion
-        | HumanDecision::AmendIntent { .. } => anyhow::bail!(
+        | HumanDecision::AmendIntent { .. }
+        | HumanDecision::ConsentChoice { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit or an intent \
              amendment — approve, approve with an edited plan, or reject"
         ),
@@ -11171,6 +11293,29 @@ pub(crate) fn confirm_gate(
              approval gate"
         );
     }
+    // (core#820) A consent gate's answers: a plan's choice (or plain approve = its default) is
+    // recorded on the gated unit, then the ordinary approve runs it; a choice answers no other gate.
+    let consent_row = crate::interaction::list_interactions(
+        &*store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .into_iter()
+    .find(|r| r.gate_kind.as_deref() == Some(CONSENT_GATE_KIND));
+    let decision = match consent_row.and_then(|r| r.ord) {
+        Some(ord) => resolve_consent_answer(store, run_id, ord, decision)?,
+        None if matches!(
+            decision,
+            crate::workflow::HumanDecision::ConsentChoice { .. }
+        ) =>
+        {
+            anyhow::bail!(
+                "run {run_id} has no consent gate open — a consent choice answers only a consent \
+                 gate"
+            )
+        }
+        None => decision,
+    };
 
     // (core#761) The capped review's gate: approve = LAND WITH CARRIED ITEMS (the unit counts
     // over its FAIL, the items recorded as carried), request changes = ONE MORE ROUND (the
@@ -11367,6 +11512,12 @@ pub(crate) fn confirm_gate(
                 "approve": true, "action": "amend_intent", "amend": text,
             })
             .to_string(),
+            // (core#820) The consent choice is the answer's action, so the durable record says
+            // WHICH write set was approved.
+            crate::workflow::HumanDecision::ConsentChoice { choice } => serde_json::json!({
+                "approve": true, "action": choice, "amend": null,
+            })
+            .to_string(),
         };
         crate::interaction::resolve_open_for_session(
             store,
@@ -11491,6 +11642,10 @@ pub(crate) fn confirm_gate(
         // every later unit is judged against (applied after the boundary check, below).
         crate::workflow::HumanDecision::AmendIntent { text } => {
             intent_amendment = Some(text);
+            (None, crate::workflow::AmendScope::Cursor, None)
+        }
+        // (core#820) A consent choice is an approve; the choice is already on the unit.
+        crate::workflow::HumanDecision::ConsentChoice { .. } => {
             (None, crate::workflow::AmendScope::Cursor, None)
         }
     };
@@ -23681,6 +23836,248 @@ mod catalog_alias_governance_tests {
         assert_eq!(
             approve_under_review_policy("review", None),
             SessionStatus::Cancelled
+        );
+    }
+}
+
+#[cfg(test)]
+mod consent_plan_tests {
+    //! core#820: the consent gate offers the dry-run plan's choices, each with what it writes.
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, HumanDecision};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, GraphStore, ToNode};
+
+    const PLAN: &str = r#"{"dry_run":true,"choices":[{"id":"worker","label":"Install for workers","default":true,"writes":[{"path":"/h/.wicked-worker/claude/.claude.json","what":"claude MCP config","cli":"claude"}]},{"id":"operator","label":"Also install into my CLIs","writes":[{"path":"/h/.codex/config.toml","what":"codex MCP config","cli":"codex","operator_owned":true}]}]}"#;
+
+    /// A run whose unit 2 (`install`, consent_before) depends on unit 1 (`install-plan`), which
+    /// printed `plan_output` and was approved.
+    fn seed(store: &mut dyn GraphStore, run_id: &str, plan_output: Option<&str>) {
+        let attempt = 0;
+        let session = AgentSession {
+            intent_amendments: Vec::new(),
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into(), "codex".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::All,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut plan = WorkUnit::pending(format!("{run_id}:install-plan"), run_id, 1, "plan");
+        plan.status = UnitStatus::Done;
+        put_node(store, plan.to_node()).unwrap();
+        if let Some(out) = plan_output {
+            let o = crate::execute::apply_unit(
+                store,
+                &plan,
+                out,
+                &format!("wf-{run_id}"),
+                EntityMode::Shared,
+                run_id,
+                None,
+                0,
+            )
+            .unwrap();
+            assert!(o.approved);
+        }
+        let mut install = WorkUnit::pending(format!("{run_id}:install"), run_id, 2, "install");
+        install.gate = GateSpec::ConsentBefore;
+        install.depends_on = vec!["install-plan".to_string()];
+        install.tool_cmd = Some(vec!["true".to_string()]);
+        put_node(store, install.to_node()).unwrap();
+    }
+
+    fn install_unit(store: &dyn GraphStore, run_id: &str) -> WorkUnit {
+        crate::domain::session_units(store, run_id)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.ord == 2)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_consent_pause_names_each_choice_and_what_it_writes() {
+        let run_id = "consent-offer";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, run_id, Some(&format!("building\n{PLAN}\n")));
+        let mut session = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let mut subs = crate::event_log::EventSink::default();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        subs.push(ev_tx);
+        pause_for_human(
+            &mut store,
+            &mut subs,
+            &tx,
+            &mut session,
+            2,
+            None,
+            CONSENT_GATE_KIND,
+            "Consent needed before unit 2 runs.".to_string(),
+        )
+        .unwrap();
+        let frame = ev_rx
+            .try_iter()
+            .find(|e| matches!(e, CoreEvent::AwaitingHuman { .. }))
+            .expect("an awaitingHuman")
+            .to_json();
+        assert_eq!(
+            frame["choices"],
+            serde_json::json!(["consent:worker", "consent:operator", "reject"])
+        );
+        assert_eq!(frame["recommended"], serde_json::json!(0));
+        assert_eq!(frame["writePlanOrd"], serde_json::json!(1));
+        assert_eq!(
+            frame["writeTargets"]["consent:operator"][0]["path"],
+            serde_json::json!("/h/.codex/config.toml")
+        );
+        let prompt = frame["prompt"].as_str().unwrap();
+        assert!(prompt.contains("Install for workers (default)"), "{prompt}");
+        assert!(
+            prompt.contains("/.codex/config.toml (codex MCP config)"),
+            "{prompt}"
+        );
+        // The durable prompt says the same (a skin that connects later reads it there).
+        let open = crate::interaction::list_interactions(
+            &store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert!(open
+            .iter()
+            .any(|r| r.prompt.contains("Also install into my CLIs")));
+    }
+
+    #[test]
+    fn a_choice_is_recorded_on_the_unit_and_rides_its_tool_command() {
+        let run_id = "consent-answer";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, run_id, Some(PLAN));
+        let d = resolve_consent_answer(
+            &mut store,
+            run_id,
+            2,
+            HumanDecision::ConsentChoice {
+                choice: "consent:operator".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(d, HumanDecision::ConsentChoice { .. }));
+        let unit = install_unit(&store, run_id);
+        assert_eq!(unit.consent_choice.as_deref(), Some("operator"));
+        let env = ToolRunEnv {
+            run_id: run_id.into(),
+            ord: 2,
+            consent_choice: unit.consent_choice.clone(),
+            evidence_root: None,
+            tree_from: None,
+        }
+        .vars();
+        assert!(env.contains(&(
+            crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
+            "operator".to_string()
+        )));
+        // A choice the plan does not offer is refused, and records nothing new.
+        let err = resolve_consent_answer(
+            &mut store,
+            run_id,
+            2,
+            HumanDecision::ConsentChoice {
+                choice: "consent:everywhere".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("consent:worker, consent:operator, reject"),
+            "{err}"
+        );
+        // A plain approve takes the plan's default — the program-owned target.
+        resolve_consent_answer(
+            &mut store,
+            run_id,
+            2,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            install_unit(&store, run_id).consent_choice.as_deref(),
+            Some("worker")
+        );
+    }
+
+    #[test]
+    fn with_no_plan_the_gate_says_so_and_takes_no_choice() {
+        let run_id = "consent-noplan";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            Some("installed nothing, printed no plan"),
+        );
+        let offer = consent_offer(&store, run_id, 2).unwrap();
+        assert!(offer.plan.is_none());
+        assert_eq!(
+            offer.missing.as_deref(),
+            Some("the phase this gate depends on printed no dry-run plan")
+        );
+        let err = resolve_consent_answer(
+            &mut store,
+            run_id,
+            2,
+            HumanDecision::ConsentChoice {
+                choice: "consent:worker".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("offers no choices"), "{err}");
+        // Approve still approves (nothing recorded); reject is unchanged.
+        resolve_consent_answer(
+            &mut store,
+            run_id,
+            2,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        assert_eq!(install_unit(&store, run_id).consent_choice, None);
+        assert!(
+            HumanDecision::escalation_action("consent:worker").is_some()
+                && HumanDecision::escalation_action("consent:").is_none()
         );
     }
 }

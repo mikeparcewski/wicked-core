@@ -1079,10 +1079,18 @@ export declare class Subscription {
  * the very seat of) the CLI that created the work the unit depends on.
  * core#759 (additive): an awaitingHuman with `gateKind: 'team_dispute'` carries
  * `choices: ['approve', 'request_changes', 'reject']` and `recommended: 1` (send the finding
- * back). Every other gate kind carries NEITHER key (absent, never null).
+ * back). Every other gate kind carries NEITHER key (absent, never null), except a
+ * `consent` gate with a dry-run plan (core#820, below).
  * core#759 follow-up (additive): that team_dispute awaitingHuman also carries `findingIds`
  * (the unresolved HIGH finding ids the dispute is about, as `gate.opened` names them); absent
  * for every other gate kind.
+ * core#820 (additive): an awaitingHuman with `gateKind: 'consent'` whose gated unit depends on a
+ * dry-run plan carries `choices` (`'consent:<id>'` per plan choice, then `'reject'`), `recommended`
+ * (the default, program-owned choice), `choiceLabels` and `writeTargets` (both keyed by choice
+ * token; each target `{path, what, cli?, operatorOwned}`, `reject` → `[]`), `writePlanOrd` and,
+ * when the plan names any, `writeTargetsSkipped` (`{cli, why}[]`). With no plan it carries only
+ * `writeTargetsMissing` (why nothing is listed). Answer with `action: 'consent:<id>'`, approve
+ * (= the default) or reject.
  */
 export interface CoreEventJson {
   type: string

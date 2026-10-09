@@ -98,6 +98,7 @@ mod tests {
             budget_secs: None,
             pool: None,
             pool_seating: None,
+            consent_choice: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

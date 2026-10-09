@@ -452,6 +452,11 @@ pub enum HumanDecision {
     /// Refused with an empty text (there is nothing to amend) and at a plan/team gate (a plan's
     /// own edit arm is [`Self::EditPlan`]).
     AmendIntent { text: String },
+    /// (core#820) Approve a `consent` gate WITH ONE OF ITS DRY-RUN PLAN'S CHOICES — the wire token
+    /// `consent:<id>` itself (e.g. `consent:worker`, `consent:operator`). The id is recorded on the
+    /// gated unit and handed to its Tool command as `WICKED_CONSENT_CHOICE`; a plain approve takes
+    /// the plan's default. Refused at any other gate and for a choice the plan does not offer.
+    ConsentChoice { choice: String },
 }
 
 /// (core#555) The sentence an approved intent amendment rides into every later unit's prompt. It
@@ -476,6 +481,13 @@ impl HumanDecision {
             "targeted" => Self::FloorRerun(Mode::Targeted),
             "accept_partial" => Self::FloorRerun(Mode::AcceptPartial),
             "accept_suggestion" => Self::AcceptSuggestion,
+            t if t.starts_with(crate::consent_plan::CHOICE_PREFIX)
+                && t.len() > crate::consent_plan::CHOICE_PREFIX.len() =>
+            {
+                Self::ConsentChoice {
+                    choice: t.to_string(),
+                }
+            }
             _ => return None,
         })
     }
@@ -2181,10 +2193,11 @@ mod workflow_def_tests {
         );
     }
 
-    /// The `mcp-server` drop-in is governed exactly as designed (DES-mcp-server-workflow): eight
+    /// The `mcp-server` drop-in is governed exactly as designed (DES-mcp-server-workflow): nine
     /// phases in order, one creator (`build`, evidence-floor pin), one verify-floor phase (`test`),
-    /// two cold evaluators after `test`, and an operator-gated Tool phase `install` that carries no
-    /// pin (it leaves the tree unchanged, so the evidence floor would deny it). No `deliver` phase —
+    /// two cold evaluators after `test`, the `install-plan` dry run (core#820) and an
+    /// operator-gated Tool phase `install` that carries no pin (it leaves the tree unchanged, so the
+    /// evidence floor would deny it) and runs the choice its gate recorded. No `deliver` phase —
     /// wicked-crew composes it per run.
     #[test]
     fn mcp_server_drop_in_is_governed_as_designed() {
@@ -2205,6 +2218,7 @@ mod workflow_def_tests {
                 "test",
                 "security-review",
                 "observability-review",
+                "install-plan",
                 "install"
             ]
         );
@@ -2252,6 +2266,26 @@ mod workflow_def_tests {
             );
         }
 
+        // (core#820) The dry run the consent gate lists: an auto-gated Tool phase after both
+        // reviews, running the same launcher with `--dry-run --json`, writing nothing.
+        let plan = phase("install-plan");
+        match &plan.executor {
+            PhaseExecutor::Tool { cmd } => assert!(
+                cmd[2].contains("scripts/mcp/install.py --from-run --dry-run --json"),
+                "{cmd:?}"
+            ),
+            other => panic!("install-plan must be a Tool executor, got {other:?}"),
+        }
+        assert_eq!(plan.gate, GateSpec::Auto);
+        assert!(!plan.executes_code && plan.validator_pin.is_none());
+        assert_eq!(
+            plan.depends_on,
+            vec![
+                "security-review".to_string(),
+                "observability-review".to_string()
+            ]
+        );
+
         let install = phase("install");
         match &install.executor {
             PhaseExecutor::Tool { cmd } => {
@@ -2269,6 +2303,11 @@ mod workflow_def_tests {
                     "install runs the handed garden root's launcher: {cmd:?}"
                 );
                 assert!(!cmd[2].contains("npx"), "no PATH/npx fallback: {cmd:?}");
+                // (core#820) It installs exactly the choice the operator approved.
+                assert!(
+                    cmd[2].contains("--target \"${WICKED_CONSENT_CHOICE:?"),
+                    "install runs the recorded consent choice: {cmd:?}"
+                );
             }
             other => panic!("install must be a Tool executor, got {other:?}"),
         }
@@ -2281,13 +2320,7 @@ mod workflow_def_tests {
         assert!(install.validator_pin.is_none(), "install carries no pin");
         assert!(install.skill_ref.is_none(), "install carries no skill_ref");
         assert!(!install.executes_code && !install.verified_evidence);
-        assert_eq!(
-            install.depends_on,
-            vec![
-                "security-review".to_string(),
-                "observability-review".to_string()
-            ]
-        );
+        assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
 
         for p in &def.phases {
             assert!(
