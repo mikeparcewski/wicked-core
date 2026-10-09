@@ -8569,7 +8569,7 @@ fn resolve_consent_answer(
         HumanDecision::ConsentChoice { choice } => {
             let Some(plan) = plan else {
                 anyhow::bail!(
-                    "the consent gate on unit {ord} offers no choices ({}) — answer approve or                      reject",
+                    "the consent gate on unit {ord} offers no choices ({}) — answer approve or reject",
                     offer.missing.as_deref().unwrap_or("no dry-run plan")
                 );
             };
@@ -8580,7 +8580,7 @@ fn resolve_consent_answer(
                     .map(|c| format!("{}{}", crate::consent_plan::CHOICE_PREFIX, c.id))
                     .collect();
                 anyhow::bail!(
-                    "`{choice}` is not a choice of the consent gate on unit {ord} (offered: {},                      reject)",
+                    "`{choice}` is not a choice of the consent gate on unit {ord} (offered: {}, reject)",
                     offered.join(", ")
                 );
             };
