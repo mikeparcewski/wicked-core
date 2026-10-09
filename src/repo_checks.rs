@@ -288,6 +288,10 @@ pub const DENIAL_SOURCE_TIMEOUT: &str = "repo_checks_timeout";
 /// * `accept_partial` — the checks that passed run again and the ones that did not finish (or
 ///   never ran) are WAIVED for this unit.
 ///
+/// * `floor_fix` (core#782) — a seat distinct from the read-only phase first makes the fix the
+///   operator's note asks for, then the ordinary floor runs on the fixed tree. Reached only
+///   through an approve with a note at a read-only phase's floor gate, never as its own answer.
+///
 /// A waived check is disclosed on `repoChecksEvaluated.waived` and in the gate's `floorNote`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -295,6 +299,7 @@ pub enum FloorRerunMode {
     Extend,
     Targeted,
     AcceptPartial,
+    FloorFix,
 }
 
 impl FloorRerunMode {
@@ -304,6 +309,7 @@ impl FloorRerunMode {
             FloorRerunMode::Extend => "extend",
             FloorRerunMode::Targeted => "targeted",
             FloorRerunMode::AcceptPartial => "accept_partial",
+            FloorRerunMode::FloorFix => "floor_fix",
         }
     }
 }
@@ -323,6 +329,18 @@ pub struct FloorRerun {
     /// The seat's output from the attempt the gate reviewed.
     #[serde(default)]
     pub output: String,
+    /// `floor_fix` (core#782): the fix a seat makes before the floor runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<FloorFix>,
+}
+
+/// (core#782) The fix a `floor_fix` re-run makes before its floor: the operator's note, handed to
+/// `seat` — a seat distinct from the read-only phase whose floor failed — which edits the run's
+/// worktree and nothing else. Only the floor judges the result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloorFix {
+    pub note: String,
+    pub seat: String,
 }
 
 /// One check the floor detected: a name, the exact argv, and where it was read from.
@@ -2549,6 +2567,8 @@ fn apply_rerun(
                 .partition(|c| rerun.waive.iter().any(|w| w == &c.name));
             Ok((run, waived.into_iter().map(|c| c.name).collect()))
         }
+        // The fix already ran; its floor is the ordinary one, on the fixed tree.
+        FloorRerunMode::FloorFix => Ok((detected, Vec::new())),
     }
 }
 
@@ -6330,6 +6350,7 @@ mod tests {
             mode,
             waive: waive.iter().map(|w| w.to_string()).collect(),
             output: String::new(),
+            fix: None,
         };
 
         let (run, waived) = apply_rerun(
