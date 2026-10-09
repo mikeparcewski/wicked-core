@@ -155,6 +155,9 @@ const HAND_AUTHORED = `${BEGIN}
  * core#591 (additive): unitReassigned carries \`distinctnessFallback\` ('creator_seat' |
  * 'same_cli_instance' | null), as unitDistributed does — the new seat is another INSTANCE of (or
  * the very seat of) the CLI that created the work the unit depends on.
+ * core#759 (additive): an awaitingHuman with \`gateKind: 'team_dispute'\` carries
+ * \`choices: ['approve', 'request_changes', 'reject']\` and \`recommended: 1\` (send the finding
+ * back). Every other gate kind carries NEITHER key (absent, never null).
  */
 export interface CoreEventJson {
   type: string
