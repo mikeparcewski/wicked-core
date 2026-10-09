@@ -369,9 +369,13 @@ export declare class Core {
    * `{ source, reason, claim_id?, rule_ids?, denied_tool?, phase? }`. A rejected unit keeps its
    * PARTIAL output here, flagged; a unit denied BEFORE any output existed answers with an
    * explicit failure record (`output` absent, `denial` carrying the claim id / firing rule ids /
-   * denied tool) instead of `null`.
+   * denied tool) instead of `null`. (core#791) Every record also names its `attempt`, and
+   * `attempts` lists each attempt that left an output record; pass `attempt` to read that
+   * attempt's own bytes (`resolution: "superseded"` when a later attempt replaced it,
+   * `"unresolved"` when it ended without a resolution record — `phase_status` is then its step
+   * status, e.g. `timed_out`). Without `attempt` the resolution record is read as before.
    */
-  unitTranscript(unitId: string): Promise<string>
+  unitTranscript(unitId: string, attempt?: number | undefined | null): Promise<string>
   /**
    * A run's recorded event history, oldest first, as a JSON array. Each entry is the SAME tagged
    * object the `/ws` stream carries ([`CoreEvent::to_json`]) plus the durable log's envelope — a

@@ -142,9 +142,9 @@ pub use command::InjectTarget;
 pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
-    all_sessions, get_session, get_unit_transcript, get_work_output, put_node, put_nodes,
-    session_units, AgentSession, HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind,
-    UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
+    all_sessions, get_session, get_unit_transcript, get_unit_transcript_at, get_work_output,
+    put_node, put_nodes, session_units, AgentSession, HumanConfirm, RoutingInfo, SessionStatus,
+    SessionView, StageKind, UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
 };
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
@@ -1559,9 +1559,22 @@ impl Core {
     /// EXPLICIT FAILURE RECORD of a unit denied before any output existed (`output: None`).
     /// `None` when the unit never ran far enough to leave a record.
     pub fn unit_transcript(&self, unit_id: &str) -> Option<domain::UnitTranscript> {
+        self.unit_transcript_at(unit_id, None)
+    }
+
+    /// (core#791) [`Core::unit_transcript`] by attempt, with `attempts` listing every attempt that
+    /// left an output record: `None` reads the resolution record (or, when there is none, the
+    /// newest attempt's); `Some(n)` reads attempt `n`'s own bytes — including an attempt that
+    /// ended `timed_out` / `cancelled` / `failed`, or one a rework superseded
+    /// ([`domain::get_unit_transcript_at`]).
+    pub fn unit_transcript_at(
+        &self,
+        unit_id: &str,
+        attempt: Option<u32>,
+    ) -> Option<domain::UnitTranscript> {
         let (reply, rx) = channel();
         self.tx
-            .send(Command::UnitTranscript(unit_id.to_string(), reply))
+            .send(Command::UnitTranscript(unit_id.to_string(), attempt, reply))
             .ok()?;
         rx.recv().ok().flatten()
     }

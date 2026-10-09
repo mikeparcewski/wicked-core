@@ -1434,12 +1434,16 @@ impl Core {
     /// `{ source, reason, claim_id?, rule_ids?, denied_tool?, phase? }`. A rejected unit keeps its
     /// PARTIAL output here, flagged; a unit denied BEFORE any output existed answers with an
     /// explicit failure record (`output` absent, `denial` carrying the claim id / firing rule ids /
-    /// denied tool) instead of `null`.
+    /// denied tool) instead of `null`. (core#791) Every record also names its `attempt`, and
+    /// `attempts` lists each attempt that left an output record; pass `attempt` to read that
+    /// attempt's own bytes (`resolution: "superseded"` when a later attempt replaced it,
+    /// `"unresolved"` when it ended without a resolution record — `phase_status` is then its step
+    /// status, e.g. `timed_out`). Without `attempt` the resolution record is read as before.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn unit_transcript(&self, unit_id: String) -> AsyncTask<CoreTask> {
+    pub fn unit_transcript(&self, unit_id: String, attempt: Option<u32>) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
-            let out = core.unit_transcript(&unit_id);
+            let out = core.unit_transcript_at(&unit_id, attempt);
             serde_json::to_string(&out).map_err(err)
         })
     }
