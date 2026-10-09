@@ -9354,9 +9354,9 @@ sleep 30
     #[cfg(unix)]
     fn stub_bridge_with_version(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
         let script = dir.join("stub-acp-bridge-versioned.sh");
-        std::fs::write(
+        write_version_stub(
             &script,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo '{version}'
@@ -9369,11 +9369,41 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"stub"}}}}'
 sleep 30
 "#
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         script
+    }
+
+    /// (core#728) Writes a `--version`-answering stub and returns only once it can be EXECUTED.
+    /// On Linux a sibling test that forks while this thread still holds the file open for writing
+    /// keeps a writable descriptor until its own exec, and executing the stub in that window fails
+    /// with `ETXTBSY` — which the version probe reports as "nothing observed", the flake on
+    /// `a_drifted_version_pin_reports_what_the_resolved_binary_actually_is`. Writers only ever go
+    /// away once ours is closed, so one successful `--version` exec proves every later one works.
+    #[cfg(unix)]
+    fn write_version_stub(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        const ETXTBSY: i32 = 26; // the same errno on Linux and macOS
+        for _ in 0..100 {
+            match std::process::Command::new(path)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(e) => panic!("the version stub {} cannot run: {e}", path.display()),
+                Ok(_) => return,
+            }
+        }
+        panic!(
+            "the version stub {} stayed busy (ETXTBSY) for 2 s",
+            path.display()
+        );
     }
 
     #[test]
@@ -9449,13 +9479,12 @@ sleep 30
         let padded_dir = dir.join("padded");
         std::fs::create_dir_all(&padded_dir).unwrap();
         let padded = stub_bridge_with_version(&padded_dir, "");
-        std::fs::write(
+        write_version_stub(
             &padded,
-            std::fs::read_to_string(&padded)
+            &std::fs::read_to_string(&padded)
                 .unwrap()
                 .replace("echo ''", "echo ''; echo '1.17.18'"),
-        )
-        .unwrap();
+        );
         let blank_first = probe_resolved_binary_version(&padded.to_string_lossy(), "1.17.18");
         assert_eq!(
             blank_first.observed.as_deref(),
