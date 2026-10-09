@@ -81,6 +81,14 @@ impl GraphRead for AnyStore {
     fn find_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
         on_backend!(self, s => s.find_symbols(query))
     }
+    // estate 0.22.0 (#177 / #218): provided methods a backend may override with a store-side
+    // query (`SqliteStore` pushes the COUNT down) — forwarded so the override is not bypassed.
+    fn count_symbols(&self, query: &SymbolQuery) -> Result<usize> {
+        on_backend!(self, s => s.count_symbols(query))
+    }
+    fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+        on_backend!(self, s => s.find_structural_symbols(query))
+    }
     fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
         on_backend!(self, s => s.neighbors(id, dir))
     }
@@ -116,6 +124,12 @@ impl GraphRead for AnyStore {
     }
     fn file_content(&self, file: &str) -> Result<Option<String>> {
         on_backend!(self, s => s.file_content(file))
+    }
+    // estate 0.23.0 (#220): the per-file value-flow call refs the incremental index replays.
+    // The trait default records nothing, so an unforwarded wrapper would silently keep every
+    // caller on the re-extract path.
+    fn file_call_refs(&self, file: &str) -> Result<Option<String>> {
+        on_backend!(self, s => s.file_call_refs(file))
     }
     fn symbol_source(&self, node: &Node) -> Result<Option<String>> {
         on_backend!(self, s => s.symbol_source(node))
@@ -188,6 +202,9 @@ impl GraphWrite for AnyStore {
     }
     fn set_file_content(&mut self, file: &str, text: &str) -> Result<()> {
         on_backend!(self, s => s.set_file_content(file, text))
+    }
+    fn set_file_call_refs(&mut self, file: &str, refs_json: &str) -> Result<()> {
+        on_backend!(self, s => s.set_file_call_refs(file, refs_json))
     }
     fn prune_dangling_edges(&mut self) -> Result<usize> {
         on_backend!(self, s => s.prune_dangling_edges())
