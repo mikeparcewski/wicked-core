@@ -9549,6 +9549,13 @@ fn run_walkthrough_record(
         .map(|k| ((*k).to_string(), tmp_s.clone()))
         .collect();
     env.extend(rec.env.iter().cloned());
+    // (core#798) Tell the recorder it is jailed, and by what: only reached with a `Sandboxed`
+    // launcher armed above, so the variable is never set on an unjailed run.
+    let kind = std::path::Path::new(&launcher.wrapper[0])
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| launcher.wrapper[0].clone());
+    env.push((wt::JAIL_ENV.to_string(), kind));
     if let Some(root) = garden_root {
         env.push((
             crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
@@ -21822,6 +21829,7 @@ except OSError as e:
             "WICKED_EVIDENCE_ROOT",
             "WICKED_TREE",
             "WICKED_WALKTHROUGH_AUTHOR",
+            "WICKED_WALKTHROUGH_JAIL",
             "TMPDIR",
             "TMP",
             "TEMP",
@@ -21840,6 +21848,17 @@ except OSError as e:
             );
         }
         assert!(env.contains("WICKED_RUN_UNIT=3\n"));
+        // core#798: the jail kind is handed over, so garden's recorder does not seal
+        // `unjailed_host` under the engine's own jail.
+        let kind = if cfg!(target_os = "macos") {
+            "sandbox-exec"
+        } else {
+            "bwrap"
+        };
+        assert!(
+            env.contains(&format!("WICKED_WALKTHROUGH_JAIL={kind}\n")),
+            "the jail kind must be handed over: {env}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

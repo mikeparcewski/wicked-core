@@ -27,7 +27,8 @@
 //!   worktree's tree id, snapshotted at dispatch OUTSIDE the jail, since computing it writes git
 //!   objects), `WICKED_WALKTHROUGH_AUTHOR` (the author dir of the walkthrough_plan step it
 //!   records, when the plan has one) and the skills generation's launcher env
-//!   (`WICKED_GARDEN_ROOT` + the `PATH` prefix). Nothing else: no key or token reaches the
+//!   (`WICKED_GARDEN_ROOT` + the `PATH` prefix), and `WICKED_WALKTHROUGH_JAIL` = the armed
+//!   launcher's kind (core#798: garden's recorder records only when it is set). Nothing else: no key or token reaches the
 //!   recorder, the app or the probes.
 //!
 //! ## The jail
@@ -52,6 +53,11 @@ pub(crate) const EVIDENCE_ROOT_ENV: &str = "WICKED_EVIDENCE_ROOT";
 pub(crate) const TREE_ENV: &str = "WICKED_TREE";
 /// The author dir of the `walkthrough_plan` step the record Tool records.
 pub(crate) const AUTHOR_DIR_ENV: &str = "WICKED_WALKTHROUGH_AUTHOR";
+/// (core#798) Set on the record Tool ONLY when the engine armed a `Sandboxed` launcher for it;
+/// the value is the launcher kind (`sandbox-exec`, `bwrap`). garden's recorder refuses to record
+/// (INCONCLUSIVE / `unjailed_host`) when it is absent, so a hand-run outside the engine's jail
+/// never records; the engine owns the jail decision and says so here.
+pub(crate) const JAIL_ENV: &str = "WICKED_WALKTHROUGH_JAIL";
 /// The subdirectory of the evidence root the walkthrough author writes under.
 pub(crate) const AUTHOR_SUBDIR: &str = "author";
 /// The record Tool's verdict file, read by the pinned result validator.
