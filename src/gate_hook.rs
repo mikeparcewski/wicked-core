@@ -2262,9 +2262,10 @@ fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
 ///
 /// * **`wicked-estate` CLI** — the read-only subcommands [`ESTATE_READ_VERBS`] (`query`,
 ///   `blast-radius`, `rank`/`hotspots`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`,
-///   `lineage`, `traverse`) and
-///   `clusters` WITHOUT `--annotate` are ALLOWED; the write subcommands (`index`, `scip`,
-///   `tfstate`, `import-telemetry`, `compact`, `watch`, `clusters --annotate`) and any
+///   `lineage`, `traverse`, `rules-inventory`, `rules-recall`),
+///   `clusters` WITHOUT `--annotate` and `supports owners|edge` are ALLOWED; the write subcommands
+///   (`index`, `scip`, `tfstate`, `import-telemetry`, `compact`, `watch`, `clusters --annotate`,
+///   `supports retract`) and any
 ///   unrecognised subcommand are DENIED (fail-closed: a future read verb must be added here).
 /// * **`wicked-estate-mcp`** and the **estate shim** — ALLOWED only when the segment carries
 ///   BOTH `--readonly` AND a pinned store: `--db <path>` / `--db=<path>` on argv, a leading
@@ -2525,9 +2526,12 @@ fn graph_store_cwd_bases(
 
 /// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
 /// `clusters` joins them only WITHOUT `--annotate` (judged at the call site). (core#729) `lineage`,
-/// `traverse` and the `rank` alias `hotspots` (estate#241/#242) are read-only too. THE list:
-/// garden's shim mirrors it (`wicked_core::ESTATE_READ_VERBS`), so a new read verb lands here first.
-pub const ESTATE_READ_VERBS: [&str; 11] = [
+/// `traverse` and the `rank` alias `hotspots` (estate#241/#242) are read-only too, and so are
+/// (core#797) estate#250's `rules-inventory` / `rules-recall` (RetrievalTool-backed, like `rank`).
+/// `supports` is mixed and is judged at the call site: `owners` / `edge` read, `retract` writes.
+/// THE list: garden's shim mirrors it (`wicked_core::ESTATE_READ_VERBS`), so a new read verb lands
+/// here first.
+pub const ESTATE_READ_VERBS: [&str; 13] = [
     "query",
     "blast-radius",
     "rank",
@@ -2539,6 +2543,8 @@ pub const ESTATE_READ_VERBS: [&str; 11] = [
     "subscribe",
     "lineage",
     "traverse",
+    "rules-inventory",
+    "rules-recall",
 ];
 /// The `wicked-estate` subcommands that WRITE the graph — named so the reason can say "write
 /// subcommand" rather than "unknown"; anything else unrecognised is denied fail-closed anyway.
@@ -2728,6 +2734,12 @@ fn estate_subcommand<'a>(rest: &[&'a str]) -> Option<&'a str> {
     None
 }
 
+/// The mode token of a `wicked-estate supports` segment: the word right after `supports` (core#797).
+fn supports_mode<'a>(rest: &[&'a str]) -> Option<&'a str> {
+    let at = rest.iter().position(|t| *t == "supports")?;
+    rest.get(at + 1).copied()
+}
+
 fn classify_estate_command(
     command: &str,
     store_pinned_by_env: bool,
@@ -2884,6 +2896,14 @@ fn classify_estate_command_in(
                 // `clusters` is read-only UNLESS `--annotate` is present (that flag writes).
                 Some("clusters") if !rest.contains(&"--annotate") => {}
                 Some("clusters") => return deny(ESTATE_WHY_WRITE_VERB),
+                // (core#797) `supports` takes its mode as the very next token (estate's
+                // `parse_supports_args` splits it off first): `owners` / `edge` read, `retract`
+                // writes, anything else is a mode this build does not know.
+                Some("supports") => match supports_mode(rest) {
+                    Some("owners" | "edge") => {}
+                    Some("retract") => return deny(ESTATE_WHY_WRITE_VERB),
+                    _ => return deny(ESTATE_WHY_UNKNOWN_VERB),
+                },
                 Some(verb) if ESTATE_WRITE_VERBS.contains(&verb) => {
                     return deny(ESTATE_WHY_WRITE_VERB)
                 }
@@ -8617,6 +8637,11 @@ mod boundary_tests {
             format!("wicked-estate lineage src/lib.rs --db {shared}"),
             format!("wicked-estate traverse 'fn:main' --depth 2 --db {shared}"),
             format!("wicked-estate hotspots --db {shared}"),
+            // core#797: estate#250's rules verbs, and `supports`' two read modes
+            format!("wicked-estate rules-inventory --json --db {shared}"),
+            format!("wicked-estate rules-recall --severity high --limit 5 --db {shared}"),
+            format!("wicked-estate --db {shared} supports owners --json"),
+            format!("wicked-estate supports edge --source a --target b --kind calls --db {shared}"),
             // clusters WITHOUT --annotate is read-only
             format!("wicked-estate clusters --json --db {shared}"),
             "wicked-estate.exe stats".to_string(),
@@ -8656,6 +8681,19 @@ mod boundary_tests {
             (
                 format!("wicked-estate clusters --annotate --db {shared}"),
                 ESTATE_WHY_WRITE_VERB,
+            ),
+            // core#797: `supports retract` writes; a missing or unknown mode is fail-closed
+            (
+                format!("wicked-estate supports retract --producer p --snapshot s --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            (
+                format!("wicked-estate supports --db {shared}"),
+                ESTATE_WHY_UNKNOWN_VERB,
+            ),
+            (
+                format!("wicked-estate supports prune --db {shared}"),
+                ESTATE_WHY_UNKNOWN_VERB,
             ),
             // an unrecognised verb — fail-closed
             (
