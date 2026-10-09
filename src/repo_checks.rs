@@ -407,6 +407,11 @@ pub struct FloorContext {
     pub git_dir: Option<PathBuf>,
     /// The seat's transcript, scanned at the creator stage for a "pre-existing failure" claim.
     pub claim_text: Option<String>,
+    /// (core#817) Set when detecting a SUBDIRECTORY package: the worktree handed to detection
+    /// is `<root>/<package_dir>`, and the change's touched / deleted files are read from the
+    /// root through the pinned git dir and made package-relative — so `{files}`, `{base}` and a
+    /// derived targeted command work in the package as at the root.
+    pub package_dir: Option<String>,
 }
 
 /// The evidence of one check having run.
@@ -1301,6 +1306,13 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
 /// copied, modified, renamed) plus untracked-not-ignored files, through the PINNED git dir; the
 /// engine scratch is never a touched path. Empty when the run knows no base.
 fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    if let Some((root, dir)) = package_root(worktree, ctx) {
+        let root_ctx = FloorContext {
+            package_dir: None,
+            ..ctx.clone()
+        };
+        return Ok(package_relative(touched_files(&root, &root_ctx)?, &dir));
+    }
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -1338,6 +1350,13 @@ fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
 /// The tracked paths the change deleted relative to the base (a rename's old path included —
 /// `--no-renames`). Empty when the run knows no base.
 fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    if let Some((root, dir)) = package_root(worktree, ctx) {
+        let root_ctx = FloorContext {
+            package_dir: None,
+            ..ctx.clone()
+        };
+        return Ok(package_relative(deleted_files(&root, &root_ctx)?, &dir));
+    }
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -1420,12 +1439,12 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     } else {
         Vec::new()
     };
-    let sub_ctx = FloorContext {
-        stage: ctx.stage,
-        force_install: ctx.force_install,
-        ..FloorContext::default()
-    };
     for dir in &pkgs.dirs {
+        let sub_ctx = FloorContext {
+            package_dir: Some(dir.clone()),
+            claim_text: None,
+            ..ctx.clone()
+        };
         for mut c in detect_package(&worktree.join(dir), &sub_ctx)? {
             c.source = format!("{dir}/{}", c.source);
             c.dir = dir.clone();
@@ -1433,6 +1452,24 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
         }
     }
     Ok(out)
+}
+
+/// (core#817) For a subdirectory package's context: the repository root (`worktree` minus
+/// `package_dir`) and the dir, or `None` at the root.
+fn package_root(worktree: &Path, ctx: &FloorContext) -> Option<(PathBuf, String)> {
+    let dir = ctx.package_dir.as_deref().filter(|d| !d.is_empty())?;
+    let depth = dir.split('/').filter(|s| !s.is_empty()).count();
+    let root = worktree.ancestors().nth(depth)?.to_path_buf();
+    (root.join(dir) == worktree).then(|| (root, dir.to_string()))
+}
+
+/// Repo-relative paths under `dir/`, made relative to it; others dropped.
+fn package_relative(files: Vec<String>, dir: &str) -> Vec<String> {
+    let prefix = format!("{dir}/");
+    files
+        .into_iter()
+        .filter_map(|f| f.strip_prefix(&prefix).map(str::to_string))
+        .collect()
 }
 
 /// (core#817) Where the change sits relative to the repo's packages.
@@ -2615,7 +2652,11 @@ pub(crate) fn run_with_sandbox_ctx(
     };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
+    // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
+    // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
     let baseline_diff = baseline_diff_enabled(worktree);
+    let baseline_diff_for =
+        |dir: &str| dir.is_empty() || baseline_diff_enabled(&worktree.join(dir));
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -2642,7 +2683,7 @@ pub(crate) fn run_with_sandbox_ctx(
             && !is_formatter_check(&check.name)
         {
             match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-                (Some(head), _) if !baseline_diff => {
+                (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
                     run.base = Some(Box::new(BaseRun {
                         head: head.to_string(),
                         cached: false,
@@ -6735,6 +6776,32 @@ mod tests {
         let checks = detect_with(&repo, &ctx).unwrap();
         let note = package_coverage_note(&repo, &ctx, &checks).expect("the bare package is named");
         assert!(note.contains("touches package giphy/"), "{checks:?} {note}");
+        // A package-local targeted command sees the change's files RELATIVE to the package
+        // (review r2: the subpackage context kept no base, so `{files}` was never detected).
+        std::fs::create_dir_all(repo.join("giphy/.wicked")).unwrap();
+        std::fs::write(
+            repo.join("giphy").join(CONFIG_PATH),
+            r#"{"test_targeted":["sh","-c","echo","{files}"],"baseline_diff":false}"#,
+        )
+        .unwrap();
+        let checks = detect_with(
+            &repo,
+            &FloorContext {
+                stage: FloorStage::Creator,
+                ..ctx.clone()
+            },
+        )
+        .unwrap();
+        let targeted = checks
+            .iter()
+            .find(|c| c.name == "test_targeted" && c.dir == "giphy")
+            .unwrap_or_else(|| panic!("{checks:?}"));
+        assert!(
+            targeted.argv.iter().any(|a| a == "src/server.ts")
+                && !targeted.argv.iter().any(|a| a.starts_with("giphy/")),
+            "{targeted:?}"
+        );
+        assert!(!baseline_diff_enabled(&repo.join("giphy")) && baseline_diff_enabled(&repo));
         // The check runs IN its package directory.
         let sandbox = sandbox_for(&repo);
         if sandbox.level != SandboxLevel::Sandboxed {

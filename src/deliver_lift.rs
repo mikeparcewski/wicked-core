@@ -945,6 +945,7 @@ pub(crate) fn lift_and_reverify(
             base_head,
             git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
             claim_text: None,
+            package_dir: None,
         },
     );
     eprintln!(
