@@ -4385,8 +4385,9 @@ mod tests {
             .collect();
         ids.sort_unstable();
         // The engine seeds the `mcp-defaults` posture rules (steering_type security) at boot
-        // (DES-MCP-TOOLS-001 §4.3), and the `editor-defaults` rules (EP-K1); they list beside
-        // the imported ones.
+        // (DES-MCP-TOOLS-001 §4.3), the `editor-defaults` rules (EP-K1), and the shipped
+        // `mcp-server` guidance pack (core#804) whose security rules are MCPS-1004/1005; they
+        // list beside the imported ones.
         assert_eq!(
             ids,
             [
@@ -4398,6 +4399,8 @@ mod tests {
                 "MCP-MODE-ASK-WRITE",
                 "MCP-POSTURE-READ",
                 "MCP-POSTURE-WRITE",
+                "MCPS-1004",
+                "MCPS-1005",
                 "PAT-100",
                 "PAT-101",
                 "SEC-CUSTOM-1"

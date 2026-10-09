@@ -13,7 +13,11 @@
 //! of a seeded rule equals the one an ingest of `governance/packs/<pack>` writes. INSERT-ONLY like
 //! the `mcp-defaults` / `editor-defaults` seeds: a rule already in the store — re-ingested from a
 //! newer doc, edited, or RETIRED by the operator — is left exactly as it is, so a restart never
-//! resurrects a retired rule. Written straight to the store with one autocommit upsert (no batch,
+//! resurrects a retired rule. A NEWER doc (a release that rewords a rule) reaches an existing
+//! store through `rules ingest governance/packs/<pack>`, which re-registers these ids as it always
+//! did — they are deliberately not in `boot_seeded_rule_ids` (core#709 keeps those ledger rows as
+//! stored), because a guidance pack's doc, not the store, is its source of truth.
+//! Written straight to the store with one autocommit upsert (no batch,
 //! no bus event) because this runs on the actor's boot path (core#705, `tests/bus_handoff.rs`).
 
 use wicked_apps_core::ToNode;
