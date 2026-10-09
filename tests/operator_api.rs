@@ -276,6 +276,7 @@ mod tests {
                 acp: None,
                 capabilities: None,
                 login_invocation: None,
+                logout_invocation: None,
                 governance_class: None,
                 credential: None,
                 free_tier: None,

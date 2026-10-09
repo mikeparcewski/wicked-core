@@ -84,6 +84,81 @@ pub(crate) fn is_lift_conflict_strand(output: &str) -> bool {
     }
 }
 
+/// (crew#739) The TRUSTED terminal sentinel: `deliver: OUTCOME <nonce> <verdict>`. crew's deliver
+/// script mints a per-composition nonce (`DELIVER_NONCE=<hex>` in the script text, so it rides
+/// the unit's `tool_cmd` the engine already holds) and its EXIT trap prints exactly one sentinel
+/// with the verdict (`pr` | `pushed` | `rejected` | `stranded` | `failed`). A remote never sees
+/// the script, only the branch, so a pre-receive hook cannot echo a sentinel with the right nonce.
+pub(crate) const OUTCOME_SENTINEL: &str = "deliver: OUTCOME";
+
+/// The script variable that carries the nonce ([`OUTCOME_SENTINEL`]).
+pub(crate) const NONCE_VAR: &str = "DELIVER_NONCE";
+
+/// The verdict of a stranded deliver (the post-hoc-liftable `LIFT-CONFLICT` class).
+pub(crate) const OUTCOME_STRANDED: &str = "stranded";
+
+/// The nonce a nonce-bearing deliver script declares (`DELIVER_NONCE=<hex>`, optionally quoted),
+/// read from the unit's `tool_cmd`. `None` for a legacy script — it keeps the last-marker rule.
+/// A nonce is 16-64 lowercase or uppercase hex digits; anything else is not a nonce.
+pub(crate) fn deliver_nonce(tool_cmd: &[String]) -> Option<String> {
+    let needle = format!("{NONCE_VAR}=");
+    for arg in tool_cmd {
+        let mut rest = arg.as_str();
+        while let Some(at) = rest.find(&needle) {
+            let after = &rest[at + needle.len()..];
+            let after = after.trim_start_matches(['\'', '"']);
+            let hex: String = after.chars().take_while(char::is_ascii_hexdigit).collect();
+            if (16..=64).contains(&hex.len()) {
+                return Some(hex);
+            }
+            rest = &rest[at + needle.len()..];
+        }
+    }
+    None
+}
+
+/// The verdict of the LAST `deliver: OUTCOME <nonce> <verdict>` line carrying `nonce` exactly.
+/// A sentinel with another nonce (a remote's echo) is not a sentinel.
+pub(crate) fn trusted_outcome<'a>(output: &'a str, nonce: &str) -> Option<&'a str> {
+    output.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix(OUTCOME_SENTINEL)?;
+        let mut words = rest.split_whitespace();
+        (words.next()? == nonce).then_some(())?;
+        let verdict = words.next()?;
+        words.next().is_none().then_some(verdict)
+    })
+}
+
+/// [`is_lift_conflict_strand`] for the deliver unit whose script is `tool_cmd` (crew#739). A
+/// nonce-bearing script is judged ONLY on its trusted sentinel: `stranded` is a strand, anything
+/// else — another verdict, or NO sentinel (a script killed before its trap, an output the remote
+/// filled) — is not, so it parks at the refusal gate (fail closed). A legacy script (no nonce)
+/// keeps the last-marker rule.
+pub(crate) fn is_lift_conflict_strand_for(tool_cmd: Option<&[String]>, output: &str) -> bool {
+    match tool_cmd.and_then(deliver_nonce) {
+        Some(nonce) => trusted_outcome(output, &nonce) == Some(OUTCOME_STRANDED),
+        None => is_lift_conflict_strand(output),
+    }
+}
+
+/// Seal the ENGINE's own deliver refusal (the lift or re-verify, which runs before the script and
+/// stops it) with the trusted sentinel when the script carries a nonce: the engine wrote the text,
+/// so it is trusted by construction. A lift CONFLICT is `stranded` (the post-hoc-liftable class,
+/// as today); every other engine refusal is `failed`. Legacy scripts get the text unchanged.
+pub(crate) fn seal_engine_refusal(text: String, tool_cmd: &[String]) -> String {
+    match deliver_nonce(tool_cmd) {
+        Some(nonce) => {
+            let verdict = if text.starts_with(LIFT_CONFLICT_MARKER) {
+                OUTCOME_STRANDED
+            } else {
+                "failed"
+            };
+            format!("{text}\n{OUTCOME_SENTINEL} {nonce} {verdict}")
+        }
+        None => text,
+    }
+}
+
 /// `UnitDenial.source` of a deliver unit the actor parked on a refusal (DES-L9 F1 arm). Rides
 /// the existing `unit.denial` shape — `UnitDenialSource` is open-ended on the wire.
 pub(crate) const DENIAL_SOURCE_DELIVER_REFUSAL: &str = "deliver_refusal";
@@ -1788,5 +1863,75 @@ mod tests {
             err.contains("FAILED") && !err.contains(crate::repo_checks::REGRESSION),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sentinel_tests {
+    use super::*;
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn script() -> Vec<String> {
+        vec![
+            "bash".into(),
+            "-c".into(),
+            format!("DELIVER_NONCE={NONCE}\ntrap 'echo \"deliver: OUTCOME $DELIVER_NONCE $VERDICT\"' EXIT\n…"),
+        ]
+    }
+
+    #[test]
+    fn the_nonce_is_read_from_the_script_and_only_a_matching_sentinel_counts() {
+        assert_eq!(deliver_nonce(&script()).as_deref(), Some(NONCE));
+        assert_eq!(
+            deliver_nonce(&["x".into(), format!("DELIVER_NONCE='{NONCE}' rest")]).as_deref(),
+            Some(NONCE)
+        );
+        assert_eq!(deliver_nonce(&["DELIVER_NONCE=short".into()]), None);
+        assert_eq!(deliver_nonce(&["echo deliver".into()]), None);
+        let out = format!(
+            "remote: deliver: OUTCOME ffffffffffffffffffffffffffffffff stranded\n\
+             deliver: OUTCOME {NONCE} pushed\n"
+        );
+        assert_eq!(trusted_outcome(&out, NONCE), Some("pushed"));
+        assert_eq!(trusted_outcome("deliver: OUTCOME x y", NONCE), None);
+    }
+
+    /// The acceptance case: an ACCEPTING hook echoes `deliver: LIFT-CONFLICT`, then an unmarked
+    /// `gh` failure ends the script — the trusted sentinel says `failed`, so it is not a strand.
+    #[test]
+    fn a_hook_echoed_lift_marker_then_an_unmarked_failure_is_not_a_strand() {
+        let out = format!(
+            "remote: {LIFT_CONFLICT_MARKER}\nTo github.com:o/r.git\n * [new branch] wicked/x\n\
+             gh: HTTP 401 Bad credentials\n{OUTCOME_SENTINEL} {NONCE} failed\n"
+        );
+        assert!(
+            is_lift_conflict_strand(&out),
+            "the legacy rule reads it stranded (the bug)"
+        );
+        assert!(!is_lift_conflict_strand_for(Some(&script()), &out));
+        // No sentinel at all (killed before the trap, or the remote filled the tail) — fail closed.
+        let out = format!("remote: {LIFT_CONFLICT_MARKER}\n");
+        assert!(!is_lift_conflict_strand_for(Some(&script()), &out));
+        // The script's own trusted `stranded` is a strand.
+        let out = format!(
+            "{LIFT_CONFLICT_MARKER} — rebase hit conflicts\n{OUTCOME_SENTINEL} {NONCE} stranded"
+        );
+        assert!(is_lift_conflict_strand_for(Some(&script()), &out));
+        // A legacy script keeps the last-marker rule.
+        let legacy = vec!["bash".to_string(), "-c".to_string(), "deliver".to_string()];
+        assert!(is_lift_conflict_strand_for(Some(&legacy), &out));
+    }
+
+    #[test]
+    fn the_engines_own_refusals_are_sealed_with_the_scripts_nonce() {
+        let conflict = format!("{LIFT_CONFLICT_MARKER} — lifting would conflict in: a.rs");
+        let sealed = seal_engine_refusal(conflict.clone(), &script());
+        assert!(is_lift_conflict_strand_for(Some(&script()), &sealed));
+        let reverify = seal_engine_refusal("deliver: re-verify failed".into(), &script());
+        assert_eq!(trusted_outcome(&reverify, NONCE), Some("failed"));
+        assert!(!is_lift_conflict_strand_for(Some(&script()), &reverify));
+        let legacy = vec!["deliver-script".to_string()];
+        assert_eq!(seal_engine_refusal(conflict.clone(), &legacy), conflict);
     }
 }

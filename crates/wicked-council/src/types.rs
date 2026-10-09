@@ -373,6 +373,12 @@ pub struct AgenticCli {
     /// default for the seat key ([`default_login_invocation`]), else no sign-in surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_invocation: Option<String>,
+    /// (crew#615) The command that signs this seat OUT — the CLI's own logout, run in the
+    /// seat's configuration root exactly as [`Self::login_invocation`] signs it in. `None` ⇒ the
+    /// registry's built-in default for the seat key ([`default_logout_invocation`]), else the CLI
+    /// has no logout command and no Log out surface is offered (the daemon never invents one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logout_invocation: Option<String>,
     /// (IG1-core-3) The seat's governance class (`acp_input_governance` | `os_sandbox` | `none`,
     /// [`governance_class`]) — DERIVED by `wicked_core::registry_roster()` per call, as it fills
     /// `login_invocation`, so a launcher can show how each seat's writes are held. Computed, so
@@ -458,7 +464,7 @@ impl SeatHealth {
 /// read after the environment changed reads the environment, not a cached spelling.
 #[must_use]
 pub fn default_login_invocation(key: &str) -> Option<String> {
-    use wicked_apps_core::spawn::{seat_cli_key, seat_config_for_seat, SeatCli, SeatConfig};
+    use wicked_apps_core::spawn::{seat_cli_key, SeatCli};
     // (core#591) `key` is a seat INSTANCE key. WHICH command signs a seat in is a property of its
     // CLI (`claude#2` signs in with `claude`), but WHERE it writes is a property of the instance
     // (`<worker home>/claude-2`) — so the arm is chosen on the cli key and the root is resolved on
@@ -482,6 +488,33 @@ pub fn default_login_invocation(key: &str) -> Option<String> {
         "agy" => (SeatCli::Agy, "agy"),
         _ => return None,
     };
+    in_seat_root(cli, key, login)
+}
+
+/// (crew#615) Built-in sign-OUT commands for the known seat keys, prefixed with the seat's
+/// resolved configuration root exactly like [`default_login_invocation`] (an isolated seat signs
+/// out of ITS directory, never the operator's). Only the spellings each CLI documents
+/// (checked against its own `--help`): `claude auth logout`, `codex logout`, `opencode auth
+/// logout`. `copilot`, `pi` and `agy` document no logout command, so they have none — `None`, and
+/// the System page offers no Log out for them rather than a command the daemon made up.
+#[must_use]
+pub fn default_logout_invocation(key: &str) -> Option<String> {
+    use wicked_apps_core::spawn::{seat_cli_key, SeatCli};
+    let (cli, logout) = match seat_cli_key(key) {
+        "claude" => (SeatCli::Claude, "claude auth logout"),
+        "codex" => (SeatCli::Codex, "codex logout"),
+        "opencode" => (SeatCli::Opencode, "opencode auth logout"),
+        _ => return None,
+    };
+    in_seat_root(cli, key, logout)
+}
+
+/// `command` prefixed with the seat's configuration-root variables (`VAR="<dir>" … command`), or
+/// plain under the operator's inherit hatch; `None` when the root cannot be resolved or prepared
+/// (fail closed, as the spawns refuse).
+fn in_seat_root(cli: wicked_apps_core::spawn::SeatCli, key: &str, command: &str) -> Option<String> {
+    use wicked_apps_core::spawn::{seat_config_for_seat, SeatConfig};
+    let login = command;
     match seat_config_for_seat(cli, key) {
         Ok(SeatConfig::Inherit) => Some(login.to_string()),
         Ok(cfg @ SeatConfig::Isolated { .. }) => {
@@ -1571,6 +1604,46 @@ pub type InstallHints = BTreeMap<String, String>;
 #[cfg(test)]
 mod login_tests {
     use super::*;
+
+    /// (crew#615) The sign-OUT command is the CLI's own documented logout, run in the SAME seat
+    /// root the sign-in command names; the CLIs that document no logout have none.
+    #[test]
+    fn the_default_logout_invocation_mirrors_the_login_root_and_names_only_real_commands() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        for (key, login, logout) in [
+            ("claude", "claude", "claude auth logout"),
+            ("codex", "codex login", "codex logout"),
+            ("opencode", "opencode auth login", "opencode auth logout"),
+            ("codex#2", "codex login", "codex logout"),
+        ] {
+            let (Some(li), Some(lo)) = (
+                default_login_invocation(key),
+                default_logout_invocation(key),
+            ) else {
+                // An unresolvable seat root (no home) has neither: fail closed together.
+                assert_eq!(default_logout_invocation(key), None, "{key}");
+                continue;
+            };
+            assert!(
+                li.ends_with(login) && lo.ends_with(logout),
+                "{key}: {li} / {lo}"
+            );
+            assert_eq!(
+                li.strip_suffix(login),
+                lo.strip_suffix(logout),
+                "{key}: the logout runs in the login's seat root"
+            );
+        }
+        for key in ["copilot", "pi", "agy", "unknown-seat"] {
+            assert_eq!(
+                default_logout_invocation(key),
+                None,
+                "{key} documents no logout"
+            );
+        }
+    }
 
     /// Every built-in seat key has a sign-in command, each the CLI's OWN interactive flow —
     /// the platform hosts them in a PTY and never implements provider auth itself.

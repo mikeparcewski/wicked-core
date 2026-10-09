@@ -267,6 +267,14 @@ fn allowed_roots_from_env() -> Option<crate::path_policy::AllowedRoots> {
 /// the wider root set and let it through.
 const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 
+/// (crew#634 R7) The leading text of a sibling-worktree read refusal.
+pub(crate) const SIBLING_WORKTREE_REASON_PREFIX: &str = "worker fence:";
+
+/// (crew#634 R7) The remedy a sibling-worktree read refusal carries to the seat.
+pub(crate) const SIBLING_WORKTREE_REMEDY: &str = "a seat reads its own worktree and the \
+    repository's checked-in files, never another run's in-progress tree under `wicked-worktrees/`; \
+    read the file from your own working directory or the repository's committed history instead";
+
 /// The hook-subprocess boundary check WITHOUT a shell-cwd sidecar — the spelling the boundary
 /// tests exercise (judged from the process cwd, as before the install fence became stateful).
 #[cfg(test)]
@@ -842,6 +850,27 @@ pub(crate) fn boundary_denial_tracked(
     estate_store_pinned: bool,
     graph_store: &[std::path::PathBuf],
 ) -> Option<(String, bool)> {
+    // (crew#634 R7) A search tool with NO `path` searches the shell's cwd; its path pattern can
+    // still climb into a sibling run's worktree (`Glob {pattern: "../run-2/**"}`).
+    if matches!(tool, "Glob" | "Grep")
+        && context
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        if let Some(tree) =
+            sibling_worktree_target(&cwd.to_string_lossy(), context, tool, cwd, home)
+        {
+            return Some((
+                format!(
+                    "{SIBLING_WORKTREE_REASON_PREFIX} the search reaches another run's worktree \
+                     ({}) — {SIBLING_WORKTREE_REMEDY}",
+                    tree.display()
+                ),
+                false,
+            ));
+        }
+    }
     // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
     if let Some(path) = context
         .get("path")
@@ -849,6 +878,22 @@ pub(crate) fn boundary_denial_tracked(
         .filter(|p| !p.is_empty())
     {
         let is_write = WRITE_TOOLS.contains(&tool);
+        // (crew#634 R7) WORKER FENCE: another run's worktree is not readable, although it sits
+        // under the repository a seat may read (`<repo>/wicked-worktrees/<id>`). A read is
+        // ADVISORY like every out-of-bounds read (blocked, audited, the seat continues); a write
+        // there is already outside the write roots and is judged by the check below.
+        if !is_write {
+            if let Some(tree) = sibling_worktree_target(path, context, tool, cwd, home) {
+                return Some((
+                    format!(
+                        "{SIBLING_WORKTREE_REASON_PREFIX} `{path}` is inside another run's worktree \
+                         ({}) — {SIBLING_WORKTREE_REMEDY}",
+                        tree.display()
+                    ),
+                    false,
+                ));
+            }
+        }
         if let Err(d) = crate::path_policy::check(path, roots, is_write, cwd, home) {
             // A blocked WRITE is unit-FATAL — EXCEPT into two benign trees, where it stays
             // BLOCKED and AUDITED but must not ABORT the run (advisory, exactly as a blocked
@@ -963,6 +1008,51 @@ pub(crate) fn boundary_denial_tracked(
     }
 
     None
+}
+
+/// (crew#634 R7) The sibling worktree a READ reaches: its own `path`, or — for the search tools —
+/// the literal prefix of a path pattern joined onto the search root (`Glob {path: <repo>,
+/// pattern: "wicked-worktrees/run-2/**"}`, `Grep {glob: …}`; codex review), or any path pattern
+/// naming the worktrees directory from a search root outside the unit's own tree. Grep's
+/// `pattern` is a CONTENT regex and is not a path. A plain recursive search of the repository
+/// root does not descend into `wicked-worktrees/`: the engine lists it in the clone's
+/// `.git/info/exclude` (`repo::ensure_worktrees_excluded`), which the search tools honour.
+fn sibling_worktree_target(
+    path: &str,
+    context: &serde_json::Value,
+    tool: &str,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(tree) = crate::path_policy::sibling_worktree(path, cwd, home) {
+        return Some(tree);
+    }
+    let key = match tool {
+        "Glob" => "pattern",
+        "Grep" => "glob",
+        _ => return None,
+    };
+    let pattern = context
+        .get("args")
+        .and_then(|a| a.get(key))
+        .and_then(serde_json::Value::as_str)?;
+    let literal: String = pattern
+        .chars()
+        .take_while(|c| !matches!(c, '*' | '?' | '[' | '{'))
+        .collect();
+    let base = crate::path_policy::normalize_for_fence(path, cwd, home);
+    let joined = base.join(&literal);
+    if let Some(tree) = crate::path_policy::sibling_worktree(&joined.to_string_lossy(), cwd, home) {
+        return Some(tree);
+    }
+    // A pattern whose literal prefix lands in the unit's OWN tree searches only that tree.
+    if crate::path_policy::raw_resolves_within(&joined.to_string_lossy(), cwd, home, cwd) {
+        return None;
+    }
+    let names_listing =
+        pattern.contains("wicked-worktrees") || pattern.contains(".wicked/worktrees");
+    (names_listing && !crate::path_policy::raw_resolves_within(path, cwd, home, cwd))
+        .then_some(base)
 }
 
 /// Refuse a PRE-BUILD phase's write to a NON-DOCUMENTATION path (core#296).
@@ -9786,6 +9876,108 @@ mod boundary_tests {
     /// "read the repo" would silently become "write the repo", the exact weakening core#294's
     /// fail-closed claim rules out. [`crate::path_policy::check`] tests a write against
     /// `roots.write` ALONE, so containment between the lists must be irrelevant; this pins that.
+    /// crew#634 R7 — a seat may read the repository it is grounded in, but never another run's
+    /// in-progress worktree under `<repo>/wicked-worktrees/`, nor the listing of them. Advisory
+    /// (a blocked read). Its own worktree and the repository's own files stay readable.
+    #[test]
+    fn a_sibling_runs_worktree_is_not_readable_from_a_unit() {
+        #[cfg(unix)]
+        let repo = std::path::PathBuf::from("/srv/monorepo");
+        #[cfg(windows)]
+        let repo = std::path::PathBuf::from("C:\\srv\\monorepo");
+        let wt = repo.join("wicked-worktrees").join("run-1");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![repo.clone()],
+        };
+        let read = |p: &std::path::Path, tool: &str| {
+            boundary_denial_with(&roots, &wt, None, None, &ctx(p.to_str().unwrap()), tool)
+        };
+        for (p, tool) in [
+            (
+                repo.join("wicked-worktrees")
+                    .join("run-2")
+                    .join("src")
+                    .join("a.rs"),
+                "Read",
+            ),
+            (repo.join("wicked-worktrees").join("run-2"), "Grep"),
+            (repo.join("wicked-worktrees"), "Glob"),
+            (wt.join("..").join("run-3").join("x"), "Read"),
+            (
+                repo.join(".wicked").join("worktrees").join("old").join("x"),
+                "Read",
+            ),
+        ] {
+            let (reason, fatal) = read(&p, tool).unwrap_or_else(|| panic!("refused: {p:?}"));
+            assert!(!fatal, "advisory: {reason}");
+            assert!(
+                reason.starts_with(SIBLING_WORKTREE_REASON_PREFIX),
+                "{reason}"
+            );
+            assert!(reason.contains(SIBLING_WORKTREE_REMEDY), "{reason}");
+        }
+        for (p, tool) in [
+            (wt.join("src").join("main.rs"), "Read"),
+            (wt.clone(), "Grep"),
+            (repo.join("src").join("main.rs"), "Read"),
+            (repo.clone(), "Glob"),
+        ] {
+            assert_eq!(read(&p, tool), None, "readable: {p:?}");
+        }
+        // codex review: a search rooted at the repository whose PATH PATTERN reaches a sibling.
+        let glob = |pattern: &str, tool: &str, key: &str| {
+            let mut c = ctx(repo.to_str().unwrap());
+            c["args"] = json!({ "path": repo.to_str().unwrap(), key: pattern });
+            boundary_denial_with(&roots, &wt, None, None, &c, tool)
+        };
+        for (pattern, tool, key) in [
+            ("wicked-worktrees/run-2/**", "Glob", "pattern"),
+            ("**/wicked-worktrees/**/*.rs", "Glob", "pattern"),
+            ("wicked-worktrees/*/src/*.ts", "Grep", "glob"),
+        ] {
+            let (reason, _) = glob(pattern, tool, key).unwrap_or_else(|| panic!("{pattern}"));
+            assert!(
+                reason.starts_with(SIBLING_WORKTREE_REASON_PREFIX),
+                "{reason}"
+            );
+        }
+        for (pattern, tool, key) in [
+            ("src/**/*.rs", "Glob", "pattern"),
+            ("wicked-worktrees", "Grep", "pattern"), // a CONTENT regex, not a path
+            ("wicked-worktrees/run-1/**", "Glob", "pattern"), // the unit's own tree (round 2)
+        ] {
+            assert_eq!(glob(pattern, tool, key), None, "{pattern}");
+        }
+        // No `path`: the search is rooted at the unit's own tree, and may not climb out of it.
+        let mut c = json!({ "path": null, "args": { "pattern": "../run-2/**" } });
+        assert!(boundary_denial_with(&roots, &wt, None, None, &c, "Glob").is_some());
+        c["args"]["pattern"] = json!("src/**/*.rs");
+        assert_eq!(
+            boundary_denial_with(&roots, &wt, None, None, &c, "Glob"),
+            None
+        );
+        // A repository nested inside another checkout's worktree: its OWN listing decides.
+        let outer = repo.join("wicked-worktrees").join("run-A").join("inner");
+        let own = outer.join("wicked-worktrees").join("run-1");
+        let sib = outer.join("wicked-worktrees").join("run-2").join("x.rs");
+        assert!(crate::path_policy::sibling_worktree(sib.to_str().unwrap(), &own, None).is_some());
+        assert!(crate::path_policy::sibling_worktree(
+            own.join("x.rs").to_str().unwrap(),
+            &own,
+            None
+        )
+        .is_none());
+        // A relative path from inside the worktree that climbs into a sibling is the same read.
+        let (reason, _) =
+            boundary_denial_with(&roots, &wt, None, None, &ctx("../run-2/a.rs"), "Read")
+                .expect("refused");
+        assert!(
+            reason.starts_with(SIBLING_WORKTREE_REASON_PREFIX),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn a_read_root_containing_the_write_root_never_admits_a_write() {
         // Nothing here is created on disk, and none of it is under the system temp — a write-deny

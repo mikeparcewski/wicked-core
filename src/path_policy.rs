@@ -237,6 +237,47 @@ pub(crate) fn raw_resolves_within(raw: &str, cwd: &Path, home: Option<&Path>, ro
     resolved_is_within(&resolved, root)
 }
 
+/// (crew#634 R7) The OTHER run's worktree a tool call's raw path lands in, if any: a path under
+/// `<repo>/wicked-worktrees/<id>` (or the legacy `<repo>/.wicked/worktrees/<id>`, or the listing
+/// directory itself) that is not inside `cwd` — the unit's own tree. The repository a seat may
+/// READ holds every sibling run's worktree under that directory, so "inside the read roots" was
+/// true of another run's in-progress work. Same normalize → symlink-resolve chain as [`check`],
+/// so `/tmp` vs `/private/tmp` cannot make the unit's own tree look foreign. Returns the sibling
+/// tree (or the listing directory) the path is inside.
+pub(crate) fn sibling_worktree(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let resolved = resolve_symlinks(&normalize(raw, cwd, home));
+    let own = resolve_symlinks(cwd);
+    if resolved_is_within(&resolved, &own) {
+        return None;
+    }
+    let parts: Vec<Component> = resolved.components().collect();
+    let names: Vec<String> = parts
+        .iter()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // The LAST worktree directory on the path (codex review): a repository that itself lives
+    // inside another checkout's `wicked-worktrees/<id>/` has its own listing deeper down.
+    let listing_end = (0..names.len()).rev().find_map(|i| {
+        if names[i] == "wicked-worktrees" {
+            Some(i + 1)
+        } else if names[i] == ".wicked" && names.get(i + 1).map(String::as_str) == Some("worktrees")
+        {
+            Some(i + 2)
+        } else {
+            None
+        }
+    })?;
+    // The sibling's own directory (`…/wicked-worktrees/<id>`), or the listing when the path IS it.
+    let end = (listing_end + 1).min(parts.len());
+    let tree: PathBuf = parts[..end].iter().map(|c| c.as_os_str()).collect();
+    // A seat whose cwd is BELOW the listing (its own tree) reading the listing's other entries is
+    // the case this exists for; one whose cwd is inside `tree` is reading its own tree.
+    if own.starts_with(&tree) && end > listing_end {
+        return None;
+    }
+    Some(tree)
+}
+
 /// Validate launcher-declared extra write roots at LAUNCH time (core#259), before any session is
 /// persisted. Fails the launch loudly rather than arming a boundary that would reopen FINDING-098.
 ///
