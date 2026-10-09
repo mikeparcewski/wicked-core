@@ -906,6 +906,13 @@ pub(crate) fn boundary_denial_tracked(
             if let Some(hit) = crate::install_fence::judge_from(command, cwd, &here, home).hit {
                 return Some((hit.reason(), false));
             }
+            // OPERATOR-CONFIG FENCE (core#803): the MCP install script, `wicked-installer`, a
+            // coding-agent CLI's `mcp add`, or a CLI configuration path outside the worktree.
+            // The writes those make happen in a CHILD process the command only names, so the
+            // write-target scan below never sees them. Advisory, disclosed like the two above.
+            if let Some(hit) = crate::operator_config_fence::judge(command, cwd, &here, home) {
+                return Some((hit.reason(), false));
+            }
             for target in bash_write_targets(command) {
                 if let Err(d) = crate::path_policy::check(&target, roots, true, cwd, home) {
                     // A shell write into the SYSTEM temp is the same benign-scratch class as
@@ -2076,7 +2083,18 @@ fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
             return Unwrapped::Program { idx, assignments };
         };
         match program_basename(prog) {
-            "exec" => idx += 1,
+            "exec" => {
+                // `exec [-cl] [-a NAME] cmd` (core#804 review): skip exec's own flags, and `-a`'s
+                // value, so `exec -c <program>` does not read `-c` as the program.
+                idx += 1;
+                while idx < words.len() && words[idx].starts_with('-') {
+                    let takes_value = words[idx] == "-a";
+                    idx += 1;
+                    if takes_value {
+                        idx += 1;
+                    }
+                }
+            }
             "xargs" => {
                 idx += 1;
                 while idx < words.len() && words[idx].starts_with('-') {
@@ -2091,7 +2109,16 @@ fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
                     if is_env_assignment(words[idx]) {
                         assignments.push(words[idx]);
                     }
+                    // (core#804) `env -u NAME` / `-C DIR` / `-S STR` take a SEPARATE value: without
+                    // skipping it, `env -u X wicked-estate index .` read `X` as the program.
+                    let takes_value = matches!(
+                        words[idx],
+                        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+                    );
                     idx += 1;
+                    if takes_value {
+                        idx += 1;
+                    }
                 }
             }
             "nice" => {
@@ -2625,7 +2652,44 @@ fn classify_estate_command(
         cwd_bases,
         home,
         true,
+        readonly_env_disarmed(command),
     )
+}
+
+/// (core#804) Whether `command` could run the estate shim WITHOUT the read-only default both
+/// carriers arm on every worker child ([`ESTATE_READONLY_ENV`]` = 1`, `execute_wrapped` /
+/// `acp_runner::build_cmd`): any mention of the variable (an assignment, `export`, `unset`, a
+/// `-u` naming it) or an environment-clearing `env` (`env -i`, `env -`, `--ignore-environment`).
+/// Judged over the WHOLE command line, so a disarm in one segment covers a shim in another, or
+/// one inside a `bash -c` string.
+fn readonly_env_disarmed(command: &str) -> bool {
+    if command.contains(ESTATE_READONLY_ENV) {
+        return true;
+    }
+    let toks = shell_tokens(command);
+    // A quoted script (`bash -c "env -i …"`) is one token here: judge it as a command too.
+    if toks.iter().map(|t| strip_one_quote_layer(t)).any(|t| {
+        t.contains(char::is_whitespace) && t.len() < command.len() && readonly_env_disarmed(t)
+    }) {
+        return true;
+    }
+    // FAIL CLOSED on the environment wrappers: `env` with ANY option (`-i`, `-`, `-u`, `-S`, a
+    // cluster, a value between them — codex review: `env -u X -i …` hid the `-i` behind `-u`'s
+    // value), and `exec -c` (bash's exec with an emptied environment). `env NAME=v cmd` with no
+    // option keeps the default.
+    toks.iter().enumerate().any(|(i, t)| {
+        let next = toks.get(i + 1).map(|a| strip_one_quote_layer(a));
+        match program_basename(t) {
+            "env" => toks[i + 1..]
+                .iter()
+                .map(|a| strip_one_quote_layer(a))
+                .take_while(|a| a.starts_with('-') || is_env_assignment(a))
+                .any(|a| a.starts_with('-')),
+            // ANY exec option (`-c`, `-a NAME -c`, a cluster) — fail closed (codex round 2).
+            "exec" => next.is_some_and(|a| a.starts_with('-')),
+            _ => false,
+        }
+    })
 }
 
 /// The scan behind [`classify_estate_command`]. `unwrap_inline` is true for the command line the
@@ -2641,6 +2705,10 @@ fn classify_estate_command_in(
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
     unwrap_inline: bool,
+    // (core#804) The command could clear or override the read-only default the carriers arm on
+    // every worker ([`readonly_env_disarmed`]); `false` ⇒ the shim is read-only by default and a
+    // missing `--readonly` token is not a refusal.
+    readonly_env_disarmed: bool,
 ) -> Option<EstateDeny> {
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -2698,6 +2766,7 @@ fn classify_estate_command_in(
                         cwd_bases,
                         home,
                         false,
+                        readonly_env_disarmed,
                     );
                     if hit.is_some() {
                         return hit;
@@ -2740,7 +2809,16 @@ fn classify_estate_command_in(
         if matches!(base, "wicked-estate-mcp" | "wicked-estate-mcp.exe")
             || executed_estate_shim(words, idx)
         {
-            if !words.contains(&"--readonly") {
+            // (core#804) Read-only is satisfied by the `--readonly` token OR by the default
+            // both carriers arm on every worker child (`WICKED_ESTATE_READONLY=1`: garden's shim
+            // then spawns `wicked-estate-mcp --readonly` whatever its argv says) when nothing in
+            // the command clears or overrides it. A design unit's plain
+            // `wicked-garden run scripts/mem/recall.py …` was refused for the missing token and
+            // invented rule meanings instead (run c3aa0bfb). `wicked-estate-mcp` itself does not
+            // read the variable, so it still needs the token.
+            let shim_default_readonly = !readonly_env_disarmed
+                && !matches!(base, "wicked-estate-mcp" | "wicked-estate-mcp.exe");
+            if !words.contains(&"--readonly") && !shim_default_readonly {
                 return deny(ESTATE_WHY_NO_READONLY);
             }
             if !(store_pinned_by_env || argv_pins_store(words, &prefix_assignments)) {
@@ -2961,6 +3039,7 @@ pub(crate) fn evaluate_tool_call(
         // (`collect_hook_decisions` surfaces both) — advisory like a blocked read.
         if reason.starts_with(REMOTE_WRITE_REASON_PREFIX)
             || reason.starts_with(crate::install_fence::REASON_PREFIX)
+            || reason.starts_with(crate::operator_config_fence::REASON_PREFIX)
         {
             let command = context
                 .get("command")
@@ -8544,12 +8623,19 @@ mod boundary_tests {
             Some(ESTATE_WHY_NO_PIN)
         );
         // No `--readonly`: DENIED whatever the pin says (the hole the old deny-all missed for the
-        // shim: its program word is `python`, invisible to a binary-name scan).
+        // shim: its program word is `python`, invisible to a binary-name scan). For the SHIM this
+        // holds once the command clears or overrides the read-only default the carriers arm
+        // (core#804); `wicked-estate-mcp` never reads that default.
         for rw in [
             format!("wicked-estate-mcp --db {shared}"),
             "wicked-estate-mcp.exe --db x".to_string(),
-            format!("python _estate_client.py --db {shared} recall '{{}}'"),
-            format!("python3 _estate_client.py --db {shared} search 'foo'"),
+            format!(
+                "WICKED_ESTATE_READONLY=0 python _estate_client.py --db {shared} recall '{{}}'"
+            ),
+            format!("env -i python3 _estate_client.py --db {shared} search 'foo'"),
+            format!(
+                "unset WICKED_ESTATE_READONLY; python3 _estate_client.py --db {shared} search 'x'"
+            ),
         ] {
             for env_pinned in [false, true] {
                 let hit = classify_estate_command(&rw, env_pinned)
@@ -8581,10 +8667,22 @@ mod boundary_tests {
              scripts/mem/session_fact_extractor.py"
                 .to_string(),
         ] {
-            let hit = classify_estate_command(&backend, true).unwrap_or_else(|| {
-                panic!("a backend that spawns the shim must be classified: {backend}")
+            let disarmed = format!("WICKED_ESTATE_READONLY=0 {backend}");
+            let hit = classify_estate_command(&disarmed, true).unwrap_or_else(|| {
+                panic!("a backend that spawns the shim must be classified: {disarmed}")
             });
-            assert_eq!(hit.why, ESTATE_WHY_NO_READONLY, "{backend}");
+            assert_eq!(hit.why, ESTATE_WHY_NO_READONLY, "{disarmed}");
+            // (core#804) Under the carriers' read-only default the token is not required; the
+            // store pin still is.
+            assert!(
+                classify_estate_command(&backend, true).is_none(),
+                "{backend}"
+            );
+            assert_eq!(
+                classify_estate_command(&backend, false).map(|h| h.why),
+                Some(ESTATE_WHY_NO_PIN),
+                "{backend}"
+            );
             let ro = format!("{backend} --readonly");
             assert_eq!(
                 classify_estate_command(&ro, false).map(|h| h.why),
@@ -8634,9 +8732,13 @@ mod boundary_tests {
             "wicked-garden run mem/estate_memory.py store '{}'",
         ] {
             assert_eq!(
-                classify_estate_command(run, false).map(|h| h.why),
+                classify_estate_command(&format!("env -i {run}"), false).map(|h| h.why),
                 Some(ESTATE_WHY_NO_READONLY),
-                "a garden-launched shim without --readonly must be denied: {run}"
+                "a garden-launched shim without --readonly or its default must be denied: {run}"
+            );
+            assert!(
+                classify_estate_command(run, true).is_none(),
+                "the carriers' read-only default + a pin admit it (core#804): {run}"
             );
             let ok = format!("{run} --readonly --db {shared}");
             assert!(
@@ -8655,11 +8757,73 @@ mod boundary_tests {
             "python3 ./scripts//_estate_client.py call '{}'",
         ] {
             assert_eq!(
-                classify_estate_command(direct, false).map(|h| h.why),
+                classify_estate_command(&format!("WICKED_ESTATE_READONLY= {direct}"), false)
+                    .map(|h| h.why),
                 Some(ESTATE_WHY_NO_READONLY),
                 "a #474-spelled shim without --readonly must be denied: {direct}"
             );
         }
+    }
+
+    /// core#804 — the design unit's recall (run c3aa0bfb) was refused for a missing `--readonly`
+    /// token although both carriers arm `WICKED_ESTATE_READONLY=1` on every worker child, so the
+    /// shim it launches is read-only. The default now satisfies the read-only half; anything that
+    /// clears or overrides it, anywhere in the command, puts the token requirement back.
+    #[test]
+    fn the_carriers_read_only_default_admits_a_pinned_recall_unless_the_command_disarms_it() {
+        let recall = "wicked-garden run scripts/mem/recall.py 'MCPS-1001 MCPS-1007'";
+        assert!(classify_estate_command(recall, true).is_none(), "{recall}");
+        assert_eq!(
+            classify_estate_command(recall, false).map(|h| h.why),
+            Some(ESTATE_WHY_NO_PIN),
+            "the store pin is still required"
+        );
+        for disarm in [
+            format!("WICKED_ESTATE_READONLY=0 {recall}"),
+            format!("export WICKED_ESTATE_READONLY=; {recall}"),
+            format!("env -u WICKED_ESTATE_READONLY {recall}"),
+            format!("env -i WICKED_HOME=/x {recall}"),
+            format!("env - {recall}"),
+            format!("bash -c \"env --ignore-environment {recall}\""),
+        ] {
+            assert_eq!(
+                classify_estate_command(&disarm, true).map(|h| h.why),
+                Some(ESTATE_WHY_NO_READONLY),
+                "{disarm}"
+            );
+        }
+        // `wicked-estate-mcp` does not read the variable: the token stays required.
+        assert_eq!(
+            classify_estate_command("wicked-estate-mcp", true).map(|h| h.why),
+            Some(ESTATE_WHY_NO_READONLY)
+        );
+        // codex review: an option VALUE must not hide a later `-i`; `exec -c` empties the env.
+        for disarm in [
+            "env -u UNUSED -i PATH=\"$PATH\" python3 scripts/_estate_client.py --db /srv/g.db call x",
+            "exec -c python3 scripts/_estate_client.py --db /srv/g.db call x",
+            "exec -a renamed -c python3 scripts/_estate_client.py --db /srv/g.db call x",
+            "env -S 'python3 scripts/_estate_client.py --db /srv/g.db call x'",
+        ] {
+            assert!(readonly_env_disarmed(disarm), "{disarm}");
+        }
+        assert_eq!(
+            classify_estate_command(
+                "env -u UNUSED -i PATH=x python3 scripts/_estate_client.py --db /srv/g.db call x",
+                true
+            )
+            .map(|h| h.why),
+            Some(ESTATE_WHY_NO_READONLY)
+        );
+        assert_eq!(
+            classify_estate_command(
+                "exec -c python3 scripts/_estate_client.py --db /srv/g.db call x",
+                true
+            )
+            .map(|h| h.why),
+            Some(ESTATE_WHY_NO_READONLY)
+        );
+        assert!(!readonly_env_disarmed("env X=1 ls"));
+        assert!(!readonly_env_disarmed("printenv"));
     }
 
     /// Evasion shapes and non-leading segments: env-assignment prefixes, the `env` wrapper, a
@@ -8678,7 +8842,11 @@ mod boundary_tests {
             format!("> /dev/null wicked-estate index . --db {shared}"),
             format!("cat notes.txt; wicked-estate index . --db {shared}"),
             format!("echo x | wicked-estate index . --db {shared}"),
-            "ls && python3 scripts/mem/estate_memory.py store '{}'".to_string(),
+            "ls && WICKED_ESTATE_READONLY=0 python3 scripts/mem/estate_memory.py store '{}'"
+                .to_string(),
+            "export WICKED_ESTATE_READONLY=0; python3 scripts/mem/estate_memory.py store '{}'"
+                .to_string(),
+            "env -i python3 scripts/mem/estate_memory.py store '{}'".to_string(),
         ] {
             assert!(
                 classify_estate_command(&evade, true).is_some(),
@@ -8766,9 +8934,10 @@ mod boundary_tests {
             "timeout 60 wicked-estate index .",
             "\"wicked-estate\" index .",
             "'/usr/local/bin/wicked-estate' index .",
-            // the shim without `--readonly`, behind a wrapper
-            "sh -c 'python3 scripts/_estate_client.py call x'",
-            "timeout 30 python3 scripts/mem/estate_memory.py store '{}'",
+            // the shim without `--readonly` or the carriers' read-only default, behind a wrapper
+            "sh -c 'WICKED_ESTATE_READONLY=0 python3 scripts/_estate_client.py call x'",
+            "env -i python3 scripts/mem/estate_memory.py store '{}'",
+            "env -u WICKED_ESTATE_READONLY wicked-estate index .",
             "exec wicked-estate-mcp --db /srv/g.db",
         ] {
             assert!(

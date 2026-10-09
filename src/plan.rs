@@ -507,7 +507,7 @@ pub struct PlanStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// May only RAISE the entry's gate along `auto` < `human_confirm_if` <
-    /// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}`.
+    /// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}` < `consent_before`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<crate::workflow::GateSpec>,
     /// Free (no production reader). `null` clears it; absent keeps the entry's.
@@ -881,7 +881,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
 ];
 
 /// A gate's position on the §8.3 ladder: `auto` < `human_confirm_if` <
-/// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}`.
+/// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}` < `consent_before`.
 fn gate_rank(g: crate::workflow::GateSpec) -> u8 {
     use crate::workflow::GateSpec;
     match g {
@@ -893,6 +893,9 @@ fn gate_rank(g: crate::workflow::GateSpec) -> u8 {
         GateSpec::HumanConfirm {
             unconditional: true,
         } => 3,
+        // (core#801) Consent before a side-effecting phase is the top of the ladder: a step
+        // may never trade it for an after-the-fact gate.
+        GateSpec::ConsentBefore => 4,
     }
 }
 

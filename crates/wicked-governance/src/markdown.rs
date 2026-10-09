@@ -273,19 +273,58 @@ impl SourceAdapter for MarkdownAdapter {
             // normalization touches the text.
             let bytes = std::fs::read(&path)
                 .map_err(|e| anyhow::anyhow!("markdown adapter: cannot read {path:?}: {e}"))?;
-            let sha = crate::provenance::git_blob_sha1(&bytes);
-            let text = String::from_utf8(bytes).map_err(|e| {
-                anyhow::anyhow!("markdown adapter: {path:?} is not valid UTF-8: {e}")
-            })?;
-            // BOM + CRLF tolerated (cross-platform mandate); the grammar itself stays strict.
-            let text = text.trim_start_matches('\u{feff}');
-            if !opens_with_fence(text) {
-                continue; // no frontmatter fence → not a rule doc (like a stray .txt); AW-10 drift reports these.
+            if let Some(doc) = parse_doc_bytes(bytes, &self.rel_ref(&path))? {
+                docs.push(doc);
             }
-            let display = self.rel_ref(&path);
-            let doc = parse_doc(text, &display, &sha)
-                .map_err(|e| anyhow::anyhow!("markdown adapter: {display}: {e}"))?;
-            docs.push(doc);
+        }
+        Ok(docs)
+    }
+}
+
+/// One rule doc from its raw BYTES (the blob sha is taken before any normalisation) and its
+/// root-relative display path. `None` for a file without a frontmatter fence (not a rule doc).
+fn parse_doc_bytes(bytes: Vec<u8>, display: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    let sha = crate::provenance::git_blob_sha1(&bytes);
+    let text = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("markdown adapter: {display} is not valid UTF-8: {e}"))?;
+    // BOM + CRLF tolerated (cross-platform mandate); the grammar itself stays strict.
+    let text = text.trim_start_matches('\u{feff}');
+    if !opens_with_fence(text) {
+        return Ok(None); // no frontmatter fence → not a rule doc (like a stray .txt); AW-10 drift reports these.
+    }
+    parse_doc(text, display, &sha)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("markdown adapter: {display}: {e}"))
+}
+
+/// (core#804) The markdown adapter over docs EMBEDDED in a binary — a steering pack the engine
+/// ships and seeds at boot, where no pack directory exists on disk. Each doc is `(root-relative
+/// path, raw bytes)`: the SAME parse path and provenance (`<path>@<git blob sha>#<RULE-ID>`, the
+/// adapter name `markdown`) as `MarkdownAdapter::new(<pack dir>)` over the same files, so a rule
+/// seeded at boot and the same rule from `rules ingest governance/packs/<pack>` are one record.
+pub struct EmbeddedMarkdownAdapter {
+    docs: Vec<(String, Vec<u8>)>,
+}
+
+impl EmbeddedMarkdownAdapter {
+    pub fn new(docs: impl IntoIterator<Item = (String, Vec<u8>)>) -> Self {
+        Self {
+            docs: docs.into_iter().collect(),
+        }
+    }
+}
+
+impl SourceAdapter for EmbeddedMarkdownAdapter {
+    fn name(&self) -> &str {
+        "markdown"
+    }
+
+    fn fetch(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut docs = Vec::new();
+        for (display, bytes) in &self.docs {
+            if let Some(doc) = parse_doc_bytes(bytes.clone(), &display.replace('\\', "/"))? {
+                docs.push(doc);
+            }
         }
         Ok(docs)
     }

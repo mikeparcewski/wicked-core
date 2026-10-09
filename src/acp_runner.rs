@@ -4845,6 +4845,24 @@ fn answer_permission_request<W: Write>(
                         .clone()
                         .map(|hit| ("install fence", hit.reason(), crate::install_fence::REMEDY))
                 })
+                // OPERATOR-CONFIG FENCE (core#803): the MCP install, `wicked-installer`, a CLI's
+                // `mcp add`, or a CLI configuration path outside the worktree — every role and
+                // posture, like the two fences above.
+                .or_else(|| {
+                    crate::operator_config_fence::judge(
+                        &command,
+                        &fence.cwd,
+                        &here,
+                        fence.home.as_deref(),
+                    )
+                    .map(|hit| {
+                        (
+                            "operator-config fence",
+                            hit.reason(),
+                            crate::operator_config_fence::REMEDY,
+                        )
+                    })
+                })
                 // R7 (DES-L4 PR-②): under a FENCED posture the command's WRITE TARGETS are judged
                 // against the posture's admitted roots (the evaluator's notes root, the creator's
                 // deliverable roots) — the same rule the gate hook applies on the wrapped carrier

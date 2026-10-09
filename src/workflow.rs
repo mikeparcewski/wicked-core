@@ -658,6 +658,14 @@ pub enum GateSpec {
     HumanConfirm { unconditional: bool },
     /// Require a human only when the condition holds (else auto-advance).
     HumanConfirmIf(GateCond),
+    /// (core#801) Require a human BEFORE this phase runs: the run pauses ahead of the unit's
+    /// dispatch (`awaitingHuman{gateKind: "consent"}`), and the unit runs only on an explicit
+    /// approve. Every other gate here fires AFTER its phase's work, so a phase with side effects
+    /// outside the run (the `mcp-server` install writes the operator's CLI configurations) could
+    /// only be asked about once it had already acted. Never suppressed: not by the run-level
+    /// policy, not by `auto_deliver`, not by a released plan, not by a standing order (the
+    /// `consent` gate kind is not an auto-approvable kind). No gate fires after the phase.
+    ConsentBefore,
 }
 
 /// Which side of the evaluator≠creator split a phase plays. The Evaluator phase runs under a seat
@@ -2184,18 +2192,29 @@ mod workflow_def_tests {
 
         let install = phase("install");
         match &install.executor {
-            PhaseExecutor::Tool { cmd } => assert!(
-                cmd.iter().any(|a| a.contains("scripts/mcp/install.py")),
-                "install's cmd names scripts/mcp/install.py: {cmd:?}"
-            ),
+            PhaseExecutor::Tool { cmd } => {
+                assert!(
+                    cmd.iter().any(|a| a.contains("scripts/mcp/install.py")),
+                    "install's cmd names scripts/mcp/install.py: {cmd:?}"
+                );
+                // (core#802) No login shell: `-l` re-sources the operator's profile, whose PATH
+                // resolved a different wicked-garden than the published snapshot. The script is
+                // run from the garden root the engine hands the Tool phase, never from PATH.
+                assert_eq!(cmd[..2], ["bash".to_string(), "-c".to_string()], "{cmd:?}");
+                assert!(
+                    cmd[2].contains("${WICKED_GARDEN_ROOT:?")
+                        && cmd[2].contains("/scripts/wicked-garden\" run scripts/mcp/install.py"),
+                    "install runs the handed garden root's launcher: {cmd:?}"
+                );
+                assert!(!cmd[2].contains("npx"), "no PATH/npx fallback: {cmd:?}");
+            }
             other => panic!("install must be a Tool executor, got {other:?}"),
         }
+        // (core#801) The operator consents BEFORE the install writes anything.
         assert_eq!(
             install.gate,
-            GateSpec::HumanConfirm {
-                unconditional: true
-            },
-            "install pauses for the operator unconditionally"
+            GateSpec::ConsentBefore,
+            "install asks for consent before it runs"
         );
         assert!(install.validator_pin.is_none(), "install carries no pin");
         assert!(install.skill_ref.is_none(), "install carries no skill_ref");

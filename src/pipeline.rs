@@ -529,6 +529,7 @@ pub(crate) fn pre_distribute(
                 GateSpec::Auto => "auto",
                 GateSpec::HumanConfirm { .. } => "human_confirm",
                 GateSpec::HumanConfirmIf(_) => "human_confirm_if",
+                GateSpec::ConsentBefore => "consent_before",
             }
             .to_string(),
             skill_ref: u.skill_ref.clone(),
@@ -1785,6 +1786,8 @@ pub(crate) fn disclose_hook_record(
             // differs, and the reason's prefix says which fence spoke.
             let remedy = if reason.starts_with(crate::install_fence::REASON_PREFIX) {
                 crate::install_fence::REMEDY
+            } else if reason.starts_with(crate::operator_config_fence::REASON_PREFIX) {
+                crate::operator_config_fence::REMEDY
             } else {
                 // Which remote-write remedy the recorded reason embeds: the deliver-phase one
                 // for a write, the no-credentials one for a fenced provider command (core#569
