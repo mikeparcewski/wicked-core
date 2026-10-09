@@ -1573,6 +1573,13 @@ pub(crate) fn apply_and_finish_unit(
                 )
             }
         )),
+        // (core#782) Said on every floor-fix floor, green or red: whose change the floor judged.
+        (None, Some(r)) if r.rerun == Some(crate::repo_checks::FloorRerunMode::FloorFix) => Some(
+            "the operator's `floor_fix`: a seat distinct from this read-only phase made the \
+                 operator's fix after its verdict — the verdict was given on the pre-fix tree, \
+                 and only this floor judged the fixed tree"
+                .to_string(),
+        ),
         (None, Some(r)) if !r.waived.is_empty() => Some(format!(
             "the operator's `{}` re-run waived {} for this unit — unverified by the floor, not \
              refuted",

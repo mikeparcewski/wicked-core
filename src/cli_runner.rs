@@ -800,6 +800,96 @@ pub(crate) fn run_unit_and_judge(
     )
 }
 
+/// (core#782) The unit a floor fix's seat runs: the operator's note as the whole task, on
+/// `fix.seat`, with a creator's write posture — not the read-only phase's skill, validator or
+/// floor (those stay on the phase, which does not run again).
+pub(crate) fn floor_fix_unit(
+    unit: &crate::domain::WorkUnit,
+    fix: &crate::repo_checks::FloorFix,
+) -> crate::domain::WorkUnit {
+    let mut u = unit.clone();
+    u.description = format!(
+        "Make exactly this fix in the worktree, and nothing else (core#782 floor fix): {} — The \
+         `{}` phase reviewed this tree and its verdict stands; the engine's floor re-runs the \
+         repository's checks on the tree you leave. Do not commit.",
+        fix.note.split_whitespace().collect::<Vec<_>>().join(" "),
+        unit.phase_id().unwrap_or("read-only"),
+    );
+    u.assigned_cli = Some(fix.seat.clone());
+    u.assigned_invocation = None;
+    u.role = crate::workflow::PhaseRole::Creator;
+    u.executes_code = true;
+    u.worktree_guarded = false;
+    u.pre_build_scope = false;
+    u.skill_ref = None;
+    u.validator = None;
+    u.repo_checks_floor = false;
+    u.required_deliverables.clear();
+    u.member_step = None;
+    u.team = None;
+    u
+}
+
+/// (core#782) Run a floor fix's seat ([`floor_fix_unit`]), then hand back the read-only phase's
+/// input for the floor that follows: its guard baseline re-taken on the fixed tree (a baseline
+/// that cannot be re-taken stays, so the guard sees the fix as a mutation and denies — fail
+/// closed) and the fixing seat excluded from any judge, beside the seat's own output. Whatever
+/// the seat's turn did, the floor decides.
+fn run_floor_fix(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    fix: &crate::repo_checks::FloorFix,
+    emit_delta: &DeltaSink,
+) -> (StepInput, StepOutput) {
+    emit_delta(&format!(
+        "floor fix: seat '{}' makes the operator's fix; the `{}` phase does not run again — only \
+         the floor re-runs, on the fixed tree",
+        fix.seat,
+        input.unit.phase_id().unwrap_or("read-only")
+    ));
+    let fixer = StepInput {
+        unit: floor_fix_unit(&input.unit, fix),
+        ..input.clone()
+    };
+    let out = runner.run_unit_streaming(&fixer, emit_delta);
+    if out.status != StepStatus::Ok {
+        emit_delta(&format!(
+            "floor fix: seat '{}' ended {:?}; the floor still decides",
+            fix.seat, out.status
+        ));
+    }
+    let mut next = input.clone();
+    let git_dir = next
+        .unit
+        .worktree_baseline
+        .as_ref()
+        .and_then(|b| b.git_dir.clone());
+    let rebased = match (next.workdir.as_deref(), git_dir) {
+        (Some(wd), Some(gd)) => {
+            crate::worktree_guard::snapshot_through(wd, std::path::Path::new(&gd))
+                .map_err(|e| e.to_string())
+        }
+        _ => Err("no pinned worktree baseline to re-take".to_string()),
+    };
+    match rebased {
+        Ok(snap) => next.unit.worktree_baseline = Some(snap),
+        // No baseline at all: the guard reads the tree as UNVERIFIABLE and denies — never a
+        // comparison that might let the fix (or anything else) through unjudged.
+        Err(e) => {
+            eprintln!(
+                "wicked-core: unit {}: could not re-baseline after the floor fix ({e}); the \
+                 guard cannot verify the tree and denies (fail-closed, core#782)",
+                next.unit.ord
+            );
+            next.unit.worktree_baseline = None;
+        }
+    }
+    if !next.unit.exclude_seats.contains(&fix.seat) {
+        next.unit.exclude_seats.push(fix.seat.clone());
+    }
+    (next, out)
+}
+
 /// Cadence of the repo-checks floor heartbeat (crew #581 / F-BM-010): 5 min — well under the
 /// watchdog's default `workerStallMinutes` (15). A setting below 5 would still read a live
 /// floor as stalled (disclosed; the engine does not read crew settings).
@@ -1021,6 +1111,14 @@ fn run_unit_and_judge_on(
         .repo_checks
         .as_ref()
         .and_then(|r| r.requested_rerun.as_ref());
+    // (core#782) A FLOOR FIX: before the floor, a seat distinct from this read-only phase makes
+    // the fix the operator's note asks for — the phase itself does not run again. The rest of
+    // this thread then runs on the fixed tree: the guard re-baselined on it (the fix is not the
+    // phase's own mutation; anything after it still is), the fixing seat excluded from any judge.
+    let fixed: Option<(StepInput, StepOutput)> = floor_rerun
+        .and_then(|r| r.fix.as_ref())
+        .map(|fix| run_floor_fix(runner, input, fix, emit_delta));
+    let input = fixed.as_ref().map(|(i, _)| i).unwrap_or(input);
     let output = match floor_rerun {
         Some(r) => {
             emit_delta(&format!(
@@ -1028,6 +1126,12 @@ fn run_unit_and_judge_on(
                  checks re-run on the tree as it stands",
                 r.mode.as_wire()
             ));
+            // (core#782) A floor fix's tool calls are this attempt's: its governance evidence
+            // (the hook's decisions log) and its tools fold with the reviewed output.
+            let (files, tools, governed) = match &fixed {
+                Some((_, f)) => (f.files.clone(), f.tools.clone(), f.governed),
+                None => (Vec::new(), Vec::new(), false),
+            };
             StepOutput {
                 run_id: input.run_id.clone(),
                 unit_ix: input.unit_ix,
@@ -1035,9 +1139,9 @@ fn run_unit_and_judge_on(
                 output: r.output.clone(),
                 status: StepStatus::Ok,
                 usage: None,
-                files: Vec::new(),
-                tools: Vec::new(),
-                governed: false,
+                files,
+                tools,
+                governed,
             }
         }
         None => runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta),
@@ -4299,6 +4403,233 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path_b).parent().unwrap());
+    }
+
+    /// core#782: a FLOOR FIX armed on a read-only phase hands the operator's note to the fixing
+    /// seat (a creator posture on a seat other than the phase's), the phase itself does not run
+    /// again (its reviewed output is what the fold reads), the guard re-baselines on the fixed tree
+    /// so the fix is not the phase's mutation, and only the floor runs on that tree.
+    #[test]
+    fn a_floor_fix_hands_the_note_to_a_distinct_seat_and_re_runs_only_the_floor() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::process::Command;
+        use std::sync::Mutex;
+
+        struct Fixer {
+            calls: Mutex<Vec<crate::domain::WorkUnit>>,
+        }
+        impl StepRunner for Fixer {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.calls.lock().unwrap().push(input.unit.clone());
+                if let Some(wd) = &input.workdir {
+                    std::fs::write(wd.join("fixed.txt"), "fixed\n").unwrap();
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "made the fix".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base =
+            std::env::temp_dir().join(format!("wicked-core-floor-fix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(
+            repo.join(crate::repo_checks::CONFIG_PATH),
+            serde_json::json!({ "test": ["sh", "-c", "test -f fixed.txt"] }).to_string(),
+        )
+        .unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/floor-fix",
+            ],
+        );
+
+        const REVIEWED: &str = "Reviewed the change; it is correct.\nVERDICT: PASS";
+        let red: crate::repo_checks::RepoChecksReport = serde_json::from_value(serde_json::json!({
+            "detected": [], "checks": [], "skipped": [], "passed": false, "sandbox_level": "none"
+        }))
+        .unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:test", "r", 4, "test the change");
+        unit.role = crate::workflow::PhaseRole::Evaluator;
+        unit.assigned_cli = Some("claude".into());
+        unit.worktree_guarded = true;
+        unit.repo_checks_floor = true;
+        unit.skill_ref = Some("wicked-garden-qe-tester".into());
+        unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+        unit.repo_checks = Some(crate::repo_checks::RepoChecksReport {
+            requested_rerun: Some(crate::repo_checks::FloorRerun {
+                mode: crate::repo_checks::FloorRerunMode::FloorFix,
+                waive: Vec::new(),
+                output: REVIEWED.into(),
+                fix: Some(crate::repo_checks::FloorFix {
+                    note: "create fixed.txt".into(),
+                    seat: "codex".into(),
+                }),
+            }),
+            ..red
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 3,
+            attempt: 1,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let fixer = Arc::new(Fixer {
+            calls: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = fixer.clone();
+        let noop: &DeltaSink = &|_| {};
+        let (out, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[], &[]);
+
+        // The note reached exactly one seat — the fixing one, with a creator's write posture and
+        // the note as its task (not the read-only phase's skill) — and the phase did not re-run.
+        let calls = fixer.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "only the fix seat ran: {calls:?}");
+        let task = &calls[0].description;
+        assert_eq!(
+            calls[0].assigned_cli.as_deref(),
+            Some("codex"),
+            "the fix seat, never the phase's own"
+        );
+        assert_eq!(calls[0].role, crate::workflow::PhaseRole::Creator);
+        assert!(
+            !calls[0].worktree_guarded,
+            "the fixing seat may write the tree"
+        );
+        assert!(
+            task.contains("create fixed.txt"),
+            "the note is the task: {task}"
+        );
+        assert!(!task.contains("qe-tester"), "not the phase's skill: {task}");
+        // The fold reads the reviewed output: the phase's verdict stands.
+        assert_eq!(out.status, StepStatus::Ok);
+        assert_eq!(out.output, REVIEWED);
+        assert!(verdict.is_none(), "no judge re-ran");
+        // The guard re-baselined on the fixed tree: the fix is not the phase's mutation.
+        assert!(
+            matches!(
+                evidence.worktree_guard,
+                Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { .. })
+            ),
+            "{:?}",
+            evidence.worktree_guard
+        );
+        let report = evidence.repo_checks.expect("the floor ran");
+        assert_eq!(
+            report.rerun,
+            Some(crate::repo_checks::FloorRerunMode::FloorFix)
+        );
+        if report.sandbox_error.is_some() {
+            eprintln!("cli_runner: no sandbox tool here — the floor fix's floor cannot run");
+        } else {
+            assert!(report.passed, "the floor judged the FIXED tree: {report:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#782 (review): a floor fix whose guard baseline cannot be re-taken leaves NO baseline,
+    /// so the guard reads the tree as unverifiable and denies — fail closed, never a pass.
+    #[test]
+    fn a_floor_fix_that_cannot_re_baseline_leaves_the_guard_unverifiable() {
+        use crate::workflow::{StepOutput, StepRunner};
+        struct Ok1;
+        impl StepRunner for Ok1 {
+            fn run_unit(&self, i: &StepInput) -> StepOutput {
+                StepOutput {
+                    run_id: i.run_id.clone(),
+                    unit_ix: i.unit_ix,
+                    attempt: i.attempt,
+                    output: "fixed".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-ff-nobase-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:test", "r", 4, "test it");
+        unit.worktree_guarded = true;
+        unit.worktree_baseline = Some(crate::worktree_guard::WorktreeSnapshot {
+            head: "h".into(),
+            head_ref: None,
+            tree: "t".into(),
+            taken_at_ms: 1,
+            git_dir: None,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 3,
+            attempt: 1,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let runner: Arc<dyn StepRunner> = Arc::new(Ok1);
+        let fix = crate::repo_checks::FloorFix {
+            note: "n".into(),
+            seat: "codex".into(),
+        };
+        let (next, _) = run_floor_fix(&runner, &input, &fix, &|_| {});
+        assert!(next.unit.worktree_baseline.is_none());
+        assert!(matches!(
+            crate::worktree_guard::outcome_for_unit(&next.unit, Some(&dir)),
+            Some(crate::worktree_guard::WorktreeGuardOutcome::Unverifiable(_))
+        ));
+        assert!(next.unit.exclude_seats.iter().any(|s| s == "codex"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review of #449, RT-1: the DEFAULT judge is drawn from the registry seats the RUN

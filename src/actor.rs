@@ -7197,6 +7197,13 @@ fn denial_gate_prompt(
                 reason_head(reason)
             )
         }
+        "floor_failed" if floor_fix_applies(unit) => format!(
+            "Unit {ord} failed its deterministic floor ({source}): {} — confirm to retry the \
+             phase, approve with a note to have a seat other than this read-only phase's make \
+             that fix in the worktree and re-run only the floor, or reject to cancel the \
+             run{note}",
+            reason_head(reason)
+        ),
         "floor_failed" => format!(
             "Unit {ord} failed its deterministic floor ({source}): {} — confirm to retry the \
              phase, or reject to cancel the run{note}",
@@ -11125,6 +11132,20 @@ pub(crate) fn confirm_gate(
     .iter()
     .any(|r| r.gate_kind.as_deref() == Some(crate::review_context::REVIEW_ADJUDICATION_GATE));
 
+    // (core#782) An approve WITH A NOTE at a read-only phase's floor gate is a FLOOR FIX: the
+    // note goes to a seat that can write, then only the floor re-runs (`floor_fix_request`) —
+    // never appended to the read-only phase, which could not act on it.
+    let floor_fix_route = !adjudication_open
+        && !team_gate::transport_gate_open(&session)
+        && !team_gate::dispute_gate_open(&session)
+        && matches!(
+            &decision,
+            crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if !a.trim().is_empty()
+        )
+        && crate::domain::session_units(store, run_id)?
+            .get(session.unit_ix)
+            .is_some_and(floor_fix_applies);
+
     // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
     // are checked here, before the durable prompt below is marked `answered` — a refused answer
     // must leave the gate row OPEN (the run stays paused and re-answerable, and the prompts surface
@@ -11178,6 +11199,13 @@ pub(crate) fn confirm_gate(
                     anyhow::bail!(
                         "no creator phase precedes unit {cursor_ord} — approve (retry) or reject"
                     );
+                }
+            }
+            // (core#782) The floor fix is refused here when no seat distinct from the phase
+            // can make it — whatever the amend scope, which it supersedes.
+            crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if floor_fix_route => {
+                if let Some(cursor) = cursor {
+                    floor_fix_request(&*store, &session, &units, cursor, a)?;
                 }
             }
             crate::workflow::HumanDecision::Approve {
@@ -11251,7 +11279,13 @@ pub(crate) fn confirm_gate(
         let answer = match &decision {
             crate::workflow::HumanDecision::Approve { amend, amend_scope } => serde_json::json!({
                 "approve": true,
-                "action": if adjudication_open { "land_with_carried_items" } else { "approve" },
+                "action": if adjudication_open {
+                    "land_with_carried_items"
+                } else if floor_fix_route {
+                    "floor_fix"
+                } else {
+                    "approve"
+                },
                 "amend": amend,
                 "amend_scope": amend_scope.as_wire(),
             })
@@ -11360,6 +11394,8 @@ pub(crate) fn confirm_gate(
     // (DES-L1 PR-1B) Three arms. Reject = cancel, unchanged (D-2). `RequestChanges` and `Approve`
     // both pass the layer-3 boundary check below first; `rework` is `Some(note)` for the former.
     let mut floor_rerun: Option<crate::repo_checks::FloorRerunMode> = None;
+    // (core#782) The operator's note a floor fix hands to its seat.
+    let mut floor_fix_note: Option<String> = None;
     let mut adopt_suggestion = false;
     // (core#555) The approved INTENT AMENDMENT this decision carries, applied below to every unit
     // at or after the cursor (not one unit's instruction) so it reaches every later evaluator.
@@ -11373,6 +11409,12 @@ pub(crate) fn confirm_gate(
             let s = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps)?;
             in_flight.remove(run_id);
             return Ok(s);
+        }
+        // (core#782) A floor fix: the floor re-run, with its note for the fixing seat.
+        crate::workflow::HumanDecision::Approve { amend, .. } if floor_fix_route => {
+            floor_rerun = Some(crate::repo_checks::FloorRerunMode::FloorFix);
+            floor_fix_note = amend;
+            (None, crate::workflow::AmendScope::Cursor, None)
         }
         crate::workflow::HumanDecision::Approve { amend, amend_scope } => {
             (amend, amend_scope, None)
@@ -11454,14 +11496,49 @@ pub(crate) fn confirm_gate(
             // re-dispatch below skips the seat and re-runs only the checks.
             if let Some(mode) = floor_rerun {
                 let mut units = crate::domain::session_units(store, run_id)?;
+                let request = {
+                    let cursor = units
+                        .get(session.unit_ix)
+                        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+                    match floor_fix_note.as_deref() {
+                        Some(note) => floor_fix_request(&*store, &session, &units, cursor, note)?,
+                        None => floor_rerun_request(&*store, cursor, mode)?,
+                    }
+                };
                 let cursor = units
                     .get_mut(session.unit_ix)
                     .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
-                let request = floor_rerun_request(&*store, cursor, mode)?;
+                // (core#782) The fix is a ruling on the record — the note, and the seat it went
+                // to — and its paper trail is the amendment event, before the run resumes.
+                let fix = request.fix.clone();
+                if let Some(f) = &fix {
+                    cursor.operator_rulings.push(crate::domain::OperatorRuling {
+                        action: crate::repo_checks::FloorRerunMode::FloorFix
+                            .as_wire()
+                            .to_string(),
+                        text: format!("{} (fix seat: {})", f.note, f.seat),
+                        attempt: cursor.last_attempt.unwrap_or(0),
+                        at: crate::interaction::now_millis(),
+                    });
+                }
                 if let Some(r) = cursor.repo_checks.as_mut() {
                     r.requested_rerun = Some(request);
                 }
                 put_node(store, cursor.to_node())?;
+                if let Some(f) = fix {
+                    emit(
+                        subscribers,
+                        CoreEvent::UnitReworkAmended {
+                            session: run_id.to_string(),
+                            ord: cursor.ord,
+                            amendment: f.note,
+                            updated_description: cursor.description.clone(),
+                            scope: crate::repo_checks::FloorRerunMode::FloorFix
+                                .as_wire()
+                                .to_string(),
+                        },
+                    );
+                }
             }
             // Optionally inject an amendment (the gate is steering) — into the unit at the cursor,
             // or (DES-L1 PR-1B, core#465 `amendScope: creator`) into the first CREATOR phase at or
@@ -11732,6 +11809,63 @@ pub(crate) fn confirm_gate(
     }
 }
 
+/// (core#782) Whether an approve WITH A NOTE at `unit`'s escalation gate is a FLOOR FIX: `unit`
+/// is a read-only phase (the worktree guard governs it, so it cannot make the edit itself) whose
+/// own repo-checks floor ran and denied it. Its note goes to a seat that can write
+/// ([`floor_fix_request`]) and only the floor re-runs; the note on the read-only phase itself
+/// would reach no seat that can act on it.
+fn floor_fix_applies(unit: &crate::domain::WorkUnit) -> bool {
+    crate::worktree_guard::applies_to(unit)
+        && unit.repo_checks_floor
+        && unit.repo_checks.is_some()
+        && unit.denial.as_ref().is_some_and(|d| {
+            d.source == crate::repo_checks::DENIAL_SOURCE
+                || d.source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT
+        })
+}
+
+/// (core#782) The `floor_fix` re-run for `cursor`: `note` handed to a seat DISTINCT from the
+/// read-only phase's own (evaluator ≠ fixer) — the most recent prior creator's seat, else the
+/// first of the run's seats — never a seat benched for the run. Refused when no such seat exists.
+/// Carries the reviewed attempt's transcript: the phase does not run again; its verdict stands
+/// and the floor on the fixed tree decides.
+fn floor_fix_request(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    cursor: &crate::domain::WorkUnit,
+    note: &str,
+) -> anyhow::Result<crate::repo_checks::FloorRerun> {
+    use crate::team::runner::seat_key;
+    let own = cursor.assigned_cli.as_deref().map(seat_key);
+    let creator = crate::pipeline::most_recent_prior_creator(units, cursor.ord)
+        .and_then(|c| c.assigned_cli.clone());
+    let seat = creator
+        .into_iter()
+        .chain(session.clis.iter().cloned())
+        .find(|k| Some(seat_key(k)) != own && !session.benched_seats.iter().any(|b| b.cli == *k))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no seat distinct from unit {}'s own ('{}') can make the fix — request changes \
+                 (the creator reworks) or reject",
+                cursor.ord,
+                cursor.assigned_cli.as_deref().unwrap_or("?")
+            )
+        })?;
+    let output = crate::domain::get_unit_transcript(store, &cursor.id)
+        .and_then(|t| t.output)
+        .unwrap_or_default();
+    Ok(crate::repo_checks::FloorRerun {
+        mode: crate::repo_checks::FloorRerunMode::FloorFix,
+        waive: Vec::new(),
+        output,
+        fix: Some(crate::repo_checks::FloorFix {
+            note: note.trim().to_string(),
+            seat,
+        }),
+    })
+}
+
 /// (core#469) The floor re-run `mode` asks for on `unit` — refused unless the unit's denial is a
 /// floor that did not FINISH (`repo_checks_timeout`) with its report on the unit, and, for
 /// `accept_partial`, unless that report names a check to waive. The request carries the reviewed
@@ -11768,6 +11902,10 @@ fn floor_rerun_request(
             }
             waive
         }
+        // (core#782) Never an answer of its own: an approve with a note arms it.
+        crate::repo_checks::FloorRerunMode::FloorFix => {
+            anyhow::bail!("`floor_fix` is armed by an approve with a note, not as an action")
+        }
         _ => Vec::new(),
     };
     let output = crate::domain::get_unit_transcript(store, &unit.id)
@@ -11777,6 +11915,7 @@ fn floor_rerun_request(
         mode,
         waive,
         output,
+        fix: None,
     })
 }
 
@@ -15005,6 +15144,100 @@ mod substance_gate_tests {
         );
     }
 
+    /// core#782: the floor decides a floor fix. A RED floor on the fixed tree opens the ordinary
+    /// escalation gate again (`floor_failed`, the fix offered again on the prompt), the armed fix
+    /// is consumed, and the gate's `floorNote` says whose change the floor judged; a GREEN floor
+    /// completes the unit on its standing verdict.
+    #[test]
+    fn a_floor_fix_floor_decides_red_re_escalates_green_completes() {
+        let report = |passed: bool| -> crate::repo_checks::RepoChecksReport {
+            let mut r: crate::repo_checks::RepoChecksReport =
+                serde_json::from_value(serde_json::json!({
+                    "detected": [],
+                    "checks": [{
+                        "name": "test", "argv": ["npm", "test"], "source": "package.json",
+                        "exit_code": if passed { 0 } else { 1 }, "timed_out": false,
+                        "duration_ms": 1200, "stdout_tail": "",
+                        "stderr_tail": if passed { "" } else { "1 failed" }
+                    }],
+                    "skipped": [], "passed": passed, "sandbox_level": "none"
+                }))
+                .unwrap();
+            r.rerun = Some(crate::repo_checks::FloorRerunMode::FloorFix);
+            r
+        };
+        let floor_note = |evs: &[CoreEvent]| {
+            evs.iter().find_map(|ev| match ev {
+                CoreEvent::GateEvaluated { floor_note, .. } => floor_note.clone(),
+                _ => None,
+            })
+        };
+        for passed in [false, true] {
+            let run_id = format!("floor-fix-fold-{passed}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, PhaseRole::Evaluator, |u| {
+                u.worktree_guarded = true;
+                u.repo_checks_floor = true;
+                let mut armed = report(false);
+                armed.rerun = None;
+                armed.requested_rerun = Some(crate::repo_checks::FloorRerun {
+                    mode: crate::repo_checks::FloorRerunMode::FloorFix,
+                    waive: Vec::new(),
+                    output: String::new(),
+                    fix: Some(crate::repo_checks::FloorFix {
+                        note: "raise the timeout".into(),
+                        seat: "codex".into(),
+                    }),
+                });
+                u.repo_checks = Some(armed);
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (esub, erx) = channel();
+            subs.push(esub);
+            let evidence = crate::workflow::UnitEvidence {
+                repo_checks: Some(report(passed)),
+                ..Default::default()
+            };
+            let (applied, session, unit) = fold_with_evidence(
+                &mut store,
+                &mut subs,
+                &run_id,
+                "Reviewed the fix; the change is correct.\nVERDICT: PASS",
+                evidence,
+            );
+            let evs = drain_events(&erx);
+            assert!(
+                floor_note(&evs).is_some_and(|n| n.contains("floor_fix")),
+                "{:?}",
+                floor_note(&evs)
+            );
+            assert!(
+                unit.repo_checks
+                    .as_ref()
+                    .is_some_and(|r| r.requested_rerun.is_none()),
+                "the armed fix is consumed by the attempt that ran it"
+            );
+            if passed {
+                assert!(matches!(applied, StepApplied::Finished));
+                assert_eq!(unit.status, UnitStatus::Done);
+            } else {
+                assert!(matches!(applied, StepApplied::Paused));
+                assert_eq!(session.status, SessionStatus::AwaitingHuman);
+                assert_eq!(unit.status, UnitStatus::Rejected);
+                let (escalated, paused) = gate_shape(&evs);
+                assert_eq!(
+                    (escalated.0.as_str(), escalated.1.as_str()),
+                    ("floor_failed", "repo_checks")
+                );
+                assert!(
+                    paused.3.contains("approve with a note"),
+                    "the fix is offered again: {}",
+                    paused.3
+                );
+            }
+        }
+    }
+
     /// L1↔L2 contract (review-L2-505 / DES-L2 §4): the deliver TOOL unit's repo-checks frame reads
     /// `floor: "verify"` — it re-verifies the tree it ships — while an undeclared creator floor
     /// still reads `creator`.
@@ -15314,6 +15547,141 @@ mod request_changes_tests {
 
     fn drain(erx: &std::sync::mpsc::Receiver<CoreEvent>) -> Vec<CoreEvent> {
         std::iter::from_fn(|| erx.try_recv().ok()).collect()
+    }
+
+    /// core#782: [`seed_bug`] at the verify gate, but `verify` is a READ-ONLY phase (the guard
+    /// governs it) whose own repo-checks floor denied it (`repo_checks`), the run seated on
+    /// `claude` (the evaluator) and `fix_seat` (the creator).
+    fn seed_floor_red_verify(store: &mut dyn GraphStore, run_id: &str, fix_seat: &str) {
+        seed_bug(store, run_id, true);
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.clis = vec!["claude".into(), fix_seat.into()];
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        units[2].assigned_cli = Some(fix_seat.into());
+        put_node(store, units[2].to_node()).unwrap();
+        let v = &mut units[3];
+        v.worktree_guarded = true;
+        v.repo_checks_floor = true;
+        v.repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap(),
+        );
+        v.denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE,
+            "test timed out after 5000 ms",
+        ));
+        v.denial_reason = Some("test timed out after 5000 ms".into());
+        put_node(store, v.to_node()).unwrap();
+    }
+
+    /// core#782 (operator ruling: option B): "Approve and steer" at a read-only phase's floor
+    /// gate hands the note to a seat that can write — the creator's seat, distinct from the
+    /// evaluator's — and arms ONLY a floor re-run on that phase: no rewind, the creator and every
+    /// phase between untouched, the cursor still on `verify`. Whatever the amend scope says.
+    #[test]
+    fn approve_with_a_note_at_a_read_only_floor_gate_arms_a_floor_fix_not_a_rewind() {
+        for scope in [AmendScope::Cursor, AmendScope::Creator] {
+            let run_id = format!("floor-fix-{}-{}", scope.as_wire(), std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_floor_red_verify(&mut store, &run_id, "codex");
+            let mut subs = crate::event_log::EventSink::default();
+            let (esub, erx) = channel();
+            subs.push(esub);
+
+            let status = gate(
+                &mut store,
+                &mut subs,
+                &run_id,
+                HumanDecision::Approve {
+                    amend: Some("raise the test's timeout to 30_000".into()),
+                    amend_scope: scope,
+                },
+            )
+            .unwrap();
+            assert_eq!(status, SessionStatus::Executing);
+            let session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                session.unit_ix, 3,
+                "the cursor stays on the read-only phase"
+            );
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            let (fix, verify) = (&units[2], &units[3]);
+            assert_eq!(fix.status, UnitStatus::Done, "the creator does not re-run");
+            assert_eq!(fix.description, "fix the bug", "nor is it amended");
+            assert!(
+                !verify.description.contains("30_000"),
+                "the note is not appended to the phase that cannot act on it"
+            );
+            let rerun = verify
+                .repo_checks
+                .as_ref()
+                .and_then(|r| r.requested_rerun.as_ref())
+                .expect("a floor re-run armed on the read-only phase");
+            assert_eq!(rerun.mode, crate::repo_checks::FloorRerunMode::FloorFix);
+            let f = rerun.fix.as_ref().expect("the fix");
+            assert_eq!(f.note, "raise the test's timeout to 30_000");
+            assert_eq!(f.seat, "codex", "the creator's seat, never the evaluator's");
+            assert_eq!(
+                verify.operator_rulings.last().map(|r| r.action.as_str()),
+                Some("floor_fix")
+            );
+            let evs = drain(&erx);
+            assert!(
+                evs.iter().any(|e| matches!(e,
+                    CoreEvent::UnitReworkAmended { ord: 4, scope, amendment, .. }
+                        if scope == "floor_fix" && amendment == "raise the test's timeout to 30_000")),
+                "{evs:?}"
+            );
+            assert!(
+                !evs.iter().any(|e| matches!(e,
+                    CoreEvent::UnitReworkAmended { scope, .. } if scope == "request_changes")),
+                "no rewind"
+            );
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, CoreEvent::UnitDispatched { ord: 4, .. })),
+                "the read-only phase re-dispatches (its worker runs the fix, then the floor)"
+            );
+        }
+    }
+
+    /// core#782: the fixing seat is never the evaluator's — with no other seat on the run the
+    /// floor fix is refused BEFORE the gate resolves, naming the remedy, and the run stays paused.
+    #[test]
+    fn a_floor_fix_with_no_seat_distinct_from_the_evaluator_is_refused() {
+        let run_id = format!("floor-fix-no-seat-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_red_verify(&mut store, &run_id, "claude#2");
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.clis = vec!["claude".into(), "claude#2".into()];
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let err = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("raise the timeout".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .expect_err("no distinct seat");
+        assert!(
+            err.to_string().contains("no seat distinct from unit 4"),
+            "{err}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
     }
 
     /// DES §7 (8): `RequestChanges` at the verify gate rewinds to `fix` — cursor 3 → 2, fix
