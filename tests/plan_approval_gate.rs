@@ -338,6 +338,7 @@ fn paused_on_plan(seen: &[CoreEvent], run: &str) -> Option<(u32, Option<u32>, St
             reviewing_ord,
             prompt,
             gate_kind,
+            ..
         } if session == run && gate_kind == "plan_approval" => {
             Some((*ord, *reviewing_ord, prompt.clone()))
         }

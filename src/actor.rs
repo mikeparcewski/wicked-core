@@ -7644,6 +7644,19 @@ fn pause_for_human_keyed(
             reviewing_ord,
             prompt: prompt.clone(),
             gate_kind: gate_kind.to_string(),
+            // (core#759 follow-up) A dispute pause names its unresolved HIGHs — `open_dispute`
+            // records the gate on the run before it pauses.
+            finding_ids: if gate_kind == team_gate::TEAM_DISPUTE_GATE {
+                session
+                    .team
+                    .as_ref()
+                    .and_then(|t| t.dispute.as_ref())
+                    .filter(|d| d.ord == ord)
+                    .map(|d| d.finding_ids.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
