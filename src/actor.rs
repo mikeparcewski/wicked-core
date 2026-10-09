@@ -8592,12 +8592,16 @@ fn resolve_consent_answer(
         ),
         other => (None, other),
     };
-    if let Some(id) = chosen {
-        let mut unit = crate::domain::session_units(&*store, session_id)?
-            .into_iter()
-            .find(|u| u.ord == ord)
-            .ok_or_else(|| anyhow::anyhow!("run {session_id} has no unit {ord}"))?;
-        unit.consent_choice = Some(id);
+    // EVERY answer rewrites the record — a choice from an earlier opening of this gate (a retry
+    // after a failed install) must never ride an answer that chose nothing, or the install would
+    // run a target nobody approved this time. No choice ⇒ the Tool command's
+    // `${WICKED_CONSENT_CHOICE:?}` refuses (fail-closed).
+    let mut unit = crate::domain::session_units(&*store, session_id)?
+        .into_iter()
+        .find(|u| u.ord == ord)
+        .ok_or_else(|| anyhow::anyhow!("run {session_id} has no unit {ord}"))?;
+    if unit.consent_choice != chosen {
+        unit.consent_choice = chosen;
         put_node(store, unit.to_node())?;
     }
     Ok(decision)
@@ -24063,6 +24067,11 @@ mod consent_plan_tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("offers no choices"), "{err}");
+        // A choice recorded at an earlier opening (a retry) does not survive an answer that
+        // chose nothing.
+        let mut stale = install_unit(&store, run_id);
+        stale.consent_choice = Some("operator".into());
+        put_node(&mut store, stale.to_node()).unwrap();
         // Approve still approves (nothing recorded); reject is unchanged.
         resolve_consent_answer(
             &mut store,
