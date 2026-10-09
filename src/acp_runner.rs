@@ -4786,6 +4786,9 @@ struct SettleWatch {
     last_frame: Instant,
     last_was_message: bool,
     open_tools: HashSet<String>,
+    /// A tool call arrived with no `toolCallId`: it cannot be seen to close, so the settle is off
+    /// for the rest of the turn (codex r1 on #826).
+    untracked_tool: bool,
 }
 
 impl SettleWatch {
@@ -4794,6 +4797,7 @@ impl SettleWatch {
             last_frame: Instant::now(),
             last_was_message: false,
             open_tools: HashSet::new(),
+            untracked_tool: false,
         }
     }
 
@@ -4810,8 +4814,11 @@ impl SettleWatch {
             (Some("session/update"), Some("agent_message_chunk")) => self.last_was_message = true,
             (Some("session/update"), Some("tool_call")) => {
                 self.last_was_message = false;
-                if let Some(id) = update["toolCallId"].as_str() {
-                    self.open_tools.insert(id.to_string());
+                match update["toolCallId"].as_str() {
+                    Some(id) => {
+                        self.open_tools.insert(id.to_string());
+                    }
+                    None => self.untracked_tool = true,
                 }
             }
             (Some("session/update"), Some("tool_call_update")) => {
@@ -4831,7 +4838,7 @@ impl SettleWatch {
     /// How long until the settle could fire (`None` when it is not armed).
     fn due_in(&self, settle: Option<Duration>) -> Option<Duration> {
         let settle = settle?;
-        (self.last_was_message && self.open_tools.is_empty())
+        (self.last_was_message && self.open_tools.is_empty() && !self.untracked_tool)
             .then(|| settle.saturating_sub(self.last_frame.elapsed()))
     }
 }
@@ -5793,6 +5800,9 @@ fn auth_refusal(input: &StepInput, cli_key: &str, kind: &str, why: &str) -> Step
     }
 }
 
+/// (core#418) Per `(run, cli)` key: why its next process is a restart, and since when.
+type RestartDue = Arc<Mutex<HashMap<(String, String), (&'static str, Option<Instant>)>>>;
+
 pub struct AcpStepRunner {
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`).
     tx: std::sync::mpsc::Sender<Command>,
@@ -5830,7 +5840,7 @@ pub struct AcpStepRunner {
     /// where a fenced unit's process is quiesced at its end (`fenced_unit_quiesced`) and where a
     /// settled turn's process is dropped (`turn_settled`); consumed — `acpProcessRestarted` — when
     /// the replacement session opens. Pruned with the run.
-    restart_due: Arc<Mutex<HashMap<(String, String), (&'static str, Option<Instant>)>>>,
+    restart_due: RestartDue,
 }
 
 /// What a READ-ONLY member session runs against (core#410 / crew#502, F-067; the warm chat pool
@@ -7326,6 +7336,9 @@ impl AcpStepRunner {
                 || maps.current_launch_seq(&run_id) > input.launch_seq
         };
         if superseded {
+            // (core#762, codex r1 on #826) A settled turn's process is wedged: evict it here too,
+            // or a superseded return would leave it cached for the next turn.
+            let settled = matches!(&turn, Ok(r) if r.settled.is_some());
             let (output, usage, files) = match turn {
                 Ok(result) => (result.output, result.usage, result.files),
                 Err(error) => (
@@ -7335,6 +7348,11 @@ impl AcpStepRunner {
                 ),
             };
             drop(proc);
+            if settled {
+                self.drop_session_key(&session_key);
+                drop(proc_arc);
+                self.mark_restart(&session_key, "turn_settled", None);
+            }
             return StepOutput {
                 run_id: input.run_id.clone(),
                 unit_ix: input.unit_ix,
@@ -21311,6 +21329,17 @@ while True:
             json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"hm"}}),
         ));
         assert_eq!(w.due_in(settle), None, "a thought disarms it");
+        // A tool call with no id can never be seen to close: no settle for the rest of the turn.
+        let mut w = SettleWatch::new();
+        w.observe(&frame(json!({"sessionUpdate":"tool_call","title":"bash"})));
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}),
+        ));
+        assert_eq!(
+            w.due_in(settle),
+            None,
+            "an untracked tool call keeps it off"
+        );
     }
 
     #[test]
