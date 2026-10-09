@@ -109,6 +109,10 @@ pub struct CatalogEntry {
     pub skill_ref: Option<String>,
     /// The entry's one-line description, when it has one (`null` for every entry today).
     pub description: Option<String>,
+    /// (core#810, studio#617) The entry's worker pool (`PhaseDef::pool_size`, absent = 1): the
+    /// most a plan step of it may ask for. A step may only lower it (`plan::compose`:
+    /// `pool_raised`), so a plan editor offers 1 up to this and never more.
+    pub pool: u8,
 }
 
 /// The catalog as [`CatalogEntry`] rows, in [`CATALOG_IDS`] order.
@@ -131,6 +135,7 @@ pub fn catalog_entries() -> Vec<CatalogEntry> {
             // No entry carries a description yet (the §8.3 table has none); the key is pinned so
             // a picker can render one the day an entry gains it.
             description: None,
+            pool: e.pool_size(),
         })
         .collect()
 }
@@ -582,6 +587,7 @@ mod tests {
                 "id",
                 "kind",
                 "pinned",
+                "pool",
                 "role",
                 "skill_ref",
                 "validator_pin",
@@ -595,9 +601,13 @@ mod tests {
                 "id": "build", "kind": "build", "role": "creator", "gate": "auto",
                 "gate_type": "execution", "executes_code": true, "executor": "agent",
                 "validator_pin": EVIDENCE_FLOOR_PIN, "pinned": true, "evidence_floor": true,
-                "verified_evidence": false, "skill_ref": null, "description": null
+                "verified_evidence": false, "skill_ref": null, "description": null,
+                "pool": 1
             })
         );
+        // (core#810, studio#617) Every shipped entry is a pool of 1 today: the key is pinned so a
+        // plan editor can offer a lower pool the day an entry declares one.
+        assert!(entries.iter().all(|e| e["pool"] == 1));
         let cov = by("domain_coverage");
         assert_eq!(
             (cov["pinned"].clone(), cov["evidence_floor"].clone()),
