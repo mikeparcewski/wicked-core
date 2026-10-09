@@ -483,6 +483,7 @@ mod tests {
             acp: None,
             capabilities: Some(format!("{key} capabilities")),
             login_invocation: None,
+            logout_invocation: None,
             governance_class: None,
             credential: None,
             free_tier: None,

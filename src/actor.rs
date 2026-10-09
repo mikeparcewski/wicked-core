@@ -5772,7 +5772,10 @@ fn apply_step_result(
         // `is_deliver_unit` (tool_cmd + phase id `deliver`) leaves every other Tool unit — and
         // `should_pause`'s deliver GATE — exactly as they are.
         if crate::deliver_lift::is_deliver_unit(unit)
-            && !crate::deliver_lift::is_lift_conflict_strand(&output.output)
+            && !crate::deliver_lift::is_lift_conflict_strand_for(
+                unit.tool_cmd.as_deref(),
+                &output.output,
+            )
         {
             let unit = units.get_mut(output.unit_ix).ok_or_else(|| {
                 anyhow::anyhow!("unit ix {} vanished on a deliver refusal", output.unit_ix)
@@ -9265,7 +9268,12 @@ fn dispatch_unit(
                             )
                         });
                         match lifted {
-                            Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
+                            // (crew#739) The engine's own refusal is sealed with the script's
+                            // trusted sentinel, so the strand classifier reads one rule.
+                            Some(Err(text)) => (
+                                crate::deliver_lift::seal_engine_refusal(text, &cmd),
+                                crate::workflow::StepStatus::Failed,
+                            ),
                             Some(Ok(clearance)) => {
                                 lift_checks = clearance.checks;
                                 lift_verified_tree = Some(clearance.verified_tree);
