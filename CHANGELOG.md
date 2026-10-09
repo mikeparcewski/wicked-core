@@ -239,6 +239,18 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.44** — 2026-10-09 — npm release on main tip 5e32cce, carrying #811, #813 and
+  #814. Wire changes are additive. **Floor fix (#811, core#782)**: approving a read-only phase's
+  repo-checks floor gate with a note arms `requestedRerun{mode: floor_fix, fix{note, seat}}` — a
+  seat distinct from the phase's makes the note's fix, only the floor re-runs, and the verdict
+  stands. **Per-phase worker pool (#813, core#810)**: `PhaseDef.pool` (default 1, `1..=4`; a plan
+  step may only lower it, `pool_raised`; a user workflow refuses a pool above 1) seats one creator
+  plus up to `pool − 1` monitors from distinct signed-in instances, re-filled at dispatch after a
+  failover. A shortfall is seated short and disclosed, never refused: `unitDistributed.pool`
+  (`UnitPoolSeatingJson | null` — `requested`, `seated`, `monitors`, `missing`, `shortfall`), the
+  unit's `pool_seating`, and team `step.claimed.monitors`. No shipped catalog entry sets a pool.
+  **Stale plan revision (#814, core#812)**: answering a `plan_approval` gate whose revision a newer
+  one superseded re-opens the gate on the current revision instead of failing the run.
 - **core-ts 0.7.43** — 2026-10-09 — npm release on main tip 35e7dfb, carrying #796, #792, #793,
   #800, #806, #805, #807 and #808. Wire changes are additive. A `team_dispute` pause names its
   answers: `awaitingHuman.choices` + `recommended` (#796, core#759), plus `findingIds`, the
