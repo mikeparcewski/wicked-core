@@ -1366,6 +1366,18 @@ fn denial_json(d: &crate::domain::UnitDenial) -> serde_json::Value {
     })
 }
 
+/// (core#759) The answers a gate of `gate_kind` accepts, in the order a client offers them, and
+/// the index of the recommended one — for the kinds whose answers are fixed by the kind alone.
+/// `team_dispute` (the gate approved the work; a teamed unit's ledger holds an unresolved HIGH):
+/// approve / request_changes / reject, recommending `request_changes` — the honest answer to a
+/// verified finding is usually to send it back, and a careless Approve waves it through.
+pub(crate) fn gate_choices(gate_kind: &str) -> Option<(&'static [&'static str], usize)> {
+    match gate_kind {
+        "team_dispute" => Some((&["approve", "request_changes", "reject"], 1)),
+        _ => None,
+    }
+}
+
 impl CoreEvent {
     /// Serialize to the tagged JSON object (`{ "type": "...", ...fields }`) that IS this event's
     /// wire identity — the shape the studio's `/ws` stream carries and the shape the durable event
@@ -1697,7 +1709,15 @@ impl CoreEvent {
                 prompt,
                 gate_kind,
             } => {
-                json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind })
+                let mut j = json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind });
+                // (core#759) A gate whose answers are fixed by its kind names them, so a client
+                // never parses the prompt's prose for the middle arm. ABSENT for every other kind
+                // (a `null` would read as a free-text gate).
+                if let Some((choices, recommended)) = gate_choices(gate_kind) {
+                    j["choices"] = json!(choices);
+                    j["recommended"] = json!(recommended);
+                }
+                j
             }
             CoreEvent::Resumed { session, ord } => {
                 json!({ "type": "resumed", "session": session, "ord": ord })
@@ -2501,6 +2521,42 @@ impl CoreEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#759: a `team_dispute` pause names its three answers (and recommends sending the
+    /// finding back) on the wire; every other gate kind carries no `choices` key at all — a
+    /// `null` there would read as a free-text gate to the studio.
+    #[test]
+    fn a_team_dispute_pause_names_its_answers_and_no_other_gate_does_759() {
+        let frame = |kind: &str| {
+            CoreEvent::AwaitingHuman {
+                session: "s".into(),
+                ord: 6,
+                reviewing_ord: Some(6),
+                prompt: "p".into(),
+                gate_kind: kind.into(),
+            }
+            .to_json()
+        };
+        let j = frame("team_dispute");
+        assert_eq!(
+            j["choices"],
+            serde_json::json!(["approve", "request_changes", "reject"])
+        );
+        assert_eq!(j["recommended"], 1);
+        for kind in [
+            "def",
+            "escalation",
+            "deliver",
+            "team_transport",
+            "plan_approval",
+        ] {
+            let j = frame(kind);
+            assert!(
+                j.get("choices").is_none() && j.get("recommended").is_none(),
+                "{kind}: {j}"
+            );
+        }
+    }
 
     /// TR-W1b: `repoChecksEvaluated.changed` / `changedTruncated` ride the wire only when the
     /// creator's tree changed — a no-change frame is byte-identical to one from before the field.
