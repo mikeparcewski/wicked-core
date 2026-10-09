@@ -57,8 +57,9 @@ pub use bus::EmitSink;
 pub use store::{EstateHandle, EstateRankStore, Ledger, TaskRecord};
 pub use types::{
     codex_sandbox_is_bounded, governance_class, AgenticCli, Category, Confidence, CouncilTask,
-    Dispatcher, EventSink, GovernanceClass, InputMode, NoopEventSink, ProbeOutcome, Prober,
-    RankSignal, RankStore, Ranking, TaskState, UnusableReason, Verdict, Vote, COUNCIL_EVENTS,
+    CredentialRequirement, Dispatcher, EventSink, GovernanceClass, InputMode, NoopEventSink,
+    ProbeOutcome, Prober, RankSignal, RankStore, Ranking, TaskState, UnusableReason, Verdict, Vote,
+    COUNCIL_EVENTS,
 };
 pub use worker::{PollStatus, Worker};
 

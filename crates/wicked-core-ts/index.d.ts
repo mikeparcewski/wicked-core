@@ -744,6 +744,19 @@ export declare class Core {
    */
   registerWorkflow(json: string): Promise<string>
   /**
+   * (core#677) Vault a deterministic validator the host authored — `criterion` and a POSIX
+   * shell `script` that exits 0 iff it holds — UNAPPROVED, resolving to its content-addressed
+   * pin. Rejects `bad_request: …` on an empty criterion/script or a script the run-time
+   * backstop refuses. Approve it with `approveValidator`; a def pins the APPROVED pin.
+   */
+  vaultValidator(criterion: string, script: string): Promise<string>
+  /**
+   * (core#677) Approve a vaulted validator (the audited step) and resolve to the APPROVED pin
+   * a workflow def's `validator_pin` names. Rejects `not_found: …` on an unknown pin. A def
+   * pinning an unapproved or unvaulted pin still fails its launch at plan time.
+   */
+  approveValidator(pin: string): Promise<string>
+  /**
    * Recall which conformance rules apply to the given `query_json` (a JSON-serialized
    * `RuleQuery` — fields: language, layer, framework, severity, rule_type, steering_type;
    * all optional).
@@ -776,6 +789,15 @@ export declare class Core {
    * needs no `Core` handle.
    */
   static evaluateMcpCall(requestJson: string): Promise<string>
+  /**
+   * (core#669, DES-MCP-TOOLS-001 decision 2) Record that a brokered REST call left its pinned
+   * host (crew's broker calls this on `RestBoundaryError`, after `evaluateMcpCall` allowed it).
+   * `request_json` is `{ token, subject, reason }`; appends a unit-FATAL deny claim under rule
+   * `engine:mcp-rest-boundary` (not the advisory `mcp-deny:` class) and resolves to
+   * `{ claimId }`. Rejects with `invalid_token: …`, `bad_request: …` or `guard_error: …` — the
+   * broker then refuses the call with `guard_error` (D-3). Static, like `evaluateMcpCall`.
+   */
+  static recordMcpBoundaryEscape(requestJson: string): Promise<string>
   /**
    * The unit's visible MCP tool list (DES-MCP-TOOLS-001 §8 `GET /mcp/tools?token=`; slice S4,
    * the garden shim's `list`). `request_json` is `{ token, calls: [{ server, tool, annotations?,
@@ -1033,6 +1055,22 @@ export declare class Subscription {
  * the option the producer of the options recommends (the field's own JSON Schema `default`, when
  * it names a delivered option). ABSENT ⇒ nothing is preselected; `options`/`propType` stay
  * explicit nulls.
+ * core#412 (additive — a new `type` value): cliUsageUnreported {session, ord, attempt, cli} — an
+ * agent unit whose seat reported NO usage for that attempt; emitted where cliUsage would be, so a
+ * burn view shows the unit as UNREPORTED, never as $0.
+ * core#554 (additive): every unitContextInjected.priorUnits[] item carries `deliveredBytes`
+ * (the size the worker received, after the carriers' shared prior-context clip) and `clipped`
+ * (boolean). `outputBytes` stays the pre-clip size; a clipped operator note now says so.
+ * core#651 (a new VALUE): unitReworkAmended.scope can read `'floor_auto_retry'` — the one automatic
+ * round a creator gets when its own repo-checks floor ran and failed (the failing tails are the
+ * amendment); WorkUnit gains `floor_auto_retries` (number, absent while 0).
+ * core#686 (additive): WorkUnit gains `instructions` (the phase's authored card, absent when
+ * none), `amendments` (approved intent-amendment texts, absent when empty) and
+ * `structured_description` (true on units planned with those fields; absent on older records,
+ * which a reader re-parses from `description` as legacy).
+ * core#591 (additive): unitReassigned carries `distinctnessFallback` ('creator_seat' |
+ * 'same_cli_instance' | null), as unitDistributed does — the new seat is another INSTANCE of (or
+ * the very seat of) the CLI that created the work the unit depends on.
  */
 export interface CoreEventJson {
   type: string

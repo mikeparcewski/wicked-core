@@ -54,6 +54,10 @@ struct TomlCli {
     #[serde(default)]
     login_invocation: Option<String>,
     #[serde(default)]
+    credential: Option<crate::types::CredentialRequirement>,
+    #[serde(default)]
+    free_tier: Option<String>,
+    #[serde(default)]
     acp: Option<TomlAcpConfig>,
 }
 
@@ -128,6 +132,8 @@ impl From<TomlCli> for AgenticCli {
             capabilities: t.capabilities,
             login_invocation: t.login_invocation,
             governance_class: None,
+            credential: t.credential,
+            free_tier: t.free_tier,
             health: None,
         }
     }
@@ -170,6 +176,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             ),
             login_invocation: None,
             governance_class: None,
+            credential: Some(crate::types::CredentialRequirement::Required),
+            free_tier: None,
             health: None,
         },
         AgenticCli {
@@ -227,6 +235,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             ),
             login_invocation: None,
             governance_class: None,
+            credential: Some(crate::types::CredentialRequirement::Required),
+            free_tier: None,
             health: None,
         },
         AgenticCli {
@@ -326,6 +336,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             ),
             login_invocation: None,
             governance_class: None,
+            credential: Some(crate::types::CredentialRequirement::Required),
+            free_tier: None,
             health: None,
         },
         AgenticCli {
@@ -402,6 +414,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             ),
             login_invocation: None,
             governance_class: None,
+            credential: Some(crate::types::CredentialRequirement::Required),
+            free_tier: None,
             health: None,
         },
         AgenticCli {
@@ -454,6 +468,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             ),
             login_invocation: None,
             governance_class: None,
+            credential: Some(crate::types::CredentialRequirement::Required),
+            free_tier: None,
             health: None,
         },
         AgenticCli {
@@ -519,6 +535,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             ),
             login_invocation: None,
             governance_class: None,
+            credential: Some(crate::types::CredentialRequirement::Optional),
+            free_tier: Some("OpenCode Zen free models (no account needed)".into()),
             health: None,
         },
     ]
@@ -611,6 +629,14 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                             cli.key, cli.trust_flags
                         );
                     }
+                    // (core#447) The credential requirement describes the CLI, not the record: a
+                    // same-binary override that omits it keeps the built-in's (and its label).
+                    if cli.credential.is_none() && cli.binary == slot.binary {
+                        cli.credential = slot.credential;
+                        if cli.free_tier.is_none() {
+                            cli.free_tier = slot.free_tier.clone();
+                        }
+                    }
                     if omitted_enabled && !slot.enabled_for_council {
                         cli.enabled_for_council = false;
                         eprintln!(
@@ -688,6 +714,56 @@ pub fn list_json(clis: &[AgenticCli]) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    /// core#447: each built-in declares its credential requirement — opencode answers on a free
+    /// tier (`optional`, labelled), every other seat needs a sign-in — and a TOML record states
+    /// `credential` / `free_tier`; the roster wire carries both, an undeclared record carries none.
+    #[test]
+    fn every_builtin_declares_its_credential_requirement_447() {
+        use crate::types::CredentialRequirement as C;
+        for c in builtin() {
+            let want = if c.key == "opencode" {
+                C::Optional
+            } else {
+                C::Required
+            };
+            assert_eq!(c.credential, Some(want), "{}", c.key);
+            assert_eq!(c.free_tier.is_some(), c.key == "opencode", "{}", c.key);
+        }
+        let parsed: Vec<AgenticCli> = toml::from_str::<TomlRegistry>(
+            r#"
+[[cli]]
+key = "freebie"
+display_name = "Freebie"
+binary = "freebie"
+headless_invocation = "freebie {PROMPT}"
+credential = "optional"
+free_tier = "the vendor's free models"
+
+[[cli]]
+key = "plain"
+display_name = "Plain"
+binary = "plain"
+headless_invocation = "plain {PROMPT}"
+"#,
+        )
+        .unwrap()
+        .cli
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(parsed[0].credential, Some(C::Optional));
+        assert_eq!(
+            parsed[0].free_tier.as_deref(),
+            Some("the vendor's free models")
+        );
+        let wire = serde_json::to_value(&parsed[0]).unwrap();
+        assert_eq!(wire["credential"], "optional");
+        assert_eq!(wire["free_tier"], "the vendor's free models");
+        assert_eq!(parsed[1].credential, None);
+        let wire = serde_json::to_value(&parsed[1]).unwrap();
+        assert!(wire.get("credential").is_none() && wire.get("free_tier").is_none());
+    }
+
     use super::*;
     use std::io::Write;
 

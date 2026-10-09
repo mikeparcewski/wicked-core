@@ -215,6 +215,16 @@ pub fn governance_class(seat: &AgenticCli) -> GovernanceClass {
     GovernanceClass::OsSandboxFloor
 }
 
+/// (core#447) A CLI's declared credential requirement ([`AgenticCli::credential`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRequirement {
+    /// The CLI answers nothing without a sign-in.
+    Required,
+    /// A provider free tier answers with no sign-in.
+    Optional,
+}
+
 /// How the scaffold prompt is delivered to the CLI process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -370,6 +380,16 @@ pub struct AgenticCli {
     /// carries none, and no predicate reads it — the engine recomputes the class from `acp.*`.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub governance_class: Option<String>,
+    /// (core#447) Whether the CLI needs a credential to answer at all: `required` (a signed-out
+    /// seat is benched) or `optional` (a provider free tier answers with no sign-in). DECLARED on
+    /// the `[cli]` record (`credential = "required" | "optional"`) and carried on the roster wire
+    /// so a launcher's seat auth reads the record instead of guessing. `None` = not declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialRequirement>,
+    /// (core#447) The free tier a `credential = "optional"` seat falls back to, as a label
+    /// (`free_tier = "…"` on the record). Meaningful only with `optional`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_tier: Option<String>,
     /// (F-7R2-006, wave 6) The LAUNCHER's health verdict for this seat — the result of its
     /// sign-in / usability probe (wicked-crew's `GET /roster` `auth` + `council_eligible`), carried
     /// on the roster it hands the engine so routing can act on it. `Some(usable: false)` BENCHES

@@ -153,14 +153,14 @@ pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, parse_protocol_version, protocol_version_line,
     run_gate_hook, run_output_gate_hook, HookDrainSummary, COVERAGE_DB_ENV, DECISIONS_PATH_ENV,
-    ESTATE_DB_ENV, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV,
-    GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
+    ESTATE_DB_ENV, ESTATE_READ_VERBS, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV,
+    GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
 };
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, list_mcp_tools_json,
-    preview_mcp_calls_json, McpAnnotations, McpClass,
+    preview_mcp_calls_json, record_mcp_boundary_escape_json, McpAnnotations, McpClass,
     APPROVAL_OBLIGATION as MCP_APPROVAL_OBLIGATION, CREW_URL_ENV as MCP_CREW_URL_ENV,
-    TOKEN_ENV as MCP_TOKEN_ENV,
+    MCP_REST_BOUNDARY_RULE, TOKEN_ENV as MCP_TOKEN_ENV,
 };
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;
@@ -1634,6 +1634,43 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (core#677) Vault a deterministic validator the HOST authored — `criterion` (what it checks)
+    /// and `script` (a POSIX shell check that exits 0 iff it holds) — UNAPPROVED, returning its
+    /// content-addressed pin. The napi twin of `wicked-core provision-validator` without the live
+    /// writer: a host (crew) that owns its check can provision it on a machine nobody seeded by
+    /// hand. Approve it with [`Core::approve_validator`]; a def pins the APPROVED pin.
+    pub fn vault_validator(
+        &self,
+        criterion: impl Into<String>,
+        script: impl Into<String>,
+    ) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::VaultValidator {
+                criterion: criterion.into(),
+                script: script.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (core#677) Approve a vaulted validator (the audited step `approve-validator` takes) and
+    /// return the APPROVED pin a workflow def's `validator_pin` names. An unknown pin is an error
+    /// (`not_found: …`); a def pinning an unapproved or unvaulted pin still bails at plan time.
+    pub fn approve_validator(&self, pin: impl Into<String>) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ApproveValidator {
+                pin: pin.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     pub fn register_workflow(&self, json: impl Into<String>) -> anyhow::Result<String> {
         let (reply, rx) = channel();
         self.tx
@@ -1854,6 +1891,8 @@ mod tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         };
 
@@ -1985,6 +2024,8 @@ mod tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         };
         struct NoRun;

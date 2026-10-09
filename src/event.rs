@@ -41,6 +41,35 @@ pub struct InjectedContext {
     pub label: String,
     /// Byte length of the injected output (for size debugging; not the content itself).
     pub output_bytes: usize,
+    /// (core#554) Byte length of the block AS THE WORKER RECEIVED IT — after the carriers' shared
+    /// prior-context clip ([`crate::execute_wrapped::clip_prior_output`]). Equal to
+    /// `output_bytes` unless [`clipped`](Self::clipped).
+    pub delivered_bytes: usize,
+    /// (core#554) The block was clipped (head + tail kept, elision marked) before the worker saw
+    /// it — an operator note on a rework can be one of them, so a client comparing the amend
+    /// length against `outputBytes` alone would miss the truncation.
+    pub clipped: bool,
+}
+
+impl InjectedContext {
+    /// An item whose delivered size is not yet known — [`Self::deliver`] sets it once the whole
+    /// block's count (which sizes each share) is.
+    pub fn new(ord: u32, label: String, output_bytes: usize) -> Self {
+        Self {
+            ord,
+            label,
+            output_bytes,
+            delivered_bytes: output_bytes,
+            clipped: false,
+        }
+    }
+
+    /// (core#554) Record what the worker receives of `output`, one of `count` prior blocks.
+    pub fn deliver(&mut self, output: &str, count: usize) {
+        let delivered = crate::execute_wrapped::clip_prior_output(output, count);
+        self.clipped = delivered != output;
+        self.delivered_bytes = delivered.len();
+    }
 }
 
 /// (core#468) The BASE skill directive a dispatch carries — the run's role-keyed discipline
@@ -394,6 +423,16 @@ pub enum CoreEvent {
         cache_read_tokens: u64,
         cache_creation_tokens: u64,
         cost_usd: Option<f64>,
+    },
+    /// (core#412) An agent unit's seat reported NO usage for this attempt (its adapter carries no
+    /// token counts — today every seat but claude on the wrapped carrier, and any ACP adapter that
+    /// sends none). Emitted where [`CoreEvent::CliUsage`] would be, so a run's burn says which units
+    /// are UNREPORTED instead of reading them as $0. Additive.
+    CliUsageUnreported {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli: String,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched (from `tool_use` file paths),
     /// emitted after the unit completes when ≥1 file was seen. Absent for seats that report no file access.
@@ -1113,6 +1152,12 @@ pub enum CoreEvent {
         /// BEFORE this event was emitted (core#500 / AC2); `false` for non-tool units or when
         /// no child was registered (e.g. the previous attempt had not yet spawned its child).
         previous_attempt_reaped: bool,
+        /// (core#591) The evaluator ≠ creator fallback the NEW seat takes, as on
+        /// `unitDistributed`: `Some("same_cli_instance")` when it is another INSTANCE of the CLI
+        /// that created the work this unit depends on (context separated, model not),
+        /// `Some("creator_seat")` when it is that very seat, `None` otherwise (and for a re-route,
+        /// `new_cli: None`). Wire `distinctnessFallback`, `null` when none.
+        distinctness_fallback: Option<String>,
     },
     /// A seat was BENCHED for this run by what it said while doing the run's work: a worker or a
     /// judge refused on a classified dead-seat cause (`not_logged_in`, `quota_exhausted`,
@@ -1612,6 +1657,18 @@ impl CoreEvent {
                 "cacheCreationTokens": cache_creation_tokens,
                 "costUsd": cost_usd,
             }),
+            CoreEvent::CliUsageUnreported {
+                session,
+                ord,
+                attempt,
+                cli,
+            } => json!({
+                "type": "cliUsageUnreported",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+            }),
             // (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched.
             CoreEvent::DataUsed {
                 session,
@@ -1687,6 +1744,7 @@ impl CoreEvent {
                 previous_cli,
                 new_cli,
                 previous_attempt_reaped,
+                distinctness_fallback,
             } => json!({
                 "type": "unitReassigned",
                 "session": session,
@@ -1695,6 +1753,7 @@ impl CoreEvent {
                 "previousCli": previous_cli,
                 "newCli": new_cli,
                 "previousAttemptReaped": previous_attempt_reaped,
+                "distinctnessFallback": distinctness_fallback,
             }),
             CoreEvent::SeatBenched {
                 session,
@@ -1931,6 +1990,8 @@ impl CoreEvent {
                     "ord": c.ord,
                     "label": c.label,
                     "outputBytes": c.output_bytes,
+                    "deliveredBytes": c.delivered_bytes,
+                    "clipped": c.clipped,
                 })).collect::<Vec<_>>(),
             }),
             // ── P2 governance-deep wave (EVT-008, EVT-009, EVT-010, EVT-011, EVT-016) ──────────

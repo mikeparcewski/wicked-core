@@ -139,6 +139,22 @@ const HAND_AUTHORED = `${BEGIN}
  * the option the producer of the options recommends (the field's own JSON Schema \`default\`, when
  * it names a delivered option). ABSENT ⇒ nothing is preselected; \`options\`/\`propType\` stay
  * explicit nulls.
+ * core#412 (additive — a new \`type\` value): cliUsageUnreported {session, ord, attempt, cli} — an
+ * agent unit whose seat reported NO usage for that attempt; emitted where cliUsage would be, so a
+ * burn view shows the unit as UNREPORTED, never as $0.
+ * core#554 (additive): every unitContextInjected.priorUnits[] item carries \`deliveredBytes\`
+ * (the size the worker received, after the carriers' shared prior-context clip) and \`clipped\`
+ * (boolean). \`outputBytes\` stays the pre-clip size; a clipped operator note now says so.
+ * core#651 (a new VALUE): unitReworkAmended.scope can read \`'floor_auto_retry'\` — the one automatic
+ * round a creator gets when its own repo-checks floor ran and failed (the failing tails are the
+ * amendment); WorkUnit gains \`floor_auto_retries\` (number, absent while 0).
+ * core#686 (additive): WorkUnit gains \`instructions\` (the phase's authored card, absent when
+ * none), \`amendments\` (approved intent-amendment texts, absent when empty) and
+ * \`structured_description\` (true on units planned with those fields; absent on older records,
+ * which a reader re-parses from \`description\` as legacy).
+ * core#591 (additive): unitReassigned carries \`distinctnessFallback\` ('creator_seat' |
+ * 'same_cli_instance' | null), as unitDistributed does — the new seat is another INSTANCE of (or
+ * the very seat of) the CLI that created the work the unit depends on.
  */
 export interface CoreEventJson {
   type: string

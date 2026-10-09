@@ -3244,6 +3244,21 @@ fn is_auth_required_error(e: &anyhow::Error) -> bool {
 /// sends it as `error.data.errorKind` on an `internalError`).
 const AUTH_FAILED_ERROR_KIND: &str = "authentication_failed";
 
+/// (core#755) Whether an `ok` ACP turn is really a seat refusal: not one tool call, and its output
+/// is a provider's quota / sign-in / approval refusal by the council's own classifier (judged with
+/// no exit evidence — an ACP turn has no exit code — so only self-framed provider sentences count).
+fn ok_turn_is_a_seat_refusal(output: &str, tool_calls: usize) -> bool {
+    tool_calls == 0
+        && wicked_council::types::SeatFailureReason::classify_refusal(output, false).is_some()
+}
+
+/// (core#754) Whether a turn error is the model refusing the prompt as over its context window —
+/// Anthropic's `Prompt is too long`, OpenAI's `context_length_exceeded`.
+fn turn_prompt_too_long(e: &anyhow::Error) -> bool {
+    let t = format!("{e:#}").to_ascii_lowercase();
+    t.contains("prompt is too long") || t.contains("context_length_exceeded")
+}
+
 /// Classify a turn error as an AUTHENTICATION refusal, by protocol facts only — the error frame's
 /// CODE or its structured `data.errorKind`, read off the downcast [`RpcServerError`], never a
 /// rendered message. Pure so the classification is testable without a live bridge.
@@ -3257,13 +3272,6 @@ const AUTH_FAILED_ERROR_KIND: &str = "authentication_failed";
 ///
 /// `Some((kind, message))` carries the bridge's own `error.message` (empty when it sent none), so
 /// the unit's refusal names the cause in the seat's words.
-/// (core#754) Whether a turn error is the model refusing the prompt as over its context window —
-/// Anthropic's `Prompt is too long`, OpenAI's `context_length_exceeded`.
-fn turn_prompt_too_long(e: &anyhow::Error) -> bool {
-    let t = format!("{e:#}").to_ascii_lowercase();
-    t.contains("prompt is too long") || t.contains("context_length_exceeded")
-}
-
 fn turn_auth_refusal(e: &anyhow::Error) -> Option<(&'static str, String)> {
     let se = e.downcast_ref::<RpcServerError>()?;
     let frame: Option<Value> = serde_json::from_str(&se.raw).ok();
@@ -7172,6 +7180,34 @@ impl AcpStepRunner {
         }
 
         match turn {
+            // (core#755) A turn whose ONLY account is a seat-failure sentence — a provider's
+            // quota / sign-in refusal, with not one tool call — did no work: booking it `ok` let
+            // the floor pass on the previous attempt's tree and the seat "succeed" doing nothing.
+            // It is a worker failure, exactly as the wrapped carrier books it, so the actor
+            // benches the seat and fails the unit over.
+            Ok(result)
+                if result.status == StepStatus::Ok
+                    && ok_turn_is_a_seat_refusal(&result.output, result.tools.len()) =>
+            {
+                drop(proc);
+                self.drop_session(&run_id);
+                eprintln!(
+                    "[wicked-core] ACP seat '{cli_key}' answered unit {} with a seat refusal and \
+                     no tool call; booked as a worker failure (core#755)",
+                    input.unit.ord
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::Failed,
+                    usage: result.usage,
+                    files: result.files,
+                    tools: result.tools,
+                    governed: gate.is_some() || floor_governed,
+                }
+            }
             Ok(result) if result.status == StepStatus::Ok => {
                 if wants_no_code {
                     // F-036 QUIESCE (adversarial review on #414): a NO-CODE unit's process — the
@@ -8124,13 +8160,24 @@ mod tests {
         assert!(!is_auth_required_error(&text_only));
     }
 
-    /// core#718 — claude-agent-acp answers a turn whose OAuth session expired with an
-    /// `internalError` (-32603) carrying the SDK's categorical `data.errorKind:
-    /// "authentication_failed"` (dogfood run `3580f771`: "Failed to authenticate: OAuth session
-    /// expired and could not be refreshed"). That is a seat-specific AUTH refusal — a protocol
-    /// fact like -32000, not a grep — so it takes the auth path (no single-shot fallback; the
-    /// actor benches the seat and the unit fails over). Every other `errorKind` (a rate limit, a
-    /// server error) stays a session death, and the bridge's message rides the reason.
+    /// core#755: an `ok` turn whose only output is copilot's quota sentence (and no tool call) is a
+    /// seat refusal, booked as a worker failure; a turn that worked, or that only DISCUSSES quotas
+    /// in its body, is not.
+    #[test]
+    fn a_quota_only_ok_turn_is_a_seat_refusal_755() {
+        let quota = "Error: You have exceeded your monthly quota (Request ID: 1234:abcd)";
+        assert!(ok_turn_is_a_seat_refusal(quota, 0));
+        assert!(
+            !ok_turn_is_a_seat_refusal(quota, 3),
+            "a turn that ran tools did work; its tail is judged by the actor as before"
+        );
+        assert!(!ok_turn_is_a_seat_refusal(
+            "Done: added the quota banner.",
+            0
+        ));
+        assert!(!ok_turn_is_a_seat_refusal("", 0));
+    }
+
     /// core#754: the bridge's `Prompt is too long` (a demo review's first turn) is its own class —
     /// not an auth refusal, not a session death; `context_length_exceeded` reads the same.
     #[test]
@@ -8179,6 +8226,13 @@ mod tests {
         );
     }
 
+    /// core#718 — claude-agent-acp answers a turn whose OAuth session expired with an
+    /// `internalError` (-32603) carrying the SDK's categorical `data.errorKind:
+    /// "authentication_failed"` (dogfood run `3580f771`: "Failed to authenticate: OAuth session
+    /// expired and could not be refreshed"). That is a seat-specific AUTH refusal — a protocol
+    /// fact like -32000, not a grep — so it takes the auth path (no single-shot fallback; the
+    /// actor benches the seat and the unit fails over). Every other `errorKind` (a rate limit, a
+    /// server error) stays a session death, and the bridge's message rides the reason.
     #[test]
     fn an_authentication_failed_error_kind_is_an_auth_refusal() {
         let expired = anyhow::Error::new(RpcServerError {
@@ -14224,6 +14278,10 @@ No further next steps — both questions fully answered.";
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
             carried_items: Vec::new(),
+            floor_auto_retries: 0,
+            instructions: None,
+            amendments: Vec::new(),
+            structured_description: false,
             status: crate::domain::UnitStatus::Pending,
             catalog: None,
             exclude_seats: Vec::new(),

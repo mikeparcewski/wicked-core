@@ -2523,6 +2523,8 @@ pub(crate) fn seat_governance_class(cli_key: &str) -> wicked_council::Governance
         capabilities: None,
         login_invocation: None,
         governance_class: None,
+        credential: None,
+        free_tier: None,
         health: None,
     };
     wicked_council::governance_class(&unregistered)
@@ -12061,6 +12063,8 @@ mod project_graph_end_to_end_tests {
             capabilities: None,
             login_invocation: None,
             governance_class: None,
+            credential: None,
+            free_tier: None,
             health: None,
         }
     }

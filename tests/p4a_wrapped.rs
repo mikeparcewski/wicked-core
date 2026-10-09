@@ -50,6 +50,8 @@ fn echo_cli() -> AgenticCli {
         capabilities: None,
         login_invocation: None,
         governance_class: None,
+        credential: None,
+        free_tier: None,
         health: None,
     }
 }

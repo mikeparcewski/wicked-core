@@ -2213,6 +2213,25 @@ impl Core {
         task(move || core.register_workflow(json).map_err(err))
     }
 
+    /// (core#677) Vault a deterministic validator the host authored — `criterion` and a POSIX
+    /// shell `script` that exits 0 iff it holds — UNAPPROVED, resolving to its content-addressed
+    /// pin. Rejects `bad_request: …` on an empty criterion/script or a script the run-time
+    /// backstop refuses. Approve it with `approveValidator`; a def pins the APPROVED pin.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn vault_validator(&self, criterion: String, script: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.vault_validator(criterion, script).map_err(err))
+    }
+
+    /// (core#677) Approve a vaulted validator (the audited step) and resolve to the APPROVED pin
+    /// a workflow def's `validator_pin` names. Rejects `not_found: …` on an unknown pin. A def
+    /// pinning an unapproved or unvaulted pin still fails its launch at plan time.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn approve_validator(&self, pin: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.approve_validator(pin).map_err(err))
+    }
+
     /// Recall which conformance rules apply to the given `query_json` (a JSON-serialized
     /// `RuleQuery` — fields: language, layer, framework, severity, rule_type, steering_type;
     /// all optional).
@@ -2263,6 +2282,17 @@ impl Core {
     #[napi(ts_return_type = "Promise<string>")]
     pub fn evaluate_mcp_call(request_json: String) -> AsyncTask<CoreTask> {
         task(move || wicked_core::evaluate_mcp_call_json(&request_json).map_err(err))
+    }
+
+    /// (core#669, DES-MCP-TOOLS-001 decision 2) Record that a brokered REST call left its pinned
+    /// host (crew's broker calls this on `RestBoundaryError`, after `evaluateMcpCall` allowed it).
+    /// `request_json` is `{ token, subject, reason }`; appends a unit-FATAL deny claim under rule
+    /// `engine:mcp-rest-boundary` (not the advisory `mcp-deny:` class) and resolves to
+    /// `{ claimId }`. Rejects with `invalid_token: …`, `bad_request: …` or `guard_error: …` — the
+    /// broker then refuses the call with `guard_error` (D-3). Static, like `evaluateMcpCall`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn record_mcp_boundary_escape(request_json: String) -> AsyncTask<CoreTask> {
+        task(move || wicked_core::record_mcp_boundary_escape_json(&request_json).map_err(err))
     }
 
     /// The unit's visible MCP tool list (DES-MCP-TOOLS-001 §8 `GET /mcp/tools?token=`; slice S4,
@@ -3256,6 +3286,16 @@ mod tests {
             ],
         );
         check(
+            CoreEvent::CliUsageUnreported {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                cli: s(),
+            },
+            "cliUsageUnreported",
+            &["type", "session", "ord", "attempt", "cli"],
+        );
+        check(
             CoreEvent::DataUsed {
                 session: s(),
                 ord: 1,
@@ -3391,6 +3431,7 @@ mod tests {
                 previous_cli: s(),
                 new_cli: Some(s()),
                 previous_attempt_reaped: false,
+                distinctness_fallback: None,
             },
             "unitReassigned",
             &[
@@ -3401,6 +3442,7 @@ mod tests {
                 "previousCli",
                 "newCli",
                 "previousAttemptReaped",
+                "distinctnessFallback",
             ],
         );
         check(
@@ -3602,11 +3644,7 @@ mod tests {
                 session: s(),
                 ord: 2,
                 recipient_cli: s(),
-                prior_units: vec![wicked_core::InjectedContext {
-                    ord: 1,
-                    label: s(),
-                    output_bytes: 42,
-                }],
+                prior_units: vec![wicked_core::InjectedContext::new(1, s(), 42)],
             },
             "unitContextInjected",
             &["type", "session", "ord", "recipientCli", "priorUnits"],

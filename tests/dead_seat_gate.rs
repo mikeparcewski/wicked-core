@@ -54,6 +54,8 @@ fn cli(key: &str) -> AgenticCli {
         capabilities: None,
         login_invocation: None,
         governance_class: None,
+        credential: None,
+        free_tier: None,
         health: None,
     }
 }
@@ -361,6 +363,19 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
             .any(|e| matches!(e, CoreEvent::SessionCompleted { session } if session == sid)),
         "the stub runner answers on the provisional seat and the run completes: {post:?}"
     );
+    // core#412: the stub seat reports no usage, so its burn is disclosed UNREPORTED, not $0.
+    assert!(
+        post.iter().any(|e| matches!(e,
+            CoreEvent::CliUsageUnreported { session, ord: 1, attempt: 0, cli }
+                if session == sid && cli == "codex")),
+        "{post:?}"
+    );
+    assert!(
+        !post
+            .iter()
+            .any(|e| matches!(e, CoreEvent::CliUsage { session, .. } if session == sid)),
+        "no usage frame for a seat that reported none"
+    );
     let store = wicked_apps_core::open_store_ro(Some(&db)).expect("read-only store");
     let units = session_units(&store, sid).unwrap();
     assert_eq!(units[0].assigned_cli.as_deref(), Some("codex"));
@@ -413,7 +428,7 @@ fn a_reassign_at_a_gate_reseats_in_place_and_the_approve_dispatches_once_there()
     assert!(
         parked.iter().any(|e| matches!(e,
             CoreEvent::UnitReassigned {
-                session, ord: 1, attempt: 0, previous_cli, new_cli, previous_attempt_reaped: true
+                session, ord: 1, attempt: 0, previous_cli, new_cli, previous_attempt_reaped: true, ..
             } if session == sid && previous_cli == "codex" && new_cli.as_deref() == Some("claude"))),
         "{parked:?}"
     );

@@ -2857,6 +2857,22 @@ pub(crate) fn run(
             Command::ListPresets { project_id, reply } => {
                 let _ = reply.send(crate::preset::list_presets(&store, project_id.as_deref()));
             }
+            Command::VaultValidator {
+                criterion,
+                script,
+                reply,
+            } => {
+                let _ = reply.send(vault_host_validator(&mut store, criterion, script));
+            }
+            Command::ApproveValidator { pin, reply } => {
+                let res =
+                    crate::validator_vault::approve_and_store(&mut store, &pin).and_then(|p| {
+                        p.ok_or_else(|| {
+                            anyhow::anyhow!("not_found: no vaulted validator with pin {pin}")
+                        })
+                    });
+                let _ = reply.send(res);
+            }
             Command::RegisterWorkflow { json, reply } => {
                 let result = serde_json::from_str::<crate::workflow::WorkflowDef>(&json)
                     .map_err(|e| anyhow::anyhow!("invalid workflow JSON: {e}"))
@@ -3180,6 +3196,11 @@ pub(crate) fn run(
                                 previous_cli: previous_cli.clone(),
                                 new_cli: Some(cli.clone()),
                                 previous_attempt_reaped,
+                                distinctness_fallback: reassign_distinctness(
+                                    &units,
+                                    session.unit_ix,
+                                    &cli,
+                                ),
                             },
                         );
                         // Re-dispatch the cursor unit.
@@ -3239,6 +3260,7 @@ pub(crate) fn run(
                                 previous_cli: previous_cli.clone(),
                                 new_cli: None,
                                 previous_attempt_reaped,
+                                distinctness_fallback: None,
                             },
                         );
                         let _ = reply.send(Ok(()));
@@ -5023,6 +5045,40 @@ fn reassign_candidates(
         .collect()
 }
 
+/// (core#591) The evaluator ≠ creator fallback a reassignment of unit `unit_ix` onto `seat`
+/// takes, by the distribution rule's own vocabulary: `creator_seat` when `seat` IS the seat of a
+/// unit it depends on, `same_cli_instance` when it is another INSTANCE of that seat's CLI
+/// (`claude#2` checking `claude`'s work: context separated, model not), `None` otherwise.
+fn reassign_distinctness(
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+    seat: &str,
+) -> Option<String> {
+    let unit = units.get(unit_ix)?;
+    let creators: Vec<String> = units
+        .iter()
+        .filter(|u| {
+            u.phase_id()
+                .is_some_and(|p| unit.depends_on.iter().any(|d| d == p))
+        })
+        .map(|u| {
+            u.assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string())
+        })
+        .collect();
+    if creators.iter().any(|c| c == seat) {
+        Some(crate::distribute::DISTINCTNESS_FALLBACK_CREATOR_SEAT.to_string())
+    } else if creators
+        .iter()
+        .any(|c| crate::distribute::model_of(c) == crate::distribute::model_of(seat))
+    {
+        Some(crate::distribute::DISTINCTNESS_FALLBACK_SAME_CLI_INSTANCE.to_string())
+    } else {
+        None
+    }
+}
+
 /// (core#718) Whether a failed launch's output is the SEAT's own refusal rather than the run's
 /// environment: today, the wrapped carrier refusing to run a governed claude unit ungoverned
 /// because the host's org settings allow only managed hooks (core#653) — claude's carrier alone
@@ -5228,6 +5284,21 @@ fn apply_step_result(
                 cache_read_tokens: u.cache_read_tokens,
                 cache_creation_tokens: u.cache_creation_tokens,
                 cost_usd,
+            },
+        );
+    }
+    // (core#412) …and an agent unit whose seat reported nothing says so, rather than reading as $0.
+    if output.usage.is_none() && unit.tool_cmd.is_none() {
+        emit(
+            subscribers,
+            CoreEvent::CliUsageUnreported {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                cli: unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string()),
             },
         );
     }
@@ -6140,6 +6211,8 @@ fn apply_step_result(
                         &reason,
                     )?;
                 }
+                // (core#591) Another instance of the creator's CLI is a disclosed fallback.
+                let failover_distinctness = reassign_distinctness(&units, unit_ix, &next);
                 let invocation = crate::registry_roster()
                     .into_iter()
                     .find(|c| c.key == next)
@@ -6158,8 +6231,12 @@ fn apply_step_result(
                         attempt: output.attempt,
                         detail: format!(
                             "seat '{failed_cli}' failed (worker error); failing over to '{next}' \
-                             (seats worker-failed on this unit: {seats_tried}/{})",
-                            session.clis.len().max(seats_tried)
+                             (seats worker-failed on this unit: {seats_tried}/{}){}",
+                            session.clis.len().max(seats_tried),
+                            failover_distinctness
+                                .as_deref()
+                                .map(|f| format!(" [distinctness fallback: {f}]"))
+                                .unwrap_or_default()
                         ),
                         failure_kind: crate::event::StepFailureKind::WorkerError,
                     },
@@ -6587,6 +6664,35 @@ fn apply_step_result(
         } else {
             denial_gate_note(session.human_confirm)
         };
+        // (core#651) A creator whose OWN repo-checks floor ran and failed gets ONE automatic
+        // round with the failing checks' tails before any gate opens — a lint or a spawn-audit
+        // failure the seat can fix itself is not worth an operator round-trip. Never a timed-out
+        // floor (it did not finish: nothing for the creator to fix) nor a floor that did not run.
+        if floor_auto_retry_applies(unit, outcome.hook_denied, &evidence) {
+            let mut u = unit.clone();
+            u.floor_auto_retries = u.floor_auto_retries.saturating_add(1);
+            put_node(store, u.to_node())?;
+            let mut scratch_in_flight = HashSet::new();
+            return match rewind_to_creator_scoped(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                &mut scratch_in_flight,
+                session.clone(),
+                &run_id,
+                Some(FLOOR_AUTO_RETRY_NOTE.to_string()),
+                FLOOR_AUTO_RETRY_SCOPE,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            )? {
+                SessionStatus::Executing => Ok(StepApplied::Continuing),
+                SessionStatus::AwaitingHuman => Ok(StepApplied::Paused),
+                _ => Ok(StepApplied::Finished),
+            };
+        }
         escalate_denied_unit(
             store,
             subscribers,
@@ -6755,6 +6861,64 @@ fn tail_chars(s: &str, cap: usize) -> String {
     } else {
         format!("…{}", s.chars().skip(n - cap).collect::<String>())
     }
+}
+
+/// (core#677) Vault a validator a napi HOST authored (crew's draft self-check, …) — UNAPPROVED, at
+/// the engine's content address. Refused up front: an empty criterion or script, and a script the
+/// run-time backstop would refuse anyway ([`crate::validator::looks_dangerous`]) — so a host learns
+/// at provisioning, not at its first gate.
+fn vault_host_validator(
+    store: &mut dyn GraphStore,
+    criterion: String,
+    script: String,
+) -> anyhow::Result<String> {
+    if criterion.trim().is_empty() || script.trim().is_empty() {
+        anyhow::bail!("bad_request: a validator needs a non-empty criterion and script");
+    }
+    if let Some(why) = crate::validator::looks_dangerous(&script) {
+        anyhow::bail!("bad_request: the script would be refused at run time ({why})");
+    }
+    crate::validator_vault::store_validator(
+        store,
+        &crate::validator::DeterministicValidator {
+            criterion,
+            script,
+            approved: false,
+        },
+    )
+}
+
+/// (core#651) The `unitReworkAmended.scope` token of the automatic creator-floor round.
+pub(crate) const FLOOR_AUTO_RETRY_SCOPE: &str = "floor_auto_retry";
+
+/// (core#651) The marker the automatic round's amendment carries after the floor's own denial
+/// (which already names each failing check with its stdout/stderr tails).
+const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (core#651)] Your own \
+     repo-checks floor ran on the tree you left and FAILED (the checks and their tails are above). \
+     Fix those failures in this round; a second red floor opens the escalation gate for a human.";
+
+/// (core#651) Whether a denied unit takes the one automatic creator-floor round instead of the
+/// escalation gate: an agent CREATOR unit, not hook-denied, whose denial is the repo-checks floor
+/// (`repo_checks`, never `repo_checks_timeout`), on a floor report of this attempt that RAN and
+/// failed (`outcome() == "failed"` — not a refused sandbox, a detect error, or a carried result),
+/// and that has not had its round yet.
+fn floor_auto_retry_applies(
+    unit: &crate::domain::WorkUnit,
+    hook_denied: bool,
+    evidence: &crate::workflow::UnitEvidence,
+) -> bool {
+    unit.role == crate::workflow::PhaseRole::Creator
+        && unit.tool_cmd.is_none()
+        && !hook_denied
+        && unit.floor_auto_retries == 0
+        && unit
+            .denial
+            .as_ref()
+            .is_some_and(|d| d.source == crate::repo_checks::DENIAL_SOURCE)
+        && evidence
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.outcome() == "failed")
 }
 
 /// (core#464) The DENIAL CLASS a denied unit opens the escalation gate under — the token
@@ -7539,6 +7703,7 @@ fn reseat_parked_unit(
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
+    let distinctness_fallback = reassign_distinctness(&units, session.unit_ix, cli);
     let mut moved = unit.clone();
     moved.assigned_cli = Some(cli.to_string());
     moved.assigned_invocation = None;
@@ -7552,6 +7717,7 @@ fn reseat_parked_unit(
             previous_cli,
             new_cli: Some(cli.to_string()),
             previous_attempt_reaped: true,
+            distinctness_fallback,
         },
     );
     Ok(())
@@ -7640,6 +7806,7 @@ fn reseat_off_benched_seat(
             ord: unit.ord,
             attempt: session.attempt,
             previous_cli: seat,
+            distinctness_fallback: reassign_distinctness(units, unit_ix, &next),
             new_cli: Some(next),
             previous_attempt_reaped: false,
         },
@@ -7935,10 +8102,7 @@ fn advance_or_pause(
                     .repo_ref
                     .as_deref()
                     .map_or_else(|| "the run's repository".to_string(), |r| format!("`{r}`"));
-                (
-                    reviewing_ord,
-                    deliver_gate_prompt(unit.ord, &unit.description, &branch, &repo),
-                )
+                (reviewing_ord, deliver_gate_prompt_for(unit, &branch, &repo))
             }
         };
         let ord = unit.ord;
@@ -8095,6 +8259,59 @@ fn filter_triage_decision(
     }
 }
 
+/// (core#686) The deliver gate's consent prompt read from the unit's FIELDS: the card is
+/// [`WorkUnit::instructions`](crate::domain::WorkUnit::instructions), the amendments
+/// [`WorkUnit::amendments`](crate::domain::WorkUnit::amendments), and the intent head is the
+/// description with exactly those known suffixes removed — nothing is split on ` ||| `, so an
+/// intent that contains the separator or the engine's own amendment sentence reads whole. A unit
+/// planned before the fields (or whose description no longer ends in them) takes the legacy
+/// re-parse, flagged on stderr.
+fn deliver_gate_prompt_for(unit: &crate::domain::WorkUnit, branch: &str, repo: &str) -> String {
+    match structured_deliver_parts(unit) {
+        Some((head, card, amendments)) => {
+            deliver_gate_prompt_parts(unit.ord, &head, card, &amendments, branch, repo)
+        }
+        None => {
+            eprintln!(
+                "[wicked-core] deliver unit {} carries no structured card/amendments (a record \
+                 planned before core#686): its gate card is re-parsed from the description \
+                 (legacy)",
+                unit.ord
+            );
+            deliver_gate_prompt(unit.ord, &unit.description, branch, repo)
+        }
+    }
+}
+
+/// (core#686) `(head, card, amendments)` of a structured unit: the description minus each
+/// amendment segment (from the end, newest first) and then minus ` ||| <card>`. `None` for a
+/// legacy record, or when the description does not end in the fields it claims.
+fn structured_deliver_parts(
+    unit: &crate::domain::WorkUnit,
+) -> Option<(String, Option<String>, Vec<String>)> {
+    if !unit.structured_description {
+        return None;
+    }
+    let mut rest = unit.description.as_str();
+    for a in unit.amendments.iter().rev() {
+        let segment = format!("{}{a}", crate::workflow::INTENT_AMENDMENT_PREFIX);
+        rest = rest.strip_suffix(segment.as_str())?;
+    }
+    let card = unit
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    if let Some(c) = card {
+        rest = rest.strip_suffix(format!("{}{c}", crate::plan::INSTRUCTION_SEP).as_str())?;
+    }
+    Some((
+        rest.trim().to_string(),
+        card.map(str::to_string),
+        unit.amendments.clone(),
+    ))
+}
+
 /// The deliver gate's consent prompt (N3, ship re-proof). The deliver unit's description is
 /// `deliver — <intent>` plus, after [`crate::plan::INSTRUCTION_SEP`], the gate-card text the
 /// workflow's author wrote for the phase (crew's `deliverGateInstructions`: what the push will do
@@ -8109,6 +8326,9 @@ fn filter_triage_decision(
 ///  - the engine's own sentence states only what the engine knows — it commits and pushes the
 ///    branch; whether a pull request follows is the card's, or (no card) conditional on the remote;
 ///  - no separator is ever rendered: the intent follows as plain prose.
+///
+/// The legacy reader: the deliver card and amendments RE-PARSED from a flat description (records
+/// planned before core#686). See [`deliver_gate_prompt_for`].
 fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) -> String {
     // The description is `deliver — <intent>`, then ` ||| <card>` (the phase's instructions, authored
     // with the workflow), then one `INTENT_AMENDMENT_PREFIX + <text>` per approved amendment
@@ -8130,28 +8350,45 @@ fn deliver_gate_prompt(ord: u32, description: &str, branch: &str, repo: &str) ->
         ),
         None => (pre.trim(), None),
     };
-    // The amendments ride with the work as prose, each keeping its own prefix sentence; only the
-    // separators that introduce them are dropped.
-    let head = match amendments {
-        Some(a) => {
-            let prose = a
-                .split(crate::workflow::INTENT_AMENDMENT_PREFIX)
+    let amendments: Vec<String> = amendments
+        .map(|a| {
+            a.split(crate::workflow::INTENT_AMENDMENT_PREFIX)
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
-                .map(|t| {
-                    format!(
-                        "{} {t}",
-                        crate::workflow::INTENT_AMENDMENT_PREFIX
-                            .trim_start()
-                            .trim_start_matches("|||")
-                            .trim()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" — ");
-            format!("{head} — {prose}")
-        }
-        None => head.to_string(),
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    deliver_gate_prompt_parts(ord, head, card, &amendments, branch, repo)
+}
+
+/// The deliver gate's prose from its parts — the intent `head`, the author's `card`, and the
+/// approved amendment texts — shared by the structured reader and the legacy re-parse.
+fn deliver_gate_prompt_parts(
+    ord: u32,
+    head: &str,
+    card: Option<String>,
+    amendments: &[String],
+    branch: &str,
+    repo: &str,
+) -> String {
+    // The amendments ride with the work as prose, each keeping its own prefix sentence; only the
+    // separators that introduce them are dropped.
+    let head = if amendments.is_empty() {
+        head.to_string()
+    } else {
+        let sentence = crate::workflow::INTENT_AMENDMENT_PREFIX
+            .trim_start()
+            .trim_start_matches("|||")
+            .trim();
+        let prose = amendments
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("{sentence} {t}"))
+            .collect::<Vec<_>>()
+            .join(" — ");
+        format!("{head} — {prose}")
     };
     let what = match &card {
         // The card owns the push target AND the identity (crew states the configured login and
@@ -8545,11 +8782,7 @@ fn dispatch_unit(
                     label: label.clone(),
                     output,
                 },
-                crate::event::InjectedContext {
-                    ord: u.ord,
-                    label,
-                    output_bytes,
-                },
+                crate::event::InjectedContext::new(u.ord, label, output_bytes),
             ))
         })
         .unzip();
@@ -8574,11 +8807,11 @@ fn dispatch_unit(
         };
         if !output.is_empty() {
             let label = format!("[review — unit {e} — requested changes]");
-            context_items.push(crate::event::InjectedContext {
-                ord: e,
-                label: label.clone(),
+            context_items.push(crate::event::InjectedContext::new(
+                e,
+                label.clone(),
                 output_bytes,
-            });
+            ));
             prior_outputs.push(PriorUnitOutput { label, output });
         }
     }
@@ -8593,11 +8826,11 @@ fn dispatch_unit(
                 .and_then(crate::team::runner::render_for_gate)
             {
                 let label = format!("[team findings — unit {}]", creator.ord);
-                context_items.push(crate::event::InjectedContext {
-                    ord: creator.ord,
-                    label: label.clone(),
-                    output_bytes: text.len(),
-                });
+                context_items.push(crate::event::InjectedContext::new(
+                    creator.ord,
+                    label.clone(),
+                    text.len(),
+                ));
                 prior_outputs.push(PriorUnitOutput {
                     label,
                     output: text,
@@ -8615,11 +8848,11 @@ fn dispatch_unit(
                 &units,
                 unit,
             ) {
-                context_items.push(crate::event::InjectedContext {
+                context_items.push(crate::event::InjectedContext::new(
                     ord,
-                    label: label.clone(),
-                    output_bytes: output.len(),
-                });
+                    label.clone(),
+                    output.len(),
+                ));
                 prior_outputs.push(PriorUnitOutput { label, output });
             }
         }
@@ -8638,11 +8871,11 @@ fn dispatch_unit(
             .unwrap_or_else(|| format!("unit-{}", unit.ord));
         let label = format!("[team step — {step_id} by {member}]");
         let output = crate::domain::get_work_output(store, &unit.id).unwrap_or_default();
-        context_items.push(crate::event::InjectedContext {
-            ord: unit.ord,
-            label: label.clone(),
-            output_bytes: output.len(),
-        });
+        context_items.push(crate::event::InjectedContext::new(
+            unit.ord,
+            label.clone(),
+            output.len(),
+        ));
         prior_outputs.push(PriorUnitOutput {
             label,
             output: format!(
@@ -8659,6 +8892,14 @@ fn dispatch_unit(
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
     if !context_items.is_empty() {
+        // (core#554) Each item reports what the worker RECEIVES, after the carriers' shared clip
+        // (`clip_prior_output`, sized by the block count) — the items and the outputs are pushed
+        // in lockstep above, so they pair by index.
+        debug_assert_eq!(context_items.len(), prior_outputs.len());
+        let count = prior_outputs.len();
+        for (item, p) in context_items.iter_mut().zip(&prior_outputs) {
+            item.deliver(&p.output, count);
+        }
         emit(
             subscribers,
             CoreEvent::UnitContextInjected {
@@ -11181,6 +11422,8 @@ pub(crate) fn confirm_gate(
                 for u in units.iter_mut().skip(session.unit_ix) {
                     if !u.description.contains(&segment) {
                         u.description.push_str(&segment);
+                        // (core#686) …and as a field, read by the deliver card without a split.
+                        u.amendments.push(text.to_string());
                         put_node(store, u.to_node())?;
                     }
                 }
@@ -13209,6 +13452,91 @@ retry the deliver phase";
         ));
     }
 
+    /// core#686: the card and the amendments are read from the unit's FIELDS. The two known
+    /// mis-parses of the flat description now read correctly: (1) an intent that contains the
+    /// engine's full amendment sentence verbatim; (2) a no-card phase whose intent contains
+    /// ` ||| ` (its tail was read as the card). A legacy record (no fields) keeps the re-parse.
+    #[test]
+    fn the_deliver_card_and_amendments_are_read_from_fields_not_split_686() {
+        let card = "Pushes the run branch to origin; opens a pull request as @bot.";
+        let structured = |intent: &str, card: Option<&str>, amendments: &[&str]| {
+            let mut d = format!("deliver — {intent}");
+            if let Some(c) = card {
+                d.push_str(crate::plan::INSTRUCTION_SEP);
+                d.push_str(c);
+            }
+            for a in amendments {
+                d.push_str(&format!("{}{a}", crate::workflow::INTENT_AMENDMENT_PREFIX));
+            }
+            let mut u = WorkUnit::pending("r:deliver", "r", 8, d);
+            u.instructions = card.map(str::to_string);
+            u.amendments = amendments.iter().map(|a| a.to_string()).collect();
+            u.structured_description = true;
+            u
+        };
+        // (1) The intent quotes the engine's amendment sentence; there is a card.
+        let quoting = format!(
+            "document why{}is used",
+            crate::workflow::INTENT_AMENDMENT_PREFIX
+        );
+        let u = structured(&quoting, Some(card), &[]);
+        let p = deliver_gate_prompt_for(&u, "wicked/abc", "`r`");
+        assert!(
+            p.starts_with(&format!("Approve delivery before unit 8 runs. {card}")),
+            "the card leads: {p}"
+        );
+        assert!(
+            p.contains(&format!("The work: deliver — {}.", quoting.trim())),
+            "the intent reads whole: {p}"
+        );
+        // The legacy re-parse of the SAME text loses the card (the mis-parse being fixed).
+        let legacy = deliver_gate_prompt(8, &u.description, "wicked/abc", "`r`");
+        assert!(!legacy.starts_with(&format!("Approve delivery before unit 8 runs. {card}")));
+
+        // (2) No card, and the intent contains ` ||| `: the no-card disclosure, intent verbatim.
+        let u = structured("keep a ||| b as is", None, &[]);
+        let p = deliver_gate_prompt_for(&u, "wicked/abc", "`r`");
+        assert!(
+            p.contains("only if gh resolves that remote to a GitHub repository"),
+            "{p}"
+        );
+        assert!(p.contains("The work: deliver — keep a ||| b as is."), "{p}");
+        let legacy = deliver_gate_prompt(8, &u.description, "wicked/abc", "`r`");
+        assert!(
+            legacy.contains("b as is This step"),
+            "the legacy mis-parse: {legacy}"
+        );
+
+        // A card and two amendments: the card leads, both amendments ride with the work.
+        let u = structured(
+            "add a widget",
+            Some(card),
+            &["clamp at 10", "keep ||| as is"],
+        );
+        let p = deliver_gate_prompt_for(&u, "wicked/abc", "`r`");
+        assert!(p.starts_with(&format!("Approve delivery before unit 8 runs. {card}")));
+        assert!(
+            p.contains("clamp at 10") && p.contains("keep ||| as is"),
+            "{p}"
+        );
+        assert!(p.contains("The work: deliver — add a widget — "), "{p}");
+
+        // A legacy record (no fields) is the old reader, byte-identical.
+        let mut old = WorkUnit::pending("r:deliver", "r", 8, format!("deliver — x ||| {card}"));
+        old.structured_description = false;
+        assert_eq!(
+            deliver_gate_prompt_for(&old, "wicked/abc", "`r`"),
+            deliver_gate_prompt(8, &old.description, "wicked/abc", "`r`")
+        );
+        // A structured unit whose description no longer ends in its fields falls back too.
+        let mut drifted = structured("x", Some(card), &[]);
+        drifted.description.push_str(" (edited)");
+        assert_eq!(
+            deliver_gate_prompt_for(&drifted, "wicked/abc", "`r`"),
+            deliver_gate_prompt(8, &drifted.description, "wicked/abc", "`r`")
+        );
+    }
+
     /// A `LIFT-CONFLICT` strand keeps today's terminal path exactly: crew derives `completed` +
     /// `delivery: stranded` from `failed` + the marker and offers the post-hoc lift — the arm
     /// exempts the marker so that contract does not move.
@@ -13531,6 +13859,153 @@ mod substance_gate_tests {
             "no denial reaches sessionFailed without a decided gate (core#464)"
         );
         (escalated, paused)
+    }
+
+    /// A creator floor report that RAN: `test` exited `exit` (or hit its bound, `timed_out`).
+    fn creator_floor(exit: i32, timed_out: bool) -> crate::workflow::UnitEvidence {
+        let report: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [],
+                "checks": [{
+                    "name": "lint", "argv": ["npm", "run", "lint"], "source": "package.json",
+                    "exit_code": exit, "timed_out": timed_out, "duration_ms": 900,
+                    "stdout_tail": "", "stderr_tail": "src/a.ts:3:1 error no-unused-vars"
+                }],
+                "skipped": [],
+                "passed": exit == 0 && !timed_out,
+                "sandbox_level": "none"
+            }))
+            .unwrap();
+        crate::workflow::UnitEvidence {
+            repo_checks: Some(report),
+            ..Default::default()
+        }
+    }
+
+    /// Fold an Ok creator result at `attempt` (the cursor's) with `evidence`.
+    fn fold_at(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        attempt: u32,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (StepApplied, AgentSession, WorkUnit) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt,
+            output: "Implemented the feature in src/a.ts and wired it into the router.".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        let applied = apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            evidence,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .remove(0);
+        (applied, session, unit)
+    }
+
+    /// core#651: a creator whose own floor ran and FAILED is re-dispatched ONCE with the failing
+    /// checks' tails — no gate — and the round is on the unit; the second red floor opens the
+    /// `floor_failed` escalation gate as before, with no third automatic attempt.
+    #[test]
+    fn a_red_creator_floor_retries_once_automatically_then_escalates_651() {
+        let run_id = format!("floor-auto-retry-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (applied, session, unit) =
+            fold_at(&mut store, &mut subs, &run_id, 0, creator_floor(1, false));
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!((session.unit_ix, session.attempt), (0, 1));
+        assert_eq!(unit.status, UnitStatus::Distributed);
+        assert_eq!(
+            unit.floor_auto_retries, 1,
+            "the round is on the unit (restart-durable)"
+        );
+        let evs = drain_events(&erx);
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::GateEscalated { .. } | CoreEvent::AwaitingHuman { .. }
+            )),
+            "no gate opens on the automatic round: {evs:?}"
+        );
+        let amendment = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitReworkAmended {
+                    amendment, scope, ..
+                } if scope == FLOOR_AUTO_RETRY_SCOPE => Some(amendment.clone()),
+                _ => None,
+            })
+            .expect("unitReworkAmended{floor_auto_retry}");
+        assert!(
+            amendment.contains("no-unused-vars") && amendment.contains("core#651"),
+            "the failing check's tail and the round marker ride the amendment: {amendment}"
+        );
+        assert_eq!(unit.rework_amendment.as_deref(), Some(amendment.as_str()));
+
+        // The second red floor: the escalation gate, as today.
+        let (applied, session, unit) =
+            fold_at(&mut store, &mut subs, &run_id, 1, creator_floor(1, false));
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.floor_auto_retries, 1, "no third automatic attempt");
+        let (escalated, _) = gate_shape(&drain_events(&erx));
+        assert_eq!(
+            (escalated.0.as_str(), escalated.1.as_str()),
+            ("floor_failed", "repo_checks")
+        );
+    }
+
+    /// core#651: a floor that did not FINISH is not something the creator can fix — a timed-out
+    /// creator floor opens the gate at once; and an evaluator's red floor never auto-retries.
+    #[test]
+    fn a_timed_out_or_evaluator_floor_never_auto_retries_651() {
+        for (role, ev, source) in [
+            (
+                PhaseRole::Creator,
+                creator_floor(1, true),
+                "repo_checks_timeout",
+            ),
+            (PhaseRole::Evaluator, creator_floor(1, false), "repo_checks"),
+        ] {
+            let run_id = format!("floor-no-retry-{role:?}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(&mut store, &run_id, role);
+            let mut subs = crate::event_log::EventSink::default();
+            let (esub, erx) = channel();
+            subs.push(esub);
+            let (applied, _session, unit) = fold_at(&mut store, &mut subs, &run_id, 0, ev);
+            assert!(matches!(applied, StepApplied::Paused), "{role:?}");
+            assert_eq!(unit.floor_auto_retries, 0);
+            let (escalated, _) = gate_shape(&drain_events(&erx));
+            assert_eq!(escalated.1, source, "{role:?}");
+        }
     }
 
     /// core#464: a FLOOR denial (the substance floor here — the class every deterministic floor
@@ -15213,6 +15688,119 @@ mod request_changes_tests {
             Some(expected_amendment.as_str()),
             "rework_amendment on the creator unit must be the full amendment"
         );
+    }
+
+    /// A [`StepRunner`] that records every dispatched input — the string handed to the seat is
+    /// read off it, not off the event (core#554 item 3).
+    struct CaptureRunner(Arc<std::sync::Mutex<Vec<StepInput>>>);
+    impl StepRunner for CaptureRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            self.0.lock().unwrap().push(i.clone());
+            NoopRunner.run_unit(i)
+        }
+    }
+
+    /// Request changes at the deliver gate of a seeded run with `note`, through the real
+    /// `confirm_gate`, returning the events and the input the creator's re-dispatch received.
+    fn rework_through_capture(run_id: &str, note: &str) -> (Vec<CoreEvent>, StepInput) {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, run_id);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner: Arc<dyn StepRunner> = Arc::new(CaptureRunner(seen.clone()));
+        let (tx, _rx) = channel::<Command>();
+        let mut in_flight = HashSet::new();
+        confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::RequestChanges {
+                note: Some(note.to_string()),
+            },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let input = loop {
+            if let Some(i) = seen.lock().unwrap().first().cloned() {
+                break i;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the creator was never re-dispatched"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        (drain(&erx), input)
+    }
+
+    fn rework_item(evs: &[CoreEvent]) -> crate::event::InjectedContext {
+        evs.iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitContextInjected { prior_units, .. } => prior_units
+                    .iter()
+                    .find(|u| u.label.contains("requested changes"))
+                    .cloned(),
+                _ => None,
+            })
+            .expect("a requested-changes context item")
+    }
+
+    /// (core#554 items 2 + 3) The operator's note as the WORKER receives it: under the shared
+    /// prior-context budget it arrives verbatim in the wrapped carrier's prompt block and the
+    /// event says `deliveredBytes == outputBytes`, `clipped: false`; a note above the budget is
+    /// clipped by the carrier — and the event now SAYS so (`clipped: true`, `deliveredBytes` the
+    /// size the seat received) instead of reporting the pre-clip length alone.
+    #[test]
+    fn the_rework_note_is_pinned_as_delivered_and_a_clip_is_named_554() {
+        let note = "n".repeat(2400);
+        let (evs, input) =
+            rework_through_capture(&format!("rc-554a-{}", std::process::id()), &note);
+        let item = rework_item(&evs);
+        assert_eq!(
+            item.output_bytes,
+            note.len() + 1,
+            "amendment = \"\\n\" + note"
+        );
+        assert_eq!(item.delivered_bytes, item.output_bytes);
+        assert!(!item.clipped);
+        let block = crate::execute_wrapped::prior_context_prefix(&input.prior_outputs);
+        assert!(
+            block.contains(&format!("requested changes]\n\n{note}\n\n")),
+            "the note reaches the seat verbatim, whole, in its labelled block"
+        );
+
+        let big = "b".repeat(200 * 1024);
+        let (evs, input) = rework_through_capture(&format!("rc-554b-{}", std::process::id()), &big);
+        let item = rework_item(&evs);
+        assert_eq!(item.output_bytes, big.len() + 1);
+        assert!(
+            item.clipped,
+            "a note over the budget is clipped — and named"
+        );
+        assert!(item.delivered_bytes < item.output_bytes);
+        let delivered = input
+            .prior_outputs
+            .iter()
+            .find(|p| p.label.contains("requested changes"))
+            .map(|p| {
+                crate::execute_wrapped::clip_prior_output(&p.output, input.prior_outputs.len())
+            })
+            .expect("the note block was dispatched");
+        assert_eq!(
+            delivered.len(),
+            item.delivered_bytes,
+            "deliveredBytes is what the carrier hands the seat"
+        );
+        assert!(!crate::execute_wrapped::prior_context_prefix(&input.prior_outputs).contains(&big));
     }
 
     /// (core#549, acceptance 2) A 12 KB operator note arrives whole at the creator (no cap on the
@@ -17100,6 +17688,49 @@ mod seat_failover_tests {
             next_failover_seat(&[lone], 0, &roster).as_deref(),
             Some("agy")
         );
+    }
+
+    /// core#591 residual: a failover / reseat onto ANOTHER INSTANCE of the creator's CLI
+    /// (`claude#2` taking over a review of `claude`'s work) is disclosed `same_cli_instance`, the
+    /// creator's own seat `creator_seat`, and a model-distinct seat nothing.
+    #[test]
+    fn a_reassignment_onto_the_creators_cli_instance_is_disclosed_591() {
+        let mut creator = WorkUnit::pending("s:build", "s", 1, "w");
+        creator.assigned_cli = None; // the default seat: claude
+        let mut eval = WorkUnit::pending("s:review", "s", 2, "w");
+        eval.assigned_cli = Some("agy".into());
+        eval.depends_on = vec!["build".into()];
+        eval.worker_failed_clis = vec!["agy".into()];
+        let units = vec![creator, eval];
+        let roster = vec![
+            "claude".to_string(),
+            "agy".to_string(),
+            "claude#2".to_string(),
+        ];
+        let next = next_failover_seat(&units, 1, &roster).expect("claude#2 is eligible");
+        assert_eq!(next, "claude#2");
+        assert_eq!(
+            reassign_distinctness(&units, 1, &next).as_deref(),
+            Some("same_cli_instance")
+        );
+        assert_eq!(
+            reassign_distinctness(&units, 1, "claude").as_deref(),
+            Some("creator_seat")
+        );
+        assert_eq!(reassign_distinctness(&units, 1, "codex"), None);
+        // A unit with no dependencies has no creator to be distinct from.
+        assert_eq!(reassign_distinctness(&units, 0, "claude#2"), None);
+        let j = CoreEvent::UnitReassigned {
+            session: "s".into(),
+            ord: 2,
+            attempt: 1,
+            previous_cli: "agy".into(),
+            new_cli: Some(next.clone()),
+            previous_attempt_reaped: false,
+            distinctness_fallback: reassign_distinctness(&units, 1, &next),
+        }
+        .to_json();
+        assert_eq!(j["distinctnessFallback"], "same_cli_instance");
     }
 }
 

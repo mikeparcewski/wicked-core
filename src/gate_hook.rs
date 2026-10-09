@@ -1308,14 +1308,102 @@ fn shell_tokens(command: &str) -> Vec<String> {
     out
 }
 
-/// Returns `true` for a code-string token that is an absolute filesystem path.
-/// Covers Unix (`/`-rooted), Windows (`C:\`, `\\?\`, UNC `\\server\share\`) via
-/// `Path::is_absolute()`, and explicitly excludes `//`-prefixed tokens (URL authority
-/// components left after splitting on `:`, e.g. `//127.0.0.1` from `http://127.0.0.1`).
-/// INDEPENDENT REVIEW items 1 and 3a. Used only in tests (validates the rule holds).
-#[cfg(test)]
-fn is_abs_path_token(tok: &str) -> bool {
-    !tok.starts_with("//") && std::path::Path::new(tok).is_absolute()
+/// (core#552) `command` with the BODY lines of every quoted-delimiter heredoc (`<<'EOF'`,
+/// `<<"EOF"`, `<<\EOF`, and their `<<-` forms) fed to a data sink (`cat`, `tee`) blanked, up to
+/// and including the line that closes it. A heredoc fed to any other program (a shell, an
+/// interpreter) is a script it RUNS, so its body stays scanned. The operator counts only OUTSIDE quotes on its line (a quoted `"<<'EOF'"` starts nothing,
+/// so a command hidden under a fake body is still scanned); `<<<` (a here-string) is not a
+/// heredoc. An unquoted delimiter leaves its body in place: the shell expands `$(…)` there.
+fn strip_quoted_heredoc_bodies(command: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut close: Option<(String, bool)> = None;
+    for line in command.split('\n') {
+        if let Some((delim, dash)) = &close {
+            let probe = if *dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if probe == delim {
+                close = None;
+            }
+            out.push("");
+            continue;
+        }
+        out.push(line);
+        close = quoted_heredoc_on(line);
+    }
+    out.join("\n")
+}
+
+/// The delimiter (and `<<-` flag) of the quoted-delimiter heredoc operator on `line` that sits
+/// outside quotes, or `None`. FAIL-CLOSED on a line with more than one heredoc operator: the
+/// bodies follow one another (`cat <<EOF <<'DATA'` — the first, unquoted, body is EXPANDED by the
+/// shell), and blanking up to the last delimiter would hide the expanded one, so none is stripped.
+fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
+    let b = line.as_bytes();
+    let (mut i, mut sq, mut dq) = (0usize, false, false);
+    let mut found = None;
+    let mut operators = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if sq {
+            sq = c != b'\'';
+        } else if dq {
+            if c == b'\\' {
+                i += 1;
+            } else if c == b'"' {
+                dq = false;
+            }
+        } else if c == b'\\' {
+            i += 1;
+        } else if c == b'\'' {
+            sq = true;
+        } else if c == b'"' {
+            dq = true;
+        } else if c == b'<' && b.get(i + 1) == Some(&b'<') && b.get(i + 2) == Some(&b'<') {
+            // `<<<` is a here-string, not a heredoc: step over ALL of it, or its second and third
+            // `<` would read as a heredoc operator (codex round 2 on batch 3).
+            i += 3;
+            continue;
+        } else if c == b'<' && b.get(i + 1) == Some(&b'<') {
+            operators += 1;
+            let mut j = i + 2;
+            let dash = b.get(j) == Some(&b'-');
+            if dash {
+                j += 1;
+            }
+            while b.get(j).is_some_and(|c| *c == b' ' || *c == b'\t') {
+                j += 1;
+            }
+            let rest = &line[j..];
+            let word: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&' | '<' | '>'))
+                .collect();
+            let quoted = word.starts_with('\'') || word.starts_with('"') || word.starts_with('\\');
+            let delim: String = word
+                .chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+                .collect();
+            // Only a heredoc feeding a DATA sink (`cat`, `tee`) is data: one fed to `bash`, `sh`,
+            // `python3`, … is a script that program runs, and its body must stay scanned.
+            let program = line[..i]
+                .rsplit(['|', ';', '&', '('])
+                .next()
+                .and_then(|seg| seg.split_whitespace().next())
+                .map(program_basename);
+            // …and only when its output is not piped on (`cat <<'EOF' | sh` runs the body).
+            let piped_on = line[i..].contains('|');
+            if quoted && !delim.is_empty() && !piped_on && matches!(program, Some("cat" | "tee")) {
+                found = Some((delim, dash));
+            }
+            i = j + word.len();
+            continue;
+        }
+        i += 1;
+    }
+    found.filter(|_| operators == 1)
 }
 
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
@@ -1342,6 +1430,10 @@ pub(crate) fn bash_write_targets(command: &str) -> Vec<String> {
 /// issued and false for the ONE inner rescan of a shell `-c` string — a `-c` wrapper found INSIDE
 /// that string is the documented two-level pass, not unwrapped again.
 fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut Vec<String>) {
+    // (core#552) The body of a QUOTED-delimiter heredoc is data the shell never expands, so its
+    // words are no command's arguments: `tee docs/x.md <<'EOF'` naming `/var/log/app.log` in its
+    // body writes only `docs/x.md`. An unquoted heredoc's body still expands `$(…)`, so it stays.
+    let command = &strip_quoted_heredoc_bodies(command);
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -2052,7 +2144,8 @@ fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
 /// Replaces the old deny-all rule with a per-command ALLOWLIST:
 ///
 /// * **`wicked-estate` CLI** — the read-only subcommands [`ESTATE_READ_VERBS`] (`query`,
-///   `blast-radius`, `rank`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`) and
+///   `blast-radius`, `rank`/`hotspots`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`,
+///   `lineage`, `traverse`) and
 ///   `clusters` WITHOUT `--annotate` are ALLOWED; the write subcommands (`index`, `scip`,
 ///   `tfstate`, `import-telemetry`, `compact`, `watch`, `clusters --annotate`) and any
 ///   unrecognised subcommand are DENIED (fail-closed: a future read verb must be added here).
@@ -2314,16 +2407,21 @@ fn graph_store_cwd_bases(
 }
 
 /// The read-only `wicked-estate` subcommands a governed unit may run (DES-GROUNDING-001 §7.1).
-/// `clusters` joins them only WITHOUT `--annotate` (judged at the call site).
-const ESTATE_READ_VERBS: [&str; 8] = [
+/// `clusters` joins them only WITHOUT `--annotate` (judged at the call site). (core#729) `lineage`,
+/// `traverse` and the `rank` alias `hotspots` (estate#241/#242) are read-only too. THE list:
+/// garden's shim mirrors it (`wicked_core::ESTATE_READ_VERBS`), so a new read verb lands here first.
+pub const ESTATE_READ_VERBS: [&str; 11] = [
     "query",
     "blast-radius",
     "rank",
+    "hotspots",
     "stats",
     "source",
     "semantic",
     "cross-graph",
     "subscribe",
+    "lineage",
+    "traverse",
 ];
 /// The `wicked-estate` subcommands that WRITE the graph — named so the reason can say "write
 /// subcommand" rather than "unknown"; anything else unrecognised is denied fail-closed anyway.
@@ -3018,7 +3116,14 @@ pub(crate) fn evaluate_tool_call(
         }
     };
 
-    let phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias);
+    let mut phases = crate::scope::phase_aliases(phase, phase_alias, catalog_alias);
+    // (core#707) The tool itself is a selection token — `tool:<name>` beside the phase aliases —
+    // so a rule scoped to one tool writes `applies_to: [tool:Bash]` instead of matching JSON text
+    // a crafted `args` could carry. Only a tool-shaped name earns one (never a described call).
+    let tool_token = tool_selection_token(tool);
+    if let Some(t) = tool_token.as_deref() {
+        phases.push(t);
+    }
     let selected = match select_any(&store, scope, &phases, context) {
         Ok(s) => s,
         Err(e) => {
@@ -3383,6 +3488,17 @@ fn is_plain_tool_token(token: &str) -> bool {
 ///
 /// This lives at the ONE recording seam — the annotation the three appenders write — so it holds
 /// for every carrier (wrapped hook, ACP bridge, MCP broker) rather than per parse site.
+/// (core#707) The `tool:<name>` selection token for a tool-shaped `tool` (`tool:Bash`,
+/// `tool:mcp__estate__query`); `None` for an empty or described call, which selects nothing extra.
+pub(crate) fn tool_selection_token(tool: &str) -> Option<String> {
+    let t = tool.trim();
+    (!t.is_empty() && !TOOL_NAME_SENTINELS.contains(&t) && is_tool_shaped(t))
+        .then(|| format!("{TOOL_TOKEN_PREFIX}{t}"))
+}
+
+/// The prefix of a [`tool_selection_token`] (`applies_to: [tool:Bash]`).
+pub const TOOL_TOKEN_PREFIX: &str = "tool:";
+
 pub(crate) fn audit_tool_name(tool: &str) -> String {
     let t = tool.trim();
     if t.is_empty() {
@@ -5146,8 +5262,9 @@ mod tests {
         );
 
         // python3 - <<EOF (stdin heredoc shape): denied by opaque-interpreter word.
-        // Heredoc body content is NOT scanned pre-call; the witness catches any out-of-tree
-        // writes after the call (#548).
+        // Heredoc body content is NOT scanned pre-call. The post-hoc witness fingerprints only the
+        // unit's OWN write roots, so it cannot see a write into another tree; that is the OS
+        // write boundary's job where it arms (#548).
         let d = deny_ro(format!(
             "python3 - <<'EOF'\nopen('{}','w')\nEOF",
             w(&wt.join("pwned"))
@@ -5669,56 +5786,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// INDEPENDENT REVIEW item 1 / 3a — `is_abs_path_token` covers Unix, Windows and UNC
-    /// paths via `Path::is_absolute()`, and rejects `//`-prefixed URL authority tokens and
-    /// relative paths. Runs on all platforms without hard-coding path separators.
+    /// core#552: a quoted-delimiter heredoc fed to `cat`/`tee` is data — its body is blanked
+    /// before the scan; one fed to a shell, piped on, unquoted, or opened inside quotes is not.
     #[test]
-    fn absolute_path_detection_cross_platform_ir_item1_3a() {
-        // Relative paths: never absolute.
-        assert!(!is_abs_path_token("relative/x"), "relative path rejected");
-        assert!(!is_abs_path_token("./local"), "dot-relative rejected");
-        assert!(!is_abs_path_token(""), "empty string rejected");
-        // URL authority leftover after splitting on ':' — must be rejected.
-        assert!(!is_abs_path_token("//127.0.0.1"), "URL authority rejected");
-        assert!(
-            !is_abs_path_token("//server/share"),
-            "UNC-style // rejected"
+    fn only_a_quoted_data_heredoc_body_is_blanked_552() {
+        let tee = "tee docs/x.md <<'EOF'\n/var/log/a >> b\nEOF\necho done > /etc/x";
+        assert_eq!(
+            strip_quoted_heredoc_bodies(tee),
+            "tee docs/x.md <<'EOF'\n\n\necho done > /etc/x",
+            "the body and its closing line go; the command after it stays"
         );
-        // On Unix, /tmp/x is absolute.
-        #[cfg(unix)]
-        {
-            assert!(is_abs_path_token("/tmp/x"), "Unix abs accepted");
-            assert!(is_abs_path_token("/etc/hosts"), "Unix abs accepted");
-        }
-        // On Windows, drive-letter, extended-length, and UNC paths are absolute.
-        #[cfg(windows)]
-        {
+        assert!(bash_write_targets(tee).contains(&"/etc/x".to_string()));
+        assert!(!bash_write_targets(tee).contains(&"/var/log/a".to_string()));
+        for kept in [
+            "bash <<'EOF'\necho x > /etc/y\nEOF",
+            "cat <<'EOF' | sh\necho x > /etc/y\nEOF",
+            "cat > f <<EOF\n$(echo x > /etc/y)\nEOF",
+            "echo \"<<'EOF'\"\necho x > /etc/y\nEOF",
+            // (codex on batch 3) Two heredocs on one line: the first, unquoted, body is expanded
+            // by the shell, so nothing up to the quoted one's delimiter may be blanked.
+            "cat <<EOF <<'DATA'\n$(echo x > /etc/y)\nEOF\nliteral\nDATA",
+            // A here-string has no body: the next line is a command.
+            "cat <<<'EOF'\necho x > /etc/y\nEOF",
+        ] {
+            assert_eq!(strip_quoted_heredoc_bodies(kept), kept, "{kept}");
             assert!(
-                is_abs_path_token(r"C:\Users\foo"),
-                "Windows drive-letter abs accepted"
-            );
-            assert!(
-                is_abs_path_token(r"\\?\C:\long\path"),
-                "Windows extended-length abs accepted"
-            );
-            assert!(
-                is_abs_path_token(r"\\srv\share\dir"),
-                "Windows UNC abs accepted"
+                bash_write_targets(kept).contains(&"/etc/y".to_string()),
+                "still scanned: {kept}"
             );
         }
-        // Platform-native temp dir is always absolute and not //-prefixed.
-        let td = std::env::temp_dir().to_string_lossy().into_owned();
-        assert!(is_abs_path_token(&td), "temp_dir() is absolute: {td}");
-        // URL scanner: python3 -c "urlopen('http://127.0.0.1:7701/path')" must produce no
-        // abs-path target from the URL — the token after splitting on non-':' separators
-        // keeps the full URL form, which is_abs_path_token must reject.
-        let url_code = "urlopen('http://127.0.0.1:7701/path')";
-        let has_url_hit = url_code
-            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '(' | ')' | ',' | ';'))
-            .any(is_abs_path_token);
-        assert!(
-            !has_url_hit,
-            "URL token must not be flagged as abs path: {url_code}"
+        assert_eq!(
+            strip_quoted_heredoc_bodies("cat <<-\"END\" > f\n\tbody /etc/z\n\tEND\nls"),
+            "cat <<-\"END\" > f\n\n\nls"
         );
     }
 
@@ -5748,8 +5847,9 @@ mod tests {
 
     /// Regression: 11 realistic own-tree Creator writes are ADMITTED pre-call; the same inputs
     /// are denied for ReadOnly by the program-word rule. Former heredoc-body and interpreter-literal
-    /// scanners caused false denials of these; the post-hoc witness catches out-of-tree effects
-    /// for ReadOnly units only (wicked-core#548).
+    /// scanners caused false denials of these. The post-hoc witness runs for ReadOnly units only
+    /// and fingerprints only their own write roots — it never observes an out-of-tree write; the
+    /// OS write boundary does where it arms (wicked-core#548).
     #[test]
     fn own_tree_creator_writes_admitted_readonly_denied_by_program_word() {
         use crate::path_policy::AllowedRoots;
@@ -5897,6 +5997,54 @@ mod tests {
             "case 11 must be admitted: {c11}"
         );
         assert!(ro_denies(c11).is_some(), "case 11 ReadOnly must be denied");
+
+        // --- core#552 item 4: the review's fatal shapes — a body scanner coming back would deny
+        // each of these own-tree Creator writes (their BODY names an out-of-tree path) ---
+        std::fs::create_dir_all(wt.join("docs")).unwrap();
+        let fatal = [
+            // deploy.sh whose body copies into /var/www/html/
+            format!(
+                "cat > {} <<'EOF'\n#!/bin/sh\ncp -r dist/* /var/www/html/\nEOF",
+                w(&wt.join("scripts").join("deploy.sh"))
+            ),
+            // docs/ops.md describing a write to /etc
+            format!(
+                "cat > {} <<'EOF'\nSet net.core.somaxconn > 1024 in /etc/sysctl.d/99-x.conf on the host.\nEOF",
+                w(&wt.join("docs").join("ops.md"))
+            ),
+            // tee docs/x.md <<EOF with an absolute path in the body
+            format!(
+                "tee {} <<'EOF'\nLogs go to /var/log/app.log >> rotated nightly.\nEOF",
+                w(&wt.join("docs").join("x.md"))
+            ),
+            // src/x.ts whose body names /etc/passwd and a redirect-looking arrow
+            format!(
+                "cat > {} <<'EOF'\nexport const P = '/etc/passwd'; const f = (a) => a > 0;\nEOF",
+                w(&wt.join("src").join("x.ts"))
+            ),
+        ];
+        for (i, c) in fatal.into_iter().enumerate() {
+            let denied = creator_admits(&c);
+            assert!(
+                denied.is_none(),
+                "fatal shape {i} must be admitted for a Creator: {c}\n{denied:?}"
+            );
+            assert!(
+                ro_denies(c).is_some(),
+                "fatal shape {i} ReadOnly must be denied"
+            );
+        }
+        // python3 - <<EOF reading /etc/hosts' size (no write at all)
+        let py = "python3 - <<'EOF'\nimport os\nprint(os.path.getsize('/etc/hosts') > 0)\nEOF"
+            .to_string();
+        assert!(
+            creator_admits(&py).is_none(),
+            "a heredoc that only READS /etc/hosts must be admitted: {py}"
+        );
+        assert!(
+            ro_denies(py).is_some(),
+            "the python heredoc ReadOnly must be denied"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6135,6 +6283,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// core#552 item 2: the collector-mismatch guard pinned through the PRODUCTION fold
+    /// ([`fold_input_denial`]), not a re-implementation of it — a `git ls-files` witness re-checked
+    /// with `.git` unavailable (a raw walk) re-snapshots and admits; removing the fold-site guard
+    /// fails this test (the raw walk sees `.git-bak/**`, a "change"). A real write after the
+    /// re-snapshot still denies, so the fold does read the witness.
+    #[test]
+    fn the_fold_resnapshots_on_a_collector_mismatch_and_still_catches_a_write_552() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-collf-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if !git(&["init", "-q"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: git init failed");
+            return;
+        }
+        std::fs::write(base.join("tracked.rs"), "fn main() {}").unwrap();
+        let _ = git(&["add", "."]);
+        let _ = git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "i",
+        ]);
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("collfold-{}-{tid}", std::process::id());
+        let path = decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_file(&path);
+        append_decision(&path, &allow_claim("a1", "unit-1")).unwrap();
+        let sidecar = write_root_witness_path(&path.to_string_lossy(), "unit-1");
+        let mut entries = Vec::new();
+        assert_eq!(
+            collect_dir_entries_for_witness(&base, &mut entries),
+            CollectorKind::GitLsFiles
+        );
+        entries.sort_unstable();
+        write_write_root_witness(
+            &sidecar,
+            &WitnessSnapshot {
+                roots: vec![base.clone()],
+                collector: CollectorKind::GitLsFiles,
+                entries,
+            },
+        );
+        std::fs::rename(base.join(".git"), base.join(".git-bak")).unwrap();
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap(),
+            None,
+            "a collector change with no file changed is no denial"
+        );
+        assert_eq!(
+            read_write_root_witness(&sidecar).map(|w| w.collector),
+            Some(CollectorKind::RawWalk),
+            "the fold re-snapshotted under the raw walk"
+        );
+        std::fs::write(base.join("escaped.txt"), "x").unwrap();
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap();
+        assert!(
+            denial
+                .as_ref()
+                .is_some_and(|d| d.reason.contains("escaped.txt")),
+            "{denial:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// item 4 — `bash_cd_escape_targets` fires when the command contains a write-CAPABLE
     /// program even if `bash_write_targets` finds no resolvable target. Interpreter-literal
     /// code-string scanning is retired; a Creator-posture unit writing outside its tree through
@@ -6336,6 +6562,92 @@ mod tests {
             vec![app, outbox],
             "only the exact graph dir is dropped"
         );
+    }
+
+    /// core#707: the tool is a selection token — a rule with `applies_to: [tool:Bash]` fires on a
+    /// Bash call in any phase and on no other tool, however the other call's raw input is spelled.
+    #[test]
+    fn a_tool_token_selects_a_rule_for_that_tool_only_707() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        assert_eq!(tool_selection_token("Bash").as_deref(), Some("tool:Bash"));
+        assert_eq!(tool_selection_token("(unknown)"), None);
+        assert_eq!(tool_selection_token("run a shell command"), None);
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-tooltok-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let policy_db = base.join("policy.db").to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&policy_db)).unwrap();
+            wicked_governance::register_policy(
+                &mut store,
+                &wicked_governance::Policy {
+                    id: "pol-tool-bash".into(),
+                    kind: "ops".into(),
+                    applies_to: vec!["tool:Bash".into()],
+                    effect: wicked_governance::Effect::Deny,
+                    trigger: wicked_governance::Trigger { contains: None },
+                    obligations: vec![],
+                    criteria: "no shell in this test".into(),
+                    severity: wicked_governance::Severity::High,
+                    rule: "Deny every Bash call.".into(),
+                    retired: false,
+                },
+            )
+            .unwrap();
+        }
+        let run_id = format!("tooltok-{}-{tid}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0)
+            .to_string_lossy()
+            .into_owned();
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::Full,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        let call = |tool: &str, ctx: serde_json::Value| {
+            evaluate_tool_call(
+                "wicked-agent/tooltok/shared",
+                "unit-1",
+                Some("build"),
+                None,
+                Some(&policy_db),
+                &dpath,
+                &ctx,
+                tool,
+                Some(&boundary),
+            )
+        };
+        let read = wt.join("a.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            call(
+                "Read",
+                serde_json::json!({ "file_path": read, "args": {"tool": "Bash", "command": "rm -rf /"} })
+            ),
+            0,
+            "a Read whose raw input says Bash is not a Bash call"
+        );
+        assert_eq!(
+            call("Bash", serde_json::json!({ "command": "ls" })),
+            2,
+            "the tool:Bash rule fires on a Bash call"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A read-only unit that grounds on the code graph (run 1a22f803's `pa-scope`: the estate
@@ -8132,6 +8444,10 @@ mod boundary_tests {
             format!("wicked-estate semantic 'design pattern' --db {shared}"),
             format!("wicked-estate cross-graph --db {shared}"),
             format!("wicked-estate subscribe --db {shared}"),
+            // core#729: estate#241/#242's read verbs
+            format!("wicked-estate lineage src/lib.rs --db {shared}"),
+            format!("wicked-estate traverse 'fn:main' --depth 2 --db {shared}"),
+            format!("wicked-estate hotspots --db {shared}"),
             // clusters WITHOUT --annotate is read-only
             format!("wicked-estate clusters --json --db {shared}"),
             "wicked-estate.exe stats".to_string(),
