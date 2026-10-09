@@ -1074,6 +1074,9 @@ export declare class Subscription {
  * core#759 (additive): an awaitingHuman with `gateKind: 'team_dispute'` carries
  * `choices: ['approve', 'request_changes', 'reject']` and `recommended: 1` (send the finding
  * back). Every other gate kind carries NEITHER key (absent, never null).
+ * core#759 follow-up (additive): that team_dispute awaitingHuman also carries `findingIds`
+ * (the unresolved HIGH finding ids the dispute is about, as `gate.opened` names them); absent
+ * for every other gate kind.
  */
 export interface CoreEventJson {
   type: string

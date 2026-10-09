@@ -1364,6 +1364,19 @@ fn t5_c_final_pass_timeout_pauses_team_dispute_and_a_late_fold_changes_nothing()
         .collect();
     assert_eq!(dispute.len(), 1, "{opened:?}");
     assert_eq!(dispute[0]["finding_ids"].as_array().unwrap().len(), 1);
+    // (core#759 follow-up) The awaitingHuman frame names the same findings as `gate.opened`.
+    let frame_ids: Vec<serde_json::Value> = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::AwaitingHuman {
+                session, gate_kind, ..
+            } if session == "t5c" && gate_kind == "team_dispute" => {
+                ev.to_json()["findingIds"].as_array().cloned()
+            }
+            _ => None,
+        })
+        .expect("the dispute frame carries findingIds");
+    assert_eq!(&frame_ids, dispute[0]["finding_ids"].as_array().unwrap());
     let decided = payloads(&rig, "t5c", tev::GATE_DECIDED);
     assert!(
         decided

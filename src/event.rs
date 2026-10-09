@@ -548,6 +548,12 @@ pub enum CoreEvent {
         /// (a worker failure the operator may retry) or `triage` (a failure triage escalated). A
         /// consumer keys on this, never on the prompt's wording.
         gate_kind: String,
+        /// (core#759 follow-up) For a `team_dispute` pause: the ids of the unresolved HIGH
+        /// findings the dispute is about (the run's `team.dispute.finding_ids`, the same list
+        /// `gate.opened{kind: team_dispute}` carries), so a client can name them beside the
+        /// answers without reading the team stream. Empty for every other kind, and then ABSENT
+        /// on the wire.
+        finding_ids: Vec<String>,
     },
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
@@ -1708,8 +1714,12 @@ impl CoreEvent {
                 reviewing_ord,
                 prompt,
                 gate_kind,
+                finding_ids,
             } => {
                 let mut j = json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind });
+                if !finding_ids.is_empty() {
+                    j["findingIds"] = json!(finding_ids);
+                }
                 // (core#759) A gate whose answers are fixed by its kind names them, so a client
                 // never parses the prompt's prose for the middle arm. ABSENT for every other kind
                 // (a `null` would read as a free-text gate).
@@ -2534,6 +2544,11 @@ mod tests {
                 reviewing_ord: Some(6),
                 prompt: "p".into(),
                 gate_kind: kind.into(),
+                finding_ids: if kind == "team_dispute" {
+                    vec!["F-1".into(), "F-2".into()]
+                } else {
+                    Vec::new()
+                },
             }
             .to_json()
         };
@@ -2543,6 +2558,7 @@ mod tests {
             serde_json::json!(["approve", "request_changes", "reject"])
         );
         assert_eq!(j["recommended"], 1);
+        assert_eq!(j["findingIds"], serde_json::json!(["F-1", "F-2"]));
         for kind in [
             "def",
             "escalation",
@@ -2552,7 +2568,9 @@ mod tests {
         ] {
             let j = frame(kind);
             assert!(
-                j.get("choices").is_none() && j.get("recommended").is_none(),
+                j.get("choices").is_none()
+                    && j.get("recommended").is_none()
+                    && j.get("findingIds").is_none(),
                 "{kind}: {j}"
             );
         }

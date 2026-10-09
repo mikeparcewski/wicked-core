@@ -3338,6 +3338,7 @@ mod tests {
                 reviewing_ord: Some(1),
                 prompt: s(),
                 gate_kind: s(),
+                finding_ids: Vec::new(),
             },
             "awaitingHuman",
             &[
