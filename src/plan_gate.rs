@@ -1348,7 +1348,7 @@ fn path_scored(
         json!({
             "changed_symbols": s.changed_symbols, "dependents": s.dependents,
             "products": s.products, "contract_change": s.contract_change, "test_gap": s.test_gap,
-            "critical": s.critical, "destructive": s.destructive, "truncated": s.truncated,
+            "critical": s.critical, "destructive": s.destructive, "truncated": s.truncated(),
         })
     });
     let model = a

@@ -116,8 +116,19 @@ pub(crate) struct ImpactSignals {
     pub unindexed: u32,
     pub critical: bool,
     pub destructive: bool,
-    /// A traversal hit a cap, so `dependents` is a lower bound.
-    pub truncated: bool,
+    /// A traversal's node cap dropped a reachable node, so `dependents` is a lower bound
+    /// (estate's `Subgraph::node_cap_reached`).
+    pub node_cap_reached: bool,
+    /// A traversal's hop horizon left dependents beyond [`Thresholds::hops`] uncounted
+    /// (estate's `Subgraph::depth_horizon_reached`). `dependents` is exact within the horizon.
+    pub depth_horizon_reached: bool,
+}
+
+impl ImpactSignals {
+    /// Either cause: `dependents` is not the whole blast radius. The wire's `truncated` field.
+    pub(crate) fn truncated(&self) -> bool {
+        self.node_cap_reached || self.depth_horizon_reached
+    }
 }
 
 /// The deterministic score and how it was reached, one line per contribution.
@@ -539,7 +550,8 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
     let mut untested = 0u32;
     for seed in &seeds {
         let sub = store.traverse(seed, &spec)?;
-        s.truncated |= sub.truncated;
+        s.node_cap_reached |= sub.node_cap_reached;
+        s.depth_horizon_reached |= sub.depth_horizon_reached;
         let mut tested = false;
         for n in &sub.nodes {
             if !sub.depths.contains_key(&n.symbol.0) || seed_ids.contains(n.symbol.0.as_str()) {
@@ -565,6 +577,18 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
 /// their test reach is unknown — never "untested".
 fn unindexed_note(unindexed: u32) -> String {
     format!("{unindexed} unindexed path(s) with unknown test reach")
+}
+
+/// The reach reason's note on an incomplete traversal, by cause (core#692): a node cap makes
+/// `dependents` a lower bound ("capped"); a hop horizon only means dependents exist further out
+/// than the table counts ("depth-limited"). Both can hold.
+fn truncation_note(s: &ImpactSignals) -> &'static str {
+    match (s.node_cap_reached, s.depth_horizon_reached) {
+        (true, true) => " (capped, depth-limited)",
+        (true, false) => " (capped)",
+        (false, true) => " (depth-limited)",
+        (false, false) => "",
+    }
 }
 
 /// The deterministic score from the table.
@@ -596,7 +620,7 @@ pub(crate) fn impact_score_in(t: &Thresholds, s: &ImpactSignals) -> Score {
             },
             s.dependents,
             t.hops,
-            if s.truncated { " (capped)" } else { "" }
+            truncation_note(s)
         ));
     }
     let span = s.products.saturating_sub(1).min(t.product_max_steps) * t.product_step;
