@@ -242,6 +242,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // declaration must ride the unit.
             unit.executes_code = phase.executes_code;
             unit.budget_secs = phase.budget_secs;
+            // (core#810) The phase's worker pool rides the unit: distribution reads it to seat the
+            // creator's monitors, and has no route back to the def.
+            unit.pool = phase.pool;
             // (BC-80, core#535) Carry the phase's `requires_capture_report` declaration for the
             // same reason `executes_code` rides the unit: the fold that reads the capture marker
             // has no route back to the def.
@@ -534,6 +537,10 @@ pub struct PlanStep {
     /// budget takes any; the carrier's ceiling still applies above it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_secs: Option<u64>,
+    /// (core#810) The step's worker pool (one creator plus `pool − 1` monitors): may only LOWER
+    /// the entry's (an entry with no pool is a pool of 1, so a step may only restate 1 there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,6 +607,8 @@ pub enum PlanRefusal {
     GateLowered { step: String, catalog: String },
     /// (ASK-K1b) The step's `budget_secs` is larger than its entry's.
     BudgetLoosened { step: String, catalog: String },
+    /// (core#810) The step's `pool` is larger than its entry's (absent = 1).
+    PoolRaised { step: String, catalog: String },
     /// The step clears the pin of an entry that carries one.
     PinRemoved { step: String, catalog: String },
     /// The step sets a pin other than the one its entry carries (a swap, even to an approved pin).
@@ -670,6 +679,7 @@ impl PlanRefusal {
             PlanRefusal::RoleChanged { .. } => "role_changed",
             PlanRefusal::GateLowered { .. } => "gate_lowered",
             PlanRefusal::BudgetLoosened { .. } => "budget_loosened",
+            PlanRefusal::PoolRaised { .. } => "pool_raised",
             PlanRefusal::PinRemoved { .. } => "pin_removed",
             PlanRefusal::PinChanged { .. } => "pin_changed",
             PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
@@ -715,6 +725,10 @@ impl std::fmt::Display for PlanRefusal {
                      lower it"
                 )
             }
+            PlanRefusal::PoolRaised { step, catalog } => write!(
+                f,
+                "{r}: step {step} may not raise {catalog}'s pool \u{2014} a step may only lower it"
+            ),
             PlanRefusal::GateLowered { step, catalog } => {
                 write!(
                     f,
@@ -867,6 +881,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("validator_pin", FieldRule::SetIfUnset),
     ("executes_code", FieldRule::TightenOnly),
     ("budget_secs", FieldRule::TightenOnly),
+    ("pool", FieldRule::TightenOnly),
     ("required_deliverables", FieldRule::TightenOnly),
     ("executor", FieldRule::ToolEntriesOnly),
     ("instructions", FieldRule::SetIfUnset),
@@ -959,10 +974,12 @@ pub fn compose(
         phases,
         base_skill_ref: None,
     };
-    // The composed def is judged exactly as a registered one is (`WorkflowRegistry::register`).
+    // The composed def is judged exactly as a registered one is, by the engine's own entry
+    // (`WorkflowRegistry::register_composed`): every rule but the user-workflow-only ones — the
+    // reserved namespace, and (core#810) a pool above 1, which only a composed plan can seat.
     let mut probe = crate::workflow::WorkflowRegistry::default();
     probe
-        .register(def.clone())
+        .register_composed(def.clone())
         .map_err(PlanRefusal::InvalidDef)?;
     Ok(def)
 }
@@ -1045,6 +1062,14 @@ fn apply_step(
             return refuse(|step, catalog| PlanRefusal::BudgetLoosened { step, catalog });
         }
         phase.budget_secs = Some(budget);
+    }
+    // pool — TightenOnly: lower the entry's worker pool (absent = 1), never raise it (core#810).
+    // A pool of 0 is refused by the composed def's own validation (`pool_out_of_range`).
+    if let Some(pool) = step.pool {
+        if pool > entry.pool_size() {
+            return refuse(|step, catalog| PlanRefusal::PoolRaised { step, catalog });
+        }
+        phase.pool = Some(pool);
     }
     // required_deliverables — TightenOnly: a superset of the entry's.
     if let Some(deliverables) = &step.required_deliverables {
@@ -1751,6 +1776,60 @@ mod tests {
                 .unwrap();
         let v = serde_json::to_value(&bare).unwrap();
         assert!(v.get("monitors").is_none() && v["steps"][0].get("budget_secs").is_none());
+    }
+
+    /// (core#810) `pool` composes TightenOnly: on an entry with a pool a step lowers it (and the
+    /// unit carries it), restating is fine, raising is refused by name; on an entry with none
+    /// (pool 1) a step may not raise it; a 0 fails the composed def's validation.
+    #[test]
+    fn pool_composes_lower_only_and_lands_on_the_unit_810() {
+        let mut pooled = crate::catalog::catalog().to_vec();
+        pooled.iter_mut().find(|e| e.id == "build").unwrap().pool = Some(3);
+        let step = |id: &str, pool: u8| -> PlanSteps {
+            serde_json::from_value(serde_json::json!({"steps": [
+                {"catalog": "understand", "id": "understand"},
+                {"catalog": id, "id": id, "pool": pool}
+            ]}))
+            .unwrap()
+        };
+        let def = compose(&pooled, &step("build", 2)).expect("lowering composes");
+        let build = def.phases.iter().find(|p| p.id == "build").unwrap();
+        assert_eq!(build.pool, Some(2));
+        let units = plan_from_def(&def, "add a flag", "r1");
+        let unit = units
+            .iter()
+            .find(|u| u.phase_id() == Some("build"))
+            .unwrap();
+        assert_eq!(unit.pool, Some(2), "the unit carries the phase's pool");
+        assert_eq!(
+            compose(&pooled, &step("build", 3)).unwrap().phases[1].pool,
+            Some(3),
+            "restating the entry's pool is fine"
+        );
+        let err = compose(&pooled, &step("build", 4)).unwrap_err();
+        assert_eq!(err.reason(), "pool_raised");
+        assert_eq!(
+            err.to_string(),
+            "pool_raised: step build may not raise build's pool \u{2014} a step may only lower it"
+        );
+        // An entry with no pool is a pool of 1: a step may restate 1, never raise it.
+        let catalog = crate::catalog::catalog();
+        assert!(compose(catalog, &step("build", 1)).is_ok());
+        assert_eq!(
+            compose(catalog, &step("build", 2)).unwrap_err().reason(),
+            "pool_raised"
+        );
+        assert_eq!(
+            compose(&pooled, &step("build", 0)).unwrap_err().reason(),
+            "invalid_def",
+            "a pool of 0 is out of range"
+        );
+        // Absent stays absent on the wire.
+        let bare: PlanSteps =
+            serde_json::from_value(serde_json::json!({"steps": [{"catalog": "build"}]})).unwrap();
+        assert!(serde_json::to_value(&bare).unwrap()["steps"][0]
+            .get("pool")
+            .is_none());
     }
 
     /// (ASK-K1b) The carrier's wall budget is `min(ceiling, budget)`: a budget lowers the ceiling,

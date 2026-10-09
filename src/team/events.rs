@@ -851,6 +851,12 @@ pub struct StepClaimed {
     pub baseline_tree: Option<String>,
     pub repo: Option<RepoRef>,
     pub code_graph_db: Option<String>,
+    /// (core#810) The monitor seat instances distribution filled the unit's worker pool with
+    /// (`PoolSeating::monitors`): the supervisor summons them FIRST, and its target is at least
+    /// their count. Empty (not written, so an older row re-serialises byte-identical) for a pool
+    /// of 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<String>,
 }
 
 /// 10 — `checkpoint.reached` (R, the carrier).

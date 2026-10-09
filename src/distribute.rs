@@ -26,7 +26,7 @@
 
 use wicked_council::AgenticCli;
 
-use crate::domain::{BenchedSeat, RoutingInfo, WorkUnit};
+use crate::domain::{BenchedSeat, PoolSeating, RoutingInfo, WorkUnit};
 use crate::skills_snapshot::{SeatRequirement, SkillsError, SkillsSnapshot, NONPORTABLE_SEAT};
 
 /// The distribution decision for one unit (positionally aligned with the input units).
@@ -88,6 +88,9 @@ pub struct Distribution {
     /// `None` when the unit is separated, is not an evaluator, or is a tool unit. Rides
     /// `unitDistributed.distinctnessFallback`.
     pub distinctness_fallback: Option<String>,
+    /// (core#810) How the unit's worker pool was filled ([`pool_seating`]): `None` for a pool of
+    /// 1 and for a tool unit. Rides `unitDistributed.pool` and is persisted on the unit.
+    pub pool: Option<crate::domain::PoolSeating>,
 }
 
 /// (core#461) [`Distribution::distinctness_fallback`] when the evaluator STAYS on a creator seat.
@@ -162,6 +165,7 @@ fn tool_distribution(unit: &WorkUnit) -> Distribution {
         degraded_reason: None,
         benched: Vec::new(),
         distinctness_fallback: None,
+        pool: None,
     }
 }
 
@@ -181,6 +185,7 @@ fn teamed_distribution(candidates: &[AgenticCli]) -> Distribution {
         degraded_reason: None,
         benched: Vec::new(),
         distinctness_fallback: None,
+        pool: None,
     }
 }
 
@@ -637,8 +642,124 @@ pub(crate) fn distribute_units_against_benched(
             (_, Some(bench), Some(gov)) => Some(format!("{bench}; {gov}")),
             (_, bench, gov) => bench.or(gov),
         };
+        // (core#810) The unit's worker pool, judged on its FINAL seat (after the fence moved it).
+        d.pool = pool_seating(u, &d.assigned_cli, pa.as_deref(), &still_eligible, &benched);
     }
     Ok(dists)
+}
+
+/// (core#810) [`pool_seating`] RE-DERIVED at dispatch, against the run's CURRENT seats: the
+/// unit's `assigned_cli` as it stands (a failover, a bench reseat or an operator reassign may
+/// have moved it since distribution), the roster minus every seat benched since (`clis` minus
+/// `benched`, the failover ladder's rule), and the PA as the run recorded it (`primary`, else the
+/// first eligible seat — distribution's rule). Pure; `None` for a pool of 1 or an unseated unit.
+pub(crate) fn refill_pool(
+    unit: &WorkUnit,
+    clis: &[String],
+    benched: &[BenchedSeat],
+    primary: Option<&str>,
+) -> Option<PoolSeating> {
+    let creator = unit.assigned_cli.as_deref()?;
+    let eligible: Vec<String> = clis
+        .iter()
+        .filter(|k| !benched.iter().any(|b| &b.cli == *k))
+        .cloned()
+        .collect();
+    let pa = unit
+        .team_run
+        .then(|| primary.or(eligible.first().map(String::as_str)))
+        .flatten();
+    pool_seating(unit, creator, pa, &eligible, benched)
+}
+
+/// (core#810) Fill a unit's worker pool: ONE creator — the seat routing already gave the unit —
+/// plus up to `pool − 1` MONITORS that watch its attempt. Never parallel creators.
+///
+/// The monitors come from the still-ELIGIBLE (signed-in, unbenched) seat instances only, each
+/// distinct from the creator's instance and from the run's PA (which the team supervisor never
+/// seats as a member): a model-distinct seat first, then another instance of the creator's cli,
+/// roster order within each — the member-step pick's preference. The evaluator≠creator fence is
+/// untouched: the creator here is the unit's final seat, and the supervisor re-checks at summon
+/// that no member is the creator's instance (a later failover cannot slip one in unseen).
+///
+/// A pool larger than what is signed in is SEATED SHORT and disclosed — requested, seated, the
+/// configured instances that are not signed in (`missing`), and why — never refused. Monitors
+/// watch an attempt only on a TEAM run (the supervisor's bus); any other unit seats its creator
+/// alone and says so. `None` for a pool of 1 and for a tool unit: nothing to disclose.
+fn pool_seating(
+    unit: &WorkUnit,
+    creator: &str,
+    pa: Option<&str>,
+    eligible: &[String],
+    benched: &[BenchedSeat],
+) -> Option<PoolSeating> {
+    let requested = unit.pool.unwrap_or(1);
+    if unit.tool_cmd.is_some() || requested <= 1 {
+        return None;
+    }
+    let distinct = |k: &str| k != creator && Some(k) != pa;
+    let monitors: Vec<String> = if unit.team_run {
+        let (model_distinct, same_cli): (Vec<&String>, Vec<&String>) = eligible
+            .iter()
+            .filter(|k| distinct(k))
+            .partition(|k| model_of(k) != model_of(creator));
+        model_distinct
+            .into_iter()
+            .chain(same_cli)
+            .take(usize::from(requested - 1))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let seated = 1 + u8::try_from(monitors.len()).unwrap_or(u8::MAX - 1);
+    if seated >= requested {
+        return Some(PoolSeating {
+            requested,
+            seated,
+            monitors,
+            missing: Vec::new(),
+            shortfall: None,
+        });
+    }
+    if !unit.team_run {
+        return Some(PoolSeating {
+            requested,
+            seated,
+            monitors,
+            missing: Vec::new(),
+            shortfall: Some(format!(
+                "pool {requested}, seated 1: monitors watch an attempt only on a team run (a \
+                 catalog-composed plan), so unit {} runs on its creator '{creator}' alone",
+                unit.ord
+            )),
+        });
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for b in benched {
+        if distinct(&b.cli) && !missing.contains(&b.cli) {
+            missing.push(b.cli.clone());
+        }
+    }
+    let remedy = if missing.is_empty() {
+        "declare and sign in another seat instance (e.g. claude#2) to fill it".to_string()
+    } else {
+        format!("not signed in: {}", missing.join(", "))
+    };
+    Some(PoolSeating {
+        requested,
+        seated,
+        shortfall: Some(format!(
+            "pool {requested}, seated {seated}: {} signed-in seat instance(s) distinct from the \
+             creator '{creator}'{} — the run continues short; {remedy}",
+            monitors.len(),
+            pa.filter(|p| *p != creator)
+                .map(|p| format!(" and the PA '{p}'"))
+                .unwrap_or_default(),
+        )),
+        monitors,
+        missing,
+    })
 }
 
 /// The first seat-instance key of `cli` (`<cli>#2`, `<cli>#3`, …) the roster does not already
@@ -1702,6 +1823,7 @@ mod tests {
             degraded_reason: None,
             benched: Vec::new(),
             distinctness_fallback: None,
+            pool: None,
         }
     }
 
@@ -2717,6 +2839,152 @@ mod tests {
         assert_eq!(dists[1].assigned_cli, "pi");
         assert_eq!(dists[0].degraded_reason, None);
         assert_eq!(dists[1].degraded_reason, None);
+    }
+
+    // ── core#810: the per-phase worker pool (one creator + pool − 1 monitors) ─────────────────
+
+    /// core#810: the dispatch-time re-fill. After a failover moved the creator onto a former
+    /// monitor, and a monitor was benched since distribution, the fill never names the creator,
+    /// the PA or a benched seat; the freed seat fills in, and a new shortfall names what is
+    /// missing.
+    #[test]
+    fn the_pool_is_refilled_against_the_current_seats_at_dispatch_810() {
+        use crate::domain::StageKind;
+        let mut u = pooled(staged(1, StageKind::Build), 3, true);
+        let clis: Vec<String> = ["claude", "codex", "pi", "claude#2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // As distributed: creator codex (a member step), PA claude, monitors pi + claude#2.
+        u.assigned_cli = Some("codex".into());
+        let p = refill_pool(&u, &clis, &[], Some("claude")).unwrap();
+        assert_eq!(p.monitors, ["pi", "claude#2"]);
+        // Failover onto pi, and claude#2 benched since: pi is the creator now, codex is free.
+        u.assigned_cli = Some("pi".into());
+        let bench = [BenchedSeat {
+            cli: "claude#2".into(),
+            reason: "not_logged_in".into(),
+            source: "worker".into(),
+        }];
+        let p = refill_pool(&u, &clis, &bench, Some("claude")).unwrap();
+        assert_eq!(p.monitors, ["codex"], "{p:?}");
+        assert_eq!((p.requested, p.seated), (3, 2));
+        assert_eq!(p.missing, ["claude#2"]);
+        assert!(p.shortfall.is_some());
+        // No primary recorded: the PA is the first eligible seat, as distribution has it.
+        let p = refill_pool(&u, &clis, &bench, None).unwrap();
+        assert!(!p.monitors.contains(&"claude".to_string()), "{p:?}");
+        // A pool of 1 or an unseated unit: nothing.
+        u.assigned_cli = None;
+        assert_eq!(refill_pool(&u, &clis, &[], None), None);
+    }
+
+    fn pooled(mut u: WorkUnit, pool: u8, team_run: bool) -> WorkUnit {
+        u.pool = Some(pool);
+        u.team_run = team_run;
+        u
+    }
+
+    /// core#810, N ≤ available: a team build with pool 3 seats its creator (the PA, `claude`)
+    /// plus two monitors from DISTINCT signed-in instances — model-distinct first (`codex`, `pi`)
+    /// before another instance of the creator's cli — and a team review with pool 2 keeps the
+    /// evaluator≠creator fence (it lands off the builder) and takes a monitor that is neither its
+    /// own seat nor the PA. No shortfall, nothing missing.
+    #[test]
+    fn pool_fills_monitors_from_distinct_signed_in_instances_810() {
+        use crate::domain::StageKind;
+        let units = [
+            pooled(staged(1, StageKind::Build), 3, true),
+            pooled(staged(2, StageKind::Review), 2, true),
+        ];
+        let roster = [seat("claude"), seat("claude#2"), seat("codex"), seat("pi")];
+        let dists = distribute_units_against_benched(&units, &roster, "r1", None, &[])
+            .expect("a pool never refuses the run");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        let build = dists[0].pool.as_ref().expect("pool 3 is disclosed");
+        assert_eq!(
+            build,
+            &PoolSeating {
+                requested: 3,
+                seated: 3,
+                monitors: vec!["codex".into(), "pi".into()],
+                missing: vec![],
+                shortfall: None,
+            }
+        );
+        let review_seat = dists[1].assigned_cli.as_str();
+        assert_ne!(review_seat, "claude", "evaluator≠creator still holds");
+        let review = dists[1].pool.as_ref().expect("pool 2 is disclosed");
+        assert_eq!((review.requested, review.seated), (2, 2));
+        assert_eq!(review.monitors.len(), 1);
+        assert!(
+            review.monitors[0] != review_seat && review.monitors[0] != "claude",
+            "a monitor is never the unit's own seat nor the PA: {review:?}"
+        );
+        for d in &dists {
+            let p = d.pool.as_ref().unwrap();
+            assert!(!p.monitors.contains(&d.assigned_cli), "{p:?}");
+        }
+    }
+
+    /// core#810, N > available: pool 4 on a roster with one more signed-in instance and a
+    /// signed-out `codex` seats SHORT — creator + `claude#2` — and discloses requested 4 /
+    /// seated 2 / missing `[codex]` with the reason. The run is NOT refused.
+    #[test]
+    fn pool_larger_than_the_signed_in_instances_seats_short_and_discloses_810() {
+        use crate::domain::StageKind;
+        let units = [pooled(staged(1, StageKind::Build), 4, true)];
+        let roster = [seat("claude"), seat("claude#2"), unusable(seat("codex"))];
+        let dists = distribute_units_against_benched(&units, &roster, "r1", None, &[])
+            .expect("a shortfall continues with what is available");
+        let p = dists[0].pool.as_ref().unwrap();
+        assert_eq!((p.requested, p.seated), (4, 2));
+        assert_eq!(p.monitors, vec!["claude#2".to_string()]);
+        assert_eq!(p.missing, vec!["codex".to_string()]);
+        let why = p.shortfall.as_deref().expect("a shortfall says why");
+        assert!(
+            why.starts_with("pool 4, seated 2:") && why.contains("not signed in: codex"),
+            "{why}"
+        );
+        // A one-seat roster: nothing distinct to seat and nothing benched — the remedy is a new
+        // instance, still not a refusal.
+        let dists =
+            distribute_units_against_benched(&units, &[seat("claude")], "r1", None, &[]).unwrap();
+        let p = dists[0].pool.as_ref().unwrap();
+        assert_eq!((p.requested, p.seated, p.monitors.len()), (4, 1, 0));
+        assert!(p.missing.is_empty());
+        assert!(
+            p.shortfall
+                .as_deref()
+                .unwrap()
+                .contains("declare and sign in another seat instance"),
+            "{p:?}"
+        );
+    }
+
+    /// core#810: a pool of 1 (or none) and a tool unit disclose nothing; a pool on a NON-team
+    /// unit seats its creator alone and says monitors watch only on a team run.
+    #[test]
+    fn pool_of_one_is_silent_and_a_non_team_pool_says_why_810() {
+        use crate::domain::StageKind;
+        let roster = [seat("claude"), seat("codex")];
+        let units = [
+            staged(1, StageKind::Build),
+            pooled(staged(2, StageKind::Build), 1, true),
+            pooled(staged(3, StageKind::Build), 3, false),
+        ];
+        let dists = distribute_units_against_benched(&units, &roster, "r1", None, &[]).unwrap();
+        assert_eq!(dists[0].pool, None);
+        assert_eq!(dists[1].pool, None);
+        let p = dists[2].pool.as_ref().unwrap();
+        assert_eq!((p.requested, p.seated, p.monitors.len()), (3, 1, 0));
+        assert!(
+            p.shortfall
+                .as_deref()
+                .unwrap()
+                .contains("only on a team run"),
+            "{p:?}"
+        );
     }
 }
 

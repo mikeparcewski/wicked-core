@@ -2994,6 +2994,7 @@ mod tests {
             degraded_reason: None,
             seat_constraint: None,
             distinctness_fallback: None,
+            pool: None,
         });
         for key in emitted.as_object().expect("object").keys() {
             assert!(
@@ -3135,6 +3136,7 @@ mod tests {
                 degraded_reason: None,
                 seat_constraint: None,
                 distinctness_fallback: None,
+                pool: None,
             },
             "unitDistributed",
             &[
@@ -3161,6 +3163,10 @@ mod tests {
                 // that is a different INSTANCE of a builder's cli. Additive; emitted
                 // unconditionally.
                 "distinctnessFallback",
+                // (core#810) How the unit's worker pool was filled (`{requested, seated,
+                // monitors, missing, shortfall}` | null for a pool of 1). Additive; emitted
+                // unconditionally.
+                "pool",
             ],
         );
         check(

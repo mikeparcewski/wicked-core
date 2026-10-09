@@ -208,6 +208,11 @@ pub enum CoreEvent {
         /// [`crate::distribute::Distribution::distinctness_fallback`]). Additive; emitted
         /// unconditionally, the `degraded_reason` rule.
         distinctness_fallback: Option<String>,
+        /// (core#810) How the unit's worker pool (one creator plus `pool − 1` monitors) was
+        /// filled: `{requested, seated, monitors, missing, shortfall}`; `None` (wire `null`) for a
+        /// pool of 1 and a tool unit. A pool larger than the signed-in instances is seated short
+        /// and disclosed here, never refused. Additive; emitted unconditionally.
+        pool: Option<crate::domain::PoolSeating>,
     },
     /// The council was convened to pick a CLI for a unit (distribution vote started).
     CouncilConvened {
@@ -1466,6 +1471,7 @@ impl CoreEvent {
                 degraded_reason,
                 seat_constraint,
                 distinctness_fallback,
+                pool,
             } => {
                 json!({
                     "type": "unitDistributed",
@@ -1485,6 +1491,14 @@ impl CoreEvent {
                     // (core#461, core#591) Same rule: a consumer keys on the TOKEN —
                     // `"creator_seat"` or `"same_cli_instance"` — never on prose.
                     "distinctnessFallback": distinctness_fallback,
+                    // (core#810) Same rule: `null` = a pool of 1 (or a tool unit), never absent.
+                    "pool": pool.as_ref().map(|p| json!({
+                        "requested": p.requested,
+                        "seated": p.seated,
+                        "monitors": p.monitors,
+                        "missing": p.missing,
+                        "shortfall": p.shortfall,
+                    })),
                 })
             }
             CoreEvent::CouncilConvened { session, ord, clis } => json!({
@@ -2700,6 +2714,7 @@ mod tests {
             degraded_reason: None,
             seat_constraint: seat_constraint.map(str::to_string),
             distinctness_fallback: None,
+            pool: None,
         };
         let j = ev(Some(
             "the skills snapshot marks wicked-garden-repo-learn as portable: false",
@@ -2740,6 +2755,7 @@ mod tests {
             degraded_reason: None,
             seat_constraint: None,
             distinctness_fallback: fallback.map(str::to_string),
+            pool: None,
         };
         let j = ev(Some("creator_seat")).to_json();
         assert_eq!(j["type"], "unitDistributed");
@@ -2761,6 +2777,27 @@ mod tests {
             "emitted unconditionally: {j}"
         );
         assert!(j["distinctnessFallback"].is_null(), "{j}");
+        // (core#810) `pool` is emitted unconditionally too: null for a pool of 1 …
+        assert!(
+            j.as_object().unwrap().contains_key("pool") && j["pool"].is_null(),
+            "{j}"
+        );
+        // … and the fill, shortfall included, as camelCase-free plain keys when one was asked.
+        let mut short = ev(None);
+        if let CoreEvent::UnitDistributed { pool, .. } = &mut short {
+            *pool = Some(crate::domain::PoolSeating {
+                requested: 3,
+                seated: 2,
+                monitors: vec!["claude#2".into()],
+                missing: vec!["codex".into()],
+                shortfall: Some("pool 3, seated 2".into()),
+            });
+        }
+        assert_eq!(
+            short.to_json()["pool"],
+            serde_json::json!({"requested": 3, "seated": 2, "monitors": ["claude#2"],
+                "missing": ["codex"], "shortfall": "pool 3, seated 2"})
+        );
     }
 
     /// F-031: `councilSeatFailed` carries the seat's stdout TAIL and the classified `reason`

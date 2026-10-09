@@ -520,6 +520,28 @@ pub struct IntentAmendment {
     pub at: i64,
 }
 
+/// (core#810) How distribution filled a unit's worker pool (one creator plus `requested − 1`
+/// monitors): the monitors come from DISTINCT signed-in seat instances only — never the creator's
+/// own instance — and a pool larger than what is signed in is SEATED SHORT and disclosed here,
+/// never refused. Rides `unitDistributed.pool` and the unit's record ([`WorkUnit::pool_seating`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolSeating {
+    /// The unit's pool (`PhaseDef::pool`, after any plan step lowered it).
+    pub requested: u8,
+    /// Seats filled: the creator plus `monitors.len()`.
+    pub seated: u8,
+    /// The monitor seat instances, in the order the team supervisor summons them.
+    pub monitors: Vec<String>,
+    /// Configured seat instances that could have filled the shortfall but are not signed in
+    /// (benched by the launcher's probe, a worker or a ballot). Empty when the roster is simply
+    /// too small — then declaring and signing in another instance (`claude#2`) is the remedy.
+    #[serde(default)]
+    pub missing: Vec<String>,
+    /// Why `seated < requested`, in words; `None` when the pool was filled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortfall: Option<String>,
+}
+
 /// One seat benched for a run ([`AgentSession::benched_seats`], F-7R2-006).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchedSeat {
@@ -838,6 +860,16 @@ pub struct WorkUnit {
     /// (`workflow::effective_timeout`). `None` (skipped on the wire) keeps the ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_secs: Option<u64>,
+    /// (core#810) The unit's worker pool, carried from the backing phase's
+    /// [`pool`](crate::workflow::PhaseDef::pool) at plan time: one creator plus `pool − 1`
+    /// monitors. `None` (skipped on the wire) is a pool of 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<u8>,
+    /// (core#810) How distribution FILLED that pool — requested, seated, the monitor instances and
+    /// the shortfall — persisted with the unit's routing so the run record says it, not only the
+    /// `unitDistributed` frame. `None` for a pool of 1 and for a tool unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_seating: Option<PoolSeating>,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -1243,6 +1275,8 @@ impl WorkUnit {
             role: crate::workflow::PhaseRole::default(),
             owner: crate::workflow::StepOwner::default(),
             budget_secs: None,
+            pool: None,
+            pool_seating: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,
@@ -1495,6 +1529,27 @@ pub struct SessionView {
 
 #[cfg(test)]
 mod tests {
+    /// (core#810) The pool's fill rides the unit's RECORD: `pool` and `pool_seating` round-trip
+    /// through the store node, and a pool-free unit writes neither key (older rows unchanged).
+    #[test]
+    fn a_units_pool_seating_round_trips_on_its_record_810() {
+        use super::*;
+        let mut u = WorkUnit::pending("u1", "s", 1, "build it");
+        let bare = u.to_node();
+        assert!(!bare.metadata.contains_key("pool") && !bare.metadata.contains_key("pool_seating"));
+        u.pool = Some(3);
+        u.pool_seating = Some(PoolSeating {
+            requested: 3,
+            seated: 2,
+            monitors: vec!["claude#2".into()],
+            missing: vec!["codex".into()],
+            shortfall: Some("pool 3, seated 2".into()),
+        });
+        let back = WorkUnit::from_node(&u.to_node()).unwrap();
+        assert_eq!(back.pool, Some(3));
+        assert_eq!(back.pool_seating, u.pool_seating);
+    }
+
     /// (F-7R3-001, review F3) A transcript's quota refusal benches only a seat with no `Done`
     /// unit in the run; sign-in and missing-binary refusals bench regardless.
     #[test]

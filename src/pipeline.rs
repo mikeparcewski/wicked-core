@@ -710,6 +710,8 @@ pub(crate) fn apply_distributions(
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.assigned_invocation = dist.assigned_invocation.clone();
         u.routing = Some(dist.routing.clone());
+        // (core#810) The pool's fill (and any shortfall) is on the run record, not only the frame.
+        u.pool_seating = dist.pool.clone();
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
         // (F-7R2-006 / crew#533 anchor) `degradedReason` is the DISTRIBUTION's, on every arm:
@@ -762,6 +764,7 @@ pub(crate) fn apply_distributions(
             degraded_reason,
             seat_constraint: dist.seat_constraint.clone(),
             distinctness_fallback: dist.distinctness_fallback.clone(),
+            pool: dist.pool.clone(),
         });
         // (F-E2E-029 review F4) Say what write containment the assigned seat actually runs under.
         // `os_sandbox` on the seat's record arms the kernel write boundary on BOTH carriers

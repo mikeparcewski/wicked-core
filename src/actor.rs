@@ -8685,6 +8685,25 @@ fn dispatch_unit(
     }
     // DES-TEAMING-002 §8.8 (T6): a member's step records the member seat it belongs to.
     team_changed |= team_gate::stamp_member_step(&session, &mut unit);
+    // (core#810) The worker pool is re-filled against the run's CURRENT seats at every dispatch:
+    // a failover, a bench reseat or an operator reassign moves `assigned_cli` after distribution,
+    // and a seat benched since then is no longer signed in. Re-derived through the one rule
+    // distribution used (`distribute::pool_seating`), so the record and `step.claimed.monitors`
+    // never name the creator's own instance, the PA or a benched seat, and a shortfall that
+    // opened since distribution is disclosed on the record.
+    if unit.pool_seating.is_some() {
+        let primary = session
+            .team
+            .as_ref()
+            .and_then(|t| t.primary.as_ref())
+            .map(|p| p.cli.as_str());
+        let fresh =
+            crate::distribute::refill_pool(&unit, &session.clis, &session.benched_seats, primary);
+        if fresh != unit.pool_seating {
+            unit.pool_seating = fresh;
+            team_changed = true;
+        }
+    }
     // (EP-K3) The run's launch-time judge exclusion rides on the unit to whichever worker runs
     // it (in-process or over the bus), stamped from the persisted session, never the worker.
     if unit.exclude_seats != session.exclude_seats {

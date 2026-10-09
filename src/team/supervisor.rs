@@ -1230,6 +1230,29 @@ impl RunState {
     }
 }
 
+impl TeamPlan {
+    /// (core#810) The attempt's plan with the unit's POOL monitors (`step.claimed.monitors`, as
+    /// distribution seated them) summoned first, and a target of at least their count — the band's
+    /// target still applies when it is higher (a pool never watches less), and
+    /// [`MAX_MONITORS`] caps both. The rest of the roster stays behind them as the fallback order,
+    /// so a pool monitor that [`UnitTeam::summon`] refuses (the creator's own instance after a
+    /// failover, or one the host does not admit) is disclosed and the next candidate fills in.
+    pub(crate) fn with_pool(mut self, monitors: &[String]) -> Self {
+        if monitors.is_empty() {
+            return self;
+        }
+        let pooled = u8::try_from(monitors.len()).unwrap_or(MAX_MONITORS);
+        self.monitors = self.monitors.max(pooled).min(MAX_MONITORS);
+        let rest: Vec<String> = self
+            .candidates
+            .into_iter()
+            .filter(|c| !monitors.contains(c))
+            .collect();
+        self.candidates = monitors.iter().cloned().chain(rest).collect();
+        self
+    }
+}
+
 // ── The supervisor core (synchronous: the thread drives it, tests pump it) ──────────────────────
 
 /// What the core asks its driver to run off the cursor thread.
@@ -1602,7 +1625,7 @@ impl SupervisorCore {
             ord: k.0,
             attempt: k.1,
             creator: env.by.clone(),
-            plan: st.plan(),
+            plan: st.plan().with_pool(&b.monitors),
             repo,
             // A `repo` record of any shape means a worktree: when the dispatch snapshot failed
             // the runner still names the workdir, with an EMPTY `git_dir` (codex review of #739

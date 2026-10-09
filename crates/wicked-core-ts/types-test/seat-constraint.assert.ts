@@ -67,6 +67,7 @@ const omitted: UnitDistributedEventJson = {
   dissent: 0,
   degradedReason: null,
   distinctnessFallback: null,
+  pool: null,
 }
 const complete: UnitDistributedEventJson = { ...omitted, seatConstraint: null }
 const constrained: UnitDistributedEventJson = {
@@ -103,4 +104,16 @@ void distinctnessFallbackIsTokenOrNull
 void teamed
 void fallback
 void instanceFallback
+// (core#810) A short pool is a typed fill, not prose.
+const shortPool: UnitDistributedEventJson = {
+  ...complete,
+  pool: {
+    requested: 3,
+    seated: 2,
+    monitors: ['claude#2'],
+    missing: ['codex'],
+    shortfall: 'pool 3, seated 2',
+  },
+}
+void shortPool
 void unknownFallback
