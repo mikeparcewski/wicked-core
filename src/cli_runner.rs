@@ -1310,6 +1310,9 @@ fn run_unit_and_judge_on(
             let Some(v) = input.unit.validator.as_ref().filter(|v| v.approved) else {
                 break 'pinned None;
             };
+            // (core#799) The judge is told the pinned floor decides the criterion's
+            // deterministic half — it runs after the judge, so the judge never sees its result.
+            let judge_criterion = crate::validator::pinned_judge_criterion(v);
             // BUS PATH: only over a bus exec mediation ARMED for this unit (`gate_eval_bus_db`; never
             // process env — DES-TEAMING-002 T0), publish a gate-evaluation request and
             // wait for the governed evaluator daemon to respond (no subprocess, no dangerous flags,
@@ -1323,7 +1326,7 @@ fn run_unit_and_judge_on(
                 // The daemon does not report which seat judged: `judge_cli` stays `None` on
                 // this path (core#431) — an honest unknown, never a guessed seat.
                 break 'pinned Some(bus_request_agent_verdict(
-                    &v.criterion,
+                    &judge_criterion,
                     work_for_agent,
                     &input.run_id,
                     input.unit_ix,
@@ -1402,7 +1405,7 @@ fn run_unit_and_judge_on(
                 break 'pinned None;
             }
             let (verdict, refused) = crate::validator::agent_validate_with_refusals(
-                &v.criterion,
+                &judge_criterion,
                 work_for_agent,
                 &excluded,
                 roster,
@@ -3165,6 +3168,88 @@ mod tests {
         assert!(!ran, "the judge is skipped, not run as a self-grade");
         // Naming the author or a nonsense seat changes nothing about the author's exclusion.
         assert_eq!(judge_with(&["agy", "nope"]).0.as_deref(), Some("pi"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#799: the agent judge of a pinned validator is told the deterministic floor decides
+    /// the criterion's deterministic half (the floor runs after it, so its result is never in the
+    /// WORK) — run e2e4039b's judge rejected a lint-exit-0 plan for "not showing the lint result".
+    #[test]
+    fn the_pinned_judge_is_handed_the_deterministic_floor_contract() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Rec {
+            prompts: Mutex<Vec<String>>,
+        }
+        impl StepRunner for Rec {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.prompts
+                    .lock()
+                    .unwrap()
+                    .push(input.unit.description.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nrecorded\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-core-799-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:wp", "r", 1, "author the storyline");
+        unit.assigned_cli = Some("agy".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: crate::builtin_floors::WALKTHROUGH_LINT_CRITERION.into(),
+            script: "wicked-garden run scripts/demo/walkthrough.mjs lint".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let rec = Arc::new(Rec::default());
+        let runner: Arc<dyn StepRunner> = rec.clone();
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let noop: &DeltaSink = &|_: &str| {};
+        let (_out, verdict, _ev) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        assert!(verdict.is_some(), "the pinned judge ran");
+        let prompts = rec.prompts.lock().unwrap();
+        let judge = prompts.get(1).expect("the judge's prompt");
+        assert!(
+            judge.contains(crate::builtin_floors::WALKTHROUGH_LINT_CRITERION),
+            "{judge}"
+        );
+        assert!(judge.contains("[deterministic floor]"), "{judge}");
+        assert!(
+            judge.contains("do NOT reject because the WORK does not show that check's result"),
+            "{judge}"
+        );
+        assert!(judge.contains("walkthrough.mjs lint"), "{judge}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
