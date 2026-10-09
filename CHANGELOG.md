@@ -239,6 +239,29 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.43** — 2026-10-09 — npm release on main tip 35e7dfb, carrying #796, #792, #793,
+  #800, #806, #805, #807 and #808. Wire changes are additive. A `team_dispute` pause names its
+  answers: `awaitingHuman.choices` + `recommended` (#796, core#759), plus `findingIds`, the
+  unresolved HIGHs it is about (#808). The floor re-runs load-class failures alone, and an
+  identical env crash on head and base is `env_cannot_run`; journeys get a check type (#792). New
+  `review-loop` guidance pack, RVWL-1001..1004 (#793). The walkthrough recorder is handed
+  `WICKED_WALKTHROUGH_JAIL`, and a pinned judge is told the floor decides (#800). wicked-estate
+  0.21.0 → 0.23.0: an older graph re-extracts on its next index (#806). **MCP install safety
+  (#805)**:
+  - New gate `"consent_before"` pauses BEFORE its unit (`awaitingHuman{gateKind: "consent"}`).
+    Nothing skips it, and the `mcp-server` install uses it (core#801).
+  - Generic Tool units get `WICKED_GARDEN_ROOT`, and the install runs the snapshot's launcher
+    under `bash -c` (core#802).
+  - Send back on a FAILED Tool unit re-runs that unit only. A new operator-config fence refuses
+    `scripts/mcp/install.py`, `wicked-installer`, `<cli> mcp add` and CLI configuration paths
+    outside the worktree (core#803).
+  - The `mcp-server` and `review-loop` packs are seeded insert-only at boot. The carriers'
+    `WICKED_ESTATE_READONLY=1` default satisfies the estate shim's read-only half (core#804).
+
+  **Engine halves of crew issues (#807)**: a nonce-bearing deliver script is judged on its trusted
+  `deliver: OUTCOME <nonce> <verdict>` sentinel (crew#739). Roster records carry
+  `logout_invocation` (crew#615). Reads into a sibling run's `wicked-worktrees/<id>` are refused
+  (crew#634 R7).
 - **core-ts 0.7.42** — 2026-10-09 — npm release carrying engine batches 2 and 3, on main tip fd03d31
   (#788, #794). Wire changes are additive. **Batch 2**: Tool phases get `WICKED_RUN_ID`,
   `WICKED_RUN_UNIT`, `WICKED_TREE` and `WICKED_EVIDENCE_ROOT` (#776). The supervisor follows
