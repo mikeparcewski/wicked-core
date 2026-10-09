@@ -9386,6 +9386,7 @@ sleep 30
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         const ETXTBSY: i32 = 26; // the same errno on Linux and macOS
         for _ in 0..100 {
+            // spawn-audit: test-only — runs the test's own `--version` stub to prove it is executable.
             match std::process::Command::new(path)
                 .arg("--version")
                 .stdin(std::process::Stdio::null())
