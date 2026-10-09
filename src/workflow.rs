@@ -822,6 +822,17 @@ pub struct PhaseDef {
     /// absent on the wire, so defs authored before the field serialize back byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_secs: Option<u64>,
+    /// (core#810) The phase's worker POOL: how many distinct signed-in seat instances work one of
+    /// its units — ONE creator plus `pool − 1` monitors watching that creator's attempt (never
+    /// parallel creators: the engine has no merge story for them). `None` (the default; no shipped
+    /// entry sets one) is a pool of 1, today's single seat. Bounded `1..=`[`MAX_POOL`] at
+    /// [`WorkflowDef::validate`]; a plan step may only LOWER it (`plan::STEP_FIELD_RULES`,
+    /// TightenOnly). Distribution fills the monitors from distinct signed-in instances only and
+    /// DISCLOSES a shortfall (requested / seated / missing, `unitDistributed.pool`) rather than
+    /// refusing the run. `skip_serializing_if`: defs authored before the field serialize back
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<u8>,
     /// (BC-80, core#535) Whether this phase must REPORT what it captured: its output carries a
     /// machine-readable `wicked-capture-report {derived, submitted, failed}` marker
     /// ([`crate::validator::parse_capture_report`]), and the gate fold DENIES the unit when the
@@ -892,6 +903,10 @@ pub struct PhaseDef {
 }
 
 impl PhaseDef {
+    /// (core#810) The phase's effective pool: its declared [`Self::pool`], else 1.
+    pub fn pool_size(&self) -> u8 {
+        self.pool.unwrap_or(1)
+    }
     /// A minimal phase: id + kind, no gate, no code, neutral role. `pub(crate)` so sibling modules'
     /// tests (e.g. the planner's) can author fixture phases without a JSON detour.
     pub(crate) fn new(id: &str, kind: StageKind) -> Self {
@@ -903,6 +918,7 @@ impl PhaseDef {
             gate: GateSpec::Auto,
             executes_code: false,
             budget_secs: None,
+            pool: None,
             requires_capture_report: false,
             verified_evidence: false,
             required_deliverables: Vec::new(),
@@ -1082,7 +1098,24 @@ pub enum WorkflowDefError {
     ReservedId {
         id: String,
     },
+    /// (core#810) A phase's `pool` is outside `1..=`[`MAX_POOL`] (one creator plus at most
+    /// [`crate::team::supervisor::MAX_MONITORS`] monitors), or above 1 on a Tool phase — the
+    /// engine's own command has no seat, so nothing could watch it.
+    PoolOutOfRange {
+        phase: String,
+        pool: u8,
+    },
+    /// (core#810) A USER workflow (registered, or a drop-in file) declares a pool above 1. A pool's
+    /// monitors watch an attempt only on a TEAM run — a catalog-composed plan — and a user
+    /// workflow never is one (its id cannot take the per-run shape), so the field would gate
+    /// nothing. Refused loud at registration rather than shipped as a control that does nothing.
+    PoolOutsideTeamRun {
+        phase: String,
+    },
 }
+
+/// (core#810) The largest [`PhaseDef::pool`]: one creator plus the team's monitor ceiling.
+pub const MAX_POOL: u8 = 1 + crate::team::supervisor::MAX_MONITORS;
 
 impl std::fmt::Display for WorkflowDefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1119,6 +1152,18 @@ impl std::fmt::Display for WorkflowDefError {
                 "reserved workflow id: {id} \u{2014} the shape \"<run>:plan-<rev>\" names an \
                  engine-composed per-run plan and cannot be supplied by a user workflow; rename it"
             ),
+            WorkflowDefError::PoolOutsideTeamRun { phase } => write!(
+                f,
+                "pool outside a team run: {phase} declares a pool above 1, but a pool's monitors \
+                 watch only a team run's (catalog-composed plan's) attempts and a user workflow \
+                 is never one \u{2014} set the pool on the catalog entry, or drop it"
+            ),
+            WorkflowDefError::PoolOutOfRange { phase, pool } => write!(
+                f,
+                "pool out of range: {phase} declares pool {pool} \u{2014} a pool is one creator \
+                 plus up to {} monitors (1..={MAX_POOL}), and a Tool phase's pool is 1",
+                crate::team::supervisor::MAX_MONITORS
+            ),
         }
     }
 }
@@ -1135,6 +1180,16 @@ impl WorkflowDef {
         for p in &self.phases {
             if !ids.insert(p.id.as_str()) {
                 return Err(WorkflowDefError::DuplicatePhaseId(p.id.clone()));
+            }
+            // (core#810) One creator plus at most MAX_MONITORS monitors; a Tool phase has no seat.
+            if let Some(pool) = p.pool {
+                let tool = matches!(p.executor, PhaseExecutor::Tool { .. });
+                if pool == 0 || pool > MAX_POOL || (tool && pool > 1) {
+                    return Err(WorkflowDefError::PoolOutOfRange {
+                        phase: p.id.clone(),
+                        pool,
+                    });
+                }
             }
         }
         // Declaration order IS execution order: the planner assigns `ord` from the phase index, so
@@ -1195,10 +1250,17 @@ impl WorkflowRegistry {
     /// [`refuse_unpinned_verified_evidence`]); nothing is injected or restored on the way in.
     pub fn register(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
         refuse_reserved_id(&def)?;
+        // (core#810) A user workflow never runs teamed, so a pool above 1 would seat no monitor.
+        if let Some(p) = def.phases.iter().find(|p| p.pool_size() > 1) {
+            return Err(WorkflowDefError::PoolOutsideTeamRun {
+                phase: p.id.clone(),
+            });
+        }
         self.register_judged(def)
     }
 
-    /// Every registration rule but the reserved-namespace one: shared by [`register`](Self::register)
+    /// Every registration rule but the user-workflow-only ones (the reserved namespace, a pool above
+    /// 1): shared by [`register`](Self::register)
     /// and [`register_composed`](Self::register_composed).
     fn register_judged(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
         def.validate()?;
@@ -1215,9 +1277,9 @@ impl WorkflowRegistry {
     /// Register the engine's OWN composed per-run def (`"<run>:plan-<rev>"`, DES-TEAMING-002
     /// §8.3) — the one path allowed into the reserved namespace [`register`](Self::register)
     /// refuses. Judged by every other registration rule. Crate-private: no launcher can call it.
-    /// Its production caller is the plan-registration seam (the per-run def registered from
-    /// `plan.accepted`); until that lands only the tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Its production caller is `plan::compose`, which judges every composed def through it; a
+    /// composed def may also carry a phase `pool` above 1 (core#810), which [`register`](Self::register)
+    /// refuses for a user workflow.
     pub(crate) fn register_composed(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
         self.register_judged(def)
     }
@@ -2599,6 +2661,55 @@ mod workflow_def_tests {
         })
         .unwrap();
         assert_eq!(pin_of(&reg, "wf-unverified", "check"), None);
+    }
+
+    /// core#810: `pool` parses (absent = 1, skipped on the wire), and validation bounds it to
+    /// `1..=MAX_POOL` — refusing 0, MAX_POOL + 1 and a pool above 1 on a Tool phase by name.
+    #[test]
+    fn phase_pool_parses_defaults_to_one_and_is_bounded_810() {
+        let p: PhaseDef = serde_json::from_value(serde_json::json!({"id": "x"})).unwrap();
+        assert_eq!((p.pool, p.pool_size()), (None, 1));
+        assert!(serde_json::to_value(&p).unwrap().get("pool").is_none());
+        let p: PhaseDef =
+            serde_json::from_value(serde_json::json!({"id": "x", "pool": 3})).unwrap();
+        assert_eq!(p.pool_size(), 3);
+        let def = |pool: u8, tool: bool| {
+            let mut ph = PhaseDef::new("x", StageKind::Build);
+            ph.pool = Some(pool);
+            if tool {
+                ph.executor = PhaseExecutor::Tool {
+                    cmd: vec!["true".into()],
+                };
+            }
+            WorkflowDef {
+                id: "wf-pool".into(),
+                phases: vec![ph],
+                ..feature_def()
+            }
+        };
+        assert!(def(1, false).validate().is_ok());
+        assert!(def(MAX_POOL, false).validate().is_ok());
+        assert!(def(1, true).validate().is_ok());
+        for (pool, tool) in [(0, false), (MAX_POOL + 1, false), (2, true)] {
+            assert_eq!(
+                def(pool, tool).validate(),
+                Err(WorkflowDefError::PoolOutOfRange {
+                    phase: "x".into(),
+                    pool
+                }),
+                "pool {pool} tool {tool}"
+            );
+        }
+        assert_eq!(MAX_POOL, 4);
+        // A USER workflow never runs teamed: a pool above 1 is refused at registration (loud),
+        // a pool of 1 registers, and the engine's own composed def keeps its pool.
+        let mut reg = WorkflowRegistry::default();
+        assert_eq!(
+            reg.register(def(2, false)),
+            Err(WorkflowDefError::PoolOutsideTeamRun { phase: "x".into() })
+        );
+        assert!(reg.register(def(1, false)).is_ok());
+        assert!(reg.register_composed(def(3, false)).is_ok());
     }
 
     // ---- DES-TEAMING-002 D1: the per-run plan namespace is reserved ----

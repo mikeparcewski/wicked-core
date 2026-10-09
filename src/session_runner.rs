@@ -819,6 +819,8 @@ mod tests {
             role: PhaseRole::default(),
             owner: Default::default(),
             budget_secs: None,
+            pool: None,
+            pool_seating: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

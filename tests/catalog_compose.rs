@@ -445,7 +445,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     let entries: Vec<PhaseDef> = serde_json::from_value(json!([
         {"id": "full", "kind": "build", "role": "creator", "instructions": "own",
          "gate_type": "execution", "gate": {"human_confirm": {"unconditional": false}},
-         "executes_code": true, "budget_secs": 600, "required_deliverables": ["r.json"],
+         "executes_code": true, "budget_secs": 600, "pool": 3, "required_deliverables": ["r.json"],
          "skill_ref": "own-skill", "allowed_skills": ["a"], "validator_pin": EVIDENCE_FLOOR_PIN},
         {"id": "tool", "kind": "recon", "executor": {"type": "tool", "cmd": []}}
     ]))
@@ -454,7 +454,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     // A fully populated step serializes every field: the table must name exactly those.
     let full_step = json!({"catalog": "full", "id": "x", "instructions": "own", "gate": "auto",
         "gate_type": "value", "validator_pin": "p", "executes_code": true, "budget_secs": 1,
-        "skill_ref": "s",
+        "pool": 1, "skill_ref": "s",
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
         "added_by": "floor", "floor_reason": "band 20-39 requires build",
@@ -543,6 +543,13 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
             (
                 vec![("full", json!({"budget_secs": 601}), "budget_loosened")],
                 ("full", json!({"budget_secs": 600})),
+            ),
+        ),
+        (
+            "pool",
+            (
+                vec![("full", json!({"pool": 4}), "pool_raised")],
+                ("full", json!({"pool": 3})),
             ),
         ),
         (

@@ -2478,3 +2478,56 @@ fn an_output_finding_on_a_colon_step_id_is_raised() {
     assert_eq!(raised[0]["path"], "answer:1");
     assert_eq!(raised[0]["target"], "output");
 }
+
+/// (core#810) A unit's POOL monitors ride `step.claimed.monitors`: the supervisor summons them
+/// FIRST and its target is at least their count, even in a band that would watch nothing. Pinned
+/// through the no-baseline refusal so the seats are on the record without starting a process.
+#[test]
+fn pool_monitors_on_the_claim_are_summoned_first_810() {
+    let mut h = Harness::new("pool810");
+    h.start("claude#1", &["claude#1", "claude#2", "codex", "pi"], "0-19");
+    h.publish(&fixture_with(tev::STEP_CLAIMED, 0, RUN, |p| {
+        p["ord"] = json!(3);
+        p["attempt"] = json!(1);
+        p["by"] = json!("claude#1");
+        p["at"] = json!(crate::interaction::now_millis());
+        p["step_id"] = json!("build");
+        p["criterion"] = json!("the handler cancels stale fetches");
+        p["baseline_tree"] = Value::Null;
+        p["repo"] = json!({"workdir": "/nonexistent", "git_dir": ""});
+        p["monitors"] = json!(["pi", "codex"]);
+    }));
+    h.complete_with_output(3, 1, "claude#1", "build", ANSWER);
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    let seats: Vec<&str> = joined.iter().map(|j| j["seat"].as_str().unwrap()).collect();
+    assert_eq!(
+        seats,
+        ["pi", "codex"],
+        "pool monitors first, two of them: {joined:#?}"
+    );
+}
+
+/// (core#810) `TeamPlan::with_pool`: no pool monitors leave the plan as is; pool monitors lead
+/// the candidates (deduplicated), raise the target to their count, never lower a higher band
+/// target, and stay under `MAX_MONITORS`.
+#[test]
+fn team_plan_with_pool_810() {
+    let base = TeamPlan {
+        monitors: 1,
+        candidates: vec!["claude#2".into(), "codex".into(), "pi".into()],
+    };
+    assert_eq!(base.clone().with_pool(&[]), base);
+    let p = base.clone().with_pool(&["pi".into(), "codex".into()]);
+    assert_eq!(p.monitors, 2);
+    assert_eq!(p.candidates, ["pi", "codex", "claude#2"]);
+    let high = TeamPlan {
+        monitors: 3,
+        ..base.clone()
+    };
+    assert_eq!(
+        high.with_pool(&["pi".into()]).monitors,
+        3,
+        "a pool never watches less"
+    );
+}

@@ -14271,6 +14271,8 @@ No further next steps — both questions fully answered.";
             role: Default::default(),
             owner: Default::default(),
             budget_secs: None,
+            pool: None,
+            pool_seating: None,
             validator: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),

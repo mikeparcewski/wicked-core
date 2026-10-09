@@ -1286,6 +1286,9 @@ fn wire_step(s: &PlanStep) -> Value {
     if let Some(b) = s.budget_secs {
         o.insert("budget_secs".into(), json!(b));
     }
+    if let Some(p) = s.pool {
+        o.insert("pool".into(), json!(p));
+    }
     if let Some(a) = &s.added_by {
         o.insert("added_by".into(), json!(a));
     }

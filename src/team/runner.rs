@@ -371,6 +371,13 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                 .governance
                 .as_ref()
                 .and_then(|g| g.code_graph_db.clone()),
+            // (core#810) The unit's pool monitors, as distribution seated them.
+            monitors: input
+                .unit
+                .pool_seating
+                .as_ref()
+                .map(|p| p.monitors.clone())
+                .unwrap_or_default(),
         }),
     };
     let why = match publish_bounded(runner, &ev) {

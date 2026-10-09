@@ -480,6 +480,7 @@ fn entry(
         gate,
         executes_code,
         budget_secs: None,
+        pool: None,
         verified_evidence: false,
         required_deliverables: Vec::new(),
         depends_on: Vec::new(),

@@ -1016,6 +1016,8 @@ export declare class Subscription {
  * `'pre_existing_in_sandbox'` (`'floor_env_mismatch'` is no longer produced); libtest ids are
  * qualified by binary (`test t::name [-p crate --lib]`); every `checks[]` entry carries
  * `envCannotRun: string[]` and `reruns: CheckRun[]` (each re-run's `boundNote` carries the host load).
+ * core#810 (additive): unitDistributed.pool (UnitPoolSeatingJson | null — a phase's worker pool,
+ * one creator plus monitors, with any shortfall disclosed as requested/seated/missing).
  * core#461/#591 (additive): unitDistributed.distinctnessFallback ('creator_seat' |
  * 'same_cli_instance' | null — the evaluator ≠ creator fallback as a field, see
  * UnitDistributedEventJson); gateEscalated.condition
@@ -1139,6 +1141,29 @@ export interface UnitDistributedEventJson extends CoreEventJson {
    * disclosure. The seat the unit stays on is therefore always a still-eligible one. Additive.
    */
   distinctnessFallback: 'creator_seat' | 'same_cli_instance' | null
+  /**
+   * (core#810) How the unit's worker POOL was filled — one creator plus `requested − 1` monitors
+   * from DISTINCT signed-in seat instances (never the creator's own, never the run's PA).
+   * `null` for a pool of 1 (the default) and a tool unit. A pool larger than what is signed in
+   * is seated SHORT and disclosed — never refused: `seated < requested`, `missing` names the
+   * configured instances that are not signed in, `shortfall` says why. Monitors watch an
+   * attempt only on a team run; any other unit reports `seated: 1` with the reason. Additive.
+   */
+  pool: UnitPoolSeatingJson | null
+}
+
+/** (core#810) {@link UnitDistributedEventJson.pool}: a unit's worker-pool fill. */
+export interface UnitPoolSeatingJson {
+  /** The phase's `pool` (after any plan step lowered it). */
+  requested: number
+  /** Seats filled: the creator plus `monitors.length`. */
+  seated: number
+  /** The monitor seat instances, in the order the team supervisor summons them. */
+  monitors: string[]
+  /** Configured instances that could have filled the shortfall but are not signed in. */
+  missing: string[]
+  /** Why `seated < requested`; `null` when the pool was filled. */
+  shortfall: string | null
 }
 
 /**
