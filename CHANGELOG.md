@@ -239,6 +239,24 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.42** — 2026-10-09 — npm release carrying engine batches 2 and 3, on main tip fd03d31
+  (#788, #794). Wire changes are additive. **Batch 2**: Tool phases get `WICKED_RUN_ID`,
+  `WICKED_RUN_UNIT`, `WICKED_TREE` and `WICKED_EVIDENCE_ROOT` (#776). The supervisor follows
+  `path.repicked`, and an unbound unit summons its members when the PA claims it (#745). A reassign
+  on a parked run re-seats in place, and the approve then dispatches once (#773). A vitest behind
+  an npm/pnpm/yarn script re-runs alone through its own runner (#781). Prior outputs share one
+  96 KiB budget on both carriers, and `Prompt is too long` fails the unit as `prompt_too_long`
+  (#754). **Batch 3**: in the gate hook, `lineage`/`traverse`/`hotspots` are read-only estate verbs
+  (#729); `applies_to: [tool:Bash]` works (#707); a quoted cat/tee heredoc body is data, and the
+  scanner fails closed on two heredocs per line and on here-strings (#552). Each CLI declares its
+  credential requirement (#447). New `Core.recordMcpBoundaryEscape` (#669). New event
+  `cliUsageUnreported` (#412). An ACP `ok` turn that is only a seat refusal is a worker failure
+  (#755). `unitContextInjected.priorUnits[]` gains `deliveredBytes`/`clipped`; the rework note
+  needed no crew route change (#554). A red creator floor gets one automatic round with the
+  failing tails, `unitReworkAmended.scope: floor_auto_retry` (#651). `WorkUnit` gains
+  `instructions`/`amendments`/`structured_description`, and the deliver card is read from those
+  fields (#686). New napi methods `vaultValidator`/`approveValidator` (#677).
+  `unitReassigned.distinctnessFallback` (#591).
 - **core-ts 0.7.41** — 2026-10-08 — npm release for IG1-crew, on main tip f6fc3d1 (#786).
   **IG1-core-2**: the OS-sandbox floor is an admission class the engine honours. A governed unit on
   an `os_sandbox`-class seat (pi, copilot, agy, and codex while its own `--sandbox` is bounded)
