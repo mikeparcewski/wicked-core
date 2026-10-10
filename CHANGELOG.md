@@ -239,6 +239,14 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.8.1** — 2026-10-10 — npm release on main tip a49c63e, carrying #867. **#867
+  (wicked-crew#933)**: the engine's origin fetch (the run-base mint and the pre-deliver lift)
+  authenticates an Azure DevOps origin with the daemon's own credential (`AZURE_DEVOPS_EXT_PAT`,
+  or the `CREW_ADO_*` service principal through an Entra token), the same one-command
+  `Authorization` header the crew deliver script uses: handed to that one `git fetch` through
+  `GIT_CONFIG_*` (ambient extra header reset, scoped to the canonical repository URL, no
+  redirects, credential helpers, hooks and traces off), fetching the canonical URL into origin's
+  tracking refs. The lift on an Azure DevOps origin is decided and re-verified instead of skipped.
 - **core-ts 0.8.0** — 2026-10-10 — npm release on main tip 026112f, carrying #860. A **minor**
   bump on purpose: **#860 (X-MIG M9, core#649)** makes `interactive-chat`, `interactive-draft` and
   `interactive-edit` built-in presets (repo-less `produce` plans; the PA rates RISK first; every
