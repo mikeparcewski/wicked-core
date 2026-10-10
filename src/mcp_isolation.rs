@@ -69,9 +69,9 @@ pub(crate) const CLAUDE_STRICT_MCP_ARGS: [&str; 1] = ["--strict-mcp-config"];
 /// (`mcp_servers."weird name".enabled=false`) replaces the table instead of merging into it and
 /// codex then fails to load its own config ("invalid transport"), so there is no override this
 /// can emit — and a governed seat that loads an MCP server the engine did not hand it is what
-/// this closes. Not covered, disclosed: the codex-acp bridge is a different binary, so it takes
-/// no `-c` (core#660 item 2's ACP half stays open), and an enterprise-managed codex config
-/// source this cannot read.
+/// this closes. The codex-acp bridge is a different binary that takes no `-c`: its half is
+/// [`acp_codex_mcp_refusal`]. Not covered, disclosed: an enterprise-managed codex config source
+/// this cannot read.
 pub(crate) fn seat_mcp_pin_flags(
     cli: SeatCli,
     seat_root: Option<&std::path::Path>,
@@ -102,6 +102,134 @@ pub(crate) fn seat_mcp_pin_flags(
             Ok(flags)
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// (core#660, the ACP half) The codex-acp bridge is a different program from `codex`: it takes no
+/// `-c`, so [`seat_mcp_pin_flags`]' per-server override cannot ride it, and codex's MCP calls on it
+/// never reach `session/request_permission` (its `auto_review` decides them), so layer 2 never sees
+/// them either. Nothing can switch an ambient server off on this carrier, so an ACP codex seat whose
+/// configuration ENABLES one is REFUSED at spawn (fail closed) — `Err` names the server and the
+/// file, and the remedy is codex's own `enabled = false` on that server (or removing it).
+///
+/// Sources: the seat's configuration home (`<CODEX_HOME>/config.toml`, or the CLI's own home under
+/// the operator-inherit hatch, as [`config_home`] resolves it) and the working directory's
+/// `.codex/config.toml` — codex-acp marks every session root `trust_level: "trusted"`, and a trusted
+/// project's config layer loads. A server with `enabled = false` is not loaded and passes. A file
+/// that exists and cannot be read or parsed is an `Err` (a config the engine cannot read is not one
+/// it can show is empty). The rig's seat homes configure no MCP server, so this refuses nothing
+/// there.
+pub(crate) fn acp_codex_mcp_refusal(
+    seat_root: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut sources = vec![config_home(SeatCli::Codex, seat_root)?.join("config.toml")];
+    if let Some(cwd) = cwd {
+        sources.push(cwd.join(".codex").join("config.toml"));
+    }
+    // (codex r1 on #825) codex-acp also merges a JSON `CODEX_CONFIG` from its environment into
+    // the session config — the child inherits the daemon's — and that layer can add servers too.
+    if let Some(raw) = std::env::var_os(CODEX_ACP_CONFIG_ENV).filter(|v| !v.is_empty()) {
+        let enabled = codex_acp_config_mcp_servers(&raw.to_string_lossy())?;
+        if !enabled.is_empty() {
+            return Err(format!(
+                "the inherited {CODEX_ACP_CONFIG_ENV} enables the MCP server(s) {} — the \
+                 codex-acp bridge merges it and takes no `-c` override, so the engine cannot pin \
+                 them off; drop them from {CODEX_ACP_CONFIG_ENV} (or set each `enabled: false`); \
+                 {REFUSAL_TAIL}",
+                enabled
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    for source in sources {
+        let enabled = codex_enabled_mcp_servers(&source)?;
+        if !enabled.is_empty() {
+            return Err(format!(
+                "{} enables the MCP server(s) {} — the codex-acp bridge takes no `-c` override, \
+                 so the engine cannot pin them off on this carrier; set `enabled = false` on each \
+                 (or remove it), or seat codex on the wrapped carrier, where the pin rides; \
+                 {REFUSAL_TAIL}",
+                source.display(),
+                enabled
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The variable codex-acp reads a JSON config layer from (its `startAcpServer`).
+pub(crate) const CODEX_ACP_CONFIG_ENV: &str = "CODEX_CONFIG";
+
+/// The MCP servers a `CODEX_CONFIG` JSON layer could enable: every entry of an `mcp_servers`
+/// object whose `enabled` is not `false`, and every dotted `mcp_servers.<name>…` key other than
+/// `mcp_servers.<name>.enabled: false`. Not JSON, or not an object, is an `Err` (fail closed).
+fn codex_acp_config_mcp_servers(raw: &str) -> Result<Vec<String>, String> {
+    let doc: Value = serde_json::from_str(raw).map_err(|e| {
+        format!("the inherited {CODEX_ACP_CONFIG_ENV} is not valid JSON ({e}); {REFUSAL_TAIL}")
+    })?;
+    let Some(map) = doc.as_object() else {
+        return Err(format!(
+            "the inherited {CODEX_ACP_CONFIG_ENV} is not a JSON object; {REFUSAL_TAIL}"
+        ));
+    };
+    let mut enabled: Vec<String> = Vec::new();
+    for (key, value) in map {
+        if key == "mcp_servers" {
+            match value {
+                Value::Object(servers) => enabled.extend(
+                    servers
+                        .iter()
+                        .filter(|(_, v)| v.get("enabled").and_then(Value::as_bool) != Some(false))
+                        .map(|(k, _)| k.clone()),
+                ),
+                _ => {
+                    return Err(format!(
+                        "the inherited {CODEX_ACP_CONFIG_ENV} has an `mcp_servers` that is not an \
+                         object; {REFUSAL_TAIL}"
+                    ))
+                }
+            }
+        } else if let Some(rest) = key.strip_prefix("mcp_servers.") {
+            let name = rest.split('.').next().unwrap_or(rest);
+            let disables = rest.ends_with(".enabled") && value.as_bool() == Some(false);
+            if !disables {
+                enabled.push(name.to_string());
+            }
+        }
+    }
+    enabled.sort();
+    enabled.dedup();
+    Ok(enabled)
+}
+
+/// The ENABLED server names in a codex `config.toml`: every `[mcp_servers.<name>]` whose
+/// `enabled` is not `false` (codex's default is enabled). Missing file ⇒ none.
+fn codex_enabled_mcp_servers(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let Some(text) = read_optional(path)? else {
+        return Ok(Vec::new());
+    };
+    let doc: toml::Value = text
+        .parse()
+        .map_err(|e| format!("{} is not valid TOML ({e}); {REFUSAL_TAIL}", path.display()))?;
+    match doc.get("mcp_servers") {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Table(table)) => Ok(table
+            .iter()
+            .filter(|(_, v)| v.get("enabled").and_then(|e| e.as_bool()) != Some(false))
+            .map(|(k, _)| k.clone())
+            .collect()),
+        Some(_) => Err(format!(
+            "{} has an `mcp_servers` that is not a table; {REFUSAL_TAIL}",
+            path.display()
+        )),
     }
 }
 
@@ -802,5 +930,114 @@ mod tests {
             let err = opencode_config(Some(bad)).expect_err(bad);
             assert!(err.contains("OPENCODE_CONFIG_CONTENT"), "{bad}: {err}");
         }
+    }
+
+    /// core#660, the ACP half: the codex-acp bridge takes no `-c`, so a codex seat whose config
+    /// ENABLES an MCP server — in its seat home or the trusted project's `.codex/config.toml` — is
+    /// refused at spawn; `enabled = false` (codex's own switch) or no server at all passes.
+    #[test]
+    fn an_acp_codex_seat_with_an_enabled_mcp_server_is_refused() {
+        // `CODEX_CONFIG` is read from the process environment: hold the env lock against the test
+        // that sets it.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("wicked-660-acp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let seat = base.join("codex");
+        let ws = base.join("wt");
+        std::fs::create_dir_all(&seat).unwrap();
+        std::fs::create_dir_all(ws.join(".codex")).unwrap();
+        assert_eq!(
+            acp_codex_mcp_refusal(Some(&seat), Some(&ws)),
+            Ok(()),
+            "no config"
+        );
+
+        std::fs::write(
+            seat.join("config.toml"),
+            "[mcp_servers.off]\ncommand = \"/bin/echo\"\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            acp_codex_mcp_refusal(Some(&seat), Some(&ws)),
+            Ok(()),
+            "a disabled server passes"
+        );
+
+        std::fs::write(
+            seat.join("config.toml"),
+            "[mcp_servers.off]\ncommand = \"/bin/echo\"\nenabled = false\n\n[mcp_servers.probe]\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let err = acp_codex_mcp_refusal(Some(&seat), Some(&ws)).unwrap_err();
+        assert!(err.contains("`probe`") && !err.contains("`off`"), "{err}");
+        assert!(err.contains("enabled = false"), "names the remedy: {err}");
+
+        std::fs::write(
+            seat.join("config.toml"),
+            "[mcp_servers.off]\ncommand = \"/bin/echo\"\nenabled = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(".codex").join("config.toml"),
+            "[mcp_servers.repo-one]\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let err = acp_codex_mcp_refusal(Some(&seat), Some(&ws)).unwrap_err();
+        assert!(
+            err.contains("`repo-one`"),
+            "the project layer counts: {err}"
+        );
+
+        std::fs::write(ws.join(".codex").join("config.toml"), "not = [toml").unwrap();
+        assert!(
+            acp_codex_mcp_refusal(Some(&seat), Some(&ws))
+                .unwrap_err()
+                .contains("not valid TOML"),
+            "an unreadable config fails closed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// codex r1 on #825: the JSON layer codex-acp merges from `CODEX_CONFIG` counts as a source.
+    #[test]
+    fn a_codex_acp_config_layer_that_enables_a_server_is_refused() {
+        assert_eq!(codex_acp_config_mcp_servers(r#"{"model":"x"}"#), Ok(vec![]));
+        assert_eq!(
+            codex_acp_config_mcp_servers(
+                r#"{"mcp_servers":{"a":{"command":"x"},"b":{"command":"y","enabled":false}}}"#
+            ),
+            Ok(vec!["a".to_string()])
+        );
+        assert_eq!(
+            codex_acp_config_mcp_servers(
+                r#"{"mcp_servers.c.command":"x","mcp_servers.d.enabled":false}"#
+            ),
+            Ok(vec!["c".to_string()])
+        );
+        assert!(codex_acp_config_mcp_servers("[1]").is_err());
+        assert!(codex_acp_config_mcp_servers("not json").is_err());
+
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(CODEX_ACP_CONFIG_ENV);
+        let seat = std::env::temp_dir().join(format!("wicked-660-cc-{}", std::process::id()));
+        std::fs::create_dir_all(&seat).unwrap();
+        std::env::set_var(
+            CODEX_ACP_CONFIG_ENV,
+            r#"{"mcp_servers":{"ambient":{"command":"x"}}}"#,
+        );
+        let err = acp_codex_mcp_refusal(Some(&seat), None).unwrap_err();
+        assert!(
+            err.contains("`ambient`") && err.contains("CODEX_CONFIG"),
+            "{err}"
+        );
+        match saved {
+            Some(v) => std::env::set_var(CODEX_ACP_CONFIG_ENV, v),
+            None => std::env::remove_var(CODEX_ACP_CONFIG_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&seat);
     }
 }

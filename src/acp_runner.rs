@@ -2501,15 +2501,20 @@ fn start_acp_process_with_write_roots(
         .map(|url| (crate::mcp_gate::McpToken::mint(), url));
     // core#660: the seat's own MCP off-switches, on the carriers claude's `strictMcpConfig`
     // session option does not cover. Only when the BRIDGE IS that CLI (copilot's ACP mode is
-    // `copilot --acp` — the same binary, so its flags are valid here): the codex bridge is
-    // `codex-acp`, a different program that takes no `-c`, so the codex ACP half of core#660
-    // stays open and disclosed rather than being handed flags it would reject. A pin the engine
-    // cannot build refuses the spawn — fail closed, never a spawn with an ungoverned tool channel.
+    // `copilot --acp` — the same binary, so its flags are valid here). The codex bridge is
+    // `codex-acp`, a different program that takes no `-c`: an ambient server cannot be pinned off
+    // on it, so a codex seat whose config ENABLES one is refused here instead
+    // (`acp_codex_mcp_refusal`). A pin the engine cannot build refuses the spawn — fail closed,
+    // never a spawn with an ungoverned tool channel.
     let mcp_pins: Vec<String> =
         if wicked_apps_core::spawn::SeatCli::from_binary(&config.binary) == seat_cli {
             crate::mcp_isolation::seat_mcp_pin_flags(seat_cli, seat_config.root(), Some(cwd))
                 .map_err(|why| anyhow::anyhow!("ACP seat '{}': {why}", config.binary))?
         } else {
+            if seat_cli == wicked_apps_core::spawn::SeatCli::Codex {
+                crate::mcp_isolation::acp_codex_mcp_refusal(seat_config.root(), Some(cwd))
+                    .map_err(|why| anyhow::anyhow!("ACP seat '{}': {why}", config.binary))?;
+            }
             Vec::new()
         };
     let build_cmd = |binary: &str| {

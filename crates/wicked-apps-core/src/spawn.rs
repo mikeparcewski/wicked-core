@@ -466,6 +466,26 @@ pub const AGY_HIDE_LOGO_ENV: &str = "AGY_CLI_HIDE_LOGO";
 /// See [`AGY_HIDE_LOGO_ENV`].
 pub const AGY_HIDE_ACCOUNT_INFO_ENV: &str = "AGY_CLI_HIDE_ACCOUNT_INFO";
 
+/// (core#585) The credential variables an agy seat authenticates with OTHER than an interactive
+/// sign-in into its isolated home: a Gemini API key, or Vertex AI (project + location +
+/// application credentials). The isolated `HOME` (#578) cuts the seat off from the operator's
+/// `antigravity-oauth-token`, which is the consumer-OAuth path the operator docs single out
+/// (wicked-crew#660). These are how an operator gives the seat a sanctioned credential instead:
+/// set them in the DAEMON's environment, and every agy seat inherits them, because no strip
+/// touches them. [`hardened`](HardenedCommand::hardened) removes only [`ENGINE_INTERNAL_ENV`],
+/// [`SeatConfig::apply`] only the foreign [`SEAT_CONFIG_ENV`] and the remote-write credentials
+/// ([`fence_remote_credentials`]). Named here so that stays true: a test pins that none of them
+/// is ever stripped. Configuring one is an operator ATTESTATION about its tier — the engine cannot
+/// tell a free-tier key from a billed one, and does not claim to.
+pub const AGY_CREDENTIAL_ENV: &[&str] = &[
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+];
+
 /// (F-7R2-012, wave 6) Remote-write CREDENTIALS a seat process never inherits. A worker seat
 /// opened a GitHub PR from its own shell (`gh pr create`, `git push`) on the daemon's ambient
 /// `gh` login — delivery is the ENGINE's job (the deliver tool phase lifts, re-verifies and
@@ -1567,6 +1587,59 @@ mod tests {
         assert!(
             surviving.is_empty(),
             "hardened() left engine-internal variables set: {surviving:?}"
+        );
+    }
+
+    /// core#585: an agy seat's isolated `HOME` must not cost it its sanctioned credentials. Every
+    /// [`AGY_CREDENTIAL_ENV`] variable survives `hardened()` + the agy seat's `SeatConfig::apply`
+    /// (which also sets the isolated home), and none is on any list a strip reads from the daemon's
+    /// own environment, so one set on the daemon reaches the seat.
+    #[test]
+    fn an_agy_seat_keeps_its_api_key_and_vertex_credentials() {
+        for key in AGY_CREDENTIAL_ENV {
+            assert!(
+                !ENGINE_INTERNAL_ENV.contains(key)
+                    && !SEAT_CONFIG_ENV.contains(key)
+                    && !REMOTE_CREDENTIAL_ENV.contains(key)
+                    && !REMOTE_CREDENTIAL_ENV_PREFIXES
+                        .iter()
+                        .any(|p| key.starts_with(p)),
+                "{key} would be stripped from an inherited environment"
+            );
+        }
+        let root = std::env::temp_dir().join(format!("wicked-585-{}", std::process::id()));
+        let decision = SeatConfig::Isolated {
+            cli: SeatCli::Agy,
+            root: Some(root.clone()),
+            set: vec![(HOME_ENV, root.clone())],
+            strip: SEAT_CONFIG_ENV.to_vec(),
+        };
+        let mut cmd = Command::new("true");
+        for key in AGY_CREDENTIAL_ENV {
+            cmd.env(key, "attested");
+        }
+        cmd.hardened();
+        decision.apply(&mut cmd);
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for key in AGY_CREDENTIAL_ENV {
+            assert_eq!(
+                envs.get(*key),
+                Some(&Some("attested".to_string())),
+                "{key} reaches the agy seat"
+            );
+        }
+        assert_eq!(
+            envs.get(HOME_ENV),
+            Some(&Some(root.to_string_lossy().into_owned())),
+            "and the home is still the isolated one"
         );
     }
 
