@@ -29,6 +29,12 @@ open to check a claim.
 
 - Single-writer store actor — never open the shared SQLite from a second writer.
 - Workflows are data (`WorkflowDef` JSON, see `workflows/`); gates are
-  deny-dominates and evaluator≠creator.
+  deny-dominates. evaluator≠creator is enforced where it can be and DISCLOSED where it
+  cannot (`src/distribute.rs`): a team run, or a roster whose distinct seat is benched,
+  refuses with `NoEligibleSeat`; a bench-free ordinary run on a too-small roster keeps the
+  review on the creator seat and stamps `distinctness_fallback: "creator_seat"` (a second
+  instance of the same CLI is `"same_cli_instance"`). A pinned gate with no distinct judge
+  skips the judge (`judge_skipped`, wire `agentVerdict: "skipped"`, `judgeDistinct: false`)
+  and the deterministic floor decides alone. Don't document either as unconditional.
 - PR merge protocol per the ecosystem root `CLAUDE.md`: branch, wait for bot
   reviewers + CI, address comments, then merge.

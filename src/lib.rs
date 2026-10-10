@@ -6,10 +6,11 @@
 //! so consumers (agent, UI, MCP) stop re-opening and racing on the shared file. See `DESIGN.md`.
 //!
 //! Built: the actor + command/reply + event fan-out, the full plan → distribute → execute →
-//! evidence pipeline ([`Core::launch`], stub execute path), and the read API
-//! ([`Core::sessions_detail`], [`Core::work_output`]). Remaining (see `DESIGN.md`): the wrapped-CLI
-//! execute backend (real subprocess + gate-hook), migrating the GUI onto `Core`, and deleting the
-//! `wicked-agent` crate.
+//! evidence pipeline ([`Core::launch`]), the read API ([`Core::sessions_detail`],
+//! [`Core::work_output`]), and real worker execution — persistent ACP sessions (`acp_runner`)
+//! and the wrapped/PTY CLI carrier (`execute_wrapped`, `cli_runner`) — with the validator,
+//! semantic-judge and repo-check gates folded on the actor. The stub execute path remains for
+//! tests.
 
 mod acp_permission;
 mod acp_runner;
