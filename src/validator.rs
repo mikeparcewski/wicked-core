@@ -714,11 +714,11 @@ pub(crate) fn loopback_jail(write_roots: &[&Path]) -> SandboxLauncher {
 
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
 /// Linux regression test uses (a home lacking some of the six) without touching the process env.
-/// (core#703) The seccomp program the loopback-only jail loads: `socket(AF_UNIX, …)` fails with
-/// `EACCES` (connecting to a pathname socket needs one; `socketpair` creates a connected pair with
-/// no pathname and stays allowed), every other syscall is allowed, an x32-ABI syscall on x86_64 and
-/// any syscall of a foreign architecture are refused. Raw classic BPF, no library: ten
-/// instructions for the arch this binary runs on (x86_64 or aarch64); any other arch has no filter.
+/// (core#703) The seccomp program the loopback-only jail loads: every way to reach a pathname
+/// socket fails with `EACCES` — `socket(AF_UNIX, …)`, a datagram `socketpair(AF_UNIX, …)` and
+/// `io_uring_setup` — every other syscall is allowed, an x32-ABI syscall on x86_64 and any syscall
+/// of a foreign architecture are refused. Raw classic BPF, no library, for the arch this binary
+/// runs on (x86_64 or aarch64); on any other arch there is no program and the jail refuses to arm.
 mod seccomp {
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
@@ -729,31 +729,46 @@ mod seccomp {
     const AF_UNIX: u32 = 1;
     const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-    /// `(AUDIT_ARCH_*, __NR_socket)` for this build's architecture.
-    fn arch() -> Option<(u32, u32)> {
+    /// `(AUDIT_ARCH_*, __NR_socket, __NR_socketpair, __NR_io_uring_setup)` for this build's
+    /// architecture.
+    fn arch() -> Option<(u32, u32, u32, u32)> {
         if cfg!(target_arch = "x86_64") {
-            Some((0xC000_003E, 41))
+            Some((0xC000_003E, 41, 53, 425))
         } else if cfg!(target_arch = "aarch64") {
-            Some((0xC000_00B7, 198))
+            Some((0xC000_00B7, 198, 199, 425))
         } else {
             None
         }
     }
 
-    /// The program's bytes (`struct sock_filter[]`, native endian).
+    /// The program's bytes (`struct sock_filter[]`, native endian). Refused with EACCES:
+    /// `socket(AF_UNIX, …)`; `socketpair(AF_UNIX, SOCK_DGRAM, …)` (a datagram endpoint can
+    /// `sendto` any pathname socket — codex r1; stream / seqpacket pairs are connected and stay
+    /// allowed); `io_uring_setup` (io_uring can create a socket without the filtered syscall); any
+    /// x32-ABI or foreign-arch syscall. Everything else is allowed.
     pub(super) fn af_unix_program() -> Option<Vec<u8>> {
-        let (audit_arch, nr_socket) = arch()?;
-        let insns: [(u16, u8, u8, u32); 10] = [
-            (LD_W_ABS, 0, 0, 4),            // 0: A = seccomp_data.arch
-            (JEQ_K, 1, 0, audit_arch),      // 1: our arch ? 3 : 2
-            (RET_K, 0, 0, RET_EACCES),      // 2: a foreign arch: refuse
-            (LD_W_ABS, 0, 0, 0),            // 3: A = seccomp_data.nr
-            (JGE_K, 4, 0, X32_SYSCALL_BIT), // 4: an x32 syscall ? 9 : 5
-            (JEQ_K, 0, 2, nr_socket),       // 5: socket() ? 6 : 8
-            (LD_W_ABS, 0, 0, 16),           // 6: A = args[0] (domain, low 32 bits)
-            (JEQ_K, 1, 0, AF_UNIX),         // 7: AF_UNIX ? 9 : 8
-            (RET_K, 0, 0, RET_ALLOW),       // 8: allow
-            (RET_K, 0, 0, RET_EACCES),      // 9: refuse
+        let (audit_arch, nr_socket, nr_socketpair, nr_io_uring_setup) = arch()?;
+        const ALU_AND_K: u16 = 0x54;
+        const SOCK_TYPE_MASK: u32 = 0xf;
+        const SOCK_DGRAM: u32 = 2;
+        let insns: [(u16, u8, u8, u32); 17] = [
+            (LD_W_ABS, 0, 0, 4),               // 0: A = arch
+            (JEQ_K, 1, 0, audit_arch),         // 1: ours ? 3 : 2
+            (RET_K, 0, 0, RET_EACCES),         // 2: foreign arch
+            (LD_W_ABS, 0, 0, 0),               // 3: A = nr
+            (JGE_K, 11, 0, X32_SYSCALL_BIT),   // 4: x32 ? 16
+            (JEQ_K, 10, 0, nr_io_uring_setup), // 5: io_uring_setup ? 16
+            (JEQ_K, 0, 2, nr_socket),          // 6: socket ? 7 : 9
+            (LD_W_ABS, 0, 0, 16),              // 7: A = args[0] (domain)
+            (JEQ_K, 7, 6, AF_UNIX),            // 8: AF_UNIX ? 16 : 15
+            (JEQ_K, 0, 5, nr_socketpair),      // 9: socketpair ? 10 : 15
+            (LD_W_ABS, 0, 0, 16),              // 10: A = args[0] (domain)
+            (JEQ_K, 0, 3, AF_UNIX),            // 11: AF_UNIX ? 12 : 15
+            (LD_W_ABS, 0, 0, 24),              // 12: A = args[1] (type)
+            (ALU_AND_K, 0, 0, SOCK_TYPE_MASK), // 13: A &= 0xf (drop CLOEXEC/NONBLOCK)
+            (JEQ_K, 1, 0, SOCK_DGRAM),         // 14: DGRAM ? 16 : 15
+            (RET_K, 0, 0, RET_ALLOW),          // 15: allow
+            (RET_K, 0, 0, RET_EACCES),         // 16: refuse
         ];
         let mut out = Vec::with_capacity(insns.len() * 8);
         for (code, jt, jf, k) in insns {
@@ -779,7 +794,13 @@ mod seccomp {
         if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
             return Some(path);
         }
-        let tmp = dir.join(format!("no-af-unix.{}.tmp", std::process::id()));
+        // A name of its own per call (codex r1): concurrent first launches must not race.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = dir.join(format!(
+            "no-af-unix.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, &bytes).ok()?;
         std::fs::rename(&tmp, &path).ok()?;
         Some(path)
@@ -901,19 +922,22 @@ fn launcher_for_roots_masking(
             // prefix so the fd is the jail's own (bwrap reads it; a shared one would be at EOF
             // for the next jail).
             if matches!(network, NetworkPolicy::LoopbackOnly) {
-                if let Some(filter) = seccomp::af_unix_filter_path() {
-                    let mut wrapped: Vec<String> = vec![
-                        "/bin/sh".to_string(),
-                        "-c".to_string(),
-                        "exec 9<\"$0\" || exit 125; exec \"$@\"".to_string(),
-                        filter.to_string_lossy().into_owned(),
-                        w[0].clone(),
-                        "--seccomp".to_string(),
-                        "9".to_string(),
-                    ];
-                    wrapped.extend(w.into_iter().skip(1));
-                    w = wrapped;
-                }
+                // Fail CLOSED (codex r1): a loopback jail that cannot load its program is no jail
+                // at all — the caller treats a non-`Sandboxed` launcher as "cannot jail".
+                let Some(filter) = seccomp::af_unix_filter_path() else {
+                    return floor;
+                };
+                let mut wrapped: Vec<String> = vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "exec 9<\"$0\" || exit 125; exec \"$@\"".to_string(),
+                    filter.to_string_lossy().into_owned(),
+                    w[0].clone(),
+                    "--seccomp".to_string(),
+                    "9".to_string(),
+                ];
+                wrapped.extend(w.into_iter().skip(1));
+                w = wrapped;
             }
             return SandboxLauncher {
                 wrapper: w,
@@ -3983,14 +4007,14 @@ mod tests {
     /// database file") and the coverage gate can never pass on the governed daemon path.
     /// WT-C2 (Copilot on #697): the loopback-only bwrap jail masks the socket directories — and
     /// never one that holds a write root.
-    /// core#703: the AF_UNIX program — ten instructions, the arch check first, the socket()
-    /// domain test, and a refusal that is EACCES, never a kill.
+    /// core#703: the AF_UNIX program — the arch check first, then io_uring_setup, socket(AF_UNIX)
+    /// and socketpair(AF_UNIX, SOCK_DGRAM) refused with EACCES (never a kill), all else allowed.
     #[test]
     fn the_af_unix_seccomp_program_has_its_shape() {
         let Some(p) = seccomp::af_unix_program() else {
             return; // no program on this arch: the jail runs with its masks only
         };
-        assert_eq!(p.len(), 10 * 8);
+        assert_eq!(p.len(), 17 * 8);
         let insn = |i: usize| {
             let b = &p[i * 8..i * 8 + 8];
             (
@@ -4001,13 +4025,28 @@ mod tests {
             )
         };
         assert_eq!(insn(0), (0x20, 0, 0, 4), "loads the arch first");
-        assert_eq!(insn(7).3, 1, "the domain compared is AF_UNIX");
+        assert_eq!(insn(8).3, 1, "the socket() domain compared is AF_UNIX");
+        assert_eq!(insn(14).3, 2, "a socketpair's DGRAM type is refused");
         assert_eq!(
-            insn(8),
+            insn(15),
             (0x06, 0, 0, 0x7fff_0000),
             "everything else is allowed"
         );
-        assert_eq!(insn(9), (0x06, 0, 0, 0x0005_0000 | 13), "AF_UNIX is EACCES");
+        assert_eq!(
+            insn(16),
+            (0x06, 0, 0, 0x0005_0000 | 13),
+            "the refusal is EACCES"
+        );
+        // Every jump lands inside the program.
+        for i in 0..17 {
+            let (code, jt, jf, _) = insn(i);
+            if code == 0x15 || code == 0x35 {
+                assert!(
+                    i + 1 + (jt as usize) < 17 && i + 1 + (jf as usize) < 17,
+                    "insn {i}"
+                );
+            }
+        }
     }
 
     /// core#703, end to end on a Linux host with bwrap: inside the loopback-only jail a process
@@ -4052,7 +4091,11 @@ mod tests {
         );
         assert!(
             run("import socket; socket.socketpair()"),
-            "a socketpair still works"
+            "a stream socketpair still works"
+        );
+        assert!(
+            !run("import socket; socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)"),
+            "a datagram AF_UNIX socketpair is refused (it could sendto any pathname socket)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

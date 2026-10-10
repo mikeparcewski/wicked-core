@@ -388,7 +388,10 @@ pub(crate) fn host_boundary() -> serde_json::Value {
             .trim(),
         "1" | "true"
     );
-    host_boundary_from(boundary_tool(), opted_in, std::env::consts::OS)
+    // The floor arms only what this same cached probe arms (`repo_checks::arm_probed`), so the
+    // prediction and the floor cannot disagree (codex r1).
+    let probe = boundary_tool();
+    host_boundary_from(probe, opted_in, std::env::consts::OS)
 }
 
 /// [`host_boundary`] over explicit inputs — the testable seam.
