@@ -42,7 +42,7 @@ const FIELDS: [&str; 10] = [
 /// Every §11.2 consumer row that still exists. `survey-repo`, `memories`, `domain-graph-slice`
 /// and `collab` were deleted outright (operator decision, 2026-09-26: nothing launched them), so
 /// they have no preset and no fixture.
-const CONSUMERS: [&str; 13] = [
+const CONSUMERS: [&str; 14] = [
     "feature",
     "bug",
     "migration",
@@ -56,6 +56,7 @@ const CONSUMERS: [&str; 13] = [
     "interactive-draft",
     "interactive-edit",
     "qe-author-tests",
+    "mcp-server",
 ];
 
 fn fixtures() -> PathBuf {
@@ -171,8 +172,9 @@ fn compose_of_every_mapping_equals_todays_def_except_the_bold_cells() {
         bold_total += bold.len();
     }
     // feature 2 (test/review role), migration 5 (cutover pin+role, cleanup pin+code+role),
-    // domain-extraction 1, steering-author 1 (collab's 2 left with the deleted workflow).
-    assert_eq!(bold_total, 9, "§11.2 has nine bold cells");
+    // domain-extraction 1, steering-author 1 (collab's 2 left with the deleted workflow), and
+    // mcp-server 1 (test role; M12, DES-W7-M12).
+    assert_eq!(bold_total, 10, "§11.2 (plus M12's row) has ten bold cells");
 }
 
 /// domain-extraction's coverage maps onto `domain_coverage`, which carries the coverage pin as

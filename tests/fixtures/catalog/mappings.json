@@ -429,5 +429,129 @@
    }
   ],
   "bold": {}
+ },
+ "mcp-server": {
+  "steps": [
+   {
+    "catalog": "understand",
+    "id": "scope",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    },
+    "instructions": "Decide what this MCP server exposes (tools, resources, prompts), the upstream's authentication scheme (bearer, API key, basic, OAuth2 client credentials — the server reads ONE secret variable <SERVER>_TOKEN and every other auth parameter from its committed mcp-server.config.json), the transport (stdio by default; httpStream only when the intent asks for a hosted server), and the target: this run's repository, at its root when the repository is new and near-empty, or in a named subdirectory when it already holds code. Say whether an OpenAPI document was given (URL or file), and whether the operator wants the server installed for running when the run completes (the install phase asks again at its gate). If the intent names a repository that is not this run's, say that the operator must create it with an initial commit and register it before a run can deliver into it; do not try to create one.",
+    "skill_ref": "wicked-garden-mcp-scaffold"
+   },
+   {
+    "catalog": "understand",
+    "id": "source-discovery",
+    "gate_type": null,
+    "instructions": "With an OpenAPI document: run the skill's openapi action against the conversion service and report every tool it yields with its class (read, write, destructive), its input schema summary and its request mapping, plus the skipped operations and why. Without one: inventory the integration surface (SDK calls, CLI, database, events) into a candidate tool list with the same columns. Do not write code in this phase.",
+    "skill_ref": "wicked-garden-mcp-scaffold",
+    "depends_on": [
+     "scope"
+    ]
+   },
+   {
+    "catalog": "design",
+    "id": "design",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    },
+    "instructions": "Produce the design: the final tool table (name, description, input schema, annotations, class), the resources and prompts if any, the authentication plan (the one secret variable, the committed non-secret parameters, which header, what fails at startup), and the observability plan (span names and attributes, the three instruments, log fields, what leaves the process and only when). Check each against the MCP-server steering rules MCPS-1001 to MCPS-1007 (recall them with rules.recall, scope wiki:governance, when an estate store is present; otherwise use the checklist in the skill) and against MCP-D2 and MCP-D4. If a rule cannot be recalled, say so, cite the skill's checklist instead, and never state what a rule id means when you could not read it. Name every deviation and why.",
+    "skill_ref": "wicked-garden-mcp-scaffold",
+    "depends_on": [
+     "source-discovery"
+    ]
+   },
+   {
+    "catalog": "build",
+    "id": "build",
+    "instructions": "Scaffold the TypeScript server with the skill (--lang typescript) into the target directory. Branch A, with a tools.json from the conversion service: the generated tools ride the skeleton's REST runtime; adapt names, descriptions and annotations to the design. Branch B, without one: write each tool by hand with a zod schema on the same skeleton. Either way: the one secret variable and the committed mcp-server.config.json the design named, the conformance smoke and one contract test per tool under npm test, the typecheck, lint and test scripts present, an SPDX header on every source file, telemetry exporters armed only by OTEL_EXPORTER_OTLP_ENDPOINT. Build it and run the skill's probe; put the probe JSON in your output.",
+    "skill_ref": "wicked-garden-mcp-scaffold",
+    "depends_on": [
+     "design"
+    ]
+   },
+   {
+    "catalog": "test",
+    "id": "test",
+    "instructions": "Judge the verify floor's report of the repository's own checks (typecheck, lint, test) and the tests themselves: every tool in the design has a contract test, the conformance smoke covers initialize, tools/list, tools/call, the missing-credential startup failure and the httpStream 401 path, and nothing in the tree holds a secret value. A tool without a test, or a smoke that does not exercise the failure paths, is a FAIL with the tool named.",
+    "skill_ref": "wicked-garden-qe-contract-testing-engineer",
+    "depends_on": [
+     "build"
+    ]
+   },
+   {
+    "catalog": "review",
+    "id": "security-review",
+    "gate": {
+     "human_confirm": {
+      "unconditional": false
+     }
+    },
+    "instructions": "Review the diff cold against MCPS-1004 and MCPS-1005 and MCP-D2: the one secret read from the environment only and never logged, returned or accepted as an argument; non-secret auth parameters in the committed config; authentication on every tool and resource (authenticate on httpStream, canAccess on every tool); input validated before the handler runs; upstream requests pinned to the configured base URL with allowlisted arguments and no redirects; a rate limit that answers a user error. Cite file and line for every finding.",
+    "skill_ref": "wicked-garden-platform-security-engineer",
+    "depends_on": [
+     "test"
+    ]
+   },
+   {
+    "catalog": "review",
+    "id": "observability-review",
+    "gate": {
+     "human_confirm_if": "verdict_not_pass"
+    },
+    "instructions": "Review the diff cold against MCPS-1002 and MCPS-1003: one span per tool call with the server, tool, request id and outcome attributes and a child span per upstream request; the three instruments recorded; logs through loglayer with trace and span ids stamped, a request-scoped child logger per call, console output on stderr only; nothing exported unless the operator sets an OTLP endpoint. Cite file and line for every finding.",
+    "skill_ref": "wicked-garden-qe-observability-test-engineer",
+    "depends_on": [
+     "test"
+    ]
+   },
+   {
+    "catalog": "run",
+    "id": "install-plan",
+    "kind": "build",
+    "gate_type": "execution",
+    "instructions": "Plan the install without writing anything: resolve, on this host and as the daemon user, every file and directory each install choice would write — Install for workers (the default: the staged copy under ~/.wicked/mcp-servers/<key>/current, the wicked-crew MCP tools registry and the worker homes' CLI configurations under ~/.wicked-worker) and Also install into my CLIs (the worker set plus your own CLI configurations, such as ~/.claude.json, ~/.codex/config.toml and the opencode configuration) — and print them as one JSON plan line, so the install's consent gate can list them before you answer.",
+    "depends_on": [
+     "security-review",
+     "observability-review"
+    ],
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "bash",
+      "-c",
+      "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --dry-run --json"
+     ]
+    }
+   },
+   {
+    "catalog": "run",
+    "id": "install",
+    "kind": "build",
+    "gate_type": "execution",
+    "gate": "consent_before",
+    "instructions": "Install for running — or update the installed copy when this server key is already installed. Nothing has been installed yet: this asks before the install runs, and each answer lists exactly the files it would write (from the install-plan dry run). Install for workers (the default) builds the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, registers it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks) and writes it into the worker homes' CLI MCP configurations — program-owned files only. Also install into my CLIs does the same and also writes it into your own CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret). Both probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Decline for not now — the pull request already delivered stays as it is.",
+    "depends_on": [
+     "install-plan"
+    ],
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "bash",
+      "-c",
+      "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --target \"${WICKED_CONSENT_CHOICE:?the consent gate recorded no install choice}\" --json"
+     ]
+    }
+   }
+  ],
+  "bold": {
+   "test.role": "evaluator"
+  }
  }
 }

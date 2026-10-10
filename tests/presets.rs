@@ -635,6 +635,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "interactive-chat",
             "interactive-draft",
             "interactive-edit",
+            "mcp-server",
             "migration",
             "onboarding",
             "qe-author-tests",
@@ -1073,6 +1074,78 @@ fn m1_bug_launches_the_preset_in_its_order_with_its_gates_and_pins() {
     assert!(fix
         .description
         .contains("Update every consumer of behaviour this fix retires or changes"));
+}
+
+/// M12 (DES-W7-M12, core#649): a launch naming `mcp-server` runs the built-in preset — the def's
+/// nine phases in order under their own ids, each review keeping its specialist skill and raised
+/// gate (security-review is a `review`, not the catalog's `security_review`), test on the evaluator
+/// role (the bold cell), install-plan and install as Tool `run` steps with install gated
+/// `consent_before`. The PA's `pa-scope` comes first; floor fill may add steps by band.
+#[test]
+fn m12_mcp_server_launches_the_preset_with_its_skills_gates_and_consent() {
+    let dir = tmp_dir("mcp");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core
+        .launch_run(spec("rmcp", "mcp-server", None))
+        .unwrap();
+    let units = units_of(&rig.core, "rmcp");
+    let all = rows("rmcp", &units);
+    assert_eq!(all[0].0, "pa-scope", "{all:?}");
+    let own_ids = [
+        "scope",
+        "source-discovery",
+        "design",
+        "build",
+        "test",
+        "security-review",
+        "observability-review",
+        "install-plan",
+        "install",
+    ];
+    let own: Vec<_> = all
+        .iter()
+        .filter(|r| own_ids.contains(&r.0.as_str()))
+        .cloned()
+        .collect();
+    let f = Some(EVIDENCE_FLOOR_PIN);
+    let h = r#"{"human_confirm":{"unconditional":false}}"#;
+    let v = r#"{"human_confirm_if":"verdict_not_pass"}"#;
+    assert_eq!(
+        own,
+        vec![
+            r("scope", "recon", "neutral", h, None),
+            r("source-discovery", "recon", "neutral", "auto", None),
+            r("design", "recon", "neutral", h, None),
+            r("build", "build", "creator", "auto", f),
+            r("test", "test", "evaluator", v, f),
+            r("security-review", "review", "evaluator", h, f),
+            r("observability-review", "review", "evaluator", v, f),
+            r("install-plan", "build", "neutral", "auto", None),
+            r("install", "build", "neutral", "consent_before", None),
+        ],
+        "{all:?}"
+    );
+    let skill = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("rmcp:{id}"))
+            .and_then(|u| u.skill_ref.clone())
+    };
+    assert_eq!(
+        skill("security-review").as_deref(),
+        Some("wicked-garden-platform-security-engineer")
+    );
+    assert_eq!(
+        skill("observability-review").as_deref(),
+        Some("wicked-garden-qe-observability-test-engineer")
+    );
+    assert_eq!(
+        skill("build").as_deref(),
+        Some("wicked-garden-mcp-scaffold")
+    );
+    let install = units.iter().find(|u| u.id == "rmcp:install").unwrap();
+    assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
