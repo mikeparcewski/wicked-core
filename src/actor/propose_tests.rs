@@ -244,10 +244,8 @@ fn the_answer_carries_the_band_high_risk_and_floor_additions_of_the_edit() {
         .map(|a| a.as_str().unwrap())
         .collect();
     added.sort_unstable();
-    assert_eq!(
-        added,
-        ["architecture", "design", "security_review", "test_plan"]
-    );
+    // A non-code edit owes no diff-floored `security_review` (core#649).
+    assert_eq!(added, ["architecture", "design", "test_plan"]);
     // A duplicate re-decides nothing: no band, no risk, no additions.
     let again = propose_plan(
         &mut store,
