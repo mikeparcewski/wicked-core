@@ -192,7 +192,7 @@ impl PersistentStepRunner {
             // lever-less seat refuses the launch. This carrier resolves no `trust_flags`, so the
             // template is the whole posture here.
             // Recognition is by the RESOLVED binary's stem (argv[0]), never the seat's key.
-            let lever = crate::execute_wrapped::apply_no_code_posture(&mut argv, Vec::new())?;
+            let lever = crate::execute_wrapped::apply_no_code_posture(&mut argv, Vec::new(), None)?;
             eprintln!(
                 "wicked-core: unit {} (phase `{}`, executes_code:false) opens a persistent \
                  session on '{}' with the read-only posture {} (F-036)",

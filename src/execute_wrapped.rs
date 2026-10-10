@@ -1827,17 +1827,34 @@ impl WrappedCliStepRunner {
                     ..
                 })
             );
+        // (core#503) …which now runs its checks: codex's workspace becomes a per-attempt check
+        // scratch (the tree stays denied), so the prompt names the tree to run commands in.
+        let codex_checks = if sandbox_cannot_run_checks {
+            match codex_check_scratch(input) {
+                Ok(check_scratch) => Some(NoCodeLaunchContext {
+                    check_scratch,
+                    notes_root: input.unit.notes_root.as_ref().map(PathBuf::from),
+                }),
+                Err(why) => return posture_refusal(input, &why),
+            }
+        } else {
+            None
+        };
         let task = if guard_only {
             format!(
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
                 read_only_instruction(input.unit.notes_root.as_deref())
             )
-        } else if sandbox_cannot_run_checks {
+        } else if let Some(ctx) = &codex_checks {
             format!(
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
-                sandboxed_checks_instruction(input.unit.notes_root.as_deref())
+                codex_checks_instruction(
+                    &input.workdir.clone().unwrap_or_else(|| sandbox_for(input)),
+                    &ctx.check_scratch,
+                    input.unit.notes_root.as_deref()
+                )
             )
         } else if !is_claude
             && write_posture == crate::write_posture::WritePosture::DeliverableRoots
@@ -1926,7 +1943,7 @@ impl WrappedCliStepRunner {
             // declared roots, which a seat-wide read-only sandbox would refuse — it runs under the
             // seat's ordinary posture, guard-only, and the record says so below.
             if write_posture == crate::write_posture::WritePosture::ReadOnly {
-                match apply_no_code_posture(&mut argv, posture) {
+                match apply_no_code_posture(&mut argv, posture, codex_checks.as_ref()) {
                     Ok(ReadOnlyLever::None) => {
                         let note = format!(
                             "phase `{}` declares executes_code:false but seat '{cli_key}' exposes \
@@ -2347,6 +2364,11 @@ impl WrappedCliStepRunner {
             // convenience, not a governance control, and every seat benefits from temp that is
             // reaped with the worktree and inside its own write root.
             redirect_scratch_into_boundary(&mut cmd, &cwd);
+            // (core#503) …except a read-only codex unit's, whose `<cwd>/tmp` sits in the tree its
+            // sandbox denies: its temp, cargo target and npm cache go to the check scratch.
+            if let Some(ctx) = &codex_checks {
+                ctx.apply_env(&mut cmd);
+            }
             // Even seats without a hook receive the exact root set the kernel launcher got. This
             // does not turn the env into a boundary; it keeps descendant tools and diagnostics
             // aligned with Boundary 1's source of truth.
@@ -2632,6 +2654,11 @@ impl WrappedCliStepRunner {
             }
         };
 
+        // (core#503) The check scratch is this attempt's alone: reap it (a cargo `target/` in it
+        // runs to gigabytes). The notes root is separate and kept.
+        if let Some(ctx) = &codex_checks {
+            let _ = std::fs::remove_dir_all(&ctx.check_scratch);
+        }
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
@@ -3716,21 +3743,27 @@ pub(crate) fn notes_root_sentence(notes_root: &str) -> String {
     )
 }
 
-/// (core#503) The instruction a READ-ONLY unit carries on a seat whose read-only lever is the
-/// seat's OWN sandbox — codex's `--sandbox read-only`, which denies every filesystem write and
-/// all network, not only writes to the tree. The repository's own runners need both: vitest
-/// bundles its config into a temp file beside it, cargo takes `target/debug/.cargo-build-lock`,
-/// `npm audit` resolves the registry. So the checks the evaluator's standing instruction asks for
-/// cannot run here, and the engine's own deterministic floor is what ran them.
-///
-/// This is a DISCLOSURE, not a fix for core#503: the lever still cannot both deny the tree and
-/// admit a check's scratch (codex's `workspace-write` admits the WORKSPACE, which is the tree
-/// under review, and the wrapped carrier has no per-call judge to hold it). What it prevents is
-/// the damage the issue measured — a worker reporting checks it could not run as FAILING checks
-/// and settling on a "CONDITIONAL" verdict for a tree the floor had passed.
-pub(crate) fn sandboxed_checks_instruction(notes_root: Option<&str>) -> String {
-    let mut out = String::from(
-        "READ-ONLY PHASE, SANDBOXED: this phase declares executes_code: false, so your seat runs          in its own read-only sandbox — EVERY filesystem write is denied (including the temp file          a test runner writes beside its config and cargo's build lock) and so is the network.          The repository's own test, build and audit commands therefore CANNOT RUN in this phase.          Do NOT report a check you could not run as a failing check, and do not let it decide          your verdict: the engine's own deterministic floor runs the repository's checks on this          tree and its exit codes are on the run record — cite those. If a check is the only way          to settle a question, say so in your output and name the command you would run. Do not          edit, write, create, delete, move or format any file in the worktree, and do not commit.",
+/// (core#503) The instruction a READ-ONLY unit on a codex seat carries in the check-scratch shape:
+/// the tree is denied by codex's own sandbox, its workspace is the scratch, so every command must
+/// run with its working directory set to the tree; temp, cargo's target and the npm cache already
+/// point into the scratch, and the network is on. The one write that still fails is a temp file a
+/// tool writes BESIDE the tree's own config (vite/vitest's `vite.config.*.timestamp-*.mjs`).
+pub(crate) fn codex_checks_instruction(
+    tree: &Path,
+    scratch: &Path,
+    notes_root: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "READ-ONLY PHASE, CHECKS RUN IN A SCRATCH: this phase declares executes_code: false. The \
+         repository is at {tree} and your sandbox DENIES every write to it; your workspace is the \
+         check scratch {scratch}, which is writable. Run EVERY command with its working directory \
+         set to {tree} (the repository's own test, build and audit commands work there: temp, \
+         CARGO_TARGET_DIR and the npm cache point into the scratch, and the network is open). A \
+         tool that writes a temp file beside the repository's own config still fails (vitest: \
+         pass --configLoader runner). Do NOT edit, write, create, delete, move or format any file \
+         in the repository, and do not commit.",
+        tree = tree.display(),
+        scratch = scratch.display()
     );
     if let Some(root) = notes_root {
         out.push(' ');
@@ -3759,8 +3792,14 @@ pub(crate) enum ReadOnlyLever {
     /// pi: `--exclude-tools edit,write` (pi's built-in tools are read/bash/edit/write; the
     /// denylist flag is documented on `pi --help`).
     PiExcludeTools,
-    /// The seat exposes no lever the engine knows how to apply per launch (copilot's tool
-    /// grants are allow-lists with no verified write-class deny; opencode/agy run over ACP).
+    /// (core#366) copilot: `--deny-tool write`, beside the seat's own `--allow-all-tools` (kept,
+    /// so a read-only unit can still run its checks). Measured on copilot 1.0.94 (program
+    /// `design/w4-seat-sandbox-probes/`): deny beats allow-all (`apply_patch` refused: "denied due
+    /// to the following rules: write"). Shell writes are not covered — the same posture as pi's
+    /// lever; the worktree guard and the OS floor hold the rest.
+    CopilotDenyWrite,
+    /// The seat exposes no lever the engine knows how to apply per launch (opencode/agy run over
+    /// ACP).
     None,
 }
 
@@ -3769,6 +3808,7 @@ impl ReadOnlyLever {
         match self {
             ReadOnlyLever::CodexSandbox => "`--sandbox read-only`",
             ReadOnlyLever::PiExcludeTools => "`--exclude-tools edit,write`",
+            ReadOnlyLever::CopilotDenyWrite => "`--deny-tool write`",
             ReadOnlyLever::None => "(no lever)",
         }
     }
@@ -3780,6 +3820,9 @@ impl ReadOnlyLever {
             ReadOnlyLever::PiExcludeTools => {
                 vec!["--exclude-tools".to_string(), "edit,write".to_string()]
             }
+            ReadOnlyLever::CopilotDenyWrite => {
+                vec!["--deny-tool".to_string(), "write".to_string()]
+            }
             ReadOnlyLever::None => Vec::new(),
         }
     }
@@ -3790,9 +3833,11 @@ impl ReadOnlyLever {
 /// it with. codex's own spellings (`--sandbox workspace-write`, `danger-full-access`, the blanket
 /// bypass, `--full-auto`) are REWRITTEN on a recognised codex seat and REFUSED anywhere else — an
 /// unrecognised alias of codex must not slip a write-capable sandbox through the lever-less branch.
-pub(crate) const WRITE_CAPABLE_TOKENS: [&str; 8] = [
+pub(crate) const WRITE_CAPABLE_TOKENS: [&str; 9] = [
     "--allow-all-tools",
     "--allow-all",
+    // (core#366) copilot's path-check bypass: lets a call reach past the cwd + temp.
+    "--allow-all-paths",
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
     "--full-auto",
@@ -3837,7 +3882,13 @@ fn known_seat(binary: &str) -> Option<&'static str> {
         crate::validator::find_on_path(binary).map(|p| p.to_string_lossy().into_owned())
     };
     let stem = cli_stem(&resolved?);
-    ["codex", "pi"].into_iter().find(|known| stem == *known)
+    // (core#366) copilot ships as `copilot` and as the registry's alt binary `gh-copilot`.
+    match stem.as_str() {
+        "gh-copilot" => Some("copilot"),
+        _ => ["codex", "pi", "copilot"]
+            .into_iter()
+            .find(|known| stem == *known),
+    }
 }
 
 /// Whether `tok` (with its following token, when one exists) is a codex sandbox flag naming a
@@ -3962,6 +4013,32 @@ pub(crate) fn no_code_posture(binary: &str, flags: Vec<String>) -> Result<NoCode
                 satisfied,
             })
         }
+        // (core#366) copilot: its own `--allow-all-tools` STAYS (the checks must run; copilot's
+        // default path check bounds it to the cwd and temp, and the OS floor to the tree), and
+        // `--deny-tool write` is the lever. Every other grant — `--allow-all`, `--yolo`,
+        // `--allow-all-paths` (the path-check bypass), any generic write token — is REFUSED.
+        Some("copilot") => {
+            for tok in &flags {
+                if tok != "--allow-all-tools" && WRITE_CAPABLE_TOKENS.contains(&tok.as_str()) {
+                    return Err(format!(
+                        "binary `{binary}` would launch a phase that declares executes_code:false \
+                         with the WRITE-CAPABLE copilot token `{tok}` ({flags:?}); on a read-only \
+                         phase copilot keeps only `--allow-all-tools` under `--deny-tool write` \
+                         (F-036, core#366). Remove `{tok}` from the seat's `trust_flags`/invocation \
+                         in your wicked-council clis.toml."
+                    ));
+                }
+            }
+            let satisfied = flags
+                .windows(2)
+                .any(|w| w[0] == "--deny-tool" && w[1] == "write")
+                || flags.iter().any(|f| f == "--deny-tool=write");
+            Ok(NoCodePosture {
+                flags,
+                lever: ReadOnlyLever::CopilotDenyWrite,
+                satisfied,
+            })
+        }
         _ => {
             for (i, tok) in flags.iter().enumerate() {
                 let next = flags.get(i + 1).map(String::as_str);
@@ -3970,11 +4047,12 @@ pub(crate) fn no_code_posture(binary: &str, flags: Vec<String>) -> Result<NoCode
                         "binary `{binary}` would launch a phase that declares executes_code:false \
                          with the WRITE-CAPABLE posture token `{tok}` ({flags:?}), and it is not a \
                          CLI the engine has a read-only lever for (recognised by the resolved \
-                         executable's name: codex, pi) — refusing the launch rather than letting an \
-                         evaluator/recon phase run with writes granted (F-036). Remove `{tok}` \
-                         from the seat's `trust_flags`/invocation in your wicked-council \
-                         clis.toml, or route the phase to codex (`--sandbox read-only`), pi \
-                         (`--exclude-tools edit,write`) or the governed claude seat."
+                         executable's name: codex, pi, copilot / gh-copilot) — refusing the launch \
+                         rather than letting an evaluator/recon phase run with writes granted \
+                         (F-036). Remove `{tok}` from the seat's `trust_flags`/invocation in your \
+                         wicked-council clis.toml, or route the phase to codex (its check-scratch \
+                         sandbox), pi (`--exclude-tools edit,write`), copilot \
+                         (`--deny-tool write`) or the governed claude seat."
                     ));
                 }
             }
@@ -3996,6 +4074,7 @@ pub(crate) fn no_code_posture(binary: &str, flags: Vec<String>) -> Result<NoCode
 pub(crate) fn apply_no_code_posture(
     argv: &mut Vec<String>,
     posture: Vec<String>,
+    codex_checks: Option<&NoCodeLaunchContext>,
 ) -> Result<ReadOnlyLever, String> {
     let Some(binary) = argv.first().cloned() else {
         return Ok(ReadOnlyLever::None);
@@ -4005,11 +4084,125 @@ pub(crate) fn apply_no_code_posture(
     argv.extend(t.flags);
     let p = no_code_posture(&binary, posture)?;
     let mut flags = p.flags;
+    // (core#503) A recognised codex seat with a check scratch runs codex's `workspace-write`
+    // sandbox ROOTED AT THE SCRATCH, not `--sandbox read-only`: the tree (the process cwd, never a
+    // writable root) stays denied by the kernel, while the repository's checks get a writable
+    // workspace, temp and network. Every read-only sandbox spelling and every `-C`/`--cd` is
+    // dropped first, so neither the template nor the posture can root codex anywhere else.
+    if let (ReadOnlyLever::CodexSandbox, Some(ctx)) = (p.lever, codex_checks) {
+        let head = argv.split_off(1);
+        argv.extend(strip_codex_roots(head));
+        flags = strip_codex_roots(flags);
+        flags.extend(ctx.codex_flags());
+        apply_seat_posture(argv, &flags);
+        return Ok(p.lever);
+    }
     if !(t.satisfied || p.satisfied) {
         flags.extend(p.lever.flags());
     }
     apply_seat_posture(argv, &flags);
     Ok(p.lever)
+}
+
+/// (core#503) Drop every codex sandbox-mode and working-root spelling from a flag list:
+/// `--sandbox <mode>` / `-s <mode>` / `--sandbox=<mode>`, and `-C <dir>` / `--cd <dir>` /
+/// `--cd=<dir>`. (A no-code posture has already rewritten the modes to read-only.)
+fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(flags.len());
+    let mut i = 0;
+    while i < flags.len() {
+        let f = flags[i].as_str();
+        if matches!(f, "--sandbox" | "-s" | "-C" | "--cd") {
+            i += 2;
+            continue;
+        }
+        if f.starts_with("--sandbox=") || f.starts_with("-s=") || f.starts_with("--cd=") {
+            i += 1;
+            continue;
+        }
+        out.push(flags[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// (core#503, operator ruling 2026-10-09) Where a READ-ONLY unit on a recognised codex seat runs
+/// its checks: a per-attempt CHECK SCRATCH outside the tree and outside the system temp
+/// (`<worker home>/checks/<run>/<ord>-a<attempt>`), made codex's `workspace-write` root. Measured
+/// on codex-cli 0.161.0 (program `design/w4-seat-sandbox-probes/`): with `-C <scratch>` and
+/// commands run in the tree, a tree write is DENIED by the kernel while scratch writes, a cargo
+/// `target/` lock in the scratch and (with `network_access`) DNS all work. Writable roots only ever
+/// ADD to the workspace, so the tree must never be `-C` or `--add-dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoCodeLaunchContext {
+    pub(crate) check_scratch: PathBuf,
+    /// The unit's notes root (core#483), the one other writable place.
+    pub(crate) notes_root: Option<PathBuf>,
+}
+
+impl NoCodeLaunchContext {
+    /// The codex flags for this shape: `workspace-write` rooted at the scratch, `/tmp` and
+    /// `$TMPDIR` excluded from the writable set (temp is pointed into the scratch instead), the
+    /// network ON (the operator's ruling: a read-only unit can run `npm audit` and registry
+    /// fetches), and the notes root added.
+    pub(crate) fn codex_flags(&self) -> Vec<String> {
+        let mut f: Vec<String> = ["--sandbox", "workspace-write", "-C"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        f.push(self.check_scratch.to_string_lossy().into_owned());
+        for kv in [
+            "sandbox_workspace_write.exclude_slash_tmp=true",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "sandbox_workspace_write.network_access=true",
+        ] {
+            f.push("-c".to_string());
+            f.push(kv.to_string());
+        }
+        if let Some(notes) = &self.notes_root {
+            f.push("--add-dir".to_string());
+            f.push(notes.to_string_lossy().into_owned());
+        }
+        f
+    }
+
+    /// Point the checks' scratch writes into the scratch: temp, cargo's target dir and the npm
+    /// cache. Applied AFTER [`redirect_scratch_into_boundary`], whose `<cwd>/tmp` would sit in the
+    /// read-only tree.
+    pub(crate) fn apply_env(&self, cmd: &mut Command) {
+        let tmp = self.check_scratch.join("tmp");
+        let _ = std::fs::create_dir_all(&tmp);
+        for k in ["TMPDIR", "TMP", "TEMP"] {
+            cmd.env(k, &tmp);
+        }
+        cmd.env("CARGO_TARGET_DIR", self.check_scratch.join("target"));
+        cmd.env("npm_config_cache", self.check_scratch.join("npm-cache"));
+    }
+}
+
+/// (core#503) Make the check scratch for one attempt of `input`'s unit, private, under the worker
+/// home. `Err` (the launch is refused) when it cannot be made.
+pub(crate) fn codex_check_scratch(input: &StepInput) -> Result<PathBuf, String> {
+    let base = wicked_apps_core::spawn::worker_home_base()
+        .map_err(|e| format!("no worker home for the codex check scratch: {e}"))?;
+    let run: String = input
+        .run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = base
+        .join("checks")
+        .join(run)
+        .join(format!("{}-a{}", input.unit.ord, input.attempt));
+    wicked_apps_core::spawn::ensure_private_dir(&dir)
+        .map_err(|e| format!("cannot make the codex check scratch {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 /// The [`StepOutput`] for a unit whose launch [`no_code_posture`] REFUSED: nothing ran, nothing was
@@ -7498,7 +7691,7 @@ mod tests {
         }
         // The full argv a `--yolo` template yields for a no-code unit: lever appended, no grant.
         let mut argv = s(&[codex, "--yolo", "exec"]);
-        apply_no_code_posture(&mut argv, Vec::new()).unwrap();
+        apply_no_code_posture(&mut argv, Vec::new(), None).unwrap();
         assert_eq!(argv, s(&[codex, "exec", "--sandbox", "read-only"]));
     }
 
@@ -7595,6 +7788,61 @@ mod tests {
         assert!(p.satisfied);
     }
 
+    /// core#366: copilot's lever is `--deny-tool write` BESIDE its own `--allow-all-tools`, which
+    /// stays so the checks run; `--allow-all`, `--yolo` and `--allow-all-paths` are refused,
+    /// whether they come from the seat's flags or the template, and `gh-copilot` is copilot.
+    #[test]
+    fn no_code_posture_keeps_copilots_allow_all_tools_and_denies_its_write_tool() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let p = no_code_posture("/opt/tools/copilot", s(&["--allow-all-tools"])).unwrap();
+        assert_eq!(
+            (p.flags, p.lever, p.satisfied),
+            (
+                s(&["--allow-all-tools"]),
+                ReadOnlyLever::CopilotDenyWrite,
+                false
+            )
+        );
+        assert_eq!(
+            ReadOnlyLever::CopilotDenyWrite.flags(),
+            s(&["--deny-tool", "write"])
+        );
+        assert!(
+            no_code_posture("/opt/tools/copilot", s(&["--deny-tool", "write"]))
+                .unwrap()
+                .satisfied
+        );
+        assert_eq!(
+            no_code_posture("/usr/bin/gh-copilot", vec![])
+                .unwrap()
+                .lever,
+            ReadOnlyLever::CopilotDenyWrite
+        );
+        for tok in ["--allow-all", "--yolo", "--allow-all-paths"] {
+            let err = no_code_posture("/opt/tools/copilot", s(&["--allow-all-tools", tok]))
+                .expect_err(tok);
+            assert!(err.contains(tok) && err.contains("clis.toml"), "{err}");
+        }
+        // The launch boundary: the template's own `--allow-all-paths` refuses before spawn, and a
+        // bare template gets the lever appended once.
+        let mut argv = s(&["/opt/tools/copilot", "--allow-all-paths", "-p", "x"]);
+        assert!(apply_no_code_posture(&mut argv, s(&["--allow-all-tools"]), None).is_err());
+        let mut argv = s(&["/opt/tools/copilot", "-p", "x"]);
+        let lever = apply_no_code_posture(&mut argv, s(&["--allow-all-tools"]), None).unwrap();
+        assert_eq!(lever, ReadOnlyLever::CopilotDenyWrite);
+        assert_eq!(
+            argv,
+            s(&[
+                "/opt/tools/copilot",
+                "-p",
+                "x",
+                "--allow-all-tools",
+                "--deny-tool",
+                "write"
+            ])
+        );
+    }
+
     /// An UNKNOWN binary: passes through when its flags grant nothing (the caller discloses and
     /// the worktree guard holds the line), and is REFUSED when they grant writes — the generic
     /// tokens AND codex's write-capable sandbox spellings. A bare name that does not resolve on
@@ -7602,23 +7850,23 @@ mod tests {
     #[test]
     fn no_code_posture_refuses_a_write_capable_unknown_binary_and_passes_a_bare_one() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let p = no_code_posture("/opt/tools/copilot", vec![]).unwrap();
+        let p = no_code_posture("/opt/tools/mystery", vec![]).unwrap();
         assert_eq!(
             (p.flags, p.lever, p.satisfied),
             (vec![], ReadOnlyLever::None, true)
         );
         assert_eq!(
-            no_code_posture("/opt/tools/copilot", s(&["--add-dir", "/x"]))
+            no_code_posture("/opt/tools/mystery", s(&["--add-dir", "/x"]))
                 .unwrap()
                 .lever,
             ReadOnlyLever::None
         );
-        let err = no_code_posture("/opt/tools/copilot", s(&["--allow-all-tools"]))
+        let err = no_code_posture("/opt/tools/mystery", s(&["--allow-all-tools"]))
             .expect_err("a write grant with no lever must refuse the launch");
         assert!(
             err.contains("--allow-all-tools")
                 && err.contains("executes_code:false")
-                && err.contains("copilot")
+                && err.contains("mystery")
                 && err.contains("clis.toml"),
             "the refusal names the token, the rule, the binary and the remedy: {err}"
         );
@@ -7657,7 +7905,8 @@ mod tests {
             "--dangerously-bypass-approvals-and-sandbox",
             "the prompt",
         ]);
-        let lever = apply_no_code_posture(&mut argv, s(&["--sandbox", "workspace-write"])).unwrap();
+        let lever =
+            apply_no_code_posture(&mut argv, s(&["--sandbox", "workspace-write"]), None).unwrap();
         assert_eq!(lever, ReadOnlyLever::CodexSandbox);
         assert_eq!(
             argv,
@@ -7671,7 +7920,7 @@ mod tests {
         );
         // No sandbox anywhere: the lever's flags are appended before a `--` guard when one exists.
         let mut argv = s(&["/opt/tools/codex", "exec", "--", "the prompt"]);
-        apply_no_code_posture(&mut argv, vec![]).unwrap();
+        apply_no_code_posture(&mut argv, vec![], None).unwrap();
         assert_eq!(
             argv,
             s(&[
@@ -7685,17 +7934,17 @@ mod tests {
         );
         // An unknown binary whose TEMPLATE grants writes is refused, whatever its posture says.
         let mut argv = s(&[
-            "/opt/tools/copilot",
+            "/opt/tools/opencode",
             "--allow-all-tools",
             "-p",
             "the prompt",
         ]);
-        let err = apply_no_code_posture(&mut argv, vec![]).expect_err("refused");
+        let err = apply_no_code_posture(&mut argv, vec![], None).expect_err("refused");
         assert!(err.contains("--allow-all-tools"));
         // An empty argv is left alone (the launch fails on its own account downstream).
         let mut empty: Vec<String> = vec![];
         assert_eq!(
-            apply_no_code_posture(&mut empty, vec![]).unwrap(),
+            apply_no_code_posture(&mut empty, vec![], None).unwrap(),
             ReadOnlyLever::None
         );
     }
@@ -7831,8 +8080,8 @@ mod tests {
     }
 
     /// END-TO-END through `run_unit`: a unit whose phase declared `executes_code: false` on a
-    /// binary whose stem is `codex` — the argv must carry `--sandbox read-only` and NOT the
-    /// workspace-write posture the code phases get. The fixture is an executable named `codex`
+    /// binary whose stem is `codex` — the argv must carry the check-scratch shape (core#503) and
+    /// NOT the worktree-rooted workspace-write posture the code phases get. The fixture is an executable named `codex`
     /// because recognition reads the resolved binary, never the seat key.
     #[cfg(unix)]
     #[test]
@@ -7847,6 +8096,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let _home = HomeGuard::pin(&home);
+        let _no_worker_home = VarGuard::unset(wicked_apps_core::spawn::WORKER_HOME_ENV);
 
         let dir = home.join("wt");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7873,24 +8123,47 @@ mod tests {
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        // core#503 (operator ruling): codex's workspace-write sandbox ROOTED AT THE CHECK SCRATCH
+        // under the worker home, with the network open — and never the worktree as a root, so the
+        // kernel keeps denying writes to it.
+        let scratch = home
+            .join(".wicked-worker")
+            .join("checks")
+            .join("run-ro-posture")
+            .join("4-a0");
         assert!(
-            out.output.contains("--sandbox") && out.output.contains("read-only"),
-            "a no-code phase on codex must run in codex's read-only sandbox; got: {}",
+            out.output.contains(&format!(
+                "--sandbox workspace-write -C {}",
+                scratch.display()
+            )),
+            "a no-code phase on codex runs its checks in the scratch; got: {}",
             out.output
         );
         assert!(
-            !out.output.contains("workspace-write") && !out.output.contains("dangerously-bypass"),
-            "no write-capable sandbox may survive on a no-code phase; got: {}",
+            out.output
+                .contains("sandbox_workspace_write.network_access=true"),
+            "the network is open for the checks; got: {}",
             out.output
         );
-        // core#503: the prompt says the repository's own checks cannot run under that sandbox,
-        // so the worker does not report them as FAILING checks.
         assert!(
-            out.output.contains("CANNOT RUN in this phase")
-                && out.output.contains("deterministic floor"),
-            "the sandbox limit must ride the prompt; got: {}",
+            !out.output.contains(&format!("-C {}", dir.display()))
+                && !out.output.contains(&format!("--add-dir {}", dir.display()))
+                && !out.output.contains("--sandbox read-only")
+                && !out.output.contains("--sandbox=read-only")
+                && !out.output.contains("dangerously-bypass"),
+            "the worktree is never a writable root; got: {}",
             out.output
         );
+        // The prompt names the tree to run commands in.
+        assert!(
+            out.output.contains("CHECKS RUN IN A SCRATCH")
+                && out
+                    .output
+                    .contains(&format!("working directory set to {}", dir.display())),
+            "the shape rides the prompt; got: {}",
+            out.output
+        );
+        assert!(!scratch.exists(), "the attempt's scratch is reaped");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -9068,22 +9341,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// core#503: the sandboxed-checks instruction says what cannot run, where the checks' exit
-    /// codes are, and that a check it could not run must not decide the verdict — and it still
-    /// carries the notes root when the unit has one.
+    /// core#503 (operator ruling: network on): a read-only codex unit runs codex's
+    /// `workspace-write` sandbox ROOTED AT ITS CHECK SCRATCH with the network open, and the tree is
+    /// never a writable root — so it can reach the network and still cannot write the tree. The
+    /// template's own read-only sandbox and `-C` are rewritten the same way; without a scratch the
+    /// lever is the plain read-only sandbox, as before.
     #[test]
-    fn the_sandboxed_checks_instruction_names_the_limit_the_floor_and_the_notes_root() {
-        let bare = sandboxed_checks_instruction(None);
+    fn a_read_only_codex_unit_runs_its_checks_in_a_scratch_with_the_network_and_no_tree_root() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let codex = "/opt/tools/codex".to_string();
+        let ctx = NoCodeLaunchContext {
+            check_scratch: PathBuf::from("/w/checks/run-1/4-a0"),
+            notes_root: Some(PathBuf::from("/w/notes/run-1/u4")),
+        };
+        for template in [
+            s(&[&codex, "exec", "--skip-git-repo-check", "the prompt"]),
+            s(&[
+                &codex,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "-C",
+                "/repo/tree",
+                "the prompt",
+            ]),
+            s(&[
+                &codex,
+                "exec",
+                "--cd=/repo/tree",
+                "--sandbox=read-only",
+                "the prompt",
+            ]),
+        ] {
+            let mut argv = template.clone();
+            let lever =
+                apply_no_code_posture(&mut argv, s(&["--sandbox", "workspace-write"]), Some(&ctx))
+                    .unwrap();
+            assert_eq!(lever, ReadOnlyLever::CodexSandbox);
+            let joined = argv.join(" ");
+            assert!(
+                joined.contains("--sandbox workspace-write -C /w/checks/run-1/4-a0"),
+                "{joined}"
+            );
+            for kv in [
+                "-c sandbox_workspace_write.exclude_slash_tmp=true",
+                "-c sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                "-c sandbox_workspace_write.network_access=true",
+                "--add-dir /w/notes/run-1/u4",
+            ] {
+                assert!(joined.contains(kv), "{kv}: {joined}");
+            }
+            assert!(
+                !joined.contains("read-only"),
+                "no read-only sandbox left: {joined}"
+            );
+            assert!(
+                !joined.contains("/repo/tree"),
+                "the tree is never a root: {joined}"
+            );
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--sandbox").count(),
+                1,
+                "{joined}"
+            );
+        }
+        // Without a scratch (the persistent-session carrier) the lever is the read-only sandbox.
+        let mut argv = s(&[&codex, "exec", "the prompt"]);
+        apply_no_code_posture(&mut argv, Vec::new(), None).unwrap();
+        assert!(argv.join(" ").contains("--sandbox read-only"), "{argv:?}");
+
+        // The checks' temp, cargo target and npm cache land in the scratch.
+        let scratch = std::env::temp_dir().join(format!("wicked-503-{}", std::process::id()));
+        let ctx = NoCodeLaunchContext {
+            check_scratch: scratch.clone(),
+            notes_root: None,
+        };
+        let mut cmd = Command::new("true");
+        ctx.apply_env(&mut cmd);
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        for k in [
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "CARGO_TARGET_DIR",
+            "npm_config_cache",
+        ] {
+            assert!(
+                env.get(k)
+                    .is_some_and(|v| std::path::Path::new(v).starts_with(&scratch)),
+                "{k}: {env:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn the_codex_checks_instruction_names_the_tree_the_scratch_and_the_notes_root() {
+        let bare = codex_checks_instruction(
+            std::path::Path::new("/repo/tree"),
+            std::path::Path::new("/w/checks/r/1-a0"),
+            None,
+        );
         for must in [
-            "CANNOT RUN in this phase",
-            "Do NOT report a check you could not run as a failing check",
-            "deterministic floor",
+            "DENIES every write to it",
+            "working directory set to /repo/tree",
+            "check scratch /w/checks/r/1-a0",
+            "the network is open",
+            "--configLoader runner",
             "do not commit",
         ] {
             assert!(bare.contains(must), "{must}: {bare}");
         }
-        assert!(!bare.contains("write them ONLY under"), "{bare}");
-        let with_notes = sandboxed_checks_instruction(Some("/notes/u4"));
+        let with_notes = codex_checks_instruction(
+            std::path::Path::new("/repo/tree"),
+            std::path::Path::new("/w/checks/r/1-a0"),
+            Some("/notes/u4"),
+        );
         assert!(with_notes.contains("/notes/u4"), "{with_notes}");
     }
 
