@@ -1018,7 +1018,9 @@ pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
     let mut blocks: Vec<Vec<&str>> = vec![Vec::new()];
     for line in diff.lines() {
         if line.starts_with("diff --git ") {
-            blocks.push(Vec::new());
+            // Kept as the block's first line: the only place a binary or mode-only change names
+            // its paths ([`file_block`] reads it last, as a fallback).
+            blocks.push(vec![line]);
         } else if let Some(block) = blocks.last_mut() {
             block.push(line);
         }
@@ -1092,13 +1094,37 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
             new.get_or_insert_with(|| git_unquote(p));
         } else if l.starts_with("deleted file mode") {
             deleted = true;
+        } else if let Some((a, b)) = l
+            .strip_prefix("Binary files ")
+            .and_then(|r| r.strip_suffix(" differ"))
+            .and_then(|r| r.split_once(" and "))
+        {
+            // (codex r1 on the QE PR) A binary change has no `---`/`+++`: its paths are here.
+            old.get_or_insert_with(|| header_path(a, "a/"));
+            let b = header_path(b, "b/");
+            deleted |= b.is_empty();
+            new.get_or_insert(b);
+        }
+    }
+    // Last resort for a block with no header paths at all (a mode-only change, a binary whose
+    // line did not parse): the `diff --git a/X b/Y` line, when it splits unambiguously. A block
+    // that still names nothing counts as code below (fail closed).
+    if old.is_none() && new.is_none() {
+        if let Some((a, b)) = lines
+            .first()
+            .and_then(|l| l.strip_prefix("diff --git "))
+            .and_then(git_header_paths)
+        {
+            old = Some(a);
+            new = Some(b);
         }
     }
     let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
     let sides = [old.as_str(), new.as_str()];
     let named = sides.iter().any(|p| !p.is_empty());
-    if !named && hunks == lines.len() {
-        return; // nothing to attribute: no path and no hunk
+    let headed = lines.first().is_some_and(|l| l.starts_with("diff --git "));
+    if !named && hunks == lines.len() && !headed {
+        return; // nothing to attribute: no file header, no path and no hunk
     }
     // A dependency manifest is never docs, whatever its extension (`requirements.txt`): it is
     // configuration, and its adds are read for new dependencies below.
@@ -1148,6 +1174,9 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         .map(|(_, e)| e.to_ascii_lowercase());
     for line in &lines[hunks..] {
         if let Some(h) = line.strip_prefix("@@") {
+            // A hunk shows only its own lines: what section it sits in is unknown until it says
+            // (codex r1 on the QE PR — a `[package]` in one hunk must not cover the next).
+            section = None;
             // `@@ -a[,b] +c[,d] @@`: `a` is the first base-side line (0 for a new file).
             old_next = h
                 .trim_start()
@@ -1235,6 +1264,26 @@ enum Manifest {
     GoSum,
 }
 
+/// `package.json` top-level string fields that are never a dependency.
+const PACKAGE_JSON_FIELDS: &[&str] = &[
+    "name",
+    "version",
+    "description",
+    "main",
+    "module",
+    "types",
+    "typings",
+    "type",
+    "license",
+    "author",
+    "homepage",
+    "private",
+    "packageManager",
+    "browser",
+    "sideEffects",
+    "$schema",
+];
+
 fn manifest_kind(path: &str) -> Option<Manifest> {
     let name = path.rsplit('/').next().unwrap_or(path);
     Some(match name {
@@ -1281,23 +1330,34 @@ fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Opti
             (in_deps || (section.is_none() && shaped)).then(|| unquote(key))
         }
         Manifest::PackageJson => {
+            // Track the object a line sits in (`"dependencies": {` … `}`), per hunk.
+            if l.starts_with('}') {
+                *section = None;
+                return None;
+            }
             let (key, value) = l.split_once(':')?;
             let key = unquote(key);
             let value = value.trim().trim_end_matches(',').trim();
-            let v = value.strip_prefix('"')?;
-            let ranged = v.starts_with(|c: char| c.is_ascii_digit() || "^~=<>*".contains(c))
-                || [
-                    "workspace:",
-                    "npm:",
-                    "file:",
-                    "link:",
-                    "git",
-                    "github:",
-                    "http",
-                ]
-                .iter()
-                .any(|p| v.starts_with(p));
-            (ranged && key != "version" && key != "node" && !key.is_empty()).then_some(key)
+            if value.starts_with('{') {
+                *section = Some(key.to_ascii_lowercase());
+                return None;
+            }
+            value.strip_prefix('"')?;
+            match section.as_deref() {
+                // Inside a dependency object every key is a dependency, whatever its version
+                // syntax (`latest`, a tag, a URL) and whatever its name.
+                Some(s)
+                    if s.ends_with("dependencies") || s == "overrides" || s == "resolutions" =>
+                {
+                    Some(key)
+                }
+                Some(_) => None,
+                // A hunk that never showed its object: anything but a known top-level field
+                // counts (unknown leans toward "new").
+                None => {
+                    (!PACKAGE_JSON_FIELDS.contains(&key.as_str()) && !key.is_empty()).then_some(key)
+                }
+            }
         }
         Manifest::GoMod => {
             let l = l.strip_prefix("require").map_or(l, str::trim);
@@ -1379,6 +1439,11 @@ fn public_decl(ext: Option<&str>, line: &str) -> Option<String> {
                 "fn" | "struct" | "enum" | "trait" | "type" | "static" | "mod" | "union" => {
                     name_of(words.next()?)
                 }
+                // A re-export widens the public surface by whatever it names.
+                "use" => Some(format!(
+                    "use {}",
+                    line.trim().trim_start_matches("pub use ")
+                )),
                 field if field.ends_with(':') => name_of(field).map(|f| format!(".{f}")),
                 _ => None,
             }
@@ -1393,6 +1458,13 @@ fn public_decl(ext: Option<&str>, line: &str) -> Option<String> {
             }
             if w == "default" {
                 return Some("default".to_string());
+            }
+            // `export { a, b }`, `export * from …`, `export type { T }`: a re-export.
+            if w.starts_with('{') || w.starts_with('*') || (w == "type" && line.contains('{')) {
+                return Some(format!(
+                    "export {}",
+                    line.trim().trim_start_matches("export ")
+                ));
             }
             match w {
                 "function" | "function*" | "class" | "const" | "let" | "var" | "interface"
@@ -1431,6 +1503,23 @@ fn public_decl(ext: Option<&str>, line: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The two paths of a `diff --git` header's remainder (`a/X b/Y`, or both git-quoted), only when
+/// the split is unambiguous — exactly one ` b/` boundary — else `None`.
+fn git_header_paths(rest: &str) -> Option<(String, String)> {
+    if let Some(q) = rest.strip_prefix('"') {
+        let end = q.find("\" \"")?;
+        let (a, b) = (format!("\"{}\"", &q[..end]), &q[end + 2..]);
+        return Some((header_path(&a, "a/"), header_path(b, "b/")));
+    }
+    let a = rest.strip_prefix("a/")?;
+    let mut parts = a.match_indices(" b/");
+    let (i, _) = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((a[..i].to_string(), a[i + 3..].to_string()))
 }
 
 /// The path on a `---`/`+++` line: git-unquoted, a trailing `\t<timestamp>` dropped from an

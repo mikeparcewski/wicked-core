@@ -242,6 +242,43 @@ fn an_explicit_skip_carries_its_reason_and_force_is_recorded() {
     );
 }
 
+/// codex r1: a PRESET launch (`feature`, a team plan whose first rev is the PA's scope step) with an
+/// explicit skip launches and runs on to its plan: the word is judged where the contract is built
+/// (the launch stub), never again against the scope step's def.
+#[test]
+fn a_preset_launch_takes_an_explicit_skip_through_to_its_plan() {
+    let core = engine("preset-skip");
+    let ev = core.subscribe();
+    core.launch_run(spec(
+        "qe-preset-skip",
+        "feature",
+        QeOverride::Skip("spike".into()),
+    ))
+    .expect("launch");
+    let evs = collect_until(
+        &ev,
+        Duration::from_secs(30),
+        |e| matches!(e, CoreEvent::UnitPlanned { session, .. } | CoreEvent::SessionFailed { session, .. } if session == "qe-preset-skip"),
+    );
+    let s = evs
+        .iter()
+        .map(|e| e.to_json())
+        .find(|j| j["type"] == "sessionStarted")
+        .unwrap_or_else(|| panic!("{evs:?}"));
+    assert_eq!(s["assurance"]["qe"]["status"], "skipped", "{s}");
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, CoreEvent::SessionFailed { .. })),
+        "the plan never re-judges the word: {evs:?}"
+    );
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, CoreEvent::UnitPlanned { .. })),
+        "the run planned: {evs:?}"
+    );
+    let _ = core.cancel_run("qe-preset-skip");
+}
+
 /// A skip with no reason, and a skip or force on a run that does not require QE acceptance, are
 /// refused synchronously — never a silently dropped word.
 #[test]

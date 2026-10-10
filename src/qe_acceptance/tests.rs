@@ -3,6 +3,7 @@ use crate::assurance::{QeOverride, RunAssurance};
 use crate::domain::{HumanConfirm, SessionStatus};
 use crate::scope::EntityMode;
 use crate::workflow::PhaseRole;
+use wicked_apps_core::spawn::HardenedCommand;
 
 fn session(assurance: RunAssurance) -> AgentSession {
     AgentSession {
@@ -147,6 +148,7 @@ fn the_run_diff_and_history_come_from_the_repository() {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
+            .hardened()
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
             .args(args)
             .current_dir(&dir)
@@ -270,6 +272,7 @@ impl Repo {
     }
     fn git(&self, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
+            .hardened()
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
             .args(args)
             .current_dir(&self.dir)
@@ -401,4 +404,64 @@ fn a_new_file_with_a_new_dependency_is_required_end_to_end() {
         d.reason.contains("new dependency") && d.reason.contains("new or unindexed file"),
         "{d:?}"
     );
+}
+
+/// codex r1: every unit that may change the scored tree revokes a waiver — a `produce` creator
+/// (no `executes_code`), a creator Tool step, a neutral `executes_code` unit — but not the deliver
+/// step.
+#[test]
+fn any_tree_changing_unit_after_a_waiver_revokes_it() {
+    let mut s = session(requiring());
+    s.assurance.qe = Some(waived_at(4));
+    let mut produce = WorkUnit::pending("s:produce", "s", 5, "produce");
+    produce.role = PhaseRole::Creator;
+    let mut tool = WorkUnit::pending("s:run", "s", 5, "run");
+    tool.role = PhaseRole::Creator;
+    tool.tool_cmd = Some(vec!["make".into()]);
+    let mut cutover = WorkUnit::pending("s:cutover", "s", 5, "cutover");
+    cutover.executes_code = true;
+    for u in [produce, tool, cutover] {
+        assert!(
+            matches!(on_dispatch(&s, &u, None, None), Dispatched::Decided(ref d) if d.status == "required"),
+            "{}",
+            u.id
+        );
+    }
+    let mut deliver = WorkUnit::pending("s:deliver", "s", 6, "deliver");
+    deliver.role = PhaseRole::Creator;
+    deliver.tool_cmd = Some(vec!["deliver".into()]);
+    assert!(matches!(
+        on_dispatch(&s, &deliver, None, None),
+        Dispatched::Unchanged
+    ));
+}
+
+/// codex r1: a QE dispatch that carries a floor fix (a seat changes the tree after the score) is
+/// required whatever the diff scores.
+#[test]
+fn a_qe_dispatch_carrying_a_floor_fix_is_required() {
+    let repo = Repo::new("floorfix", 3);
+    let tree = repo.change(&[("src/a.rs", "fn a() {\n    42\n}\n")]);
+    assert_eq!(
+        repo.decide(&tree).status,
+        "waived",
+        "the tree alone would be waived"
+    );
+    let mut s = session(requiring());
+    s.base_commit = Some(repo.base.clone());
+    let mut u = qe_unit(4);
+    u.repo_checks = Some(
+        serde_json::from_value(serde_json::json!({
+            "detected": [], "checks": [], "skipped": [], "passed": false,
+            "requested_rerun": {"mode": "floor_fix", "output": "", "fix": {"note": "fix the test", "seat": "codex"}}
+        }))
+        .expect("a repo-checks report with a requested fix"),
+    );
+    let git_dir = repo.dir.join(".git");
+    let Dispatched::Decided(d) = on_dispatch(&s, &u, Some(&repo.dir), Some((&tree, &git_dir)))
+    else {
+        panic!("decided");
+    };
+    assert_eq!(d.status, "required");
+    assert!(d.reason.contains("floor fix"), "{d:?}");
 }

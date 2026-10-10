@@ -484,10 +484,18 @@ pub(crate) fn pre_distribute(
                 .as_ref()
                 .and_then(|d| d.required_instruments.as_deref()),
             reduced_assurance,
-        )
-        .with_qe_override(qe_acceptance)
-        .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?,
+        ),
     };
+    // (QE acceptance) The operator's word applies where the contract is BUILT. A session whose
+    // launch stub already exists carries the stub's contract forward below (the word was applied
+    // there, against the def the launch named), so it is never re-judged against a later rev's def.
+    if !session_already_started {
+        session.assurance = session
+            .assurance
+            .clone()
+            .with_qe_override(qe_acceptance)
+            .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?;
+    }
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
         // worktree handler recorded (`run_branch`, `base_commit`) and any seats benched before

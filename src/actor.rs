@@ -4096,6 +4096,15 @@ fn team_plan_at_launch(
         deliverables: spec.deliverables.clone(),
         ..Default::default()
     };
+    // (QE acceptance) A built-in preset that makes application changes requires QE acceptance:
+    // the per-run def carries its declaration, so every path that reads the def's contract (the
+    // campaign launch builds the session from it) sees the same requirement.
+    let instruments = match preset.as_deref() {
+        Some(name) => {
+            crate::preset::required_instruments(&*store, spec.project_id.as_deref(), name)?
+        }
+        None => None,
+    };
     // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
     // read-only scope step alone, and the launch plan is decided at that step's boundary
     // (`team_gate::apply_scope`), before any creator step dispatches.
@@ -4109,17 +4118,14 @@ fn team_plan_at_launch(
             prior,
             &spec.human_confirm,
         )?;
+        // (QE acceptance, codex r1) The scope rev's def carries the preset's declaration too: the
+        // campaign launch builds the run's contract from this def.
+        let def = crate::workflow::WorkflowDef {
+            required_instruments: instruments,
+            ..def
+        };
         return register_launch_plan(store, registry, spec, state, def, persist).map(Some);
     }
-    // (QE acceptance) A built-in preset that makes application changes requires QE acceptance:
-    // the per-run def carries its declaration, so every path that reads the def's contract (the
-    // campaign launch builds the session from it) sees the same requirement.
-    let instruments = match preset.as_deref() {
-        Some(name) => {
-            crate::preset::required_instruments(&*store, spec.project_id.as_deref(), name)?
-        }
-        None => None,
-    };
     let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);
     // (WT-C3) A launch is not teamed yet (teaming is positive evidence: an acknowledged
     // `path.started`), so its testing-rule context fails closed on `kinds`.

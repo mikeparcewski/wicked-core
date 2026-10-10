@@ -12,7 +12,8 @@
 //! run garden's acceptance pipeline) and carried on every later receipt.
 //!
 //! A waiver covers the tree it scored and nothing after it: a creator unit dispatched after a
-//! waiver revokes it (`required`), and the QE phase re-scores at its next dispatch. Anything that
+//! waiver revokes it (`required`), and the QE phase re-scores at its next dispatch; a QE dispatch
+//! that carries a floor fix (a seat changes the tree after the score) is `required`. Anything that
 //! cannot be read — no repo, no base, no snapshot, a git failure, no current graph — is
 //! `required` with the reason (fail-closed). An operator decision is never re-scored.
 
@@ -31,11 +32,22 @@ pub(crate) fn is_qe_unit(unit: &WorkUnit) -> bool {
     unit.repo_checks_floor && unit.tool_cmd.is_none()
 }
 
-/// A unit that changes the tree a waiver scored.
-fn is_code_creator(unit: &WorkUnit) -> bool {
-    unit.role == crate::workflow::PhaseRole::Creator
-        && unit.executes_code
-        && unit.tool_cmd.is_none()
+/// A unit that may change the tree a waiver scored: every creator, whatever its executor or its
+/// `executes_code` (a `produce` creator writes too, and so does a creator Tool step), and every
+/// `executes_code` unit whatever its role (a neutral cutover) — except the deliver step, which
+/// ships the tree and changes nothing the waiver covered.
+fn may_change_the_tree(unit: &WorkUnit) -> bool {
+    (unit.role == crate::workflow::PhaseRole::Creator || unit.executes_code)
+        && !crate::deliver_lift::is_deliver_unit(unit)
+}
+
+/// (core#782) The QE unit's dispatch carries a FLOOR FIX: a seat changes the tree after this
+/// dispatch scores it, so the scored tree is not the one that will be verified and delivered.
+fn floor_fix_pending(unit: &WorkUnit) -> bool {
+    unit.repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref())
+        .is_some_and(|r| r.fix.is_some())
 }
 
 /// What a dispatch did to the run's decision, for the caller to persist and publish.
@@ -61,7 +73,7 @@ pub(crate) fn on_dispatch(
     if current.by_operator() {
         return Dispatched::Unchanged;
     }
-    if is_code_creator(unit) && current.status == a::QE_WAIVED {
+    if may_change_the_tree(unit) && current.status == a::QE_WAIVED {
         return Dispatched::Decided(QeAcceptance {
             status: a::QE_REQUIRED.to_string(),
             basis: a::QE_BASIS_DIFF.to_string(),
@@ -79,7 +91,23 @@ pub(crate) fn on_dispatch(
     if !is_qe_unit(unit) {
         return Dispatched::Unchanged;
     }
-    let decided = decide(session, unit.ord, repo_root, baseline);
+    let decided = if floor_fix_pending(unit) {
+        QeAcceptance {
+            status: a::QE_REQUIRED.to_string(),
+            basis: a::QE_BASIS_DIFF.to_string(),
+            score: None,
+            threshold: rs::THRESHOLDS.qe_waiver_max_score,
+            reason:
+                "required: a floor fix changes the tree after this dispatch, so no score of it \
+                     can waive the tree that will be delivered"
+                    .to_string(),
+            reasons: Vec::new(),
+            ord: Some(unit.ord),
+            tree: None,
+        }
+    } else {
+        decide(session, unit.ord, repo_root, baseline)
+    };
     if decided == *current {
         Dispatched::Unchanged
     } else {

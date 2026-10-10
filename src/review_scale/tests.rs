@@ -1776,7 +1776,7 @@ fn new_dependencies_are_read_from_manifests_and_lockfiles() {
         ("Cargo.toml", "@@ -1,3 +1,4 @@\n [dev-dependencies]\n+tempfile = \"3\"\n-anyhow = \"1.0\"\n+anyhow = \"1.1\"\n", &["tempfile"]),
         ("Cargo.toml", "@@ -1,2 +1,3 @@\n [package]\n+version = \"0.2.0\"\n", &[]),
         ("Cargo.toml", "@@ -9,1 +9,2 @@\n+[dependencies.tokio]\n+version = \"1\"\n", &["tokio"]),
-        ("package.json", "@@ -4,2 +4,4 @@\n   \"dependencies\": {\n+    \"left-pad\": \"^1.3.0\",\n+    \"version\": \"1.0.0\",\n+    \"build\": \"tsc -p .\",\n", &["left-pad"]),
+        ("package.json", "@@ -4,2 +4,4 @@\n   \"dependencies\": {\n+    \"left-pad\": \"^1.3.0\",\n+    \"version\": \"1.0.0\",\n+    \"build\": \"tsc -p .\",\n", &["build", "left-pad", "version"]),
         ("go.mod", "@@ -3,1 +3,2 @@\n require (\n+\tgithub.com/pkg/errors v0.9.1\n", &["github.com/pkg/errors"]),
         ("requirements.txt", "@@ -1 +1,2 @@\n flask==2.0\n+requests>=2.31\n", &["requests"]),
         ("Cargo.lock", "@@ -10,0 +11,3 @@\n+[[package]]\n+name = \"itoa\"\n+version = \"1.0.0\"\n", &["itoa"]),
@@ -1821,4 +1821,68 @@ fn branch_lines_count_changed_control_flow_only() {
         "@@ -1 +1 @@\n-if = 1\n+if = 2\n",
     ));
     assert_eq!(d.branch_lines, 0, "{d:?}");
+}
+
+/// codex r1 on the QE PR: a binary or mode-only change has no `---`/`+++` header; it was dropped
+/// (docs-only, 0, waivable). Its paths come from the `Binary files` line or the `diff --git` line.
+#[test]
+fn binary_and_mode_only_changes_are_never_dropped() {
+    let added = "diff --git a/assets/app.wasm b/assets/app.wasm\nnew file mode 100644\nindex 0000000..1111111\nBinary files /dev/null and b/assets/app.wasm differ\n";
+    let d = signals_from_diff(added);
+    assert!(d.behavioural(), "{d:?}");
+    assert_eq!(d.touched[0].path, "assets/app.wasm");
+    assert_eq!(d.touched[0].old_path, "", "a new binary has no base side");
+    let deleted = "diff --git a/bin/tool b/bin/tool\ndeleted file mode 100755\nindex 1111111..0000000\nBinary files a/bin/tool and /dev/null differ\n";
+    let d = signals_from_diff(deleted);
+    assert!(d.behavioural() && d.destructive, "{d:?}");
+    let mode = "diff --git a/scripts/run.sh b/scripts/run.sh\nold mode 100644\nnew mode 100755\n";
+    let d = signals_from_diff(mode);
+    assert!(d.behavioural(), "{d:?}");
+    assert_eq!(d.touched[0].old_path, "scripts/run.sh");
+    // An unparseable header still counts (fail closed): code with no path.
+    let odd = "diff --git a/x b/y b/z\nold mode 100644\nnew mode 100755\n";
+    assert!(signals_from_diff(odd).behavioural());
+}
+
+/// codex r1: a TOML section seen in one hunk must not cover a later hunk that does not show its
+/// own header; there the key counts when it is dependency-shaped.
+#[test]
+fn a_toml_section_does_not_leak_into_the_next_hunk() {
+    let hunk = "@@ -1,2 +1,2 @@\n [package]\n-version = \"0.1.0\"\n+version = \"0.2.0\"\n@@ -20,1 +20,2 @@\n anyhow = \"1\"\n+tokio = \"1\"\n";
+    let d = signals_from_diff(&file_diff("Cargo.toml", hunk));
+    assert_eq!(
+        d.new_dependencies,
+        BTreeSet::from(["tokio".to_string()]),
+        "{d:?}"
+    );
+}
+
+/// codex r1: inside a dependency object every key is a dependency, whatever its version syntax or
+/// name; a hunk that never shows its object counts anything but a known top-level field.
+#[test]
+fn npm_dependencies_are_read_by_object_not_by_version_syntax() {
+    let hunk = "@@ -4,3 +4,6 @@\n   \"dependencies\": {\n+    \"left-pad\": \"latest\",\n+    \"node\": \"^20\",\n   },\n   \"scripts\": {\n+    \"build\": \"tsc\",\n";
+    let d = signals_from_diff(&file_diff("package.json", hunk));
+    assert_eq!(
+        d.new_dependencies,
+        BTreeSet::from(["left-pad".to_string(), "node".to_string()]),
+        "{d:?}"
+    );
+    let blind = "@@ -9,1 +9,2 @@\n     \"a\": \"1.0.0\",\n+    \"b\": \"next\",\n";
+    assert_eq!(
+        signals_from_diff(&file_diff("package.json", blind)).new_dependencies,
+        BTreeSet::from(["b".to_string()])
+    );
+}
+
+/// codex r1: a re-export widens the public surface.
+#[test]
+fn re_exports_are_new_public_symbols() {
+    let rs_ = signals_from_diff(&file_diff(
+        "src/lib.rs",
+        "@@ -1 +1,2 @@\n mod inner;\n+pub use inner::Thing;\n",
+    ));
+    assert_eq!(rs_.new_public_symbols.len(), 1, "{rs_:?}");
+    let ts = signals_from_diff(&file_diff("src/index.ts", "@@ -1 +1,3 @@\n import x from './x';\n+export { a, b } from './ab';\n+export * from './all';\n"));
+    assert_eq!(ts.new_public_symbols.len(), 2, "{ts:?}");
 }
