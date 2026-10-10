@@ -668,14 +668,16 @@ export declare class Core {
   /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
-   * `args_json` is `{ type?, corpus?, knowledgeDb?, dbPath }` (camelCase keys are the PINNED
+   * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED
    * binding contract): `type` slices the corpus to one of the 7 steering types; `corpus`
    * names an estate knowledge scope (`evals:<name>` — a corpus landed by
    * [`Core::governance_corpus_import`]) or, omitted, selects the compiled-in default corpus;
    * `knowledgeDb` powers embedding gap hints (absent/unusable ⇒ the report carries
    * `degraded: "facet-only"` — an honest downgrade to keyword hints, never fabricated
-   * similarity); `dbPath` is the rules store, opened READ-ONLY — this call never goes through
-   * the single-writer actor and never writes either store.
+   * similarity); `memoryDb` (core#397) is the estate memory store the memory axis recalls from,
+   * opened READ-ONLY (absent ⇒ the report's `memory` is `null`, and a sample that declares
+   * memories rejects the run); `dbPath` is the rules store, opened READ-ONLY — this call never
+   * goes through the single-writer actor and never writes any store.
    *
    * Resolves to the `EvalReport` JSON exactly as the engine serializes it (snake_case — crew
    * passes it through verbatim as the pinned wire contract):
@@ -687,6 +689,10 @@ export declare class Core {
    * partitions the decide-lane rules eligible for the run (narrowed to `type` when given) by
    * whether any sample fired them; `recall_only` counts the effect-less rules the gate never
    * fires (core#395 — zero decide-lane rules means the verdicts are the corpus split).
+   * (core#397) The MEMORY axis: each result carries `memory: { surfaced, missing,
+   * unexpected_surfaced, verdict } | null` (null when the sample declares no memories), and the
+   * report carries `memory: { summary: { total, caught, gaps, false_positives }, coverage } |
+   * null` (null when no `memoryDb` was given) — both ALWAYS present, never absent.
    *
    * Fail-closed: malformed args, an unknown steering type, a corpus name outside the
    * `evals:` scope, or a missing store reject the Promise with the engine's reason — crew maps
