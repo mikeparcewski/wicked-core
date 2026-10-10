@@ -391,7 +391,8 @@ impl Campaign {
                     | HumanDecision::Reject
                     | HumanDecision::EditPlan { .. }
                     | HumanDecision::FloorRerun(_)
-                    | HumanDecision::AcceptSuggestion => None,
+                    | HumanDecision::AcceptSuggestion
+                    | HumanDecision::ConsentChoice { .. } => None,
                     // (core#555) A campaign step's amendment is the run's acceptance list, not
                     // a unit instruction — the persisted mirror carries the text either way.
                     HumanDecision::AmendIntent { text } => Some(text.clone()),

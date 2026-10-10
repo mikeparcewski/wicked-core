@@ -2105,7 +2105,8 @@ pub(super) fn answer_dispute_gate(
         // amending the run's acceptance list is a decision for its own gate.
         crate::workflow::HumanDecision::FloorRerun(_)
         | crate::workflow::HumanDecision::AcceptSuggestion
-        | crate::workflow::HumanDecision::AmendIntent { .. } => {
+        | crate::workflow::HumanDecision::AmendIntent { .. }
+        | crate::workflow::HumanDecision::ConsentChoice { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: approve, request changes or reject")
         }
     };

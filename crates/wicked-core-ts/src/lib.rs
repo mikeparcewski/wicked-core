@@ -1243,6 +1243,19 @@ impl Core {
                     }
                     HumanDecision::escalation_action(a).expect("an escalation action token")
                 }
+                // (core#820) A consent gate's plan choice: `consent:<id>`, approve-shaped.
+                (Some(a), true) if a.starts_with("consent:") => {
+                    if amend.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        || amend_scope.is_some()
+                    {
+                        return Err(err(anyhow::anyhow!(
+                            "action `{a}` takes no amend / amendScope"
+                        )));
+                    }
+                    HumanDecision::escalation_action(a).ok_or_else(|| {
+                        err(anyhow::anyhow!("action `{a}` names no consent choice"))
+                    })?
+                }
                 (
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
@@ -3349,6 +3362,7 @@ mod tests {
                 prompt: s(),
                 gate_kind: s(),
                 finding_ids: Vec::new(),
+                consent: None,
             },
             "awaitingHuman",
             &[

@@ -5,7 +5,7 @@ status: active
 date: 2026-10-02
 enforcement_class: policy
 steering_type: operations
-applies_to: [adversarial-review, analyze, architecture, build, clarify, cleanup, coverage, critique, cutover, design, domain-graph, domain_coverage, execute, extract, fix, implement, install, observability-review, plan, produce, reproduce, review, scope, security-review, security_review, source-discovery, survey, test, test_plan, triage, understand, verify, walkthrough_plan]
+applies_to: [adversarial-review, analyze, architecture, build, clarify, cleanup, coverage, critique, cutover, design, domain-graph, domain_coverage, execute, extract, fix, implement, install, install-plan, observability-review, plan, produce, reproduce, review, scope, security-review, security_review, source-discovery, survey, test, test_plan, triage, understand, verify, walkthrough_plan]
 scope: wiki:governance
 domain: ops-watch
 confidence: 1.0

@@ -135,10 +135,10 @@
       "instructions": "Review the diff cold against MCPS-1002 and MCPS-1003: one span per tool call with the server, tool, request id and outcome attributes and a child span per upstream request; the three instruments recorded; logs through loglayer with trace and span ids stamped, a request-scoped child logger per call, console output on stderr only; nothing exported unless the operator sets an OTLP endpoint. Cite file and line for every finding."
     },
     {
-      "id": "install",
+      "id": "install-plan",
       "kind": "build",
       "gate_type": "execution",
-      "gate": "consent_before",
+      "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
       "required_deliverables": [],
@@ -155,10 +155,35 @@
         "cmd": [
           "bash",
           "-c",
-          "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --json"
+          "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --dry-run --json"
         ]
       },
-      "instructions": "Install for running — or update the installed copy when this server key is already installed. Nothing has been installed yet: this asks before the install runs. Approve to: build the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, register it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks), write it into your CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret), and probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Reject for not now — the pull request already delivered stays as it is."
+      "instructions": "Plan the install without writing anything: resolve, on this host and as the daemon user, every file and directory each install choice would write — Install for workers (the default: the staged copy under ~/.wicked/mcp-servers/<key>/current, the wicked-crew MCP tools registry and the worker homes' CLI configurations under ~/.wicked-worker) and Also install into my CLIs (the worker set plus your own CLI configurations, such as ~/.claude.json, ~/.codex/config.toml and the opencode configuration) — and print them as one JSON plan line, so the install's consent gate can list them before you answer."
+    },
+    {
+      "id": "install",
+      "kind": "build",
+      "gate_type": "execution",
+      "gate": "consent_before",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "install-plan"
+      ],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null,
+      "executor": {
+        "type": "tool",
+        "cmd": [
+          "bash",
+          "-c",
+          "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --target \"${WICKED_CONSENT_CHOICE:?the consent gate recorded no install choice}\" --json"
+        ]
+      },
+      "instructions": "Install for running — or update the installed copy when this server key is already installed. Nothing has been installed yet: this asks before the install runs, and each answer lists exactly the files it would write (from the install-plan dry run). Install for workers (the default) builds the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, registers it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks) and writes it into the worker homes' CLI MCP configurations — program-owned files only. Also install into my CLIs does the same and also writes it into your own CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret). Both probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Decline for not now — the pull request already delivered stays as it is."
     }
   ]
 }

@@ -870,6 +870,11 @@ pub struct WorkUnit {
     /// `unitDistributed` frame. `None` for a pool of 1 and for a tool unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_seating: Option<PoolSeating>,
+    /// (core#820) The choice an operator approved at this unit's `consent_before` gate, when the
+    /// gate offered a dry-run plan's choices ([`crate::consent_plan`]): the id rides the unit's Tool
+    /// command as `WICKED_CONSENT_CHOICE`. `None` for every other unit (skipped on the wire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_choice: Option<String>,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -1277,6 +1282,7 @@ impl WorkUnit {
             budget_secs: None,
             pool: None,
             pool_seating: None,
+            consent_choice: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

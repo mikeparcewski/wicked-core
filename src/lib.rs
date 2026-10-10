@@ -25,6 +25,7 @@ mod clock;
 mod code_graph;
 mod codex_skills;
 mod command;
+mod consent_plan;
 mod decision;
 mod deliver_lift;
 mod diagnostic;
