@@ -1705,11 +1705,15 @@ fn run_unit_and_judge_on(
                                 tree,
                                 &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
                             ) {
-                                Ok(checkout) => crate::repo_checks::run_floor_rerun(
-                                    &checkout.dir,
-                                    &ctx,
-                                    floor_rerun,
-                                ),
+                                Ok(checkout) => {
+                                    let mut r = crate::repo_checks::run_floor_rerun(
+                                        &checkout.dir,
+                                        &ctx,
+                                        floor_rerun,
+                                    );
+                                    checkout.hold_to(tree, &mut r);
+                                    r
+                                }
                                 Err(why) => {
                                     crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why)
                                 }

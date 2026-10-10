@@ -2974,6 +2974,8 @@ pub(crate) struct FloorCheckout {
     pub(crate) dir: PathBuf,
     git_dir: PathBuf,
     worktree: PathBuf,
+    /// Every blob entry written: `(mode, blob id, path)` — what [`Self::hold_to`] re-checks.
+    entries: Vec<(String, String, PathBuf)>,
 }
 
 impl Drop for FloorCheckout {
@@ -3038,18 +3040,27 @@ pub(crate) fn checkout_guarded_tree(
         .unwrap_or_default();
     let dir = parent.join(format!("{label}-{}-{nonce}", std::process::id()));
     let dir_s = dir.to_string_lossy().into_owned();
-    let checkout = FloorCheckout {
+    let mut checkout = FloorCheckout {
         dir: dir.clone(),
         git_dir: git_dir.to_path_buf(),
         worktree: worktree.to_path_buf(),
+        entries: Vec::new(),
     };
     // `--no-checkout` (codex r1 on the slice): a checkout runs the repository's `post-checkout`
     // hook and its configured smudge filters OUTSIDE the floor's sandbox. The worktree is made
     // empty, its files are written from the tree's own blobs (no filter, no attribute), and its
-    // index is set with `read-tree`, which touches no file.
+    // index is set with `read-tree`, which touches no file. Every git call here runs with an
+    // engine-owned EMPTY hooks dir (codex r2): `read-tree` alone fires `post-index-change`, and no
+    // repository hook may run outside the floor's sandbox.
+    let no_hooks_dir = parent.join("no-hooks");
+    std::fs::create_dir_all(&no_hooks_dir)
+        .map_err(|e| format!("the floor's empty hooks dir could not be created: {e}"))?;
+    let no_hooks = format!("core.hooksPath={}", no_hooks_dir.to_string_lossy());
     crate::worktree_guard::git(
         worktree,
         &[
+            "-c",
+            &no_hooks,
             "worktree",
             "add",
             "--no-checkout",
@@ -3060,9 +3071,9 @@ pub(crate) fn checkout_guarded_tree(
         &env[..1],
     )
     .map_err(|e| format!("the guarded tree {tree} could not be checked out for the floor: {e}"))?;
-    write_tree_blobs(worktree, git_dir, tree, &dir)
+    checkout.entries = write_tree_blobs(worktree, git_dir, tree, &dir)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
-    crate::worktree_guard::git(&dir, &["read-tree", &commit], &[])
+    crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
         .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
     Ok(checkout)
 }
@@ -3072,14 +3083,21 @@ pub(crate) fn checkout_guarded_tree(
 /// `export-ignore`). Regular files keep their executable bit; a symlink entry becomes a symlink
 /// (unix) or a plain file holding its target; a submodule becomes an empty directory. A path that
 /// is absolute or climbs out of `dir` is refused.
-fn write_tree_blobs(worktree: &Path, git_dir: &Path, tree: &str, dir: &Path) -> Result<(), String> {
+fn write_tree_blobs(
+    worktree: &Path,
+    git_dir: &Path,
+    tree: &str,
+    dir: &Path,
+) -> Result<Vec<(String, String, PathBuf)>, String> {
     use std::io::{BufRead, Read, Write};
     let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
     let listing = crate::worktree_guard::git(worktree, &["ls-tree", "-r", "-z", tree], &env)
         .map_err(|e| e.to_string())?;
     let mut entries: Vec<(String, String, PathBuf)> = Vec::new();
     for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let rec = String::from_utf8_lossy(rec);
+        // Strict (codex r2): a lossy decode can fold two distinct paths into one.
+        let rec = std::str::from_utf8(rec)
+            .map_err(|_| "the tree holds a path that is not UTF-8".to_string())?;
         let (meta, path) = rec
             .split_once('\t')
             .ok_or_else(|| format!("unreadable ls-tree entry {rec:?}"))?;
@@ -3136,6 +3154,18 @@ fn write_tree_blobs(worktree: &Path, git_dir: &Path, tree: &str, dir: &Path) -> 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        // Never write through a link: no component under `dir`, nor the entry itself, may be one.
+        let mut at = dir.to_path_buf();
+        for c in path
+            .strip_prefix(dir)
+            .map_err(|e| e.to_string())?
+            .components()
+        {
+            at.push(c);
+            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!("{} is a symlink in the checkout", at.display()));
+            }
+        }
         match mode.as_str() {
             #[cfg(unix)]
             "120000" => {
@@ -3158,7 +3188,106 @@ fn write_tree_blobs(worktree: &Path, git_dir: &Path, tree: &str, dir: &Path) -> 
     for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(entries
+        .into_iter()
+        .filter(|(m, _, _)| m != "160000")
+        .collect())
+}
+
+impl FloorCheckout {
+    /// (codex r2) The checks ran IN the checkout: a check that rewrote tracked content there would
+    /// otherwise pass against code that is not the tree that ships. After the floor, the checkout
+    /// must still hash to the guarded `tree` (the engine scratch excluded); a difference fails the
+    /// report, naming it.
+    pub(crate) fn hold_to(&self, tree: &str, report: &mut RepoChecksReport) {
+        let why = match self.changed_entries() {
+            Ok(changed) if changed.is_empty() => return,
+            Ok(changed) => format!(
+                "the checks changed the tracked content they ran on ({}{}) — a verify floor \
+                 certifies only the guarded tree {}, untouched",
+                changed
+                    .iter()
+                    .take(5)
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if changed.len() > 5 { ", …" } else { "" },
+                &tree[..tree.len().min(10)]
+            ),
+            Err(e) => format!("the floor checkout could not be re-checked after the checks: {e}"),
+        };
+        report.passed = false;
+        report.detect_error = Some(match report.detect_error.take() {
+            Some(prev) => format!("{prev}; {why}"),
+            None => why,
+        });
+    }
+
+    /// The tree entries whose content no longer matches the blob written: re-hashed with
+    /// `hash-object --no-filters` (no repository filter runs); a symlink entry must still be a
+    /// symlink. Untracked files a check created are not entries and are not judged — only what
+    /// ships is.
+    fn changed_entries(&self) -> Result<Vec<String>, String> {
+        use std::io::Write;
+        let rel = |p: &Path| p.strip_prefix(&self.dir).unwrap_or(p).display().to_string();
+        let mut changed = Vec::new();
+        let mut files: Vec<&(String, String, PathBuf)> = Vec::new();
+        for e in &self.entries {
+            let (mode, _, path) = e;
+            match std::fs::symlink_metadata(path) {
+                Err(_) => changed.push(rel(path)),
+                Ok(m) if mode == "120000" => {
+                    if !m.file_type().is_symlink() {
+                        changed.push(rel(path));
+                    }
+                }
+                Ok(m) if !m.is_file() => changed.push(rel(path)),
+                Ok(_) => files.push(e),
+            }
+        }
+        if files.is_empty() {
+            return Ok(changed);
+        }
+        // spawn-audit: hardened — git plumbing hashing the floor checkout's own files.
+        let mut cmd = Command::new("git");
+        cmd.hardened()
+            .args(["hash-object", "--no-filters", "--stdin-paths"])
+            .current_dir(&self.worktree)
+            .env("GIT_DIR", &self.git_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().map_err(|e| format!("git hash-object: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("git hash-object has no stdin")?;
+        let paths: Vec<String> = files
+            .iter()
+            .map(|(_, _, p)| p.to_string_lossy().into_owned())
+            .collect();
+        let feeder = std::thread::spawn(move || {
+            for p in paths {
+                if writeln!(stdin, "{p}").is_err() {
+                    break;
+                }
+            }
+        });
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let _ = feeder.join();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let shas: Vec<&str> = text.lines().collect();
+        if shas.len() != files.len() {
+            return Err(format!(
+                "git hash-object answered {} of {} paths",
+                shas.len(),
+                files.len()
+            ));
+        }
+        for ((_, sha, path), now) in files.iter().zip(shas) {
+            if sha != now {
+                changed.push(rel(path));
+            }
+        }
+        Ok(changed)
+    }
 }
 
 /// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
@@ -6114,8 +6243,30 @@ mod tests {
         let git_dir = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]));
         let snap = crate::worktree_guard::snapshot_through(&wt, &git_dir).expect("snapshot");
 
+        // No repository hook may run while the engine builds the checkout (codex r2).
+        let hooks = wt.join("repo-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = wt.join("hook-ran");
+        for h in ["post-checkout", "post-index-change"] {
+            let hook = hooks.join(h);
+            std::fs::write(
+                &hook,
+                format!("#!/bin/sh\necho {h} >> '{}'\n", marker.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        git(&wt, &["config", "core.hooksPath", &hooks.to_string_lossy()]);
         let checkout =
             checkout_guarded_tree(&wt, &git_dir, &snap.tree, "t-417").expect("guarded checkout");
+        assert!(
+            !marker.exists(),
+            "a repository hook ran while the checkout was built"
+        );
         let dir = checkout.dir.clone();
         assert!(dir.join("app.txt").is_file() && dir.join("new.txt").is_file());
         assert!(
@@ -6131,6 +6282,25 @@ mod tests {
             assert!(!live.passed, "the live worktree sees the plant: {live:?}");
             assert!(guarded.passed, "the guarded tree does not: {guarded:?}");
         }
+        // A check that rewrites tracked content in the checkout cannot pass on it (codex r2):
+        // the floor certifies only the guarded tree, untouched. An untracked artifact is fine.
+        let mut ok = guarded.clone();
+        ok.passed = true;
+        std::fs::write(dir.join("coverage.out"), "artifact\n").unwrap();
+        checkout.hold_to(&snap.tree, &mut ok);
+        assert!(
+            ok.passed,
+            "an untracked artifact is not a change to what ships: {ok:?}"
+        );
+        std::fs::write(dir.join("app.txt"), "rewritten by a check\n").unwrap();
+        checkout.hold_to(&snap.tree, &mut ok);
+        assert!(!ok.passed, "{ok:?}");
+        assert!(
+            ok.detect_error
+                .as_deref()
+                .is_some_and(|e| e.contains("app.txt")),
+            "{ok:?}"
+        );
         drop(checkout);
         assert!(!dir.exists(), "the checkout is removed when dropped");
         let listed = git(&wt, &["worktree", "list", "--porcelain"]);

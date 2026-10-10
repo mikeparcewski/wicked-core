@@ -956,7 +956,11 @@ pub(crate) fn lift_and_reverify(
             &now.tree,
             &format!("{run_id}-{ord}-deliver"),
         ) {
-            Ok(checkout) => crate::repo_checks::run_floor(&checkout.dir, &floor_ctx),
+            Ok(checkout) => {
+                let mut r = crate::repo_checks::run_floor(&checkout.dir, &floor_ctx);
+                checkout.hold_to(&now.tree, &mut r);
+                r
+            }
             Err(why) => {
                 crate::repo_checks::guarded_checkout_refused(&ctx.worktree, &floor_ctx, &why)
             }
