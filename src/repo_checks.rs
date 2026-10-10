@@ -2958,6 +2958,131 @@ pub fn partial_waiver(report: &RepoChecksReport) -> Vec<String> {
         .collect()
 }
 
+/// (core#417, operator ruling option (a)) A guarded VERIFY floor runs on a clean checkout of
+/// EXACTLY the tree the worktree guard checked — never the live worktree, where an untracked or
+/// ignored file the seat planted (a `.env.local`, a `vitest.config.local.*`, a shim under
+/// `node_modules/`, a self-ignoring `.gitignore` beside a payload) could steer the repository's
+/// own checks while the guard's tree hash stayed the same.
+///
+/// The guard's tree becomes a commit object (`commit-tree`, parented on HEAD when there is one; no
+/// ref moves) checked out as a DETACHED linked worktree through the pinned git dir, under an
+/// engine-owned directory in the system temp — outside the seat's write boundary. So the checks
+/// see the tracked and untracked-not-ignored content the guard hashed and nothing else, with real
+/// git metadata for checks that call git. The cost (a fresh install and a cold build per verify
+/// floor) is the ruling's accepted price. Dropped ⇒ the worktree is removed and pruned.
+pub(crate) struct FloorCheckout {
+    pub(crate) dir: PathBuf,
+    git_dir: PathBuf,
+    worktree: PathBuf,
+}
+
+impl Drop for FloorCheckout {
+    fn drop(&mut self) {
+        let env: [(&str, &Path); 1] = [("GIT_DIR", self.git_dir.as_path())];
+        let dir = self.dir.to_string_lossy().into_owned();
+        let _ = crate::worktree_guard::git(
+            &self.worktree,
+            &["worktree", "remove", "--force", &dir],
+            &env,
+        );
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = crate::worktree_guard::git(&self.worktree, &["worktree", "prune"], &env);
+    }
+}
+
+/// Check out `tree` (the guard's snapshot) for a verify floor — see [`FloorCheckout`]. `Err` names
+/// what failed; the caller denies the floor on it (fail-closed: a floor that cannot get the guarded
+/// tree does not fall back to the live one).
+pub(crate) fn checkout_guarded_tree(
+    worktree: &Path,
+    git_dir: &Path,
+    tree: &str,
+    label: &str,
+) -> Result<FloorCheckout, String> {
+    let env: [(&str, &Path); 5] = [
+        ("GIT_DIR", git_dir),
+        ("GIT_AUTHOR_NAME", Path::new("wicked-core")),
+        ("GIT_AUTHOR_EMAIL", Path::new("floor@wicked-core.invalid")),
+        ("GIT_COMMITTER_NAME", Path::new("wicked-core")),
+        (
+            "GIT_COMMITTER_EMAIL",
+            Path::new("floor@wicked-core.invalid"),
+        ),
+    ];
+    let msg = "wicked-core: the guarded tree a verify floor runs on (core#417)";
+    let commit = crate::worktree_guard::git_string(
+        worktree,
+        &["commit-tree", tree, "-p", "HEAD", "-m", msg],
+        &env,
+    )
+    .or_else(|_| {
+        crate::worktree_guard::git_string(worktree, &["commit-tree", tree, "-m", msg], &env)
+    })
+    .map_err(|e| format!("the guarded tree {tree} could not be committed for the floor: {e}"))?;
+    let label: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let parent = std::env::temp_dir().join("wicked-core-floor");
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| format!("the floor checkout directory could not be created: {e}"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = parent.join(format!("{label}-{}-{nonce}", std::process::id()));
+    let dir_s = dir.to_string_lossy().into_owned();
+    let checkout = FloorCheckout {
+        dir: dir.clone(),
+        git_dir: git_dir.to_path_buf(),
+        worktree: worktree.to_path_buf(),
+    };
+    crate::worktree_guard::git(
+        worktree,
+        &["worktree", "add", "--detach", &dir_s, &commit],
+        &env[..1],
+    )
+    .map_err(|e| format!("the guarded tree {tree} could not be checked out for the floor: {e}"))?;
+    Ok(checkout)
+}
+
+/// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
+/// ran, and the floor does not pass.
+pub(crate) fn guarded_checkout_refused(
+    worktree: &Path,
+    ctx: &FloorContext,
+    why: &str,
+) -> RepoChecksReport {
+    let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+    RepoChecksReport {
+        detected: detect_with(worktree, ctx).unwrap_or_default(),
+        checks: Vec::new(),
+        skipped: Vec::new(),
+        passed: false,
+        detect_error: Some(format!(
+            "the verify floor runs on a clean checkout of the tree the worktree guard checked \
+             (core#417), and it could not be made: {why}"
+        )),
+        sandbox_level: sandbox.level.as_wire().to_string(),
+        sandbox_note: sandbox.downgrade_reason.clone(),
+        sandbox_error: None,
+        engine_writes_removed: Vec::new(),
+        claim: None,
+        env: None,
+        tree: None,
+        rerun: None,
+        waived: Vec::new(),
+        requested_rerun: None,
+        coverage_note: None,
+    }
+}
+
 /// The run base, exported into the checks' scratch for the baseline diff — plain files, no git
 /// metadata, no nested worktree: `git read-tree` into a scratch index + `git checkout-index
 /// --prefix`, both through the PINNED git dir (never the worktree's own `.git` file, which the
@@ -5852,6 +5977,56 @@ mod tests {
             .expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// core#417 (operator ruling (a)): a guarded verify floor runs on a clean checkout of the
+    /// tree the worktree guard hashed. An IGNORED file the seat planted in the live worktree is
+    /// absent there and cannot change the verdict: the same check FAILS on the live worktree (it
+    /// sees the plant) and PASSES on the guarded checkout. Tracked and untracked-not-ignored
+    /// content is there, with git metadata, and the checkout is removed when dropped.
+    #[test]
+    fn a_guarded_verify_floor_runs_on_the_guards_tree_where_an_ignored_plant_cannot_reach() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let wt = scratch("guarded-checkout");
+        std::fs::write(wt.join("app.txt"), "v1\n").unwrap();
+        std::fs::write(wt.join(".gitignore"), ".env.local\n").unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            r#"{"typecheck": false, "lint": false, "test": ["sh", "-c", "test ! -e .env.local && test -e new.txt"]}"#,
+        )
+        .unwrap();
+        git_repo_with_commit(&wt);
+        // The creator's uncommitted work, and the plant: ignored, so the guard's hash skips it.
+        std::fs::write(wt.join("new.txt"), "new\n").unwrap();
+        std::fs::write(wt.join(".env.local"), "STEER=1\n").unwrap();
+        let git_dir = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]));
+        let snap = crate::worktree_guard::snapshot_through(&wt, &git_dir).expect("snapshot");
+
+        let checkout =
+            checkout_guarded_tree(&wt, &git_dir, &snap.tree, "t-417").expect("guarded checkout");
+        let dir = checkout.dir.clone();
+        assert!(dir.join("app.txt").is_file() && dir.join("new.txt").is_file());
+        assert!(
+            !dir.join(".env.local").exists(),
+            "the ignored plant never reaches the floor"
+        );
+        assert!(dir.join(".git").exists(), "the checks keep git metadata");
+
+        let live = run_floor_rerun(&wt, &FloorContext::default(), None);
+        let guarded = run_floor_rerun(&dir, &FloorContext::default(), None);
+        if !live.checks.is_empty() {
+            // A host with an OS write boundary ran the checks: the verdicts must differ.
+            assert!(!live.passed, "the live worktree sees the plant: {live:?}");
+            assert!(guarded.passed, "the guarded tree does not: {guarded:?}");
+        }
+        drop(checkout);
+        assert!(!dir.exists(), "the checkout is removed when dropped");
+        let listed = git(&wt, &["worktree", "list", "--porcelain"]);
+        assert!(!listed.contains("wicked-core-floor"), "{listed}");
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     fn git_repo_with_commit(repo: &Path) -> String {

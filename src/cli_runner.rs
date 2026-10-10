@@ -1682,7 +1682,36 @@ fn run_unit_and_judge_on(
                     stage.as_wire()
                 ),
                 FLOOR_HEARTBEAT_EVERY,
-                || crate::repo_checks::run_floor_rerun(wd, &ctx, floor_rerun),
+                || {
+                    // (core#417, operator ruling (a)) A GUARDED verify floor runs on a clean
+                    // checkout of exactly the tree the guard checked, never the live worktree —
+                    // an untracked or ignored file there cannot steer the checks.
+                    let guarded = stage == crate::repo_checks::FloorStage::Verify
+                        && input.unit.worktree_guarded;
+                    let git_dir = baseline.and_then(|b| b.git_dir.as_deref());
+                    match (guarded, current_tree.as_deref(), git_dir) {
+                        (true, Some(tree), Some(git_dir)) => {
+                            match crate::repo_checks::checkout_guarded_tree(
+                                wd,
+                                std::path::Path::new(git_dir),
+                                tree,
+                                &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
+                            ) {
+                                Ok(checkout) => crate::repo_checks::run_floor_rerun(
+                                    &checkout.dir,
+                                    &ctx,
+                                    floor_rerun,
+                                ),
+                                Err(why) => {
+                                    crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why)
+                                }
+                            }
+                        }
+                        // No guard tree (a repo-less run: no git, no snapshot) — there is
+                        // no guarded tree to check out, so the floor stays where the run is.
+                        _ => crate::repo_checks::run_floor_rerun(wd, &ctx, floor_rerun),
+                    }
+                },
             );
             // (core#544) The tree these checks judged — the one this unit's next attempt compares
             // against before it re-runs or carries this verdict.
