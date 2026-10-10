@@ -755,6 +755,12 @@ pub struct LaunchOptions {
     /// (`path.started{selection:"random"}`); a legacy run keeps the roster's first seat. A key not
     /// on the roster REJECTS the launch. The roster is re-ordered so the pick is first.
     pub primary: Option<String>,
+    /// (core#850, EX-01/EX-02) The EXPLICIT opt-in to reduced assurance: the run may evaluate on its
+    /// creator's seat and pass a pinned gate whose judge had no distinct seat — both disclosed on every
+    /// receipt (`sessionStarted.assurance.mode: "reduced"`, `gateEvaluated.assurance`). Omit (or
+    /// `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
+    /// whose required judge was skipped holds (`judge_unavailable`).
+    pub reduced_assurance: Option<bool>,
 }
 
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
@@ -808,7 +814,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         exclude_seats: o.exclude_seats.unwrap_or_default(),
         evidence_root: o.evidence_root,
         primary: o.primary,
-        reduced_assurance: false,
+        reduced_assurance: o.reduced_assurance.unwrap_or(false),
     })
 }
 
