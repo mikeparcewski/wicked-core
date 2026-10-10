@@ -151,13 +151,12 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2),
-/// `capture-learnings` (M7) and `demo` (M9b, which replaces `interactive-demo` and
-/// `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by
-/// its migration seam (§14 M1–M10), which also deletes the def it replaces.
+/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2) and
+/// `demo` (M9b, which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping
+/// them). Every other consumer's preset is added by its migration seam (§14 M1–M10), which also
+/// deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
-        ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
         ("demo", demo_preset()),
         ("feature", feature_preset()),
@@ -367,45 +366,6 @@ fn feature_preset() -> Vec<PlanStep> {
         },
         step("test", "test", Some("build")),
         step("critique", "review", Some("test")),
-    ]
-}
-
-/// The repo-learn skill every capture-learnings step runs (wicked-garden).
-const REPO_LEARN_SKILL: &str = "wicked-garden-repo-learn";
-/// capture-learnings' three phase instructions, moved verbatim from crew's def (M7).
-const CAPTURE_CHURN_INSTRUCTIONS: &str = "Phase 1/3 CHURN: produce a ranked list of this repo's most actively-changed files and directories over the last ~12 months, plus the repo's real name (manifest or git remote) and parent project. Use the skill's bounded/sampled git-churn method — never stream the whole history. Do not read code deeply yet; the next phase targets these areas.";
-const CAPTURE_HOTSPOTS_INSTRUCTIONS: &str = "Phase 2/3 HOTSPOTS: cross-reference the prior churn ranking with wicked-estate hotspot / blast-radius signals to find the load-bearing code, then READ it through the estate shim (`wicked-garden run scripts/_estate_client.py --readonly call …`, the skill's grounding path) to build a real technical understanding of how the system fits together — not a file listing. Reuse wicked-garden-search for the hotspot signals; follow the skill.";
-const CAPTURE_CAPTURE_INSTRUCTIONS: &str = "Phase 3/3 CAPTURE: from the prior churn + hotspot understanding, submit durable learnings as estate proposals through the shim's `propose` per the skill's capture contract — BOTH memories (facts / how-it-works) and policies (enforced conventions), one proposal per item, tagged repo/project. Each is inert until human review; never include secrets or personal data. END with `wicked-capture-report {\"derived\": N, \"submitted\": M, \"failed\": K}` — always, even on a degrade or a legitimate 0 (which is acceptable).";
-
-/// `capture-learnings` (M7): §11.2's row. churn, hotspots → `understand`; capture → `produce`, the
-/// creator, which keeps the capture-report floor (`requires_capture_report`, BC-80) so a run whose
-/// skill never submitted cannot report `completed`. Every step runs the repo-learn skill.
-fn capture_learnings_preset() -> Vec<PlanStep> {
-    let step = |catalog: &str, id: &str, instructions: &str, after: Option<&str>| PlanStep {
-        catalog: catalog.to_string(),
-        id: id.to_string(),
-        instructions: Some(instructions.to_string()),
-        skill_ref: Some(REPO_LEARN_SKILL.to_string()),
-        depends_on: after.map(|a| vec![a.to_string()]),
-        ..PlanStep::default()
-    };
-    vec![
-        step("understand", "churn", CAPTURE_CHURN_INSTRUCTIONS, None),
-        step(
-            "understand",
-            "hotspots",
-            CAPTURE_HOTSPOTS_INSTRUCTIONS,
-            Some("churn"),
-        ),
-        PlanStep {
-            requires_capture_report: Some(true),
-            ..step(
-                "produce",
-                "capture",
-                CAPTURE_CAPTURE_INSTRUCTIONS,
-                Some("hotspots"),
-            )
-        },
     ]
 }
 
