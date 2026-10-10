@@ -20,6 +20,10 @@ wicked-estate-knowledge = "0.23.0"
 # line, no semantic/ONNX features), so this adds no build weight — hence no cargo feature gate.
 wicked-estate-retrieve = "0.23.0"
 wicked-estate-overlay = "0.23.0"
+# The eval memory axis (core#397): the SAME `MemoryApi::recall` a worker's `memory.recall` runs,
+# in-process over a read-only store. Already in the workspace graph through the root crate.
+wicked-estate-memory = "0.23.0"
+wicked-estate-memory-core = "0.23.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

@@ -265,9 +265,21 @@ pub struct EvalSample {
     pub steering_type: String,
     #[serde(default)]
     pub signals: SampleSignals,
+    /// (core#397) Memories the worker's recall for this action SHOULD surface: `id:<memory id>`
+    /// matches one memory exactly; any other entry is a case-insensitive content substring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_memories: Vec<String>,
+    /// (core#397) Memories that must NOT surface for this action (same matcher).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexpected_memories: Vec<String>,
 }
 
 impl EvalSample {
+    /// Does the sample put a question to the memory axis?
+    pub fn declares_memories(&self) -> bool {
+        !self.expected_memories.is_empty() || !self.unexpected_memories.is_empty()
+    }
+
     /// Fail-closed sample validation: blank ids can't be reported on, and an unknown
     /// steering_type is a typo that would silently drop the sample from every `--type` slice
     /// (INV-S1 posture — reject at the boundary, don't default).
@@ -277,6 +289,20 @@ impl EvalSample {
                 "eval sample has a blank id (description: {:?})",
                 self.description
             );
+        }
+        for m in self
+            .expected_memories
+            .iter()
+            .chain(&self.unexpected_memories)
+        {
+            let probe = m.strip_prefix(MEMORY_ID_PREFIX).unwrap_or(m);
+            if probe.trim().is_empty() {
+                anyhow::bail!(
+                    "eval sample {:?} has a blank memory expectation (use `id:<memory id>` or a \
+                     content substring)",
+                    self.id
+                );
+            }
         }
         if !STEERING_TYPES.contains(&self.steering_type.as_str()) {
             anyhow::bail!(
@@ -359,6 +385,49 @@ pub struct SampleResult {
     /// Present on gaps (possibly empty); omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nearest_rules: Option<Vec<NearestRule>>,
+    /// (core#397) The memory axis for this sample — ALWAYS serialized: `null` when the sample
+    /// declares no memory expectations (the `degraded` pinned-shape rule; `serde(default)` lets a
+    /// report recorded before the field existed still parse).
+    #[serde(default)]
+    pub memory: Option<MemoryResult>,
+}
+
+/// (core#397) What the worker's recall surfaced for one sample, against its declared memories.
+/// `false_positive` when an `unexpected_memories` entry surfaced; else `gap` when an
+/// `expected_memories` entry did not; else `caught`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryResult {
+    /// Every memory id the recall returned, in rank order.
+    pub surfaced: Vec<String>,
+    /// `expected_memories` entries no surfaced memory matched.
+    pub missing: Vec<String>,
+    /// `unexpected_memories` entries a surfaced memory matched.
+    pub unexpected_surfaced: Vec<String>,
+    pub verdict: Verdict,
+}
+
+/// (core#397) A stored memory no sample's recall surfaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsurfacedMemory {
+    pub memory_id: String,
+    pub scope: String,
+}
+
+/// (core#397) Memory coverage: of the store's memories, which the corpus' recalls ever surfaced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCoverage {
+    pub memories: usize,
+    pub surfaced: usize,
+    /// Sorted by `memory_id`.
+    pub unsurfaced: Vec<UnsurfacedMemory>,
+}
+
+/// (core#397) The report's memory axis: verdict counts over the samples that declare memories,
+/// plus memory coverage over every evaluated sample's recall.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryAxis {
+    pub summary: EvalSummary,
+    pub coverage: MemoryCoverage,
 }
 
 /// The counts row. `total = caught + gaps + false_positives`.
@@ -422,6 +491,9 @@ pub struct EvalReport {
     pub degraded: Option<String>,
     #[serde(default)]
     pub rule_coverage: RuleCoverage,
+    /// (core#397) ALWAYS serialized: `null` when the run had no memory store (`memoryDb`).
+    #[serde(default)]
+    pub memory: Option<MemoryAxis>,
 }
 
 /// The corpus-import receipt (pinned wire shape).
@@ -1028,6 +1100,7 @@ fn evaluate_sample(
             fired,
             verdict,
             nearest_rules: None,
+            memory: None,
         },
         claim.policy_ids,
     ))
@@ -1043,6 +1116,126 @@ pub fn run_evals(
     samples: &[EvalSample],
     steering_type: Option<&str>,
     knowledge_db: Option<&str>,
+    now: i64,
+) -> anyhow::Result<EvalReport> {
+    run_evals_with_memory(store, samples, steering_type, knowledge_db, None, now)
+}
+
+/// The `id:` prefix of a memory expectation that names one memory exactly.
+pub const MEMORY_ID_PREFIX: &str = "id:";
+
+/// (core#397) The worker's recall depth: garden's `mem recall` default (`token_budget: 2000`).
+pub const MEMORY_RECALL_TOKEN_BUDGET: usize = 2000;
+
+/// (core#397) Open the memory store a worker's `memory.recall` reads — READ-ONLY: the
+/// authoritative store through `SqliteStore::open_readonly`, the `.memext` sidecar index rebuilt
+/// in memory (`MemoryEngine::open` would reconcile it on disk). Default embedder, as estate's
+/// MCP server uses.
+pub fn open_memory_ro(memory_db: &str) -> anyhow::Result<wicked_estate_memory::MemoryEngine> {
+    if !Path::new(memory_db).is_file() {
+        anyhow::bail!("memory store {memory_db:?} does not exist");
+    }
+    let store = SqliteStore::open_readonly(memory_db)
+        .map_err(|e| anyhow::anyhow!("open memory store read-only at {memory_db:?}: {e}"))?;
+    wicked_estate_memory::MemoryEngine::with_backend(Box::new(store), ":memory:")
+        .map_err(|e| anyhow::anyhow!("open memory store at {memory_db:?}: {e}"))
+}
+
+/// Does one surfaced memory match an expectation (`id:<id>` exact, else a content substring)?
+fn memory_matches(expect: &str, id: &str, content_lower: &str) -> bool {
+    match expect.strip_prefix(MEMORY_ID_PREFIX) {
+        Some(want) => want.trim() == id,
+        None => content_lower.contains(&expect.to_lowercase()),
+    }
+}
+
+/// (core#397) The worker's recall for `sample`, scored against its declared memories. Returns
+/// the result (or `None` when the sample declares nothing) and the surfaced ids (coverage).
+fn evaluate_memory(
+    memory: &wicked_estate_memory::MemoryEngine,
+    ids: &mut BTreeMap<String, String>,
+    sample: &EvalSample,
+    now: i64,
+) -> anyhow::Result<(Option<MemoryResult>, Vec<String>)> {
+    use wicked_estate_memory_core::{MemoryApi, RecallQuery};
+    let mut q = RecallQuery::new(
+        sample.match_text(),
+        String::new(),
+        MEMORY_RECALL_TOKEN_BUDGET,
+        now,
+    );
+    q.scope_prefix = Some(String::new());
+    let items = MemoryApi::recall(memory, &q)?;
+    // Recall answers the memory's graph SymbolId; report the memory id `memory.list` (and the
+    // studio browse) shows, so an `id:` expectation and the coverage rows use one spelling.
+    // A memory captured after the run's id scan (the store is live) is resolved from its node.
+    // Only a decoded mapping is cached; an unresolvable one (erased meanwhile) reports the raw
+    // SymbolId this once, and an `id:` expectation also accepts that spelling.
+    let mut surfaced: Vec<String> = Vec::with_capacity(items.len());
+    for i in &items {
+        if !ids.contains_key(&i.id) {
+            if let Some(m) = memory
+                .node(&SymbolId(i.id.clone()))?
+                .and_then(|n| wicked_estate_memory_core::Memory::from_node(&n))
+            {
+                ids.insert(i.id.clone(), m.id);
+            }
+        }
+        surfaced.push(ids.get(&i.id).cloned().unwrap_or_else(|| i.id.clone()));
+    }
+    if !sample.declares_memories() {
+        return Ok((None, surfaced));
+    }
+    let lowered: Vec<(&str, &str, String)> = surfaced
+        .iter()
+        .zip(&items)
+        .map(|(id, i)| (id.as_str(), i.id.as_str(), i.content.to_lowercase()))
+        .collect();
+    let hit = |e: &String| {
+        lowered
+            .iter()
+            .any(|(id, sym, c)| memory_matches(e, id, c) || memory_matches(e, sym, c))
+    };
+    let missing: Vec<String> = sample
+        .expected_memories
+        .iter()
+        .filter(|e| !hit(e))
+        .cloned()
+        .collect();
+    let unexpected_surfaced: Vec<String> = sample
+        .unexpected_memories
+        .iter()
+        .filter(|e| hit(e))
+        .cloned()
+        .collect();
+    let verdict = if !unexpected_surfaced.is_empty() {
+        Verdict::FalsePositive
+    } else if !missing.is_empty() {
+        Verdict::Gap
+    } else {
+        Verdict::Caught
+    };
+    Ok((
+        Some(MemoryResult {
+            surfaced: surfaced.clone(),
+            missing,
+            unexpected_surfaced,
+            verdict,
+        }),
+        surfaced,
+    ))
+}
+
+/// [`run_evals`] plus the memory axis (core#397) over `memory` — the store a worker's
+/// `memory.recall` reads, opened read-only ([`open_memory_ro`]). `None` ⇒ `memory: null`; a
+/// sample that declares memories then fails the run (fail-closed: the question it asks cannot be
+/// answered, and silence would read as a pass).
+pub fn run_evals_with_memory(
+    store: &dyn GraphRead,
+    samples: &[EvalSample],
+    steering_type: Option<&str>,
+    knowledge_db: Option<&str>,
+    memory: Option<&wicked_estate_memory::MemoryEngine>,
     now: i64,
 ) -> anyhow::Result<EvalReport> {
     if let Some(t) = steering_type {
@@ -1068,8 +1261,41 @@ pub fn run_evals(
     let mut summary = EvalSummary::default();
     // Every rule id any evaluated claim fired — the rule-coverage "exercised" evidence.
     let mut triggered: BTreeSet<String> = BTreeSet::new();
+    if memory.is_none() {
+        if let Some(s) = selected_samples.iter().find(|s| s.declares_memories()) {
+            anyhow::bail!(
+                "eval sample {:?} declares memories but no memory store was given (memoryDb / \
+                 --memory-db): the memory axis cannot be answered",
+                s.id
+            );
+        }
+    }
+    let mut memory_summary = EvalSummary::default();
+    let mut surfaced_ever: BTreeSet<String> = BTreeSet::new();
+    // SymbolId → memory id, once per run (recall speaks the former, `memory.list` the latter).
+    let mut memory_ids: BTreeMap<String, String> = match memory {
+        Some(mem) => mem
+            .all_memories()?
+            .into_iter()
+            .map(|m| (m.symbol().0, m.id))
+            .collect(),
+        None => BTreeMap::new(),
+    };
     for sample in selected_samples {
         let (mut result, fired_ids) = evaluate_sample(store, sample, scope, now)?;
+        if let Some(mem) = memory {
+            let (row, surfaced) = evaluate_memory(mem, &mut memory_ids, sample, now)?;
+            surfaced_ever.extend(surfaced);
+            if let Some(r) = &row {
+                memory_summary.total += 1;
+                match r.verdict {
+                    Verdict::Caught => memory_summary.caught += 1,
+                    Verdict::Gap => memory_summary.gaps += 1,
+                    Verdict::FalsePositive => memory_summary.false_positives += 1,
+                }
+            }
+            result.memory = row;
+        }
         triggered.extend(fired_ids);
         summary.total += 1;
         match result.verdict {
@@ -1097,6 +1323,40 @@ pub fn run_evals(
             HintMode::FacetOnly => Some(DEGRADED_FACET_ONLY.to_string()),
         },
         rule_coverage: rule_coverage(store, &candidates, steering_type, &triggered)?,
+        memory: match memory {
+            None => None,
+            Some(mem) => Some(MemoryAxis {
+                summary: memory_summary,
+                coverage: memory_coverage(mem, &surfaced_ever)?,
+            }),
+        },
+    })
+}
+
+/// (core#397) Every stored (live) memory, split by whether any sample's recall surfaced it.
+fn memory_coverage(
+    memory: &wicked_estate_memory::MemoryEngine,
+    surfaced: &BTreeSet<String>,
+) -> anyhow::Result<MemoryCoverage> {
+    let mut all: Vec<(String, String)> = memory
+        .all_memories()?
+        .into_iter()
+        .filter(|m| m.invalid_at.is_none())
+        .map(|m| (m.id.clone(), m.scope.as_path()))
+        .collect();
+    all.sort();
+    let unsurfaced: Vec<UnsurfacedMemory> = all
+        .iter()
+        .filter(|(id, _)| !surfaced.contains(id))
+        .map(|(id, scope)| UnsurfacedMemory {
+            memory_id: id.clone(),
+            scope: scope.clone(),
+        })
+        .collect();
+    Ok(MemoryCoverage {
+        memories: all.len(),
+        surfaced: all.len() - unsurfaced.len(),
+        unsurfaced,
     })
 }
 
@@ -1114,6 +1374,9 @@ struct EvalsArgs {
     corpus: Option<String>,
     #[serde(rename = "knowledgeDb", default)]
     knowledge_db: Option<String>,
+    /// (core#397) The memory store workers recall from; absent ⇒ `memory: null`.
+    #[serde(rename = "memoryDb", default)]
+    memory_db: Option<String>,
     #[serde(rename = "dbPath")]
     db_path: String,
 }
@@ -1140,11 +1403,16 @@ pub fn governance_evals(args_json: &str) -> anyhow::Result<String> {
     };
     let samples = load_corpus(&source, Some(&knowledge_db))?;
     let store = wicked_apps_core::open_store_ro(Some(&args.db_path))?;
-    let report = run_evals(
+    let memory = match args.memory_db.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => Some(open_memory_ro(p)?),
+        None => None,
+    };
+    let report = run_evals_with_memory(
         &store,
         &samples,
         args.steering_type.as_deref().filter(|t| !t.is_empty()),
         Some(&knowledge_db),
+        memory.as_ref(),
         now_secs(),
     )?;
     Ok(serde_json::to_string(&report)?)
@@ -1303,6 +1571,8 @@ mod tests {
                 files: files.iter().map(|s| s.to_string()).collect(),
                 content: Some(content.to_string()),
             },
+            expected_memories: Vec::new(),
+            unexpected_memories: Vec::new(),
         }
     }
 
@@ -1726,6 +1996,171 @@ mod tests {
             gap_row["nearest_rules"].is_array(),
             "gaps carry the field (empty allowed)"
         );
+    }
+
+    /// core#397: a durable memory store at a temp path, holding `contents` (unfaceted, root
+    /// scope); returns the db path and the captured ids in order.
+    fn memory_store(tag: &str, contents: &[&str]) -> (String, Vec<String>) {
+        use wicked_estate_memory_core::{MemKind, Memory, Scope, Tier};
+        let path = temp_db(tag).replace("knowledge.db", "memory.db");
+        let mut engine = wicked_estate_memory::MemoryEngine::open(&path).unwrap();
+        let mut ids = Vec::new();
+        for c in contents {
+            let m = Memory::new(MemKind::Fact, Tier::Semantic, Scope::root(), *c, 1_000);
+            ids.push(m.id.clone());
+            engine.capture(&m).unwrap();
+        }
+        drop(engine);
+        (path, ids)
+    }
+
+    fn with_memories(mut s: EvalSample, expected: &[&str], unexpected: &[&str]) -> EvalSample {
+        s.expected_memories = expected.iter().map(|x| x.to_string()).collect();
+        s.unexpected_memories = unexpected.iter().map(|x| x.to_string()).collect();
+        s
+    }
+
+    /// core#397: the memory axis scores what the worker's recall surfaces for the action —
+    /// caught / gap / false_positive — and reports which stored memories no sample surfaced.
+    #[test]
+    fn the_memory_axis_scores_what_the_workers_recall_surfaces() {
+        let store = open_store(Some(":memory:")).unwrap();
+        let (db, ids) = memory_store(
+            "mem-axis",
+            &[
+                "In this repo never force-push to main; open a pull request instead.",
+                "The release train needs the core-ts platform packages verified on npm.",
+                "Prefer tabs over spaces in the legacy Makefile.",
+            ],
+        );
+        let before = std::fs::metadata(&db).unwrap().modified().unwrap();
+        let sidecar_before = std::fs::metadata(format!("{db}.memext"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let memory = open_memory_ro(&db).unwrap();
+        let push = |id: &str| {
+            sample(
+                id,
+                SampleKind::Bad,
+                "development",
+                "build",
+                "Bash",
+                &[],
+                "git push --force origin main",
+            )
+        };
+        let caught = with_memories(push("m-caught"), &["never force-push"], &[]);
+        let by_id = with_memories(push("m-by-id"), &[&format!("id:{}", ids[0])], &[]);
+        let gap = with_memories(push("m-gap"), &["core-ts platform packages"], &[]);
+        let fp = with_memories(push("m-fp"), &[], &["force-push"]);
+        let silent = push("m-none");
+        let report = run_evals_with_memory(
+            &store,
+            &[caught, by_id, gap, fp, silent],
+            None,
+            None,
+            Some(&memory),
+            2_000,
+        )
+        .unwrap();
+        let verdicts: Vec<Option<Verdict>> = report
+            .results
+            .iter()
+            .map(|r| r.memory.as_ref().map(|m| m.verdict))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                Some(Verdict::Caught),
+                Some(Verdict::Caught),
+                Some(Verdict::Gap),
+                Some(Verdict::FalsePositive),
+                None
+            ],
+            "{report:#?}"
+        );
+        let gap_row = report.results[2].memory.as_ref().unwrap();
+        assert_eq!(gap_row.missing, vec!["core-ts platform packages"]);
+        assert!(gap_row.surfaced.contains(&ids[0]), "{gap_row:?}");
+        let axis = report.memory.as_ref().expect("a store was given");
+        assert_eq!(
+            (
+                axis.summary.total,
+                axis.summary.caught,
+                axis.summary.gaps,
+                axis.summary.false_positives
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(axis.coverage.memories, 3);
+        assert!(axis
+            .coverage
+            .unsurfaced
+            .iter()
+            .all(|u| u.memory_id != ids[0]));
+        assert!(
+            axis.coverage
+                .unsurfaced
+                .iter()
+                .any(|u| u.memory_id == ids[2]),
+            "the Makefile memory no action surfaces is named: {:?}",
+            axis.coverage
+        );
+        // Read-only: neither the store nor a sidecar was written.
+        assert_eq!(std::fs::metadata(&db).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(format!("{db}.memext"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            sidecar_before,
+            "the sidecar index is rebuilt in memory, never on disk"
+        );
+        // Wire: ALWAYS serialized, null without a store.
+        let plain = run_evals(&store, &[push("x")], None, None, 1_000).unwrap();
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(
+            v["memory"].is_null() && v["results"][0]["memory"].is_null(),
+            "{v}"
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["results"][0]["memory"]["verdict"], "caught");
+        assert_eq!(v["memory"]["summary"]["false_positives"], 1);
+    }
+
+    /// core#397: a sample that asks a memory question with no store fails the run, and a blank
+    /// expectation is refused at load.
+    #[test]
+    fn memory_questions_without_a_store_fail_closed() {
+        let store = open_store(Some(":memory:")).unwrap();
+        let s = with_memories(
+            sample(
+                "q",
+                SampleKind::Bad,
+                "development",
+                "build",
+                "Bash",
+                &[],
+                "x",
+            ),
+            &["anything"],
+            &[],
+        );
+        let err = run_evals(&store, std::slice::from_ref(&s), None, None, 1_000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("declares memories") && err.contains("memoryDb"),
+            "{err}"
+        );
+        let blank = with_memories(s, &["id:  "], &[]);
+        assert!(blank
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("blank memory expectation"));
+        assert!(open_memory_ro("/nonexistent/wicked-memory.db").is_err());
     }
 
     #[test]

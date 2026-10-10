@@ -174,9 +174,10 @@ pub use schemas::{
 // entry points the core-ts binding wraps verbatim.
 pub use evals::{
     default_knowledge_db, governance_corpus_import, governance_evals, import_corpus, load_corpus,
-    pretool_context, pretool_event_from_signals, run_evals, sample_chunk_id, CorpusSource,
-    EvalReport, EvalSample, EvalSummary, Expected, ImportReceipt, NearestRule, RuleCoverage,
-    SampleKind, SampleRef, SampleResult, SampleSignals, TypeCoverage, UnexercisedRule, Verdict,
+    open_memory_ro, pretool_context, pretool_event_from_signals, run_evals, run_evals_with_memory,
+    sample_chunk_id, CorpusSource, EvalReport, EvalSample, EvalSummary, Expected, ImportReceipt,
+    MemoryAxis, MemoryCoverage, MemoryResult, NearestRule, RuleCoverage, SampleKind, SampleRef,
+    SampleResult, SampleSignals, TypeCoverage, UnexercisedRule, UnsurfacedMemory, Verdict,
     DEFAULT_CORPUS_NAME, DEFAULT_EVAL_PHASE, DEGRADED_FACET_ONLY, EVAL_SAMPLE_PREFIX,
     EVAL_SCOPE_PREFIX,
 };
