@@ -1928,7 +1928,7 @@ impl WrappedCliStepRunner {
             // without the claude-only gate-hook. This is deliberately NOT the claude branch: claude
             // gets `--permission-mode acceptEdits` + the gate-hook, and its `--dangerously-skip-
             // permissions` trust flag would make those deny rules inert.
-            let posture = resolve_seat_posture(&cli_key);
+            let posture = copilot_worker_grant(&binary, resolve_seat_posture(&cli_key));
             // F-036: a unit whose phase declared `executes_code: false` (an evaluator, a recon
             // rung, a review) runs with a READ-ONLY tool posture where this seat has a lever —
             // codex `--sandbox read-only`, pi `--exclude-tools edit,write` — applied to the
@@ -3552,6 +3552,21 @@ pub(crate) fn resolve_seat_posture(cli_key: &str) -> Vec<String> {
     bound_ungated_posture(cli_key, seat_posture_from(cli_key, user.as_deref()))
 }
 
+/// (core#366) The grant a WRAPPED copilot WORKER launch adds to its seat posture:
+/// `--allow-all-tools`, without which headless copilot runs no shell command at all ("Permission
+/// denied because no interactive user response was available"), so it could not run a test.
+/// Worker launches only — never a council ballot, which runs the registry's `trust_flags` with no
+/// read-only lever and no MCP pin (codex r1 on the slice): the grant is bounded here by copilot's
+/// own path check (cwd + temp), the engine's OS floor where it arms, the MCP pin and, on a
+/// read-only phase, `--deny-tool write`. NOT `--sandbox` (copilot's MXC Seatbelt nests under the
+/// floor and every shell command fails). Measured on copilot 1.0.94.
+pub(crate) fn copilot_worker_grant(binary: &str, mut posture: Vec<String>) -> Vec<String> {
+    if known_seat(binary) == Some("copilot") && !posture.iter().any(|f| f == "--allow-all-tools") {
+        posture.push("--allow-all-tools".to_string());
+    }
+    posture
+}
+
 /// [`resolve_seat_posture`] against an explicit registry path (`None` ⇒ built-ins only) — the
 /// testable seam, so a test can pin the built-in posture without depending on the operator's live
 /// `~/.config/wicked-council/clis.toml`. Returns the RAW declared flags (uncapped): the security
@@ -4105,18 +4120,32 @@ pub(crate) fn apply_no_code_posture(
 }
 
 /// (core#503) Drop every codex sandbox-mode and working-root spelling from a flag list:
-/// `--sandbox <mode>` / `-s <mode>` / `--sandbox=<mode>`, and `-C <dir>` / `--cd <dir>` /
-/// `--cd=<dir>`. (A no-code posture has already rewritten the modes to read-only.)
+/// `--sandbox <mode>` / `-s <mode>` / `--sandbox=<mode>`, `-C <dir>` / `--cd <dir>` /
+/// `--cd=<dir>`, every `--add-dir`, and every `-c`/`--config` override of a sandbox key. (A no-code
+/// posture has already rewritten the modes to read-only.)
 fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
+    // A config override that names the sandbox (`sandbox_mode`, `sandbox_workspace_write.*` —
+    // `writable_roots` above all) could re-grant the tree: the writable set is built ONLY from
+    // the scratch and the notes root (codex r1 on the slice).
+    let sandbox_override = |v: &str| v.trim_start().starts_with("sandbox");
     let mut out = Vec::with_capacity(flags.len());
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
-        if matches!(f, "--sandbox" | "-s" | "-C" | "--cd") {
+        if matches!(f, "--sandbox" | "-s" | "-C" | "--cd" | "--add-dir") {
             i += 2;
             continue;
         }
-        if f.starts_with("--sandbox=") || f.starts_with("-s=") || f.starts_with("--cd=") {
+        if matches!(f, "-c" | "--config") && flags.get(i + 1).is_some_and(|v| sandbox_override(v)) {
+            i += 2;
+            continue;
+        }
+        if f.starts_with("--sandbox=")
+            || f.starts_with("-s=")
+            || f.starts_with("--cd=")
+            || f.starts_with("--add-dir=")
+            || f.strip_prefix("--config=").is_some_and(sandbox_override)
+        {
             i += 1;
             continue;
         }
@@ -4196,13 +4225,47 @@ pub(crate) fn codex_check_scratch(input: &StepInput) -> Result<PathBuf, String> 
             }
         })
         .collect();
-    let dir = base
-        .join("checks")
-        .join(run)
-        .join(format!("{}-a{}", input.unit.ord, input.attempt));
-    wicked_apps_core::spawn::ensure_private_dir(&dir)
-        .map_err(|e| format!("cannot make the codex check scratch {}: {e}", dir.display()))?;
-    Ok(dir)
+    let parent = base.join("checks").join(run);
+    wicked_apps_core::spawn::ensure_private_dir(&parent).map_err(|e| {
+        format!(
+            "cannot make the codex check scratch under {}: {e}",
+            parent.display()
+        )
+    })?;
+    // EXCLUSIVE per invocation (codex r1 on the slice: two run ids that sanitize alike shared, and
+    // reaped, one scratch): `create_dir` fails on an existing name, so a colliding name is retried
+    // with a new nonce rather than reused.
+    for n in 0u32..16 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = parent.join(format!(
+            "{}-a{}-{}-{nonce}-{n}",
+            input.unit.ord,
+            input.attempt,
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                wicked_apps_core::spawn::ensure_private_dir(&dir).map_err(|e| {
+                    format!("cannot make the codex check scratch {}: {e}", dir.display())
+                })?;
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot make the codex check scratch {}: {e}",
+                    dir.display()
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "no unused codex check scratch name under {}",
+        parent.display()
+    ))
 }
 
 /// The [`StepOutput`] for a unit whose launch [`no_code_posture`] REFUSED: nothing ran, nothing was
@@ -7843,6 +7906,33 @@ mod tests {
         );
     }
 
+    /// core#366: the copilot grant rides worker launches only (never the registry `trust_flags`
+    /// a council ballot runs), once, and never on another binary.
+    #[test]
+    fn the_copilot_worker_grant_is_added_once_and_only_for_copilot() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            copilot_worker_grant("/opt/tools/copilot", vec![]),
+            s(&["--allow-all-tools"])
+        );
+        assert_eq!(
+            copilot_worker_grant("/opt/tools/gh-copilot", s(&["--allow-all-tools"])),
+            s(&["--allow-all-tools"])
+        );
+        assert_eq!(
+            copilot_worker_grant("/opt/tools/codex", vec![]),
+            Vec::<String>::new()
+        );
+        let copilot = wicked_council::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == "copilot")
+            .unwrap();
+        assert!(
+            copilot.trust_flags.is_empty(),
+            "a ballot runs the registry flags: no grant there"
+        );
+    }
+
     /// An UNKNOWN binary: passes through when its flags grant nothing (the caller discloses and
     /// the worktree guard holds the line), and is REFUSED when they grant writes — the generic
     /// tokens AND codex's write-capable sandbox spellings. A bare name that does not resolve on
@@ -8126,15 +8216,14 @@ mod tests {
         // core#503 (operator ruling): codex's workspace-write sandbox ROOTED AT THE CHECK SCRATCH
         // under the worker home, with the network open — and never the worktree as a root, so the
         // kernel keeps denying writes to it.
-        let scratch = home
+        let parent = home
             .join(".wicked-worker")
             .join("checks")
-            .join("run-ro-posture")
-            .join("4-a0");
+            .join("run-ro-posture");
         assert!(
             out.output.contains(&format!(
-                "--sandbox workspace-write -C {}",
-                scratch.display()
+                "--sandbox workspace-write -C {}/4-a0-",
+                parent.display()
             )),
             "a no-code phase on codex runs its checks in the scratch; got: {}",
             out.output
@@ -8163,7 +8252,11 @@ mod tests {
             "the shape rides the prompt; got: {}",
             out.output
         );
-        assert!(!scratch.exists(), "the attempt's scratch is reaped");
+        assert_eq!(
+            std::fs::read_dir(&parent).map(|d| d.count()).unwrap_or(0),
+            0,
+            "the attempt's scratch is reaped"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -9405,6 +9498,31 @@ mod tests {
                 "{joined}"
             );
         }
+        // A template that tries to re-grant the tree — `--add-dir`, a `writable_roots` override —
+        // loses the grant; only the scratch and the notes root are writable.
+        let mut argv = s(&[
+            &codex,
+            "exec",
+            "--add-dir",
+            "/repo/tree",
+            "-c",
+            "sandbox_workspace_write.writable_roots=[\"/repo/tree\"]",
+            "--config=sandbox_mode=danger-full-access",
+            "-c",
+            "model=o3",
+            "the prompt",
+        ]);
+        apply_no_code_posture(&mut argv, Vec::new(), Some(&ctx)).unwrap();
+        let joined = argv.join(" ");
+        assert!(!joined.contains("/repo/tree"), "{joined}");
+        assert!(
+            !joined.contains("danger-full-access") && !joined.contains("writable_roots"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-c model=o3"),
+            "an unrelated override stays: {joined}"
+        );
         // Without a scratch (the persistent-session carrier) the lever is the read-only sandbox.
         let mut argv = s(&[&codex, "exec", "the prompt"]);
         apply_no_code_posture(&mut argv, Vec::new(), None).unwrap();

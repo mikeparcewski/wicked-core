@@ -433,16 +433,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["copilot".into(), "--version".into()],
-            // (core#366) Headless copilot runs no shell command at all without a grant
-            // ("Permission denied because no interactive user response was available"), so a
-            // wrapped copilot unit could not run tests. `--allow-all-tools` is bounded by copilot's
-            // own default path check (cwd + temp; `cd .. && touch` is refused) and, on a host
-            // where it arms, by the engine's OS-sandbox floor (the kernel denies the escape).
-            // NOT `--sandbox`: copilot's MXC Seatbelt nests under the floor and every shell
-            // command then fails (`sandbox_init` rejected). A read-only unit keeps this grant under
-            // the `--deny-tool write` lever (execute_wrapped `ReadOnlyLever::CopilotDenyWrite`).
-            // Measured on copilot 1.0.94 (program `design/w4-seat-sandbox-probes/`).
-            trust_flags: vec!["--allow-all-tools".into()],
+            // (core#366) No grant here: a council ballot runs these flags with no read-only lever
+            // and no MCP pin. A WORKER launch adds `--allow-all-tools` itself
+            // (execute_wrapped `copilot_worker_grant`).
+            trust_flags: vec![],
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
