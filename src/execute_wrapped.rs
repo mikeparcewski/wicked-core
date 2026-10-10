@@ -4104,11 +4104,21 @@ pub(crate) fn apply_no_code_posture(
     // writable root) stays denied by the kernel, while the repository's checks get a writable
     // workspace, temp and network. Every read-only sandbox spelling and every `-C`/`--cd` is
     // dropped first, so neither the template nor the posture can root codex anywhere else.
-    if let (ReadOnlyLever::CodexSandbox, Some(ctx)) = (p.lever, codex_checks) {
+    //
+    // EVERY read-only codex launch — scratch or not (the persistent-session carrier passes none) —
+    // also drops the options that make codex write OUTSIDE its sandbox and pins the host-side
+    // writes off (codex r6 on the slice): `notify`, lifecycle hooks.
+    if p.lever == ReadOnlyLever::CodexSandbox {
         let head = argv.split_off(1);
         argv.extend(strip_codex_roots(head));
         flags = strip_codex_roots(flags);
-        flags.extend(ctx.codex_flags());
+        match codex_checks {
+            Some(ctx) => flags.extend(ctx.codex_flags()),
+            None => {
+                flags.extend(p.lever.flags());
+                flags.extend(codex_host_write_pins());
+            }
+        }
         apply_seat_posture(argv, &flags);
         return Ok(p.lever);
     }
@@ -4117,6 +4127,15 @@ pub(crate) fn apply_no_code_posture(
     }
     apply_seat_posture(argv, &flags);
     Ok(p.lever)
+}
+
+/// The `-c` pins that switch off the writes codex makes OUTSIDE its command sandbox: the
+/// turn-end `notify` command and lifecycle hooks (codex r5/r6 on the slice).
+fn codex_host_write_pins() -> Vec<String> {
+    ["-c", "notify=[]", "-c", "features.hooks=false"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// (core#503) Drop every codex sandbox-mode and working-root spelling from a flag list:
@@ -4242,10 +4261,6 @@ impl NoCodeLaunchContext {
             // The writable set is EXACTLY the scratch (the workspace) and the notes root below:
             // no configured `writable_roots` survives, whatever a config file says.
             "sandbox_workspace_write.writable_roots=[]",
-            // Host-side writes codex makes OUTSIDE its command sandbox, pinned whatever a config
-            // file says: no turn-end notify command, and its state database in the scratch.
-            "notify=[]",
-            "features.hooks=false",
             "sandbox_workspace_write.exclude_slash_tmp=true",
             "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             "sandbox_workspace_write.network_access=true",
@@ -4253,6 +4268,9 @@ impl NoCodeLaunchContext {
             f.push("-c".to_string());
             f.push(kv.to_string());
         }
+        // Host-side writes codex makes OUTSIDE its command sandbox, pinned whatever a config file
+        // says: no turn-end notify command, no lifecycle hook, and its state database here.
+        f.extend(codex_host_write_pins());
         f.push("-c".to_string());
         f.push(format!(
             "sqlite_home=\"{}\"",
@@ -7825,7 +7843,19 @@ mod tests {
         // The full argv a `--yolo` template yields for a no-code unit: lever appended, no grant.
         let mut argv = s(&[codex, "--yolo", "exec"]);
         apply_no_code_posture(&mut argv, Vec::new(), None).unwrap();
-        assert_eq!(argv, s(&[codex, "exec", "--sandbox", "read-only"]));
+        assert_eq!(
+            argv,
+            s(&[
+                codex,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "notify=[]",
+                "-c",
+                "features.hooks=false"
+            ])
+        );
     }
 
     /// F-036, the posture half: a NO-CODE phase (`executes_code: false`) on a codex binary runs
@@ -8075,7 +8105,11 @@ mod tests {
                 "exec",
                 "the prompt",
                 "--sandbox",
-                "read-only"
+                "read-only",
+                "-c",
+                "notify=[]",
+                "-c",
+                "features.hooks=false"
             ])
         );
         // No sandbox anywhere: the lever's flags are appended before a `--` guard when one exists.
@@ -8088,6 +8122,10 @@ mod tests {
                 "exec",
                 "--sandbox",
                 "read-only",
+                "-c",
+                "notify=[]",
+                "-c",
+                "features.hooks=false",
                 "--",
                 "the prompt"
             ])

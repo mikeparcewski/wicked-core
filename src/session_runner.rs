@@ -1091,20 +1091,49 @@ mod tests {
             &input,
         )
         .expect("codex has a lever");
-        assert_eq!(argv, s(&[&codex, "--sandbox", "read-only"]));
+        assert_eq!(
+            argv,
+            s(&[
+                &codex,
+                "--sandbox",
+                "read-only",
+                "-c",
+                "notify=[]",
+                "-c",
+                "features.hooks=false"
+            ])
+        );
         // No sandbox in the template: the lever is appended.
         let mut unit = make_unit("verify the fix", &format!("{codex} exec"));
         unit.worktree_guarded = true;
         let input = make_input("run-ro-append", 0, unit);
         assert_eq!(
             PersistentStepRunner::session_argv(&format!("{codex} exec"), &input).unwrap(),
-            s(&[&codex, "exec", "--sandbox", "read-only"])
+            s(&[
+                &codex,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "notify=[]",
+                "-c",
+                "features.hooks=false"
+            ])
         );
         // `--yolo` (codex's alias of the bypass, which beats a later read-only sandbox) is dropped
         // on this carrier too — adversarial review on #414.
         assert_eq!(
             PersistentStepRunner::session_argv(&format!("{codex} --yolo exec"), &input).unwrap(),
-            s(&[&codex, "exec", "--sandbox", "read-only"])
+            s(&[
+                &codex,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "notify=[]",
+                "-c",
+                "features.hooks=false"
+            ])
         );
         // A CODE phase is untouched — the guard reads the def, never guesses.
         let unit = make_unit("build it", &format!("{codex} --sandbox workspace-write"));
@@ -1138,8 +1167,12 @@ mod tests {
         let _embedder = EmbedderPin::hash();
         let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         let events = core.subscribe();
-        let mut unit = make_unit("verify the fix", "copilot --allow-all-tools -p");
-        unit.assigned_cli = Some("copilot".to_string());
+        // (core#366) copilot has a read-only lever now; the refusal is for a binary with none.
+        let mut unit = make_unit(
+            "verify the fix",
+            "wicked-no-lever-cli-xyz --allow-all-tools -p",
+        );
+        unit.assigned_cli = Some("mystery".to_string());
         unit.worktree_guarded = true;
         let input = make_input("run-refused", 0, unit);
         let out = runner.run_unit(&input);
