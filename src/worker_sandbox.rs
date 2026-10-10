@@ -731,10 +731,11 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
             c
         };
         let (base, _clone, own, _sibling) = clone_with_two_runs("posture");
-        let pi = seat("pi", None, &[]);
+        // (core#563) pi is ACP-governed now; copilot is the built-in floor-class seat with an ACP record.
+        let pi = seat("copilot", None, &[]);
         // 1. Off the floor.
         assert_eq!(
-            predicted_posture(&seat("pi", Some(false), &[]), Some(&own)),
+            predicted_posture(&seat("copilot", Some(false), &[]), Some(&own)),
             Err(PostureGap::NotOnTheFloor)
         );
         // 2. On the floor, not bound to a worktree (none, or a plain directory).

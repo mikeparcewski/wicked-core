@@ -364,52 +364,37 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
-                // OQ-PI-ACP-001 resolved NOT admitted — but read the reason carefully, because
-                // the wording this comment used to carry ("its requestPermission is invoked
-                // only for pi's extension select/confirm UI, never for tool execution") was
-                // literally true and drew the OPPOSITE conclusion from its own premise, and
-                // that conclusion has been keeping the pi seat refused for scoped work
-                // (wicked-core#571).
+                // OQ-PI-ACP-001 RESOLVED ADMITTED, with the gate loaded (core#563). pi-acp's own
+                // tool path is a fire-and-forget `tool_call` NOTIFICATION (a core `write` goes
+                // pending -> in_progress -> completed with zero `session/request_permission`
+                // round-trips; reproduced on pi-acp 0.0.32), so the seat is governed by a GATE
+                // EXTENSION instead: `mikeparcewski/pi-governance` handles pi's awaited `tool_call`
+                // hook for every tool and asks through `ctx.ui.confirm`, which pi-acp bridges into
+                // a real `session/request_permission` (`extension_ui_request` ->
+                // `requestExtensionPermission`). Only an explicit yes runs the call; a reject, a
+                // cancel, a thrown dialog or a mode with no permission channel denies it.
                 //
-                // What the capture showed, and still shows: against the pinned pi-acp@0.0.32
-                // (gitHead 2f6e3c5, see .product/evidence/oq-pi-acp-001/) a core `write` goes
-                // pending -> in_progress -> completed with zero session/request_permission
-                // round-trips, and the same path serves read/edit/bash. That is because the
-                // tool path emits a fire-and-forget ACP `tool_call` NOTIFICATION, never a
-                // request.
+                // The gate rides `acp_governance_env` below: crew's `wicked-pi` launcher loads it
+                // (`--no-extensions -e <gate>`, a sha-pinned tarball) when `WICKED_PI_GOVERNANCE`
+                // is set, and refuses to start pi (exit 126) when it is requested and missing.
+                // Captured offline with a scripted model (pi 0.84.2; pi-acp 0.0.32 and 0.0.34;
+                // pi-governance evidence `pi-0.84.2_pi-acp-0.0.32/`): read, bash, edit and write
+                // each ask once, in order; a reject fails every call with zero side effects; an
+                // allow runs each after its answer; a fail-open mutant of the gate fails the
+                // capture.
                 //
-                // What it does NOT establish is that the adapter cannot ask. pi's extension
-                // select/confirm UI *is* a tool-execution gate when an extension raises it
-                // from pi's blocking `tool_call` hook, and every link of that chain ships in
-                // the builds pinned here:
-                //   1. pi-agent-core `dist/agent-loop.js` — `prepareToolCall` AWAITS
-                //      `config.beforeToolCall`; a `block` result returns `kind: "immediate"`
-                //      and `executePreparedToolCall` is never reached.
-                //   2. pi-coding-agent `dist/core/agent-session.js` — wires that hook to the
-                //      extension runner's `tool_call` event and fails CLOSED on a handler
-                //      error ("Extension failed, blocking execution").
-                //   3. pi under `--mode rpc` — `ctx.ui.select` / `ctx.ui.confirm` build a
-                //      promise that emits `extension_ui_request` and resolves only on the
-                //      client's answer (`dist/modes/rpc/rpc-mode.js`, `createDialogPromise`);
-                //      `confirm` defaults to `false` if it times out, i.e. fails closed.
-                //   4. pi-acp bridges exactly that into a real ACP round-trip:
-                //      `extension_ui_request` -> `handleExtensionSelect`/`handleExtensionConfirm`
-                //      -> `requestExtensionPermission` -> `this.conn.requestPermission(...)`,
-                //      with the answer written back via `sendExtensionUiResponse` (read in the
-                //      SHIPPED `pi-acp@0.0.32` `dist/index.js`, not upstream sources).
-                //   ...and pi-acp deliberately leaves extensions enabled when it spawns pi:
-                //   `pi --mode rpc --no-themes`, `env: process.env`, no disable flag.
-                //
-                // So `acp_input_governance: false` below is correct as a statement about the
-                // CURRENT CONFIGURATION — no gate extension is loaded, so nothing raises an
-                // ask — and wrong as a statement about the adapter's capability. It stays
-                // false until OQ-PI-ACP-001 is re-run WITH a gate extension loaded: the four
-                // links above are each source-verified, but the COMPOSED path has never been
-                // executed end-to-end, and an unexecuted composition is reasoning, not
-                // evidence.
-                acp_input_governance: false,
+                // No `verified_version`: `pi-acp --version` prints nothing, so a pin could never
+                // match. Admission rests instead on the engine's BYPASS DETECTOR
+                // (`acp_runner::pi_ungranted_completion`): on a governed pi seat, a tool call that
+                // completes without a granted confirm naming its id fails the turn — a missing
+                // gate (an overridden `PI_ACP_PI_COMMAND`, a pi update that changed the hook) is
+                // caught on its first call, never trusted. The confirm envelope is re-shaped
+                // into the tool request it stands for (`acp_permission::normalize_pi_permission_
+                // request`), so the boundary and the remote-write fence read the real path and
+                // command.
+                acp_input_governance: true,
                 os_sandbox: false,
-                acp_governance_env: None,
+                acp_governance_env: Some(("WICKED_PI_GOVERNANCE".into(), "1".into())),
                 verified_version: None,
                 governance_floor: None,
             }),
@@ -801,28 +786,31 @@ headless_invocation = "plain {PROMPT}"
     fn only_proven_acp_adapters_are_admitted_in_the_builtin_roster() {
         // claude: DES-INPUT-GOV-001 §3. opencode: DES-INPUT-GOV-006 / oq-opencode-acp-002 —
         // admitted via the harness-provisioned `acp_governance_env` forcing function, not the
-        // registry's unconfigured invocation OQ-OPENCODE-ACP-001 found ungoverned.
+        // registry's unconfigured invocation OQ-OPENCODE-ACP-001 found ungoverned. pi (core#563):
+        // admitted via the pi-governance gate the `WICKED_PI_GOVERNANCE` forcing function loads,
+        // backed by the engine's bypass detector.
         for cli in builtin() {
             let admitted = cli.acp.as_ref().is_some_and(|acp| acp.acp_input_governance);
             assert_eq!(
                 admitted,
-                cli.key == "claude" || cli.key == "opencode",
-                "only claude and opencode's pinned adapters have passed ACP input-governance proof"
+                cli.key == "claude" || cli.key == "opencode" || cli.key == "pi",
+                "only claude, opencode and pi's gated adapters have passed ACP input-governance proof"
             );
         }
     }
 
     #[test]
     fn every_builtin_seat_has_its_governance_class() {
-        // IG1-core-1: the class table. claude/opencode are admitted to ACP input governance; every
-        // other built-in has no per-call permission adapter and sits on the OS-sandbox floor
-        // (codex through its own `--sandbox workspace-write`).
+        // IG1-core-1: the class table. claude/opencode — and pi through its gate (core#563) — are
+        // admitted to ACP input governance; every other built-in has no per-call permission
+        // adapter and sits on the OS-sandbox floor (codex through its own
+        // `--sandbox workspace-write`).
         use crate::types::{governance_class, GovernanceClass};
         let want = [
             ("claude", GovernanceClass::AcpInputGovernance),
             ("opencode", GovernanceClass::AcpInputGovernance),
             ("codex", GovernanceClass::OsSandboxFloor),
-            ("pi", GovernanceClass::OsSandboxFloor),
+            ("pi", GovernanceClass::AcpInputGovernance),
             ("copilot", GovernanceClass::OsSandboxFloor),
             ("agy", GovernanceClass::OsSandboxFloor),
         ];
@@ -926,6 +914,7 @@ headless_invocation = "pi -p {PROMPT}"
 
 [cli.acp]
 binary = "pi-acp"
+acp_input_governance = false
 governance_floor = false
 "#,
         )

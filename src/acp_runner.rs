@@ -3455,6 +3455,10 @@ struct TurnResult {
     /// The status is then `Ok` and the output is the attempt's result; the caller discloses it
     /// (`acpTurnSettled`) and never reuses the process.
     settled: Option<u64>,
+    /// (core#563) The pi tool call that completed WITHOUT a granted pi-governance confirm — a
+    /// governance breach. The turn is `Failed`, and the caller fails the unit with it: never a
+    /// fallback onto the ungoverned wrapped carrier, and the process is never reused.
+    breach: Option<String>,
 }
 
 impl TurnResult {
@@ -3470,6 +3474,7 @@ impl TurnResult {
             tools: Vec::new(),
             answer: String::new(),
             settled: None,
+            breach: None,
         }
     }
 
@@ -4142,6 +4147,14 @@ fn exec_turn_acp_posture(
     // with no tool call open, is ended here and its output kept (`TurnResult::settled`).
     let mut watch = SettleWatch::new();
     let mut settled: Option<u64> = None;
+    // (core#563) On a governed pi seat every tool call must have been GRANTED through the
+    // pi-governance gate before it completes; one that was not is a breach that fails the turn.
+    // Every turn that relies on the seat ASKING — a policy gate, a chat boundary or a write-posture
+    // fence (codex r1 on the slice: a fenced unit with no policy governance still depends on it).
+    let pi_governed = proc.seat_cli == wicked_apps_core::spawn::SeatCli::Pi
+        && (gate.is_some() || proc.chat_boundary.is_some() || posture.is_some());
+    let mut pi_allowed: HashSet<String> = HashSet::new();
+    let mut pi_breach: Option<String> = None;
 
     'exec: loop {
         let remaining = deadline
@@ -4472,6 +4485,15 @@ fn exec_turn_acp_posture(
                                             }
                                         }
                                         "session/update" => {
+                                            if pi_governed {
+                                                if let Some(id) =
+                                                    pi_ungranted_completion(&v2, &pi_allowed)
+                                                {
+                                                    pi_breach = Some(id);
+                                                    proc.kill_handle.signal();
+                                                    break 'exec;
+                                                }
+                                            }
                                             handle_update(
                                                 &v2,
                                                 emit,
@@ -4488,7 +4510,7 @@ fn exec_turn_acp_posture(
                                         // the turn. Answered here with the same policy the main
                                         // loop applies, via the same handler.
                                         "session/request_permission" => {
-                                            answer_permission_request(
+                                            if let Some(g) = answer_permission_request(
                                                 &mut proc.stdin,
                                                 &write_lock,
                                                 gate,
@@ -4498,7 +4520,11 @@ fn exec_turn_acp_posture(
                                                 &v2,
                                                 &mut output,
                                                 MAX_OUT,
-                                            );
+                                            ) {
+                                                if g.allowed {
+                                                    pi_allowed.insert(g.tool_call_id);
+                                                }
+                                            }
                                         }
                                         // Unknown request → explicit refusal; unknown
                                         // NOTIFICATION (the `id` member is absent) → ignored.
@@ -4604,6 +4630,13 @@ fn exec_turn_acp_posture(
                 if let Some(method) = agent_method(&v) {
                     match method {
                         "session/update" => {
+                            if pi_governed {
+                                if let Some(id) = pi_ungranted_completion(&v, &pi_allowed) {
+                                    pi_breach = Some(id);
+                                    proc.kill_handle.signal();
+                                    break 'exec;
+                                }
+                            }
                             handle_update(
                                 &v,
                                 emit,
@@ -4640,7 +4673,7 @@ fn exec_turn_acp_posture(
                         // unanswered request would have hung the turn — which is why the
                         // capability above had to stay off.
                         "session/request_permission" => {
-                            answer_permission_request(
+                            if let Some(g) = answer_permission_request(
                                 &mut proc.stdin,
                                 &write_lock,
                                 gate,
@@ -4650,7 +4683,11 @@ fn exec_turn_acp_posture(
                                 &v,
                                 &mut output,
                                 MAX_OUT,
-                            );
+                            ) {
+                                if g.allowed {
+                                    pi_allowed.insert(g.tool_call_id);
+                                }
+                            }
                         }
                         // Catch-all (core#293): a request this client does not implement gets an
                         // explicit JSON-RPC error. Dropping it would block the agent until the
@@ -4734,7 +4771,18 @@ fn exec_turn_acp_posture(
     // No `stopReason` and no timeout means the bridge stopped answering — it died mid-turn. Its
     // stderr is the only account of why, and `StepOutput.output` is where an operator looks, so
     // say it there rather than reporting a Failed unit with an empty reason.
+    if let Some(id) = &pi_breach {
+        let note = format!(
+            "\n[wicked-core] GOVERNANCE BREACH on the pi seat: tool call `{id}` completed without a \
+             granted pi-governance confirm — the gate is not in this seat's path (an overridden \
+             PI_ACP_PI_COMMAND, a pi or pi-acp that no longer asks), so the turn is failed rather \
+             than trusted (core#563)"
+        );
+        eprintln!("wicked-core: run {run_id}: {}", note.trim());
+        append_within_cap(&mut output, &note, MAX_OUT);
+    }
     if !found
+        && pi_breach.is_none()
         && !timed_out
         && !elicitation_timed_out
         && !elicitation_cancelled
@@ -4782,6 +4830,7 @@ fn exec_turn_acp_posture(
         files,
         tools: Vec::new(),
         settled,
+        breach: pi_breach,
     })
 }
 
@@ -4848,6 +4897,35 @@ impl SettleWatch {
     }
 }
 
+/// (core#563) What an answered pi-governance confirm granted: the pi tool call it names, and
+/// whether the answer allowed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiGrant {
+    tool_call_id: String,
+    allowed: bool,
+}
+
+/// (core#563) A tool call that reached `completed` on a governed pi seat without an ALLOWED
+/// pi-governance confirm naming its id — the gate is not in the path (an overridden
+/// `PI_ACP_PI_COMMAND`, a pi update that changed the hook, a pi-acp that stopped forwarding
+/// confirm). `in_progress` is not a breach: pi-acp sends it at `tool_execution_start`, before the
+/// hook asks. Returns the id.
+fn pi_ungranted_completion(v: &Value, allowed: &HashSet<String>) -> Option<String> {
+    let update = &v["params"]["update"];
+    if !matches!(
+        update.get("sessionUpdate").and_then(Value::as_str),
+        Some("tool_call" | "tool_call_update")
+    ) || update.get("status").and_then(Value::as_str) != Some("completed")
+    {
+        return None;
+    }
+    let id = update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or("(no id)");
+    (!allowed.contains(id)).then(|| id.to_string())
+}
+
 /// Answer one `session/request_permission` REQUEST from the agent.
 ///
 /// Factored out for core#293: the `'elicit` sub-loop had no permission arm at all, so a
@@ -4879,14 +4957,31 @@ fn answer_permission_request<W: Write>(
     frame: &Value,
     output: &mut String,
     max_out: usize,
-) {
+) -> Option<PiGrant> {
     // `request_id` — not a raw `get("id")` — so the "notification ⇒ no answer" rule is decided in
     // ONE place: the `id` member being ABSENT means nothing to answer, while an explicit
     // `"id": null` is a real request and is answered with a null-id response (Copilot review).
     let Some(req_id) = answerable_id(frame).cloned() else {
-        return; // a permission NOTIFICATION is not a thing; nothing to answer.
+        return None; // a permission NOTIFICATION is not a thing; nothing to answer.
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    // (core#563) On a pi seat the pi-governance gate's confirm envelope is re-shaped into the tool
+    // request it stands for, BEFORE anything judges it — and the call it names is remembered, so
+    // the turn can tell a granted tool call from one that ran without asking.
+    let pi_call = (seat == wicked_apps_core::spawn::SeatCli::Pi)
+        .then(|| crate::acp_permission::pi_governed_call_id(&params))
+        .flatten();
+    let params = if pi_call.is_some() {
+        crate::acp_permission::normalize_pi_permission_request(params)
+    } else {
+        params
+    };
+    let grant = |allowed: bool| {
+        pi_call.clone().map(|tool_call_id| PiGrant {
+            tool_call_id,
+            allowed,
+        })
+    };
     // core#657 (F-11): the MCP FENCE, judged FIRST and on EVERY turn — governed or not, unit or
     // chat, any posture. No MCP server is registered for workers (nothing ambient loads: the
     // claude bridge runs `strictMcpConfig`, opencode hides `<server>_<tool>`), so an MCP call that
@@ -4929,7 +5024,7 @@ fn answer_permission_request<W: Write>(
             output,
             max_out,
         );
-        return;
+        return grant(false);
     }
     // Where the seat's shell will stand IF this call is allowed (install fence, F1) — applied
     // only at the final ALLOW response below, never here: a call the governance verdict refuses
@@ -5058,7 +5153,7 @@ fn answer_permission_request<W: Write>(
                     output,
                     max_out,
                 );
-                return;
+                return grant(false);
             }
         }
         if let Some(call) = crate::acp_permission::write_class_call(&params) {
@@ -5102,7 +5197,7 @@ fn answer_permission_request<W: Write>(
                     output,
                     max_out,
                 );
-                return;
+                return grant(false);
             }
         }
     }
@@ -5133,6 +5228,7 @@ fn answer_permission_request<W: Write>(
         output,
         max_out,
     );
+    grant(allowed)
 }
 
 /// Process one `session/update` notification — extract text chunks and usage.
@@ -7388,6 +7484,25 @@ impl AcpStepRunner {
                      no tool call; booked as a worker failure (core#755)",
                     input.unit.ord
                 );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::Failed,
+                    usage: result.usage,
+                    files: result.files,
+                    tools: result.tools,
+                    governed: gate.is_some() || floor_governed,
+                }
+            }
+            // (core#563) A governance breach on the pi seat FAILS the unit, with its diagnostic —
+            // never the session-death fallback onto the wrapped carrier, which has no input
+            // governance at all. The process the gate was missing from is never reused.
+            Ok(result) if result.breach.is_some() => {
+                drop(proc);
+                self.drop_session_key(&session_key);
+                drop(proc_arc);
                 StepOutput {
                     run_id: input.run_id.clone(),
                     unit_ix: input.unit_ix,
@@ -14152,6 +14267,7 @@ transport = "stdio"
             tools: Vec::new(),
             answer: "The answer.".into(),
             settled: None,
+            breach: None,
         };
         assert_eq!(turn.chat_answer(), "The answer.");
         assert_eq!(
@@ -14315,6 +14431,7 @@ No further next steps — both questions fully answered.";
             tools: Vec::new(),
             answer: golden.to_string(),
             settled: None,
+            breach: None,
         };
         assert_eq!(scaffold_header_hits(&via_answer.chat_answer()), 0);
         assert!(via_answer
@@ -14612,7 +14729,9 @@ No further next steps — both questions fully answered.";
     /// ACP input governance is an explicit adapter-proof capability, not a CLI-name heuristic.
     /// The built-in registry admits claude (DES-INPUT-GOV-001 §3) and opencode (DES-INPUT-GOV-006
     /// / oq-opencode-acp-002, via the harness-provisioned `acp_governance_env` forcing function)
-    /// today; every other built-in fails safely to the explicitly disclosed ungoverned posture.
+    /// and pi (core#563, its pi-governance gate through the same forcing function, backed by the
+    /// bypass detector) today; every other built-in fails safely to the explicitly disclosed
+    /// ungoverned posture.
     /// Asserted against `builtin()` — never the merged registry, whose answer would depend on the
     /// operator's real clis.toml (review, #371).
     #[test]
@@ -14623,7 +14742,7 @@ No further next steps — both questions fully answered.";
                 .as_ref()
                 .map(|a| a.acp_input_governance)
                 .unwrap_or(false);
-            if cli.key == "claude" || cli.key == "opencode" {
+            if cli.key == "claude" || cli.key == "opencode" || cli.key == "pi" {
                 assert!(
                     admitted,
                     "{}'s pinned adapter passed the admission proof",
@@ -21370,5 +21489,52 @@ while True:
             Some(v) => std::env::set_var(ACP_SETTLE_ENV, v),
             None => std::env::remove_var(ACP_SETTLE_ENV),
         }
+    }
+}
+
+/// core#563: the bypass detector's rule — a governed pi seat's tool call that COMPLETES must have
+/// been granted through the pi-governance gate first.
+#[cfg(test)]
+mod pi_bypass_tests {
+    use super::*;
+
+    fn update(status: &str, id: &str) -> Value {
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{
+            "sessionUpdate":"tool_call_update","toolCallId":id,"status":status}}})
+    }
+
+    #[test]
+    fn a_completed_pi_tool_call_needs_a_granted_confirm() {
+        let mut allowed = HashSet::new();
+        assert_eq!(
+            pi_ungranted_completion(&update("completed", "call_1"), &allowed).as_deref(),
+            Some("call_1"),
+            "completed with no prior envelope: a breach"
+        );
+        assert_eq!(
+            pi_ungranted_completion(&update("in_progress", "call_1"), &allowed),
+            None,
+            "pi-acp sends in_progress at tool_execution_start, before the hook asks"
+        );
+        assert_eq!(
+            pi_ungranted_completion(&update("failed", "call_1"), &allowed),
+            None,
+            "a rejected call ends failed: not a breach"
+        );
+        allowed.insert("call_1".to_string());
+        assert_eq!(
+            pi_ungranted_completion(&update("completed", "call_1"), &allowed),
+            None,
+            "an allowed envelope, then completed: passes"
+        );
+        assert_eq!(
+            pi_ungranted_completion(&update("completed", "call_2"), &allowed).as_deref(),
+            Some("call_2"),
+            "another call that was never granted"
+        );
+        // A plain message is not a tool completion.
+        let msg = json!({"jsonrpc":"2.0","method":"session/update","params":{"update":{
+            "sessionUpdate":"agent_message_chunk","content":{"text":"done"}}}});
+        assert_eq!(pi_ungranted_completion(&msg, &HashSet::new()), None);
     }
 }
