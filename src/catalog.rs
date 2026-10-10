@@ -202,7 +202,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
 /// requires, as a workflow's `required_instruments` declares them: the presets that make
 /// application changes (`feature`, `bug`, `editor-plugin`, `mcp-server`, `migration`) require `qe_acceptance` on top of the
 /// defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
-pub(crate) fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
+pub fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
     matches!(
         name,
         "feature" | "bug" | "editor-plugin" | "mcp-server" | "migration"

@@ -13036,7 +13036,7 @@ fn register_deny_policy(
     let phase = phase.trim();
     // The phase tokens a run can carry (X-MIG M11: the built-ins are presets, so the registry
     // alone no longer names them): every registered def's phases, every global preset's step ids
-    // (the seeded built-ins included), the catalog's entry ids (a floor-added step takes its entry's
+    // (the seeded built-ins included, and every project's), the catalog's entry ids (a floor-added step takes its entry's
     // id) and the PA's scope step.
     let mut known: Vec<String> = registry
         .ids()
@@ -13044,7 +13044,8 @@ fn register_deny_policy(
         .filter_map(|id| registry.get(id))
         .flat_map(|def| def.phases.iter().map(|p| p.id.clone()))
         .collect();
-    for p in crate::preset::list_presets(&*store, None)? {
+    // Every scope's presets: a project preset launches in its project (codex r1 on core#871).
+    for p in crate::preset::list_all_presets(&*store)? {
         known.extend(p.steps.into_iter().map(|s| s.id));
     }
     known.extend(crate::catalog::CATALOG_IDS.iter().map(|c| c.to_string()));
@@ -19733,6 +19734,38 @@ mod deny_policy_tests {
             elsewhere.is_empty(),
             "a deny scoped to `build` selected at `clarify` — the fan-out is back: {:?}",
             elsewhere.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_step_only_a_project_preset_names_is_a_known_phase() {
+        // codex r1 on core#871: a drop-in migrated to a PROJECT preset must stay deny-scopable.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let pid = crate::project::create_project(&mut store, "alpha", None, 1)
+            .unwrap()
+            .id;
+        crate::preset::put_preset(
+            &mut store,
+            crate::preset::PresetSpec {
+                name: "audit".into(),
+                project_id: Some(pid),
+                steps: vec![crate::plan::PlanStep {
+                    catalog: "understand".into(),
+                    id: "project-audit".into(),
+                    ..Default::default()
+                }],
+                created_by: "api".into(),
+            },
+            2,
+        )
+        .unwrap();
+        register_deny_policy(&mut store, &registry, "project-audit", "DENYME").unwrap();
+        assert_eq!(
+            select_any(&store, "s", &["project-audit"], &ctx())
+                .unwrap()
+                .len(),
+            1
         );
     }
 

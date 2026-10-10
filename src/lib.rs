@@ -186,8 +186,8 @@ pub use wicked_governance::{
 };
 
 pub use catalog::{
-    builtin_presets, catalog, catalog_entries, catalog_entry, CatalogEntry, CATALOG_IDS,
-    SECURITY_REVIEW_SKILL,
+    builtin_preset_instruments, builtin_presets, catalog, catalog_entries, catalog_entry,
+    CatalogEntry, CATALOG_IDS, SECURITY_REVIEW_SKILL,
 };
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
@@ -208,8 +208,8 @@ pub use plan_gate::{
     PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, TeamPlanState,
 };
 pub use preset::{
-    put_preset, resolve as resolve_preset, Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY,
-    GLOBAL_SCOPE, PLAN_PRESET,
+    compose_preset, list_all_presets, put_preset, put_preset_requiring, resolve as resolve_preset,
+    Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET,
 };
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,

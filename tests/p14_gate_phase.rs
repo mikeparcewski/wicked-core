@@ -12,8 +12,8 @@
 use std::process::Command;
 
 use wicked_core::{
-    builtin_presets, load_validator, pin, put_preset, resolve_preset, store_validator,
-    DeterministicValidator, PresetSpec,
+    builtin_preset_instruments, builtin_presets, compose_preset, load_validator, pin,
+    put_preset_requiring, resolve_preset, store_validator, DeterministicValidator, PresetSpec,
 };
 
 fn bin() -> &'static str {
@@ -68,7 +68,7 @@ fn gate_phase_preset_makes_a_step_actually_gate() {
             s
         })
         .collect();
-    put_preset(
+    put_preset_requiring(
         &mut store,
         PresetSpec {
             name: name.clone(),
@@ -76,6 +76,7 @@ fn gate_phase_preset_makes_a_step_actually_gate() {
             steps,
             created_by: "gate-phase".to_string(),
         },
+        builtin_preset_instruments("feature"),
         1,
     )
     .expect("the gated preset saves (the step rules accept a pin on an unpinned entry)");
@@ -91,6 +92,25 @@ fn gate_phase_preset_makes_a_step_actually_gate() {
         base.iter().map(|s| &s.id).collect::<Vec<_>>(),
         "gate-phase reproduces the base step list exactly"
     );
+
+    // 4b. The COMPOSED def — what a launch runs — carries the pin on that phase (codex r1: the
+    //     stored step alone does not prove the composition keeps it), and the gated copy keeps
+    //     `feature`'s required instruments (its QE acceptance contract).
+    let def = compose_preset(&saved).expect("the gated preset composes");
+    let phase = def
+        .phases
+        .iter()
+        .find(|p| p.id == STEP)
+        .expect("the design phase");
+    assert_eq!(phase.validator_pin.as_deref(), Some(approved_pin.as_str()));
+    assert_eq!(
+        saved.required_instruments,
+        builtin_preset_instruments("feature")
+    );
+    assert!(saved
+        .required_instruments
+        .as_ref()
+        .is_some_and(|r| r.iter().any(|i| i == "qe_acceptance")));
 
     // 5. The pin resolves to the APPROVED validator — the read `attach_pinned_validators` performs.
     let resolved = load_validator(&store, &approved_pin)

@@ -695,8 +695,16 @@ fn gate_phase_cmd(args: &[String]) {
     };
     // 1. The base preset: the store's row (a user preset, or a built-in a boot seeded), else the
     //    compiled built-in of that name (a store no engine has booted on yet).
+    // The base's required instruments ride along (codex r1 on core#871): a gated copy of a
+    // QE-required workflow must still require QE acceptance. A built-in's come from the catalog.
+    let mut base_instruments = wicked_core::builtin_preset_instruments(&workflow);
     let base_steps = match wicked_core::resolve_preset(&store, None, &workflow) {
-        Ok(Some(p)) => p.steps,
+        Ok(Some(p)) => {
+            if p.created_by != wicked_core::BUILTIN_CREATED_BY {
+                base_instruments = p.required_instruments.clone();
+            }
+            p.steps
+        }
         Ok(None) => match wicked_core::builtin_presets()
             .into_iter()
             .find(|(n, _)| *n == workflow)
@@ -782,7 +790,12 @@ fn gate_phase_cmd(args: &[String]) {
         steps,
         created_by: "gate-phase".to_string(),
     };
-    if let Err(e) = wicked_core::put_preset(&mut store, spec, wicked_core::now_millis()) {
+    if let Err(e) = wicked_core::put_preset_requiring(
+        &mut store,
+        spec,
+        base_instruments,
+        wicked_core::now_millis(),
+    ) {
         fail(&format!(
             "gate-phase: saving preset `{new_name}` failed: {e}"
         ));

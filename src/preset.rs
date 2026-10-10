@@ -45,6 +45,11 @@ pub struct Preset {
     /// row with this set, and it never lists or resolves. A later put clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<i64>,
+    /// (X-MIG M11) The instruments a launch of this SAVED preset requires, when its writer derived it
+    /// from a workflow that requires more than the defaults (`gate-phase` copies its base's). `None`
+    /// = the defaults. A built-in's own come from the catalog, never from this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_instruments: Option<Vec<String>>,
 }
 
 /// What a caller asks to save.
@@ -193,6 +198,7 @@ pub(crate) fn builtin_preset_def(name: &str) -> crate::workflow::WorkflowDef {
         created_by: BUILTIN_CREATED_BY.to_string(),
         updated_at: 0,
         deleted_at: None,
+        required_instruments: None,
     };
     compose_preset(&preset).unwrap_or_else(|e| panic!("built-in preset `{name}` composes: {e}"))
 }
@@ -244,6 +250,7 @@ pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<
             created_by: BUILTIN_CREATED_BY.to_string(),
             updated_at: now_ms,
             deleted_at: None,
+            required_instruments: None,
         });
     }
     if !rows.is_empty() {
@@ -259,6 +266,17 @@ pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<
 pub fn put_preset(
     store: &mut dyn GraphStore,
     spec: PresetSpec,
+    now_ms: i64,
+) -> anyhow::Result<Preset> {
+    put_preset_requiring(store, spec, None, now_ms)
+}
+
+/// [`put_preset`], saving the instruments a launch of the preset requires (`None` = the defaults):
+/// what `gate-phase` uses so a gated copy of a QE-required workflow keeps its contract.
+pub fn put_preset_requiring(
+    store: &mut dyn GraphStore,
+    spec: PresetSpec,
+    required_instruments: Option<Vec<String>>,
     now_ms: i64,
 ) -> anyhow::Result<Preset> {
     if !valid_name(&spec.name) {
@@ -286,6 +304,7 @@ pub fn put_preset(
         created_by: spec.created_by,
         updated_at: now_ms,
         deleted_at: None,
+        required_instruments,
     };
     compose_preset(&preset).map_err(|e| PresetError::InvalidSteps(e.to_string()))?;
     crate::domain::put_node(store, preset.to_node())?;
@@ -357,15 +376,35 @@ pub fn resolve(
 
 /// (QE acceptance) The instruments a launch of preset `name` requires: a built-in's declaration
 /// ([`crate::catalog::builtin_preset_instruments`]) when the preset that resolves IS the built-in;
-/// `None` (the defaults) for a saved preset, including one that shadows a built-in's name.
+/// for a saved preset, the instruments its writer saved (`None` = the defaults), including one that
+/// shadows a built-in's name.
 pub(crate) fn required_instruments(
     store: &dyn GraphRead,
     project_id: Option<&str>,
     name: &str,
 ) -> anyhow::Result<Option<Vec<String>>> {
-    Ok(resolve(store, project_id, name)?
-        .filter(|p| p.created_by == BUILTIN_CREATED_BY)
-        .and_then(|p| crate::catalog::builtin_preset_instruments(&p.name)))
+    Ok(resolve(store, project_id, name)?.and_then(|p| {
+        if p.created_by == BUILTIN_CREATED_BY {
+            crate::catalog::builtin_preset_instruments(&p.name)
+        } else {
+            p.required_instruments
+        }
+    }))
+}
+
+/// Every live preset of every scope (global and each project's) — what a check over "any phase a
+/// run can carry" reads, since a project preset launches in its project only.
+pub fn list_all_presets(store: &dyn GraphRead) -> anyhow::Result<Vec<Preset>> {
+    let query = wicked_estate_core::SymbolQuery {
+        kinds: vec![NodeKind::Other(PLAN_PRESET.to_string())],
+        ..Default::default()
+    };
+    Ok(store
+        .find_symbols(&query)?
+        .iter()
+        .filter_map(|n| Preset::from_node(n).ok())
+        .filter(|p| p.deleted_at.is_none())
+        .collect())
 }
 
 #[cfg(test)]
@@ -403,6 +442,7 @@ mod tests {
             created_by: "studio".into(),
             updated_at: 7,
             deleted_at: None,
+            required_instruments: None,
         };
         let node = p.to_node();
         assert_eq!(node.kind, NodeKind::Other("plan_preset".into()));
@@ -447,6 +487,7 @@ mod tests {
             created_by: BUILTIN_CREATED_BY.into(),
             updated_at: 1,
             deleted_at: None,
+            required_instruments: None,
         };
         crate::domain::put_node(&mut store, stale.to_node()).unwrap();
         assert_eq!(
@@ -485,6 +526,7 @@ mod tests {
             created_by: "studio".into(),
             updated_at: 1,
             deleted_at: None,
+            required_instruments: None,
         };
         crate::domain::put_node(&mut store, saved.to_node()).unwrap();
         assert_eq!(
@@ -582,6 +624,41 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_preset_requires_the_instruments_its_writer_saved_and_lists_in_every_scope() {
+        // codex r1 on core#871: `gate-phase` saves a gated copy of `feature`; it must keep
+        // `feature`'s QE contract, and a project preset's step ids are known to the deny check.
+        let mut store = mem_store();
+        seed_builtins(&mut store, 1).unwrap();
+        let qe = crate::catalog::builtin_preset_instruments("feature").unwrap();
+        put_preset_requiring(&mut store, user("gated", None), Some(qe.clone()), 2).unwrap();
+        put_preset(&mut store, user("plain", None), 2).unwrap();
+        assert_eq!(
+            required_instruments(&store, None, "gated").unwrap(),
+            Some(qe.clone())
+        );
+        assert_eq!(required_instruments(&store, None, "plain").unwrap(), None);
+        assert_eq!(
+            required_instruments(&store, None, "feature").unwrap(),
+            Some(qe)
+        );
+
+        let pid = crate::project::create_project(&mut store, "alpha", None, 1)
+            .unwrap()
+            .id;
+        let mut spec = user("proj-only", Some(&pid));
+        spec.steps[0].id = "project-audit".into();
+        put_preset(&mut store, spec, 3).unwrap();
+        assert!(list_presets(&store, None)
+            .unwrap()
+            .iter()
+            .all(|p| p.name != "proj-only"));
+        assert!(list_all_presets(&store)
+            .unwrap()
+            .iter()
+            .any(|p| p.steps.iter().any(|st| st.id == "project-audit")));
+    }
+
+    #[test]
     fn a_project_row_shadows_only_its_project() {
         let mut store = mem_store();
         seed_builtins(&mut store, 1).unwrap();
@@ -649,6 +726,7 @@ mod tests {
             created_by: "api".into(),
             updated_at: 0,
             deleted_at: None,
+            required_instruments: None,
         };
         let def = compose_preset(&p).unwrap();
         assert_eq!(def.id, "my-flow");
