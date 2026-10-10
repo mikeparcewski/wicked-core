@@ -1258,7 +1258,8 @@ pub(crate) fn ado_canonical_url(raw: &str) -> Option<String> {
                 segs[1].to_string(),
                 segs[3].to_string(),
             )
-        } else if let Some(org) = host.strip_suffix(".visualstudio.com") {
+        } else {
+            let org = host.strip_suffix(".visualstudio.com")?;
             let rest: Vec<&str> = segs[..g]
                 .iter()
                 .enumerate()
@@ -1273,8 +1274,6 @@ pub(crate) fn ado_canonical_url(raw: &str) -> Option<String> {
                 rest[0].to_string(),
                 segs[g + 1].to_string(),
             )
-        } else {
-            return None;
         }
     };
     let repo = repo
