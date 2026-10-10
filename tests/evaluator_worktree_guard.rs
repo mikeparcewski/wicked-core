@@ -849,8 +849,9 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
 }
 
 /// Codex review on #414: a "passing" check script that EDITS a tracked file. The evaluator leaves
-/// the tree alone and the repo checks exit 0 — yet the gate must DENY on the worktree guard,
-/// because the FINAL comparison is taken after the checks ran, not right after the seat returned.
+/// the tree alone and the repo checks exit 0 — yet the gate must DENY. Since core#417 the guarded
+/// verify floor runs on a clean checkout of the guarded tree, so the write lands there and the
+/// floor's post-check hold denies it; the live worktree is never touched.
 /// Needs `npm` on PATH (every hosted CI runner; developer machines) — otherwise says so.
 #[test]
 fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
@@ -901,26 +902,30 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
         let _ = std::fs::remove_dir_all(&repo);
         return;
     }
+    // (core#417) A guarded verify floor runs on a clean checkout of the guarded tree, so the
+    // mutating check writes THERE: the live worktree stays clean, and the floor's own hold —
+    // every tree entry re-checked after the checks — catches the write and fails the floor.
     assert_eq!(
         verify.denial_source.as_deref(),
-        Some("worktree_guard"),
-        "the FINAL comparison caught the check's write: {:?}",
+        Some("repo_checks"),
+        "the floor's hold caught the check's write: {:?}",
         verify.denial_reason
     );
     assert!(
-        verify
-            .denial_reason
-            .as_deref()
-            .is_some_and(|r| r.contains("M src/app.ts")),
+        verify.denial_reason.as_deref().is_some_and(|r| {
+            r.contains("the checks changed the tracked content they ran on")
+                && r.contains("src/app.ts")
+        }),
         "{:?}",
         verify.denial_reason
     );
-    // The checks themselves PASSED and were recorded — the passing script is exactly the trap.
-    let checks_passed = evs.iter().find_map(|ev| match ev {
-        CoreEvent::RepoChecksEvaluated { ord: 4, passed, .. } => Some(*passed),
-        _ => None,
-    });
-    assert_eq!(checks_passed, Some(true), "the mutating check exited 0");
+    assert!(
+        !evs.iter()
+            .any(|ev| matches!(ev, CoreEvent::EvaluatorMutatedWorktree { .. })),
+        "the live worktree was never touched"
+    );
+    let live = std::fs::read_to_string(repo.join("src/app.ts")).unwrap();
+    assert!(!live.contains("touched by the test script"), "{live}");
     let _ = std::fs::remove_dir_all(&repo);
 }
 
