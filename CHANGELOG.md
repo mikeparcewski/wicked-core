@@ -239,6 +239,14 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.8.2** — 2026-10-10 — npm release on main tip 4deb15d, carrying #864 and #866.
+  **#864 (X-MIG M1, core#649)**: `bug` is a built-in preset (triage → `understand`, reproduce →
+  `test_plan`, fix → `build` with the retired-behaviour sweep instructions, verify → `test`;
+  `qe_acceptance` kept); the PA scopes it first and floor fill applies. **#866 (X-MIG M12)**:
+  `mcp-server` is a built-in preset (its nine phases as data; security-review is a catalog `review`
+  keeping `wicked-garden-platform-security-engineer`; install gated `consent_before`), and a
+  delivering run's deliver step goes before a terminal consent-gated Tool `run` suffix (its dry run
+  when that is the step right before it), the anchor keeping its own dependencies.
 - **core-ts 0.8.1** — 2026-10-10 — npm release on main tip a49c63e, carrying #867. **#867
   (wicked-crew#933)**: the engine's origin fetch (the run-base mint and the pre-deliver lift)
   authenticates an Azure DevOps origin with the daemon's own credential (`AZURE_DEVOPS_EXT_PAT`,
