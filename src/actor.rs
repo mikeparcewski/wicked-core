@@ -12389,7 +12389,12 @@ fn rewind_to_creator_scoped(
     // reason-only record that is not a pinned-validator verdict, re-runs the Tool. Every other
     // source — pinned validator, evaluator verdict, output governance, the floor — judged the work.
     let command_failed = match cursor.denial.as_ref() {
-        Some(d) => matches!(d.source.as_str(), "worker_failure" | "turn_timeout"),
+        // `deliver_refusal`: the deliver script RAN and exited refusing (codex r2) — its own
+        // target, as core#803 says.
+        Some(d) => {
+            matches!(d.source.as_str(), "worker_failure" | "turn_timeout")
+                || d.source == crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL
+        }
         None => !cursor
             .denial_reason
             .as_deref()
@@ -16815,6 +16820,40 @@ mod request_changes_tests {
             );
             assert_eq!(amended.len(), 1, "{tag}: {amended:?}");
         }
+        // A deliver that RAN and refused (`deliver_refusal`) is a command failure: it re-runs
+        // itself (core#803), the creator is untouched.
+        let run_id = format!("rc-deliver-refused-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let tool = units.iter_mut().find(|u| u.ord == 5).unwrap();
+        tool.tool_cmd = Some(vec!["deliver.sh".to_string()]);
+        tool.status = UnitStatus::Rejected;
+        tool.last_attempt = Some(0);
+        tool.denial_reason = Some("deliver refused on unit 5: gh: 403".into());
+        tool.denial = Some(crate::domain::UnitDenial::new(
+            crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
+            "deliver refused on unit 5: gh: 403",
+        ));
+        put_node(&mut store, tool.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges { note: None },
+        )
+        .unwrap();
+        let amended: Vec<u32> = drain(&erx)
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::UnitReworkAmended { ord, .. } => Some(*ord),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(amended, vec![5], "a refused deliver retries itself");
     }
 
     /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused
