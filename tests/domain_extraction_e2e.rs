@@ -433,6 +433,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch domain-extraction");
 }

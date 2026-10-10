@@ -107,6 +107,7 @@ fn launch(core: &Core, id: &str, sid: &str) -> anyhow::Result<String> {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
 }
 

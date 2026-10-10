@@ -121,6 +121,7 @@ fn spec(sid: &str) -> LaunchSpec {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     }
 }
 

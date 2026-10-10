@@ -160,6 +160,7 @@ fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     }
 }
 

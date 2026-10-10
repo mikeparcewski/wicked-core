@@ -138,6 +138,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch");
 

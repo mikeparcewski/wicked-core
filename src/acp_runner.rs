@@ -14650,6 +14650,7 @@ No further next steps — both questions fully answered.";
             status: crate::domain::UnitStatus::Pending,
             catalog: None,
             exclude_seats: Vec::new(),
+            assurance: None,
         }
     }
 

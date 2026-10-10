@@ -244,6 +244,11 @@ pub struct AgentSession {
     /// without it serializes byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_root: Option<String>,
+    /// (core#850) The run's assurance contract — what it requires and whether the launch opted
+    /// into `reduced` assurance ([`crate::assurance::RunAssurance`]). `#[serde(default)]`: a session
+    /// persisted before this field reads back `full` with the default requirements (fail-closed).
+    #[serde(default)]
+    pub assurance: crate::assurance::RunAssurance,
 }
 
 /// (EP-K3) A launch's `exclude_seats` as the session keeps it: trimmed, empties dropped, first-seen
@@ -1116,6 +1121,10 @@ pub struct WorkUnit {
     /// never grants a second automatic round. Skipped on the wire while zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub floor_auto_retries: u32,
+    /// (core#850) The receipt of this unit's last gate — what assured (or did not assure) it, as
+    /// `gateEvaluated.assurance` carried it. Persisted so a delivery receipt aggregates the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance: Option<crate::assurance::AssuranceReceipt>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -1317,6 +1326,7 @@ impl WorkUnit {
             structured_description: false,
             status: UnitStatus::Pending,
             exclude_seats: Vec::new(),
+            assurance: None,
         }
     }
 
@@ -1768,6 +1778,7 @@ mod tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         }
     }
 

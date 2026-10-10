@@ -131,6 +131,7 @@ mod tests {
             structured_description: false,
             catalog: None,
             exclude_seats: Vec::new(),
+            assurance: None,
         }
     }
 

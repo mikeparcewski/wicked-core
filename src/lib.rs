@@ -17,6 +17,7 @@ mod acp_runner;
 mod actor;
 mod applications;
 pub mod assumptions;
+mod assurance;
 mod builtin_floors;
 mod bus;
 mod campaign;
@@ -346,6 +347,11 @@ pub struct LaunchSpec {
     /// the launch. The roster is re-ordered so the pick is first: every `owner:"pa"` unit of a
     /// team run lands on it (`distribute::teamed_distribution`).
     pub primary: Option<String>,
+    /// (core#850, EX-01/EX-02) The EXPLICIT opt-in to reduced assurance: the run may evaluate on
+    /// its creator's seat and pass a pinned gate whose judge had no distinct seat — both disclosed
+    /// on every receipt (`mode: "reduced"`). `false` (the default; an absent wire field) refuses a
+    /// creator-seat evaluator at distribution and holds a gate whose required judge was skipped.
+    pub reduced_assurance: bool,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):

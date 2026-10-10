@@ -1033,6 +1033,12 @@ pub struct WorkflowDef {
     /// this field serialize back byte-identical (the shipped mirrors don't gain `null`s).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_skill_ref: Option<String>,
+    /// (core#850) The instruments a run of this workflow REQUIRES — tokens of
+    /// [`crate::assurance::INSTRUMENTS`] (`distinct_evaluator`, `judge`, `qe_acceptance`). Absent ⇒
+    /// [`crate::assurance::DEFAULT_REQUIRED`]; declared ⇒ exactly the list. An unknown or repeated
+    /// token refuses the def at load. Absent stays absent on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_instruments: Option<Vec<String>>,
 }
 
 /// The engine-config default for [`WorkflowDef::base_skill_ref`] (core#468): the frontmatter
@@ -1504,6 +1510,7 @@ pub fn feature_def() -> WorkflowDef {
                 .gate(GateType::Execution, GateSpec::Auto)
                 .after("test"),
         ],
+        required_instruments: None,
     }
 }
 
@@ -1548,6 +1555,7 @@ pub fn bug_def() -> WorkflowDef {
                 .evidence_floor()
                 .after("fix"),
         ],
+        required_instruments: None,
     }
 }
 
@@ -1594,6 +1602,7 @@ pub fn migration_def() -> WorkflowDef {
                 .after("cutover"),
             PhaseDef::new("cleanup", StageKind::Build).after("verify"),
         ],
+        required_instruments: None,
     }
 }
 
@@ -1622,6 +1631,7 @@ mod workflow_def_tests {
                     cmd: vec!["definitely-not-a-real-binary-xyzzy".to_string()],
                 }),
             ],
+            required_instruments: None,
         };
         let err = preflight_tool_phases(&def).unwrap_err().to_string();
         assert!(err.contains("cannot start"), "loud refusal, got: {err}");
@@ -1638,6 +1648,7 @@ mod workflow_def_tests {
             base_skill_ref: None,
             id: "agenty".to_string(),
             phases: vec![PhaseDef::new("explore", StageKind::Recon)],
+            required_instruments: None,
         };
         assert!(preflight_tool_phases(&agent_only).is_ok());
 
@@ -1654,6 +1665,7 @@ mod workflow_def_tests {
                     cmd: vec![file.to_string_lossy().into_owned()],
                 }),
             ],
+            required_instruments: None,
         };
         assert!(preflight_tool_phases(&def).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1745,6 +1757,7 @@ mod workflow_def_tests {
                 PhaseDef::new("a", StageKind::Build).after("b"),
                 PhaseDef::new("b", StageKind::Build).after("a"),
             ],
+            required_instruments: None,
         };
         assert!(matches!(
             bad.validate(),
@@ -1762,6 +1775,7 @@ mod workflow_def_tests {
                 PhaseDef::new("a", StageKind::Build).after("b"),
                 PhaseDef::new("b", StageKind::Build),
             ],
+            required_instruments: None,
         };
         assert!(matches!(
             forward.validate(),
@@ -1772,6 +1786,7 @@ mod workflow_def_tests {
             base_skill_ref: None,
             id: "self".to_string(),
             phases: vec![PhaseDef::new("a", StageKind::Build).after("a")],
+            required_instruments: None,
         };
         assert!(matches!(
             selfdep.validate(),
@@ -1791,6 +1806,7 @@ mod workflow_def_tests {
                     .skill("wicked-testing-execution", &["wicked-testing-authoring"]),
                 PhaseDef::new("review", StageKind::Review).after("build"),
             ],
+            required_instruments: None,
         };
         let units = crate::plan::plan_from_def(&def, "do it", "s");
         assert_eq!(
@@ -1821,6 +1837,7 @@ mod workflow_def_tests {
                     ..PhaseDef::new("b", StageKind::Build)
                 },
             ],
+            required_instruments: None,
         };
         assert_eq!(dup.validate(), Ok(()));
     }
@@ -1831,6 +1848,7 @@ mod workflow_def_tests {
             base_skill_ref: None,
             id: "dangling".to_string(),
             phases: vec![PhaseDef::new("a", StageKind::Build).after("ghost")],
+            required_instruments: None,
         };
         assert!(matches!(
             bad.validate(),
@@ -2087,6 +2105,7 @@ mod workflow_def_tests {
                 phases: vec![PhaseDef::new("build", StageKind::Build)
                     .codes()
                     .role(PhaseRole::Creator)],
+                required_instruments: None,
             })
             .expect_err("refused");
         assert_eq!(
@@ -2382,6 +2401,7 @@ mod workflow_def_tests {
                     .role(PhaseRole::Creator)
                     .after("triage"),
             ],
+            required_instruments: None,
         };
         assert_eq!(
             ungated_code_phases(&ungated),
@@ -2415,6 +2435,7 @@ mod workflow_def_tests {
             base_skill_ref: None,
             id: id.to_string(),
             phases: vec![fix],
+            required_instruments: None,
         };
         let own_pin = PhaseDef {
             validator_pin: Some("authors-own-pin".to_string()),
@@ -2516,6 +2537,7 @@ mod workflow_def_tests {
                         .verified()
                         .after("work"),
                 ],
+                required_instruments: None,
             })
             .expect_err("a flagged, unpinned phase is refused");
         assert_eq!(
@@ -2551,6 +2573,7 @@ mod workflow_def_tests {
                         .after("work")
                 },
             ],
+            required_instruments: None,
         })
         .unwrap();
         let def = reg.get("declares").unwrap();
@@ -2655,6 +2678,7 @@ mod workflow_def_tests {
                     .evidence_floor()
                     .after("work"),
             ],
+            required_instruments: None,
         };
         let mut reg = WorkflowRegistry::default();
         reg.register(pinned("wf")).unwrap();
@@ -2695,6 +2719,7 @@ mod workflow_def_tests {
                     .evidence_floor(),
                 PhaseDef::new("check", StageKind::Test).after("work"),
             ],
+            required_instruments: None,
         })
         .unwrap();
         assert_eq!(pin_of(&reg, "wf-unverified", "check"), None);

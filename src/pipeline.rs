@@ -472,6 +472,7 @@ pub(crate) fn pre_distribute(
         team_plan: None,
         exclude_seats,
         evidence_root,
+        assurance: Default::default(),
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the

@@ -102,6 +102,7 @@ fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     }
 }
 

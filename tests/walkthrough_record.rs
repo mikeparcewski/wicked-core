@@ -179,6 +179,7 @@ fn run(name: &str, mode: Option<&str>) -> Run {
         exclude_seats: Vec::new(),
         evidence_root: Some(evidence.to_string_lossy().into_owned()),
         primary: None,
+        reduced_assurance: false,
     })
     .expect("the walkthrough plan launches");
     let mut events = Vec::new();

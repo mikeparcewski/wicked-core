@@ -1255,6 +1255,7 @@ pub(crate) fn run(
                     // Legacy path is no team path: it names no PA (ASK-K1a). A chosen seat is
                     // refused below with the plan it would have led, never silently dropped.
                     primary,
+                    reduced_assurance,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1579,6 +1580,7 @@ pub(crate) fn run(
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
                         // (WT-C2) Validated with the write roots above; in the launch record.
                         evidence_root: spec.evidence_root.clone(),
+                        assurance: Default::default(),
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -13203,6 +13205,7 @@ mod gate_pause_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -13524,6 +13527,7 @@ mod terminal_gate_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -13673,6 +13677,7 @@ retry the deliver phase";
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -14309,6 +14314,7 @@ mod substance_gate_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -15715,6 +15721,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -15793,6 +15800,7 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -17438,6 +17446,7 @@ mod code_evidence_floor_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -17810,6 +17819,7 @@ mod deliverable_floor_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -18335,6 +18345,7 @@ mod seat_failover_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -19114,6 +19125,7 @@ mod def_gate_disclosure_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -19224,6 +19236,7 @@ mod def_gate_disclosure_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -19323,6 +19336,7 @@ mod def_gate_disclosure_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -19645,6 +19659,7 @@ mod terminal_worktree_reap_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -20148,6 +20163,7 @@ mod terminal_worktree_reap_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -20323,6 +20339,7 @@ mod worker_code_graph_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         }
     }
 
@@ -20650,6 +20667,7 @@ mod project_graph_binding_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         }
     }
 
@@ -21401,6 +21419,7 @@ mod phase_boundary_governance_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -21864,6 +21883,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -22647,6 +22667,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -22710,6 +22731,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -22791,6 +22813,7 @@ mod turn_timeout_vs_cancel_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -23685,6 +23708,7 @@ mod dead_seat_park_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -23826,6 +23850,7 @@ mod plan_gate_confirm_tests {
             }),
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("r:understand", "r", 1, "understand the problem");
@@ -24069,6 +24094,7 @@ mod catalog_alias_governance_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("r:{phase_id}"), "r", 1, "a unit");
@@ -24192,6 +24218,7 @@ mod consent_plan_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut plan = WorkUnit::pending(format!("{run_id}:install-plan"), run_id, 1, "plan");

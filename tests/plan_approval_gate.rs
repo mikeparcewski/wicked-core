@@ -245,7 +245,8 @@ fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> Laun
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
-        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+        reduced_assurance: false,
     }
 }
 

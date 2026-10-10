@@ -173,6 +173,7 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch");
 
@@ -257,6 +258,7 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch");
 

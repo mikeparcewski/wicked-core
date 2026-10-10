@@ -113,6 +113,7 @@ fn run_with(name: &str, exclude_seats: Vec<String>) -> Vec<Vec<String>> {
             exclude_seats,
             evidence_root: None,
             primary: None,
+            reduced_assurance: false,
         })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -181,6 +182,7 @@ fn the_straight_through_path_refuses_an_exclusion_instead_of_dropping_it() {
         exclude_seats: vec!["codex".into()],
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     });
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

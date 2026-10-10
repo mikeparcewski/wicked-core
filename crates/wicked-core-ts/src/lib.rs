@@ -808,6 +808,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         exclude_seats: o.exclude_seats.unwrap_or_default(),
         evidence_root: o.evidence_root,
         primary: o.primary,
+        reduced_assurance: false,
     })
 }
 
