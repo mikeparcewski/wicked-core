@@ -3268,7 +3268,7 @@ impl FloorCheckout {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let exec = m.permissions().mode() & 0o111 != 0;
+                        let exec = m.permissions().mode() & 0o100 != 0; // git keys on the OWNER execute bit
                         if exec != (mode == "100755") {
                             changed.push(rel(path));
                             continue;
