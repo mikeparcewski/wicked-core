@@ -239,11 +239,14 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
-- **core-ts 0.8.3** — 2026-10-10 — npm release on main tip 2bb370a, carrying #869. **#869
+- **core-ts 0.8.3** — 2026-10-10 — npm release (tag on 774994b, main after #873), carrying #869 and
+  #873. **#869
   (wicked-crew#944)**: the sessions-detail fold (`list_projects`, behind every `GET /runs` and
   `GET /runs/:id`) reads the work units once and groups them per session
   (`domain::units_by_session`) instead of re-parsing every unit once per session, so a run read is
   linear in the store, not O(sessions x units), and no longer starves `/health` on a long-lived home.
+  **#873**: the wicked-estate crates move from 0.24.0 to 0.26.0 (the estate pin the engine and the
+  binding build against).
 - **core-ts 0.8.2** — 2026-10-10 — npm release on main tip 4deb15d, carrying #864 and #866.
   **#864 (X-MIG M1, core#649)**: `bug` is a built-in preset (triage → `understand`, reproduce →
   `test_plan`, fix → `build` with the retired-behaviour sweep instructions, verify → `test`;
