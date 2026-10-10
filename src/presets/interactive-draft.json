@@ -1,0 +1,11 @@
+{
+ "steps": [
+  {
+   "catalog": "produce",
+   "id": "draft",
+   "instructions": "PLAN, then WRITE — in this one phase. First read the brief (and any source files/folders named in the task, expanding ~) and state a short outline in your reply: the sections in order, the key points each carries, and the format the requested style implies (web = rich scrollable page; ppt = fixed landscape slides; brochure = landscape print pages; doc = minimal content-first prose). Then write the COMPLETE first-draft HTML document to the absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish and end your reply with the absolute path you wrote. Contract: a full self-contained HTML document (inline CSS, no external network resources, no build step); honor the requested style/format and the page budget in the task; keep every fact grounded in the brief/sources and cite it — never fabricate a figure, a URL or an audit row, and label every mock visibly; leave NO placeholder copy in the document (say what is missing in your reply instead); do NOT add data-wid attributes anywhere (the wicked-interactive service instruments its own anchors); keep the markup semantic and well-formed (balanced tags) so the instrumentation pass lands cleanly.",
+   "gate_type": "execution",
+   "skill_ref": "wicked-garden-draft"
+  }
+ ]
+}

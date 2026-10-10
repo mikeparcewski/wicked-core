@@ -4,9 +4,7 @@ Read by `tests/catalog_compose.rs`.
 
 - `crew-defs.json`: today's defs for the §11.2 consumers that only crew defines. They were dumped
   from crew `main` at `4870c87` by evaluating crew's own exports, with no hand transcription:
-  `withDraftSkill(<def>, true)` for `interactive-chat`, `interactive-draft` and `interactive-edit`
-  (the form crew registers when garden holds the draft skill), and `deliverPrPhase([], ...)` for `deliver` (the phase
-  `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
+  `deliverPrPhase([], ...)` for `deliver` (the phase `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
   engine sees a def. The consumers core owns are not here: the test reads them live from
   `WorkflowRegistry::with_defaults()` overlaid with `workflows/*.json`.
 - `mappings.json`: for each of the 13 remaining §11.2 consumers, `steps` (the plan that maps today's phases
@@ -20,8 +18,11 @@ Read by `tests/catalog_compose.rs`.
   serialized with every field spelled), `qe-author-tests` (M10, crew's def, unchanged since the
   dump), `capture-learnings` (M7, crew's def as of crew `842f099`, current instructions and
   `requires_capture_report` on capture) and `steering-author` (M8, crew's def as of crew
-  `842f099`, with the #789 reply-is-the-proposal instruction). They keep pinning the built-in
-  presets that replaced them.
+  `842f099`, with the #789 reply-is-the-proposal instruction) and `interactive-chat`,
+  `interactive-draft` and `interactive-edit` (M9, crew's defs as of crew `fb1bca7`, where the draft
+  is one plan-then-write phase: `withDraftSkill(<def>, true)`, the form crew registered when garden
+  held the draft skill). They keep pinning the built-in presets
+  that replaced them.
   `survey-repo`, `memories`, `domain-graph-slice` and `collab` were deleted outright with no preset
   (operator decision, 2026-09-26), so they have no fixture and no mapping.
 
