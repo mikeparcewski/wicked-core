@@ -617,6 +617,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "capture-learnings",
             "chat",
             "demo",
+            "domain-extraction",
             "feature",
             "migration",
             "onboarding",
