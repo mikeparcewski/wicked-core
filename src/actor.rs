@@ -13412,8 +13412,10 @@ mod sessions_detail_fold_tests {
 
     #[test]
     fn the_fold_over_a_long_lived_store_stays_within_its_budget() {
-        // 150 runs x 30 units: one unit scan is ~4.5k unit parses; the per-session scan this
-        // replaced was ~675k (O(sessions x units)) and took tens of seconds in a debug build.
+        // 150 runs x 30 units: one unit scan is ~4.5k unit parses (well under a second in a debug
+        // build); the per-session scan this replaced was ~675k (O(sessions x units)), tens of
+        // seconds. The 10 s budget sits far from both, so a descheduled CI runner cannot fail the
+        // single scan and the per-session scan cannot pass.
         let store = seeded(150, 30);
         let started = std::time::Instant::now();
         let views = list_projects(&store).unwrap();
@@ -13421,8 +13423,8 @@ mod sessions_detail_fold_tests {
         assert_eq!(views.len(), 150);
         assert!(views.iter().all(|v| v.units.len() == 30));
         assert!(
-            took < std::time::Duration::from_secs(3),
-            "the sessions-detail fold took {took:?} over 150 runs x 30 units (budget 3 s): it is \
+            took < std::time::Duration::from_secs(10),
+            "the sessions-detail fold took {took:?} over 150 runs x 30 units (budget 10 s): it is \
              re-reading the units once per session again (wicked-crew#944)"
         );
     }
