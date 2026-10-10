@@ -149,7 +149,14 @@ fn the_run_diff_and_history_come_from_the_repository() {
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")
             .hardened()
-            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
             .current_dir(&dir)
             .output()
@@ -273,7 +280,14 @@ impl Repo {
     fn git(&self, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .hardened()
-            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
             .current_dir(&self.dir)
             .output()

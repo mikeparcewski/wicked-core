@@ -1166,7 +1166,10 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
     // does not remove is new.
     let (mut deps_added, mut deps_removed) = (BTreeSet::new(), BTreeSet::new());
     let (mut pub_added, mut pub_removed) = (BTreeSet::new(), BTreeSet::new());
-    let mut section = None::<String>;
+    // The object/section a line sits in, and an open multi-line export group, PER SIDE (codex r2):
+    // a context line moves both sides, a `-` line the base side, a `+` line the head side.
+    let (mut section_old, mut section_new) = (None::<String>, None::<String>);
+    let (mut group_old, mut group_new) = (None::<String>, None::<String>);
     let source_ext = code
         .last()
         .and_then(|p| p.rsplit('/').next())
@@ -1176,7 +1179,8 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         if let Some(h) = line.strip_prefix("@@") {
             // A hunk shows only its own lines: what section it sits in is unknown until it says
             // (codex r1 on the QE PR — a `[package]` in one hunk must not cover the next).
-            section = None;
+            (section_old, section_new) = (None, None);
+            (group_old, group_new) = (None, None);
             // `@@ -a[,b] +c[,d] @@`: `a` is the first base-side line (0 for a new file).
             old_next = h
                 .trim_start()
@@ -1193,25 +1197,34 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         s.lines_removed += u32::from(removed);
         let body = line.get(1..).unwrap_or("");
         if let Some(m) = manifest {
-            if let Some(key) = dependency_key(m, body, &mut section) {
-                if added {
+            if added || context {
+                if let Some(key) = dependency_key(m, body, &mut section_new).filter(|_| added) {
                     deps_added.insert(key);
-                } else if removed {
+                }
+            }
+            if removed || context {
+                if let Some(key) = dependency_key(m, body, &mut section_old).filter(|_| removed) {
                     deps_removed.insert(key);
                 }
             }
+        }
+        if behavioural && k == Kind::Code && context {
+            public_decls(source_ext.as_deref(), body, &mut group_new);
+            public_decls(source_ext.as_deref(), body, &mut group_old);
         }
         if behavioural && (added || removed) {
             s.behavioural_lines += 1;
             if matches!(k, Kind::Code | Kind::Test) {
                 s.branch_lines += u32::from(is_branch_line(body));
                 if k == Kind::Code {
-                    if let Some(name) = public_decl(source_ext.as_deref(), body) {
-                        if added {
-                            pub_added.insert(name);
-                        } else {
-                            pub_removed.insert(name);
-                        }
+                    if added {
+                        pub_added.extend(public_decls(source_ext.as_deref(), body, &mut group_new));
+                    } else {
+                        pub_removed.extend(public_decls(
+                            source_ext.as_deref(),
+                            body,
+                            &mut group_old,
+                        ));
                     }
                 }
             }
@@ -1403,6 +1416,46 @@ fn is_branch_line(line: &str) -> bool {
             l.contains(tok)
         }
     })
+}
+
+/// The public symbols a code line declares, with a multi-line re-export group tracked in `group`
+/// (codex r2): `pub use inner::{` … `};` (Rust) and `export {` … `}` (JS/TS) open a group whose
+/// member lines name symbols without repeating `pub`/`export`. A member is keyed with its group's
+/// head, so adding one to an existing group is new and moving one between groups is not hidden.
+fn public_decls(ext: Option<&str>, line: &str, group: &mut Option<String>) -> Vec<String> {
+    let t = line.trim();
+    if let Some(head) = group.clone() {
+        let (members, closes) = match t.find('}') {
+            Some(i) => (&t[..i], true),
+            None => (t, false),
+        };
+        if closes {
+            *group = None;
+        }
+        return members
+            .split(',')
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty() && !m.starts_with("//"))
+            .map(|m| format!("{head}{m}"))
+            .collect();
+    }
+    let opens = |prefix: &str| t.starts_with(prefix) && t.ends_with('{');
+    let head = match ext {
+        Some("rs") if opens("pub use ") => {
+            Some(format!("use {}", &t["pub use ".len()..t.len() - 1]))
+        }
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts")
+            if opens("export {") || opens("export type {") =>
+        {
+            Some("export ".to_string())
+        }
+        _ => None,
+    };
+    if let Some(h) = head {
+        *group = Some(h);
+        return Vec::new();
+    }
+    public_decl(ext, line).into_iter().collect()
 }
 
 /// The public or exported symbol a code line declares, by language: Rust `pub` items and fields

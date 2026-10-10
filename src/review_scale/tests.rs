@@ -1886,3 +1886,46 @@ fn re_exports_are_new_public_symbols() {
     let ts = signals_from_diff(&file_diff("src/index.ts", "@@ -1 +1,3 @@\n import x from './x';\n+export { a, b } from './ab';\n+export * from './all';\n"));
     assert_eq!(ts.new_public_symbols.len(), 2, "{ts:?}");
 }
+
+/// codex r2: a member added inside an existing multi-line re-export group is a new public symbol,
+/// though its line repeats neither `pub` nor `export`.
+#[test]
+fn a_member_added_to_a_multi_line_export_group_is_new() {
+    let rs_ = signals_from_diff(&file_diff(
+        "src/lib.rs",
+        "@@ -1,4 +1,5 @@\n pub use inner::{\n     A,\n+    B,\n };\n fn x() {}\n",
+    ));
+    assert_eq!(
+        rs_.new_public_symbols,
+        BTreeSet::from(["use inner::B".to_string()]),
+        "{rs_:?}"
+    );
+    let ts = signals_from_diff(&file_diff(
+        "src/index.ts",
+        "@@ -1,3 +1,4 @@\n export {\n   a,\n+  b,\n } from './ab';\n",
+    ));
+    assert_eq!(
+        ts.new_public_symbols,
+        BTreeSet::from(["export b".to_string()]),
+        "{ts:?}"
+    );
+    // Re-ordering a member within the group is not new.
+    let moved = signals_from_diff(&file_diff(
+        "src/lib.rs",
+        "@@ -1,4 +1,4 @@\n pub use inner::{\n-    A,\n     B,\n+    A,\n };\n",
+    ));
+    assert!(moved.new_public_symbols.is_empty(), "{moved:?}");
+}
+
+/// codex r2: the two sides of a hunk keep their own object state — a removed `"scripts": {` must
+/// not make the added dependency lines below it read as scripts.
+#[test]
+fn each_side_of_a_hunk_keeps_its_own_object() {
+    let hunk = "@@ -3,6 +3,4 @@\n   \"dependencies\": {\n-  },\n-  \"scripts\": {\n-    \"build\": \"tsc\"\n+    \"b\": \"^1\"\n   }\n";
+    let d = signals_from_diff(&file_diff("package.json", hunk));
+    assert_eq!(
+        d.new_dependencies,
+        BTreeSet::from(["b".to_string()]),
+        "{d:?}"
+    );
+}
