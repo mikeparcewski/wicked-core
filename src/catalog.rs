@@ -152,15 +152,16 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
 /// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2),
-/// `capture-learnings` (M7), `steering-author` (M8), `qe-author-tests` (M10) and `demo` (M9b,
-/// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them).
-/// Every other consumer's preset is added by its migration seam (§14 M1–M10), which also deletes
-/// the def it replaces.
+/// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `qe-author-tests`
+/// (M10) and `demo` (M9b, which replaces `interactive-demo` and `interactive-demo-reauthor` rather
+/// than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
+/// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
         ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
         ("demo", demo_preset()),
+        ("domain-extraction", domain_extraction_preset()),
         ("feature", feature_preset()),
         ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
@@ -496,6 +497,64 @@ fn steering_author_preset() -> Vec<PlanStep> {
     ]
 }
 
+/// `domain-extraction` (M6): §11.2's row. survey, analyze → `understand` (no gate type);
+/// extract → `produce` (the bold cell: kind recon → build); coverage → `domain_coverage`, which
+/// carries `COVERAGE_VALIDATOR_PIN` as data (the step restates it, a no-op), with `executes_code`
+/// raised and its report as the deliverable; domain-graph → `run`, the Tool step that builds the
+/// requirements graph, behind a `human_confirm` gate. The skills are the domain family's.
+fn domain_extraction_preset() -> Vec<PlanStep> {
+    use crate::workflow::CODE_GRAPH_DB_TOKEN;
+    let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
+        catalog: catalog.to_string(),
+        id: id.to_string(),
+        depends_on: after.map(|a| vec![a.to_string()]),
+        ..PlanStep::default()
+    };
+    vec![
+        PlanStep {
+            gate_type: Some(None),
+            skill_ref: Some("wicked-garden-domain".to_string()),
+            ..step("understand", "survey", None)
+        },
+        PlanStep {
+            gate_type: Some(None),
+            skill_ref: Some("wicked-garden-domain".to_string()),
+            ..step("understand", "analyze", Some("survey"))
+        },
+        PlanStep {
+            skill_ref: Some("wicked-garden-domain-extractor".to_string()),
+            ..step("produce", "extract", Some("analyze"))
+        },
+        PlanStep {
+            executes_code: Some(true),
+            required_deliverables: Some(vec!["coverage-report.json".to_string()]),
+            skill_ref: Some("wicked-garden-domain-coverage".to_string()),
+            validator_pin: Some(Some(COVERAGE_VALIDATOR_PIN.to_string())),
+            ..step("domain_coverage", "coverage", Some("extract"))
+        },
+        PlanStep {
+            kind: Some(StageKind::Build),
+            gate_type: Some(Some(GateType::Strategy)),
+            gate: Some(GateSpec::HumanConfirm {
+                unconditional: false,
+            }),
+            executor: Some(PhaseExecutor::Tool {
+                cmd: [
+                    "wicked-core",
+                    "domain-graph",
+                    "--db",
+                    CODE_GRAPH_DB_TOKEN,
+                    "--out",
+                    "requirements_graph.json",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+            }),
+            ..step("run", "domain-graph", Some("coverage"))
+        },
+    ]
+}
+
 fn build_catalog() -> Vec<PhaseDef> {
     use GateType::{Execution, Strategy, Value};
     use PhaseRole::{Creator, Evaluator, Neutral};
@@ -795,6 +854,44 @@ mod tests {
             other => panic!("verify is a Tool step, got {other:?}"),
         }
         assert_eq!(by("review").role, PhaseRole::Evaluator);
+    }
+
+    /// M6: the built-in `domain-extraction` composes to the def the shipped JSON describes (the C1
+    /// mapping pins every field; this names the ones the run depends on). coverage carries the
+    /// coverage validator's pin from its catalog entry, so no installed copy can drift
+    /// (FINDING-080); extract is a `produce` creator; domain-graph is the Tool step behind a human
+    /// gate, with the code graph placeholder the planner binds per run.
+    #[test]
+    fn domain_extraction_composes_with_its_coverage_pin_and_graph_tool() {
+        let def = composed("domain-extraction");
+        let by = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
+        let coverage = by("coverage");
+        assert_eq!(
+            coverage.validator_pin.as_deref(),
+            Some(COVERAGE_VALIDATOR_PIN)
+        );
+        assert!(coverage.executes_code && coverage.verified_evidence);
+        assert_eq!(coverage.required_deliverables, ["coverage-report.json"]);
+        let extract = by("extract");
+        assert_eq!(
+            (extract.kind, extract.role),
+            (StageKind::Build, PhaseRole::Creator)
+        );
+        let graph = by("domain-graph");
+        match &graph.executor {
+            PhaseExecutor::Tool { cmd } => {
+                assert!(cmd
+                    .iter()
+                    .any(|a| a == crate::workflow::CODE_GRAPH_DB_TOKEN))
+            }
+            other => panic!("domain-graph is a Tool step, got {other:?}"),
+        }
+        assert_eq!(
+            graph.gate,
+            GateSpec::HumanConfirm {
+                unconditional: false
+            }
+        );
     }
 
     /// M3/M4: `chat` (read-only) and `onboarding` (tool-only) have no creator step, so the PA does

@@ -46,11 +46,14 @@ use wicked_core::{
 #[path = "support/skills_snapshot_fixture.rs"]
 mod skills_fixture;
 
-/// The three skills the shipped `domain-extraction` workflow names (`workflows/domain-extraction.json`).
+/// The skills the `domain-extraction` preset's plan names: the three domain skills, plus the security
+/// reviewer's, because the plan the rig approves (an un-teamed scope, 100) is floor-filled with
+/// `security_review` (DES-TEAMING-002 M6), and the Tool step's admission judges the whole plan.
 const DOMAIN_EXTRACTION_SKILLS: &[&str] = &[
     "wicked-garden-domain",
     "wicked-garden-domain-extractor",
     "wicked-garden-domain-coverage",
+    "wicked-garden-qe-security-test-engineer",
 ];
 
 /// The fixture generation `setup` published once for this process — the value
@@ -157,7 +160,9 @@ fn is_terminal(s: SessionStatus) -> bool {
 /// on an idle host and only ever spends time on a run that is genuinely stuck. An 8s bound was
 /// reachable by scheduling noise alone — on a host under load these tests failed roughly one run in
 /// three, on unmodified `main`, which is a test reporting a defect that isn't there (FINDING-028).
-const RUN_DEADLINE: Duration = Duration::from_secs(60);
+/// (M6) 180s: the preset's plan is PA-scoped and floor-filled, about eleven units where the drop-in
+/// def had five, and a loaded host was measured at ~10s per unit.
+const RUN_DEADLINE: Duration = Duration::from_secs(180);
 
 /// Waits for `run_id` to reach `want`. `Err` says which way it went wrong — a timeout and a run that
 /// terminated in the wrong status are different defects and must not read the same in the output.
@@ -177,7 +182,18 @@ fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> Result<(), Str
                         v.session.status
                     ));
                 }
-                last = Some(v.session.status);
+                let units: Vec<String> = v
+                    .units
+                    .iter()
+                    .map(|u| {
+                        format!(
+                            "{}={:?}",
+                            u.id.rsplit(':').next().unwrap_or_default(),
+                            u.status
+                        )
+                    })
+                    .collect();
+                last = Some((v.session.status, units));
             }
         }
         std::thread::sleep(Duration::from_millis(15));
@@ -186,7 +202,10 @@ fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> Result<(), Str
         "run {run_id} did not reach {want:?} within {}s — it was still {} when the wait gave up, so \
          this is a timeout, not a wrong outcome",
         RUN_DEADLINE.as_secs(),
-        last.map_or_else(|| "absent from sessions_detail".to_string(), |s| format!("{s:?}"))
+        last.map_or_else(
+            || "absent from sessions_detail".to_string(),
+            |(s, units)| format!("{s:?} (units: {})", units.join(", "))
+        )
     ))
 }
 
@@ -253,14 +272,15 @@ fn db_in(name: &str) -> String {
     dir.join("estate.db").to_str().unwrap().to_string()
 }
 
-/// The domain-extraction runner: keys on the unit's ORD. Units 1-3 emit benign output; the coverage
-/// phase (ord 4) shells the REAL `wicked-core coverage` (recompute FROM the seeded store → the pinned
-/// coverage validator greps `coverage-report.json` in the worktree); the domain-graph phase (ord 5)
-/// shells the REAL `wicked-core domain-graph` → writes `requirements_graph.json`. `out_override` lets a
-/// test inject a policy-tripping output for a specific ord.
+/// The domain-extraction runner: keys on the unit's PHASE id (DES-TEAMING-002 M6: the preset's plan
+/// is PA-scoped and floor-filled, so ords move). Every other phase emits benign output; `coverage`
+/// shells the REAL `wicked-core coverage` (recompute FROM the seeded store → the pinned coverage
+/// validator greps `coverage-report.json` in the worktree); `domain-graph` shells the REAL
+/// `wicked-core domain-graph` → writes `requirements_graph.json`. `out_override` lets a test inject a
+/// policy-tripping output for one phase.
 struct DomainExtractionRunner {
     db: String,
-    out_override: Option<(u32, String)>,
+    out_override: Option<(&'static str, String)>,
 }
 impl StepRunner for DomainExtractionRunner {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
@@ -280,11 +300,18 @@ impl StepRunner for DomainExtractionRunner {
                 governed: false,
             };
         }
-        let ord = i.unit.ord;
+        let phase = i.unit.id.rsplit(':').next().unwrap_or_default();
         let workdir = i.workdir.clone();
-        let mut output = format!("unit-{ord} done");
-        if let Some((o, ref text)) = self.out_override {
-            if o == ord {
+        let mut output = format!("{phase} done");
+        if phase == "pa-scope" {
+            // The PA's answer. This rig has no bus (an UN-TEAMED run), so a declared scope is never
+            // diff-corrected and fails closed at 100: the plan pauses for approval (X1 r2 M1).
+            output.push_str(
+                "\nSCOPE {\"touch\":[\"coverage-report.json\",\"requirements_graph.json\"]}",
+            );
+        }
+        if let Some((p, ref text)) = self.out_override {
+            if p == phase {
                 output = text.clone();
             }
         }
@@ -306,13 +333,13 @@ impl StepRunner for DomainExtractionRunner {
                 ),
                 Err(e) => eprintln!("e2e runner: `{label}` failed to spawn: {e}"),
             };
-            if ord == 4 {
+            if phase == "coverage" {
                 let out = wd.join("coverage-report.json");
                 shell(
                     &["coverage", "--db", &self.db, "--out", out.to_str().unwrap()],
                     "coverage",
                 );
-            } else if ord == 5 {
+            } else if phase == "domain-graph" {
                 let out = wd.join("requirements_graph.json");
                 shell(
                     &[
@@ -418,7 +445,8 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         base_ref: None,
         project_id: None,
         problem: "extract the domain model".into(),
-        clis: vec![cli("a")],
+        // Two seats: a team run never grades on its creator seat (§11.3 "Evaluator seat").
+        clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
         session_id: run_id.into(),
         human_confirm: HumanConfirm::None,
@@ -441,6 +469,36 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
 
 /// Derive the run's worktree from the repo root `setup` returns (not by re-deriving the temp-path
 /// scheme — so a change to the repo naming can't silently break this).
+/// (M6) The preset run's first pause is its plan-approval gate: a creator plan the PA scopes, which
+/// on this un-teamed rig scores 100 (high risk) and pauses even in auto mode. Approve it so the
+/// domain-extraction steps run.
+fn approve_plan(core: &Core, run_id: &str) {
+    wait_status(core, run_id, SessionStatus::AwaitingHuman)
+        .expect("the PA-scoped plan pauses for approval (high risk on an un-teamed repo run)");
+    core.confirm_gate(
+        run_id,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve the plan");
+    // The approve is applied on the actor; wait until the run has left the gate.
+    let deadline = Instant::now() + RUN_DEADLINE;
+    while Instant::now() < deadline {
+        let left = core
+            .sessions_detail()
+            .ok()
+            .and_then(|vs| vs.into_iter().find(|v| v.session.id == run_id))
+            .is_some_and(|v| v.session.status != SessionStatus::AwaitingHuman);
+        if left {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    panic!("run {run_id} stayed at the plan gate after the approve");
+}
+
 fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
     // crew#276: run worktrees live under the non-dotted root now.
     repo_root.join("wicked-worktrees").join(run_id)
@@ -461,6 +519,7 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
     );
     let events = core.subscribe();
     launch(&core, "run-happy", &repo_id);
+    approve_plan(&core, "run-happy");
 
     // The domain-graph phase carries a human-confirm gate → the run parks awaiting a human.
     wait_status(&core, "run-happy", SessionStatus::AwaitingHuman)
@@ -508,31 +567,33 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
 #[test]
 fn a_policy_violation_denies_a_phase_and_halts_the_run() {
     let db = db_in("deny");
-    // Trip a deny on the extractor phase (ord 3 → phase `unit-3`) via a token in its output.
+    // Trip a deny on the extractor phase (`extract`) via a token in its output.
     let (core, repo_id, dbp, repo) = setup(
         "deny",
         DomainExtractionRunner {
             db,
-            out_override: Some((3, "emitting LEAKTOKEN in the output".into())),
+            out_override: Some(("extract", "emitting LEAKTOKEN in the output".into())),
         },
         true,
     );
     {
         let mut store = open_store(Some(&dbp)).unwrap();
-        register_policy(&mut store, &deny_policy("unit-3", "LEAKTOKEN")).unwrap();
+        register_policy(&mut store, &deny_policy("extract", "LEAKTOKEN")).unwrap();
     }
     launch(&core, "run-deny", &repo_id);
+    approve_plan(&core, "run-deny");
 
     wait_status(&core, "run-deny", SessionStatus::AwaitingHuman)
         .expect("a policy violation in the extractor phase's output denies it → the run pauses at the escalation gate (core#464)");
-    // Attribute the failure to the EXTRACTOR phase (ord 3 / unit_ix 2) specifically — not an unrelated
-    // gate — so the test proves the policy-over-output deny, not just "some failure".
+    // Attribute the failure to the EXTRACTOR phase specifically — not an unrelated gate — so the test
+    // proves the policy-over-output deny, not just "some failure".
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "run-deny").unwrap();
+    let extract = v.units.iter().find(|u| u.id == "run-deny:extract").unwrap();
     assert_eq!(
-        v.units[2].status,
+        extract.status,
         UnitStatus::Rejected,
-        "the extractor phase (ord 3) is the denied unit"
+        "the extractor phase is the denied unit"
     );
     let wt = worktree(&repo, "run-deny");
     assert!(
@@ -576,6 +637,7 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
     }
     let events = core.subscribe();
     launch(&core, "run-recall", &repo_id);
+    approve_plan(&core, "run-recall");
     wait_status(&core, "run-recall", SessionStatus::AwaitingHuman)
         .expect("the run reaches the domain-graph gate");
     // core#396: admitted against the fixture generation, and only it (see TEST 1).
@@ -640,8 +702,9 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
         false, // a BARE function → an unaccounted hole → coverage < 1.0
     );
     launch(&core, "run-hole", &repo_id);
+    approve_plan(&core, "run-hole");
 
-    // Poll until the coverage phase (ord 4 / unit_ix 3) is REJECTED — the deterministic coverage
+    // Poll until the coverage phase is REJECTED — the deterministic coverage
     // validator denied the sub-1.0 report. A not-pass verdict on the `human_confirm_if verdict_not_pass`
     // coverage gate escalates rather than hard-failing, so assert on the UNIT, not the session status.
     let deadline = Instant::now() + RUN_DEADLINE;
@@ -650,11 +713,12 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
     while Instant::now() < deadline {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == "run-hole") {
-                if v.units.get(3).map(|u| u.status) == Some(UnitStatus::Rejected) {
+                let coverage = v.units.iter().find(|u| u.id == "run-hole:coverage");
+                if coverage.map(|u| u.status) == Some(UnitStatus::Rejected) {
                     rejected = true;
                     break;
                 }
-                last = Some((v.session.status, v.units.get(3).map(|u| u.status)));
+                last = Some((v.session.status, coverage.map(|u| u.status)));
             }
         }
         std::thread::sleep(Duration::from_millis(15));

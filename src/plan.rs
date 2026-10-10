@@ -479,15 +479,28 @@ impl PlanSteps {
     }
 }
 
-/// (core#846) A step that executes code, judged on the phase it composes to: its entry executes
-/// code or the step raises `executes_code`. The predicate [`floor_types`] and [`floor_fill`]'s
-/// security-review refusal share: a plan with no such step is a NON-CODE plan.
-fn executes_code_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
-    step.executes_code == Some(true)
-        || catalog
-            .iter()
-            .find(|e| e.id == step.catalog)
-            .is_some_and(|e| e.executes_code)
+/// A step that does CODE WORK, judged on the phase it composes to: its entry executes code or the
+/// step raises `executes_code` — except an evaluator whose evidence its OWN validator re-derives: a
+/// `verified_evidence` entry pinned to something other than the diff floor (domain-extraction's
+/// `domain_coverage`, which runs code only to write the report its coverage validator reads).
+/// Counting it inserted a `build` creator into every domain-extraction plan (DES-TEAMING-002 M6).
+/// Any other evaluator raised to `executes_code` (a `test` that writes) still counts: its write
+/// posture is not narrowed. The ONE predicate [`floor_types`] and [`floor_fill`]'s security-review
+/// refusal (core#846) share: a plan with no such step is a NON-CODE plan.
+fn code_work_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
+    let self_verifying = |e: &crate::workflow::PhaseDef| {
+        e.role == crate::workflow::PhaseRole::Evaluator
+            && e.verified_evidence
+            && e.validator_pin
+                .as_deref()
+                .is_some_and(|p| p != crate::builtin_floors::EVIDENCE_FLOOR_PIN)
+    };
+    catalog
+        .iter()
+        .find(|e| e.id == step.catalog)
+        .is_some_and(|e| {
+            !self_verifying(e) && (step.executes_code == Some(true) || e.executes_code)
+        })
 }
 
 /// (§8.5, T3 round 10) A step that CHANGES something, judged on the phase it COMPOSES to — never
@@ -1337,11 +1350,12 @@ pub struct FloorFilled {
 }
 
 /// The floor phase types a plan owes for a band's `phases` (§8.5): empty for a plan with no creator
-/// step; on a non-code run (no step executes code) `produce` fills the build slot and `critique`
-/// the review slot, and the band's `security_review` is left out — that entry carries the DIFF
-/// evidence floor, which a run that writes no code can never satisfy, so its denial gate's
-/// approve-means-retry loops forever (core#649, X-MIG M6); a held testing rule naming
-/// `step:security_review` still adds it through obligations; `deliver` only for a run that
+/// step; on a non-code run (no step does code work, see [`code_work_step`]: a self-verifying
+/// evaluator that runs code does not count) `produce` fills the build slot and `critique` the review
+/// slot, and the band's `security_review` is left out — that entry carries the DIFF evidence floor,
+/// which a run that writes no code can never satisfy, so its denial gate's approve-means-retry
+/// loops forever (core#649, X-MIG M6); nor may a rule or an author add it there (core#846,
+/// [`floor_fill`] refuses `security_review_on_non_code_plan`); `deliver` only for a run that
 /// delivers. The one rule [`floor_fill`] and [`worst_case_floor_additions`] share.
 fn floor_types(
     catalog: &[crate::workflow::PhaseDef],
@@ -1352,7 +1366,7 @@ fn floor_types(
     if !plan.has_creator_in(catalog) {
         return Vec::new();
     }
-    let code_run = plan.steps.iter().any(|s| executes_code_step(catalog, s));
+    let code_run = plan.steps.iter().any(|s| code_work_step(catalog, s));
     phases
         .iter()
         .filter(|p| **p != "deliver" || delivers)
@@ -1535,7 +1549,7 @@ pub fn floor_fill(
     // one composition boundary every author passes (the launch, a re-score or ratchet revision,
     // the PA's PLAN+, a human edit): its diff evidence floor cannot pass on a run that writes no
     // code. The band floor never adds it there (`floor_types`); a held rule or an author can.
-    if !steps.iter().any(|s| executes_code_step(catalog, s)) {
+    if !steps.iter().any(|s| code_work_step(catalog, s)) {
         if let Some(s) = steps.iter().find(|s| s.catalog == "security_review") {
             return Err(PlanRefusal::SecurityReviewOnNonCodePlan {
                 step: s.id.clone(),
@@ -3314,6 +3328,45 @@ mod tests {
             let code = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
             let f = fill(&code, 100, &AUTO, None).unwrap();
             assert!(f.floor.iter().any(|t| t == "security_review"));
+        }
+
+        /// (M6) A self-verifying evaluator that executes code does not make the run code work:
+        /// domain-extraction's coverage judge runs code to write the report its own validator reads,
+        /// and its plan already has its creator (`produce`). No `build` creator is inserted. A `test`
+        /// evaluator raised to `executes_code` still does (codex review on M6: its writes are not
+        /// narrowed).
+        #[test]
+        fn t2_a_code_running_evaluator_does_not_make_a_code_run() {
+            let p = plan(json!({"steps": [
+                {"catalog": "produce", "id": "extract"},
+                {"catalog": "domain_coverage", "id": "coverage", "executes_code": true}
+            ]}));
+            for score in [0, 30, 100] {
+                let f = fill(&p, score, &AUTO, None).unwrap();
+                assert!(
+                    !f.floor.iter().any(|t| t == "build"),
+                    "{score}: {:?}",
+                    f.floor
+                );
+                assert!(
+                    f.floor.iter().any(|t| t == "produce"),
+                    "{score}: {:?}",
+                    f.floor
+                );
+            }
+            let code = plan(json!({"steps": [{"catalog": "build", "id": "b"}]}));
+            assert!(fill(&code, 0, &AUTO, None)
+                .unwrap()
+                .floor
+                .iter()
+                .any(|t| t == "build"));
+            let writing_test = plan(json!({"steps": [
+                {"catalog": "produce", "id": "p"},
+                {"catalog": "test", "id": "t", "executes_code": true}
+            ]}));
+            let f = fill(&writing_test, 30, &AUTO, None).unwrap();
+            assert!(f.floor.iter().any(|t| t == "build"), "{:?}", f.floor);
+            assert!(f.floor.iter().any(|t| t == "review"), "{:?}", f.floor);
         }
 
         /// A floor-added step whose natural id is taken gets a distinct one.
