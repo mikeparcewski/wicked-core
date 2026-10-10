@@ -1443,6 +1443,33 @@ pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<
     Ok(units)
 }
 
+/// Every [`WorkUnit`] on the store grouped by its session, each group ordered by `ord` — ONE scan
+/// of the unit nodes. A whole-store read (the sessions-detail fold behind every run read) builds
+/// on this, never on [`session_units`] per session: that re-reads and re-parses EVERY unit for
+/// EACH session, O(sessions × units), which on a long-lived store (~120 runs) cost ~3 s per read
+/// and held the actor the whole time (wicked-crew#944).
+pub fn units_by_session(
+    store: &dyn GraphRead,
+) -> anyhow::Result<std::collections::HashMap<String, Vec<WorkUnit>>> {
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(WORK_UNIT.to_string())],
+        ..Default::default()
+    };
+    let mut groups: std::collections::HashMap<String, Vec<WorkUnit>> =
+        std::collections::HashMap::new();
+    for unit in store
+        .find_symbols(&query)?
+        .iter()
+        .filter_map(|n| WorkUnit::from_node(n).ok())
+    {
+        groups.entry(unit.session_id.clone()).or_default().push(unit);
+    }
+    for units in groups.values_mut() {
+        units.sort_by_key(|u| u.ord);
+    }
+    Ok(groups)
+}
+
 /// Every session on the store (unordered).
 pub fn all_sessions(store: &dyn GraphRead) -> anyhow::Result<Vec<AgentSession>> {
     let query = SymbolQuery {

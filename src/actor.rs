@@ -13313,12 +13313,111 @@ fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
 
 /// Read every session + its ordered units (the UI's project list).
 fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionView>> {
-    let mut views = Vec::new();
-    for session in crate::domain::all_sessions(store)? {
-        let units = crate::domain::session_units(store, &session.id)?;
-        views.push(crate::SessionView { session, units });
+    // One unit scan for the whole fold (wicked-crew#944): a per-session `session_units` here
+    // re-parsed every unit on the store once per session.
+    let mut units = crate::domain::units_by_session(store)?;
+    Ok(crate::domain::all_sessions(store)?
+        .into_iter()
+        .map(|session| {
+            let units = units.remove(&session.id).unwrap_or_default();
+            crate::SessionView { session, units }
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod sessions_detail_fold_tests {
+    //! wicked-crew#944: the sessions-detail fold behind every run read (`GET /runs`, `GET
+    //! /runs/:id`) must scan the unit nodes ONCE, not once per session.
+    use super::list_projects;
+    use crate::domain::{put_nodes, AgentSession, HumanConfirm, SessionStatus, WorkUnit};
+    use crate::scope::EntityMode;
+    use wicked_apps_core::{open_store, ToNode};
+
+    fn session(id: &str) -> AgentSession {
+        AgentSession {
+            intent_amendments: Vec::new(),
+            id: id.into(),
+            workflow_id: format!("wf-{id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::All,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: Default::default(),
+        }
     }
-    Ok(views)
+
+    /// A store of `sessions` runs × `units` units each, written interleaved (unit k of every run,
+    /// then unit k+1) so no run's units sit contiguously, each unit carrying ~1 KB of text.
+    fn seeded(sessions: usize, units: usize) -> wicked_apps_core::SqliteStore {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let ids: Vec<String> = (0..sessions).map(|i| format!("run-{i:04}")).collect();
+        let mut nodes: Vec<_> = ids.iter().map(|id| session(id).to_node()).collect();
+        let body = "lorem ipsum dolor sit amet ".repeat(40);
+        for ord in (1..=units as u32).rev() {
+            for id in &ids {
+                nodes.push(WorkUnit::pending(format!("{id}:u{ord}"), id, ord, &body).to_node());
+            }
+        }
+        put_nodes(&mut store, &nodes).unwrap();
+        store
+    }
+
+    #[test]
+    fn each_session_gets_exactly_its_units_in_ord_order_and_a_unitless_session_gets_none() {
+        let mut store = seeded(3, 4);
+        put_nodes(&mut store, &[session("run-empty").to_node()]).unwrap();
+        let mut views = list_projects(&store).unwrap();
+        views.sort_by(|a, b| a.session.id.cmp(&b.session.id));
+        assert_eq!(views.len(), 4);
+        for v in &views[..3] {
+            let got: Vec<(String, u32)> =
+                v.units.iter().map(|u| (u.session_id.clone(), u.ord)).collect();
+            let want: Vec<(String, u32)> = (1..=4).map(|o| (v.session.id.clone(), o)).collect();
+            assert_eq!(got, want, "{}", v.session.id);
+        }
+        assert_eq!(views[3].session.id, "run-empty");
+        assert!(views[3].units.is_empty());
+    }
+
+    #[test]
+    fn the_fold_over_a_long_lived_store_stays_within_its_budget() {
+        // 150 runs x 30 units: one unit scan is ~4.5k unit parses; the per-session scan this
+        // replaced was ~675k (O(sessions x units)) and took tens of seconds in a debug build.
+        let store = seeded(150, 30);
+        let started = std::time::Instant::now();
+        let views = list_projects(&store).unwrap();
+        let took = started.elapsed();
+        assert_eq!(views.len(), 150);
+        assert!(views.iter().all(|v| v.units.len() == 30));
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "the sessions-detail fold took {took:?} over 150 runs x 30 units (budget 3 s): it is \
+             re-reading the units once per session again (wicked-crew#944)"
+        );
+    }
 }
 
 #[cfg(test)]
