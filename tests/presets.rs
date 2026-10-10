@@ -620,7 +620,8 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "feature",
             "migration",
             "onboarding",
-            "qe-author-tests"
+            "qe-author-tests",
+            "steering-author"
         ]
     );
     // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
@@ -879,6 +880,64 @@ fn m7_capture_learnings_launches_the_preset_with_its_capture_report_floor() {
             .as_deref()
             .is_some_and(|t| t.contains("wicked-capture-report")),
         "capture's instruction mandates the report marker the floor reads"
+    );
+}
+
+/// M8 (DES-TEAMING-002 §14): a launch naming `steering-author` runs the built-in preset. propose
+/// is now a `produce` creator (the bold cell: kind recon → build) and keeps its UNCONDITIONAL human
+/// gate, the TH-12 propose-as-gate crew lands the approved rules on (crew#388), from the `propose`
+/// unit's reply (#789). As a creator plan with no declared scope, the PA scopes it first and floor
+/// fill applies (§11.3).
+#[test]
+fn m8_steering_author_launches_the_preset_with_its_propose_gate() {
+    let dir = tmp_dir("steering");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core
+        .launch_run(spec("rsa", "steering-author", None))
+        .unwrap();
+    let units = units_of(&rig.core, "rsa");
+    let hcu = r#"{"human_confirm":{"unconditional":true}}"#;
+    assert_eq!(
+        rows("rsa", &units),
+        vec![
+            r("pa-scope", "recon", "neutral", "auto", None),
+            r("analyze", "recon", "neutral", "auto", None),
+            r("test_plan", "test", "neutral", "auto", None),
+            r("design", "recon", "neutral", "auto", None),
+            r("architecture", "recon", "neutral", "auto", None),
+            r("propose", "build", "creator", hcu, None),
+            r("critique", "review", "evaluator", "auto", None),
+        ]
+    );
+    let propose = units
+        .iter()
+        .find(|u| u.id == "rsa:propose")
+        .expect("propose is planned under its own id: crew's landing finds it by id");
+    assert_eq!(
+        row("rsa", propose),
+        r("propose", "build", "creator", hcu, None)
+    );
+    assert!(!propose.executes_code, "the run writes nothing to the tree");
+    // (core#649 option A) Its one creator writes nothing, so its PA may scope it
+    // `SCOPE {"touch":[]}` (0); this rig's PA answers nothing, so it floors at 100 as a non-code
+    // run (no diff-floored `security_review`, #847).
+    let steps = wicked_core::builtin_presets()
+        .into_iter()
+        .find(|(n, _)| *n == "steering-author")
+        .unwrap()
+        .1;
+    assert!(wicked_core::PlanSteps {
+        steps,
+        ..Default::default()
+    }
+    .writes_nothing());
+    assert!(
+        propose
+            .instructions
+            .as_deref()
+            .is_some_and(|t| t.contains("```json") && t.contains("Do not write it to any file")),
+        "the reply is the proposal (#789)"
     );
 }
 

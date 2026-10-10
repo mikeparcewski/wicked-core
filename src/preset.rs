@@ -392,7 +392,8 @@ mod tests {
                 "feature",
                 "migration",
                 "onboarding",
-                "qe-author-tests"
+                "qe-author-tests",
+                "steering-author"
             ]
         );
         assert!(seed_builtins(&mut store, 20).unwrap().is_empty());
@@ -421,7 +422,8 @@ mod tests {
                 "feature",
                 "migration",
                 "onboarding",
-                "qe-author-tests"
+                "qe-author-tests",
+                "steering-author"
             ]
         );
         let f = resolve(&store, None, "feature").unwrap().unwrap();
@@ -450,7 +452,8 @@ mod tests {
                 "feature",
                 "migration",
                 "onboarding",
-                "qe-author-tests"
+                "qe-author-tests",
+                "steering-author"
             ]
         );
         assert_eq!(resolve(&store, None, "chat").unwrap(), Some(saved.clone()));
@@ -575,6 +578,7 @@ mod tests {
                 ("migration".to_string(), GLOBAL_SCOPE.to_string()),
                 ("onboarding".to_string(), GLOBAL_SCOPE.to_string()),
                 ("qe-author-tests".to_string(), GLOBAL_SCOPE.to_string()),
+                ("steering-author".to_string(), GLOBAL_SCOPE.to_string()),
             ]
         );
     }
