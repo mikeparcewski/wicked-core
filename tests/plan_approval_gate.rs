@@ -1282,6 +1282,33 @@ fn a_delivering_mcp_server_launch_puts_deliver_before_the_install_dry_run() {
     assert_eq!(ids.iter().filter(|i| *i == "deliver").count(), 1);
 }
 
+/// (X3) A delivering `editor-plugin` launch places deliver the same way: before its consent chain
+/// (deliver → install-plan → install), so the pull request exists when the install's consent card asks.
+#[test]
+fn a_delivering_editor_plugin_launch_puts_deliver_before_the_install_dry_run() {
+    let dir = tmp_dir("dlvedit");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let mut s = spec("rdedit", HumanConfirm::None, None);
+    s.workflow = Some("editor-plugin".into());
+    s.deliver_step = Some(deliver_step());
+    rig.core.launch_run(s).unwrap();
+    rig.tap
+        .until("the plan_approval pause and its gate.opened", |s| {
+            paused_on_plan(s, "rdedit").is_some() && !of_type(s, "rdedit", OPENED).is_empty()
+        });
+    let ids = unit_ids(&rig.core, "rdedit");
+    let at = |id: &str| {
+        ids.iter()
+            .position(|i| i == id)
+            .unwrap_or_else(|| panic!("{id} in {ids:?}"))
+    };
+    assert!(at("security-review") < at("deliver"), "{ids:?}");
+    assert!(at("deliver") + 1 == at("install-plan"), "{ids:?}");
+    assert!(at("install-plan") + 1 == at("install"), "{ids:?}");
+    assert_eq!(ids.iter().filter(|i| *i == "deliver").count(), 1);
+}
+
 /// A DELIVERING preset launch (crew's `deliver: "pr"`): the launcher's deliver step rides the
 /// preset's plan — appended last, in the floor (§8.5: `deliver` for a run that delivers) — so the
 /// run stays ONE team plan behind the plan_approval gate instead of a separately composed def.
