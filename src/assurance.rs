@@ -107,8 +107,9 @@ pub fn validate_required(declared: &[String]) -> Result<(), String> {
 pub struct SkippedInstrument {
     pub instrument: String,
     pub reason: String,
-    /// The engine's own words, when it has them (the judge-skip reason, the floor note).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The engine's own words, when it has them (the judge-skip reason, the floor note); `null`
+    /// otherwise.
+    #[serde(default)]
     pub detail: Option<String>,
 }
 

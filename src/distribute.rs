@@ -2510,6 +2510,44 @@ mod tests {
         );
     }
 
+    /// core#850 (EX-01): an ordinary run whose contract enforces `distinct_evaluator` — every run
+    /// not launched `reduced` — refuses the bench-free creator-seat fallback with `NoEligibleSeat`,
+    /// naming the units and the instance that would satisfy them; a second instance satisfies it,
+    /// and a reduced run keeps the disclosed fallback (D1 (e) above).
+    #[test]
+    fn ex01_a_full_assurance_run_refuses_the_creator_seat_fallback() {
+        let err = distribute_seated(
+            &build_and_review(),
+            &[seat("claude")],
+            "r1",
+            None,
+            &[],
+            false,
+        )
+        .expect_err("a full-assurance run is refused");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .expect("NoEligibleSeat");
+        assert!(
+            refusal.benched.contains("this run")
+                && refusal.benched.contains("distinct_evaluator")
+                && refusal.benched.contains("reduced assurance")
+                && refusal.benched.contains("claude#2"),
+            "{}",
+            refusal.benched
+        );
+        let dists = distribute_seated(
+            &build_and_review(),
+            &[seat("claude"), seat("claude#2")],
+            "r1",
+            None,
+            &[],
+            false,
+        )
+        .expect("a second instance satisfies it");
+        assert_eq!(dists[1].assigned_cli, "claude#2");
+    }
+
     /// D1 (f): a bench-caused shortfall on a team run is refused exactly as today (the bench
     /// message, the bench as data).
     #[test]

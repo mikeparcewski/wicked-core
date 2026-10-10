@@ -1618,6 +1618,7 @@ pub(crate) fn run(
                                 EntityMode::Shared => "shared".to_string(),
                                 EntityMode::Isolated => "isolated".to_string(),
                             },
+                            assurance: stub.assurance.clone(),
                         },
                     );
                     in_flight.insert(run_id.clone());

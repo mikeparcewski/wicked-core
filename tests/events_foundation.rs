@@ -169,6 +169,7 @@ fn session_started_for<'a>(events: &'a [CoreEvent], session: &str) -> Vec<Sessio
                 cli_count,
                 governed,
                 entity_mode,
+                ..
             } = e
             {
                 if s == session {
