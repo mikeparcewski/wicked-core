@@ -744,9 +744,11 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
 }
 
 /// The step a delivering run's `deliver` goes before (see [`with_deliver`]): the plan's final
-/// `consent_before` step's dry run — its one dependency, when that is the `run` step right before
-/// it — else the consent step itself; `None` for a plan that asks no consent, or whose consent is
-/// not its last step.
+/// step, when it is a Tool `run` gated `consent_before`, or its dry run — its one dependency, when
+/// that is the `run` step right before it. `None` otherwise (no consent, a consent that is not the
+/// last step, or a consent-gated agent step). A revision that later adds work after the install
+/// cannot depend on it through the hoisted chain and is refused (a forward dependency), never
+/// delivered without it.
 fn consent_anchor(steps: &[PlanStep]) -> Option<usize> {
     let consent = steps
         .iter()
@@ -754,7 +756,9 @@ fn consent_anchor(steps: &[PlanStep]) -> Option<usize> {
     // Only a TERMINAL consent chain (codex r1 on #866): the consent step is the plan's last, and
     // its dry run directly precedes it. Work after the chain must reach the pull request, so a
     // plan that goes on past its consent keeps the deliver step last.
-    if consent + 1 != steps.len() {
+    // …and an external-install TOOL suffix (codex r2): a creator or other agent step gated
+    // `consent_before` changes the tree, so the deliver step stays after it.
+    if consent + 1 != steps.len() || steps[consent].catalog != "run" {
         return None;
     }
     let dry_run = match steps[consent].depends_on.as_deref() {
@@ -1734,6 +1738,24 @@ mod tests {
                 "deliver"
             ]
         );
+    }
+
+    #[test]
+    fn m12_a_consent_gated_creator_keeps_deliver_last() {
+        // codex r2 on #866: only a Tool `run` suffix is hoisted past; a consent-gated build
+        // changes the tree, so the pull request comes after it.
+        let mut build2 = ws("build-2", "build", &["review"]);
+        build2.gate = Some(crate::workflow::GateSpec::ConsentBefore);
+        let plan = PlanSteps {
+            steps: vec![
+                ws("build", "build", &[]),
+                ws("review", "review", &["build"]),
+                build2,
+            ],
+            ..Default::default()
+        };
+        let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
+        assert_eq!(out.steps.last().unwrap().id, "deliver");
     }
     use crate::review_scale::Graph;
     use crate::team::events::{TeamBody, PATH_SCORED, PLAN_ACCEPTED, PLAN_PROPOSED};
