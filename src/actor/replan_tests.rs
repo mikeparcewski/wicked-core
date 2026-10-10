@@ -303,6 +303,7 @@ fn launch_on(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps, seats: &[&st
             primary: seats.first().map(|k| k.to_string()), // (ASK-K1a) the PA is the roster's first,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .expect("launch");
 }
@@ -1623,6 +1624,7 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
             primary: Some("a".into()), // (ASK-K1a) the test reads the PA as `a`,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .unwrap();
     let scored = settled(&e, "rrepo", tev::PATH_SCORED, 1);

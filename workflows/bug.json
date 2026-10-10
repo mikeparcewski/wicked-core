@@ -78,5 +78,10 @@
         "type": "agent"
       }
     }
+  ],
+  "required_instruments": [
+    "distinct_evaluator",
+    "judge",
+    "qe_acceptance"
   ]
 }

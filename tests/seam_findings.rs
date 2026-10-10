@@ -241,6 +241,7 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     });
 
     assert!(
@@ -293,6 +294,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch the bug-shaped workflow");
 
@@ -362,6 +364,7 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch the bug-shaped workflow");
     assert!(
@@ -445,6 +448,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch");
 
@@ -568,6 +572,7 @@ fn a_triage_fail_rejection_persists_the_full_failure_transcript() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch");
 

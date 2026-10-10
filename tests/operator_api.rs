@@ -387,6 +387,7 @@ mod tests {
             primary: None,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .expect("launch_run must not fail");
 

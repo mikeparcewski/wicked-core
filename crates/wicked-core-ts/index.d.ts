@@ -152,6 +152,19 @@ export interface LaunchOptions {
    * neither a plan nor a preset, and on a plan with no creator step.
    */
   deliverables?: Array<string>
+  /**
+   * (QE acceptance, operator ruling 2026-10-10) SKIP a required QE acceptance, for this reason
+   * (non-empty): persisted on the contract (`sessionStarted.assurance.qe`, `status: "skipped"`,
+   * `basis: "operator"`) and labelled on every receipt ("QE acceptance skipped by operator:
+   * <reason>"). Omit and a required QE acceptance is never skipped. Refused beside
+   * `forceQeAcceptance`, and on a run whose workflow does not require QE acceptance.
+   */
+  skipQeAcceptanceReason?: string
+  /**
+   * (QE acceptance) REQUIRE QE acceptance whatever the run's impact score says (no waiver).
+   * Refused beside `skipQeAcceptanceReason`, and on a run whose workflow does not require it.
+   */
+  forceQeAcceptance?: boolean
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -1140,6 +1153,14 @@ export declare class Subscription {
  * `error` | `not_applicable`; the delivery receipt aggregates every gate of the run. A gate whose required judge was
  * skipped now denies under `judge_unavailable`; an evaluator pass that errored denies under
  * `denial.source === 'evaluator_error'`.
+ * QE acceptance (additive, operator ruling 2026-10-10): a run whose contract requires
+ * `qe_acceptance` carries its decision as `assurance.qe: {status: 'required' | 'waived' |
+ * 'skipped', basis: 'plan' | 'operator' | 'diff', score: number | null, threshold, reason,
+ * reasons: string[], ord: number | null, tree: string | null}` on sessionStarted and on every
+ * gateEvaluated / deliverLiftEvaluated receipt; a waived or skipped one is also a `skipped[]`
+ * entry (reason `qe_waived_by_score` | `qe_skipped_by_operator`, detail = the words). New event
+ * `qeAcceptanceDecided` {session, ord, qe}: the run's QE unit scored its diff (waived only when
+ * every dimension is in its lowest band, score <= threshold), or a creator after a waiver revoked it.
  */
 export interface CoreEventJson {
   type: string

@@ -724,7 +724,13 @@ pub(crate) fn delivery_receipt(
         for i in &g.ran {
             r.ran(i);
         }
-        for k in &g.skipped {
+        // (QE acceptance) The run's CURRENT decision speaks for the delivery (`for_run` above):
+        // a gate cut while a later-revoked waiver stood must not carry it here.
+        for k in g
+            .skipped
+            .iter()
+            .filter(|k| k.instrument != crate::assurance::QE_ACCEPTANCE)
+        {
             r.skip(&k.instrument, &k.reason, k.detail.clone());
         }
     }

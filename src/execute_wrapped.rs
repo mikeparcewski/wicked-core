@@ -4748,6 +4748,9 @@ fn tokenize(s: &str) -> Vec<String> {
 /// The directive is CLI-AWARE (core#396): `form` picks the spelling the running CLI resolves, and
 /// `skills` (the admitted snapshot, when one is in hand) resolves the skill's identity from its
 /// index rather than from a naming convention — see [`plugin_skill_invocation`].
+/// (QE acceptance) The garden skill whose `accept` action is the three-agent acceptance pipeline.
+pub(crate) const QE_SKILL: &str = "wicked-garden-qe";
+
 pub(crate) fn skill_prompt(
     unit: &WorkUnit,
     layout: Option<&str>,
@@ -4805,7 +4808,19 @@ pub(crate) fn skill_prompt(
     let layout = layout
         .map(|l| format!("{LAYOUT_PREFIX}{l}"))
         .unwrap_or_default();
-    let mut prompt = format!("{lead}{layout}{}", crate::assumptions::PROMPT_CONVENTION);
+    // (QE acceptance) The run's QE unit says whether to run garden's acceptance pipeline, in the
+    // seat's own spelling of the QE skill; every other unit carries nothing here.
+    let qe = unit
+        .qe_acceptance
+        .as_ref()
+        .map(|q| {
+            crate::qe_acceptance::directive(q, &plugin_skill_invocation(QE_SKILL, form, skills))
+        })
+        .unwrap_or_default();
+    let mut prompt = format!(
+        "{lead}{qe}{layout}{}",
+        crate::assumptions::PROMPT_CONVENTION
+    );
     // L1↔L4 contract (des-adjudicated §4.1): an Evaluator work unit's prompt ends with the one
     // VERDICT line L1's fold parses — on every `SkillForm`, both carriers (`unit_prompt` is the one
     // composer). NOT a `tool_cmd` unit (a scripted step emits no verdict) and NOT engine-internal
@@ -13305,6 +13320,7 @@ mod project_graph_end_to_end_tests {
             primary: None,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         };
 
         // 1. BOUND.

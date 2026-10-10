@@ -72,6 +72,52 @@ Only `id` is required on a phase — everything else defaults:
 | `id` | *(required)* | The workflow id a launch names (`--workflow <id>`). A drop-in whose `id` matches a built-in replaces it. |
 | `phases` | *(required)* | The ordered phases — see *Phase fields*. |
 | `base_skill_ref` | *(absent)* | The BASE skill every **agent** phase of this workflow follows (core#468): the engine leads every unit prompt with `Invoke your skill "<base>" … and follow its §<role> section` (`creator` \| `evaluator` \| `neutral`, from the phase's `role`) before the phase's own `skill_ref` directive. Absent ⇒ the engine-config default `WICKED_BASE_SKILL_REF` (unset ⇒ no base skill); `""` ⇒ an explicit opt-out for this workflow. Gated at intake: a run whose skills snapshot lacks the skill is refused before any unit is planned. Never narrows seat selection. |
+| `required_instruments` | *(absent)* | The assurance instruments a run REQUIRES (core#850): `distinct_evaluator`, `judge`, `qe_acceptance`. Absent ⇒ the first two. An unknown or repeated token refuses the def. See *QE acceptance* below. |
+
+## QE acceptance (`qe_acceptance`)
+
+Every workflow that makes application changes requires real functional QE acceptance (operator
+ruling 2026-10-10): `feature`, `bug`, `migration` and `mcp-server` declare
+`"required_instruments": ["distinct_evaluator", "judge", "qe_acceptance"]`, and so do the
+`feature` and `migration` built-in presets (`src/catalog.rs` `builtin_preset_instruments`).
+`domain-extraction` makes no application change and does not. QE acceptance is garden's
+three-agent pipeline, `wicked-garden-qe accept` (writer, executor, isolated reviewer); its verdict
+lands in the wicked-ledger stamped with the run (`crew_run_id` from `WICKED_RUN_ID`, which the
+engine sets on every worker). The launcher (wicked-crew) refuses delivery unless the ledger holds a
+PASS attributed to the run.
+
+The run's contract carries the decision (`assurance.qe`): `required`, `waived` or `skipped`.
+
+- **At launch** it is provisional and `required` (`basis: "plan"`): a plan has no diff, so it can
+  only lean toward required.
+- **At the QE phase** (the run's code-verifying unit: `verified_evidence` with an `executes_code`
+  creator before it) the engine scores the run's ACTUAL diff (base commit .. the tree the unit
+  starts on) with the impact scorer (`src/review_scale.rs`) and decides (`basis: "diff"`,
+  `qeAcceptanceDecided`). The unit's prompt says whether to run the pipeline.
+- **Waived** only when every dimension is in its lowest band, which is a final score of **20 or
+  less** with no complexity and no novelty points. 20 is the score a behavioural change earns for
+  reach alone (the first reach tier: 0-5 dependents, one product, no contract, test-gap, critical
+  or destructive term). Docs-only (0) is waivable; anything more is required.
+- **A waiver covers only the tree it scored**: a creator unit dispatched after it revokes it.
+- **Unreadable is required**: no repo, no base commit, no snapshot, a git failure, or a code graph
+  not indexed at the base (fail-closed at 100).
+
+| Dimension | Lowest band (waivable) | Points above it |
+|---|---|---|
+| Reach (blast radius) | 0-5 dependents, 1 product, nothing else | +20/40/60/80 by dependents; span +10/product; contract +20; test gap +20×G; critical +20; destructive floor 70 |
+| Complexity (from the diff) | ≤ 50 changed lines, ≤ 5 branch lines, ≤ 3 changed symbols | +10 from 51 lines, +20 from 201; +10 from 6 branch lines, +20 from 21; +10 from 4 symbols; at most +30 |
+| Novelty | no new or unindexed file, no new dependency, no new public or wire symbol, every touched path with ≥ 3 commits of history | +10 per new or unindexed file (≤ +20); +20 any new dependency (manifest or lockfile add); +10 any new public symbol; +10 any low-history path; at most +40 |
+
+The estate graph exposes no symbol complexity metric, so changed-line and branch-line counts stand
+in for it. Prior memories or rules for the area are not read. A brand-new file that adds a
+dependency is never waivable, whatever its blast radius. An optional model assessment may only
+RAISE the score.
+
+**The operator's explicit word** (`LaunchSpec.qe_acceptance`; core-ts `skipQeAcceptanceReason` /
+`forceQeAcceptance`): a **skip** needs a non-empty reason and is labelled on the run, every gate
+receipt and the delivery ("QE acceptance skipped by operator: <reason>"). A **force** requires QE
+acceptance whatever the score says. Either one on a run that does not require QE acceptance
+refuses the launch. Without a skip, a required QE acceptance is never skipped.
 
 ## Phase fields
 

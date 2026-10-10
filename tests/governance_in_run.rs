@@ -330,6 +330,7 @@ fn a_denied_tool_call_gates_the_session() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .unwrap();
 
@@ -424,6 +425,7 @@ fn a_shell_hostile_session_id_is_rejected_at_launch() {
             primary: None,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         });
         assert!(
             res.is_err(),

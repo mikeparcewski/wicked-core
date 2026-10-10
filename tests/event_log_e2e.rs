@@ -137,6 +137,7 @@ fn spec(session: &str) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

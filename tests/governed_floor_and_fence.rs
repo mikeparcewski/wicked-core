@@ -284,6 +284,7 @@ fn a_changed_tree_gets_the_default_floor_and_judge_an_unchanged_one_is_honestly_
             primary: None,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .expect("launch");
     };
@@ -644,6 +645,7 @@ fn deliver_reverify_runs_the_baseline_diff_floor_against_the_run_base_2e() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch");
     let status = wait_terminal(&core, run_id);

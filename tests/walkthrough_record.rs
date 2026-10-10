@@ -181,6 +181,7 @@ fn run(name: &str, mode: Option<&str>) -> Run {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("the walkthrough plan launches");
     let mut events = Vec::new();

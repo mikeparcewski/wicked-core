@@ -92,6 +92,7 @@ fn spec(session_id: &str, problem: &str, human_confirm: HumanConfirm) -> LaunchS
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

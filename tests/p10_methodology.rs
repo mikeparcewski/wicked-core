@@ -148,6 +148,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         primary: Some("a".into()), // (ASK-K1a) the test reads the PA as `a`,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .unwrap();
     assert!(wait_done(&core, "r"), "the run completes");
@@ -241,6 +242,7 @@ fn a_run_convenes_no_council_and_still_separates_evaluator_from_creator() {
         primary: Some("a".into()), // (ASK-K1a) the test reads the PA as `a`,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .unwrap();
     assert!(wait_done(&core, "teamed"), "the run completes");

@@ -175,6 +175,7 @@ fn spec(session_id: &str, workflow: &str, repo_ref: Option<String>) -> LaunchSpe
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

@@ -420,6 +420,8 @@ pub(crate) fn pre_distribute(
     // (core#850) The launch's explicit reduced-assurance opt-in, recorded on a session this call
     // CREATES; a launch stub's contract is carried forward instead.
     reduced_assurance: bool,
+    // (QE acceptance) The operator's explicit skip or force, applied to the contract.
+    qe_acceptance: &crate::assurance::QeOverride,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     // (core#572) The run's seat pool — what failover and reassignment pick from — is its
@@ -481,7 +483,9 @@ pub(crate) fn pre_distribute(
                 .as_ref()
                 .and_then(|d| d.required_instruments.as_deref()),
             reduced_assurance,
-        ),
+        )
+        .with_qe_override(qe_acceptance)
+        .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?,
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -892,6 +896,8 @@ pub(crate) fn plan_and_distribute(
     evidence_root: Option<String>,
     // (core#850) The launch's reduced-assurance opt-in, forwarded the same way.
     reduced_assurance: bool,
+    // (QE acceptance) The operator's explicit skip or force, applied to the contract.
+    qe_acceptance: &crate::assurance::QeOverride,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -915,6 +921,7 @@ pub(crate) fn plan_and_distribute(
         exclude_seats,
         evidence_root,
         reduced_assurance,
+        qe_acceptance,
     )?;
     let distributions = distribute::distribute_units_on(
         &pre.units,

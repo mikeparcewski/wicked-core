@@ -1050,6 +1050,15 @@ pub enum CoreEvent {
         path: String,
         reason: String,
     },
+    /// (QE acceptance, operator ruling 2026-10-10) The run's QE acceptance decision changed at a
+    /// unit's dispatch: the run's QE unit scored its diff (`basis: "diff"`, `required` or
+    /// `waived` with the score and its reasons), or a creator dispatched after a waiver revoked it.
+    /// The decision is on the session's contract (`assurance.qe`) from this point on.
+    QeAcceptanceDecided {
+        session: String,
+        ord: u32,
+        qe: crate::assurance::QeAcceptance,
+    },
     /// (F-3R2-013, core#431) How the run's BASE commit was chosen when its worktree was minted:
     /// the engine fetches `origin` and, when the registered clone's `HEAD` is behind the remote
     /// default branch's tip (a fast-forward), bases the run on that tip — so the worker starts
@@ -2427,6 +2436,12 @@ impl CoreEvent {
                 "session": session,
                 "path": path,
                 "reason": reason,
+            }),
+            CoreEvent::QeAcceptanceDecided { session, ord, qe } => json!({
+                "type": "qeAcceptanceDecided",
+                "session": session,
+                "ord": ord,
+                "qe": qe,
             }),
             CoreEvent::RunBaseResolved {
                 session,

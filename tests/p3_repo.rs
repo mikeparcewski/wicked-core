@@ -157,6 +157,7 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

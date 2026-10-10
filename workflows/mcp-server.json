@@ -185,5 +185,10 @@
       },
       "instructions": "Install for running — or update the installed copy when this server key is already installed. Nothing has been installed yet: this asks before the install runs, and each answer lists exactly the files it would write (from the install-plan dry run). Install for workers (the default) builds the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, registers it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks) and writes it into the worker homes' CLI MCP configurations — program-owned files only. Also install into my CLIs does the same and also writes it into your own CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret). Both probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Decline for not now — the pull request already delivered stays as it is."
     }
+  ],
+  "required_instruments": [
+    "distinct_evaluator",
+    "judge",
+    "qe_acceptance"
   ]
 }
