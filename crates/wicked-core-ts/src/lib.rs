@@ -3645,7 +3645,9 @@ mod tests {
                 ms: 1,
             },
             "acpProcessRestarted",
-            &["type", "session", "ord", "attempt", "cliKey", "reason", "ms"],
+            &[
+                "type", "session", "ord", "attempt", "cliKey", "reason", "ms",
+            ],
         );
         check(
             CoreEvent::AcpTurnSettled {
