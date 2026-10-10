@@ -2268,13 +2268,26 @@ fn gate_receipt(
     let mut r = a::AssuranceReceipt::for_run(run, attempt);
     r.tree = f.tree;
     let seat = unit.assigned_cli.clone();
-    if unit.role == crate::workflow::PhaseRole::Evaluator {
+    // The evaluator≠creator relation exactly as distribution draws it: a Review/Test agent unit
+    // grades the Build/Recon units before it; the fact is whether its seat is one of theirs.
+    use crate::domain::StageKind;
+    if unit.tool_cmd.is_none() && matches!(unit.stage, StageKind::Review | StageKind::Test) {
         let units = crate::domain::session_units(store, session_id).unwrap_or_default();
-        r.creator =
-            most_recent_prior_creator(&units, unit.ord).and_then(|c| c.assigned_cli.clone());
+        let builders: Vec<&crate::domain::WorkUnit> = units
+            .iter()
+            .filter(|u| {
+                u.ord < unit.ord
+                    && u.tool_cmd.is_none()
+                    && matches!(u.stage, StageKind::Build | StageKind::Recon)
+            })
+            .collect();
+        r.creator = builders
+            .iter()
+            .max_by_key(|u| u.ord)
+            .and_then(|c| c.assigned_cli.clone());
         r.evaluator = seat.clone();
-        match (&r.creator, &seat) {
-            (Some(c), Some(e)) if c == e => {
+        if let Some(e) = &seat {
+            if builders.iter().any(|b| b.assigned_cli.as_ref() == Some(e)) {
                 r.skip(
                     a::DISTINCT_EVALUATOR,
                     if run.reduced() {
@@ -2282,11 +2295,11 @@ fn gate_receipt(
                     } else {
                         a::SKIP_NO_DISTINCT_SEAT
                     },
-                    Some(format!("evaluated on the creator's seat `{e}`")),
+                    Some(format!("evaluated on a seat that built the work, `{e}`")),
                 );
+            } else if !builders.is_empty() {
+                r.ran(a::DISTINCT_EVALUATOR);
             }
-            (Some(_), Some(_)) => r.ran(a::DISTINCT_EVALUATOR),
-            _ => {}
         }
     } else {
         r.creator = seat;
