@@ -239,6 +239,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.8.0** — 2026-10-10 — npm release on main tip 026112f, carrying #860. A **minor**
+  bump on purpose: **#860 (X-MIG M9, core#649)** makes `interactive-chat`, `interactive-draft` and
+  `interactive-edit` built-in presets (repo-less `produce` plans; the PA rates RISK first; every
+  agent step runs `wicked-garden-draft`, always required). A crew that still registers those defs
+  and composes its own deliverable floor (any crew before wicked-crew#938) must not resolve it, so
+  no `^0.7.x` pin does; crew pins `^0.8.0` together with #938.
 - **core-ts 0.7.49** — 2026-10-10 — npm release on main tip 666319b, carrying #861. **#861
   (QE-IN-APP-WORKFLOWS)**: `feature`, `bug`, `migration` and `mcp-server` (defs, JSON mirrors and
   the `feature`/`migration` built-in presets) require `qe_acceptance`. The impact scorer gains a
