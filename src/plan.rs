@@ -533,6 +533,12 @@ pub struct PlanStep {
     /// May be raised to `true`; never lowered on an entry that sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executes_code: Option<bool>,
+    /// The step's output is an acceptance requirement of its run: its evidence is re-verified (by
+    /// its pin) and the acceptance gate reads it (wicked-crew `qe/acceptance.ts`). May be raised to
+    /// `true` on a pinned step; never lowered on an entry that sets it (DES-TEAMING-002 M10: the
+    /// qe-author-tests `verify` Tool step keeps the acceptance declaration crew's def carried).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_evidence: Option<bool>,
     /// (ASK-K1b) The step's wall budget in seconds: may only LOWER the entry's (an entry with no
     /// budget takes any; the carrier's ceiling still applies above it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -615,6 +621,8 @@ pub enum PlanRefusal {
     PinChanged { step: String, catalog: String },
     /// The step sets `executes_code: false` on an entry that sets it.
     ExecutesCodeLowered { step: String, catalog: String },
+    /// The step sets `verified_evidence: false` on an entry that sets it.
+    VerifiedEvidenceLowered { step: String, catalog: String },
     /// The step sets a `kind` other than its entry's on an entry other than `run`.
     KindNotAllowed { step: String, catalog: String },
     /// The step sets an `executor` on an Agent entry.
@@ -683,6 +691,7 @@ impl PlanRefusal {
             PlanRefusal::PinRemoved { .. } => "pin_removed",
             PlanRefusal::PinChanged { .. } => "pin_changed",
             PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
+            PlanRefusal::VerifiedEvidenceLowered { .. } => "verified_evidence_lowered",
             PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
             PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
             PlanRefusal::ToolCommandMissing { .. } => "tool_command_missing",
@@ -748,6 +757,10 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::ExecutesCodeLowered { step, catalog } => write!(
                 f,
                 "{r}: step {step} sets executes_code false on {catalog}, which sets it"
+            ),
+            PlanRefusal::VerifiedEvidenceLowered { step, catalog } => write!(
+                f,
+                "{r}: step {step} sets verified_evidence false on {catalog}, which sets it"
             ),
             PlanRefusal::KindNotAllowed { step, catalog } => write!(
                 f,
@@ -880,6 +893,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("gate", FieldRule::TightenOnly),
     ("validator_pin", FieldRule::SetIfUnset),
     ("executes_code", FieldRule::TightenOnly),
+    ("verified_evidence", FieldRule::TightenOnly),
     ("budget_secs", FieldRule::TightenOnly),
     ("pool", FieldRule::TightenOnly),
     ("required_deliverables", FieldRule::TightenOnly),
@@ -1055,6 +1069,14 @@ fn apply_step(
             return refuse(|step, catalog| PlanRefusal::ExecutesCodeLowered { step, catalog });
         }
         phase.executes_code = code;
+    }
+    // verified_evidence — TightenOnly (false → true). A raised flag needs a pin to re-verify by:
+    // `WorkflowDef::validate` refuses an unpinned verified phase, so compose's validation holds it.
+    if let Some(verified) = step.verified_evidence {
+        if !verified && entry.verified_evidence {
+            return refuse(|step, catalog| PlanRefusal::VerifiedEvidenceLowered { step, catalog });
+        }
+        phase.verified_evidence = verified;
     }
     // budget_secs — TightenOnly: lower the entry's wall budget, never raise it (ASK-K1b).
     if let Some(budget) = step.budget_secs {
