@@ -418,6 +418,9 @@ pub fn builtin() -> Vec<AgenticCli> {
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["copilot".into(), "--version".into()],
+            // (core#366) No grant here: a council ballot runs these flags with no read-only lever
+            // and no MCP pin. A WORKER launch adds `--allow-all-tools` itself
+            // (execute_wrapped `copilot_worker_grant`).
             trust_flags: vec![],
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
