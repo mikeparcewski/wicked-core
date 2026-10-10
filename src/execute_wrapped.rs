@@ -4140,11 +4140,18 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
             i += 2;
             continue;
         }
+        // Attached spellings too (codex r2): `-cKEY=V` / `-c=KEY=V`, `-C<dir>` / `-C=<dir>`,
+        // `-s<mode>`.
+        let attached_c = f
+            .strip_prefix("-c")
+            .filter(|v| !v.is_empty())
+            .map(|v| v.strip_prefix('=').unwrap_or(v));
         if f.starts_with("--sandbox=")
-            || f.starts_with("-s=")
             || f.starts_with("--cd=")
             || f.starts_with("--add-dir=")
             || f.strip_prefix("--config=").is_some_and(sandbox_override)
+            || attached_c.is_some_and(sandbox_override)
+            || (f.len() > 2 && (f.starts_with("-C") || f.starts_with("-s")))
         {
             i += 1;
             continue;
@@ -4181,6 +4188,9 @@ impl NoCodeLaunchContext {
             .collect();
         f.push(self.check_scratch.to_string_lossy().into_owned());
         for kv in [
+            // The writable set is EXACTLY the scratch (the workspace) and the notes root below:
+            // no configured `writable_roots` survives, whatever a config file says.
+            "sandbox_workspace_write.writable_roots=[]",
             "sandbox_workspace_write.exclude_slash_tmp=true",
             "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             "sandbox_workspace_write.network_access=true",
@@ -9508,6 +9518,10 @@ mod tests {
             "-c",
             "sandbox_workspace_write.writable_roots=[\"/repo/tree\"]",
             "--config=sandbox_mode=danger-full-access",
+            "-csandbox_workspace_write.writable_roots=[\"/repo/tree\"]",
+            "-c=sandbox_workspace_write.writable_roots=[\"/repo/tree\"]",
+            "-C/repo/tree",
+            "-sworkspace-write",
             "-c",
             "model=o3",
             "the prompt",
@@ -9516,8 +9530,12 @@ mod tests {
         let joined = argv.join(" ");
         assert!(!joined.contains("/repo/tree"), "{joined}");
         assert!(
-            !joined.contains("danger-full-access") && !joined.contains("writable_roots"),
+            !joined.contains("danger-full-access") && !joined.contains("writable_roots=[\""),
             "{joined}"
+        );
+        assert!(
+            joined.contains("-c sandbox_workspace_write.writable_roots=[]"),
+            "the writable set is pinned: {joined}"
         );
         assert!(
             joined.contains("-c model=o3"),
