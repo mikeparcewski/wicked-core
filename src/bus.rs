@@ -71,7 +71,9 @@ use crate::{HumanConfirm, LaunchSpec};
 
 /// wicked-bus config default: an event is pollable for 72h (`config.ttl_hours`).
 pub const DEFAULT_TTL_HOURS: i64 = 72;
-/// wicked-bus config default: the idempotency dedup row survives 24h (`config.dedup_ttl_hours`).
+/// wicked-bus config default: an idempotency key is claimed for 24h (`config.dedup_ttl_hours`). Since
+/// wicked-bus 2.4.0 this is only the dedup WINDOW (whether a reused key is a duplicate); it no
+/// longer deletes the row, which lives until its `expires_at`.
 pub const DEFAULT_DEDUP_TTL_HOURS: i64 = 24;
 /// wicked-bus config default: the largest payload `emit()` accepts (`config.max_payload_bytes`).
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1_048_576;
@@ -254,9 +256,11 @@ fn resolve_config_dir(db_path: &str) -> Option<std::path::PathBuf> {
 
 /// Load `ttl_hours`, `dedup_ttl_hours` and `max_payload_bytes` from `<dataDir>/config.json`,
 /// matching JS `loadConfig()`: a missing file or malformed JSON silently yields the defaults
-/// (72/24/1 MiB), and an absent key falls back to its own default. This is what makes the Rust two-timer TTL agree with JS under a NON-default
-/// operator config — otherwise the JS sweep (which deletes on `dedup_expires_at`) reaps Rust rows on a
-/// different clock than JS-written rows.
+/// (72/24/1 MiB), and an absent key falls back to its own default. This is what makes the Rust
+/// two-timer TTL agree with JS under a NON-default operator config: Rust rows carry the same
+/// `expires_at` (the lifetime the wicked-bus >= 2.4.0 sweep keys on — and it never sweeps an
+/// expired row an active cursor has not acked, under the default `unacked_policy: "retain"`) and the
+/// same `dedup_expires_at` (the dedup window JS `emit()` reads) as JS-written rows.
 fn load_bus_config(db_path: &str) -> BusLimits {
     let cfg = resolve_config_dir(db_path)
         .map(|dir| dir.join("config.json"))
@@ -293,8 +297,9 @@ pub struct BusDb {
     /// what JS `emit()` computes under the SAME operator config.
     default_ttl_hours: i64,
     /// Dedup-row TTL in hours (`config.dedup_ttl_hours`), same provenance as `default_ttl_hours`
-    /// (falls back to [`DEFAULT_DEDUP_TTL_HOURS`]). Drives `dedup_expires_at`, which the JS sweep
-    /// deletes on — so this must agree with JS or Rust rows are reaped early/late.
+    /// (falls back to [`DEFAULT_DEDUP_TTL_HOURS`]). Drives `dedup_expires_at`, the dedup window JS
+    /// `emit()` reads to decide whether a reused key is a duplicate — so it must agree with JS. (Since
+    /// wicked-bus 2.4.0 no sweep deletes on it; the row lives until `expires_at`.)
     dedup_ttl_hours: i64,
     /// The largest payload a wire emit ([`BusDb::emit_wire`]) accepts (`config.max_payload_bytes`),
     /// same provenance.
@@ -567,12 +572,16 @@ fn add_events_column(conn: &Connection, column: &str, decl: &str) -> Result<()> 
 }
 
 impl BusDb {
-    /// Publish `event`. Computes the bus's two-timer TTL (`expires_at = emitted_at + ttl`,
-    /// `dedup_expires_at = emitted_at + 24h`) exactly as JS `emit()` does, so the JS poller's
-    /// `expires_at > now` visibility check and 24h dedup sweep behave identically. Returns the new
-    /// `event_id`. IDEMPOTENT: a duplicate idempotency key is not an error — the existing row's id is
-    /// returned (the JS bus raises WB-002 for a hard dup; here a re-emit of a *deterministic* event is
-    /// the normal at-least-once case, so we resolve to the existing row instead).
+    /// Publish `event`. Computes the bus's two-timer TTL (`expires_at = emitted_at + ttl`, 72h by
+    /// default; `dedup_expires_at = emitted_at + dedup_ttl`, 24h) exactly as JS `emit()` does. Since
+    /// wicked-bus 2.4.0 the sweep keys on `expires_at` alone (the full lifetime) and, under the
+    /// default `unacked_policy: "retain"`, never sweeps an expired row an active cursor still owes;
+    /// `dedup_expires_at` only bounds the dedup window. Returns the new `event_id`. IDEMPOTENT: a
+    /// duplicate idempotency key is not an error — the existing row's id is returned (the JS bus
+    /// raises WB-002 for a hard dup; here a re-emit of a *deterministic* event is the normal
+    /// at-least-once case, so we resolve to the existing row instead). Unlike JS 2.4.0 `emit()`, a
+    /// key whose dedup window has passed is NOT released here: the re-emit still resolves to the
+    /// holder row while it lives.
     pub fn emit(&self, event: &BusEmit) -> Result<i64> {
         let conn = self.lock();
         self.emit_on(&conn, event)
@@ -1790,8 +1799,8 @@ mod tests {
 
     /// Finding #1: under a NON-default operator `config.json` (next to the bus db) the two-timer TTL
     /// must be read from it — not hardcoded to 72/24 — so Rust rows carry the same `expires_at` /
-    /// `dedup_expires_at` a JS `emit()` would compute (otherwise the JS sweep reaps Rust rows on a
-    /// different clock).
+    /// `dedup_expires_at` a JS `emit()` would compute (otherwise the JS sweep and dedup window judge
+    /// Rust rows on a different clock).
     #[test]
     fn emit_uses_config_json_ttls() {
         let path = tmp_bus("cfgttl");
