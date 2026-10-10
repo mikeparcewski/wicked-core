@@ -180,7 +180,7 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
-        reduced_assurance: false,
+        reduced_assurance: true, // (core#850) one-seat roster: creator-seat review by explicit opt-in
     })
     .expect("launch");
 
@@ -252,7 +252,7 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
-        reduced_assurance: false,
+        reduced_assurance: true, // (core#850) one-seat roster: creator-seat review by explicit opt-in
     })
     .expect("launch");
 

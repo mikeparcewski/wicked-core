@@ -17,7 +17,7 @@ mod acp_runner;
 mod actor;
 mod applications;
 pub mod assumptions;
-mod assurance;
+pub mod assurance;
 mod builtin_floors;
 mod bus;
 mod campaign;

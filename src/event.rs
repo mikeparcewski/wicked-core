@@ -201,6 +201,10 @@ pub enum CoreEvent {
         ///
         /// The paragraph below is about `creator_seat` only.
         ///
+        /// (core#850) `creator_seat` reaches the wire only on a run whose assurance contract does
+        /// not enforce `distinct_evaluator` — a `reducedAssurance` launch, or a workflow whose
+        /// `required_instruments` omits it; every other run refuses it at distribution.
+        ///
         /// The roster is always BENCH-FREE when this is set (core#560/#567): a bench that leaves a
         /// review/test unit no distinct seat REFUSES the plan instead, so that case never reaches
         /// the wire. Three shapes set it — a one-seat roster; a roster whose every seat was

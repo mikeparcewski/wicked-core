@@ -3126,6 +3126,7 @@ mod tests {
                 cli_count: 1,
                 governed: false,
                 entity_mode: s(),
+                assurance: Default::default(),
             },
             "sessionStarted",
             &[
@@ -3136,6 +3137,8 @@ mod tests {
                 "cliCount",
                 "governed",
                 "entityMode",
+                // (core#850) the run's assurance contract.
+                "assurance",
             ],
         );
         check(
@@ -3270,6 +3273,7 @@ mod tests {
                 floor_note: None,
                 judge_skipped_reason: None,
                 evaluator_verdict: None,
+                assurance: Default::default(),
             },
             "gateEvaluated",
             &[
@@ -3294,6 +3298,8 @@ mod tests {
                 "judgeSkippedReason",
                 // (DES-L1 PR-1A) the evaluator's own verdict token, `null` when unread/missing.
                 "evaluatorVerdict",
+                // (core#850) the gate's assurance receipt.
+                "assurance",
             ],
         );
         check(
@@ -3915,6 +3921,7 @@ mod tests {
                 tree_after: Some(s()),
                 conflicts: vec![],
                 note: None,
+                assurance: Default::default(),
             },
             "deliverLiftEvaluated",
             &[
@@ -3930,6 +3937,8 @@ mod tests {
                 "treeAfter",
                 "conflicts",
                 "note",
+                // (core#850) the delivery's assurance receipt.
+                "assurance",
             ],
         );
         check(
