@@ -4067,6 +4067,7 @@ fn team_plan_at_launch(
             .filter_map(|c| serde_json::to_value(c).ok())
             .collect(),
         deliver_step: spec.deliver_step.clone(),
+        deliverables: spec.deliverables.clone(),
         ..Default::default()
     };
     // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
@@ -11094,6 +11095,17 @@ fn stage_edit(
             }
         };
     }
+    // (X-MIG M9, codex r1 on #858) A whole-plan edit keeps the launch's declared deliverables:
+    // they are the launcher's contract, re-joined to the edited plan's last creator step.
+    let edit = match crate::plan_gate::with_deliverables(edit, &state.deliverables) {
+        Ok(edit) => edit,
+        Err(e) => {
+            return Ok(StagedEdit::Refused {
+                reason: format!("{e:#}"),
+                events: Vec::new(),
+            })
+        }
+    };
     let repo_root = session
         .repo_ref
         .as_deref()

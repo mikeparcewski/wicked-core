@@ -95,6 +95,11 @@ pub struct TeamPlanState {
     /// floor (§8.5). `None` for a run that does not deliver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_step: Option<PlanStep>,
+    /// (X-MIG M9) The launch's declared deliverables (`LaunchSpec.deliverables`), kept so a
+    /// whole-plan edit at the initial approval gate cannot drop them: they are re-joined to the
+    /// edited plan's last creator step (codex r1 on #858). Empty for a run that declared none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverables: Vec<String>,
     /// The accepted rev's `plan.accepted` body (a P1 required transition published before the
     /// rev's first dispatch). `None` while nothing is accepted (a plan held for approval).
     #[serde(default, skip_serializing_if = "Option::is_none")]
