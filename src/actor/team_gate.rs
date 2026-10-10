@@ -3418,6 +3418,9 @@ pub(super) fn revise_units(
         &roster,
         run_id,
         &session.benched_seats,
+        !session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR),
     )?;
     // A dispatch key is `(run, ord, attempt)` (the phase id), so a unit placed on an ord that
     // already ran (the tail of a `request_changes` rewind) dispatches above that ord's last

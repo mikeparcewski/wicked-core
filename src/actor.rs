@@ -1282,6 +1282,12 @@ pub(crate) fn run(
                         "a launch with a primary seat must use launch_run: the straight-through \
                          path starts no team path to record the pick on"
                     )),
+                    // (core#850) The reduced-assurance opt-in is recorded on the governed
+                    // dispatch's session: refused here rather than silently dropped.
+                    Ok(None) if reduced_assurance => Err(anyhow::anyhow!(
+                        "a reduced-assurance launch must use launch_run: the straight-through \
+                         path does not record the run's assurance contract"
+                    )),
                     Ok(None) if deliver_step.is_none() => Ok(()),
                     Ok(_) => Err(anyhow::anyhow!(
                         "a plan or preset launch must use launch_run: its plan_approval gate \
@@ -1580,7 +1586,14 @@ pub(crate) fn run(
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
                         // (WT-C2) Validated with the write roots above; in the launch record.
                         evidence_root: spec.evidence_root.clone(),
-                        assurance: Default::default(),
+                        // (core#850) The run's assurance contract: the workflow's declared
+                        // instruments (or the default) and the launch's explicit opt-in.
+                        assurance: crate::assurance::RunAssurance::new(
+                            selected_def
+                                .as_ref()
+                                .and_then(|d| d.required_instruments.as_deref()),
+                            spec.reduced_assurance,
+                        ),
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1707,6 +1720,7 @@ pub(crate) fn run(
                     in_process_governance().is_some(), // keep governed accurate even when unused today
                     Vec::new(),
                     None,
+                    spec.reduced_assurance,
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -1726,6 +1740,9 @@ pub(crate) fn run(
                                         &pre.clis,
                                         &sid,
                                         &pre.session.benched_seats,
+                                        !pre.session
+                                            .assurance
+                                            .enforces(crate::assurance::DISTINCT_EVALUATOR),
                                     )
                                 }));
                             match result {
@@ -1924,6 +1941,7 @@ pub(crate) fn run(
                         in_process_governance().is_some(), // keep governed accurate even when unused today
                         Vec::new(),
                         None,
+                        spec.reduced_assurance,
                     )
                 }) {
                     Err(e) => {
@@ -1955,6 +1973,9 @@ pub(crate) fn run(
                                         &pre.clis,
                                         &sid,
                                         &pre.session.benched_seats,
+                                        !pre.session
+                                            .assurance
+                                            .enforces(crate::assurance::DISTINCT_EVALUATOR),
                                     )
                                 }));
                             match result {
@@ -3267,6 +3288,9 @@ pub(crate) fn run(
                         let benched_c: Vec<crate::domain::BenchedSeat> = Vec::new();
                         let units_for_routing = units.clone();
                         let clis_keys = session.clis.clone();
+                        let allow_same_seat_c = !session
+                            .assurance
+                            .enforces(crate::assurance::DISTINCT_EVALUATOR);
                         let ord_c = ord;
                         // Emit UnitReassigned now (new_cli=None indicates a re-route).
                         emit(
@@ -3299,6 +3323,7 @@ pub(crate) fn run(
                                         &clis,
                                         &run_id_c,
                                         &benched_c,
+                                        allow_same_seat_c,
                                     )
                                 }));
                             match result {
@@ -4257,6 +4282,7 @@ pub(crate) fn launch_run_inner(
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
         crate::domain::normalize_exclude_seats(&spec.exclude_seats),
         spec.evidence_root.clone(),
+        spec.reduced_assurance,
     )?;
     if let Some((state, _, _)) = team {
         let mut s = crate::domain::get_session(store, &run_id)?
@@ -11158,6 +11184,9 @@ fn check_def_runs(
         &roster,
         &session.id,
         &session.benched_seats,
+        !session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR),
     )?;
     Ok(())
 }
@@ -11237,12 +11266,16 @@ fn replan_for_accepted_edit(
         in_process_governance().is_some(),
         Vec::new(),
         None,
+        session.assurance.reduced(),
     )?;
     let distributions = crate::distribute::distribute_units_on_benched(
         &pre.units,
         &pre.clis,
         run_id,
         &pre.session.benched_seats,
+        !pre.session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR),
     )?;
     pipeline::apply_distributions(store, &mut pre, distributions, &mut |ev| {
         emit(subscribers, ev)

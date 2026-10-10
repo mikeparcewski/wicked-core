@@ -73,6 +73,7 @@ pub fn run_session(
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
         Vec::new(),
         None,
+        false,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -416,6 +417,9 @@ pub(crate) fn pre_distribute(
     // (WT-C2) The launch's evidence root, recorded the same way: in the write that creates the
     // session, or carried forward from a launch stub.
     evidence_root: Option<String>,
+    // (core#850) The launch's explicit reduced-assurance opt-in, recorded on a session this call
+    // CREATES; a launch stub's contract is carried forward instead.
+    reduced_assurance: bool,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     // (core#572) The run's seat pool — what failover and reassignment pick from — is its
@@ -472,7 +476,12 @@ pub(crate) fn pre_distribute(
         team_plan: None,
         exclude_seats,
         evidence_root,
-        assurance: Default::default(),
+        assurance: crate::assurance::RunAssurance::new(
+            selected_def
+                .as_ref()
+                .and_then(|d| d.required_instruments.as_deref()),
+            reduced_assurance,
+        ),
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -487,6 +496,8 @@ pub(crate) fn pre_distribute(
             session.exclude_seats = existing.exclude_seats;
             // (WT-C2) …and so is its evidence root.
             session.evidence_root = existing.evidence_root;
+            // (core#850) …and its assurance contract.
+            session.assurance = existing.assurance;
             // (DES-TEAMING-002 T3) The team state (P1's transport, path floor and gate counter)
             // and the plan state are the run's, not the plan's: a plan written onto a launch stub
             // (or re-planned at an edit) keeps them.
@@ -878,6 +889,8 @@ pub(crate) fn plan_and_distribute(
     exclude_seats: Vec<String>,
     // (WT-C2) The launch's evidence root, forwarded to `pre_distribute` the same way.
     evidence_root: Option<String>,
+    // (core#850) The launch's reduced-assurance opt-in, forwarded the same way.
+    reduced_assurance: bool,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -900,8 +913,16 @@ pub(crate) fn plan_and_distribute(
         governed,
         exclude_seats,
         evidence_root,
+        reduced_assurance,
     )?;
-    let distributions = distribute::distribute_units_on(&pre.units, clis, session_id)?;
+    let distributions = distribute::distribute_units_on(
+        &pre.units,
+        clis,
+        session_id,
+        !pre.session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+    )?;
     apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {
         session: pre.session,
@@ -2751,6 +2772,7 @@ mod resolve_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -2878,6 +2900,7 @@ mod resolve_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -3275,6 +3298,7 @@ mod resolve_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());
@@ -3442,6 +3466,7 @@ mod judge_bench_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {

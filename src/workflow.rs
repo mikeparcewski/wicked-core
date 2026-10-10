@@ -1130,6 +1130,8 @@ pub enum WorkflowDefError {
     PoolOutsideTeamRun {
         phase: String,
     },
+    /// (core#850) `required_instruments` names an unknown instrument or repeats one.
+    RequiredInstruments(String),
 }
 
 /// (core#810) The largest [`PhaseDef::pool`]: one creator plus the team's monitor ceiling.
@@ -1182,6 +1184,7 @@ impl std::fmt::Display for WorkflowDefError {
                  plus up to {} monitors (1..={MAX_POOL}), and a Tool phase's pool is 1",
                 crate::team::supervisor::MAX_MONITORS
             ),
+            WorkflowDefError::RequiredInstruments(why) => write!(f, "{why}"),
         }
     }
 }
@@ -1193,6 +1196,10 @@ impl WorkflowDef {
     pub fn validate(&self) -> Result<(), WorkflowDefError> {
         if self.phases.is_empty() {
             return Err(WorkflowDefError::Empty);
+        }
+        if let Some(r) = self.required_instruments.as_deref() {
+            crate::assurance::validate_required(r)
+                .map_err(WorkflowDefError::RequiredInstruments)?;
         }
         let mut ids: HashSet<&str> = HashSet::new();
         for p in &self.phases {
