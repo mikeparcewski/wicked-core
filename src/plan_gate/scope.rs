@@ -10,7 +10,12 @@
 //! - a run on a repo: `SCOPE {"touch":["src/auth/login.rs", …]}` — the files the plan will
 //!   change, found through the repo's estate graph. The touch set is scored by the SAME scorer
 //!   and blast-radius rules as a user plan's declared touch ([`super::intent_score_for_run`]); no
-//!   usable graph still fails closed at 100.
+//!   usable graph still fails closed at 100. (core#649 option A) An EMPTY touch set,
+//!   `SCOPE {"touch":[]}`, is an answer only for a plan that [writes nothing]
+//!   (every creator step declares `writes_nothing`): it scores as touching no file. For any other
+//!   plan it is no answer.
+//!
+//! [writes nothing]: crate::plan::PlanSteps::writes_nothing
 //! - a run with no repo: `RISK {"score":N,"reasons":["…"]}` — the PA's judgement of the content
 //!   and its audience. No graph is involved. The deterministic baseline is the lowest band
 //!   (`THRESHOLDS.repo_less_baseline`) and the PA's rating can only RAISE it (S4's model rule):
@@ -89,6 +94,14 @@ pub(crate) fn scope_step(plan: &PlanSteps, unbound: bool) -> PlanStep {
             steps.join(" -> ")
         )
     } else {
+        // (core#649 option A) A plan whose every creator step writes nothing may answer empty.
+        let empty = if plan.writes_nothing() {
+            " Every step of this plan declares that it writes no file in the repo: if that holds, \
+             answer SCOPE {\"touch\":[]}, which scores as touching nothing; if a step would in \
+             fact change a file, list it."
+        } else {
+            ""
+        };
         format!(
             "Scope this run before anything changes (READ ONLY: edit nothing). The plan: {}. \
              Find every file it will create, edit or delete, grounding in the repo's estate code \
@@ -96,7 +109,7 @@ pub(crate) fn scope_step(plan: &PlanSteps, unbound: bool) -> PlanStep {
              exactly one line:\n\
              SCOPE {{\"touch\":[\"repo/relative/path\", ...]}}\n\
              The engine scores the run's risk from that list against the code graph. A missing \
-             or malformed SCOPE line scores 100 (high risk).",
+             or malformed SCOPE line scores 100 (high risk).{empty}",
             steps.join(" -> ")
         )
     };
@@ -199,7 +212,13 @@ pub(crate) enum Declared {
 /// Parse the PA's answer: every line of the run's kind (`SCOPE` on a repo run, `RISK` on a
 /// repo-less one) must parse; several are merged so the answer can only get riskier (the union of
 /// the touch sets, the highest rating). `Err` names why there is no usable answer.
-pub(crate) fn parse_answer(lines: &str, unbound: bool) -> Result<Declared, String> {
+/// `writes_nothing`: the held plan [writes nothing](crate::plan::PlanSteps::writes_nothing), so
+/// an empty `SCOPE` touch set is an answer (core#649 option A); otherwise it is refused.
+pub(crate) fn parse_answer(
+    lines: &str,
+    unbound: bool,
+    writes_nothing: bool,
+) -> Result<Declared, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ScopeLine {
@@ -253,8 +272,12 @@ pub(crate) fn parse_answer(lines: &str, unbound: bool) -> Result<Declared, Strin
         } else {
             let s: ScopeLine = serde_json::from_str(json)
                 .map_err(|e| format!("a malformed {prefix} line: {e}"))?;
-            if s.touch.is_empty() {
-                return Err(format!("a {prefix} line with an empty touch set"));
+            if s.touch.is_empty() && !writes_nothing {
+                return Err(format!(
+                    "a {prefix} line with an empty touch set, on a plan with a step that may \
+                     write files (only a plan whose every creator step declares writes_nothing \
+                     may scope nothing)"
+                ));
             }
             for p in s.touch {
                 let p = p.trim();
@@ -280,6 +303,26 @@ pub(crate) fn parse_answer(lines: &str, unbound: bool) -> Result<Declared, Strin
         Some((score, reasons)) => Declared::Risk { score, reasons },
         None => Declared::Touch(touch),
     })
+}
+
+/// The first reason of an empty scope on a plan that writes nothing (core#649 option A).
+pub(crate) const SCOPED_NOTHING: &str =
+    "the PA scoped no file, and every creator step of the plan declares writes_nothing";
+
+/// (core#649 option A) The score of `SCOPE {"touch":[]}` on a plan that writes nothing: no file
+/// is touched, so 0, the lowest band. The diff re-score still measures what the run changes.
+fn scoped_nothing() -> Scored {
+    Scored {
+        assessment: Assessment {
+            deterministic: 0,
+            score: 0,
+            reasons: vec![SCOPED_NOTHING.to_string()],
+            model: None,
+            signals: Some(crate::review_scale::ImpactSignals::default()),
+            plan: crate::review_scale::plan_for(0),
+        },
+        destructive: false,
+    }
 }
 
 /// The fail-closed score of a missing or malformed answer (and, ASK-K2b, of a first-creator
@@ -345,12 +388,13 @@ pub(crate) fn scope_score(
             None,
         );
     };
-    match parse_answer(&answer.lines, hold.unbound) {
+    match parse_answer(&answer.lines, hold.unbound, hold.plan.writes_nothing()) {
         Err(why) => (no_scope(&why), None),
         Ok(Declared::Risk { score, reasons }) => {
             (judged(THRESHOLDS.repo_less_baseline, score, &reasons), None)
         }
         Ok(Declared::Touch(touch)) if !diff_rescored => (no_scope(NO_DIFF_RESCORE), Some(touch)),
+        Ok(Declared::Touch(touch)) if touch.is_empty() => (scoped_nothing(), Some(touch)),
         Ok(Declared::Touch(touch)) => {
             let plan = PlanSteps {
                 steps: hold.plan.steps.clone(),
@@ -523,7 +567,7 @@ mod tests {
         let lines = scope_lines_of(out);
         assert_eq!(lines.lines().count(), 3);
         assert_eq!(
-            parse_answer(&lines, false),
+            parse_answer(&lines, false, false),
             Ok(Declared::Touch(vec![
                 "docs/a.md".into(),
                 "src/b.rs".into(),
@@ -531,7 +575,7 @@ mod tests {
             ]))
         );
         assert_eq!(
-            parse_answer(&lines, true),
+            parse_answer(&lines, true, false),
             Ok(Declared::Risk {
                 score: 5,
                 reasons: vec!["x".into()]
@@ -540,7 +584,7 @@ mod tests {
         let risk =
             "RISK {\"score\":20,\"reasons\":[\"a\"]}\nRISK {\"score\":45,\"reasons\":[\"b\"]}";
         assert_eq!(
-            parse_answer(risk, true),
+            parse_answer(risk, true, false),
             Ok(Declared::Risk {
                 score: 45,
                 reasons: vec!["a".into(), "b".into()]
@@ -556,7 +600,7 @@ mod tests {
             "SCOPE touch: a.rs",
             "SCOPE {\"touch\":[\"a.rs\"]}\nSCOPE {oops}",
         ] {
-            assert!(parse_answer(bad, false).is_err(), "{bad:?}");
+            assert!(parse_answer(bad, false, false).is_err(), "{bad:?}");
         }
         for bad in [
             "RISK {\"score\":101,\"reasons\":[\"a\"]}",
@@ -565,7 +609,7 @@ mod tests {
             "RISK {\"score\":30}",
             "SCOPE {\"touch\":[\"a.rs\"]}",
         ] {
-            assert!(parse_answer(bad, true).is_err(), "{bad:?}");
+            assert!(parse_answer(bad, true, false).is_err(), "{bad:?}");
         }
     }
 
@@ -767,5 +811,74 @@ mod tests {
             false,
         );
         assert_eq!(s.assessment.score, 10);
+    }
+
+    /// (core#649 option A) An empty scope is an answer only for a plan whose every creator step
+    /// writes nothing: it scores 0 on a teamed run (the diff re-score measures what it did
+    /// change), fails closed un-teamed like any declared scope, and stays no answer for a plan
+    /// with a step that may write files.
+    #[test]
+    fn an_empty_scope_scores_as_no_touch_only_for_a_plan_that_writes_nothing() {
+        let writes_nothing = plan(json!({"steps": [
+            {"catalog": "understand"},
+            {"catalog": "produce", "writes_nothing": true}
+        ]}));
+        let may_write = plan(json!({"steps": [{"catalog": "produce"}]}));
+        let mixed = plan(json!({"steps": [
+            {"catalog": "produce", "writes_nothing": true},
+            {"catalog": "produce", "id": "docs"}
+        ]}));
+        assert!(writes_nothing.writes_nothing());
+        assert!(!may_write.writes_nothing());
+        assert!(!mixed.writes_nothing(), "every creator step must say so");
+        assert!(!plan(json!({"steps": [{"catalog": "understand"}]})).writes_nothing());
+
+        let empty = "SCOPE {\"touch\":[]}";
+        assert_eq!(
+            parse_answer(empty, false, true),
+            Ok(Declared::Touch(vec![]))
+        );
+        assert!(parse_answer(empty, false, false).is_err());
+        // A non-empty answer still scores as declared on a plan that writes nothing.
+        assert_eq!(
+            parse_answer("SCOPE {\"touch\":[\"docs/a.md\"]}", false, true),
+            Ok(Declared::Touch(vec!["docs/a.md".into()]))
+        );
+
+        let hold = |plan: PlanSteps| ScopeHold {
+            plan,
+            unbound: false,
+            answer: Some(ScopeAnswer {
+                ord: 1,
+                attempt: 0,
+                by: "a".into(),
+                lines: empty.into(),
+            }),
+        };
+        let (s, touch) = scope_score(&hold(writes_nothing.clone()), None, None, true);
+        assert_eq!(s.assessment.score, 0, "{:?}", s.assessment.reasons);
+        assert_eq!(s.assessment.reasons, [SCOPED_NOTHING]);
+        assert!(!s.destructive);
+        assert_eq!(touch, Some(vec![]));
+        let (s, _) = scope_score(&hold(writes_nothing.clone()), None, None, false);
+        assert_eq!(
+            s.assessment.reasons,
+            [PA_DECLARED_NO_SCOPE, NO_DIFF_RESCORE]
+        );
+        for p in [may_write, mixed] {
+            let (s, touch) = scope_score(&hold(p), None, None, true);
+            assert_eq!(s.assessment.score, 100);
+            assert_eq!(s.assessment.reasons[0], PA_DECLARED_NO_SCOPE);
+            assert!(touch.is_none());
+        }
+
+        let step = scope_step(&writes_nothing, false);
+        assert!(step
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("SCOPE {\"touch\":[]}"));
+        let step = scope_step(&plan(json!({"steps": [{"catalog": "produce"}]})), false);
+        assert!(!step.instructions.as_deref().unwrap().contains("[]}"));
     }
 }

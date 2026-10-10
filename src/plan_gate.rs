@@ -48,6 +48,8 @@ pub(crate) use scope::{
     decide_scoped, needs_pa_scope, scope_lines_of, scope_rev, with_scope_step, SCOPE_STEP_ID,
 };
 pub use scope::{ScopeAnswer, ScopeHold};
+#[cfg(test)]
+pub(crate) use scope::{PA_DECLARED_NO_SCOPE, SCOPED_NOTHING};
 
 /// The `gate_kind` token of a plan approval pause (`AwaitingHuman.gate_kind`, the durable
 /// interaction row, `gate.opened.kind`).

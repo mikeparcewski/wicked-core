@@ -458,6 +458,34 @@ impl PlanSteps {
     pub fn has_creator_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
         self.steps.iter().any(|s| is_creator_step(catalog, s))
     }
+
+    /// (core#649 option A) The plan has a creator step and EVERY creator step declares
+    /// `writes_nothing: true`: no step of it changes the run's tree, so an empty scope is an
+    /// honest answer.
+    pub fn writes_nothing(&self) -> bool {
+        self.writes_nothing_in(crate::catalog::catalog())
+    }
+
+    /// [`Self::writes_nothing`] against `catalog`.
+    pub fn writes_nothing_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
+        self.has_creator_in(catalog)
+            && self
+                .steps
+                .iter()
+                .filter(|s| is_creator_step(catalog, s))
+                .all(|s| s.writes_nothing == Some(true))
+    }
+}
+
+/// (core#846) A step that executes code, judged on the phase it composes to: its entry executes
+/// code or the step raises `executes_code`. The predicate [`floor_types`] and [`floor_fill`]'s
+/// security-review refusal share: a plan with no such step is a NON-CODE plan.
+fn executes_code_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
+    step.executes_code == Some(true)
+        || catalog
+            .iter()
+            .find(|e| e.id == step.catalog)
+            .is_some_and(|e| e.executes_code)
 }
 
 /// (§8.5, T3 round 10) A step that CHANGES something, judged on the phase it COMPOSES to — never
@@ -533,6 +561,13 @@ pub struct PlanStep {
     /// May be raised to `true`; never lowered on an entry that sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executes_code: Option<bool>,
+    /// (core#649 option A) The step changes no file in the run's tree: its work lands elsewhere
+    /// (proposals to the estate store, rules crew lands, a reply). A plan whose every creator step
+    /// says so [`PlanSteps::writes_nothing`], and its PA may scope it `SCOPE {"touch":[]}`, which
+    /// scores as touching nothing instead of failing closed. Refused on a step that composes to
+    /// code (`writes_nothing_on_code`). The diff re-score still measures what the run did change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes_nothing: Option<bool>,
     /// The step's output is an acceptance requirement of its run: its evidence is re-verified (by
     /// its pin) and the acceptance gate reads it (wicked-crew `qe/acceptance.ts`). May be raised to
     /// `true` on a pinned step; never lowered on an entry that sets it (DES-TEAMING-002 M10: the
@@ -623,6 +658,8 @@ pub enum PlanRefusal {
     ExecutesCodeLowered { step: String, catalog: String },
     /// The step sets `verified_evidence: false` on an entry that sets it.
     VerifiedEvidenceLowered { step: String, catalog: String },
+    /// (core#649) The step sets `writes_nothing: true` but composes to a code-executing phase.
+    WritesNothingOnCode { step: String, catalog: String },
     /// The step sets a `kind` other than its entry's on an entry other than `run`.
     KindNotAllowed { step: String, catalog: String },
     /// The step sets an `executor` on an Agent entry.
@@ -674,6 +711,12 @@ pub enum PlanRefusal {
     /// (WT-C3) A held testing rule that fired at compose names an obligation outside the closed
     /// vocabulary (`wicked_governance::PLAN_COMPOSE_OBLIGATIONS`).
     UnknownObligation { rule: String, token: String },
+    /// (core#846) A `security_review` step in a plan with no code-executing step: the entry's
+    /// diff evidence floor can never pass on a run that writes no code, and its denial gate's
+    /// approve-means-retry would loop forever. Refused when the plan is made, whoever added it:
+    /// `rule` names the held testing rule whose `step:security_review` obligation added it, and
+    /// is `None` for an authored step (a preset, the PA's `PLAN+`, a human edit).
+    SecurityReviewOnNonCodePlan { step: String, rule: Option<String> },
 }
 
 /// The phase id the engine's deliver protections key on (`deliver_lift::DELIVER_PHASE_ID`).
@@ -692,6 +735,7 @@ impl PlanRefusal {
             PlanRefusal::PinChanged { .. } => "pin_changed",
             PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
             PlanRefusal::VerifiedEvidenceLowered { .. } => "verified_evidence_lowered",
+            PlanRefusal::WritesNothingOnCode { .. } => "writes_nothing_on_code",
             PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
             PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
             PlanRefusal::ToolCommandMissing { .. } => "tool_command_missing",
@@ -711,6 +755,7 @@ impl PlanRefusal {
             PlanRefusal::DeliverIdReserved { .. } => "deliver_id_reserved",
             PlanRefusal::DeliverDuplicate { .. } => "deliver_duplicate",
             PlanRefusal::UnknownObligation { .. } => "unknown_obligation",
+            PlanRefusal::SecurityReviewOnNonCodePlan { .. } => "security_review_on_non_code_plan",
         }
     }
 }
@@ -761,6 +806,11 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::VerifiedEvidenceLowered { step, catalog } => write!(
                 f,
                 "{r}: step {step} sets verified_evidence false on {catalog}, which sets it"
+            ),
+            PlanRefusal::WritesNothingOnCode { step, catalog } => write!(
+                f,
+                "{r}: step {step} says it writes nothing, but {catalog} executes code — only a \
+                 step whose phase executes no code may declare writes_nothing"
             ),
             PlanRefusal::KindNotAllowed { step, catalog } => write!(
                 f,
@@ -847,6 +897,18 @@ impl std::fmt::Display for PlanRefusal {
                 "{r}: rule {rule} requires {token:?}, which is not a plan obligation (one of \
                  step:walkthrough, step:test, step:security_review) — fix or retire the rule"
             ),
+            PlanRefusal::SecurityReviewOnNonCodePlan { step, rule } => {
+                let by = match rule {
+                    Some(rule) => format!("rule {rule} requires it"),
+                    None => "the plan authored it".to_string(),
+                };
+                write!(
+                    f,
+                    "{r}: step {step} is a security_review in a plan where no step executes code \
+                     ({by}) — its diff evidence floor can never pass on a run that writes no \
+                     code; drop the step, or scope the rule to code runs"
+                )
+            }
         }
     }
 }
@@ -880,6 +942,10 @@ pub enum FieldRule {
     /// Output-only:
     /// [`floor_fill`] refuses it on input and writes it itself; `compose` ignores it.
     Record,
+    /// (core#649) A fact about the step that the plan gate reads, not a control on its entry
+    /// (`writes_nothing`): the composed phase is unchanged, and it is refused on a phase where it
+    /// cannot hold (`writes_nothing_on_code`).
+    PlanFact,
 }
 
 /// Every [`PlanStep`] field and its [`FieldRule`] — the one table `compose` applies
@@ -893,6 +959,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("gate", FieldRule::TightenOnly),
     ("validator_pin", FieldRule::SetIfUnset),
     ("executes_code", FieldRule::TightenOnly),
+    ("writes_nothing", FieldRule::PlanFact),
     ("verified_evidence", FieldRule::TightenOnly),
     ("budget_secs", FieldRule::TightenOnly),
     ("pool", FieldRule::TightenOnly),
@@ -1079,6 +1146,10 @@ fn apply_step(
         }
         phase.verified_evidence = verified;
     }
+    // writes_nothing (core#649) — a plan fact, only on a phase that executes no code.
+    if step.writes_nothing == Some(true) && phase.executes_code {
+        return refuse(|step, catalog| PlanRefusal::WritesNothingOnCode { step, catalog });
+    }
     // budget_secs — TightenOnly: lower the entry's wall budget, never raise it (ASK-K1b).
     if let Some(budget) = step.budget_secs {
         if entry.budget_secs.is_some_and(|own| budget > own) {
@@ -1259,10 +1330,7 @@ fn floor_types(
     if !plan.has_creator_in(catalog) {
         return Vec::new();
     }
-    let entry = |c: &str| catalog.iter().find(|e| e.id == c);
-    let code_run = plan.steps.iter().any(|s| {
-        s.executes_code == Some(true) || entry(&s.catalog).is_some_and(|e| e.executes_code)
-    });
+    let code_run = plan.steps.iter().any(|s| executes_code_step(catalog, s));
     phases
         .iter()
         .filter(|p| **p != "deliver" || delivers)
@@ -1440,6 +1508,18 @@ pub fn floor_fill(
                 ..PlanStep::default()
             },
         );
+    }
+    // (core#846) A security_review in a plan where no step executes code is refused here, the
+    // one composition boundary every author passes (the launch, a re-score or ratchet revision,
+    // the PA's PLAN+, a human edit): its diff evidence floor cannot pass on a run that writes no
+    // code. The band floor never adds it there (`floor_types`); a held rule or an author can.
+    if !steps.iter().any(|s| executes_code_step(catalog, s)) {
+        if let Some(s) = steps.iter().find(|s| s.catalog == "security_review") {
+            return Err(PlanRefusal::SecurityReviewOnNonCodePlan {
+                step: s.id.clone(),
+                rule: s.floor_rule.clone(),
+            });
+        }
     }
     // §8.5: no floor phase before a floor phase that precedes it in catalog order.
     let first = |ty: &String| steps.iter().position(|s| &s.catalog == ty);
@@ -2891,6 +2971,114 @@ mod tests {
 
         fn phase_ids(f: &FloorFilled) -> Vec<&str> {
             f.def.phases.iter().map(|p| p.id.as_str()).collect()
+        }
+
+        /// (core#846) A security_review in a plan where no step executes code is refused when
+        /// the plan is made, whoever put it there: an authored step (a preset, the PA's PLAN+, a
+        /// human edit) or a held rule's `step:security_review` obligation, which the refusal
+        /// names. A code plan keeps it.
+        #[test]
+        fn a_security_review_on_a_non_code_plan_is_refused_at_plan_time() {
+            let authored = plan(json!({"steps": [
+                {"catalog": "produce", "id": "draft"},
+                {"catalog": "security_review", "id": "sec"}
+            ]}));
+            let r = fill(&authored, 10, &AUTO, None).expect_err("refused");
+            assert_eq!(r.reason(), "security_review_on_non_code_plan");
+            assert_eq!(
+                r,
+                PlanRefusal::SecurityReviewOnNonCodePlan {
+                    step: "sec".into(),
+                    rule: None
+                }
+            );
+            assert!(r.to_string().contains("the plan authored it"), "{r}");
+            // A read-only plan (no creator) is a non-code plan too.
+            let read_only = plan(json!({"steps": [
+                {"catalog": "understand"},
+                {"catalog": "security_review"}
+            ]}));
+            assert_eq!(
+                fill(&read_only, 0, &AUTO, None).unwrap_err().reason(),
+                "security_review_on_non_code_plan"
+            );
+            // A held rule's obligation adds it to a non-code plan: refused, naming the rule.
+            let held = [HeldObligation {
+                rule: "TST-1002".into(),
+                token: "step:security_review".into(),
+            }];
+            let non_code = plan(json!({"steps": [{"catalog": "produce", "id": "draft"}]}));
+            let r = floor_fill(
+                crate::catalog::catalog(),
+                &non_code,
+                FloorInput {
+                    score: 10,
+                    destructive: false,
+                    human_confirm: &AUTO,
+                    deliver: None,
+                    obligations: &held,
+                    ran: &[],
+                },
+            )
+            .expect_err("refused");
+            assert_eq!(
+                r,
+                PlanRefusal::SecurityReviewOnNonCodePlan {
+                    step: "security_review".into(),
+                    rule: Some("TST-1002".into())
+                }
+            );
+            assert!(r.to_string().contains("rule TST-1002 requires it"), "{r}");
+            // The same rule on a code plan adds the step as before.
+            let code = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = floor_fill(
+                crate::catalog::catalog(),
+                &code,
+                FloorInput {
+                    score: 10,
+                    destructive: false,
+                    human_confirm: &AUTO,
+                    deliver: None,
+                    obligations: &held,
+                    ran: &[],
+                },
+            )
+            .expect("a code plan keeps its security_review");
+            assert!(f.steps.steps.iter().any(|s| s.catalog == "security_review"));
+            // A step that raises executes_code makes the plan a code plan.
+            let raised = plan(json!({"steps": [
+                {"catalog": "produce", "id": "draft", "executes_code": true,
+                 "validator_pin": crate::builtin_floors::EVIDENCE_FLOOR_PIN},
+                {"catalog": "security_review", "id": "sec"}
+            ]}));
+            if let Err(e) = fill(&raised, 10, &AUTO, None) {
+                panic!("a raised executes_code is a code plan: {e}");
+            }
+        }
+
+        /// (core#649 option A) `writes_nothing` is a plan fact on a step whose phase executes no
+        /// code; on a code step it is refused.
+        #[test]
+        fn writes_nothing_is_refused_on_a_code_step() {
+            let r = compose(
+                crate::catalog::catalog(),
+                &plan(json!({"steps": [{"catalog": "build", "writes_nothing": true}]})),
+            )
+            .unwrap_err();
+            assert_eq!(r.reason(), "writes_nothing_on_code");
+            let r = compose(
+                crate::catalog::catalog(),
+                &plan(json!({"steps": [
+                    {"catalog": "produce", "writes_nothing": true, "executes_code": true}
+                ]})),
+            )
+            .unwrap_err();
+            assert_eq!(r.reason(), "writes_nothing_on_code");
+            assert!(compose(
+                crate::catalog::catalog(),
+                &plan(json!({"steps": [{"catalog": "produce", "writes_nothing": true}]})),
+            )
+            .is_ok());
         }
 
         /// T2 (b): a user plan below the floor gets the floor phases added, each marked

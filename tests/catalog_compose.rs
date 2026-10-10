@@ -454,7 +454,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     // A fully populated step serializes every field: the table must name exactly those.
     let full_step = json!({"catalog": "full", "id": "x", "instructions": "own", "gate": "auto",
         "gate_type": "value", "validator_pin": "p", "executes_code": true,
-        "verified_evidence": true, "budget_secs": 1,
+        "writes_nothing": true, "verified_evidence": true, "budget_secs": 1,
         "pool": 1, "skill_ref": "s",
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
@@ -678,6 +678,22 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
                                     "floor_rule": "TST-1002"});
                 let def = compose_one("full", record).unwrap_or_else(|e| panic!("{field}: {e}"));
                 assert_eq!(def, compose_one("full", json!({})).unwrap(), "{field}");
+            }
+            // (core#649) A plan fact: refused where it cannot hold (a code phase), and otherwise
+            // leaves the composed phase as it was.
+            FieldRule::PlanFact => {
+                assert_eq!(field, "writes_nothing");
+                let r = compose_one("full", json!({"writes_nothing": true}))
+                    .expect_err("writes_nothing on a code phase");
+                assert_eq!(r.reason(), "writes_nothing_on_code", "{r}");
+                let cmd = json!({"type": "tool", "cmd": ["true"]});
+                let def = compose_one("tool", json!({"executor": cmd, "writes_nothing": true}))
+                    .unwrap_or_else(|e| panic!("{field}: {e}"));
+                assert_eq!(
+                    def,
+                    compose_one("tool", json!({"executor": cmd})).unwrap(),
+                    "{field}"
+                );
             }
             FieldRule::Free => {
                 let change = match field {

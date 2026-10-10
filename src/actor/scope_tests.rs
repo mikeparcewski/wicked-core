@@ -246,6 +246,63 @@ fn x1_a_a_small_docs_only_scope_in_auto_mode_proceeds_on_the_light_floor() {
     release_all(&w);
 }
 
+/// (core#649 option A) A repo-bound preset whose creator step writes nothing (capture-learnings'
+/// shape: proposals to the estate store, no file) in AUTO mode: the PA answers
+/// `SCOPE {"touch":[]}`, which scores 0 as touching nothing, so the plan is accepted with NO
+/// plan_approval pause and the next unit dispatches. The same empty answer on a preset whose
+/// creator may write files is no answer: it fails closed at 100 and pauses.
+#[test]
+fn core649_an_empty_scope_on_a_writes_nothing_preset_proceeds_in_auto_mode() {
+    let w = by_unit(|phase| {
+        (phase == "pa-scope").then(|| turn(&pa_output("SCOPE {\"touch\":[]}"), None))
+    });
+    let mut e = engine("c649a", w.clone());
+    let (repo_id, _) = repo(&e, "c649a");
+    put(
+        &e,
+        "c649-nothing",
+        json!([
+            {"catalog": "understand", "id": "churn"},
+            {"catalog": "produce", "id": "capture", "writes_nothing": true}
+        ]),
+    );
+    put(
+        &e,
+        "c649-writes",
+        json!([
+            {"catalog": "understand", "id": "churn"},
+            {"catalog": "produce", "id": "capture"}
+        ]),
+    );
+    launch_preset(&e, "wn", "c649-nothing", Some(&repo_id), HumanConfirm::None);
+    wait_for("the unit after the scope step to dispatch", || {
+        e.worker.calls().len() >= 2
+    });
+    let calls = e.worker.calls();
+    assert_eq!(calls[0].2, "wn:pa-scope");
+    assert_eq!(calls[1].2, "wn:churn", "the preset's first step, unpaused");
+    let scored = settled(&e, "wn", tev::PATH_SCORED, 1);
+    assert_eq!(scored[0]["score"], 0);
+    assert_eq!(scored[0]["reasons"][0], crate::plan_gate::SCOPED_NOTHING);
+    let accepted = settled(&e, "wn", tev::PLAN_ACCEPTED, 2);
+    assert_eq!(accepted[1]["band"], "0-19");
+    assert_eq!(accepted[1]["high_risk"], false);
+    assert!(
+        plan_pauses(&mut e, "wn").is_empty(),
+        "no plan_approval pause"
+    );
+
+    launch_preset(&e, "ww", "c649-writes", Some(&repo_id), HumanConfirm::None);
+    e.wait_awaiting("ww", crate::plan_gate::GATE_KIND, 1);
+    let scored = settled(&e, "ww", tev::PATH_SCORED, 1);
+    assert_eq!(scored[0]["score"], 100);
+    assert_eq!(
+        scored[0]["reasons"][0],
+        crate::plan_gate::PA_DECLARED_NO_SCOPE
+    );
+    release_all(&w);
+}
+
 /// core#635: the scope step's id is RESERVED. A plan the PA scopes whose author named a step
 /// `pa-scope` is refused AT LAUNCH — as the preview already refuses it — never dispatched as the
 /// PA's scope step and failed afterwards, when the boundary appends the authored steps beside it.
