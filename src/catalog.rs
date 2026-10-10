@@ -152,10 +152,10 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
 /// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2),
-/// `capture-learnings` (M7), `qe-author-tests` (M10) and `demo` (M9b, which replaces
-/// `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other
-/// consumer's preset is added by its migration seam (§14 M1–M10), which also deletes the def it
-/// replaces.
+/// `capture-learnings` (M7), `steering-author` (M8), `qe-author-tests` (M10) and `demo` (M9b,
+/// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them).
+/// Every other consumer's preset is added by its migration seam (§14 M1–M10), which also deletes
+/// the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
         ("capture-learnings", capture_learnings_preset()),
@@ -165,6 +165,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
         ("qe-author-tests", qe_author_tests_preset()),
+        ("steering-author", steering_author_preset()),
     ]
 }
 
@@ -461,6 +462,38 @@ fn qe_author_tests_preset() -> Vec<PlanStep> {
         serde_json::from_str(include_str!("presets/qe-author-tests.json"))
             .expect("src/presets/qe-author-tests.json is a valid plan");
     plan.steps
+}
+
+/// steering-author's two phase instructions, moved verbatim from crew's def (M8).
+const STEERING_ANALYZE_INSTRUCTIONS: &str = "Read the operator intent and every file or directory listed in the problem statement. Identify candidate steering rules: durable, prescriptive statements a coding agent must follow, each classified into one steering type (architecture, development, security, testing, operations, compliance, design-ux). For each candidate note the statement, steering type, severity, and the evidence in the source material. Analysis only — do not write any rule to any store, and do not emit final rule JSON yet.";
+const STEERING_PROPOSE_INSTRUCTIONS: &str = "From the prior analysis, emit the PROPOSED steering rules as one JSON array. Each entry is a conformance-rule object: id (PAT-<digits> for rule_type \"pattern\", POL-<digits> for \"policy\"), rule_type, statement, severity (info|warn|error|critical), confidence (a NUMBER 0..1), steering_type (default to the type named in the problem statement), provenance {\"source\":\"chat\"}, and — only where the source material supports them — the enforcement fields applies_to (array of phase tokens or globs), excludes, weight, obligations (array of strings), criteria (ONE string, never a list). Omit targets, effect and trigger unless you can express them in the store schema exactly: targets is a {language, layer, framework} facet OBJECT (never a file list — files belong in applies_to), and trigger is a structured condition object (never prose). Put that JSON array in your reply, ONCE, as a single ```json fenced block (the whole array, valid JSON): your reply IS the proposal — crew reads the array from it when the human approves. Do not write it to any file and do not create files for it. This output is a PROPOSAL for the human gate: rules land in the governance store only after approval, written crew-side — do not write any rule to any store yourself.";
+
+/// `steering-author` (M8): §11.2's row. analyze → `understand`; propose → `produce` (the bold
+/// cell: kind recon → build), keeping its UNCONDITIONAL human gate. That gate is the TH-12
+/// propose-as-gate: crew lands the approved rules from the propose unit's reply (crew#388, #789),
+/// and the run itself writes nothing to the store.
+fn steering_author_preset() -> Vec<PlanStep> {
+    vec![
+        PlanStep {
+            catalog: "understand".to_string(),
+            id: "analyze".to_string(),
+            instructions: Some(STEERING_ANALYZE_INSTRUCTIONS.to_string()),
+            ..PlanStep::default()
+        },
+        PlanStep {
+            catalog: "produce".to_string(),
+            id: "propose".to_string(),
+            instructions: Some(STEERING_PROPOSE_INSTRUCTIONS.to_string()),
+            gate: Some(GateSpec::HumanConfirm {
+                unconditional: true,
+            }),
+            // The proposal is the reply; crew lands the approved rules, so the run writes no
+            // file (core#649 option A: an empty SCOPE scores 0, not a fail-closed 100).
+            writes_nothing: Some(true),
+            depends_on: Some(vec!["analyze".to_string()]),
+            ..PlanStep::default()
+        },
+    ]
 }
 
 fn build_catalog() -> Vec<PhaseDef> {

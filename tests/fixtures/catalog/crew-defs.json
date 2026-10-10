@@ -1,45 +1,4 @@
 {
- "steering-author": {
-  "id": "steering-author",
-  "phases": [
-   {
-    "id": "analyze",
-    "kind": "recon",
-    "instructions": "Read the operator intent and every file or directory listed in the problem statement. Identify candidate steering rules: durable, prescriptive statements a coding agent must follow, each classified into one steering type (architecture, development, security, testing, operations, compliance, design-ux). For each candidate note the statement, steering type, severity, and the evidence in the source material. Analysis only — do not write any rule to any store, and do not emit final rule JSON yet.",
-    "gate_type": "value",
-    "gate": "auto",
-    "executes_code": false,
-    "verified_evidence": false,
-    "required_deliverables": [],
-    "depends_on": [],
-    "role": "neutral",
-    "skill_ref": null,
-    "allowed_skills": [],
-    "validator_pin": null
-   },
-   {
-    "id": "propose",
-    "kind": "recon",
-    "instructions": "From the prior analysis, emit the PROPOSED steering rules as one JSON array. Each entry is a conformance-rule object: id (PAT-<digits> for rule_type \"pattern\", POL-<digits> for \"policy\"), rule_type, statement, severity (info|warn|error|critical), confidence (a NUMBER 0..1), steering_type (default to the type named in the problem statement), provenance {\"source\":\"chat\"}, and — only where the source material supports them — the enforcement fields applies_to (array of phase tokens or globs), excludes, weight, obligations (array of strings), criteria (ONE string, never a list). Omit targets, effect and trigger unless you can express them in the store schema exactly: targets is a {language, layer, framework} facet OBJECT (never a file list — files belong in applies_to), and trigger is a structured condition object (never prose). SAVE that JSON array (bare array, no prose, no code fences) to the absolute proposal file path named in the problem statement (create parent directories if needed, overwrite if present), AND include the same array in your reply for the human reviewer. This output is a PROPOSAL for the human gate: the proposal file is an artifact for review, and rules land in the governance store only after approval, written crew-side — do not write any rule to any store yourself.",
-    "gate_type": "value",
-    "gate": {
-     "human_confirm": {
-      "unconditional": true
-     }
-    },
-    "executes_code": false,
-    "verified_evidence": false,
-    "required_deliverables": [],
-    "depends_on": [
-     "analyze"
-    ],
-    "role": "creator",
-    "skill_ref": null,
-    "allowed_skills": [],
-    "validator_pin": null
-   }
-  ]
- },
  "interactive-chat": {
   "id": "interactive-chat",
   "phases": [
