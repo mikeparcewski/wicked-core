@@ -3144,6 +3144,7 @@ fn write_tree_blobs(
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
     // (codex r3) A symlink entry's TARGET, as written — what `hold_to` compares it against.
+    #[cfg_attr(not(unix), allow(unused_mut))] // only a unix checkout writes symlinks
     let mut links: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for (mode, sha, path) in &blobs {
         let mut header = String::new();
