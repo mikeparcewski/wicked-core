@@ -4,7 +4,7 @@ Read by `tests/catalog_compose.rs`.
 
 - `crew-defs.json`: today's defs for the §11.2 consumers that only crew defines. They were dumped
   from crew `main` at `4870c87` by evaluating crew's own exports, with no hand transcription:
-  `BUILTIN_WORKFLOWS` (`capture-learnings`, `steering-author`, `qe-author-tests`),
+  `BUILTIN_WORKFLOWS` (`steering-author`, `qe-author-tests`),
   `withDraftSkill(<def>, true)` for `interactive-chat`, `interactive-draft` and `interactive-edit`
   (the form crew registers when garden holds the draft skill), and `deliverPrPhase([], ...)` for `deliver` (the phase
   `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
@@ -18,7 +18,8 @@ Read by `tests/catalog_compose.rs`.
 
 - `migrated-defs.json`: the today-defs of the consumers whose def a migration seam deleted: `chat`
   (M3, the deleted `workflows/chat.json`) and `onboarding` (M4, the deleted `onboarding_def()`,
-  serialized with every field spelled). They keep pinning the built-in presets that replaced them.
+  serialized with every field spelled) and `capture-learnings` (M7, crew's def as of crew `842f099`,
+  current instructions and `requires_capture_report` on capture). They keep pinning the built-in presets that replaced them.
   `survey-repo`, `memories`, `domain-graph-slice` and `collab` were deleted outright with no preset
   (operator decision, 2026-09-26), so they have no fixture and no mapping.
 
