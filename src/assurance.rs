@@ -264,7 +264,7 @@ pub struct AssuranceReceipt {
     /// (QE acceptance) The run's decision when this receipt was cut; absent when the run does not
     /// require QE acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub qe: Option<QeAcceptance>,
+    pub qe: Option<Box<QeAcceptance>>,
 }
 
 impl AssuranceReceipt {
@@ -273,7 +273,7 @@ impl AssuranceReceipt {
             mode: run.mode.clone(),
             required: run.required.clone(),
             attempt,
-            qe: run.qe.clone(),
+            qe: run.qe.clone().map(Box::new),
             ..Default::default()
         };
         // A waiver or a skip is a skipped instrument with its words — never silent.

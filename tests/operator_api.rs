@@ -118,6 +118,7 @@ mod tests {
             catalog: None,
             exclude_seats: Vec::new(),
             assurance: None,
+            qe_acceptance: None,
         }
     }
 

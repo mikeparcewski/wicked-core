@@ -9064,7 +9064,7 @@ fn dispatch_unit(
                 CoreEvent::QeAcceptanceDecided {
                     session: run_id.to_string(),
                     ord: unit.ord,
-                    qe: d.clone(),
+                    qe: Box::new(d.clone()),
                 },
             );
             qe = Some(d);

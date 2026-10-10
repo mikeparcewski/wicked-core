@@ -87,12 +87,47 @@ pub(crate) fn on_dispatch(
     }
 }
 
-/// Score the run's diff and decide. Every unreadable input is `required` with its reason.
+/// Score the run's diff and decide, against the run repo's code graph at the base. Every
+/// unreadable input is `required` with its reason.
 fn decide(
     session: &AgentSession,
     ord: u32,
     repo_root: Option<&Path>,
     baseline: Option<(&str, &Path)>,
+) -> QeAcceptance {
+    decide_with(session, ord, repo_root, baseline, |signals, root, base| {
+        match crate::code_graph::existing_code_graph(root) {
+            None => rs::assess(
+                signals,
+                Graph::Unavailable(format!("no code graph is indexed for {}", root.display())),
+                None,
+            ),
+            Some(db) => match wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())) {
+                Ok(store) => rs::assess(
+                    signals,
+                    Graph::Ready {
+                        store: &store,
+                        base_commit: base,
+                    },
+                    None,
+                ),
+                Err(e) => rs::assess(
+                    signals,
+                    Graph::Unavailable(format!("the code graph could not be opened: {e}")),
+                    None,
+                ),
+            },
+        }
+    })
+}
+
+/// [`decide`] with the scorer injected: `score(signals, repo_root, base_commit)` reads the graph.
+fn decide_with(
+    session: &AgentSession,
+    ord: u32,
+    repo_root: Option<&Path>,
+    baseline: Option<(&str, &Path)>,
+    score: impl FnOnce(&ChangeSignals, &Path, &str) -> rs::Assessment,
 ) -> QeAcceptance {
     let threshold = rs::THRESHOLDS.qe_waiver_max_score;
     let required = |reason: String, tree: Option<&str>| QeAcceptance {
@@ -123,29 +158,7 @@ fn decide(
     };
     let mut signals = rs::signals_from_diff(&diff);
     with_history(&mut signals, root, git_dir, base);
-    let assessment = match crate::code_graph::existing_code_graph(root) {
-        None => rs::assess(
-            &signals,
-            Graph::Unavailable(format!("no code graph is indexed for {}", root.display())),
-            None,
-        ),
-        Some(db) => match wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())) {
-            Ok(store) => rs::assess(
-                &signals,
-                Graph::Ready {
-                    store: &store,
-                    base_commit: base,
-                },
-                None,
-            ),
-            Err(e) => rs::assess(
-                &signals,
-                Graph::Unavailable(format!("the code graph could not be opened: {e}")),
-                None,
-            ),
-        },
-    };
-    from_assessment(&assessment, ord, tree)
+    from_assessment(&score(&signals, root, base), ord, tree)
 }
 
 /// The decision an assessment makes (pure).

@@ -1057,7 +1057,7 @@ pub enum CoreEvent {
     QeAcceptanceDecided {
         session: String,
         ord: u32,
-        qe: crate::assurance::QeAcceptance,
+        qe: Box<crate::assurance::QeAcceptance>,
     },
     /// (F-3R2-013, core#431) How the run's BASE commit was chosen when its worktree was minted:
     /// the engine fetches `origin` and, when the registered clone's `HEAD` is behind the remote

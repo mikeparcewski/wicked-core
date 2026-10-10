@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use wicked_core::assurance::QeOverride;
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, StepInput, StepOutput,
+    StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -262,26 +262,56 @@ fn a_reasonless_skip_or_a_word_with_nothing_to_apply_to_is_refused() {
     }
 }
 
-/// The binding decision: when the run's QE unit (`bug`'s `verify`) dispatches, the engine scores
-/// the run's diff; a repo-less run has none, so it is `required` with that reason, published as
-/// `qeAcceptanceDecided` and carried on the session's contract.
+/// A build that changes code (held by a human gate, so no pin is needed) and the code-verifying
+/// step after it: the run's QE unit.
+const BUILD_VERIFY: &str = r#"{"id":"qe-bind","required_instruments":["distinct_evaluator","judge","qe_acceptance"],"phases":[
+  {"id":"build","kind":"build","executes_code":true,"role":"creator","gate":{"human_confirm":{"unconditional":true}}},
+  {"id":"verify","kind":"test","verified_evidence":true,"validator_pin":"e2e7af1db9e48454","role":"evaluator","gate":"auto","depends_on":["build"]}]}"#;
+
+/// The binding decision: when the run's QE unit (`verify`, the code-verifying step) dispatches, the
+/// engine scores the run's diff; a repo-less run has none, so it is `required` with that reason,
+/// published as `qeAcceptanceDecided`, stamped on the unit and carried on the session's contract.
 #[test]
 fn the_qe_unit_makes_the_binding_decision_at_dispatch() {
     let sid = "qe-bind";
     let core = engine("bind");
+    core.register_workflow(BUILD_VERIFY)
+        .expect("register qe-bind");
     let ev = core.subscribe();
-    core.launch_run(spec(sid, "bug", QeOverride::Auto))
-        .expect("launch");
+    // One seat, by explicit opt-in: reduced assurance waives only the seat-bound instruments,
+    // never QE acceptance (the decision below is the point).
+    let mut one_seat = spec(sid, "qe-bind", QeOverride::Auto);
+    one_seat.clis = vec![cli("codex")];
+    one_seat.reduced_assurance = true;
+    core.launch_run(one_seat).expect("launch");
+    let held = collect_until(
+        &ev,
+        Duration::from_secs(60),
+        |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == sid),
+    );
+    assert!(
+        !held
+            .iter()
+            .any(|e| e.to_json()["type"] == "qeAcceptanceDecided"),
+        "nothing is decided before the QE unit dispatches: {held:?}"
+    );
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve the build");
     let evs = collect_until(&ev, Duration::from_secs(60), |e| {
         e.to_json()["type"] == "qeAcceptanceDecided"
-            || matches!(e, CoreEvent::SessionCompleted { session } | CoreEvent::SessionFailed { session, .. } if session == sid)
     });
     let decided = evs
         .iter()
         .map(|e| e.to_json())
         .find(|j| j["type"] == "qeAcceptanceDecided")
         .unwrap_or_else(|| panic!("the verify unit decided: {evs:?}"));
-    assert_eq!(decided["ord"], 4, "bug's verify is unit 4: {decided}");
+    assert_eq!(decided["ord"], 2, "verify is unit 2: {decided}");
     assert_eq!(decided["qe"]["status"], "required");
     assert_eq!(decided["qe"]["basis"], "diff");
     assert!(

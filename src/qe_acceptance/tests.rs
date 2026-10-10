@@ -242,3 +242,163 @@ fn the_prompt_directive_says_run_or_do_not_run() {
     q.status = a::QE_SKIPPED.into();
     assert!(directive(&q, "x").contains("skipped by the operator"));
 }
+
+/// A temp repository with `src/a.rs` committed `commits` times (`fn a` on lines 1-3), the run base
+/// at its head, and a graph indexed AT the base holding `fn a`.
+struct Repo {
+    dir: std::path::PathBuf,
+    base: String,
+}
+
+impl Repo {
+    fn new(name: &str, commits: u32) -> Self {
+        let dir = std::env::temp_dir().join(format!("wicked-qe-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let mut r = Self {
+            dir,
+            base: String::new(),
+        };
+        r.git(&["init", "-q"]);
+        for i in 0..commits {
+            std::fs::write(r.dir.join("src/a.rs"), format!("fn a() {{\n    {i}\n}}\n")).unwrap();
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-q", "-m", &format!("c{i}")]);
+        }
+        r.base = r.git(&["rev-parse", "HEAD"]);
+        r
+    }
+    fn git(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .current_dir(&self.dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    /// Write the change, stage it, and return the tree the QE unit would start on.
+    fn change(&self, files: &[(&str, &str)]) -> String {
+        for (p, text) in files {
+            let path = self.dir.join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        self.git(&["add", "-A"]);
+        self.git(&["write-tree"])
+    }
+    fn graph(&self) -> wicked_apps_core::SqliteStore {
+        use wicked_apps_core::{
+            Descriptor, GraphWrite, Language, Location, Node, NodeKind, Span, Symbol,
+        };
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let node = Node::new(
+            Symbol::global("test", None, vec![Descriptor::method("a", None)]).id(),
+            NodeKind::Function,
+            "a",
+            Language::new("rust"),
+            Location::new(
+                "src/a.rs",
+                Span {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 3,
+                    end_col: 0,
+                },
+            ),
+        );
+        store.begin_batch().unwrap();
+        store.upsert_nodes(&[node]).unwrap();
+        store.commit_batch().unwrap();
+        store
+            .set_repo_info(&wicked_estate_core::RepoInfo {
+                commit: Some(self.base.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+    }
+    fn decide(&self, tree: &str) -> QeAcceptance {
+        let mut s = session(requiring());
+        s.base_commit = Some(self.base.clone());
+        let store = self.graph();
+        let git_dir = self.dir.join(".git");
+        decide_with(
+            &s,
+            4,
+            Some(&self.dir),
+            Some((tree, &git_dir)),
+            |signals, _, base| {
+                rs::assess(
+                    signals,
+                    Graph::Ready {
+                        store: &store,
+                        base_commit: base,
+                    },
+                    None,
+                )
+            },
+        )
+    }
+}
+
+impl Drop for Repo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// THE low-score proof: a one-line edit inside a leaf function with history, on a graph indexed at
+/// the base, is waived — and the decision names the score and the line.
+#[test]
+fn a_one_line_leaf_edit_with_history_is_waived_with_its_reason() {
+    let repo = Repo::new("waive", 3);
+    let tree = repo.change(&[("src/a.rs", "fn a() {\n    42\n}\n")]);
+    let d = repo.decide(&tree);
+    assert_eq!((d.status.as_str(), d.score), ("waived", Some(20)), "{d:?}");
+    assert!(
+        d.reason
+            .starts_with("waived: impact score 20 at or below the waiver line 20"),
+        "{d:?}"
+    );
+    assert_eq!(d.tree.as_deref(), Some(tree.as_str()));
+}
+
+/// The same edit on a file with one commit of history is novelty, so required.
+#[test]
+fn the_same_edit_on_a_first_touch_file_is_required() {
+    let repo = Repo::new("history", 1);
+    let tree = repo.change(&[("src/a.rs", "fn a() {\n    42\n}\n")]);
+    let d = repo.decide(&tree);
+    assert_eq!(d.status, "required", "{d:?}");
+    assert!(
+        d.reason.contains("touched path(s) with under 3 commits"),
+        "{d:?}"
+    );
+}
+
+/// A brand-new file that adds a dependency, with nothing depending on it: required.
+#[test]
+fn a_new_file_with_a_new_dependency_is_required_end_to_end() {
+    let repo = Repo::new("newdep", 3);
+    let tree = repo.change(&[
+        ("src/b.rs", "fn b() {}\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"x\"\n\n[dependencies]\nserde_json = \"1\"\n",
+        ),
+    ]);
+    let d = repo.decide(&tree);
+    assert_eq!(d.status, "required", "{d:?}");
+    assert!(
+        d.reason.contains("new dependency") && d.reason.contains("new or unindexed file"),
+        "{d:?}"
+    );
+}

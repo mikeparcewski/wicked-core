@@ -781,11 +781,14 @@ fn tier(tiers: &[(u32, u32)], value: u32) -> u32 {
         .map_or(0, |(_, p)| *p)
 }
 
+/// One dimension's scoring terms: `(points, reason line)`.
+type Terms = Vec<(u32, String)>;
+
 /// The complexity and novelty terms of `s`: one reason line per term with points > 0, each
 /// dimension capped at [`Thresholds::complexity_max`] / [`Thresholds::novelty_max`] (the later
 /// terms absorb the cap).
-fn dimension_terms(t: &Thresholds, s: &ImpactSignals) -> (Vec<(u32, String)>, Vec<(u32, String)>) {
-    fn capped(dim: &str, terms: Vec<(u32, String)>, max: u32) -> Vec<(u32, String)> {
+fn dimension_terms(t: &Thresholds, s: &ImpactSignals) -> (Terms, Terms) {
+    fn capped(dim: &str, terms: Terms, max: u32) -> Terms {
         let mut left = max;
         terms
             .into_iter()

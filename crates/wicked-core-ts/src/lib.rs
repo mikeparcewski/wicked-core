@@ -3991,6 +3991,25 @@ mod tests {
                 "role", "posture", "reason",
             ],
         );
+        // QE-IN-APP-WORKFLOWS: the run's QE acceptance decision at its QE unit's dispatch.
+        check(
+            CoreEvent::QeAcceptanceDecided {
+                session: s(),
+                ord: 4,
+                qe: Box::new(wicked_core::assurance::QeAcceptance {
+                    status: "waived".into(),
+                    basis: "diff".into(),
+                    score: Some(20),
+                    threshold: 20,
+                    reason: s(),
+                    reasons: vec![],
+                    ord: Some(4),
+                    tree: None,
+                }),
+            },
+            "qeAcceptanceDecided",
+            &["type", "session", "ord", "qe"],
+        );
         check(
             CoreEvent::RunBaseResolved {
                 session: s(),
