@@ -49,6 +49,13 @@
       "worker_read": "none"
     },
     {
+      "name": "artifacts",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/api/codebase-archive.ts CodebaseArchiveStore — join(crewStateHome(), 'artifacts', 'runs'): each run's final-codebase zip (crew#720)",
+      "worker_read": "none (served to the operator by GET /runs/:id/artifacts/codebase.zip)"
+    },
+    {
       "name": "project-graphs",
       "kind": "dir",
       "owner": "crew",
