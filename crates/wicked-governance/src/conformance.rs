@@ -38,6 +38,12 @@ const CONFORMANCE_RESOLVED_BY: &str = "wicked-governance-conformance";
 /// The shared `provenance.source_kinds` wire enum — identical in the conformance-rules AND
 /// domain-model schemas ($defs/provenance). Enforced at the fail-closed write boundary (INV-C4).
 pub(crate) const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
+/// (core#827) A STEERING RULE's source kinds: the shared spine plus `operator-words` — a rule the
+/// operator stated in their own words (crew's decisions-from-your-words, DC-S4b), which is where
+/// the rule came from, not a grounding in code. Rules only: a domain-model FACT is still drawn
+/// from the spine ([`VALID_SOURCE_KINDS`]), so the shared domain-model schema is unchanged.
+pub(crate) const RULE_SOURCE_KINDS: [&str; 5] =
+    ["code-body", "type-def", "comment", "doc", "operator-words"];
 
 /// The steering-type vocabulary (STEERING program) — one sub-page per type in studio's Steering
 /// surface. Enum-as-STRING on the wire (a new type is a vocabulary bump, not a serde break),
@@ -302,14 +308,14 @@ impl ConformanceRule {
                 self.confidence
             );
         }
-        // INV-C4: provenance.source_kinds must be drawn from the shared wire enum — the conformance
-        // AND domain-model schemas both constrain it. Fail closed here (the write-time boundary all
-        // persist paths route through) so a wicked-core producer can never emit an out-of-enum
-        // source_kind its cross-product consumers' schema would reject.
+        // INV-C4: provenance.source_kinds must be drawn from the rule enum (the spine plus
+        // `operator-words`, core#827) — the conformance-rules schema constrains it. Fail closed here
+        // (the write-time boundary all persist paths route through) so a wicked-core producer can
+        // never emit an out-of-enum source_kind its cross-product consumers' schema would reject.
         for sk in &self.provenance.source_kinds {
-            if !VALID_SOURCE_KINDS.contains(&sk.as_str()) {
+            if !RULE_SOURCE_KINDS.contains(&sk.as_str()) {
                 anyhow::bail!(
-                    "INV-C4: provenance.source_kinds contains {sk:?}, not one of {VALID_SOURCE_KINDS:?}"
+                    "INV-C4: provenance.source_kinds contains {sk:?}, not one of {RULE_SOURCE_KINDS:?}"
                 );
             }
         }
@@ -1211,6 +1217,9 @@ mod tests {
         // A valid source_kind passes.
         r.provenance.source_kinds = vec!["code-body".to_string()];
         assert!(r.validate().is_ok());
+        // core#827: a rule remembered from the operator's words carries `operator-words`.
+        r.provenance.source_kinds = vec!["operator-words".to_string()];
+        assert!(r.validate().is_ok(), "{:?}", r.validate());
     }
 
     #[test]

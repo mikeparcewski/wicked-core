@@ -32,14 +32,15 @@
         },
         "source_kinds": {
           "type": "array",
-          "description": "The grounding tier: code-body = executable logic read directly; type-def = type/schema/interface declaration; comment = inline prose; doc = README/wiki/external. TRUST RULE (shared with domain-model): a rule is 'trusted' only when grounded in code-body and/or type-def; resting on comment/doc alone makes it trust-eligible, not proven.",
+          "description": "The grounding tier: code-body = executable logic read directly; type-def = type/schema/interface declaration; comment = inline prose; doc = README/wiki/external; operator-words = a rule the operator stated in their own words (rules only — the domain-model spine has no such kind). TRUST RULE (shared with domain-model): a rule is 'trusted' only when grounded in code-body and/or type-def; resting on comment/doc alone makes it trust-eligible, not proven.",
           "items": {
             "type": "string",
             "enum": [
               "code-body",
               "type-def",
               "comment",
-              "doc"
+              "doc",
+              "operator-words"
             ]
           }
         }

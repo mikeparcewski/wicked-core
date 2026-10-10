@@ -40,8 +40,9 @@ in a consumer's vendored copy — re-vendor from here.
 
 - `src/schemas.rs` embeds every file via `include_str!` and unit-tests that each
   parses, that `$id`/const versions agree, and that the crate's fail-closed
-  `VALID_SOURCE_KINDS` vocabulary (INV-C4) equals the schemas' shared
-  `$defs/provenance.source_kinds` enum.
+  `VALID_SOURCE_KINDS` vocabulary equals the domain-model's shared
+  `$defs/provenance.source_kinds` enum, and that `RULE_SOURCE_KINDS` (INV-C4:
+  the same plus `operator-words`, core#827) equals the conformance-rules enum.
 - The root-package wire-fidelity tests (`wicked-core/tests/domain_model_schema.rs`,
   `tests/coverage_schema.rs`) validate emitted output against THESE copies
   (`include_str!` into this directory) — no second in-repo copy exists.

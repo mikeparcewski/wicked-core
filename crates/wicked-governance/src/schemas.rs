@@ -218,9 +218,18 @@ mod tests {
     /// constant and the schema enum can no longer drift silently.
     #[test]
     fn valid_source_kinds_matches_the_schema_enum() {
-        for (name, raw) in [
-            ("conformance-rules.schema.json", CONFORMANCE_RULES_SCHEMA),
-            ("domain-model.schema.json", DOMAIN_MODEL_SCHEMA),
+        // (core#827) A steering rule adds `operator-words` to the spine; a domain fact does not.
+        for (name, raw, want) in [
+            (
+                "conformance-rules.schema.json",
+                CONFORMANCE_RULES_SCHEMA,
+                &crate::conformance::RULE_SOURCE_KINDS[..],
+            ),
+            (
+                "domain-model.schema.json",
+                DOMAIN_MODEL_SCHEMA,
+                &crate::conformance::VALID_SOURCE_KINDS[..],
+            ),
         ] {
             let schema = parsed(name, raw);
             let enum_vals: Vec<&str> = schema["$defs"]["provenance"]["properties"]["source_kinds"]
@@ -231,9 +240,8 @@ mod tests {
                 .map(|v| v.as_str().expect("enum member is a string"))
                 .collect();
             assert_eq!(
-                enum_vals,
-                crate::conformance::VALID_SOURCE_KINDS,
-                "{name} provenance.source_kinds enum drifted from INV-C4's VALID_SOURCE_KINDS"
+                enum_vals, want,
+                "{name} provenance.source_kinds enum drifted from INV-C4's vocabulary"
             );
         }
     }
