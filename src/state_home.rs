@@ -1285,6 +1285,8 @@ mod tests {
             "daemon-local.log",
             "daemon-stdout.log",
             "evals",
+            // crew#720: each run's final-codebase zip (crew `src/api/codebase-archive.ts`).
+            "artifacts",
             "interactive-demos",
             "interactive-drafts",
             "interactive-chats",
