@@ -9678,6 +9678,7 @@ mod tests {
             check_scratch: scratch.clone(),
             notes_root: None,
         };
+        // spawn-audit: test-only — never spawned; only its env map is read.
         let mut cmd = Command::new("true");
         ctx.apply_env(&mut cmd);
         let env: std::collections::HashMap<String, String> = cmd
