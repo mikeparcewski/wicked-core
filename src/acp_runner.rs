@@ -3455,6 +3455,10 @@ struct TurnResult {
     /// The status is then `Ok` and the output is the attempt's result; the caller discloses it
     /// (`acpTurnSettled`) and never reuses the process.
     settled: Option<u64>,
+    /// (core#563) The pi tool call that completed WITHOUT a granted pi-governance confirm — a
+    /// governance breach. The turn is `Failed`, and the caller fails the unit with it: never a
+    /// fallback onto the ungoverned wrapped carrier, and the process is never reused.
+    breach: Option<String>,
 }
 
 impl TurnResult {
@@ -3470,6 +3474,7 @@ impl TurnResult {
             tools: Vec::new(),
             answer: String::new(),
             settled: None,
+            breach: None,
         }
     }
 
@@ -4144,8 +4149,10 @@ fn exec_turn_acp_posture(
     let mut settled: Option<u64> = None;
     // (core#563) On a governed pi seat every tool call must have been GRANTED through the
     // pi-governance gate before it completes; one that was not is a breach that fails the turn.
+    // Every turn that relies on the seat ASKING — a policy gate, a chat boundary or a write-posture
+    // fence (codex r1 on the slice: a fenced unit with no policy governance still depends on it).
     let pi_governed = proc.seat_cli == wicked_apps_core::spawn::SeatCli::Pi
-        && (gate.is_some() || proc.chat_boundary.is_some());
+        && (gate.is_some() || proc.chat_boundary.is_some() || posture.is_some());
     let mut pi_allowed: HashSet<String> = HashSet::new();
     let mut pi_breach: Option<String> = None;
 
@@ -4483,6 +4490,7 @@ fn exec_turn_acp_posture(
                                                     pi_ungranted_completion(&v2, &pi_allowed)
                                                 {
                                                     pi_breach = Some(id);
+                                                    proc.kill_handle.signal();
                                                     break 'exec;
                                                 }
                                             }
@@ -4625,6 +4633,7 @@ fn exec_turn_acp_posture(
                             if pi_governed {
                                 if let Some(id) = pi_ungranted_completion(&v, &pi_allowed) {
                                     pi_breach = Some(id);
+                                    proc.kill_handle.signal();
                                     break 'exec;
                                 }
                             }
@@ -4821,6 +4830,7 @@ fn exec_turn_acp_posture(
         files,
         tools: Vec::new(),
         settled,
+        breach: pi_breach,
     })
 }
 
@@ -7474,6 +7484,25 @@ impl AcpStepRunner {
                      no tool call; booked as a worker failure (core#755)",
                     input.unit.ord
                 );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::Failed,
+                    usage: result.usage,
+                    files: result.files,
+                    tools: result.tools,
+                    governed: gate.is_some() || floor_governed,
+                }
+            }
+            // (core#563) A governance breach on the pi seat FAILS the unit, with its diagnostic —
+            // never the session-death fallback onto the wrapped carrier, which has no input
+            // governance at all. The process the gate was missing from is never reused.
+            Ok(result) if result.breach.is_some() => {
+                drop(proc);
+                self.drop_session_key(&session_key);
+                drop(proc_arc);
                 StepOutput {
                     run_id: input.run_id.clone(),
                     unit_ix: input.unit_ix,
@@ -14238,6 +14267,7 @@ transport = "stdio"
             tools: Vec::new(),
             answer: "The answer.".into(),
             settled: None,
+            breach: None,
         };
         assert_eq!(turn.chat_answer(), "The answer.");
         assert_eq!(
@@ -14401,6 +14431,7 @@ No further next steps — both questions fully answered.";
             tools: Vec::new(),
             answer: golden.to_string(),
             settled: None,
+            breach: None,
         };
         assert_eq!(scaffold_header_hits(&via_answer.chat_answer()), 0);
         assert!(via_answer
