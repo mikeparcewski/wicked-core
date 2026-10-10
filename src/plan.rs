@@ -477,12 +477,6 @@ impl PlanSteps {
                 .filter(|s| is_creator_step(catalog, s))
                 .all(|s| s.writes_nothing == Some(true))
     }
-
-    /// (core#846) Some step of the plan executes code (judged on the phase it composes to). A plan
-    /// with none is a NON-CODE plan: it may not carry a `security_review`.
-    pub fn has_code_step_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
-        self.steps.iter().any(|s| executes_code_step(catalog, s))
-    }
 }
 
 /// (core#846) A step that executes code, judged on the phase it composes to: its entry executes

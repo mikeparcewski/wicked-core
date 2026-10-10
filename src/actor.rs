@@ -8018,9 +8018,19 @@ fn advance_or_pause(
     // after a fold, a dispute answer, a member step's acceptance or a gate alike.
     // (WT-C3) A held re-score that fired a testing rule the floor cannot honour fails the run
     // (fail closed), never a logged error the run goes on past.
-    team_gate::refuse_unholdable_rules(&*store, run_id)
-        .map_err(|e| e.context("the diff re-score fired a testing rule the plan cannot honour"))?;
+    // (core#846 codex r2) The context carries the cause: `emit_run_error` shows the outermost
+    // message only.
+    team_gate::refuse_unholdable_rules(&*store, run_id).map_err(|e| {
+        let cause = format!("{e:#}");
+        e.context(format!(
+            "the diff re-score fired a testing rule the plan cannot honour: {cause}"
+        ))
+    })?;
     if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
+        // (core#846) A floor raise that can never be honoured fails the run (fail closed).
+        if team_gate::revision_fails_the_run(&e) {
+            return Err(e);
+        }
         // Log it and show it: the run goes on with the plan it has.
         emit_run_error(subscribers, run_id, e);
     }
@@ -11915,6 +11925,10 @@ pub(crate) fn confirm_gate(
             // its own `plan_approval` gate and the run stays paused on it.
             let rev_before = session.team_plan.as_ref().map_or(0, |t| t.accepted_rev);
             if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
+                // (core#846) As at the advance: a raise that can never be honoured fails the run.
+                if team_gate::revision_fails_the_run(&e) {
+                    return Err(e);
+                }
                 emit_run_error(subscribers, run_id, e);
             }
             let session = crate::domain::get_session(store, run_id)?

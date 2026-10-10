@@ -3224,29 +3224,32 @@ pub(super) fn refuse_unholdable_rules(store: &dyn GraphStore, run_id: &str) -> a
             }
         );
     }
-    // (core#846) A rule the diff re-score newly fired that requires a `security_review` on a run
-    // that executes no code: floor fill would refuse the revision (its diff floor can never pass),
-    // and the revision hook would drop the raise and run on without the rule's review. Fail the
-    // run here instead, naming the rule — the compose-time refusal's mid-run twin.
-    let code = session
-        .team_plan
-        .as_ref()
-        .and_then(|t| t.accepted.as_ref())
-        .is_some_and(|a| a.steps.has_code_step_in(crate::catalog::catalog()));
-    if !code {
-        if let Some(o) = r.obligations.iter().find(|o| {
-            crate::plan::obligation_types(&o.token).is_some_and(|t| t.contains(&"security_review"))
-        }) {
-            anyhow::bail!(
-                "{}",
-                crate::plan::PlanRefusal::SecurityReviewOnNonCodePlan {
-                    step: "security_review".into(),
-                    rule: Some(o.rule.clone()),
-                }
-            );
-        }
-    }
     Ok(())
+}
+
+/// (core#846) A held revision's error that FAILS THE RUN instead of being logged while the run
+/// goes on: the diff re-score fired a testing rule whose `step:security_review` floor fill
+/// refused on a run that executes no code (`security_review_on_non_code_plan`). Dropping the raise
+/// would run on without the rule's review; adding the step would deny and retry forever. The
+/// message carries the cause (the rule and the refusal).
+#[derive(Debug)]
+pub(super) struct RevisionFailsTheRun(pub String);
+
+impl std::fmt::Display for RevisionFailsTheRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the diff re-score fired a testing rule the plan cannot honour: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RevisionFailsTheRun {}
+
+/// Whether `e` (from [`apply_held_revision`]) fails the run rather than being logged.
+pub(super) fn revision_fails_the_run(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RevisionFailsTheRun>().is_some()
 }
 
 /// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
@@ -3351,6 +3354,7 @@ pub(super) fn apply_held_revision(
     let mut facts = Vec::new();
     let mut def = None;
     for change in changes {
+        let floor = matches!(change, crate::plan_gate::Change::Floor(_));
         let r = match crate::plan_gate::revise(
             run_id,
             &state,
@@ -3362,6 +3366,16 @@ pub(super) fn apply_held_revision(
         ) {
             Ok(r) => r,
             Err(e) => {
+                // (core#846) Judged by floor fill itself, after the human's edits (applied first)
+                // and with the plan's override honoured: only a raise that still needs the
+                // review on a non-code plan fails the run.
+                let cause = format!("{e:#}");
+                if floor && cause.contains("security_review_on_non_code_plan") {
+                    session.team_plan = Some(cleared);
+                    put_node(store, session.to_node())?;
+                    publish_plan_facts(&session, facts);
+                    return Err(anyhow::Error::new(RevisionFailsTheRun(cause)));
+                }
                 emit_run_error(subscribers, run_id, e);
                 continue;
             }

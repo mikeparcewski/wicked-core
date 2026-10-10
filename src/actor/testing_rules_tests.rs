@@ -194,11 +194,12 @@ fn a_held_rescore_with_an_unholdable_rule_fails_the_boundary() {
 }
 
 /// (core#846) A held re-score that newly fires a `step:security_review` rule on a run with no
-/// code-executing step fails the run at the boundary, naming the rule — the revision would be
-/// refused (`security_review_on_non_code_plan`) and the raise dropped while the run went on
-/// without the review. On a code run the same rule is held as before.
+/// code-executing step FAILS THE RUN at the revision hook, naming the rule: floor fill refuses the
+/// raise (`security_review_on_non_code_plan`), and dropping it would run on without the review.
+/// Judged by floor fill itself, so a manual plan whose override exempts `security_review` is
+/// revised as before, and so is a code run.
 #[test]
-fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_boundary() {
+fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_run() {
     let _ = wicked_apps_core::emit::hermetic_test_spool();
     let mut store = open_store(Some(":memory:")).unwrap();
     let fact = crate::plan_gate::path_scored_diff(
@@ -216,8 +217,9 @@ fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_bound
         0,
     )
     .unwrap();
-    let held = |run: &str, steps: serde_json::Value| {
+    let held = |run: &str, steps: serde_json::Value, hc: HumanConfirm| {
         let mut s = session(run);
+        s.human_confirm = hc;
         let tp = s.team_plan.as_mut().unwrap();
         tp.accepted.as_mut().unwrap().steps = serde_json::from_value(steps).unwrap();
         tp.rescored = Some(crate::plan_gate::DiffRescore {
@@ -238,24 +240,42 @@ fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_bound
         });
         s
     };
+    let non_code = serde_json::json!({"steps": [
+        {"catalog": "produce", "id": "produce", "added_by": "plan"},
+        {"catalog": "critique", "id": "critique", "added_by": "floor"}]});
+    let mut sink = crate::event_log::EventSink::default();
     put_node(
         &mut store,
-        held(
-            "r-nc",
-            serde_json::json!({"steps": [
-                {"catalog": "produce", "id": "produce", "added_by": "plan"},
-                {"catalog": "critique", "id": "critique", "added_by": "floor"}]}),
-        )
-        .to_node(),
+        held("r-nc", non_code.clone(), HumanConfirm::None).to_node(),
     )
     .unwrap();
-    let err = super::refuse_unholdable_rules(&store, "r-nc")
-        .unwrap_err()
-        .to_string();
+    let err = super::apply_held_revision(&mut store, &mut sink, "r-nc").unwrap_err();
+    assert!(super::revision_fails_the_run(&err), "{err:#}");
+    let text = err.to_string();
     assert!(
-        err.contains("TST-1003") && err.contains("security_review_on_non_code_plan"),
-        "{err}"
+        text.contains("TST-1003") && text.contains("security_review_on_non_code_plan"),
+        "the run's error names the rule and the refusal: {text}"
     );
+    let tp = crate::domain::get_session(&store, "r-nc")
+        .unwrap()
+        .unwrap()
+        .team_plan
+        .unwrap();
+    assert!(tp.rescored.is_none(), "the held raise is taken");
+
+    // A manual plan whose override exempts `security_review`: floor fill honours it.
+    let mut exempt = non_code.clone();
+    exempt["override"] =
+        serde_json::json!({"remove": ["security_review"], "reason": "reviewed out of band"});
+    put_node(
+        &mut store,
+        held("r-ov", exempt, HumanConfirm::All).to_node(),
+    )
+    .unwrap();
+    if let Err(e) = super::apply_held_revision(&mut store, &mut sink, "r-ov") {
+        assert!(!super::revision_fails_the_run(&e), "{e:#}");
+    }
+    // A code run keeps the rule's review: nothing fails the run.
     put_node(
         &mut store,
         held(
@@ -263,9 +283,12 @@ fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_bound
             serde_json::json!({"steps": [
                 {"catalog": "build", "id": "build", "added_by": "plan"},
                 {"catalog": "review", "id": "review", "added_by": "floor"}]}),
+            HumanConfirm::None,
         )
         .to_node(),
     )
     .unwrap();
-    super::refuse_unholdable_rules(&store, "r-code").unwrap();
+    if let Err(e) = super::apply_held_revision(&mut store, &mut sink, "r-code") {
+        assert!(!super::revision_fails_the_run(&e), "{e:#}");
+    }
 }
