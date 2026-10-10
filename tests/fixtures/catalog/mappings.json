@@ -228,12 +228,11 @@
    {
     "catalog": "produce",
     "id": "capture",
-    "instructions": "Phase 3/3 CAPTURE: from the prior churn + hotspot understanding, submit durable learnings as estate proposals through the shim's `propose` per the skill's capture contract — BOTH memories (facts / how-it-works) and policies (enforced conventions), one proposal per item, tagged repo/project. Each is inert until human review; never include secrets or personal data. END with `wicked-capture-report {\"derived\": N, \"submitted\": M, \"failed\": K}` — always, even on a degrade or a legitimate 0 (which is acceptable).",
+    "instructions": "Phase 3/3 CAPTURE: from the prior churn + hotspot understanding, submit durable learnings as estate proposals through the shim's `propose` per the skill's capture contract — BOTH memories (facts / how-it-works) and policies (enforced conventions), one proposal per item, tagged repo/project. Each is inert until human review; never include secrets or personal data; capturing nothing is acceptable.",
     "depends_on": [
      "hotspots"
     ],
-    "skill_ref": "wicked-garden-repo-learn",
-    "requires_capture_report": true
+    "skill_ref": "wicked-garden-repo-learn"
    }
   ],
   "bold": {}
