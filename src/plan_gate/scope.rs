@@ -831,6 +831,12 @@ mod tests {
         assert!(writes_nothing.writes_nothing());
         assert!(!may_write.writes_nothing());
         assert!(!mixed.writes_nothing(), "every creator step must say so");
+        // (codex r1) A `run` Tool step is an arbitrary command the diff re-score never measures.
+        let with_run = plan(json!({"steps": [
+            {"catalog": "produce", "writes_nothing": true},
+            {"catalog": "run", "id": "mutate", "executor": {"type": "tool", "cmd": ["sh"]}}
+        ]}));
+        assert!(!with_run.writes_nothing());
         assert!(!plan(json!({"steps": [{"catalog": "understand"}]})).writes_nothing());
 
         let empty = "SCOPE {\"touch\":[]}";

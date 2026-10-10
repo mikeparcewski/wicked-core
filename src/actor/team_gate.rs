@@ -3224,6 +3224,28 @@ pub(super) fn refuse_unholdable_rules(store: &dyn GraphStore, run_id: &str) -> a
             }
         );
     }
+    // (core#846) A rule the diff re-score newly fired that requires a `security_review` on a run
+    // that executes no code: floor fill would refuse the revision (its diff floor can never pass),
+    // and the revision hook would drop the raise and run on without the rule's review. Fail the
+    // run here instead, naming the rule — the compose-time refusal's mid-run twin.
+    let code = session
+        .team_plan
+        .as_ref()
+        .and_then(|t| t.accepted.as_ref())
+        .is_some_and(|a| a.steps.has_code_step_in(crate::catalog::catalog()));
+    if !code {
+        if let Some(o) = r.obligations.iter().find(|o| {
+            crate::plan::obligation_types(&o.token).is_some_and(|t| t.contains(&"security_review"))
+        }) {
+            anyhow::bail!(
+                "{}",
+                crate::plan::PlanRefusal::SecurityReviewOnNonCodePlan {
+                    step: "security_review".into(),
+                    rule: Some(o.rule.clone()),
+                }
+            );
+        }
+    }
     Ok(())
 }
 

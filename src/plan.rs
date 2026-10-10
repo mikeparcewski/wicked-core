@@ -459,9 +459,10 @@ impl PlanSteps {
         self.steps.iter().any(|s| is_creator_step(catalog, s))
     }
 
-    /// (core#649 option A) The plan has a creator step and EVERY creator step declares
-    /// `writes_nothing: true`: no step of it changes the run's tree, so an empty scope is an
-    /// honest answer.
+    /// (core#649 option A) The plan has a creator step, EVERY creator step declares
+    /// `writes_nothing: true`, and it has no `run` step: no step of it changes the run's tree, so
+    /// an empty scope is an honest answer. A `run` step is an arbitrary Tool command that the diff
+    /// re-score never measures (Tool units are un-teamed), so a plan with one never writes nothing.
     pub fn writes_nothing(&self) -> bool {
         self.writes_nothing_in(crate::catalog::catalog())
     }
@@ -469,11 +470,18 @@ impl PlanSteps {
     /// [`Self::writes_nothing`] against `catalog`.
     pub fn writes_nothing_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
         self.has_creator_in(catalog)
+            && !self.steps.iter().any(|s| s.catalog == "run")
             && self
                 .steps
                 .iter()
                 .filter(|s| is_creator_step(catalog, s))
                 .all(|s| s.writes_nothing == Some(true))
+    }
+
+    /// (core#846) Some step of the plan executes code (judged on the phase it composes to). A plan
+    /// with none is a NON-CODE plan: it may not carry a `security_review`.
+    pub fn has_code_step_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
+        self.steps.iter().any(|s| executes_code_step(catalog, s))
     }
 }
 

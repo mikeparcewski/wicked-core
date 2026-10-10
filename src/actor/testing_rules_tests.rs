@@ -192,3 +192,80 @@ fn a_held_rescore_with_an_unholdable_rule_fails_the_boundary() {
         "{err}"
     );
 }
+
+/// (core#846) A held re-score that newly fires a `step:security_review` rule on a run with no
+/// code-executing step fails the run at the boundary, naming the rule — the revision would be
+/// refused (`security_review_on_non_code_plan`) and the raise dropped while the run went on
+/// without the review. On a code run the same rule is held as before.
+#[test]
+fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_boundary() {
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    let mut store = open_store(Some(":memory:")).unwrap();
+    let fact = crate::plan_gate::path_scored_diff(
+        "r-nc",
+        1,
+        0,
+        1,
+        Some("t"),
+        &crate::review_scale::assess_intent(
+            true,
+            Some(&["docs/payments/refunds.md"]),
+            crate::review_scale::Graph::Unavailable("none".into()),
+            None,
+        ),
+        0,
+    )
+    .unwrap();
+    let held = |run: &str, steps: serde_json::Value| {
+        let mut s = session(run);
+        let tp = s.team_plan.as_mut().unwrap();
+        tp.accepted.as_mut().unwrap().steps = serde_json::from_value(steps).unwrap();
+        tp.rescored = Some(crate::plan_gate::DiffRescore {
+            ord: 1,
+            attempt: 0,
+            rescore_seq: 1,
+            score: 0,
+            destructive: false,
+            fact: crate::plan_gate::queued_facts(std::slice::from_ref(&fact))
+                .unwrap()
+                .pop()
+                .unwrap(),
+            obligations: vec![crate::plan::HeldObligation {
+                rule: "TST-1003".into(),
+                token: "step:security_review".into(),
+            }],
+            recalled: Vec::new(),
+        });
+        s
+    };
+    put_node(
+        &mut store,
+        held(
+            "r-nc",
+            serde_json::json!({"steps": [
+                {"catalog": "produce", "id": "produce", "added_by": "plan"},
+                {"catalog": "critique", "id": "critique", "added_by": "floor"}]}),
+        )
+        .to_node(),
+    )
+    .unwrap();
+    let err = super::refuse_unholdable_rules(&store, "r-nc")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("TST-1003") && err.contains("security_review_on_non_code_plan"),
+        "{err}"
+    );
+    put_node(
+        &mut store,
+        held(
+            "r-code",
+            serde_json::json!({"steps": [
+                {"catalog": "build", "id": "build", "added_by": "plan"},
+                {"catalog": "review", "id": "review", "added_by": "floor"}]}),
+        )
+        .to_node(),
+    )
+    .unwrap();
+    super::refuse_unholdable_rules(&store, "r-code").unwrap();
+}
