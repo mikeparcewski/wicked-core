@@ -127,6 +127,24 @@ pub(crate) fn acp_codex_mcp_refusal(
     if let Some(cwd) = cwd {
         sources.push(cwd.join(".codex").join("config.toml"));
     }
+    // (codex r1 on #825) codex-acp also merges a JSON `CODEX_CONFIG` from its environment into
+    // the session config — the child inherits the daemon's — and that layer can add servers too.
+    if let Some(raw) = std::env::var_os(CODEX_ACP_CONFIG_ENV).filter(|v| !v.is_empty()) {
+        let enabled = codex_acp_config_mcp_servers(&raw.to_string_lossy())?;
+        if !enabled.is_empty() {
+            return Err(format!(
+                "the inherited {CODEX_ACP_CONFIG_ENV} enables the MCP server(s) {} — the \
+                 codex-acp bridge merges it and takes no `-c` override, so the engine cannot pin \
+                 them off; drop them from {CODEX_ACP_CONFIG_ENV} (or set each `enabled: false`); \
+                 {REFUSAL_TAIL}",
+                enabled
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     for source in sources {
         let enabled = codex_enabled_mcp_servers(&source)?;
         if !enabled.is_empty() {
@@ -145,6 +163,51 @@ pub(crate) fn acp_codex_mcp_refusal(
         }
     }
     Ok(())
+}
+
+/// The variable codex-acp reads a JSON config layer from (its `startAcpServer`).
+pub(crate) const CODEX_ACP_CONFIG_ENV: &str = "CODEX_CONFIG";
+
+/// The MCP servers a `CODEX_CONFIG` JSON layer could enable: every entry of an `mcp_servers`
+/// object whose `enabled` is not `false`, and every dotted `mcp_servers.<name>…` key other than
+/// `mcp_servers.<name>.enabled: false`. Not JSON, or not an object, is an `Err` (fail closed).
+fn codex_acp_config_mcp_servers(raw: &str) -> Result<Vec<String>, String> {
+    let doc: Value = serde_json::from_str(raw).map_err(|e| {
+        format!("the inherited {CODEX_ACP_CONFIG_ENV} is not valid JSON ({e}); {REFUSAL_TAIL}")
+    })?;
+    let Some(map) = doc.as_object() else {
+        return Err(format!(
+            "the inherited {CODEX_ACP_CONFIG_ENV} is not a JSON object; {REFUSAL_TAIL}"
+        ));
+    };
+    let mut enabled: Vec<String> = Vec::new();
+    for (key, value) in map {
+        if key == "mcp_servers" {
+            match value {
+                Value::Object(servers) => enabled.extend(
+                    servers
+                        .iter()
+                        .filter(|(_, v)| v.get("enabled").and_then(Value::as_bool) != Some(false))
+                        .map(|(k, _)| k.clone()),
+                ),
+                _ => {
+                    return Err(format!(
+                        "the inherited {CODEX_ACP_CONFIG_ENV} has an `mcp_servers` that is not an \
+                         object; {REFUSAL_TAIL}"
+                    ))
+                }
+            }
+        } else if let Some(rest) = key.strip_prefix("mcp_servers.") {
+            let name = rest.split('.').next().unwrap_or(rest);
+            let disables = rest.ends_with(".enabled") && value.as_bool() == Some(false);
+            if !disables {
+                enabled.push(name.to_string());
+            }
+        }
+    }
+    enabled.sort();
+    enabled.dedup();
+    Ok(enabled)
 }
 
 /// The ENABLED server names in a codex `config.toml`: every `[mcp_servers.<name>]` whose
@@ -874,6 +937,11 @@ mod tests {
     /// refused at spawn; `enabled = false` (codex's own switch) or no server at all passes.
     #[test]
     fn an_acp_codex_seat_with_an_enabled_mcp_server_is_refused() {
+        // `CODEX_CONFIG` is read from the process environment: hold the env lock against the test
+        // that sets it.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let base = std::env::temp_dir().join(format!("wicked-660-acp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let seat = base.join("codex");
@@ -930,5 +998,46 @@ mod tests {
             "an unreadable config fails closed"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// codex r1 on #825: the JSON layer codex-acp merges from `CODEX_CONFIG` counts as a source.
+    #[test]
+    fn a_codex_acp_config_layer_that_enables_a_server_is_refused() {
+        assert_eq!(codex_acp_config_mcp_servers(r#"{"model":"x"}"#), Ok(vec![]));
+        assert_eq!(
+            codex_acp_config_mcp_servers(
+                r#"{"mcp_servers":{"a":{"command":"x"},"b":{"command":"y","enabled":false}}}"#
+            ),
+            Ok(vec!["a".to_string()])
+        );
+        assert_eq!(
+            codex_acp_config_mcp_servers(
+                r#"{"mcp_servers.c.command":"x","mcp_servers.d.enabled":false}"#
+            ),
+            Ok(vec!["c".to_string()])
+        );
+        assert!(codex_acp_config_mcp_servers("[1]").is_err());
+        assert!(codex_acp_config_mcp_servers("not json").is_err());
+
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(CODEX_ACP_CONFIG_ENV);
+        let seat = std::env::temp_dir().join(format!("wicked-660-cc-{}", std::process::id()));
+        std::fs::create_dir_all(&seat).unwrap();
+        std::env::set_var(
+            CODEX_ACP_CONFIG_ENV,
+            r#"{"mcp_servers":{"ambient":{"command":"x"}}}"#,
+        );
+        let err = acp_codex_mcp_refusal(Some(&seat), None).unwrap_err();
+        assert!(
+            err.contains("`ambient`") && err.contains("CODEX_CONFIG"),
+            "{err}"
+        );
+        match saved {
+            Some(v) => std::env::set_var(CODEX_ACP_CONFIG_ENV, v),
+            None => std::env::remove_var(CODEX_ACP_CONFIG_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&seat);
     }
 }
