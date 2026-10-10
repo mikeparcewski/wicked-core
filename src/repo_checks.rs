@@ -2976,6 +2976,8 @@ pub(crate) struct FloorCheckout {
     worktree: PathBuf,
     /// Every blob entry written: `(mode, blob id, path)` — what [`Self::hold_to`] re-checks.
     entries: Vec<(String, String, PathBuf)>,
+    /// Every symlink entry's target as written (unix).
+    links: Vec<(PathBuf, Vec<u8>)>,
 }
 
 impl Drop for FloorCheckout {
@@ -3045,6 +3047,7 @@ pub(crate) fn checkout_guarded_tree(
         git_dir: git_dir.to_path_buf(),
         worktree: worktree.to_path_buf(),
         entries: Vec::new(),
+        links: Vec::new(),
     };
     // `--no-checkout` (codex r1 on the slice): a checkout runs the repository's `post-checkout`
     // hook and its configured smudge filters OUTSIDE the floor's sandbox. The worktree is made
@@ -3071,7 +3074,7 @@ pub(crate) fn checkout_guarded_tree(
         &env[..1],
     )
     .map_err(|e| format!("the guarded tree {tree} could not be checked out for the floor: {e}"))?;
-    checkout.entries = write_tree_blobs(worktree, git_dir, tree, &dir)
+    (checkout.entries, checkout.links) = write_tree_blobs(worktree, git_dir, tree, &dir)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
     crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
         .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
@@ -3083,12 +3086,13 @@ pub(crate) fn checkout_guarded_tree(
 /// `export-ignore`). Regular files keep their executable bit; a symlink entry becomes a symlink
 /// (unix) or a plain file holding its target; a submodule becomes an empty directory. A path that
 /// is absolute or climbs out of `dir` is refused.
+#[allow(clippy::type_complexity)]
 fn write_tree_blobs(
     worktree: &Path,
     git_dir: &Path,
     tree: &str,
     dir: &Path,
-) -> Result<Vec<(String, String, PathBuf)>, String> {
+) -> Result<(Vec<(String, String, PathBuf)>, Vec<(PathBuf, Vec<u8>)>), String> {
     use std::io::{BufRead, Read, Write};
     let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
     let listing = crate::worktree_guard::git(worktree, &["ls-tree", "-r", "-z", tree], &env)
@@ -3139,6 +3143,8 @@ fn write_tree_blobs(
         }
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
+    // (codex r3) A symlink entry's TARGET, as written — what `hold_to` compares it against.
+    let mut links: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for (mode, sha, path) in &blobs {
         let mut header = String::new();
         out.read_line(&mut header).map_err(|e| e.to_string())?;
@@ -3169,8 +3175,10 @@ fn write_tree_blobs(
         match mode.as_str() {
             #[cfg(unix)]
             "120000" => {
-                let target = String::from_utf8_lossy(&body).into_owned();
+                use std::os::unix::ffi::OsStrExt;
+                let target = std::ffi::OsStr::from_bytes(&body);
                 std::os::unix::fs::symlink(target, path).map_err(|e| e.to_string())?;
+                links.push((path.clone(), body.clone()));
             }
             _ => {
                 std::fs::write(path, &body).map_err(|e| e.to_string())?;
@@ -3188,10 +3196,13 @@ fn write_tree_blobs(
     for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
     }
-    Ok(entries
-        .into_iter()
-        .filter(|(m, _, _)| m != "160000")
-        .collect())
+    Ok((
+        entries
+            .into_iter()
+            .filter(|(m, _, _)| m != "160000")
+            .collect(),
+        links,
+    ))
 }
 
 impl FloorCheckout {
@@ -3228,7 +3239,6 @@ impl FloorCheckout {
     /// symlink. Untracked files a check created are not entries and are not judged — only what
     /// ships is.
     fn changed_entries(&self) -> Result<Vec<String>, String> {
-        use std::io::Write;
         let rel = |p: &Path| p.strip_prefix(&self.dir).unwrap_or(p).display().to_string();
         let mut changed = Vec::new();
         let mut files: Vec<&(String, String, PathBuf)> = Vec::new();
@@ -3237,53 +3247,66 @@ impl FloorCheckout {
             match std::fs::symlink_metadata(path) {
                 Err(_) => changed.push(rel(path)),
                 Ok(m) if mode == "120000" => {
-                    if !m.file_type().is_symlink() {
+                    // A symlink stays a symlink, to the SAME target (codex r3).
+                    #[cfg(unix)]
+                    let same = m.file_type().is_symlink()
+                        && self.links.iter().any(|(p, want)| {
+                            use std::os::unix::ffi::OsStrExt;
+                            p == path
+                                && std::fs::read_link(path)
+                                    .is_ok_and(|t| t.as_os_str().as_bytes() == want.as_slice())
+                        });
+                    #[cfg(not(unix))]
+                    let same = m.is_file();
+                    if !same {
                         changed.push(rel(path));
                     }
                 }
                 Ok(m) if !m.is_file() => changed.push(rel(path)),
-                Ok(_) => files.push(e),
-            }
-        }
-        if files.is_empty() {
-            return Ok(changed);
-        }
-        // spawn-audit: hardened — git plumbing hashing the floor checkout's own files.
-        let mut cmd = Command::new("git");
-        cmd.hardened()
-            .args(["hash-object", "--no-filters", "--stdin-paths"])
-            .current_dir(&self.worktree)
-            .env("GIT_DIR", &self.git_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().map_err(|e| format!("git hash-object: {e}"))?;
-        let mut stdin = child.stdin.take().ok_or("git hash-object has no stdin")?;
-        let paths: Vec<String> = files
-            .iter()
-            .map(|(_, _, p)| p.to_string_lossy().into_owned())
-            .collect();
-        let feeder = std::thread::spawn(move || {
-            for p in paths {
-                if writeln!(stdin, "{p}").is_err() {
-                    break;
+                Ok(m) => {
+                    // The executable bit is part of what ships (codex r3).
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let exec = m.permissions().mode() & 0o111 != 0;
+                        if exec != (mode == "100755") {
+                            changed.push(rel(path));
+                            continue;
+                        }
+                    }
+                    let _ = m;
+                    files.push(e);
                 }
             }
-        });
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        let _ = feeder.join();
-        let text = String::from_utf8_lossy(&out.stdout);
-        let shas: Vec<&str> = text.lines().collect();
-        if shas.len() != files.len() {
-            return Err(format!(
-                "git hash-object answered {} of {} paths",
-                shas.len(),
-                files.len()
-            ));
         }
-        for ((_, sha, path), now) in files.iter().zip(shas) {
-            if sha != now {
-                changed.push(rel(path));
+        // Paths as ARGUMENTS, in chunks (codex r3: a newline in a name splits `--stdin-paths`).
+        for chunk in files.chunks(256) {
+            let mut args: Vec<String> = vec![
+                "hash-object".to_string(),
+                "--no-filters".to_string(),
+                "--".to_string(),
+            ];
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|(_, _, p)| p.to_string_lossy().into_owned()),
+            );
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let env: [(&str, &Path); 1] = [("GIT_DIR", self.git_dir.as_path())];
+            let text = crate::worktree_guard::git_string(&self.worktree, &refs, &env)
+                .map_err(|e| e.to_string())?;
+            let shas: Vec<&str> = text.lines().collect();
+            if shas.len() != chunk.len() {
+                return Err(format!(
+                    "git hash-object answered {} of {} paths",
+                    shas.len(),
+                    chunk.len()
+                ));
+            }
+            for ((_, sha, path), now) in chunk.iter().zip(shas) {
+                if sha != now {
+                    changed.push(rel(path));
+                }
             }
         }
         Ok(changed)
@@ -6229,6 +6252,8 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         let wt = scratch("guarded-checkout");
         std::fs::write(wt.join("app.txt"), "v1\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("app.txt", wt.join("link")).unwrap();
         std::fs::write(wt.join(".gitignore"), ".env.local\n").unwrap();
         std::fs::create_dir_all(wt.join(".wicked")).unwrap();
         std::fs::write(
@@ -6292,6 +6317,28 @@ mod tests {
             ok.passed,
             "an untracked artifact is not a change to what ships: {ok:?}"
         );
+        // (codex r3) A mode flip or a retargeted symlink is a change to what ships, too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut flipped = ok.clone();
+            let app = dir.join("app.txt");
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+            checkout.hold_to(&snap.tree, &mut flipped);
+            assert!(!flipped.passed, "a chmod +x is a change: {flipped:?}");
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mut relinked = ok.clone();
+            let link = dir.join("link");
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("new.txt", &link).unwrap();
+            checkout.hold_to(&snap.tree, &mut relinked);
+            assert!(
+                !relinked.passed,
+                "a retargeted symlink is a change: {relinked:?}"
+            );
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("app.txt", &link).unwrap();
+        }
         std::fs::write(dir.join("app.txt"), "rewritten by a check\n").unwrap();
         checkout.hold_to(&snap.tree, &mut ok);
         assert!(!ok.passed, "{ok:?}");
