@@ -136,6 +136,41 @@ Two different failures produce a healthy-looking report, and coverage is what te
 Neither number is complete without the other: gaps enumerate untested *behaviors*,
 `unexercised` enumerates untested *rules*.
 
+## The memory axis — do your memories surface for the actions they steer? (core#397)
+
+Rules are half of what steers a worker; the other half is what it **remembers**. A memory you
+stored ("in this repo never force-push"; "the release train needs X") only helps if the
+worker's recall surfaces it for the action it was meant for. The memory axis asks exactly that.
+
+- **The recall is the worker's own.** Governed workers recall through garden's `mem` skill →
+  estate MCP `memory.recall` with `token_budget: 2000`, `scope_prefix: ""` and no intent; the
+  eval runs the same `MemoryApi::recall` in-process, with the sample's text (description, tool,
+  files, content) as the query. It opens the store **read-only** (the `.memext` sidecar index is
+  rebuilt in memory, never on disk).
+- **The store is named, never guessed:** `memoryDb` (binding) / `--memory-db` (CLI) is the memory
+  db the workers recall from. Without it the report's `memory` is `null`, and a sample that
+  declares memories fails the run (fail-closed — silence would read as a pass).
+- **Samples declare** `expected_memories` and/or `unexpected_memories`: each entry is
+  `id:<memory id>` (the id `memory.list` and the studio browse show) or a case-insensitive
+  **content substring** (what a hand-authored corpus uses).
+
+| Verdict (per sample, `results[].memory.verdict`) | Meaning |
+|---|---|
+| `caught` | every expected memory surfaced, no unexpected one did |
+| `gap` | an expected memory did **not** surface (`missing` names it) — the memory exists but recall does not reach it for this action; reword it, or capture it closer to the action |
+| `false_positive` | an unexpected memory surfaced (`unexpected_surfaced`) — recall hands the worker a memory that does not apply here |
+
+`results[].memory` is `{surfaced: [memory id…], missing, unexpected_surfaced, verdict}` or
+`null` (the sample declares no memories). The report's `memory` is
+`{summary: {total, caught, gaps, false_positives}, coverage: {memories, surfaced, unsurfaced:
+[{memory_id, scope}]}}` or `null`: `summary` counts only the samples that declare memories;
+`coverage` is over every evaluated sample's recall — **`unsurfaced` lists stored memories no
+action in the corpus surfaces**, the memory twin of `rule_coverage.unexercised`.
+
+```bash
+wicked-core rules eval --corpus ./our-actions.json --memory-db <the memory db your workers recall from> --json
+```
+
 ## The sample format
 
 A **corpus** is `{ "name": string, "samples": Sample[] }`. A **Sample** is exactly:
@@ -366,7 +401,7 @@ body. Run against the imported corpus by passing the receipt's `scope` back as `
 The napi layer exports the two calls; crew presence-gates its routes on them:
 
 - `core.governanceEvals(argsJson: string) → string` — args
-  `{ type?, corpus?, knowledgeDb?, dbPath }`; returns the report JSON string, which crew
+  `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }`; returns the report JSON string, which crew
   forwards verbatim.
 - `core.governanceCorpusImport(argsJson: string) → string` — args
   `{ name, samples, knowledgeDb }`; returns the `{imported, scope, embedded}` receipt as a

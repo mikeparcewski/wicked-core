@@ -39,7 +39,7 @@
 //!       # $WICKED_KNOWLEDGE_DB/$WICKED_XEDGE_DB) also writes knowledge→code about-xedges
 //!       # (the knowledge.relate_code seam) for docs ingested into the knowledge domain
 //!   wicked-core rules eval [--corpus <evals:scope | dir | file.json>] [--type <t>] [--db <F>] \
-//!       [--knowledge-db <F>] [--json]              # replay a behavior corpus through the REAL
+//!       [--knowledge-db <F>] [--memory-db <F>] [--json]  # replay a behavior corpus through the REAL
 //!       # SELECT→DECIDE gate path and score caught/gap/false-positive per sample; gaps carry
 //!       # nearest non-firing rules by embedding similarity (facet-only keyword hints, marked,
 //!       # when no usable embeddings exist). Read-only on the rules store.
@@ -227,7 +227,7 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          recall volume (documented unavailable in-band — the store keeps no recall telemetry). \
          READ-ONLY, strictly a report: exit 0 = report produced, 1 = operational error.\n\
          wicked-core rules eval [--corpus <evals:scope | dir | file.json>] [--type <steering-type>] \
-         [--db <rules.db>] [--knowledge-db <F>] [--json]\n  \
+         [--db <rules.db>] [--knowledge-db <F>] [--memory-db <F>] [--json]\n  \
          Replay a behavior corpus (default: the built-in dev-behaviors corpus) through the REAL \
          SELECT→DECIDE gate path against the rules in --db: a bad sample a blocking rule fires for \
          is CAUGHT, one nothing fires for is a GAP (with nearest non-firing rules by embedding \
@@ -2547,11 +2547,23 @@ fn rules_eval_cmd(args: &[String]) {
             return;
         }
     };
-    let report = match wicked_governance::run_evals(
+    // (core#397) The memory axis: the store workers recall from, opened read-only.
+    let memory = match guarded("--memory-db") {
+        None => None,
+        Some(p) => match wicked_governance::open_memory_ro(&p) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                fail(&format!("rules eval: {e}"));
+                return;
+            }
+        },
+    };
+    let report = match wicked_governance::run_evals_with_memory(
         &store,
         &samples,
         steering_type.as_deref(),
         Some(&knowledge_db),
+        memory.as_ref(),
         now_secs(),
     ) {
         Ok(r) => r,
@@ -2579,6 +2591,18 @@ fn rules_eval_cmd(args: &[String]) {
          (rules store: {resolved_db})",
         s.total, s.caught, s.gaps, s.false_positives
     );
+    if let Some(m) = &report.memory {
+        println!(
+            "memory axis: {} sample(s) — {} caught, {} gap(s), {} false positive(s); {} of {} \
+             stored memories surfaced",
+            m.summary.total,
+            m.summary.caught,
+            m.summary.gaps,
+            m.summary.false_positives,
+            m.coverage.surfaced,
+            m.coverage.memories
+        );
+    }
     for r in &report.results {
         let tag = match r.verdict {
             wicked_governance::Verdict::Caught => "CAUGHT",
