@@ -163,11 +163,15 @@ fn started(ev: &std::sync::mpsc::Receiver<CoreEvent>, sid: &str) -> serde_json::
         .unwrap_or_else(|| panic!("sessionStarted for {sid}: {evs:?}"))
 }
 
-/// `bug`, `feature` and `migration` (built-in presets since M1) require QE acceptance;
+/// `bug`, `feature` and `migration` (built-in presets since M1) and `editor-plugin` (X3, whose test step
+/// runs the editor conformance harness) require QE acceptance;
 /// the launch's decision is provisional and `required` (a plan has no diff to waive on).
 #[test]
 fn app_change_workflows_require_qe_acceptance_provisionally() {
-    for (i, wf) in ["bug", "feature", "migration"].iter().enumerate() {
+    for (i, wf) in ["bug", "feature", "migration", "editor-plugin"]
+        .iter()
+        .enumerate()
+    {
         let sid = format!("qe-req-{i}");
         let core = engine(&format!("req-{i}"));
         let ev = core.subscribe();

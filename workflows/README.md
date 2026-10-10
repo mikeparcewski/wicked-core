@@ -50,6 +50,18 @@ registry.load_dir("~/.wicked/workflows")?;            // overlay: your drop-in f
   places its composed `deliver` before it). It carries only the evidence-floor pin
   (`e2e7af1db9e48454`, seeded on the plan path), so it needs no one-time seed step. Its
   doctrine is the `governance/packs/mcp-server/` steering pack (MCPS-1001..1007).
+- `editor-plugin` is a **built-in preset only** (`src/presets/editor-plugin.json`; there is no
+  drop-in file, since this directory retires with M11). It makes an artifact editor plugin for
+  wicked-studio, modelled on `mcp-server`: scope and design (the contract against
+  DES-EDITOR-PLUGINS-001) gated, build with the `wicked-garden-editor-scaffold` skill (a
+  `wicked-pack.json` spec-2 pack with one self-contained `wicked.editor/1` entry), a test step that
+  runs the editor conformance harness (`scripts/editor/conformance.py`, headless Chromium against
+  studio's conformance host page) and is the run's QE phase (`qe_acceptance` required), a
+  security review on the platform specialist (grants asked for vs used, sandbox escapes), then the
+  `install-plan` dry run and the `consent_before` `install` (`scripts/editor/install.py`: the staged
+  copy under `~/.wicked/editors/<name>/current` and wicked-crew's editor registry, which re-runs the
+  conformance itself). A delivering run's deliver goes before `install-plan`, as for `mcp-server`.
+  Launched from studio with `/workflow-editor-plugin` (Settings → Developer → Create an editor plugin).
 
 ## The minimal workflow
 
