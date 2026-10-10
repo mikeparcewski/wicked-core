@@ -216,6 +216,10 @@ fn core_for(name: &str, rework: Rework) -> (Core, Ran) {
             ran: ran.clone(),
         }),
     );
+    // (M1) `bug` launches the built-in PRESET now (PA scoping, floor fill). These tests exercise the
+    // guard over the def's own four phases, so they launch the same def under a test-local id.
+    core.register_workflow(include_str!("fixtures/workflows/bug-def.json"))
+        .expect("the bug def stand-in registers");
     (core, ran)
 }
 
@@ -238,7 +242,7 @@ fn launch(core: &Core, name: &str, repo: &Path, sid: &str) -> std::sync::mpsc::R
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: Some(entry.id),
-        workflow: Some("bug".into()),
+        workflow: Some("bug-def".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
