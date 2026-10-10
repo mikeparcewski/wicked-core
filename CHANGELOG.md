@@ -239,6 +239,16 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.48** — 2026-10-10 — npm release on main tip 026ece3, carrying #858, and recording
+  that the `core-ts-v0.7.47` tag (f868e35) also carried #855, #856 and #837, which merged before
+  #859. **#858 (X-MIG M9 prerequisite, core#649)**: `LaunchOptions.deliverables` (additive) lets a
+  plan or preset launch declare the paths its run must write; they join the last creator step's
+  `required_deliverables`, so the engine's deliverable floor judges them. They are refused with
+  neither a plan nor a preset, on a plan with no creator step, and for a blank path; a whole-plan
+  edit at the initial gate keeps them. **In the 0.7.47 tag**: built-in presets
+  `capture-learnings` (#855, M7: the capture step `writes_nothing`), `steering-author` (#856, M8:
+  propose `writes_nothing`) and `domain-extraction` (#837, M6: the coverage judge as shipped
+  is a self-verifying evaluator, so the run is not code work and floor fill adds no `build`).
 - **core-ts 0.7.47** — 2026-10-10 — npm release on main tip bf36b03, carrying #854 and #857.
   **#857 (wicked-crew#720)**: the state-home registry classifies crew's `artifacts/` (each run's
   final-codebase zip). Workers are denied it, and intake no longer refuses a launch once it exists.
