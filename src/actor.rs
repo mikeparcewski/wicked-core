@@ -6745,6 +6745,15 @@ fn apply_step_result(
         &mut fold_emit,
         coverage_db.as_deref(),
     )?;
+    // (F-7R3-001 / wicked-crew 0.9.4 smoke, F-SMOKE-004) The fold benches a judge seat that
+    // refused on the STORED session. This copy was read before the fold, and every write of it
+    // below would drop that bench, so the next unit's judge rotated onto the benched seat again.
+    // Adopt the fold's benches before any write (first reason wins, as `bench_seat` keeps it).
+    if let Some(stored) = crate::domain::get_session(store, &run_id)? {
+        for seat in stored.benched_seats {
+            crate::domain::bench_seat(&mut session.benched_seats, seat);
+        }
+    }
     // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
     // approved a teamed unit whose ledger does not let the run continue unattended.
     let team_dispute = team_review.as_deref().and_then(|gid| {
