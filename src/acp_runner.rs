@@ -4161,6 +4161,11 @@ fn exec_turn_acp_posture(
                 );
                 settled = Some(quiet);
                 found = true;
+                // The bridge is wedged: kill its group NOW, while this turn holds it, so a turn
+                // already waiting on this process (it cloned the `Arc` before the eviction) meets a
+                // dead bridge and fails through the ordinary death path instead of reusing it
+                // (codex r2 on #826).
+                proc.kill_handle.signal();
                 break 'exec;
             }
             Some(due) => due.min(remaining),
