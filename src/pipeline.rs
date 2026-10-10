@@ -1491,8 +1491,39 @@ pub(crate) fn apply_and_finish_unit(
     // verdict rendered over it. The evaluator's own verdict sits after the floors and BEFORE the
     // judge (DES-L1 review Q2): when both deny, the reviewer's findings — not the judge's prose —
     // name the gate and feed the rework; deny-dominant either way.
+    // (core#850, EX-01) The contract checked against the FACT, not only at distribution: a
+    // Review/Test unit that ran on a seat that built the work it checks — a dead-seat gate's
+    // provisional seating, an operator's reassignment — denies when the run requires a distinct
+    // evaluator, under the dead-seat class (reassign it to a distinct seat, or relaunch reduced).
+    let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) {
+        let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
+        evaluator_relation(&units, unit)
+            .filter(|rel| rel.on_builder_seat)
+            .and_then(|_| unit.assigned_cli.clone())
+            .map(|seat| {
+                crate::domain::UnitDenial::new(
+                    DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
+                    format!(
+                        "unit {} checks work built on `{seat}` and ran on that same seat; the run \
+                         requires a distinct evaluator ({}) — reassign it to a distinct signed-in \
+                         seat and approve to re-run, or relaunch with reduced assurance",
+                        unit.ord,
+                        crate::assurance::DISTINCT_EVALUATOR
+                    ),
+                )
+            })
+    } else {
+        None
+    };
+    // What the pinned validator concluded, for the receipt: `None` passed; a "failed" reason is a
+    // verdict it REACHED; a timeout or an unrunnable script reached none.
+    let det_reached_verdict = det_denial
+        .as_deref()
+        .is_none_or(|r| r.starts_with("pinned validator failed"));
+    let det_note = det_denial.clone();
     let validator_denial = guard_denial
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
+        .or(same_seat_denial)
         .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(capture_denial)
@@ -1751,11 +1782,43 @@ pub(crate) fn apply_and_finish_unit(
         &assurance,
         attempt,
         GateFacts {
-            pinned_ran: unit.validator.as_ref().is_some_and(|v| v.approved) && workdir.is_some(),
-            checks_ran: checks_ran && !default_floor_refused_unsandboxed,
-            checks_refused: default_floor_refused_unsandboxed
-                .then(|| floor_note.clone())
-                .flatten(),
+            pinned: unit.validator.as_ref().filter(|v| v.approved).map(|_| {
+                if workdir.is_some() && det_reached_verdict {
+                    Ok(())
+                } else {
+                    Err(det_note
+                        .clone()
+                        .unwrap_or_else(|| "no worktree to re-verify against".to_string()))
+                }
+            }),
+            // The checks RAN only when a report shows checks executed (or a prior verdict on this
+            // same tree was carried); a refused, missing or empty report is a skip.
+            checks: if carried.is_some()
+                || evidence
+                    .repo_checks
+                    .as_ref()
+                    .is_some_and(|r| !r.checks.is_empty())
+            {
+                Some(Ok(()))
+            } else if let Some(r) = evidence
+                .repo_checks
+                .as_ref()
+                .filter(|r| r.sandbox_error.is_some())
+            {
+                Some(Err((
+                    crate::assurance::SKIP_NO_BOUNDARY,
+                    r.sandbox_error.clone(),
+                )))
+            } else if checks_ran {
+                Some(Err((
+                    crate::assurance::SKIP_ERROR,
+                    Some(
+                        "the checks floor applied but no report of executed checks arrived".into(),
+                    ),
+                )))
+            } else {
+                None
+            },
             judge: agent_verdict,
             judge_skipped: evidence.judge_skipped.as_deref(),
             eval_ran: eval.as_ref().is_some_and(|e| !e.policies.is_empty()),
@@ -2240,11 +2303,57 @@ fn evaluator_layer(
     }
 }
 
+/// (core#850) [`crate::domain::UnitDenial::source`] when a Review/Test unit ran on a seat that
+/// built the work it checks, on a run whose contract requires a distinct evaluator.
+pub(crate) const DENIAL_SOURCE_SAME_SEAT_EVALUATOR: &str = "same_seat_evaluator";
+
+/// A Review/Test agent unit's relation to the work it checks, as distribution draws it: the
+/// Build/Recon agent units before it are its builders.
+struct EvaluatorRelation {
+    /// The most recent builder's seat.
+    creator: Option<String>,
+    /// Whether the unit's own seat is one of its builders' seats.
+    on_builder_seat: bool,
+}
+
+/// `None` for a unit that is not a Review/Test agent unit or has no builder before it.
+fn evaluator_relation(
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+) -> Option<EvaluatorRelation> {
+    use crate::domain::StageKind;
+    if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
+        return None;
+    }
+    let builders: Vec<&crate::domain::WorkUnit> = units
+        .iter()
+        .filter(|u| {
+            u.ord < unit.ord
+                && u.tool_cmd.is_none()
+                && matches!(u.stage, StageKind::Build | StageKind::Recon)
+        })
+        .collect();
+    if builders.is_empty() {
+        return None;
+    }
+    Some(EvaluatorRelation {
+        creator: builders
+            .iter()
+            .max_by_key(|u| u.ord)
+            .and_then(|c| c.assigned_cli.clone()),
+        on_builder_seat: unit
+            .assigned_cli
+            .as_ref()
+            .is_some_and(|e| builders.iter().any(|b| b.assigned_cli.as_ref() == Some(e))),
+    })
+}
+
 /// What the fold observed, for [`gate_receipt`].
 struct GateFacts<'a> {
-    pinned_ran: bool,
-    checks_ran: bool,
-    checks_refused: Option<String>,
+    /// `None`: no pinned validator; `Some(Ok)`: it reached a verdict; `Some(Err)`: it reached none.
+    pinned: Option<Result<(), String>>,
+    /// `None`: the floor did not apply; `Some(Ok)`: checks executed; `Some(Err((reason, detail)))`.
+    checks: Option<Result<(), (&'static str, Option<String>)>>,
     judge: Option<&'a crate::validator::AgentVerdict>,
     judge_skipped: Option<&'a str>,
     eval_ran: bool,
@@ -2268,27 +2377,14 @@ fn gate_receipt(
     let mut r = a::AssuranceReceipt::for_run(run, attempt);
     r.tree = f.tree;
     let seat = unit.assigned_cli.clone();
-    // The evaluator≠creator relation exactly as distribution draws it: a Review/Test agent unit
-    // grades the Build/Recon units before it; the fact is whether its seat is one of theirs.
-    use crate::domain::StageKind;
-    if unit.tool_cmd.is_none() && matches!(unit.stage, StageKind::Review | StageKind::Test) {
-        let units = crate::domain::session_units(store, session_id).unwrap_or_default();
-        let builders: Vec<&crate::domain::WorkUnit> = units
-            .iter()
-            .filter(|u| {
-                u.ord < unit.ord
-                    && u.tool_cmd.is_none()
-                    && matches!(u.stage, StageKind::Build | StageKind::Recon)
-            })
-            .collect();
-        r.creator = builders
-            .iter()
-            .max_by_key(|u| u.ord)
-            .and_then(|c| c.assigned_cli.clone());
-        r.evaluator = seat.clone();
-        if let Some(e) = &seat {
-            if builders.iter().any(|b| b.assigned_cli.as_ref() == Some(e)) {
-                r.skip(
+    // The evaluator≠creator relation exactly as distribution draws it ([`evaluator_relation`]).
+    let units = crate::domain::session_units(store, session_id).unwrap_or_default();
+    match evaluator_relation(&units, unit) {
+        Some(rel) => {
+            r.creator = rel.creator;
+            r.evaluator = seat.clone();
+            match (&seat, rel.on_builder_seat) {
+                (Some(e), true) => r.skip(
                     a::DISTINCT_EVALUATOR,
                     if run.reduced() {
                         a::SKIP_REDUCED
@@ -2296,28 +2392,35 @@ fn gate_receipt(
                         a::SKIP_NO_DISTINCT_SEAT
                     },
                     Some(format!("evaluated on a seat that built the work, `{e}`")),
-                );
-            } else if !builders.is_empty() {
-                r.ran(a::DISTINCT_EVALUATOR);
+                ),
+                (Some(_), false) => r.ran(a::DISTINCT_EVALUATOR),
+                (None, _) => {}
             }
         }
-    } else {
-        r.creator = seat;
+        None => r.creator = seat,
     }
-    if f.pinned_ran {
-        r.ran(a::PINNED_VALIDATOR);
+    match f.pinned {
+        Some(Ok(())) => r.ran(a::PINNED_VALIDATOR),
+        Some(Err(why)) => r.skip(a::PINNED_VALIDATOR, a::SKIP_ERROR, Some(why)),
+        None => {}
     }
-    if f.checks_ran {
-        r.ran(a::REPO_CHECKS);
-    } else if let Some(note) = f.checks_refused {
-        r.skip(a::REPO_CHECKS, a::SKIP_NO_BOUNDARY, Some(note));
+    match f.checks {
+        Some(Ok(())) => r.ran(a::REPO_CHECKS),
+        Some(Err((reason, detail))) => r.skip(a::REPO_CHECKS, reason, detail),
+        None => {}
     }
     match (f.judge, f.judge_skipped) {
-        (Some(v), _) if v.seat_failure.is_none() => {
+        // A judge RAN only when a seat answered: the bus path's transport failure and an
+        // unanswered request carry no `judge_cli` and are a skip, not a verdict (codex r1).
+        (Some(v), _) if v.seat_failure.is_none() && v.judge_cli.is_some() => {
             r.ran(a::JUDGE);
             r.judge = v.judge_cli.clone();
         }
-        (Some(v), _) => r.skip(a::JUDGE, a::SKIP_ERROR, v.seat_failure.clone()),
+        (Some(v), _) => r.skip(
+            a::JUDGE,
+            a::SKIP_ERROR,
+            v.seat_failure.clone().or_else(|| Some(v.reasoning.clone())),
+        ),
         (None, Some(why)) => r.skip(
             a::JUDGE,
             if run.reduced() {

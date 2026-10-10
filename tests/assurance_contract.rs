@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, StepInput, StepOutput,
+    StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -203,6 +203,37 @@ fn ex01_a_full_assurance_one_seat_run_never_reviews_on_its_creators_seat() {
     assert!(
         json_of(&evs, "gateEvaluated").is_empty(),
         "nothing was graded on the creator's seat: {evs:?}"
+    );
+    // (codex r1 P1) Approving the dead-seat gate releases the PROVISIONAL seating (both units on
+    // `codex`) without re-distributing — the fold still refuses the review that ran on its
+    // builder's seat, and the run parks again instead of completing.
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve");
+    let post = collect_until(&ev, Duration::from_secs(30), ends(sid));
+    assert!(
+        !post
+            .iter()
+            .any(|e| matches!(e, CoreEvent::SessionCompleted { session } if session == sid)),
+        "a full-assurance run never completes on a creator-seat review: {post:?}"
+    );
+    let review = json_of(&post, "gateEvaluated")
+        .into_iter()
+        .find(|g| g["ord"] == 2)
+        .unwrap_or_else(|| panic!("the review ran and was judged: {post:?}"));
+    assert_eq!(review["combined"], false);
+    assert_eq!(
+        review["denial"]["source"], "same_seat_evaluator",
+        "{review}"
+    );
+    assert_eq!(
+        review["assurance"]["skipped"][0]["instrument"],
+        "distinct_evaluator"
     );
 }
 

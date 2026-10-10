@@ -7008,6 +7008,9 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // no eligible seat left — a decision about SEATS, not a verdict on the work
         // (`domain::DENIAL_SOURCE_DEAD_SEAT`).
         Some("dead_seat") => "dead_seat",
+        // (core#850) A review that ran on a seat that built its work, on a run that requires a
+        // distinct evaluator — a decision about SEATS: reassign it, as for a dead seat.
+        Some(crate::pipeline::DENIAL_SOURCE_SAME_SEAT_EVALUATOR) => "dead_seat",
         // (core#772/#774) The judge never ran: every eligible judge seat failed (quota, sign-in,
         // an empty answer). A decision about SEATS, never a verdict on the work.
         Some(crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE) => "judge_unavailable",
@@ -7276,7 +7279,15 @@ fn denial_gate_prompt(
         // remains, so a plain retry re-runs the same refusal.
         "dead_seat" => {
             let cli = unit.assigned_cli.as_deref().unwrap_or("?");
-            if unit.last_attempt.is_none() {
+            if source == crate::pipeline::DENIAL_SOURCE_SAME_SEAT_EVALUATOR {
+                // (core#850) The seat is not dead — it built what this unit checks.
+                format!(
+                    "Unit {ord} ({cli}) reviewed work built on its own seat: {}. Reassign the unit \
+                     to a distinct seat (sign one in first if needed) and approve to retry, or \
+                     reject to stop the run{note}",
+                    reason_head(reason)
+                )
+            } else if unit.last_attempt.is_none() {
                 // (des-adjudicated §4.7, L3 PR-3A's gate) The unit was NEVER seated — the launch
                 // found no eligible seat and provisionally assigned `cli` without dispatching —
                 // so nothing "failed": the lever is a sign-in (approve retries on the provisional
@@ -15755,7 +15766,8 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            assurance: Default::default(),
+            // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
+            assurance: crate::assurance::RunAssurance::new(None, true),
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -15834,7 +15846,8 @@ mod request_changes_tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            assurance: Default::default(),
+            // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
+            assurance: crate::assurance::RunAssurance::new(None, true),
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [

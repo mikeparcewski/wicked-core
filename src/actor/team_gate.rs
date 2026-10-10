@@ -3488,6 +3488,8 @@ pub(super) fn revise_units(
                 k.collection_scope = o.collection_scope.clone();
                 k.exclude_seats = o.exclude_seats.clone();
                 k.capture_report = o.capture_report;
+                // (core#850) …and the receipt of its last gate (codex r1).
+                k.assurance = o.assurance.clone();
                 k.worker_failed_clis = o.worker_failed_clis.clone();
                 k.team_run = o.team_run;
                 k.team = o.team.clone();
