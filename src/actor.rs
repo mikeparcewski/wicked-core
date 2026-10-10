@@ -12156,6 +12156,37 @@ fn floor_rerun_request(
     })
 }
 
+/// (core#432 F-3R2-024) The creator's note for an evaluator's discarded edit: where it is pinned,
+/// which paths it touched, and the instruction to apply it or say why not. Bounded: at most 12
+/// paths, the rest counted.
+fn evaluator_suggestion_note(
+    m: &crate::worktree_guard::WorktreeMutation,
+    review_ord: u32,
+) -> String {
+    let paths: Vec<String> = m
+        .changed
+        .iter()
+        .take(12)
+        .map(|c| format!("{} {}", c.status, c.path))
+        .collect();
+    let more = m.changed.len().saturating_sub(12);
+    format!(
+        "EVALUATOR'S SUGGESTED EDIT (unit {review_ord}): while reviewing, that seat changed the tree; \
+         the guard set the change aside and pinned it at {} (tree {}): {}{}. Decide in this \
+         attempt: APPLY it (e.g. `git checkout {} -- <path>` for the paths you take) or DECLINE \
+         it, and say which in your output, with why. It is not applied for you.",
+        m.suggestion_ref.as_deref().unwrap_or("the suggestion ref"),
+        &m.after.tree[..m.after.tree.len().min(12)],
+        paths.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        },
+        m.suggestion_ref.as_deref().unwrap_or("<ref>"),
+    )
+}
+
 /// (core#467) The evaluator's edit `unit`'s gate can adopt: `unit` is an EVALUATOR the worktree
 /// guard denied, and the guard RESTORED the creator's tree and pinned the discarded edit
 /// (`suggestion_ref`). Anything else is refused — a recon rung's discarded note is not a
@@ -12455,6 +12486,17 @@ fn rewind_to_creator_scoped(
     let amendment = match &note {
         Some(n) => format!("{findings}\n{n}"),
         None => findings.clone(),
+    };
+    // (core#432 F-3R2-024) An evaluator-found fix gets a lane to land: when the reviewing seat
+    // wrote a change the guard set aside (restored the creator's tree, pinned the edit), a plain
+    // send-back hands the CREATOR that edit, by ref and paths, to apply or decline — it is never
+    // adopted silently (the creator owns it and its floor judges it) and never lost. `accept_
+    // suggestion` (core#467) is the operator applying it outright; this is the creator deciding.
+    let amendment = match (scope, adoptable_suggestion(cursor)) {
+        ("request_changes", Ok(m)) => {
+            format!("{amendment}\n{}", evaluator_suggestion_note(m, cursor.ord))
+        }
+        _ => amendment,
     };
     let target_ord = units[target_ix].ord;
     let review_attempt = cursor.last_attempt.unwrap_or(0);
@@ -16734,6 +16776,64 @@ mod request_changes_tests {
             );
             assert!(u.rework_of.is_none(), "unit {} is not reworked", u.ord);
         }
+    }
+
+    /// core#432 F-3R2-024 — Send back at an evaluator the worktree guard denied (its edit set
+    /// aside and pinned) hands the CREATOR that edit to apply or decline: the creator's rework
+    /// amendment names the ref and the paths. The edit is not applied for it.
+    #[test]
+    fn request_changes_hands_the_creator_the_evaluators_pinned_edit() {
+        let run_id = format!("rc-suggest-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, true);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let snap = |tree: &str| crate::worktree_guard::WorktreeSnapshot {
+            head: "h".into(),
+            head_ref: None,
+            tree: tree.into(),
+            git_dir: None,
+            taken_at_ms: 0,
+        };
+        let verify = units.iter_mut().find(|u| u.ord == 4).unwrap();
+        verify.status = UnitStatus::Rejected;
+        verify.last_attempt = Some(0);
+        let why = "worktree guard: the evaluator changed the tree".to_string();
+        verify.denial_reason = Some(why.clone());
+        verify.denial = Some(crate::domain::UnitDenial::new("worktree_guard", why));
+        verify.worktree_mutation = Some(crate::worktree_guard::WorktreeMutation {
+            before: snap("aaaa"),
+            after: snap("bbbbbbbbbbbbbbbb"),
+            changed: vec![crate::worktree_guard::ChangedPath {
+                status: "M".into(),
+                path: "src/App.tsx".into(),
+            }],
+            head_moved: false,
+            restored: true,
+            restore_error: None,
+            suggestion_ref: Some(format!("refs/wicked/suggestions/{run_id}/4/0")),
+        });
+        put_node(&mut store, verify.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges { note: None },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let fix = units.iter().find(|u| u.ord == 3).unwrap();
+        let note = fix.rework_amendment.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("EVALUATOR'S SUGGESTED EDIT (unit 4)"),
+            "{note}"
+        );
+        assert!(note.contains("M src/App.tsx"), "{note}");
+        assert!(
+            note.contains(&format!("refs/wicked/suggestions/{run_id}/4/0")),
+            "{note}"
+        );
+        assert!(note.contains("APPLY") && note.contains("DECLINE"), "{note}");
     }
 
     /// core#753 — Send back on a Tool unit whose PINNED VALIDATOR denied its result (the
