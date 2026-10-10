@@ -210,21 +210,26 @@ pub(crate) fn with_whole_files(
         if path.is_empty() {
             return Some(String::new());
         }
-        let out = crate::worktree_guard::git(
-            root,
-            &["cat-file", "-p", &format!("{rev}:{path}")],
-            &[("GIT_DIR", git_dir)],
-        );
-        match out {
-            Ok(b) if b.len() <= SURFACE_BYTES_CAP => Some(String::from_utf8_lossy(&b).into_owned()),
-            Ok(_) => None,
+        let object = format!("{rev}:{path}");
+        let env = [("GIT_DIR", git_dir)];
+        // The size first (codex r4): a large blob is never buffered, on the dispatch path.
+        let size = match crate::worktree_guard::git_string(root, &["cat-file", "-s", &object], &env)
+        {
+            Ok(n) => n.parse::<usize>().ok()?,
             // A path absent on a side (a new or deleted file) has an empty surface there.
-            Err(_) => Some(String::new()),
+            Err(_) => return Some(String::new()),
+        };
+        if size > SURFACE_BYTES_CAP {
+            return None;
         }
+        crate::worktree_guard::git(root, &["cat-file", "-p", &object], &env)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
     };
     let touched: Vec<(String, String)> = signals
         .touched
         .iter()
+        .filter(|f| rs::surface_relevant(&f.path) || rs::surface_relevant(&f.old_path))
         .take(HISTORY_PATH_CAP)
         .map(|f| (f.path.clone(), f.old_path.clone()))
         .collect();

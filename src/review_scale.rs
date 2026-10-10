@@ -1421,6 +1421,22 @@ pub(crate) fn public_surface(path: &str, content: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// (QE waiver) Whether a whole-file surface read can say anything for `path`: a code file whose
+/// language [`public_decl`] reads, or a dependency manifest/lockfile. Everything else (a binary, an
+/// image, a config file) is never read whole.
+pub(crate) fn surface_relevant(path: &str) -> bool {
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase());
+    manifest_kind(path).is_some()
+        || matches!(
+            ext.as_deref(),
+            Some("rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" | "py" | "go")
+        )
+}
+
 /// (QE waiver) The dependencies a whole manifest or lockfile declares (`None` for any other file).
 pub(crate) fn dependency_surface(path: &str, content: &str) -> Option<BTreeSet<String>> {
     let m = manifest_kind(path)?;
