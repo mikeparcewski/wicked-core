@@ -14,12 +14,11 @@
 //!       # output text on stdin (policy-over-output + conformance-rule recall) → decisions.ndjson
 //!   wicked-core provision-validator --criterion "..."   # author a deterministic validator (UNAPPROVED)
 //!   wicked-core approve-validator --pin <pin>     # approve a vaulted validator → the pin to put in a def
-//!   wicked-core gate-phase --workflow <base-id> --phase <phase-id> --criterion "..." [--out <dir>]
-//!       # author+approve a validator for the criterion, PIN it onto that phase, and write a gated
-//!       # drop-in workflow (new id) — the one path that turns a shipped, ungated workflow INTO a
-//!       # gated one so the rev0.4 dual-validator gate actually engages
+//!   wicked-core gate-phase --workflow <preset> --phase <step-id> --criterion "..."
+//!       # author+approve a validator for the criterion, PIN it onto that step, and save a gated
+//!       # preset (`<step>-gated-<preset>`) so the rev0.4 dual-validator gate engages on it
 //!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
-//!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
+//!       # domain-extraction preset pins, so it runs instead of failing closed
 //!   wicked-core rules ingest <dir>               # populate governance policies (deny) + conformance
 //!       # rules (recall→obligation) into the store: <dir>/policies/*.json + <dir>/rules/*.json +
 //!       # frontmattered markdown rule docs anywhere under <dir> (AW-3 MarkdownAdapter); doc
@@ -78,9 +77,9 @@ use std::io::BufRead;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
-    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
-    WrappedCliStepRunner, COVERAGE_DB_ENV, ESTATE_DB_ENV, GATE_CATALOG_ENV, GATE_DB_ENV,
-    GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
+    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WrappedCliStepRunner,
+    COVERAGE_DB_ENV, ESTATE_DB_ENV, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV,
+    GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -128,9 +127,9 @@ const ROOT_USAGE: &str = "usage: wicked-core <status | repos | register-repo --p
      resume --session <id> | reattach --session <id> | cancel --session <id> | \
      launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
      provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
-     seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
-     gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
-     (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]";
+     seed-domain-validators (seed the coverage validator the domain-extraction preset pins) | \
+     gate-phase --workflow <preset> --phase <step-id> --criterion \"...\" \
+     (author+approve+pin a validator onto a step → a gated preset)> [--db <path>]";
 
 /// Per-subcommand usage, consulted by ONE `--help` chokepoint.
 ///
@@ -623,20 +622,8 @@ fn approve_validator_cmd(args: &[String]) {
     }
 }
 
-/// The workflows overlay dir the planner resolves drop-ins from — `$WICKED_WORKFLOWS_DIR`, else
-/// `$HOME/.config/wicked-core/workflows` (mirrors `pipeline::workflow_overlay_dir`). `gate-phase`
-/// both READS this (to overlay operator drop-ins onto the built-ins before resolving `--workflow`)
-/// and, absent `--out`, WRITES the gated def here so the very next `run --workflow <new-id>` sees it.
-fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
-    if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {
-        return Some(std::path::PathBuf::from(d));
-    }
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".config/wicked-core/workflows"))
-}
-
 /// `seed-domain-validators`: seed the DETERMINISTIC, content-pinned coverage validator that the shipped
-/// `workflows/domain-extraction.json` gate carries (`validator_pin`) into the vault, so the drop-in
+/// domain-extraction preset's coverage step carries (`validator_pin`) into the vault, so the preset
 /// actually runs instead of failing closed at plan time. Unlike `provision-validator` (a live LLM writer
 /// whose script is nondeterministic and won't reproduce the pin), this vaults + approves the hand-authored
 /// `coverage.py --check` port directly, yielding exactly `COVERAGE_VALIDATOR_PIN`. Idempotent
@@ -662,7 +649,7 @@ fn seed_domain_validators_cmd(args: &[String]) {
                 "seeded + approved the domain-extraction coverage validator in {path}, pin: {pin}"
             );
             println!(
-                "(matches workflows/domain-extraction.json `validator_pin`; the drop-in now runs gated)"
+                "(matches the domain-extraction preset's `validator_pin`; the preset now runs gated)"
             );
             println!(
                 "NOTE: the vault is per-database. If a running engine still refuses this pin, it \
@@ -674,63 +661,31 @@ fn seed_domain_validators_cmd(args: &[String]) {
     }
 }
 
-/// `gate-phase --workflow <base-id> --phase <phase-id> --criterion "..." [--out <dir>]`: the one path
-/// that turns a shipped-style, UNGATED workflow into a GATED one. The built-in feature/bug/migration
-/// defs ship with `validator_pin: null` on every phase, so the rev0.4 dual-validator gate is INERT for
-/// them — it only engages for a phase carrying a `validator_pin`. This command closes that: it loads the
-/// base def, AUTHORS + APPROVES a deterministic validator for `--criterion` (a live `claude` call via the
-/// writer skill, exactly like `provision-validator`), PINS the approved pin onto the named phase, and
-/// writes the modified def as a NEW drop-in workflow JSON (fresh id, so it never clobbers the built-in)
-/// into the workflows overlay dir. The operator then runs `run --workflow <new-id>` and the gate engages.
+/// `gate-phase --workflow <preset> --phase <step-id> --criterion "..." [--db <path>]`: arm an operator's
+/// own criterion on one step of a preset. It loads the base PRESET (X-MIG M11: the built-ins are
+/// presets and the drop-in overlay is retired), AUTHORS + APPROVES a deterministic validator for
+/// `--criterion` (a live `claude` call via the writer skill, exactly like `provision-validator`), PINS
+/// the approved pin onto the named step, and saves the result as a NEW global preset
+/// `<step>-gated-<preset>`, which the operator launches by name. A step may pin a validator only where
+/// its catalog entry carries none (the entry's own floor is never swapped), so a step of a pinned
+/// entry (`build`, `test`, `review`, …) is refused naming why.
 ///
 /// Opens the store directly as its SOLE writer (the actor is NOT spawned — same reason as
-/// provision-validator/approve-validator). Fail-closed on an unknown workflow id or an unknown phase id
-/// (both name the valid choices).
+/// provision-validator/approve-validator). Fail-closed on an unknown preset or step id (both name the
+/// valid choices).
 fn gate_phase_cmd(args: &[String]) {
     let Some(workflow) = flag(args, "--workflow") else {
-        fail("gate-phase requires --workflow <base-id>");
+        fail("gate-phase requires --workflow <preset>");
         return;
     };
     let Some(phase) = flag(args, "--phase") else {
-        fail("gate-phase requires --phase <phase-id>");
+        fail("gate-phase requires --phase <step-id>");
         return;
     };
     let Some(criterion) = flag(args, "--criterion") else {
         fail("gate-phase requires --criterion \"...\"");
         return;
     };
-
-    // 1. Resolve the base WorkflowDef: the built-ins overlaid with operator drop-ins (the same seam the
-    //    planner resolves against), so `--workflow` can name a shipped OR a previously dropped-in workflow.
-    let mut reg = WorkflowRegistry::with_defaults();
-    if let Some(dir) = workflow_overlay_dir() {
-        if let Err(e) = reg.load_dir(&dir) {
-            eprintln!(
-                "gate-phase: workflow overlay {} failed to load ({e}); using built-ins only",
-                dir.display()
-            );
-        }
-    }
-    let Some(base) = reg.get(&workflow) else {
-        fail(&format!(
-            "gate-phase: unknown workflow `{workflow}` — known workflows: {}",
-            reg.ids().join(", ")
-        ));
-        return;
-    };
-    let mut def = base.clone();
-
-    // 2. Fail-closed on an unknown phase id, NAMING the valid phases so the operator can correct it.
-    if !def.phases.iter().any(|p| p.id == phase) {
-        let valid: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
-        fail(&format!(
-            "gate-phase: workflow `{workflow}` has no phase `{phase}` — valid phases: {}",
-            valid.join(", ")
-        ));
-        return;
-    }
-
-    // 3. AUTHOR + APPROVE a validator for the criterion (live `claude`), as the sole store writer.
     let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
         Err(e) => {
@@ -738,6 +693,55 @@ fn gate_phase_cmd(args: &[String]) {
             return;
         }
     };
+    // 1. The base preset: the store's row (a user preset, or a built-in a boot seeded), else the
+    //    compiled built-in of that name (a store no engine has booted on yet).
+    let base_steps = match wicked_core::resolve_preset(&store, None, &workflow) {
+        Ok(Some(p)) => p.steps,
+        Ok(None) => match wicked_core::builtin_presets()
+            .into_iter()
+            .find(|(n, _)| *n == workflow)
+        {
+            Some((_, steps)) => steps,
+            None => {
+                let known: Vec<&str> = wicked_core::builtin_presets()
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect();
+                fail(&format!(
+                    "gate-phase: unknown workflow `{workflow}` — no preset of that name; built-in \
+                     presets: {} (`GET /api/v1/presets` lists every preset)",
+                    known.join(", ")
+                ));
+                return;
+            }
+        },
+        Err(e) => {
+            fail(&format!(
+                "gate-phase: reading preset `{workflow}` failed: {e}"
+            ));
+            return;
+        }
+    };
+    // 2. The step, and whether its entry leaves the pin to the step.
+    let Some(step) = base_steps.iter().find(|s| s.id == phase) else {
+        let valid: Vec<&str> = base_steps.iter().map(|s| s.id.as_str()).collect();
+        fail(&format!(
+            "gate-phase: preset `{workflow}` has no step `{phase}` — valid steps: {}",
+            valid.join(", ")
+        ));
+        return;
+    };
+    if let Some(entry) = wicked_core::catalog_entry(&step.catalog) {
+        if entry.validator_pin.is_some() {
+            fail(&format!(
+                "gate-phase: step `{phase}` is a `{}` step, whose catalog entry pins its own floor — \
+                 a step may not swap it (pick a step of an unpinned entry, e.g. `understand`, `design`)",
+                step.catalog
+            ));
+            return;
+        }
+    }
+    // 3. AUTHOR + APPROVE a validator for the criterion (live `claude`), as the sole store writer.
     let runner = WrappedCliStepRunner::default();
     let unapproved = match wicked_core::provision_validator(&criterion, &runner, &mut store) {
         Ok(p) => p,
@@ -760,60 +764,35 @@ fn gate_phase_cmd(args: &[String]) {
             return;
         }
     };
-
-    // 4. PIN the approved validator onto the phase and RE-ID the def so the drop-in never clobbers the
-    //    built-in (a fresh id the operator selects with `run --workflow <new-id>`).
-    let new_id = format!("{phase}-gated-{workflow}");
-    def.id = new_id.clone();
-    for p in def.phases.iter_mut() {
-        if p.id == phase {
-            p.validator_pin = Some(approved.clone());
-        }
-    }
-
-    // 5. WRITE the gated def as a drop-in JSON: `--out` wins, else the resolved overlay dir (so the
-    //    very next `run --workflow <new-id>` picks it up without any extra config).
-    let Some(out_dir) = flag(args, "--out")
-        .map(std::path::PathBuf::from)
-        .or_else(workflow_overlay_dir)
-    else {
-        fail(
-            "gate-phase: no output dir — pass --out <dir>, or set $WICKED_WORKFLOWS_DIR / $HOME so the \
-             workflows overlay dir resolves",
-        );
-        return;
+    // 4. PIN it onto the step and save the gated preset under a fresh name.
+    let new_name = format!("{phase}-gated-{workflow}");
+    let steps: Vec<_> = base_steps
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            if s.id == phase {
+                s.validator_pin = Some(Some(approved.clone()));
+            }
+            s
+        })
+        .collect();
+    let spec = wicked_core::PresetSpec {
+        name: new_name.clone(),
+        project_id: None,
+        steps,
+        created_by: "gate-phase".to_string(),
     };
-    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+    if let Err(e) = wicked_core::put_preset(&mut store, spec, wicked_core::now_millis()) {
         fail(&format!(
-            "gate-phase: creating {} failed: {e}",
-            out_dir.display()
+            "gate-phase: saving preset `{new_name}` failed: {e}"
         ));
         return;
     }
-    let out_path = out_dir.join(format!("{new_id}.json"));
-    let json = match serde_json::to_string_pretty(&def) {
-        Ok(j) => j,
-        Err(e) => {
-            fail(&format!(
-                "gate-phase: serializing the gated def failed: {e}"
-            ));
-            return;
-        }
-    };
-    if let Err(e) = std::fs::write(&out_path, &json) {
-        fail(&format!(
-            "gate-phase: writing {} failed: {e}",
-            out_path.display()
-        ));
-        return;
-    }
-
-    println!("gated workflow written: {}", out_path.display());
-    println!("  new workflow id: {new_id}");
-    println!("  phase `{phase}` now pins APPROVED validator: {approved}");
+    println!("gated preset saved: {new_name}");
+    println!("  step `{phase}` now pins APPROVED validator: {approved}");
     println!(
-        "the dual-validator gate now ENGAGES for phase `{phase}`. run it with:\n  \
-         wicked-core run --problem \"...\" --workflow {new_id} --repo <id>"
+        "the dual-validator gate now ENGAGES for step `{phase}`. run it with:\n  \
+         wicked-core run --problem \"...\" --workflow {new_name} --repo <id>"
     );
 }
 

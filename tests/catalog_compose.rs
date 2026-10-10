@@ -4,12 +4,12 @@
 //! `(kind, role, gate, validator_pin, executes_code, executor, skill_ref, instructions, depends_on)`
 //! equals TODAY's def except exactly §11.2's bold cells, one fixture per consumer.
 //!
-//! "Today's def" is read LIVE for every consumer core owns — `WorkflowRegistry::with_defaults()`
-//! overlaid with the shipped `workflows/*.json`, which is what the engine resolves — and from
-//! `tests/fixtures/catalog/crew-defs.json` for the consumers only crew defines (dumped from crew
-//! `main` 4870c87 — see `tests/fixtures/catalog/README.md`), and from
+//! "Today's def" is read from `tests/fixtures/catalog/crew-defs.json` for the consumers only crew
+//! defines (dumped from crew `main` 4870c87 — see `tests/fixtures/catalog/README.md`), and from
 //! `tests/fixtures/catalog/migrated-defs.json` for the consumers whose def a migration seam
-//! deleted (M3 `chat`, M4 `onboarding`): the fixture keeps pinning their built-in presets. The steps and the bold cells are
+//! deleted — since X-MIG M11 that includes core's own (`feature`, `bug`, `migration`,
+//! `mcp-server`, `domain-extraction`, copied from the retired `workflows/*.json`): the fixture
+//! keeps pinning the built-in presets that replaced them. The steps and the bold cells are
 //! `tests/fixtures/catalog/mappings.json`; the bold cells are fixed values, and the migration
 //! cleanup cells are pinned again below in code.
 
@@ -17,9 +17,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
-use wicked_core::{
-    catalog, compose, plan_from_def, PlanRefusal, PlanSteps, WorkflowDef, WorkflowRegistry,
-};
+use wicked_core::{catalog, compose, plan_from_def, PlanRefusal, PlanSteps, WorkflowDef};
 
 const EVIDENCE_FLOOR_PIN: &str = "e2e7af1db9e48454";
 /// `COVERAGE_VALIDATOR_PIN`: shipped and APPROVED (the `domain_coverage` entry's pin).
@@ -68,22 +66,11 @@ fn read_json(path: PathBuf) -> Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// Today's def for every consumer: core's live defs, then crew's dumped ones.
+/// Today's def for every consumer, from the fixtures: crew's dumped defs and the defs the
+/// migration seams deleted (X-MIG M11 retired core's built-in defs and `workflows/*.json`, so their
+/// last shipped form lives in `migrated-defs.json` and keeps pinning the presets that replaced them).
 fn today_defs() -> BTreeMap<String, WorkflowDef> {
-    let mut reg = WorkflowRegistry::with_defaults();
-    let loaded = reg
-        .load_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workflows"))
-        .expect("the shipped workflows/ overlay loads");
-    // bug, domain-extraction, feature, mcp-server, migration.
-    assert_eq!(
-        loaded.len(),
-        5,
-        "every shipped workflow file loads: {loaded:?}"
-    );
     let mut out = BTreeMap::new();
-    for id in reg.ids() {
-        out.insert(id.clone(), reg.get(&id).unwrap().clone());
-    }
     let mut fixed = read_json(fixtures().join("crew-defs.json"))
         .as_object()
         .cloned()
@@ -100,7 +87,7 @@ fn today_defs() -> BTreeMap<String, WorkflowDef> {
         def.validate().unwrap();
         assert!(
             out.insert(consumer.clone(), def).is_none(),
-            "{consumer} is defined by core — its fixture must come from core, not a fixture file"
+            "{consumer} has two fixtures"
         );
     }
     out
@@ -758,25 +745,10 @@ fn a_misspelled_step_key_is_refused() {
     }
 }
 
-/// C1 acceptance (d): an owner-omitted def serializes byte-identically — the shipped workflow
-/// files that spell every field re-serialize to their exact bytes, no def or unit gains an
+/// C1 acceptance (d): an owner-omitted def serializes byte-identically — no def or unit gains an
 /// `owner` key, and an explicit `team` owner round-trips.
 #[test]
 fn an_owner_omitted_def_serializes_byte_identically() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workflows");
-    for name in ["feature", "bug", "migration"] {
-        // Compare the committed bytes: a Windows checkout may turn LF into CRLF (core.autocrlf).
-        let raw = std::fs::read_to_string(dir.join(format!("{name}.json")))
-            .unwrap()
-            .replace("\r\n", "\n");
-        let def: WorkflowDef = serde_json::from_str(&raw).unwrap();
-        let out = serde_json::to_string_pretty(&def).unwrap();
-        assert_eq!(
-            out.trim_end(),
-            raw.trim_end(),
-            "{name}.json re-serializes byte-identically"
-        );
-    }
     for (id, def) in today_defs() {
         let s = serde_json::to_string(&def).unwrap();
         assert!(!s.contains("\"owner\""), "{id} gained an owner key: {s}");

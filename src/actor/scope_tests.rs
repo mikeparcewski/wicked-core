@@ -365,7 +365,7 @@ fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
 #[test]
 fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
     let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
-    let registry = crate::workflow::WorkflowRegistry::with_defaults();
+    let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
     let spec = LaunchSpec {
         base_ref: None,
         project_id: None,

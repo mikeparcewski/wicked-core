@@ -299,14 +299,20 @@ fn the_pack_covers_every_shipped_phase_and_catalog_id() {
         .map(str::trim)
         .collect();
     let mut want: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(root.join("workflows")).unwrap().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let def: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        for phase in def["phases"].as_array().into_iter().flatten() {
+    // The phases the retired `workflows/*.json` shipped (X-MIG M11 kept their last form in the
+    // catalog fixtures; the presets that replaced them keep these step ids).
+    let shipped: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("tests/fixtures/catalog/migrated-defs.json")).unwrap(),
+    )
+    .unwrap();
+    for name in [
+        "bug",
+        "domain-extraction",
+        "feature",
+        "mcp-server",
+        "migration",
+    ] {
+        for phase in shipped[name]["phases"].as_array().into_iter().flatten() {
             want.push(phase["id"].as_str().unwrap().to_string());
         }
     }

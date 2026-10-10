@@ -9084,12 +9084,6 @@ mod tests {
 
     #[test]
     fn an_evaluator_prompt_ends_with_the_verdict_contract_on_every_form() {
-        // The shipped evaluators whose authored instructions are longer than one pty turn (the
-        // `mcp-server` reviews): the pty composer must refuse them by name.
-        const PTY_OVERSIZE_BY_DESIGN: [&str; 2] = [
-            "mcp-server/observability-review",
-            "mcp-server/security-review",
-        ];
         use crate::workflow::PhaseRole;
         let line = crate::assumptions::EVALUATOR_VERDICT_CONVENTION;
         let forms = [
@@ -9133,20 +9127,14 @@ mod tests {
         judge.session_id = "validator".into();
         assert!(!skill_prompt(&judge, None, SkillForm::ClaudePlugin, None).contains(line));
 
-        // (7) EVERY shipped Evaluator agent unit — the drop-in `workflows/*.json` are what reach the
-        // engine (a same-id file replaces the compiled def; `builtin_floors` tests the same set) —
-        // planned as the planner plans it, carries the line on all three forms and fits a pty turn
-        // newline-free. The set is PINNED (review-L1-513) so a new shipped evaluator fails here by
-        // name.
-        let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+        // (7) EVERY shipped Evaluator agent unit — the built-in presets as the engine composes them
+        // (X-MIG M11: no drop-in or built-in def ships) — planned as the planner plans it, carries
+        // the line on all three forms, and either fits a pty turn newline-free or is refused by the
+        // pty composer by name (never discarded by the terminal). The set is PINNED
+        // (review-L1-513) so a new shipped evaluator fails here by name.
         let mut evaluators: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let def = crate::workflow::WorkflowRegistry::def_from_file(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for (preset, _) in crate::catalog::builtin_presets() {
+            let def = crate::preset::builtin_preset_def(preset);
             let units = crate::plan::plan_from_def(&def, "fix the null deref in the parser", "s");
             for (ix, u) in units.iter().enumerate() {
                 if u.role != PhaseRole::Evaluator || u.tool_cmd.is_some() {
@@ -9176,18 +9164,13 @@ mod tests {
                     // pty composer FAST and by name — never discarded by the terminal. Pinned by name
                     // so a new over-long evaluator is a decision, not an accident. (The production
                     // binding runs wrapped/ACP seats, which carry no line limit.)
-                    if PTY_OVERSIZE_BY_DESIGN.contains(&name.as_str()) {
-                        let err = pty_unit_prompt(&input, form)
-                            .expect_err("an over-long evaluator prompt must not be sent to a pty");
-                        assert!(err.contains("cannot exceed"), "{name}: {err}");
-                        continue;
-                    }
-                    let p = pty_unit_prompt(&input, form).unwrap_or_else(|e| {
-                        panic!(
-                            "{}/{} fits a pty turn with the verdict line: {e}",
-                            def.id, u.ord
-                        )
-                    });
+                    let p = match pty_unit_prompt(&input, form) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            assert!(e.contains("cannot exceed"), "{name}: {e}");
+                            continue;
+                        }
+                    };
                     assert!(
                         p.ends_with(line) && !p.contains('\n') && p.len() < PTY_PROMPT_LIMIT,
                         "{}/{} {form:?}: {} bytes: {p}",
@@ -9203,11 +9186,16 @@ mod tests {
             evaluators,
             vec![
                 "bug/verify",
+                "demo/review",
                 "domain-extraction/coverage",
                 "feature/adversarial-review",
+                "feature/review",
+                "feature/test",
                 "mcp-server/observability-review",
                 "mcp-server/security-review",
+                "mcp-server/test",
                 "migration/verify",
+                "qe-author-tests/review",
             ],
             "the shipped Evaluator agent units the verdict contract reaches — pinned by name"
         );

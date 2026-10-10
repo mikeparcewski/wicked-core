@@ -170,18 +170,16 @@ pub(crate) struct PreDistributed {
     pub cli_keys: Vec<String>,
 }
 
-/// Resolve a selected workflow id to its validated [`WorkflowDef`]. When `extra` is provided it is
-/// consulted first (runtime-registered workflows take priority over built-ins and the file overlay);
-/// otherwise seeds the built-ins and overlays operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else
-/// `$HOME/.config/wicked-core/workflows`, best-effort). `None` (no selection) ⇒ `Ok(None)` and the
-/// caller uses the free-text planner; a requested-but-**unknown** id ⇒ `Err` (never a silent
-/// fallback).
+/// Resolve a selected workflow id to its validated [`WorkflowDef`]: a PRESET first, then a def
+/// registered at runtime (`extra`, the actor's registry), else refused. X-MIG M11: no built-in def
+/// and no file overlay remain (a drop-in left in `$WICKED_WORKFLOWS_DIR` is named once at boot and
+/// never registered). `None` (no selection) ⇒ `Ok(None)` and the caller uses the free-text planner;
+/// a requested-but-**unknown** id ⇒ `Err` (never a silent fallback).
 ///
 /// **Presets first (DES-TEAMING-002 §8.4, seam C2).** The id is resolved as a PRESET name before
 /// any registered def: the launch's project row, then the global row (built-ins are global rows
 /// seeded at boot), composed over the phase catalog (`crate::preset::compose_preset`). A name with
-/// no preset falls through to the registered defs below, so every workflow id that has not yet
-/// become a preset keeps launching its def. Every launcher — `Core::launch_run`, the campaign
+/// no preset falls through to the runtime-registered defs below. Every launcher — `Core::launch_run`, the campaign
 /// driver, the bus launch bridge — reaches this one resolver on the actor, so none resolves a
 /// preset itself.
 pub(crate) fn resolve_workflow_def(
@@ -206,45 +204,33 @@ pub(crate) fn resolve_workflow_def(
                 )
             });
     }
-    // When the caller provides an actor-owned registry (the interactive LaunchRun path), use it
-    // as the sole authoritative source: it already contains built-ins (seeded at actor startup
-    // via `with_defaults()`), the overlay directory (loaded at startup), and any runtime-registered
-    // workflows. Falling through to a disk re-scan when `extra` is present would be redundant I/O
-    // and could surface stale/inconsistent overlay files added after startup.
+    // The actor-owned registry (the LaunchRun path) holds the runtime-registered and per-run
+    // defs; a miss is a real typo or an unregistered id, refused naming what a launch can name.
+    let known = |reg: &crate::workflow::WorkflowRegistry| -> String {
+        let mut names: Vec<String> = crate::preset::list_presets(store, project_id)
+            .map(|ps| ps.into_iter().map(|p| p.name).collect())
+            .unwrap_or_default();
+        names.extend(reg.ids());
+        names.sort();
+        names.dedup();
+        names.join(", ")
+    };
     if let Some(reg) = extra {
-        // A requested-but-unknown id is a loud error here too — never a silent Ok(None) fallback.
-        // The actor-owned registry already contains built-ins + overlay workflows, so a miss is a
-        // real typo/invalid id, not a "not-yet-loaded" race.
         return reg
             .get(id)
             .cloned()
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown workflow `{id}` — known workflows: {}",
-                    reg.ids().join(", ")
-                )
+                anyhow::anyhow!("unknown workflow `{id}` — known workflows: {}", known(reg))
             })
             .map(Some);
     }
-    let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
-    if let Some(dir) = workflow_overlay_dir() {
-        // Best-effort dir read: a broken *overlay dir* must never wedge a built-in run (load_dir
-        // itself already skips individual bad files). Warn, don't fail.
-        if let Err(e) = reg.load_dir(&dir) {
-            eprintln!(
-                "wicked-core: workflow overlay {} failed to load ({e}); using built-ins only",
-                dir.display()
-            );
-        }
-    }
+    // No actor registry (a caller outside the actor): nothing is registered at runtime here.
+    let reg = crate::workflow::WorkflowRegistry::default();
     // A REQUESTED-but-unknown id is a loud error — never a silent fallback to the prose planner (a
     // `--workflow feaure` typo must not quietly produce a different plan than `--workflow feature`).
     match reg.get(id) {
         Some(def) => Ok(Some(def.clone())),
-        None => anyhow::bail!(
-            "unknown workflow `{id}` — known workflows: {}",
-            reg.ids().join(", ")
-        ),
+        None => anyhow::bail!("unknown workflow `{id}` — known workflows: {}", known(&reg)),
     }
 }
 
@@ -2636,7 +2622,7 @@ mod resolve_tests {
     #[test]
     fn workflow_selection_with_actor_registry() {
         use crate::workflow::WorkflowRegistry;
-        let reg = WorkflowRegistry::with_defaults();
+        let reg = WorkflowRegistry::legacy_fixtures();
 
         // Known id in actor registry resolves to def.
         assert_eq!(
@@ -3035,7 +3021,7 @@ mod resolve_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
 
-        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
         let pinned = registry
             .get("feature")
             .expect("the shipped feature def")
@@ -3109,11 +3095,8 @@ mod resolve_tests {
 
         // The real shipped JSON, loaded exactly as an operator's overlay dir would load it — not a
         // hand-built def. The pin under test is the one that actually ships.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
-            .join("domain-extraction.json");
-        let def = crate::workflow::WorkflowRegistry::def_from_file(&path)
-            .expect("domain-extraction.json parses + validates");
+        // (X-MIG M11) The shipped def is the built-in preset as the engine composes it.
+        let def = crate::preset::builtin_preset_def("domain-extraction");
         let coverage_pin = def
             .phases
             .iter()
@@ -3123,11 +3106,13 @@ mod resolve_tests {
         assert_eq!(
             coverage_pin,
             crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
-            "the shipped JSON pins the const the plan path seeds"
+            "the shipped preset pins the const the plan path seeds"
         );
         let id = def.id.clone();
-        let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
-        registry.register(def).expect("drop-in registers");
+        let mut registry = crate::workflow::WorkflowRegistry::default();
+        registry
+            .register_composed(def)
+            .expect("the composed preset registers");
 
         // domain-graph is now a deterministic `wicked-core domain-graph --db {code_graph_db}` Tool
         // (core#237 persist fix), so the workflow legitimately requires a bound repo to fill that
@@ -3667,7 +3652,7 @@ mod resolve_tests {
     #[test]
     fn a_preset_resolves_before_a_registered_def() {
         use crate::workflow::WorkflowRegistry;
-        let reg = WorkflowRegistry::with_defaults();
+        let reg = WorkflowRegistry::legacy_fixtures();
         let mut store = empty();
         crate::preset::seed_builtins(&mut store, 1).unwrap();
         let def = resolve_workflow_def(&store, None, Some("feature"), Some(&reg))

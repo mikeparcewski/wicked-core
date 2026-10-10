@@ -181,6 +181,22 @@ fn get_row(store: &dyn GraphRead, scope: &str, name: &str) -> anyhow::Result<Opt
     Ok((preset.deleted_at.is_none()).then_some(preset))
 }
 
+/// (Test fixture, X-MIG M11) A built-in preset's def as the engine composes it on a launch — the
+/// shipped def a test reads now that no built-in def or `workflows/*.json` copy remains.
+#[cfg(test)]
+pub(crate) fn builtin_preset_def(name: &str) -> crate::workflow::WorkflowDef {
+    let preset = Preset {
+        name: name.to_string(),
+        scope: GLOBAL_SCOPE.to_string(),
+        steps: crate::catalog::builtin_preset(name)
+            .unwrap_or_else(|| panic!("`{name}` is a built-in preset")),
+        created_by: BUILTIN_CREATED_BY.to_string(),
+        updated_at: 0,
+        deleted_at: None,
+    };
+    compose_preset(&preset).unwrap_or_else(|e| panic!("built-in preset `{name}` composes: {e}"))
+}
+
 /// Compose a preset's steps over the catalog into the def a launch runs. The def is named after
 /// the preset, so the run reports the name it launched.
 pub fn compose_preset(

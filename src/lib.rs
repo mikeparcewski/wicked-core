@@ -207,7 +207,10 @@ pub use plan::{
 pub use plan_gate::{
     PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, TeamPlanState,
 };
-pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
+pub use preset::{
+    put_preset, resolve as resolve_preset, Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY,
+    GLOBAL_SCOPE, PLAN_PRESET,
+};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
@@ -240,9 +243,10 @@ pub use validator_vault::{
 };
 pub use wicked_council::AgenticCli;
 pub use workflow::{
-    bug_def, feature_def, migration_def, AmendScope, GateCond, GateSpec, GateType, HumanDecision,
-    PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner, StepRunner, StepStatus, StubStepRunner,
-    UnitEvidence, Usage, WorkflowDef, WorkflowDefError, WorkflowRegistry,
+    bug_def, feature_def, leftover_drop_ins, migration_def, AmendScope, GateCond, GateSpec,
+    GateType, HumanDecision, PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner, StepRunner,
+    StepStatus, StubStepRunner, UnitEvidence, Usage, WorkflowDef, WorkflowDefError,
+    WorkflowRegistry,
 };
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 

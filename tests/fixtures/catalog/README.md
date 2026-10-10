@@ -5,8 +5,7 @@ Read by `tests/catalog_compose.rs`.
 - `crew-defs.json`: today's defs for the §11.2 consumers that only crew defines. They were dumped
   from crew `main` at `4870c87` by evaluating crew's own exports, with no hand transcription:
   `deliverPrPhase([], ...)` for `deliver` (the phase `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
-  engine sees a def. The consumers core owns are not here: the test reads them live from
-  `WorkflowRegistry::with_defaults()` overlaid with `workflows/*.json`.
+  engine sees a def.
 - `mappings.json`: for each of the 13 remaining §11.2 consumers plus `mcp-server` (M12, the row DES-W7-M12 adds), `steps` (the plan that maps today's phases
   onto catalog entries) and `bold` (§11.2's bold cells as `"<phase>.<field>": <composed value>`).
   A step carries a field only where today's phase differs from its catalog entry and the cell is
@@ -21,7 +20,9 @@ Read by `tests/catalog_compose.rs`.
   `842f099`, with the #789 reply-is-the-proposal instruction) and `interactive-chat`,
   `interactive-draft` and `interactive-edit` (M9, crew's defs as of crew `fb1bca7`, where the draft
   is one plan-then-write phase: `withDraftSkill(<def>, true)`, the form crew registered when garden
-  held the draft skill). They keep pinning the built-in presets
+  held the draft skill), and (X-MIG M11) `feature`, `bug`, `migration`, `mcp-server` and
+  `domain-extraction`, copied verbatim from the retired `workflows/*.json` (which the compiled
+  `feature_def`/`bug_def`/`migration_def` serialized to byte for byte). They keep pinning the built-in presets
   that replaced them.
   `survey-repo`, `memories`, `domain-graph-slice` and `collab` were deleted outright with no preset
   (operator decision, 2026-09-26), so they have no fixture and no mapping.

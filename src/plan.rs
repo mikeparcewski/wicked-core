@@ -2181,7 +2181,7 @@ mod tests {
     /// a lower ord. A forward or dangling edge is unreachable context, not a handoff.
     #[test]
     fn every_builtin_declares_dependencies_that_actually_resolve_to_earlier_units() {
-        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
         let mut edges = 0usize;
         for id in registry.ids() {
             let def = registry.get(&id).expect("registry returned its own id");
@@ -2395,7 +2395,7 @@ mod tests {
     #[test]
     fn scope_preamble_is_derived_from_def_data_across_every_builtin() {
         use crate::workflow::{PhaseExecutor, PhaseRole};
-        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
         let mut marked = 0usize;
         for id in registry.ids() {
             let def = registry.get(&id).expect("registry returned its own id");
