@@ -348,15 +348,16 @@ pub struct LaunchSpec {
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
-/// `~/.config/wicked-council/clis.toml`), keeping only council-enabled seats. This is what a
-/// consumer passes as [`LaunchSpec::clis`] for a real run.
+/// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
+/// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is
+/// what a consumer passes as [`LaunchSpec::clis`] for a real run.
 pub fn registry_roster() -> Vec<AgenticCli> {
     let user = std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".config/wicked-council/clis.toml"));
     wicked_council::registry::load(user.as_deref())
         .unwrap_or_default()
         .into_iter()
-        .filter(|c| c.enabled_for_council)
+        .filter(|c| c.enabled_for_council || c.seat_eligible_for_work)
         .map(|mut c| {
             // Fill the seat's sign-in command from the built-in table when the registry entry
             // does not override it — consumers (the studio's sign-in terminal) read it off the
@@ -1908,6 +1909,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: None,
             login_invocation: None,
@@ -2042,6 +2044,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: None,
             login_invocation: None,

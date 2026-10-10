@@ -354,9 +354,16 @@ pub struct AgenticCli {
     /// Trust level for the headless flag before the council relies on it.
     #[serde(default)]
     pub confidence: Confidence,
-    /// Whether this seat may be convened.
+    /// Whether this seat may be convened — cast a council BALLOT (core#572: that and nothing
+    /// else; being seated for work is [`Self::seat_eligible_for_work`]).
     #[serde(default = "default_true")]
     pub enabled_for_council: bool,
+    /// (core#572) Whether this seat may be SEATED FOR WORK: routed a governed unit, moved onto a
+    /// review/test unit as the distinct evaluator, failed over or reassigned onto. Separate from
+    /// [`Self::enabled_for_council`], so a seat fit for one role is not lost to the other: a
+    /// ballot-only seat never runs a unit, and a work-only seat never votes. Default `true`.
+    #[serde(default = "default_true")]
+    pub seat_eligible_for_work: bool,
     /// ACP multi-turn session config. When present, the engine tries ACP first and falls
     /// back to single-shot invocation if the ACP server is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]

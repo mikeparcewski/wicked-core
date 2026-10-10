@@ -50,6 +50,8 @@ struct TomlCli {
     #[serde(default)]
     enabled_for_council: Option<bool>,
     #[serde(default)]
+    seat_eligible_for_work: Option<bool>,
+    #[serde(default)]
     capabilities: Option<String>,
     #[serde(default)]
     login_invocation: Option<String>,
@@ -120,6 +122,7 @@ impl From<TomlCli> for AgenticCli {
             // User records default to confirm-on-probe.
             confidence: t.confidence.unwrap_or(Confidence::ConfirmOnProbe),
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
+            seat_eligible_for_work: t.seat_eligible_for_work.unwrap_or(true),
             // A user record without [cli.acp] falls back to single-shot; note that an
             // overlay REPLACES its built-in wholesale, so overriding a CLI that has a
             // built-in ACP config requires restating [cli.acp] in the TOML — INCLUDING
@@ -160,6 +163,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: Some(AcpConfig {
                 binary: "claude-agent-acp".into(),
                 start_args: vec![],
@@ -212,6 +216,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             // gates governed-work seating and evaluator reassignment, which is a design
             // question, not a fact this comment can settle).
             enabled_for_council: false,
+            seat_eligible_for_work: false,
             // Resolved by NAME off PATH — and two different programs now ship this bin name:
             // wicked-crew's own bridge (`packages/agent-acp-bridges`, bin `agy-acp`) and a
             // community `agy-acp` published on npm (0.5.2, Apache-2.0, "ACP v1 + experimental
@@ -280,6 +285,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             // Official ACP-org adapter (@agentclientprotocol/codex-acp) — a TS/Node bridge
             // around the `codex` CLI, not a Rust binary.
             acp: Some(AcpConfig {
@@ -358,6 +364,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             // Community adapter (npm `pi-acp`) — sessions + resumption.
             acp: Some(AcpConfig {
                 binary: "pi-acp".into(),
@@ -437,6 +444,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             // Native ACP over stdio (`copilot --acp`, no bridge — same binary as headless mode).
             acp: Some(AcpConfig {
                 binary: "copilot".into(),
@@ -492,6 +500,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             // opencode speaks NATIVE ACP over stdio (`opencode acp`) — no bridge needed.
             acp: Some(AcpConfig {
                 binary: "opencode".into(),
@@ -593,6 +602,8 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                 // built-in (agy) would silently re-seat it. An omission inherits the
                 // built-in's value; re-enabling takes an explicit `enabled_for_council = true`.
                 let omitted_enabled = tcli.enabled_for_council.is_none();
+                // (core#572) …and for `seat_eligible_for_work`, by the same rule.
+                let omitted_work = tcli.seat_eligible_for_work.is_none();
                 // A nested option is needed here: `AcpConfig` deliberately resolves the field to
                 // bool for consumers, while merging must distinguish omission from explicit false.
                 let omitted_acp_gov = tcli
@@ -654,6 +665,9 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                              (set `enabled_for_council = true` to re-seat it deliberately)",
                             cli.key
                         );
+                    }
+                    if omitted_work && !slot.seat_eligible_for_work {
+                        cli.seat_eligible_for_work = false;
                     }
                     if omitted_acp_gov {
                         if let (Some(new_acp), Some(builtin_acp)) =
@@ -795,6 +809,51 @@ headless_invocation = "plain {PROMPT}"
         );
         // Built-ins ship Verified confidence.
         assert!(clis.iter().all(|c| c.confidence == Confidence::Verified));
+    }
+
+    /// core#572: `seat_eligible_for_work` defaults to true, rides the TOML, and an override that
+    /// omits it inherits the built-in's value (the `enabled_for_council` rule).
+    #[test]
+    fn the_work_flag_defaults_true_and_an_override_that_omits_it_inherits() {
+        assert!(builtin()
+            .iter()
+            .all(|c| c.seat_eligible_for_work == c.enabled_for_council));
+        let dir = std::env::temp_dir().join(format!(
+            "wc-work-flag-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[cli]]
+key = "voter"
+display_name = "Voter"
+binary = "voter"
+headless_invocation = "voter {PROMPT}"
+seat_eligible_for_work = false
+
+[[cli]]
+key = "agy"
+display_name = "agy (override)"
+binary = "agy"
+headless_invocation = "agy -p {PROMPT}"
+enabled_for_council = true
+"#,
+        )
+        .unwrap();
+        let clis = load(Some(&path)).unwrap();
+        let voter = clis.iter().find(|c| c.key == "voter").unwrap();
+        assert!(voter.enabled_for_council && !voter.seat_eligible_for_work);
+        let agy = clis.iter().find(|c| c.key == "agy").unwrap();
+        assert!(agy.enabled_for_council, "re-enabled for the council");
+        assert!(
+            !agy.seat_eligible_for_work,
+            "the omitted work flag inherits the built-in's false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
