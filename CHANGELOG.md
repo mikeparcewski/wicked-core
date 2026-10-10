@@ -239,6 +239,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.47** — 2026-10-10 — npm release on main tip bf36b03, carrying #854 and #857.
+  **#857 (wicked-crew#720)**: the state-home registry classifies crew's `artifacts/` (each run's
+  final-codebase zip). Workers are denied it, and intake no longer refuses a launch once it exists.
+  **#854 (core#649 option A, core#846)**: `PlanStep.writes_nothing` and an empty SCOPE scoring 0 for
+  a plan that writes nothing; `security_review` on a non-code plan is refused at plan time
+  (`security_review_on_non_code_plan`), and a mid-run raise fails the run.
 - **core-ts 0.7.46** — 2026-10-10 — npm release on main tip adc661a, carrying #851 and #852.
   **Assurance contract (#852, core#850; codex audit EX-01, EX-02, EX-05)**: a workflow's
   `required_instruments` (`distinct_evaluator`, `judge`, `qe_acceptance`; default the first two)
