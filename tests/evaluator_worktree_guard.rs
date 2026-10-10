@@ -329,6 +329,10 @@ fn core_with(
             inputs: inputs.clone(),
         }),
     );
+    // (M1) `bug` launches the built-in PRESET now (PA scoping, floor fill). These tests exercise the
+    // guard over the def's own four phases, so they launch the same def under a test-local id.
+    core.register_workflow(include_str!("fixtures/workflows/bug-def.json"))
+        .expect("the bug def stand-in registers");
     (core, ran, inputs)
 }
 
@@ -349,7 +353,7 @@ fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         auto_deliver: false,
         repo_ref: Some(repo_ref.to_string()),
-        workflow: Some("bug".into()),
+        workflow: Some("bug-def".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,

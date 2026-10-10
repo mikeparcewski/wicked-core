@@ -324,12 +324,22 @@ fn a_workflow_without_a_preset_still_launches_its_def() {
     let dir = tmp_dir("wf");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let rig = spawn(&db);
-    rig.core.launch_run(spec("rw", "bug", None)).unwrap();
+    // (M1) `bug` is a preset now, so a registered def stands in for "an id with no preset".
+    rig.core
+        .register_workflow(
+            r#"{"id":"no-preset-flow","phases":[
+              {"id":"look","kind":"recon","gate":"auto"},
+              {"id":"note","kind":"recon","gate":"auto","depends_on":["look"]}]}"#,
+        )
+        .unwrap();
+    rig.core
+        .launch_run(spec("rw", "no-preset-flow", None))
+        .unwrap();
     let ids: Vec<String> = rows("rw", &units_of(&rig.core, "rw"))
         .into_iter()
         .map(|r| r.0)
         .collect();
-    assert_eq!(ids, ["triage", "reproduce", "fix", "verify"]);
+    assert_eq!(ids, ["look", "note"]);
     let err = rig
         .core
         .launch_run(spec("rx", "no-such-flow", None))
@@ -616,6 +626,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     assert_eq!(
         names,
         [
+            "bug",
             "capture-learnings",
             "chat",
             "demo",
@@ -1024,6 +1035,44 @@ fn m9_interactive_presets_launch_repo_less_with_the_draft_skill() {
             "{name}: a non-code run owes no build and no security_review: {ids:?}"
         );
     }
+}
+
+/// M1 (DES-TEAMING-002 §14, §11.3): a launch naming `bug` runs the built-in preset. The PA's
+/// `pa-scope` comes first; triage → reproduce → fix → verify keep their order; fix keeps the
+/// retired-behaviour sweep instructions, the evidence-floor pin and the creator role; verify keeps
+/// its `human_confirm_if` gate, pin and evaluator role. Floor fill may add steps by band (this rig's
+/// PA answers nothing, so it floors at 100) but never reorders the preset's own.
+#[test]
+fn m1_bug_launches_the_preset_in_its_order_with_its_gates_and_pins() {
+    let dir = tmp_dir("bug");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core.launch_run(spec("rbug", "bug", None)).unwrap();
+    let units = units_of(&rig.core, "rbug");
+    let all = rows("rbug", &units);
+    assert_eq!(all[0].0, "pa-scope", "{all:?}");
+    let own: Vec<_> = all
+        .iter()
+        .filter(|r| ["triage", "reproduce", "fix", "verify"].contains(&r.0.as_str()))
+        .cloned()
+        .collect();
+    let floor = Some(EVIDENCE_FLOOR_PIN);
+    let hci = r#"{"human_confirm_if":"verdict_not_pass"}"#;
+    assert_eq!(
+        own,
+        vec![
+            r("triage", "recon", "neutral", "auto", None),
+            r("reproduce", "test", "neutral", "auto", None),
+            r("fix", "build", "creator", "auto", floor),
+            r("verify", "test", "evaluator", hci, floor),
+        ],
+        "{all:?}"
+    );
+    let fix = units.iter().find(|u| u.id == "rbug:fix").unwrap();
+    assert!(fix.executes_code);
+    assert!(fix
+        .description
+        .contains("Update every consumer of behaviour this fix retires or changes"));
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo

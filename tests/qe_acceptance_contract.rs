@@ -163,7 +163,7 @@ fn started(ev: &std::sync::mpsc::Receiver<CoreEvent>, sid: &str) -> serde_json::
         .unwrap_or_else(|| panic!("sessionStarted for {sid}: {evs:?}"))
 }
 
-/// `bug` (a workflow def) and `feature` / `migration` (built-in presets) require QE acceptance;
+/// `bug`, `feature` and `migration` (built-in presets since M1) require QE acceptance;
 /// the launch's decision is provisional and `required` (a plan has no diff to waive on).
 #[test]
 fn app_change_workflows_require_qe_acceptance_provisionally() {
