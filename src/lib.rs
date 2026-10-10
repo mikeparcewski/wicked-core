@@ -347,6 +347,14 @@ pub struct LaunchSpec {
     pub primary: Option<String>,
 }
 
+/// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):
+/// `{ platform, armed, tool: "sandbox-exec"|"bwrap"|null, reason: "no_launcher"|"cannot_arm"|null,
+/// reasonText, unsandboxedOptIn, verifyFloor: "contained"|"uncontained"|"refused" }`. `refused`
+/// means every check-running verify floor on this host will deny — say so before the run.
+pub fn host_boundary() -> serde_json::Value {
+    crate::worker_sandbox::host_boundary()
+}
+
 /// Resolve the council roster from the registry (built-ins merged with the user's
 /// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
 /// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is
@@ -626,6 +634,10 @@ impl Core {
     pub fn spawn_with_acp_sessions(
         path: impl Into<String>,
     ) -> (Core, std::sync::Arc<AcpStepRunner>) {
+        // (core#678 item 1) Probe the host's repository boundary ONCE, at boot — cached for every
+        // later floor and for `host_boundary()`, so a host that cannot contain a verify floor is
+        // known before a run spends on councils.
+        let _ = crate::worker_sandbox::host_boundary();
         let (tx, rx) = channel();
         let path = path.into();
         let self_tx = tx.clone();

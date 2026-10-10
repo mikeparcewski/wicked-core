@@ -309,8 +309,7 @@ impl FloorUnarmed {
         }
     }
 
-    /// The reason's wire spelling, for a disclosure.
-    #[cfg_attr(not(test), allow(dead_code))] // `describe` leads with it on every disclosure
+    /// The reason's wire spelling, for a disclosure (and `hostBoundary().reason`, core#678).
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             FloorUnarmed::NotAWorktree => "not_a_worktree",
@@ -374,6 +373,48 @@ fn boundary_launcher() -> Result<&'static PathBuf, FloorUnarmed> {
 /// arms (`no_launcher` | `cannot_arm`) — the probe [`default_worker_sandbox`] uses, cached.
 pub(crate) fn boundary_tool() -> Result<&'static str, FloorUnarmed> {
     boundary_launcher().map(|t| launcher_name(t))
+}
+
+/// (core#678 item 1) What this HOST can contain, known before any run: the launcher that arms the
+/// repository boundary (or why none does), the operator's unsandboxed opt-in, and so what a VERIFY
+/// floor will do here — `contained` (its checks run inside the boundary), `uncontained` (no
+/// boundary, but the operator opted in: the checks run, disclosed) or `refused` (no boundary and no
+/// opt-in: every check-running floor denies, which used to be learned only at verify). The probe is
+/// [`boundary_tool`]'s, cached: taken once at boot ([`crate::Core`] spawn) and read for free after.
+pub(crate) fn host_boundary() -> serde_json::Value {
+    let opted_in = matches!(
+        std::env::var(crate::repo_checks::UNSANDBOXED_OPT_IN_ENV)
+            .unwrap_or_default()
+            .trim(),
+        "1" | "true"
+    );
+    host_boundary_from(boundary_tool(), opted_in, std::env::consts::OS)
+}
+
+/// [`host_boundary`] over explicit inputs — the testable seam.
+pub(crate) fn host_boundary_from(
+    probe: Result<&'static str, FloorUnarmed>,
+    opted_in: bool,
+    platform: &str,
+) -> serde_json::Value {
+    let (tool, reason) = match probe {
+        Ok(t) => (Some(t), None),
+        Err(r) => (None, Some(r)),
+    };
+    let floor = match (tool, opted_in) {
+        (Some(_), _) => "contained",
+        (None, true) => "uncontained",
+        (None, false) => "refused",
+    };
+    serde_json::json!({
+        "platform": platform,
+        "armed": tool.is_some(),
+        "tool": tool,
+        "reason": reason.map(FloorUnarmed::as_str),
+        "reasonText": reason.map(FloorUnarmed::describe),
+        "unsandboxedOptIn": opted_in,
+        "verifyFloor": floor,
+    })
 }
 
 /// (IG1-core-3) The write containment a seat is PREDICTED to run under at distribution — the
@@ -711,6 +752,28 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
             "a commit on the run branch must succeed: {stdout} / {stderr}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#678 item 1: the host's boundary verdict, known before any run — armed ⇒ contained;
+    /// unarmed with the operator's opt-in ⇒ uncontained; unarmed without ⇒ refused, with the
+    /// reason in both spellings.
+    #[test]
+    fn the_host_boundary_says_what_a_verify_floor_will_do_here() {
+        let armed = host_boundary_from(Ok("bwrap"), false, "linux");
+        assert_eq!(armed["armed"], true);
+        assert_eq!(armed["tool"], "bwrap");
+        assert_eq!(armed["verifyFloor"], "contained");
+        assert!(armed["reason"].is_null());
+        let windows = host_boundary_from(Err(FloorUnarmed::NoLauncher), false, "windows");
+        assert_eq!(windows["armed"], false);
+        assert_eq!(windows["verifyFloor"], "refused");
+        assert_eq!(windows["reason"], "no_launcher");
+        assert!(windows["reasonText"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("no_launcher")));
+        let opted = host_boundary_from(Err(FloorUnarmed::CannotArm), true, "linux");
+        assert_eq!(opted["verifyFloor"], "uncontained");
+        assert_eq!(opted["unsandboxedOptIn"], true);
     }
 
     /// (IG1-core-3) The `sandboxPosture` prediction and each of its three failures: a seat off the

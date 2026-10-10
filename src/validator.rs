@@ -714,6 +714,78 @@ pub(crate) fn loopback_jail(write_roots: &[&Path]) -> SandboxLauncher {
 
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
 /// Linux regression test uses (a home lacking some of the six) without touching the process env.
+/// (core#703) The seccomp program the loopback-only jail loads: `socket(AF_UNIX, …)` fails with
+/// `EACCES` (connecting to a pathname socket needs one; `socketpair` creates a connected pair with
+/// no pathname and stays allowed), every other syscall is allowed, an x32-ABI syscall on x86_64 and
+/// any syscall of a foreign architecture are refused. Raw classic BPF, no library: ten
+/// instructions for the arch this binary runs on (x86_64 or aarch64); any other arch has no filter.
+mod seccomp {
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const JGE_K: u16 = 0x35;
+    const RET_K: u16 = 0x06;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const RET_EACCES: u32 = 0x0005_0000 | 13;
+    const AF_UNIX: u32 = 1;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+    /// `(AUDIT_ARCH_*, __NR_socket)` for this build's architecture.
+    fn arch() -> Option<(u32, u32)> {
+        if cfg!(target_arch = "x86_64") {
+            Some((0xC000_003E, 41))
+        } else if cfg!(target_arch = "aarch64") {
+            Some((0xC000_00B7, 198))
+        } else {
+            None
+        }
+    }
+
+    /// The program's bytes (`struct sock_filter[]`, native endian).
+    pub(super) fn af_unix_program() -> Option<Vec<u8>> {
+        let (audit_arch, nr_socket) = arch()?;
+        let insns: [(u16, u8, u8, u32); 10] = [
+            (LD_W_ABS, 0, 0, 4),            // 0: A = seccomp_data.arch
+            (JEQ_K, 1, 0, audit_arch),      // 1: our arch ? 3 : 2
+            (RET_K, 0, 0, RET_EACCES),      // 2: a foreign arch: refuse
+            (LD_W_ABS, 0, 0, 0),            // 3: A = seccomp_data.nr
+            (JGE_K, 4, 0, X32_SYSCALL_BIT), // 4: an x32 syscall ? 9 : 5
+            (JEQ_K, 0, 2, nr_socket),       // 5: socket() ? 6 : 8
+            (LD_W_ABS, 0, 0, 16),           // 6: A = args[0] (domain, low 32 bits)
+            (JEQ_K, 1, 0, AF_UNIX),         // 7: AF_UNIX ? 9 : 8
+            (RET_K, 0, 0, RET_ALLOW),       // 8: allow
+            (RET_K, 0, 0, RET_EACCES),      // 9: refuse
+        ];
+        let mut out = Vec::with_capacity(insns.len() * 8);
+        for (code, jt, jf, k) in insns {
+            out.extend_from_slice(&code.to_ne_bytes());
+            out.push(jt);
+            out.push(jf);
+            out.extend_from_slice(&k.to_ne_bytes());
+        }
+        Some(out)
+    }
+
+    /// The program, written once (write-then-rename) under the engine's temp dir, for bwrap to
+    /// read through `--seccomp`. `None` on an arch with no program or a temp dir that refuses the
+    /// write: the jail then runs with its masks only, as before.
+    pub(super) fn af_unix_filter_path() -> Option<std::path::PathBuf> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        let bytes = af_unix_program()?;
+        let dir = std::env::temp_dir().join("wicked-core-seccomp");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("no-af-unix.bpf");
+        if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+            return Some(path);
+        }
+        let tmp = dir.join(format!("no-af-unix.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &bytes).ok()?;
+        std::fs::rename(&tmp, &path).ok()?;
+        Some(path)
+    }
+}
+
 fn launcher_for_roots_masking(
     write_roots: &[&Path],
     network: NetworkPolicy,
@@ -822,6 +894,27 @@ fn launcher_for_roots_masking(
             w.push(c.clone());
             w.push(c);
             w.push("--".to_string());
+            // (core#703) The LOOPBACK-only jail (the walkthrough recorder) also refuses
+            // `socket(AF_UNIX, …)`: the masks above hide the usual socket dirs, but a pathname
+            // socket anywhere else (a custom dir under the home) stays connectable under the
+            // read-only `/`. The seccomp program rides `bwrap --seccomp 9`, opened by a `sh`
+            // prefix so the fd is the jail's own (bwrap reads it; a shared one would be at EOF
+            // for the next jail).
+            if matches!(network, NetworkPolicy::LoopbackOnly) {
+                if let Some(filter) = seccomp::af_unix_filter_path() {
+                    let mut wrapped: Vec<String> = vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "exec 9<\"$0\" || exit 125; exec \"$@\"".to_string(),
+                        filter.to_string_lossy().into_owned(),
+                        w[0].clone(),
+                        "--seccomp".to_string(),
+                        "9".to_string(),
+                    ];
+                    wrapped.extend(w.into_iter().skip(1));
+                    w = wrapped;
+                }
+            }
             return SandboxLauncher {
                 wrapper: w,
                 level: SandboxLevel::Sandboxed,
@@ -3890,6 +3983,80 @@ mod tests {
     /// database file") and the coverage gate can never pass on the governed daemon path.
     /// WT-C2 (Copilot on #697): the loopback-only bwrap jail masks the socket directories — and
     /// never one that holds a write root.
+    /// core#703: the AF_UNIX program — ten instructions, the arch check first, the socket()
+    /// domain test, and a refusal that is EACCES, never a kill.
+    #[test]
+    fn the_af_unix_seccomp_program_has_its_shape() {
+        let Some(p) = seccomp::af_unix_program() else {
+            return; // no program on this arch: the jail runs with its masks only
+        };
+        assert_eq!(p.len(), 10 * 8);
+        let insn = |i: usize| {
+            let b = &p[i * 8..i * 8 + 8];
+            (
+                u16::from_ne_bytes([b[0], b[1]]),
+                b[2],
+                b[3],
+                u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+            )
+        };
+        assert_eq!(insn(0), (0x20, 0, 0, 4), "loads the arch first");
+        assert_eq!(insn(7).3, 1, "the domain compared is AF_UNIX");
+        assert_eq!(
+            insn(8),
+            (0x06, 0, 0, 0x7fff_0000),
+            "everything else is allowed"
+        );
+        assert_eq!(insn(9), (0x06, 0, 0, 0x0005_0000 | 13), "AF_UNIX is EACCES");
+    }
+
+    /// core#703, end to end on a Linux host with bwrap: inside the loopback-only jail a process
+    /// cannot create an AF_UNIX socket (so no pathname socket is reachable), while AF_INET and a
+    /// socketpair still work. Skipped where the jail is not bwrap.
+    #[test]
+    fn the_loopback_jail_refuses_af_unix_sockets_on_linux() {
+        if !cfg!(target_os = "linux") || find_on_path("bwrap").is_none() {
+            return;
+        }
+        if find_on_path("python3").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-703-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jail = loopback_jail(&[dir.as_path()]);
+        if jail.level != SandboxLevel::Sandboxed {
+            return;
+        }
+        assert!(
+            jail.wrapper.iter().any(|a| a == "--seccomp"),
+            "the program rides the jail: {:?}",
+            jail.wrapper
+        );
+        let run = |code: &str| {
+            // spawn-audit: test-only — runs python inside the test's own jail.
+            std::process::Command::new(&jail.wrapper[0])
+                .args(&jail.wrapper[1..])
+                .args(["python3", "-c", code])
+                .current_dir(&dir)
+                .status()
+                .expect("the jail runs")
+                .success()
+        };
+        assert!(
+            !run("import socket; socket.socket(socket.AF_UNIX)"),
+            "AF_UNIX must be refused in the loopback jail"
+        );
+        assert!(
+            run("import socket; socket.socket(socket.AF_INET)"),
+            "AF_INET still works"
+        );
+        assert!(
+            run("import socket; socket.socketpair()"),
+            "a socketpair still works"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn loopback_masks_socket_dirs_but_never_a_write_root() {
         let base = std::env::temp_dir().join(format!("wt-c2-masks-{}", std::process::id()));
