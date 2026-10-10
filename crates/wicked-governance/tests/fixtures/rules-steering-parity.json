@@ -1,0 +1,22 @@
+{
+  "$comment": "FND-EST-02: the ONE golden fixture for steering-rule recall semantics, copied byte-identical into wicked-core (crates/wicked-governance/tests/fixtures/rules-steering-parity.json); a test in each repo runs every case through its own recall (core recall_rules, estate rules.recall). Semantics: steering_type is an exact facet and a rule without it is 'architecture'; within a severity band heavier weight orders first (absent = 1.0), then id; retired and effect-bearing (decide-lane) rules are never recalled; an out-of-vocabulary steering_type recalls nothing. Expected ids are in recall order.",
+  "version": 1,
+  "rules": [
+    {"id": "PAT-911", "rule_type": "pattern", "statement": "security, heavy", "severity": "warn", "confidence": 1.0, "steering_type": "security", "weight": 2.0},
+    {"id": "PAT-912", "rule_type": "pattern", "statement": "security, light", "severity": "warn", "confidence": 1.0, "steering_type": "security", "weight": 0.5},
+    {"id": "PAT-910", "rule_type": "pattern", "statement": "security, default weight", "severity": "warn", "confidence": 1.0, "steering_type": "security"},
+    {"id": "PAT-920", "rule_type": "pattern", "statement": "legacy: no steering_type, no weight", "severity": "warn", "confidence": 1.0},
+    {"id": "PAT-930", "rule_type": "pattern", "statement": "testing", "severity": "error", "confidence": 1.0, "steering_type": "testing"},
+    {"id": "PAT-940", "rule_type": "pattern", "statement": "security, retired", "severity": "critical", "confidence": 1.0, "steering_type": "security", "retired": true},
+    {"id": "POL-950", "rule_type": "policy", "statement": "security, effect-bearing", "severity": "critical", "confidence": 1.0, "steering_type": "security", "effect": "deny", "applies_to": ["deliver"]}
+  ],
+  "cases": [
+    {"name": "no facets: severity, then weight desc, then id; retired and effect-bearing excluded", "query": {}, "expect": ["PAT-930", "PAT-911", "PAT-910", "PAT-920", "PAT-912"]},
+    {"name": "steering_type security: weight order within the band", "query": {"steering_type": "security"}, "expect": ["PAT-911", "PAT-910", "PAT-912"]},
+    {"name": "steering_type architecture: the legacy default", "query": {"steering_type": "architecture"}, "expect": ["PAT-920"]},
+    {"name": "steering_type testing", "query": {"steering_type": "testing"}, "expect": ["PAT-930"]},
+    {"name": "steering_type with no rules", "query": {"steering_type": "compliance"}, "expect": []},
+    {"name": "out-of-vocabulary steering_type recalls nothing", "query": {"steering_type": "secutiry"}, "expect": []},
+    {"name": "steering_type combines with severity", "query": {"steering_type": "security", "severity": "critical"}, "expect": []}
+  ]
+}
