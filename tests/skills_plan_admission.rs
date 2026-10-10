@@ -165,6 +165,7 @@ fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 

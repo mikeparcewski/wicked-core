@@ -247,6 +247,7 @@ fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> Laun
         evidence_root: None,
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 
@@ -716,6 +717,86 @@ fn d_approve_dispatches_the_cursor_unit_once_and_keeps_the_attempt() {
 }
 
 // ── T3 (e) approve with edit ─────────────────────────────────────────────────────────────────────
+
+/// (X-MIG M9, codex r1 on #858) A whole-plan edit at the initial approval gate keeps the launch's
+/// declared deliverables: they are the launcher's contract, re-joined to the edited plan's last
+/// creator step, so the edit cannot drop the run's deliverable floor.
+#[test]
+fn an_initial_gate_edit_keeps_the_launchs_declared_deliverables() {
+    let dir = tmp_dir("edl");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
+    let mut s = spec("redl", HumanConfirm::None, Some(p));
+    s.deliverables = vec!["docs/out.md".into()];
+    rig.core.launch_run(s).unwrap();
+    rig.tap.until("the plan_approval pause", |s| {
+        paused_on_plan(s, "redl").is_some()
+    });
+    let edit = plan(json!({"steps": [
+        {"catalog": "build", "id": "make"},
+        {"catalog": "test", "id": "prove"}
+    ]}));
+    rig.core
+        .confirm_gate("redl", HumanDecision::EditPlan { plan: edit })
+        .unwrap();
+    rig.tap.until("the first dispatch", |s| {
+        !dispatched_ords(s, "redl").is_empty()
+    });
+    let view = rig
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "redl")
+        .expect("the run");
+    let make = view
+        .units
+        .iter()
+        .find(|u| u.id == "redl:make")
+        .expect("the edited creator is planned");
+    assert_eq!(make.required_deliverables, ["docs/out.md"]);
+}
+
+/// (codex r2 on #858) An initial-gate edit that leaves no creator step to carry the launch's
+/// declared deliverables is refused with its facts — `plan.proposed` then `plan.refused` naming
+/// why — and the gate re-opens, like every other refused edit.
+#[test]
+fn an_initial_gate_edit_with_no_creator_for_the_deliverables_is_refused_with_its_facts() {
+    let dir = tmp_dir("edr");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));
+    let mut s = spec("redr", HumanConfirm::None, Some(p));
+    s.deliverables = vec!["docs/out.md".into()];
+    rig.core.launch_run(s).unwrap();
+    rig.tap.until("the plan_approval pause", |s| {
+        paused_on_plan(s, "redr").is_some()
+    });
+    let status = rig
+        .core
+        .confirm_gate(
+            "redr",
+            HumanDecision::EditPlan {
+                plan: plan(json!({"steps": [{"catalog": "understand", "id": "look"}]})),
+            },
+        )
+        .unwrap();
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    rig.tap.until("the re-opened gate", |s| {
+        of_type(s, "redr", OPENED).len() == 2
+    });
+    let refused = of_type(&rig.tap.seen, "redr", REFUSED);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("creator step"),
+        "{refused:?}"
+    );
+    assert_eq!(of_type(&rig.tap.seen, "redr", PROPOSED).len(), 2);
+}
 
 /// T3 (e): approve-with-edit publishes `plan.proposed{by:"human", kind:"edit"}` then
 /// `plan.accepted{plan_rev: n+1}`; the edit is below the floor, so the floor phases are ADDED,

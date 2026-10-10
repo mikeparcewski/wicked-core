@@ -209,6 +209,7 @@ fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 
@@ -283,6 +284,7 @@ fn session_started_cli_count_matches_spec() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
     let collected = drain_until_terminal(&ev, "clicount-sess");
@@ -324,6 +326,7 @@ fn session_started_entity_mode_is_serialized() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch shared");
     let collected = drain_until_terminal(&ev, "em-shared");
@@ -358,6 +361,7 @@ fn session_started_entity_mode_is_serialized() {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .expect("launch isolated");
     let collected2 = drain_until_terminal(&ev2, "em-isolated");
@@ -394,6 +398,7 @@ fn session_started_workflow_id_is_none_for_free_text() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
     let collected = drain_until_terminal(&ev, "wf-none-sess");
@@ -461,6 +466,7 @@ fn unit_planned_role_and_gate_from_phase_def() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -546,6 +552,7 @@ fn unit_planned_skill_ref_and_has_validator_pin() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -626,6 +633,7 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -684,6 +692,7 @@ fn unit_planned_free_text_defaults() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -743,6 +752,7 @@ fn unit_distributed_teamed_routing_carries_no_council_fields() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -824,6 +834,7 @@ fn unit_distributed_evaluator_distinct_routing() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -895,6 +906,7 @@ fn unit_distributed_names_the_bench_on_the_teamed_arm() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -1053,6 +1065,7 @@ fn workflow_selected_fires_for_structured_run_only() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch structured");
     let collected = drain_until_terminal(&ev, "wfsel-sess");
@@ -1239,6 +1252,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch");
 
@@ -1347,6 +1361,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .expect("launch empty amend run");
     let mut collected2 = drain_until_terminal(&ev2, "ura-empty-sess");

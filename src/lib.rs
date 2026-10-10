@@ -352,6 +352,14 @@ pub struct LaunchSpec {
     /// on every receipt (`mode: "reduced"`). `false` (the default; an absent wire field) refuses a
     /// creator-seat evaluator at distribution and holds a gate whose required judge was skipped.
     pub reduced_assurance: bool,
+    /// (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch: absolute
+    /// paths (inside a declared write root) or worktree-relative paths the run must write. They
+    /// join the `required_deliverables` of the plan's LAST creator step (TightenOnly: a list may
+    /// only grow), so the engine's own deliverable floor (core#297: runner-independent, written by
+    /// THIS run) judges them — the per-run artifact a preset cannot name (an interactive draft's
+    /// output file). Empty = none. Refused on a launch with neither a plan nor a preset, and on a
+    /// plan with no creator step (never silently dropped).
+    pub deliverables: Vec<String>,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):

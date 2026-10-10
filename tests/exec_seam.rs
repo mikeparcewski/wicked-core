@@ -130,6 +130,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 
@@ -566,6 +567,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("launch the bug-shaped workflow");
 

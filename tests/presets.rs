@@ -161,6 +161,7 @@ fn spec(run: &str, workflow: &str, project_id: Option<&str>) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 
@@ -940,6 +941,37 @@ fn m8_steering_author_launches_the_preset_with_its_propose_gate() {
             .is_some_and(|t| t.contains("```json") && t.contains("Do not write it to any file")),
         "the reply is the proposal (#789)"
     );
+}
+
+/// (X-MIG M9) A preset launch's declared deliverables reach the engine's deliverable floor: they
+/// join the last creator step's `required_deliverables` on its unit. A launch that declares them
+/// with neither a plan nor a preset is refused at launch, never dropped.
+#[test]
+fn a_preset_launchs_declared_deliverables_ride_its_last_creator_unit() {
+    let dir = tmp_dir("deliverables");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let mut s = spec("rdl", "feature", None);
+    s.deliverables = vec!["docs/out.md".into()];
+    rig.core.launch_run(s).unwrap();
+    let units = units_of(&rig.core, "rdl");
+    let build = units
+        .iter()
+        .find(|u| u.id == "rdl:build")
+        .expect("feature's creator is planned");
+    assert!(
+        build
+            .required_deliverables
+            .iter()
+            .any(|d| d == "docs/out.md"),
+        "{:?}",
+        build.required_deliverables
+    );
+    let mut legacy = spec("rdl2", "feature", None);
+    legacy.workflow = None;
+    legacy.deliverables = vec!["docs/out.md".into()];
+    let e = rig.core.launch_run(legacy).unwrap_err().to_string();
+    assert!(e.contains("names neither"), "{e}");
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo

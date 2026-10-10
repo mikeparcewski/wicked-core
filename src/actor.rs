@@ -1256,6 +1256,7 @@ pub(crate) fn run(
                     // refused below with the plan it would have led, never silently dropped.
                     primary,
                     reduced_assurance,
+                    deliverables,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1265,6 +1266,7 @@ pub(crate) fn run(
                     plan.as_ref(),
                     workflow.as_deref(),
                     None,
+                    &deliverables,
                 ) {
                     // (EP-K3) A judge exclusion is honoured only on the governed dispatch: refused
                     // here rather than silently dropped.
@@ -1438,6 +1440,7 @@ pub(crate) fn run(
                         spec.plan.as_ref(),
                         spec.workflow.as_deref(),
                         spec.project_id.as_deref(),
+                        &spec.deliverables,
                     )?;
                     if launch_plan.is_none() && spec.deliver_step.is_some() {
                         anyhow::bail!(
@@ -4046,6 +4049,7 @@ fn team_plan_at_launch(
         spec.plan.as_ref(),
         spec.workflow.as_deref(),
         spec.project_id.as_deref(),
+        &spec.deliverables,
     )?
     else {
         if spec.deliver_step.is_some() {
@@ -4063,6 +4067,7 @@ fn team_plan_at_launch(
             .filter_map(|c| serde_json::to_value(c).ok())
             .collect(),
         deliver_step: spec.deliver_step.clone(),
+        deliverables: spec.deliverables.clone(),
         ..Default::default()
     };
     // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
@@ -4164,7 +4169,7 @@ fn preview_launch_plan(
     human_confirm: &crate::domain::HumanConfirm,
 ) -> anyhow::Result<crate::plan_gate::PlanPreview> {
     // The plan as the launch resolves it (a preset name resolves per project; a plan is itself).
-    let (plan, _) = crate::plan_gate::launch_plan(&*store, Some(&plan), None, project_id)?
+    let (plan, _) = crate::plan_gate::launch_plan(&*store, Some(&plan), None, project_id, &[])?
         .ok_or_else(|| anyhow::anyhow!("the preview carries no plan"))?;
     // (WT-C3) The testing rules a launch filed in `project_id` would compose under; a preview
     // is not teamed (no run exists), so its kinds fail closed exactly as the launch's do.

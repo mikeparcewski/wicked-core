@@ -13304,6 +13304,7 @@ mod project_graph_end_to_end_tests {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         };
 
         // 1. BOUND.

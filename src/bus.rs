@@ -1530,6 +1530,7 @@ fn launch_from_event(
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     };
 
     let (reply, rx) = channel();

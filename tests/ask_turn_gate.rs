@@ -221,6 +221,7 @@ fn spec(run: &str, steps: Vec<Value>) -> LaunchSpec {
         // (ASK-K1a) The test reads the PA as `a`, so it chooses it.
         primary: Some("a".into()),
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 

@@ -108,6 +108,7 @@ fn launch(core: &Core, id: &str, sid: &str) -> anyhow::Result<String> {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
 }
 

@@ -161,6 +161,7 @@ fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
         primary: None,
         // (core#850) One seat: the review rides the creator's seat by the explicit opt-in.
         reduced_assurance: true,
+        deliverables: Vec::new(),
     }
 }
 
