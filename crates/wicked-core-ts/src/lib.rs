@@ -3636,6 +3636,40 @@ mod tests {
             &["type", "session", "cliKey", "acpSessionId"],
         );
         check(
+            CoreEvent::AcpProcessRestarted {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                cli_key: s(),
+                reason: s(),
+                ms: 1,
+            },
+            "acpProcessRestarted",
+            &[
+                "type", "session", "ord", "attempt", "cliKey", "reason", "ms",
+            ],
+        );
+        check(
+            CoreEvent::AcpTurnSettled {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                cli_key: s(),
+                quiet_secs: 600,
+                output_bytes: 1,
+            },
+            "acpTurnSettled",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "cliKey",
+                "quietSecs",
+                "outputBytes",
+            ],
+        );
+        check(
             CoreEvent::AcpFallback {
                 session: s(),
                 cli_key: s(),

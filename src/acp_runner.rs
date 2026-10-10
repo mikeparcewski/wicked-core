@@ -1002,6 +1002,29 @@ struct AcpProcess {
     /// only for the duration of that unit's turn and resolves to nothing between turns and on a
     /// chat session. Revoked when the process drops. `None` when the daemon has no broker URL.
     mcp_token: Option<crate::mcp_gate::McpToken>,
+    /// (core#762) How long a turn may stay silent after the worker's last MESSAGE, with no tool
+    /// call open, before the engine ends it and keeps the output ([`acp_settle_after`]). Set at
+    /// spawn from the environment; `None` never settles.
+    settle_after: Option<Duration>,
+}
+
+/// (core#762) The default settle window: a turn silent this long after the worker's final message,
+/// with no tool call open, is a transport fault, not a worker still thinking. Two observed hangs
+/// (run ad5a4ca7, a8 and a20) sat 15 and 30 min after a complete final message, while a clean close
+/// came 5 min after one (a22), so the window sits above the slow-but-healthy close and below the
+/// crew stall watchdog's first escalation (~925 s quiet).
+pub(crate) const ACP_SETTLE_DEFAULT_SECS: u64 = 600;
+/// (core#762) Overrides [`ACP_SETTLE_DEFAULT_SECS`] in whole seconds; `0` turns the settle off.
+pub(crate) const ACP_SETTLE_ENV: &str = "WICKED_ACP_SETTLE_SECS";
+
+/// (core#762) The settle window this daemon runs with ([`ACP_SETTLE_ENV`], else the default).
+/// An unparseable value keeps the default rather than silently disabling the settle.
+pub(crate) fn acp_settle_after() -> Option<Duration> {
+    let secs = std::env::var(ACP_SETTLE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(ACP_SETTLE_DEFAULT_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 impl Drop for AcpProcess {
@@ -2883,6 +2906,7 @@ fn start_acp_process_with_write_roots(
     Ok(AcpProcess {
         kill_handle: Arc::new(KillHandle::new(child)),
         no_code: false,
+        settle_after: acp_settle_after(),
         mcp_token: mcp_token.map(|(token, _)| token),
         write_lock: Arc::new(Mutex::new(())),
         stdin,
@@ -3426,6 +3450,11 @@ struct TurnResult {
     /// whole output here. Chat replies surface it (F-W1-004, R-L5-2); unit outputs stay `output`
     /// (prior-output injection and the evaluator verdict line read the full text).
     answer: String,
+    /// (core#762) `Some(quiet_secs)` when the engine ENDED the turn itself: the worker's last frame
+    /// was a message, no tool call was open, and the bridge sent no `stopReason` for `quiet_secs`.
+    /// The status is then `Ok` and the output is the attempt's result; the caller discloses it
+    /// (`acpTurnSettled`) and never reuses the process.
+    settled: Option<u64>,
 }
 
 impl TurnResult {
@@ -3440,6 +3469,7 @@ impl TurnResult {
             files: Vec::new(),
             tools: Vec::new(),
             answer: String::new(),
+            settled: None,
         }
     }
 
@@ -4108,6 +4138,10 @@ fn exec_turn_acp_posture(
     let mut write_failed_terminal = false;
     // Set when `line_rx` disconnects inside the `'elicit` poll loop (adapter died mid-suspend).
     let mut dead_session = false;
+    // (core#762) The settle: a turn silent for `proc.settle_after` after the worker's last message,
+    // with no tool call open, is ended here and its output kept (`TurnResult::settled`).
+    let mut watch = SettleWatch::new();
+    let mut settled: Option<u64> = None;
 
     'exec: loop {
         let remaining = deadline
@@ -4117,12 +4151,33 @@ fn exec_turn_acp_posture(
             timed_out = true;
             break 'exec;
         }
-        match proc.line_rx.recv_timeout(remaining) {
+        let wait = match watch.due_in(proc.settle_after) {
+            Some(due) if due.is_zero() => {
+                let quiet = watch.last_frame.elapsed().as_secs();
+                eprintln!(
+                    "wicked-core: run {run_id}: the ACP turn sent no stopReason {quiet}s after the \
+                     worker's final message with no tool call open — ending it and keeping the \
+                     output (core#762)"
+                );
+                settled = Some(quiet);
+                found = true;
+                // The bridge is wedged: kill its group NOW, while this turn holds it, so a turn
+                // already waiting on this process (it cloned the `Arc` before the eviction) meets a
+                // dead bridge and fails through the ordinary death path instead of reusing it
+                // (codex r2 on #826).
+                proc.kill_handle.signal();
+                break 'exec;
+            }
+            Some(due) => due.min(remaining),
+            None => remaining,
+        };
+        match proc.line_rx.recv_timeout(wait) {
             Ok(line) => {
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(_) => continue 'exec,
                 };
+                watch.observe(&v);
 
                 // ── elicitation/create arm ─────────────────────────────────────────────
                 if agent_method(&v) == Some("elicitation/create") {
@@ -4726,7 +4781,71 @@ fn exec_turn_acp_posture(
         usage,
         files,
         tools: Vec::new(),
+        settled,
     })
+}
+
+/// (core#762) What the settle watches on a turn: when the last frame arrived, whether it was the
+/// worker's MESSAGE, and which tool calls are open (started, no terminal update yet).
+struct SettleWatch {
+    last_frame: Instant,
+    last_was_message: bool,
+    open_tools: HashSet<String>,
+    /// A tool call arrived with no `toolCallId`: it cannot be seen to close, so the settle is off
+    /// for the rest of the turn (codex r1 on #826).
+    untracked_tool: bool,
+}
+
+impl SettleWatch {
+    fn new() -> Self {
+        Self {
+            last_frame: Instant::now(),
+            last_was_message: false,
+            open_tools: HashSet::new(),
+            untracked_tool: false,
+        }
+    }
+
+    /// Record one frame from the agent. A message chunk arms the settle; a tool call, a thought or
+    /// any request disarms it; a terminal tool update closes its call. Other notifications
+    /// (usage, plan, commands) only refresh the clock.
+    fn observe(&mut self, v: &Value) {
+        self.last_frame = Instant::now();
+        let update = &v["params"]["update"];
+        match (
+            agent_method(v),
+            update.get("sessionUpdate").and_then(Value::as_str),
+        ) {
+            (Some("session/update"), Some("agent_message_chunk")) => self.last_was_message = true,
+            (Some("session/update"), Some("tool_call")) => {
+                self.last_was_message = false;
+                match update["toolCallId"].as_str() {
+                    Some(id) => {
+                        self.open_tools.insert(id.to_string());
+                    }
+                    None => self.untracked_tool = true,
+                }
+            }
+            (Some("session/update"), Some("tool_call_update")) => {
+                self.last_was_message = false;
+                if is_terminal_tool_call_update(v) {
+                    if let Some(id) = update["toolCallId"].as_str() {
+                        self.open_tools.remove(id);
+                    }
+                }
+            }
+            (Some("session/update"), Some("agent_thought_chunk")) => self.last_was_message = false,
+            (Some("session/update"), _) => {}
+            _ => self.last_was_message = false,
+        }
+    }
+
+    /// How long until the settle could fire (`None` when it is not armed).
+    fn due_in(&self, settle: Option<Duration>) -> Option<Duration> {
+        let settle = settle?;
+        (self.last_was_message && self.open_tools.is_empty() && !self.untracked_tool)
+            .then(|| settle.saturating_sub(self.last_frame.elapsed()))
+    }
 }
 
 /// Answer one `session/request_permission` REQUEST from the agent.
@@ -5686,6 +5805,9 @@ fn auth_refusal(input: &StepInput, cli_key: &str, kind: &str, why: &str) -> Step
     }
 }
 
+/// (core#418) Per `(run, cli)` key: why its next process is a restart, and since when.
+type RestartDue = Arc<Mutex<HashMap<(String, String), (&'static str, Option<Instant>)>>>;
+
 pub struct AcpStepRunner {
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`).
     tx: std::sync::mpsc::Sender<Command>,
@@ -5718,6 +5840,12 @@ pub struct AcpStepRunner {
     /// outbox — installed by `spawn_with_acp_sessions`. A teamed attempt's turn publishes its
     /// `checkpoint.reached` and steer rows through it; `None` = no turn is teamed on this runner.
     team_runner: std::sync::OnceLock<crate::team::runner::TeamRunner>,
+    /// (core#418) Why the NEXT process for a `(run, cli)` key is a restart, and since when: set
+    /// where a live process is closed for its posture (`posture_switch`, timed from the close),
+    /// where a fenced unit's process is quiesced at its end (`fenced_unit_quiesced`) and where a
+    /// settled turn's process is dropped (`turn_settled`); consumed — `acpProcessRestarted` — when
+    /// the replacement session opens. Pruned with the run.
+    restart_due: RestartDue,
 }
 
 /// What a READ-ONLY member session runs against (core#410 / crew#502, F-067; the warm chat pool
@@ -5939,7 +6067,16 @@ impl AcpStepRunner {
             write_reg,
             monitors: Arc::new(Mutex::new(HashMap::new())),
             team_runner: std::sync::OnceLock::new(),
+            restart_due: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// (core#418) Mark the next process for `key` as a restart for `reason`.
+    fn mark_restart(&self, key: &(String, String), reason: &'static str, since: Option<Instant>) {
+        self.restart_due
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone(), (reason, since));
     }
 
     /// Accessor for the shared `ElicitationMaps` arc (used by `spawn_with_acp_sessions`
@@ -5990,6 +6127,11 @@ impl AcpStepRunner {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         injects.remove(run_id);
+        drop(injects);
+        self.restart_due
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(rid, _), _| rid != run_id);
     }
 
     /// Drain queued operator messages matching `(run_id, cli_key)` — `All`-targeted and
@@ -6212,6 +6354,7 @@ impl AcpStepRunner {
                 );
                     drop(arc);
                     self.drop_session_key(&session_key);
+                    self.mark_restart(&session_key, "posture_switch", Some(Instant::now()));
                     SessionProbe::Vacant
                 }
                 other => other,
@@ -6691,6 +6834,8 @@ impl AcpStepRunner {
                         .as_ref()
                         .and_then(|g| g.project_id.as_deref()),
                 );
+                // (core#418) A restart's cost is measured to the opened session.
+                let spawn_started = Instant::now();
                 match start_acp_process_with_write_roots(
                     &acp_config,
                     &cwd,
@@ -6752,6 +6897,22 @@ impl AcpStepRunner {
                                 cli_key: cli_key.clone(),
                                 acp_session_id,
                             });
+                            // (core#418) This session replaces one the engine closed itself.
+                            let due = self
+                                .restart_due
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&session_key);
+                            if let Some((reason, since)) = due {
+                                self.emit_event(CoreEvent::AcpProcessRestarted {
+                                    session: run_id.clone(),
+                                    ord: input.unit.ord,
+                                    attempt: input.attempt,
+                                    cli_key: cli_key.clone(),
+                                    reason: reason.to_string(),
+                                    ms: since.unwrap_or(spawn_started).elapsed().as_millis() as u64,
+                                });
+                            }
                             // core#396: the generation this session was handed, once per spawn
                             // (the session is cached and reused across the run's turns) — the log
                             // line for the operator and the event crew consults before reaping an
@@ -7180,6 +7341,9 @@ impl AcpStepRunner {
                 || maps.current_launch_seq(&run_id) > input.launch_seq
         };
         if superseded {
+            // (core#762, codex r1 on #826) A settled turn's process is wedged: evict it here too,
+            // or a superseded return would leave it cached for the next turn.
+            let settled = matches!(&turn, Ok(r) if r.settled.is_some());
             let (output, usage, files) = match turn {
                 Ok(result) => (result.output, result.usage, result.files),
                 Err(error) => (
@@ -7189,6 +7353,11 @@ impl AcpStepRunner {
                 ),
             };
             drop(proc);
+            if settled {
+                self.drop_session_key(&session_key);
+                drop(proc_arc);
+                self.mark_restart(&session_key, "turn_settled", None);
+            }
             return StepOutput {
                 run_id: input.run_id.clone(),
                 unit_ix: input.unit_ix,
@@ -7232,7 +7401,19 @@ impl AcpStepRunner {
                 }
             }
             Ok(result) if result.status == StepStatus::Ok => {
-                if wants_no_code {
+                // (core#762) The engine ended a turn the bridge never closed after the worker's
+                // final message: disclose it, and never reuse the wedged process.
+                if let Some(quiet_secs) = result.settled {
+                    self.emit_event(CoreEvent::AcpTurnSettled {
+                        session: run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        cli_key: cli_key.clone(),
+                        quiet_secs,
+                        output_bytes: result.output.len(),
+                    });
+                }
+                if wants_no_code || result.settled.is_some() {
                     // F-036 QUIESCE (adversarial review on #414): a NO-CODE unit's process — the
                     // bridge, the CLI it wraps and anything either backgrounded — dies with the
                     // unit, group and all, BEFORE this returns and the worker thread takes the
@@ -7241,6 +7422,15 @@ impl AcpStepRunner {
                     drop(proc);
                     self.drop_session_key(&session_key);
                     drop(proc_arc);
+                    self.mark_restart(
+                        &session_key,
+                        if result.settled.is_some() {
+                            "turn_settled"
+                        } else {
+                            "fenced_unit_quiesced"
+                        },
+                        None,
+                    );
                 }
                 StepOutput {
                     run_id: input.run_id.clone(),
@@ -13961,6 +14151,7 @@ transport = "stdio"
             files: Vec::new(),
             tools: Vec::new(),
             answer: "The answer.".into(),
+            settled: None,
         };
         assert_eq!(turn.chat_answer(), "The answer.");
         assert_eq!(
@@ -14123,6 +14314,7 @@ No further next steps — both questions fully answered.";
             files: Vec::new(),
             tools: Vec::new(),
             answer: golden.to_string(),
+            settled: None,
         };
         assert_eq!(scaffold_header_hits(&via_answer.chat_answer()), 0);
         assert!(via_answer
@@ -20964,5 +21156,219 @@ headless_invocation = "copilot -p \"{PROMPT}\""
             !format!("{refuser:?}{http:?}{copilot:?}").contains("acp_input_governance=false"),
             "the unadmitted-adapter refusal is gone"
         );
+    }
+}
+
+/// core#762 through the REAL ACP turn loop: a scripted bridge sends the worker's final message and
+/// then never closes the turn.
+#[cfg(all(test, unix))]
+mod settle_tests {
+    use super::*;
+    use crate::test_env::ENV_LOCK;
+
+    fn bridge(behaviour: &str) -> (std::path::PathBuf, AcpConfig) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-762-{behaviour}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("settle-bridge.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import sys, json, time
+behaviour = sys.argv[1]
+def w(o): print(json.dumps(o), flush=True)
+def r():
+    while True:
+        line = sys.stdin.readline()
+        if not line: return None
+        line = line.strip()
+        if line:
+            try: return json.loads(line)
+            except Exception: pass
+req = r(); w({"jsonrpc":"2.0","id":req["id"],"result":{"protocolVersion":1,"capabilities":{}}})
+req = r(); w({"jsonrpc":"2.0","id":req["id"],"result":{"sessionId":"s"}})
+def upd(u): w({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":u}})
+while True:
+    req = r()
+    if req is None: break
+    if req.get("method") != "session/prompt": continue
+    if behaviour == "open_tool":
+        upd({"sessionUpdate":"tool_call","toolCallId":"toolu_1","kind":"execute",
+             "title":"npm test","status":"pending"})
+    upd({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"All checks pass. VERDICT: PASS"}})
+    time.sleep(30)
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = AcpConfig {
+            binary: script.to_string_lossy().into_owned(),
+            start_args: vec![behaviour.to_string()],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: true,
+            os_sandbox: false,
+            acp_governance_env: None,
+            verified_version: None,
+            governance_floor: None,
+        };
+        (dir, config)
+    }
+
+    fn run(behaviour: &str, settle: Duration, timeout: Duration) -> (TurnResult, Duration) {
+        let (dir, config) = bridge(behaviour);
+        let mut proc = {
+            let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+            start_acp_process(
+                &config,
+                &dir,
+                None,
+                None,
+                wicked_apps_core::spawn::SeatCli::Other,
+                None,
+            )
+            .expect("bridge starts")
+        };
+        proc.settle_after = Some(settle);
+        let (tx, _rx) = std::sync::mpsc::channel::<Command>();
+        let noop: &DeltaSink = &|_: &str| {};
+        let started = Instant::now();
+        let out = exec_turn_acp_posture(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            timeout,
+            Arc::new(Mutex::new(ElicitationMaps::new())),
+            "run-762",
+            0,
+            &tx,
+            None,
+            None,
+            None,
+        )
+        .expect("turn runs");
+        let took = started.elapsed();
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+        (out, took)
+    }
+
+    /// A final message and then silence with no tool call open: the engine ends the turn as `Ok`
+    /// and keeps the output, long before the turn ceiling.
+    #[test]
+    fn a_turn_silent_after_its_final_message_is_settled_with_its_output() {
+        let (out, took) = run(
+            "message_then_hang",
+            Duration::from_millis(400),
+            Duration::from_secs(20),
+        );
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(out.settled.is_some(), "the settle is reported");
+        assert!(out.output.contains("VERDICT: PASS"), "{}", out.output);
+        assert!(
+            took < Duration::from_secs(10),
+            "settled, not timed out: {took:?}"
+        );
+    }
+
+    /// A tool call still open is the worker WORKING: no settle, the turn runs to its ceiling.
+    #[test]
+    fn a_turn_with_a_tool_call_open_is_never_settled() {
+        let (out, _) = run(
+            "open_tool",
+            Duration::from_millis(200),
+            Duration::from_millis(1500),
+        );
+        assert_eq!(out.status, StepStatus::TimedOut, "{}", out.output);
+        assert!(out.settled.is_none());
+    }
+
+    #[test]
+    fn the_settle_arms_on_a_message_and_disarms_on_work() {
+        let frame =
+            |u: Value| json!({"jsonrpc":"2.0","method":"session/update","params":{"update": u}});
+        let settle = Some(Duration::from_secs(600));
+        let mut w = SettleWatch::new();
+        assert_eq!(w.due_in(settle), None, "nothing said yet");
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}),
+        ));
+        assert!(w.due_in(settle).is_some(), "a message arms it");
+        assert_eq!(w.due_in(None), None, "an unset window never settles");
+        w.observe(&frame(
+            json!({"sessionUpdate":"tool_call","toolCallId":"t1"}),
+        ));
+        assert_eq!(w.due_in(settle), None, "a tool call disarms it");
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}),
+        ));
+        assert_eq!(w.due_in(settle), None, "still a tool call open");
+        w.observe(&frame(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}),
+        ));
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"y"}}),
+        ));
+        assert!(
+            w.due_in(settle).is_some(),
+            "closed call, then a message: armed"
+        );
+        w.observe(&frame(json!({"sessionUpdate":"usage_update","used":1})));
+        assert!(w.due_in(settle).is_some(), "a usage frame keeps it armed");
+        w.observe(
+            &json!({"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{}}),
+        );
+        assert_eq!(w.due_in(settle), None, "a request disarms it");
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"z"}}),
+        ));
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"text":"hm"}}),
+        ));
+        assert_eq!(w.due_in(settle), None, "a thought disarms it");
+        // A tool call with no id can never be seen to close: no settle for the rest of the turn.
+        let mut w = SettleWatch::new();
+        w.observe(&frame(json!({"sessionUpdate":"tool_call","title":"bash"})));
+        w.observe(&frame(
+            json!({"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}),
+        ));
+        assert_eq!(
+            w.due_in(settle),
+            None,
+            "an untracked tool call keeps it off"
+        );
+    }
+
+    #[test]
+    fn the_settle_window_reads_its_variable_and_zero_turns_it_off() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(ACP_SETTLE_ENV);
+        std::env::remove_var(ACP_SETTLE_ENV);
+        assert_eq!(
+            acp_settle_after(),
+            Some(Duration::from_secs(ACP_SETTLE_DEFAULT_SECS))
+        );
+        std::env::set_var(ACP_SETTLE_ENV, "45");
+        assert_eq!(acp_settle_after(), Some(Duration::from_secs(45)));
+        std::env::set_var(ACP_SETTLE_ENV, "0");
+        assert_eq!(acp_settle_after(), None);
+        std::env::set_var(ACP_SETTLE_ENV, "soon");
+        assert_eq!(
+            acp_settle_after(),
+            Some(Duration::from_secs(ACP_SETTLE_DEFAULT_SECS)),
+            "garbage keeps the default"
+        );
+        match saved {
+            Some(v) => std::env::set_var(ACP_SETTLE_ENV, v),
+            None => std::env::remove_var(ACP_SETTLE_ENV),
+        }
     }
 }
